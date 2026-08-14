@@ -13,7 +13,7 @@ p95 below 100 ms with 50-100 active collaborators on one document.
   wave cannot move later deadlines: missed-deadline lag is included in the
   next wave's convergence latency.
 - Two writers overlap in every fourth wave. That is exactly 10% overlapping
-  operations; the other 90% target distinct semantic entities.
+  operations; the other 90% target distinct semantic rows.
 - A wave converges only after every client reaches the marker's mutation
   generation through its own query stream. One designated observer verifies
   the marker bytes and publishes that generation as the wave receipt; the
@@ -85,7 +85,7 @@ cancellation-safety and maintainability change, not a throughput claim.
 ## Profile and change
 
 The first realistic run failed before producing a latency result. Same-file
-byte edits that touched disjoint semantic entities overlapped in file-storage
+byte edits that touched disjoint semantic rows overlapped in file-storage
 bookkeeping, and the stale transaction path classified that bookkeeping as an
 unsafe non-plugin conflict. This made the 90% disjoint workload return
 `LIX_TRANSACTION_CONFLICT`.

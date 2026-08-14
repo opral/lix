@@ -1426,7 +1426,7 @@ mod tests {
         for change in changes {
             let commit_id = change
                 .change
-                .entity_pk
+                .row_pk
                 .as_single_string()
                 .expect("commit fixture should have single id")
                 .to_string();
@@ -1525,7 +1525,7 @@ mod tests {
             change: CommitGraphChange {
                 id: ChangeId::for_test_label(change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single(commit_id),
+                row_pk: crate::row_pk::RowPk::single(commit_id),
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
                 snapshot: crate::json_store::JsonSlot::None,

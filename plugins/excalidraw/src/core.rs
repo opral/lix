@@ -30,7 +30,7 @@ impl IdNamespace {
     }
 
     /// Reconstructs this reference core's namespace from a canonical public
-    /// API ID. Excalidraw does not currently mint entities after import, but
+    /// API ID. Excalidraw does not currently mint rows after import, but
     /// preserving the exact namespace keeps that future path correct.
     pub fn from_generated_id(id: &str) -> Result<Self, String> {
         let decoded = uuid::Uuid::parse_str(id)
@@ -55,17 +55,17 @@ pub enum ChangeEffect {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityChange {
+pub struct RowChange {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Option<Vec<u8>>,
     pub effect: ChangeEffect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityRecord {
+pub struct RowRecord {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Vec<u8>,
 }
 
@@ -76,10 +76,10 @@ pub struct ByteEdit {
     pub insert: Arc<Vec<u8>>,
 }
 
-type EntityKey = (String, Vec<String>);
+type RowKey = (String, Vec<String>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SceneEntity {
+struct SceneRow {
     template_json: String,
     elements_tail_json: String,
     files_tail_json: String,
@@ -87,7 +87,7 @@ struct SceneEntity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ElementEntity {
+struct ElementRow {
     id: String,
     order_key: String,
     leading_json: String,
@@ -97,7 +97,7 @@ struct ElementEntity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FileEntity {
+struct FileRow {
     id: String,
     order_key: String,
     prefix_json: String,
@@ -125,31 +125,31 @@ pub struct Document(Arc<DocumentInner>);
 #[derive(Debug)]
 struct DocumentInner {
     bytes: Arc<Vec<u8>>,
-    scene: SceneEntity,
-    elements: Arc<Vec<ElementEntity>>,
-    files: Arc<Vec<FileEntity>>,
+    scene: SceneRow,
+    elements: Arc<Vec<ElementRow>>,
+    files: Arc<Vec<FileRow>>,
     element_spans: Arc<HashMap<String, Span>>,
     file_spans: Arc<HashMap<String, Span>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct InitialChanges {
-    changes: VecDeque<EntityChange>,
+    changes: VecDeque<RowChange>,
 }
 
 impl Iterator for InitialChanges {
-    type Item = Result<EntityChange, String>;
+    type Item = Result<RowChange, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.changes.pop_front().map(Ok)
     }
 }
 
-impl EntityChange {
-    fn upsert(record: EntityRecord) -> Self {
+impl RowChange {
+    fn upsert(record: RowRecord) -> Self {
         Self {
             schema_key: record.schema_key,
-            entity_pk: record.entity_pk,
+            row_pk: record.row_pk,
             snapshot: Some(record.snapshot),
             effect: ChangeEffect::Content,
         }
@@ -158,15 +158,15 @@ impl EntityChange {
     fn delete(schema_key: &str, id: &str) -> Self {
         Self {
             schema_key: schema_key.to_owned(),
-            entity_pk: vec![id.to_owned()],
+            row_pk: vec![id.to_owned()],
             snapshot: None,
             effect: ChangeEffect::Content,
         }
     }
 }
 
-impl SceneEntity {
-    fn record(&self) -> Result<EntityRecord, String> {
+impl SceneRow {
+    fn record(&self) -> Result<RowRecord, String> {
         let snapshot = serde_json::to_vec(&json!({
             "id": SCENE_ID,
             "template_json": self.template_json,
@@ -175,16 +175,16 @@ impl SceneEntity {
             "files_present": self.files_present,
         }))
         .map_err(|error| format!("serialize Excalidraw scene snapshot: {error}"))?;
-        Ok(EntityRecord {
+        Ok(RowRecord {
             schema_key: SCENE_SCHEMA_KEY.to_owned(),
-            entity_pk: vec![SCENE_ID.to_owned()],
+            row_pk: vec![SCENE_ID.to_owned()],
             snapshot,
         })
     }
 
-    fn parse(record: &EntityRecord) -> Result<Self, String> {
+    fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, SCENE_SCHEMA_KEY)?;
-        if record.entity_pk.as_slice() != [SCENE_ID] {
+        if record.row_pk.as_slice() != [SCENE_ID] {
             return Err("excalidraw_scene requires the single primary key \"scene\"".to_owned());
         }
         let object = snapshot_object(record)?;
@@ -230,7 +230,7 @@ impl SceneEntity {
     }
 }
 
-impl ElementEntity {
+impl ElementRow {
     fn from_source(
         order_key: String,
         leading_json: String,
@@ -277,7 +277,7 @@ impl ElementEntity {
         })
     }
 
-    fn record(&self) -> Result<EntityRecord, String> {
+    fn record(&self) -> Result<RowRecord, String> {
         let snapshot = serde_json::to_vec(&json!({
             "id": self.id,
             "order_key": self.order_key,
@@ -287,16 +287,16 @@ impl ElementEntity {
             "element_json": self.element_json,
         }))
         .map_err(|error| format!("serialize Excalidraw element snapshot: {error}"))?;
-        Ok(EntityRecord {
+        Ok(RowRecord {
             schema_key: ELEMENT_SCHEMA_KEY.to_owned(),
-            entity_pk: vec![self.id.clone()],
+            row_pk: vec![self.id.clone()],
             snapshot,
         })
     }
 
-    fn parse(record: &EntityRecord) -> Result<Self, String> {
+    fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, ELEMENT_SCHEMA_KEY)?;
-        let [id] = record.entity_pk.as_slice() else {
+        let [id] = record.row_pk.as_slice() else {
             return Err("excalidraw_element requires one primary-key component".to_owned());
         };
         let object = snapshot_object(record)?;
@@ -316,25 +316,25 @@ impl ElementEntity {
         }
         let declared_type = required_string(&object, "element_type")?;
         let declared_deleted = required_bool(&object, "is_deleted")?;
-        let entity = Self::from_source(
+        let row = Self::from_source(
             required_string(&object, "order_key")?.to_owned(),
             required_string(&object, "leading_json")?.to_owned(),
             required_string(&object, "element_json")?.to_owned(),
         )?;
-        if entity.id != *id {
-            return Err("element_json id does not match the entity key".to_owned());
+        if row.id != *id {
+            return Err("element_json id does not match the row key".to_owned());
         }
-        if entity.element_type != declared_type {
+        if row.element_type != declared_type {
             return Err("element_type does not match element_json".to_owned());
         }
-        if entity.is_deleted != declared_deleted {
+        if row.is_deleted != declared_deleted {
             return Err("is_deleted does not match element_json".to_owned());
         }
-        Ok(entity)
+        Ok(row)
     }
 }
 
-impl FileEntity {
+impl FileRow {
     fn from_source(
         id: String,
         order_key: String,
@@ -347,7 +347,7 @@ impl FileEntity {
         validate_order_key(&order_key)?;
         let prefix_id = parse_file_prefix(&prefix_json)?;
         if prefix_id != id {
-            return Err("Excalidraw file prefix key does not match its entity id".to_owned());
+            return Err("Excalidraw file prefix key does not match its row id".to_owned());
         }
         let file_value: Value = serde_json::from_str(&file_json)
             .map_err(|error| format!("invalid Excalidraw file JSON: {error}"))?;
@@ -362,7 +362,7 @@ impl FileEntity {
         })
     }
 
-    fn record(&self) -> Result<EntityRecord, String> {
+    fn record(&self) -> Result<RowRecord, String> {
         let snapshot = serde_json::to_vec(&json!({
             "id": self.id,
             "order_key": self.order_key,
@@ -370,16 +370,16 @@ impl FileEntity {
             "file_json": self.file_json,
         }))
         .map_err(|error| format!("serialize Excalidraw file snapshot: {error}"))?;
-        Ok(EntityRecord {
+        Ok(RowRecord {
             schema_key: FILE_SCHEMA_KEY.to_owned(),
-            entity_pk: vec![self.id.clone()],
+            row_pk: vec![self.id.clone()],
             snapshot,
         })
     }
 
-    fn parse(record: &EntityRecord) -> Result<Self, String> {
+    fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, FILE_SCHEMA_KEY)?;
-        let [id] = record.entity_pk.as_slice() else {
+        let [id] = record.row_pk.as_slice() else {
             return Err("excalidraw_file requires one primary-key component".to_owned());
         };
         let object = snapshot_object(record)?;
@@ -424,16 +424,16 @@ impl Document {
         }))
     }
 
-    fn from_entities(
-        scene: SceneEntity,
-        mut elements: Vec<ElementEntity>,
-        mut files: Vec<FileEntity>,
+    fn from_rows(
+        scene: SceneRow,
+        mut elements: Vec<ElementRow>,
+        mut files: Vec<FileRow>,
     ) -> Result<Self, String> {
         scene.validate_template()?;
         sort_and_validate_elements(&mut elements)?;
         sort_and_validate_files(&mut files)?;
         if !scene.files_present && !files.is_empty() {
-            return Err("file entities require a files marker in the scene".to_owned());
+            return Err("file rows require a files marker in the scene".to_owned());
         }
         let rendered = render_document(&scene, &elements, &files)?;
         validate_rendered_graph(&rendered.bytes, &elements, &files, scene.files_present)?;
@@ -456,7 +456,7 @@ impl Document {
     }
 
     #[cfg(test)]
-    pub(crate) fn source_spans_match_entities(&self) -> Result<(), String> {
+    pub(crate) fn source_spans_match_rows(&self) -> Result<(), String> {
         for element in self.0.elements.iter() {
             let span = self
                 .0
@@ -502,16 +502,16 @@ impl Document {
 
     pub fn initial_changes(&self) -> InitialChanges {
         let mut changes = VecDeque::with_capacity(1 + self.0.elements.len() + self.0.files.len());
-        changes.push_back(EntityChange::upsert(
+        changes.push_back(RowChange::upsert(
             self.0.scene.record().expect("validated scene serializes"),
         ));
         for element in self.0.elements.iter() {
-            changes.push_back(EntityChange::upsert(
+            changes.push_back(RowChange::upsert(
                 element.record().expect("validated element serializes"),
             ));
         }
         for file in self.0.files.iter() {
-            changes.push_back(EntityChange::upsert(
+            changes.push_back(RowChange::upsert(
                 file.record().expect("validated file serializes"),
             ));
         }
@@ -547,7 +547,7 @@ impl Document {
         order_key: String,
         leading_json: String,
         element_json: String,
-    ) -> Result<Option<EntityChange>, String> {
+    ) -> Result<Option<RowChange>, String> {
         let value = match serde_json::from_str(&element_json) {
             Ok(value) => value,
             // A structural insertion can make the old element span contain
@@ -555,19 +555,18 @@ impl Document {
             // reconcile that successor instead of rejecting it here.
             Err(_) => return Ok(None),
         };
-        let element =
-            ElementEntity::from_parsed_source(order_key, leading_json, element_json, value)?;
+        let element = ElementRow::from_parsed_source(order_key, leading_json, element_json, value)?;
         if element.id != id {
             return Ok(None);
         }
-        Ok(Some(EntityChange::upsert(element.record()?)))
+        Ok(Some(RowChange::upsert(element.record()?)))
     }
 
     pub fn file_changed(
         &self,
         splices: &[FileEdit<'_>],
         _namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), String> {
+    ) -> Result<(Self, Vec<RowChange>), String> {
         if splices.is_empty() {
             return Ok((self.clone(), Vec::new()));
         }
@@ -580,15 +579,12 @@ impl Document {
         Ok((after, changes))
     }
 
-    pub fn entities_changed(
-        &self,
-        changes: &[EntityChange],
-    ) -> Result<(Self, Vec<ByteEdit>), String> {
+    pub fn rows_changed(&self, changes: &[RowChange]) -> Result<(Self, Vec<ByteEdit>), String> {
         if changes.is_empty() {
             return Ok((self.clone(), Vec::new()));
         }
         if changes.len() == 1
-            && let Some(result) = self.single_entity_changed(&changes[0])?
+            && let Some(result) = self.single_row_changed(&changes[0])?
         {
             return Ok(result);
         }
@@ -600,13 +596,13 @@ impl Document {
             .collect::<HashMap<_, _>>();
         for change in changes {
             validate_change_key(change)?;
-            let key = (change.schema_key.clone(), change.entity_pk.clone());
+            let key = (change.schema_key.clone(), change.row_pk.clone());
             if let Some(snapshot) = &change.snapshot {
                 records.insert(
                     key,
-                    EntityRecord {
+                    RowRecord {
                         schema_key: change.schema_key.clone(),
-                        entity_pk: change.entity_pk.clone(),
+                        row_pk: change.row_pk.clone(),
                         snapshot: snapshot.clone(),
                     },
                 );
@@ -614,7 +610,7 @@ impl Document {
                 records.remove(&key);
             }
         }
-        let (after, _) = Self::open_entities(records.into_values().collect())?;
+        let (after, _) = Self::open_rows(records.into_values().collect())?;
         if after.0.bytes == self.0.bytes {
             return Ok((after, Vec::new()));
         }
@@ -629,25 +625,25 @@ impl Document {
         ))
     }
 
-    fn single_entity_changed(
+    fn single_row_changed(
         &self,
-        change: &EntityChange,
+        change: &RowChange,
     ) -> Result<Option<(Self, Vec<ByteEdit>)>, String> {
         let Some(snapshot) = &change.snapshot else {
             return Ok(None);
         };
-        if change.entity_pk.len() != 1 {
+        if change.row_pk.len() != 1 {
             validate_change_key(change)?;
             return Ok(None);
         }
-        let record = EntityRecord {
+        let record = RowRecord {
             schema_key: change.schema_key.clone(),
-            entity_pk: change.entity_pk.clone(),
+            row_pk: change.row_pk.clone(),
             snapshot: snapshot.clone(),
         };
         match change.schema_key.as_str() {
             ELEMENT_SCHEMA_KEY => {
-                let replacement = ElementEntity::parse(&record)?;
+                let replacement = ElementRow::parse(&record)?;
                 let Some(index) = self
                     .0
                     .elements
@@ -667,7 +663,7 @@ impl Document {
                 }
                 let mut elements = self.0.elements.as_ref().clone();
                 elements[index] = replacement.clone();
-                let after = Self::from_entities(
+                let after = Self::from_rows(
                     self.0.scene.clone(),
                     elements,
                     self.0.files.as_ref().clone(),
@@ -686,7 +682,7 @@ impl Document {
                 Ok(Some((after, edits)))
             }
             FILE_SCHEMA_KEY => {
-                let replacement = FileEntity::parse(&record)?;
+                let replacement = FileRow::parse(&record)?;
                 let Some(index) = self
                     .0
                     .files
@@ -706,7 +702,7 @@ impl Document {
                 }
                 let mut files = self.0.files.as_ref().clone();
                 files[index] = replacement.clone();
-                let after = Self::from_entities(
+                let after = Self::from_rows(
                     self.0.scene.clone(),
                     self.0.elements.as_ref().clone(),
                     files,
@@ -725,36 +721,36 @@ impl Document {
                 Ok(Some((after, edits)))
             }
             SCENE_SCHEMA_KEY => {
-                SceneEntity::parse(&record)?;
+                SceneRow::parse(&record)?;
                 Ok(None)
             }
-            other => Err(format!("unsupported Excalidraw entity schema {other:?}")),
+            other => Err(format!("unsupported Excalidraw row schema {other:?}")),
         }
     }
 
-    pub fn open_entities(entities: Vec<EntityRecord>) -> Result<(Self, ByteEdit), String> {
-        let mut builder = EntityImportBuilder::new();
-        for entity in entities {
-            builder.push(entity)?;
+    pub fn open_rows(rows: Vec<RowRecord>) -> Result<(Self, ByteEdit), String> {
+        let mut builder = RowImportBuilder::new();
+        for row in rows {
+            builder.push(row)?;
         }
         builder.finish()
     }
 
-    fn records(&self) -> Result<Vec<EntityRecord>, String> {
+    fn records(&self) -> Result<Vec<RowRecord>, String> {
         let mut records = Vec::with_capacity(1 + self.0.elements.len() + self.0.files.len());
         records.push(self.0.scene.record()?);
         records.extend(
             self.0
                 .elements
                 .iter()
-                .map(ElementEntity::record)
+                .map(ElementRow::record)
                 .collect::<Result<Vec<_>, _>>()?,
         );
         records.extend(
             self.0
                 .files
                 .iter()
-                .map(FileEntity::record)
+                .map(FileRow::record)
                 .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(records)
@@ -781,9 +777,7 @@ fn localized_edit(
     applied.extend_from_slice(insert);
     applied.extend_from_slice(&before[end..]);
     if applied != after {
-        return Err(
-            "localized entity edit does not reproduce rendered Excalidraw bytes".to_owned(),
-        );
+        return Err("localized row edit does not reproduce rendered Excalidraw bytes".to_owned());
     }
     Ok(vec![ByteEdit {
         offset: span.offset,
@@ -793,33 +787,33 @@ fn localized_edit(
 }
 
 #[derive(Debug, Default)]
-pub struct EntityImportBuilder {
-    scene: Option<SceneEntity>,
-    elements: Vec<ElementEntity>,
-    files: Vec<FileEntity>,
-    identities: HashSet<EntityKey>,
+pub struct RowImportBuilder {
+    scene: Option<SceneRow>,
+    elements: Vec<ElementRow>,
+    files: Vec<FileRow>,
+    identities: HashSet<RowKey>,
 }
 
-impl EntityImportBuilder {
+impl RowImportBuilder {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push(&mut self, record: EntityRecord) -> Result<(), String> {
+    pub fn push(&mut self, record: RowRecord) -> Result<(), String> {
         let key = record_key(&record);
         if !self.identities.insert(key.clone()) {
-            return Err(format!("duplicate Excalidraw entity {key:?}"));
+            return Err(format!("duplicate Excalidraw row {key:?}"));
         }
         match record.schema_key.as_str() {
             SCENE_SCHEMA_KEY => {
-                let scene = SceneEntity::parse(&record)?;
+                let scene = SceneRow::parse(&record)?;
                 if self.scene.replace(scene).is_some() {
                     return Err("Excalidraw graph contains multiple scene roots".to_owned());
                 }
             }
-            ELEMENT_SCHEMA_KEY => self.elements.push(ElementEntity::parse(&record)?),
-            FILE_SCHEMA_KEY => self.files.push(FileEntity::parse(&record)?),
-            other => return Err(format!("unsupported Excalidraw entity schema {other:?}")),
+            ELEMENT_SCHEMA_KEY => self.elements.push(ElementRow::parse(&record)?),
+            FILE_SCHEMA_KEY => self.files.push(FileRow::parse(&record)?),
+            other => return Err(format!("unsupported Excalidraw row schema {other:?}")),
         }
         Ok(())
     }
@@ -827,8 +821,8 @@ impl EntityImportBuilder {
     pub fn finish(self) -> Result<(Document, ByteEdit), String> {
         let scene = self
             .scene
-            .ok_or_else(|| "Excalidraw entity graph requires one scene root".to_owned())?;
-        let document = Document::from_entities(scene, self.elements, self.files)?;
+            .ok_or_else(|| "Excalidraw row graph requires one scene root".to_owned())?;
+        let document = Document::from_rows(scene, self.elements, self.files)?;
         Ok((
             document.clone(),
             ByteEdit {
@@ -842,9 +836,9 @@ impl EntityImportBuilder {
 
 #[derive(Debug)]
 struct ParsedFile {
-    scene: SceneEntity,
-    elements: Vec<ElementEntity>,
-    files: Vec<FileEntity>,
+    scene: SceneRow,
+    elements: Vec<ElementRow>,
+    files: Vec<FileRow>,
     element_spans: HashMap<String, Span>,
     file_spans: HashMap<String, Span>,
 }
@@ -907,12 +901,12 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, String> {
     let mut element_spans = HashMap::with_capacity(elements_raw.entries.len());
     let mut elements = Vec::with_capacity(elements_raw.entries.len());
     for (entry, key) in elements_raw.entries.into_iter().zip(element_keys) {
-        let entity = ElementEntity::from_source(key.to_snapshot_string(), entry.prefix, entry.raw)?;
-        if !element_ids.insert(entity.id.clone()) {
-            return Err(format!("duplicate Excalidraw element id {:?}", entity.id));
+        let row = ElementRow::from_source(key.to_snapshot_string(), entry.prefix, entry.raw)?;
+        if !element_ids.insert(row.id.clone()) {
+            return Err(format!("duplicate Excalidraw element id {:?}", row.id));
         }
-        element_spans.insert(entity.id.clone(), entry.span);
-        elements.push(entity);
+        element_spans.insert(row.id.clone(), entry.span);
+        elements.push(row);
     }
 
     let files_tail_json = files_raw
@@ -934,13 +928,12 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, String> {
         if !file_ids.insert(id.clone()) {
             return Err(format!("duplicate Excalidraw file id {id:?}"));
         }
-        let entity =
-            FileEntity::from_source(id, key.to_snapshot_string(), entry.prefix, entry.raw)?;
-        file_spans.insert(entity.id.clone(), entry.span);
-        files.push(entity);
+        let row = FileRow::from_source(id, key.to_snapshot_string(), entry.prefix, entry.raw)?;
+        file_spans.insert(row.id.clone(), entry.span);
+        files.push(row);
     }
 
-    let scene = SceneEntity {
+    let scene = SceneRow {
         template_json,
         elements_tail_json: elements_raw.tail,
         files_tail_json,
@@ -1349,9 +1342,9 @@ struct RenderedDocument {
 }
 
 fn render_document(
-    scene: &SceneEntity,
-    elements: &[ElementEntity],
-    files: &[FileEntity],
+    scene: &SceneRow,
+    elements: &[ElementRow],
+    files: &[FileRow],
 ) -> Result<RenderedDocument, String> {
     let template = scene.template_json.as_bytes();
     let mut markers = vec![(
@@ -1409,7 +1402,7 @@ impl Marker {
 
 fn render_elements(
     output: &mut Vec<u8>,
-    elements: &[ElementEntity],
+    elements: &[ElementRow],
     tail: &str,
     spans: &mut HashMap<String, Span>,
 ) -> Result<(), String> {
@@ -1435,7 +1428,7 @@ fn render_elements(
 
 fn render_files(
     output: &mut Vec<u8>,
-    files: &[FileEntity],
+    files: &[FileRow],
     tail: &str,
     spans: &mut HashMap<String, Span>,
 ) -> Result<(), String> {
@@ -1475,13 +1468,13 @@ fn find_unique(haystack: &[u8], needle: &[u8], name: &str) -> Result<usize, Stri
     }
 }
 
-trait OrderedEntity {
+trait OrderedRow {
     fn id(&self) -> &str;
     fn order_key(&self) -> &str;
     fn set_order_key(&mut self, order_key: String);
 }
 
-impl OrderedEntity for ElementEntity {
+impl OrderedRow for ElementRow {
     fn id(&self) -> &str {
         &self.id
     }
@@ -1495,7 +1488,7 @@ impl OrderedEntity for ElementEntity {
     }
 }
 
-impl OrderedEntity for FileEntity {
+impl OrderedRow for FileRow {
     fn id(&self) -> &str {
         &self.id
     }
@@ -1509,50 +1502,47 @@ impl OrderedEntity for FileEntity {
     }
 }
 
-fn sort_and_validate_elements(elements: &mut [ElementEntity]) -> Result<(), String> {
+fn sort_and_validate_elements(elements: &mut [ElementRow]) -> Result<(), String> {
     sort_and_validate_ordered(elements, "element")
 }
 
-fn sort_and_validate_files(files: &mut [FileEntity]) -> Result<(), String> {
+fn sort_and_validate_files(files: &mut [FileRow]) -> Result<(), String> {
     sort_and_validate_ordered(files, "file")
 }
 
-fn sort_and_validate_ordered<T: OrderedEntity>(
-    entities: &mut [T],
-    kind: &str,
-) -> Result<(), String> {
-    let mut ids = HashSet::with_capacity(entities.len());
-    let mut keys = HashSet::with_capacity(entities.len());
-    for entity in entities.iter() {
-        if !ids.insert(entity.id().to_owned()) {
-            return Err(format!("duplicate Excalidraw {kind} id {:?}", entity.id()));
+fn sort_and_validate_ordered<T: OrderedRow>(rows: &mut [T], kind: &str) -> Result<(), String> {
+    let mut ids = HashSet::with_capacity(rows.len());
+    let mut keys = HashSet::with_capacity(rows.len());
+    for row in rows.iter() {
+        if !ids.insert(row.id().to_owned()) {
+            return Err(format!("duplicate Excalidraw {kind} id {:?}", row.id()));
         }
-        validate_order_key(entity.order_key())?;
-        if !keys.insert(entity.order_key().to_owned()) {
+        validate_order_key(row.order_key())?;
+        if !keys.insert(row.order_key().to_owned()) {
             return Err(format!(
                 "duplicate Excalidraw {kind} order key {:?}",
-                entity.order_key()
+                row.order_key()
             ));
         }
     }
-    entities.sort_unstable_by(|left, right| {
+    rows.sort_unstable_by(|left, right| {
         (left.order_key(), left.id()).cmp(&(right.order_key(), right.id()))
     });
     Ok(())
 }
 
-fn reconcile_order_keys<T: OrderedEntity>(before: &[T], after: &mut [T]) -> Result<(), String> {
+fn reconcile_order_keys<T: OrderedRow>(before: &[T], after: &mut [T]) -> Result<(), String> {
     if after.is_empty() {
         return Ok(());
     }
     let before_index = before
         .iter()
         .enumerate()
-        .map(|(index, entity)| (entity.id(), index))
+        .map(|(index, row)| (row.id(), index))
         .collect::<HashMap<_, _>>();
     let common_positions = after
         .iter()
-        .filter_map(|entity| before_index.get(entity.id()).copied())
+        .filter_map(|row| before_index.get(row.id()).copied())
         .collect::<Vec<_>>();
     let relative_order_unchanged = common_positions.windows(2).all(|pair| pair[0] < pair[1]);
     if !relative_order_unchanged {
@@ -1562,16 +1552,16 @@ fn reconcile_order_keys<T: OrderedEntity>(before: &[T], after: &mut [T]) -> Resu
 
     let old_keys = before
         .iter()
-        .map(|entity| {
+        .map(|row| {
             Ok((
-                entity.id().to_owned(),
-                OrderKey::from_snapshot_string(entity.order_key())?,
+                row.id().to_owned(),
+                OrderKey::from_snapshot_string(row.order_key())?,
             ))
         })
         .collect::<Result<HashMap<_, _>, String>>()?;
-    for entity in after.iter_mut() {
-        if let Some(key) = old_keys.get(entity.id()) {
-            entity.set_order_key(key.to_snapshot_string());
+    for row in after.iter_mut() {
+        if let Some(key) = old_keys.get(row.id()) {
+            row.set_order_key(key.to_snapshot_string());
         }
     }
 
@@ -1588,29 +1578,27 @@ fn reconcile_order_keys<T: OrderedEntity>(before: &[T], after: &mut [T]) -> Resu
         let previous = start
             .checked_sub(1)
             .and_then(|index| old_keys.get(after[index].id()));
-        let next = after
-            .get(cursor)
-            .and_then(|entity| old_keys.get(entity.id()));
+        let next = after.get(cursor).and_then(|row| old_keys.get(row.id()));
         let allocated = OrderKey::evenly_between(previous, next, cursor - start)?;
-        for (entity, key) in after[start..cursor].iter_mut().zip(allocated) {
-            entity.set_order_key(key.to_snapshot_string());
+        for (row, key) in after[start..cursor].iter_mut().zip(allocated) {
+            row.set_order_key(key.to_snapshot_string());
         }
     }
     Ok(())
 }
 
-fn assign_even_order_keys<T: OrderedEntity>(entities: &mut [T]) -> Result<(), String> {
-    let keys = OrderKey::evenly_between(None, None, entities.len())?;
-    for (entity, key) in entities.iter_mut().zip(keys) {
-        entity.set_order_key(key.to_snapshot_string());
+fn assign_even_order_keys<T: OrderedRow>(rows: &mut [T]) -> Result<(), String> {
+    let keys = OrderKey::evenly_between(None, None, rows.len())?;
+    for (row, key) in rows.iter_mut().zip(keys) {
+        row.set_order_key(key.to_snapshot_string());
     }
     Ok(())
 }
 
 fn validate_rendered_graph(
     bytes: &[u8],
-    elements: &[ElementEntity],
-    files: &[FileEntity],
+    elements: &[ElementRow],
+    files: &[FileRow],
     files_present: bool,
 ) -> Result<(), String> {
     let value: Value = serde_json::from_slice(bytes)
@@ -1633,7 +1621,7 @@ fn validate_rendered_graph(
         .collect::<Result<Vec<_>, _>>()?;
     let expected_element_ids = elements
         .iter()
-        .map(|entity| entity.id.clone())
+        .map(|row| row.id.clone())
         .collect::<Vec<_>>();
     if rendered_element_ids != expected_element_ids {
         return Err("rendered elements do not match the semantic element order".to_owned());
@@ -1644,7 +1632,7 @@ fn validate_rendered_graph(
             let rendered_file_ids = rendered_files.keys().cloned().collect::<HashSet<_>>();
             let expected_file_ids = files
                 .iter()
-                .map(|entity| entity.id.clone())
+                .map(|row| row.id.clone())
                 .collect::<HashSet<_>>();
             if rendered_file_ids != expected_file_ids {
                 return Err("rendered files do not match the semantic file identities".to_owned());
@@ -1661,13 +1649,13 @@ fn validate_rendered_graph(
             return Err("files marker state does not match the rendered scene".to_owned());
         }
         None => {
-            return Err("file entities require a rendered files object".to_owned());
+            return Err("file rows require a rendered files object".to_owned());
         }
     }
     Ok(())
 }
 
-fn diff_records(before: Vec<EntityRecord>, after: Vec<EntityRecord>) -> Vec<EntityChange> {
+fn diff_records(before: Vec<RowRecord>, after: Vec<RowRecord>) -> Vec<RowChange> {
     let before = before
         .into_iter()
         .map(|record| (record_key(&record), record.snapshot))
@@ -1677,21 +1665,21 @@ fn diff_records(before: Vec<EntityRecord>, after: Vec<EntityRecord>) -> Vec<Enti
         .map(|record| (record_key(&record), record))
         .collect::<HashMap<_, _>>();
     let mut changes = Vec::new();
-    for (schema_key, entity_pk) in before.keys() {
-        if !after.contains_key(&(schema_key.clone(), entity_pk.clone())) {
-            changes.push(EntityChange::delete(
+    for (schema_key, row_pk) in before.keys() {
+        if !after.contains_key(&(schema_key.clone(), row_pk.clone())) {
+            changes.push(RowChange::delete(
                 schema_key,
-                entity_pk.first().expect("validated Excalidraw primary key"),
+                row_pk.first().expect("validated Excalidraw primary key"),
             ));
         }
     }
     for (key, record) in after {
         if before.get(&key) != Some(&record.snapshot) {
-            changes.push(EntityChange::upsert(record));
+            changes.push(RowChange::upsert(record));
         }
     }
     changes.sort_unstable_by(|left, right| {
-        (&left.schema_key, &left.entity_pk).cmp(&(&right.schema_key, &right.entity_pk))
+        (&left.schema_key, &left.row_pk).cmp(&(&right.schema_key, &right.row_pk))
     });
     changes
 }
@@ -1721,22 +1709,22 @@ fn apply_splices(before: &[u8], splices: &[FileEdit<'_>]) -> Result<Vec<u8>, Str
     Ok(output)
 }
 
-fn record_key(record: &EntityRecord) -> EntityKey {
-    (record.schema_key.clone(), record.entity_pk.clone())
+fn record_key(record: &RowRecord) -> RowKey {
+    (record.schema_key.clone(), record.row_pk.clone())
 }
 
-fn validate_change_key(change: &EntityChange) -> Result<(), String> {
-    match (change.schema_key.as_str(), change.entity_pk.as_slice()) {
+fn validate_change_key(change: &RowChange) -> Result<(), String> {
+    match (change.schema_key.as_str(), change.row_pk.as_slice()) {
         (SCENE_SCHEMA_KEY, [id]) if id == SCENE_ID => Ok(()),
         (ELEMENT_SCHEMA_KEY | FILE_SCHEMA_KEY, [id]) if !id.is_empty() => Ok(()),
         (SCENE_SCHEMA_KEY | ELEMENT_SCHEMA_KEY | FILE_SCHEMA_KEY, _) => {
-            Err("invalid Excalidraw entity primary key".to_owned())
+            Err("invalid Excalidraw row primary key".to_owned())
         }
-        (other, _) => Err(format!("unsupported Excalidraw entity schema {other:?}")),
+        (other, _) => Err(format!("unsupported Excalidraw row schema {other:?}")),
     }
 }
 
-fn require_key(record: &EntityRecord, expected: &str) -> Result<(), String> {
+fn require_key(record: &RowRecord, expected: &str) -> Result<(), String> {
     if record.schema_key == expected {
         Ok(())
     } else {
@@ -1747,13 +1735,13 @@ fn require_key(record: &EntityRecord, expected: &str) -> Result<(), String> {
     }
 }
 
-fn snapshot_object(record: &EntityRecord) -> Result<Map<String, Value>, String> {
+fn snapshot_object(record: &RowRecord) -> Result<Map<String, Value>, String> {
     let value: Value = serde_json::from_slice(&record.snapshot)
-        .map_err(|error| format!("invalid Excalidraw entity snapshot: {error}"))?;
+        .map_err(|error| format!("invalid Excalidraw row snapshot: {error}"))?;
     reject_numbers(&value)?;
     let object = value
         .as_object()
-        .ok_or_else(|| "Excalidraw entity snapshot must be an object".to_owned())?
+        .ok_or_else(|| "Excalidraw row snapshot must be an object".to_owned())?
         .clone();
     Ok(object)
 }

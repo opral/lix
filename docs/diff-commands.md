@@ -55,7 +55,7 @@ inspection. Their columns are listed in the
 `lix_diff` compares any two commits. Both commit arguments are required:
 
 ```sql
-SELECT diff_id, entity_pk, schema_key, file_id, diff_type,
+SELECT diff_id, row_pk, schema_key, file_id, diff_type,
        before_change_id, after_change_id
 FROM lix_diff($1, $2);
 ```
@@ -101,8 +101,8 @@ CTE, or another valid query.
 
 Each statement is atomic: it either fully succeeds or changes nothing.
 
-Revert and apply check that every selected entity is still on the side the
-command starts from. If someone changed an entity after you selected its diff,
+Revert and apply check that every selected row is still on the side the
+command starts from. If someone changed a row after you selected its diff,
 the whole statement fails and nothing changes — re-query and retry.
 
 An empty selection succeeds, does nothing, and creates no commit. You do not
@@ -134,10 +134,10 @@ current textual form starts with `d1.`), but clients must not construct or
 decode it. Use `before_change_id` and `after_change_id` for joins to
 `lix_change` and for debugging.
 
-A `diff_id` is only valid while the entity is still on the side the command
+A `diff_id` is only valid while the row is still on the side the command
 starts from, so it is a short-lived selection token rather than a durable
 handle — do not persist one and expect it to resolve later. It also describes a
-change, not an entity's history: an entity that was deleted in an earlier
+change, not a row's history: a row that was deleted in an earlier
 checkpoint and later re-added encodes the same way as one that was never
 present, even though `before_change_id` still reports the underlying row.
 

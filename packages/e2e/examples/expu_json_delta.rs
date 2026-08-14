@@ -14,7 +14,7 @@
 //!    payload is individually zstd-compressed at level 1 today. A delta only
 //!    earns the bytes zstd left on the table.
 //! 3. **What a delta base costs to reach.** A payload's natural base is the
-//!    previous version of the same entity, which is a different content
+//!    previous version of the same row, which is a different content
 //!    address in the same space.
 //!
 //! Modes:
@@ -107,7 +107,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Write log: the exact (entity, payload) stream the commit path staged.
+// Write log: the exact (row, payload) stream the commit path staged.
 // ---------------------------------------------------------------------------
 
 struct WriteLog {
@@ -123,13 +123,13 @@ impl WriteLog {
         }
     }
 
-    fn push(&mut self, entity: &str, json: &str) {
-        let entity = entity.as_bytes();
+    fn push(&mut self, row: &str, json: &str) {
+        let row = row.as_bytes();
         let json = json.as_bytes();
         self.file
-            .write_all(&(entity.len() as u32).to_le_bytes())
-            .expect("write entity length");
-        self.file.write_all(entity).expect("write entity");
+            .write_all(&(row.len() as u32).to_le_bytes())
+            .expect("write row length");
+        self.file.write_all(row).expect("write row");
         self.file
             .write_all(&(json.len() as u32).to_le_bytes())
             .expect("write payload length");
@@ -151,12 +151,12 @@ fn read_write_log(path: &Path) -> Vec<(String, Vec<u8>)> {
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(error) => panic!("read expU write log: {error}"),
         }
-        let mut entity = vec![0_u8; u32::from_le_bytes(length) as usize];
-        file.read_exact(&mut entity).expect("read entity");
+        let mut row = vec![0_u8; u32::from_le_bytes(length) as usize];
+        file.read_exact(&mut row).expect("read row");
         file.read_exact(&mut length).expect("read payload length");
         let mut json = vec![0_u8; u32::from_le_bytes(length) as usize];
         file.read_exact(&mut json).expect("read payload");
-        entries.push((String::from_utf8(entity).expect("utf8 entity"), json));
+        entries.push((String::from_utf8(row).expect("utf8 row"), json));
     }
     entries
 }
@@ -590,17 +590,17 @@ fn percent(part: u64, whole: u64) -> f64 {
 fn oracle(log_path: &Path) {
     let entries = read_write_log(log_path);
 
-    // Per entity, the ordered stream of *distinct* payloads. A repeat write of
+    // Per row, the ordered stream of *distinct* payloads. A repeat write of
     // identical content is already free (content addressing), so it neither
     // costs bytes nor extends a chain.
     let mut order: Vec<String> = Vec::new();
-    let mut by_entity: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    let mut by_row: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
     let mut stored_digests: HashSet<[u8; 32]> = HashSet::new();
     let mut inline_writes = 0_u64;
     let mut out_of_band_writes = 0_u64;
     let mut raw_lengths: Vec<u64> = Vec::new();
 
-    for (entity, json) in &entries {
+    for (row, json) in &entries {
         raw_lengths.push(json.len() as u64);
         if json.len() <= JSON_INLINE_MAX_BYTES {
             inline_writes += 1;
@@ -610,8 +610,8 @@ fn oracle(log_path: &Path) {
         if !stored_digests.insert(*blake3::hash(json).as_bytes()) {
             continue;
         }
-        let versions = by_entity.entry(entity.clone()).or_insert_with(|| {
-            order.push(entity.clone());
+        let versions = by_row.entry(row.clone()).or_insert_with(|| {
+            order.push(row.clone());
             Vec::new()
         });
         versions.push(json.clone());
@@ -619,10 +619,10 @@ fn oracle(log_path: &Path) {
 
     raw_lengths.sort_unstable();
     println!(
-        "PAYLOAD\twrites={}\tinline_writes={inline_writes}\tout_of_band_writes={out_of_band_writes}\tdistinct_out_of_band={}\tentities={}\traw_p10={}\traw_p50={}\traw_p90={}\traw_max={}",
+        "PAYLOAD\twrites={}\tinline_writes={inline_writes}\tout_of_band_writes={out_of_band_writes}\tdistinct_out_of_band={}\trows={}\traw_p10={}\traw_p50={}\traw_p90={}\traw_max={}",
         entries.len(),
         stored_digests.len(),
-        by_entity.len(),
+        by_row.len(),
         percentile_u64(&raw_lengths, 0.10),
         percentile_u64(&raw_lengths, 0.50),
         percentile_u64(&raw_lengths, 0.90),
@@ -643,13 +643,13 @@ fn oracle(log_path: &Path) {
     let mut edit_spans: Vec<u64> = Vec::new();
     let mut chain_lengths: Vec<u64> = Vec::new();
     // Byte savings attributable only to the *successors*, so a corpus with one
-    // version per entity cannot flatter the delta arm.
+    // version per row cannot flatter the delta arm.
     let mut successor_today_bytes = 0_u64;
     let mut successor_delta_bytes = 0_u64;
     let mut successor_anchor_bytes = 0_u64;
 
-    for entity in &order {
-        let versions = &by_entity[entity];
+    for row in &order {
+        let versions = &by_row[row];
         chain_lengths.push(versions.len() as u64);
         for (index, raw) in versions.iter().enumerate() {
             raw_bytes += raw.len() as u64;
@@ -710,7 +710,7 @@ fn oracle(log_path: &Path) {
         percentile(&edit_ratios, 0.99),
     );
     println!(
-        "CHAIN\tentities={}\tlen_p50={}\tlen_p90={}\tlen_max={}",
+        "CHAIN\trows={}\tlen_p50={}\tlen_p90={}\tlen_max={}",
         chain_lengths.len(),
         percentile_u64(&chain_lengths, 0.50),
         percentile_u64(&chain_lengths, 0.90),
@@ -721,7 +721,7 @@ fn oracle(log_path: &Path) {
     // per-payload bases, chains, or a base-liveness rule.
     let samples = order
         .iter()
-        .flat_map(|entity| by_entity[entity].iter())
+        .flat_map(|row| by_row[row].iter())
         .take(env_usize("LIX_EXPU_DICT_SAMPLES", 512))
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
@@ -731,8 +731,8 @@ fn oracle(log_path: &Path) {
     if let Some(dictionary) = dictionary.as_ref() {
         let mut compressor = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, dictionary)
             .expect("dictionary compressor");
-        for entity in &order {
-            for raw in &by_entity[entity] {
+        for row in &order {
+            for raw in &by_row[row] {
                 let frame = compressor.compress(raw).expect("dictionary compress");
                 dictionary_total += (STORED_JSON_HEADER_LEN + frame.len()) as u64;
             }
@@ -780,8 +780,8 @@ fn oracle(log_path: &Path) {
         ),
     );
 
-    encode_cost(&order, &by_entity, &levels);
-    reconstruction_latency(&order, &by_entity);
+    encode_cost(&order, &by_row, &levels);
+    reconstruction_latency(&order, &by_row);
 }
 
 /// Write-path CPU of each encoding arm, per payload.
@@ -789,11 +789,11 @@ fn oracle(log_path: &Path) {
 /// A delta encoder must build a fresh zstd dictionary context per row (the
 /// base differs every time), which is where its write cost comes from; a
 /// higher level pays in the compressor's own search effort instead.
-fn encode_cost(order: &[String], by_entity: &HashMap<String, Vec<Vec<u8>>>, levels: &[i32]) {
+fn encode_cost(order: &[String], by_row: &HashMap<String, Vec<Vec<u8>>>, levels: &[i32]) {
     let samples = order
         .iter()
-        .flat_map(|entity| {
-            let versions = &by_entity[entity];
+        .flat_map(|row| {
+            let versions = &by_row[row];
             versions
                 .iter()
                 .enumerate()
@@ -853,12 +853,12 @@ fn encode_cost(order: &[String], by_entity: &HashMap<String, Vec<Vec<u8>>>, leve
 /// A delta row cannot be decoded without its base, so a depth-`d` payload
 /// costs `d` sequential point reads plus `d` zstd frames. Storage latency is
 /// not modelled here; this isolates the CPU term, which is the floor.
-fn reconstruction_latency(order: &[String], by_entity: &HashMap<String, Vec<Vec<u8>>>) {
-    let Some(entity) = order.iter().find(|entity| by_entity[*entity].len() >= 9) else {
+fn reconstruction_latency(order: &[String], by_row: &HashMap<String, Vec<Vec<u8>>>) {
+    let Some(row) = order.iter().find(|row| by_row[*row].len() >= 9) else {
         println!("RECONSTRUCT\tskipped=no_chain_of_depth_9");
         return;
     };
-    let versions = &by_entity[entity];
+    let versions = &by_row[row];
     let max_depth = versions.len().min(env_usize("LIX_EXPU_MAX_DEPTH", 16));
 
     // Encode the chain the way a delta store would hold it.

@@ -4,9 +4,8 @@ use async_trait::async_trait;
 use lix::plugin::runtime::{
     WasmByteOutputsHandle, WasmChangeCursorHandle, WasmChangePage, WasmComponentActor,
     WasmComponentFactory, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage,
-    WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
-    WasmOpenEntitiesInput, WasmOpenFileInput, WasmRuntime, WasmTransitionHandle,
-    WasmTransitionLimits,
+    WasmFileTransition, WasmFileUpdate, WasmOpenFileInput, WasmOpenRowsInput, WasmRowTransition,
+    WasmRowUpdate, WasmRuntime, WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix::wasm::WasmLimits;
 use lix::{LixError, open_lix};
@@ -40,12 +39,12 @@ impl WasmComponentFactory for EmbeddingFactory {
 fn actor_contract_types_are_public(
     _: WasmTransitionLimits,
     _: WasmOpenFileInput,
-    _: WasmOpenEntitiesInput,
+    _: WasmOpenRowsInput,
     _: WasmFileUpdate,
-    _: WasmEntityUpdate,
+    _: WasmRowUpdate,
     _: WasmDocumentHandle,
     _: WasmFileTransition,
-    _: WasmEntityTransition,
+    _: WasmRowTransition,
     _: WasmTransitionHandle,
     _: WasmChangeCursorHandle,
     _: WasmEditCursorHandle,

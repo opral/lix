@@ -20,18 +20,18 @@ og:image:alt: "Lix v0.7 release cover"
 
 v0.7 stabilizes the file plugin API.
 
-Plugins teach Lix how a file format maps to semantic entities and changes: rows, cells, paragraphs, text ranges, or any schema a format needs.
+Plugins teach Lix how a file format maps to semantic rows and changes: rows, cells, paragraphs, text ranges, or any schema a format needs.
 
-At a high level, a plugin turns file bytes into entities that Lix can version:
+At a high level, a plugin turns file bytes into rows that Lix can version:
 
 ```txt
-file bytes        plugin        lix entities        lix changes
+file bytes        plugin        lix rows        lix changes
 ----------        ------        ------------        -----------
 orders.csv   ->   CSV      ->   rows + cells   ->   price: 12 -> 14
 notes.md     ->   Markdown ->   headings       ->   heading moved
 ```
 
-The plugin defines what entities exist in a file and how to detect changes between two versions of that file. Lix stores the resulting changes, which makes diffing, merging, querying, and rollback work at the level of the file format instead of at the level of raw bytes.
+The plugin defines what rows exist in a file and how to detect changes between two versions of that file. Lix stores the resulting changes, which makes diffing, merging, querying, and rollback work at the level of the file format instead of at the level of raw bytes.
 
 For example, a product catalog changes:
 
@@ -71,7 +71,7 @@ This is the difference between "the file changed" and "row 4812's price column c
 
 ## 1.8x faster engine
 
-Plugins multiply the load on the storage engine. A 10k-row CSV is 10k tracked entities, each with its own history. v0.7 spent twelve PRs rebuilding the physical layout, each one measured against the last:
+Plugins multiply the load on the storage engine. A 10k-row CSV is 10k tracked rows, each with its own history. v0.7 spent twelve PRs rebuilding the physical layout, each one measured against the last:
 
 | Benchmark                              | start of the rebuild | v0.7     |
 | -------------------------------------- | -------------------- | -------- |
@@ -108,6 +108,6 @@ Edit files in the directory with any tool and the changes flow into Lix with ful
 
 ## Also in v0.7
 
-- `INSERT ... ON CONFLICT` upserts for entity state.
-- Stable file plugin API for mapping file formats to semantic entities and changes.
+- `INSERT ... ON CONFLICT` upserts for row state.
+- Stable file plugin API for mapping file formats to semantic rows and changes.
 - e2e benchmarks in the repository, the same ones the table above comes from.

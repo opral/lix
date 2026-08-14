@@ -18,7 +18,7 @@ use crate::changelog::{
     ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest,
 };
 use crate::common::SharedStr;
-use crate::entity_pk::{EntityPk, EntityPkComponent};
+use crate::row_pk::{RowPk, RowPkComponent};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 #[cfg(test)]
 use crate::tracked_state::MaterializedTrackedStateRow;
@@ -229,7 +229,7 @@ impl FirstParentDiffOverlay {
         value: &TrackedStateIndexValue,
     ) -> Result<(), LixError> {
         let start = self.cascade_file_ids.len();
-        append_single_entity_pk_external(&mut self.cascade_file_ids, descriptor_key.entity_pk)?;
+        append_single_row_pk_external(&mut self.cascade_file_ids, descriptor_key.row_pk)?;
         let end = self.cascade_file_ids.len();
         let file_id = &self.cascade_file_ids[start..end];
         let hash = xxh3_64(file_id.as_bytes());
@@ -387,7 +387,7 @@ struct RootlessCascadeIndex {
 
 /// Small-first dictionary used by the bulk encoded historical lookup.
 ///
-/// Most exact batches contain many entity identities for one file. Starting
+/// Most exact batches contain many row identities for one file. Starting
 /// with the row count would size two distinct-id containers for every row.
 /// Once a batch proves it has high file cardinality, both containers promote
 /// once to the known upper bound so the unique-file case still has O(1) large
@@ -559,7 +559,7 @@ impl RootlessReplayOverlay {
         let key_ref = TrackedStateKeyRef {
             schema_key: key.schema_key.as_str(),
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         };
         let file_id_ordinal = self.intern_file_id(key_ref.file_id)?;
         let ordinal = u32::try_from(self.entries.len()).map_err(|_| {
@@ -731,7 +731,7 @@ impl RootlessCascadeIndex {
             return Ok(());
         }
         let start = self.file_id_arena.len();
-        append_single_entity_pk_external(&mut self.file_id_arena, key.entity_pk)?;
+        append_single_row_pk_external(&mut self.file_id_arena, key.row_pk)?;
         let end = self.file_id_arena.len();
         let hash = xxh3_64(&self.file_id_arena.as_bytes()[start..end]);
         let mut ordinal = self
@@ -850,26 +850,26 @@ impl EncodedReplayFileIdDictionary {
     }
 }
 
-fn append_single_entity_pk_external(
+fn append_single_row_pk_external(
     arena: &mut String,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
 ) -> Result<(), LixError> {
-    let [component] = entity_pk.components.as_slice() else {
+    let [component] = row_pk.components.as_slice() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "tracked_state commit_delta file descriptor tombstone has invalid identity: entity primary key is not a single-component tuple",
+            "tracked_state commit_delta file descriptor tombstone has invalid identity: row primary key is not a single-component tuple",
         ));
     };
     match component {
-        EntityPkComponent::Uuid(bytes) => {
+        RowPkComponent::Uuid(bytes) => {
             write!(arena, "{}", uuid::Uuid::from_bytes(*bytes).as_hyphenated())
                 .expect("writing into String cannot fail");
         }
-        EntityPkComponent::Integer(value) => {
+        RowPkComponent::Integer(value) => {
             write!(arena, "{value}").expect("writing into String cannot fail");
         }
-        EntityPkComponent::String(value) => arena.push_str(value),
-        EntityPkComponent::Bytes(value) => {
+        RowPkComponent::String(value) => arena.push_str(value),
+        RowPkComponent::Bytes(value) => {
             base64::engine::general_purpose::STANDARD.encode_string(value, arena);
         }
     }
@@ -880,7 +880,7 @@ fn append_single_entity_pk_external(
 struct TrackedStateIdentity {
     schema_key: String,
     file_id: Option<String>,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
 }
 
 struct TrackedStateRowWinner {
@@ -1147,7 +1147,7 @@ where
             .map(|key| TrackedStateKeyRef {
                 schema_key: key.schema_key.as_str(),
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             })
             .collect::<Vec<_>>();
         self.load_projected_batch_at_commit_refs(commit_id, &key_refs, projection)
@@ -1212,7 +1212,7 @@ where
                 .map(|key| TrackedStateKey {
                     schema_key: key.schema_key.to_owned(),
                     file_id: key.file_id.map(str::to_owned),
-                    entity_pk: key.entity_pk.clone(),
+                    row_pk: key.row_pk.clone(),
                 })
                 .collect::<Vec<_>>();
             self.commit_root_values_for_keys(commit_id, &owned_keys)
@@ -1350,7 +1350,7 @@ where
         keys.extend(rows.iter().map(|row| TrackedStateKey {
             schema_key: row.schema_key().to_owned(),
             file_id: row.file_id().map(str::to_owned),
-            entity_pk: row.entity_pk().clone(),
+            row_pk: row.row_pk().clone(),
         }));
         Ok(keys.into_iter().collect())
     }
@@ -1377,7 +1377,7 @@ where
             .await?;
         rows.iter()
             .map(|row| {
-                row.entity_pk().as_single_string_owned().map_err(|error| {
+                row.row_pk().as_single_string_owned().map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("registered schema dependency identity is invalid: {error}"),
@@ -1521,7 +1521,7 @@ where
                 encoded_keys.push(TrackedStateKeyRef {
                     schema_key: row.schema_key(),
                     file_id: row.file_id(),
-                    entity_pk: row.entity_pk(),
+                    row_pk: row.row_pk(),
                 });
             }
             let loaded = match state.as_ref() {
@@ -1543,7 +1543,7 @@ where
                     fallback_keys.push(TrackedStateKeyRef {
                         schema_key: &key.schema_key,
                         file_id: key.file_id.as_deref(),
-                        entity_pk: &key.entity_pk,
+                        row_pk: &key.row_pk,
                     });
                     fallback_rows.push(index);
                 }
@@ -1608,7 +1608,7 @@ where
         let key = TrackedStateKey {
             schema_key: row.schema_key().to_owned(),
             file_id: row.file_id().map(str::to_owned),
-            entity_pk: row.entity_pk().clone(),
+            row_pk: row.row_pk().clone(),
         };
         let root_metadata = self
             .load_cached_commit_root_metadata(root_commit_id, cache)
@@ -1853,7 +1853,7 @@ where
                     TrackedStateIdentity {
                         schema_key: key.schema_key,
                         file_id: key.file_id,
-                        entity_pk: key.entity_pk,
+                        row_pk: key.row_pk,
                     },
                     value.change_id,
                 )
@@ -2261,13 +2261,13 @@ where
                 }
                 let value = row_map.get(identity)?;
                 Some((
-                    identity.entity_pk.as_single_string_owned(),
+                    identity.row_pk.as_single_string_owned(),
                     *change_id,
                     value.commit_id,
                     TrackedStateKey {
                         schema_key: identity.schema_key.clone(),
                         file_id: identity.file_id.clone(),
-                        entity_pk: identity.entity_pk.clone(),
+                        row_pk: identity.row_pk.clone(),
                     },
                 ))
             })
@@ -2352,7 +2352,7 @@ where
                 .map(|row| TrackedStateKey {
                     schema_key: row.schema_key().to_owned(),
                     file_id: row.file_id().map(str::to_owned),
-                    entity_pk: row.entity_pk().clone(),
+                    row_pk: row.row_pk().clone(),
                 })
                 .collect::<Vec<_>>();
             let mut loaded =
@@ -2428,7 +2428,7 @@ where
                 .map(|row| TrackedStateKey {
                     schema_key: row.schema_key().to_owned(),
                     file_id: row.file_id().map(str::to_owned),
-                    entity_pk: row.entity_pk().clone(),
+                    row_pk: row.row_pk().clone(),
                 })
                 .collect::<Vec<_>>();
             let mut loaded =
@@ -2725,7 +2725,7 @@ where
     ///
     /// Merge always compares its merge base with each head. Walking only that
     /// first-parent interval makes the common branch case proportional to the
-    /// commits and identities changed since the base, rather than every entity
+    /// commits and identities changed since the base, rather than every row
     /// inherited by both commits.
     async fn diff_tree_entries_from_first_parent_interval(
         &mut self,
@@ -3199,7 +3199,7 @@ where
         let mut descriptor_key_builder =
             TrackedStateKeyBatchBuilder::with_row_capacity(file_ids.len());
         for file_id in &file_ids {
-            let entity_pk = EntityPk::uuid_from_canonical(file_id.as_str()).map_err(|error| {
+            let row_pk = RowPk::uuid_from_canonical(file_id.as_str()).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("validated file ID is not a canonical UUID: {error}"),
@@ -3208,7 +3208,7 @@ where
             descriptor_key_builder.push(TrackedStateKeyRef {
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
                 file_id: Some(file_id.as_str()),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
         }
         let descriptor_keys = descriptor_key_builder.finish();
@@ -3290,7 +3290,7 @@ where
             encoded.push(TrackedStateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             });
         }
         let encoded = encoded.finish();
@@ -3438,7 +3438,7 @@ where
                                 TrackedStateKeyRef {
                                     schema_key: &key.schema_key,
                                     file_id: key.file_id.as_deref(),
-                                    entity_pk: &key.entity_pk,
+                                    row_pk: &key.row_pk,
                                 },
                             )
                         });
@@ -3534,7 +3534,7 @@ where
                 encoded_keys.push(TrackedStateKeyRef {
                     schema_key: &key.schema_key,
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 });
                 previous_key = Some(key);
                 unique_key_count += 1;
@@ -3956,7 +3956,7 @@ where
             .map(|delta| TrackedStateKey {
                 schema_key: delta.schema_key.to_string(),
                 file_id: delta.file_id.map(str::to_string),
-                entity_pk: delta.entity_pk.clone(),
+                row_pk: delta.row_pk.clone(),
             })
             .collect::<BTreeSet<_>>();
         let mut cascade_mutations = BTreeMap::<Vec<u8>, Vec<u8>>::new();
@@ -3967,7 +3967,7 @@ where
                 if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !delta.deleted {
                     continue;
                 }
-                let file_id = delta.entity_pk.as_single_string_owned().map_err(|error| {
+                let file_id = delta.row_pk.as_single_string_owned().map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("file descriptor tombstone has invalid identity: {error}"),
@@ -4022,12 +4022,12 @@ where
                     && certified_replacement_markers.contains(&TrackedStateKey {
                         schema_key: delta.schema_key.to_owned(),
                         file_id: delta.file_id.map(str::to_owned),
-                        entity_pk: delta.entity_pk.clone(),
+                        row_pk: delta.row_pk.clone(),
                     })
             }) {
                 let (schema_key, file_id) =
-                    crate::collection_generation::collection_scope_from_entity_pk(
-                        marker.entity_pk,
+                    crate::collection_generation::collection_scope_from_row_pk(
+                        marker.row_pk,
                     )?;
                 let rows = self
                     .tree
@@ -4065,7 +4065,7 @@ where
                 .map(|delta| TrackedStateKey {
                     schema_key: delta.schema_key.to_string(),
                     file_id: delta.file_id.map(str::to_string),
-                    entity_pk: delta.entity_pk.clone(),
+                    row_pk: delta.row_pk.clone(),
                 })
                 .collect::<Vec<_>>();
             // A root fence can reconstruct several skipped ordinary commits
@@ -4104,7 +4104,7 @@ where
                     marker_keys.push(TrackedStateKey {
                         schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_string(),
                         file_id: None,
-                        entity_pk: EntityPk::single(collection_scope_key(CollectionScopeRef {
+                        row_pk: RowPk::single(collection_scope_key(CollectionScopeRef {
                             schema_key: &scope.0,
                             file_id: scope.1.as_deref(),
                         })),
@@ -4153,19 +4153,19 @@ where
             let key = TrackedStateKey {
                 schema_key: delta.schema_key.to_string(),
                 file_id: delta.file_id.map(str::to_string),
-                entity_pk: delta.entity_pk.clone(),
+                row_pk: delta.row_pk.clone(),
             };
             if parent_value.as_ref().is_some_and(|value| !value.deleted())
                 && absence_guards.contains(&key)
             {
-                let entity_pk = key
-                    .entity_pk
+                let row_pk = key
+                    .row_pk
                     .as_json_array_text()
-                    .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+                    .unwrap_or_else(|_| "<invalid row_pk>".to_string());
                 return Err(LixError::new(
                     LixError::CODE_UNIQUE,
                     format!(
-                        "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
+                        "primary-key constraint violation on schema '{}': INSERT would duplicate row_pk '{row_pk}'",
                         key.schema_key
                     ),
                 ));
@@ -4175,7 +4175,7 @@ where
             let key = TrackedStateKeyRef {
                 schema_key: delta.schema_key,
                 file_id: delta.file_id,
-                entity_pk: delta.entity_pk,
+                row_pk: delta.row_pk,
             };
             let value = TrackedStateIndexValueRef {
                 change_id: delta.change_id,
@@ -4454,7 +4454,7 @@ where
             TrackedStateKeyRef {
                 schema_key: delta.schema_key,
                 file_id: delta.file_id,
-                entity_pk: delta.entity_pk,
+                row_pk: delta.row_pk,
             },
             TrackedStateIndexValueRef {
                 change_id: delta.change_id,
@@ -4511,7 +4511,7 @@ fn tree_scan_request_from_tracked(
 ) -> TrackedStateTreeScanRequest {
     TrackedStateTreeScanRequest {
         schema_keys: request.filter.schema_keys.clone(),
-        entity_pks: request.filter.entity_pks.clone(),
+        row_pks: request.filter.row_pks.clone(),
         file_ids: request.filter.file_ids.clone(),
         include_tombstones: request.filter.include_tombstones,
         // User limits belong above delta overlay and tombstone visibility.
@@ -4528,7 +4528,7 @@ fn compare_tracked_state_key_refs(
     left.schema_key
         .cmp(right.schema_key)
         .then_with(|| left.file_id.cmp(&right.file_id))
-        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+        .then_with(|| left.row_pk.cmp(right.row_pk))
 }
 
 fn replacement_scope_covers_key(
@@ -4560,7 +4560,7 @@ fn file_descriptor_key_for_file_scoped_key(
             Ok(TrackedStateKey {
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: Some(file_id.to_string()),
-                entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                row_pk: RowPk::uuid_from_canonical(file_id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("validated file ID is not a canonical UUID: {error}"),
@@ -4579,7 +4579,7 @@ fn file_delete_cascade(
         TrackedStateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         },
         value,
     )
@@ -4604,7 +4604,7 @@ fn file_delete_cascade_ref(
     if key.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !value.deleted {
         return Ok(None);
     }
-    key.entity_pk
+    key.row_pk
         .as_single_string_owned()
         .map(Some)
         .map_err(|error| {
@@ -4635,7 +4635,7 @@ fn cascade_tombstone(
 /// so it deliberately retains the cold full-replay scan path.
 fn request_has_exact_keys(request: &TrackedStateTreeScanRequest) -> bool {
     !request.schema_keys.is_empty()
-        && !request.entity_pks.is_empty()
+        && !request.row_pks.is_empty()
         && !request.file_ids.is_empty()
         && !request
             .file_ids
@@ -4648,14 +4648,14 @@ fn exact_keys_for_request(request: &TrackedStateTreeScanRequest) -> Option<Vec<T
         return None;
     }
     let mut keys = Vec::with_capacity(
-        request.schema_keys.len() * request.entity_pks.len() * request.file_ids.len(),
+        request.schema_keys.len() * request.row_pks.len() * request.file_ids.len(),
     );
     for schema_key in &request.schema_keys {
-        for entity_pk in &request.entity_pks {
+        for row_pk in &request.row_pks {
             for file_id in &request.file_ids {
                 keys.push(TrackedStateKey {
                     schema_key: schema_key.clone(),
-                    entity_pk: entity_pk.clone(),
+                    row_pk: row_pk.clone(),
                     file_id: match file_id {
                         NullableKeyFilter::Null => None,
                         NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
@@ -4709,7 +4709,7 @@ fn validate_tree_diff_row_against_changelog(
     tracked_state_winner_kind_for_diff_parts(
         row.schema_key(),
         row.file_id(),
-        row.entity_pk(),
+        row.row_pk(),
         row.deleted(),
         change_id,
         change,
@@ -4734,7 +4734,7 @@ fn tracked_state_winner_identity_for_diff_row(
     tracked_state_winner_identity_for_diff_parts(
         row.schema_key(),
         row.file_id(),
-        row.entity_pk(),
+        row.row_pk(),
         row.deleted,
         row.change_id,
         change,
@@ -4745,27 +4745,27 @@ fn cascade_payload_key(file_id: &str) -> TrackedStateKey {
     TrackedStateKey {
         schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
         file_id: Some(file_id.to_string()),
-        entity_pk: EntityPk::uuid_from_canonical(file_id)
-            .unwrap_or_else(|_| EntityPk::single(file_id)),
+        row_pk: RowPk::uuid_from_canonical(file_id)
+            .unwrap_or_else(|_| RowPk::single(file_id)),
     }
 }
 
 fn tracked_state_winner_identity_for_diff_parts(
     schema_key: &str,
     file_id: Option<&str>,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     deleted: bool,
     change_id: ChangeId,
     change: &ChangeRecord,
 ) -> Result<TrackedStateRowWinner, LixError> {
     match tracked_state_winner_kind_for_diff_parts(
-        schema_key, file_id, entity_pk, deleted, change_id, change,
+        schema_key, file_id, row_pk, deleted, change_id, change,
     )? {
         TrackedStateRowWinnerKind::Direct => Ok(TrackedStateRowWinner {
             identity: TrackedStateIdentity {
                 schema_key: schema_key.to_owned(),
                 file_id: file_id.map(str::to_owned),
-                entity_pk: entity_pk.clone(),
+                row_pk: row_pk.clone(),
             },
             file_delete_cascade: false,
         }),
@@ -4773,7 +4773,7 @@ fn tracked_state_winner_identity_for_diff_parts(
             identity: TrackedStateIdentity {
                 schema_key: change.schema_key.clone(),
                 file_id: change.file_id.clone(),
-                entity_pk: change.entity_pk.clone(),
+                row_pk: change.row_pk.clone(),
             },
             file_delete_cascade: true,
         }),
@@ -4783,19 +4783,19 @@ fn tracked_state_winner_identity_for_diff_parts(
 fn tracked_state_winner_kind_for_diff_parts(
     schema_key: &str,
     file_id: Option<&str>,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     deleted: bool,
     change_id: ChangeId,
     change: &ChangeRecord,
 ) -> Result<TrackedStateRowWinnerKind, LixError> {
     if change.schema_key == schema_key
         && change.file_id.as_deref() == file_id
-        && change.entity_pk == *entity_pk
+        && change.row_pk == *row_pk
     {
         return Ok(TrackedStateRowWinnerKind::Direct);
     }
     if change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && change.snapshot.is_none() && deleted {
-        let cascade_file_id = change.entity_pk.as_single_string_owned().map_err(|error| {
+        let cascade_file_id = change.row_pk.as_single_string_owned().map_err(|error| {
             LixError::unknown(format!(
                 "tracked-state cascade change '{}' has invalid file descriptor identity: {error}",
                 change_id
@@ -4815,7 +4815,7 @@ fn tracked_state_identity_from_key(key: &TrackedStateKey) -> TrackedStateIdentit
     TrackedStateIdentity {
         schema_key: key.schema_key.clone(),
         file_id: key.file_id.clone(),
-        entity_pk: key.entity_pk.clone(),
+        row_pk: key.row_pk.clone(),
     }
 }
 
@@ -4826,7 +4826,7 @@ fn tracked_state_identity_matches_tree_request(
     if !request.schema_keys.is_empty() && !request.schema_keys.contains(&identity.schema_key) {
         return false;
     }
-    if !request.entity_pks.is_empty() && !request.entity_pks.contains(&identity.entity_pk) {
+    if !request.row_pks.is_empty() && !request.row_pks.contains(&identity.row_pk) {
         return false;
     }
     nullable_key_filter_allows(&request.file_ids, identity.file_id.as_deref())
@@ -4851,17 +4851,17 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::branch::BranchHeadControl;
     use crate::changelog::CommitRecord;
-    use crate::hot_state::CertifiedEntityBatchFileRef;
+    use crate::hot_state::CertifiedRowBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
-    use crate::plugin::runtime::{WasmCertifiedEntityBatch, WasmCreateContext};
+    use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmCreateContext};
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
         let request = TrackedStateTreeScanRequest {
             schema_keys: vec!["alpha".to_string()],
             file_ids: vec![NullableKeyFilter::Null],
-            entity_pks: vec![EntityPk::single("optional-residual")],
+            row_pks: vec![RowPk::single("optional-residual")],
             ..TrackedStateTreeScanRequest::default()
         };
         assert_eq!(
@@ -5050,7 +5050,7 @@ mod tests {
             &tracked_state,
             "commit-child",
             Some("missing-parent"),
-            &[row("entity-child", "change-child", "commit-child")],
+            &[row("row-child", "change-child", "commit-child")],
         )
         .await
         .expect_err("root staging should require a parent commit root");
@@ -5067,7 +5067,7 @@ mod tests {
                 .expect("parent read should open");
             let mut writes = storage.new_write_set();
             let mut writer = tracked_state.writer(&read, &mut writes);
-            let parent_row = row("entity-parent", "change-parent", "retained-parent");
+            let parent_row = row("row-parent", "change-parent", "retained-parent");
             writer
                 .stage_commit_root(
                     "retained-parent",
@@ -5112,7 +5112,7 @@ mod tests {
             &tracked_state,
             "parent",
             None,
-            &[row("entity-a", "change-parent", "parent")],
+            &[row("row-a", "change-parent", "parent")],
         )
         .await
         .expect("parent root should write");
@@ -5122,8 +5122,8 @@ mod tests {
             "child",
             Some("parent"),
             &[
-                row("entity-a", "change-child-a", "child"),
-                row("entity-b", "change-child-b", "child"),
+                row("row-a", "change-child-a", "child"),
+                row("row-b", "change-child-b", "child"),
             ],
         )
         .await
@@ -5183,7 +5183,7 @@ mod tests {
             file_id: Some("replacement.csv"),
         });
         let marker = MaterializedTrackedStateRow {
-            entity_pk: EntityPk::single(scope_key),
+            row_pk: RowPk::single(scope_key),
             schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
             file_id: None,
             snapshot_content: Some(r#"{"live_count":1}"#.into()),
@@ -5199,7 +5199,7 @@ mod tests {
         let marker_key = TrackedStateKey {
             schema_key: marker.schema_key.clone(),
             file_id: marker.file_id.clone(),
-            entity_pk: marker.entity_pk.clone(),
+            row_pk: marker.row_pk.clone(),
         };
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -5244,7 +5244,7 @@ mod tests {
             .expect("replacement child should scan")
             .into_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, EntityPk::single("b"));
+        assert_eq!(rows[0].row_pk, RowPk::single("b"));
     }
 
     #[tokio::test]
@@ -5274,7 +5274,7 @@ mod tests {
             file_id: Some("ordinary.csv"),
         });
         let marker = MaterializedTrackedStateRow {
-            entity_pk: EntityPk::single(scope_key),
+            row_pk: RowPk::single(scope_key),
             schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
             file_id: None,
             snapshot_content: Some(r#"{"live_count":1}"#.into()),
@@ -5327,7 +5327,7 @@ mod tests {
         let rows = (0..ROW_COUNT)
             .map(|index| {
                 row(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("change-arena-{index:05}"),
                     "ordered-arena",
                 )
@@ -5365,11 +5365,11 @@ mod tests {
         const FILE_ID: &str = "01920000-0000-7000-8000-000000000623";
         let mut key_builder = TrackedStateKeyBatchBuilder::with_row_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
-            let entity_pk = EntityPk::single(format!("entity-{index:05}"));
+            let row_pk = RowPk::single(format!("row-{index:05}"));
             key_builder.push(TrackedStateKeyRef {
                 schema_key: "test_schema",
                 file_id: Some(FILE_ID),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
         }
         let interval_keys = key_builder.finish_batch();
@@ -5395,7 +5395,7 @@ mod tests {
                 .expect("flat overlay row should insert");
         }
         let descriptor_pk =
-            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
+            RowPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         let mut cascade = value.clone();
         cascade.deleted = true;
         overlay
@@ -5403,7 +5403,7 @@ mod tests {
                 TrackedStateKeyRef {
                     schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
                     file_id: Some(FILE_ID),
-                    entity_pk: &descriptor_pk,
+                    row_pk: &descriptor_pk,
                 },
                 &cascade,
             )
@@ -5444,11 +5444,11 @@ mod tests {
         const FILE_ID: &str = "01920000-0000-7000-8000-000000000629";
         let mut keys = TrackedStateKeyBatchBuilder::with_row_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
-            let entity_pk = EntityPk::single(format!("entity-{index:05}"));
+            let row_pk = RowPk::single(format!("row-{index:05}"));
             keys.push(TrackedStateKeyRef {
                 schema_key: "test_schema",
                 file_id: Some(FILE_ID),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
         }
         let keys = keys.finish_batch();
@@ -5464,14 +5464,14 @@ mod tests {
         let mut overlay =
             RootlessReplayOverlay::with_capacities(ROW_COUNT, keys.encoded_bytes_len());
         for ordinal in (0..ROW_COUNT).rev() {
-            let entity_pk = EntityPk::single(format!("entity-{ordinal:05}"));
+            let row_pk = RowPk::single(format!("row-{ordinal:05}"));
             overlay
                 .upsert(
                     keys.get(ordinal).expect("encoded replay key"),
                     TrackedStateKeyRef {
                         schema_key: "test_schema",
                         file_id: Some(FILE_ID),
-                        entity_pk: &entity_pk,
+                        row_pk: &row_pk,
                     },
                     value.clone(),
                 )
@@ -5479,14 +5479,14 @@ mod tests {
         }
 
         let key_bytes_before_duplicate = overlay.key_arena.len();
-        let duplicate_pk = EntityPk::single("entity-05000");
+        let duplicate_pk = RowPk::single("row-05000");
         overlay
             .upsert(
                 keys.get(5_000).expect("duplicate encoded replay key"),
                 TrackedStateKeyRef {
                     schema_key: "test_schema",
                     file_id: Some(FILE_ID),
-                    entity_pk: &duplicate_pk,
+                    row_pk: &duplicate_pk,
                 },
                 value.clone(),
             )
@@ -5519,7 +5519,7 @@ mod tests {
         );
 
         let descriptor_pk =
-            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
+            RowPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         let mut cascade = value.clone();
         cascade.deleted = true;
         let mut cascades = RootlessCascadeIndex::with_capacity(ROW_COUNT);
@@ -5528,7 +5528,7 @@ mod tests {
                 TrackedStateKeyRef {
                     schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
                     file_id: Some(FILE_ID),
-                    entity_pk: &descriptor_pk,
+                    row_pk: &descriptor_pk,
                 },
                 &cascade,
             )
@@ -5559,7 +5559,7 @@ mod tests {
                 TrackedStateKeyRef {
                     schema_key: "test_schema",
                     file_id: Some(FILE_ID),
-                    entity_pk: &duplicate_pk,
+                    row_pk: &duplicate_pk,
                 },
                 value,
             )
@@ -5613,13 +5613,13 @@ mod tests {
                 index as u32
             );
             let descriptor_pk =
-                EntityPk::uuid_from_canonical(&file_id).expect("fixture file ID is canonical");
+                RowPk::uuid_from_canonical(&file_id).expect("fixture file ID is canonical");
             cascades
                 .insert_descriptor(
                     TrackedStateKeyRef {
                         schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
                         file_id: Some(&file_id),
-                        entity_pk: &descriptor_pk,
+                        row_pk: &descriptor_pk,
                     },
                     &cascade_value,
                 )
@@ -5658,12 +5658,12 @@ mod tests {
     fn ordered_root_batch_rejects_duplicate_encoded_keys() {
         let rows = [
             row(
-                "entity-duplicate",
+                "row-duplicate",
                 "change-duplicate-a",
                 "ordered-duplicate",
             ),
             row(
-                "entity-duplicate",
+                "row-duplicate",
                 "change-duplicate-b",
                 "ordered-duplicate",
             ),
@@ -5690,7 +5690,7 @@ mod tests {
         let rows = (0..ROW_COUNT)
             .map(|index| {
                 row(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("change-parentless-{index:05}"),
                     "ordered-parentless",
                 )
@@ -5750,7 +5750,7 @@ mod tests {
         let parent_rows = (0..PARENT_ROW_COUNT)
             .map(|index| {
                 row(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("change-parent-{index:05}"),
                     "dense-parent",
                 )
@@ -5759,20 +5759,20 @@ mod tests {
         let mut child_rows = (0..UPDATED_ROW_COUNT)
             .map(|index| {
                 row(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("change-child-{index:05}"),
                     "dense-child",
                 )
             })
             .chain((0..NEW_ROW_COUNT).map(|index| {
                 row(
-                    &format!("entity-{index:05}-new"),
+                    &format!("row-{index:05}-new"),
                     &format!("change-child-new-{index:05}"),
                     "dense-child",
                 )
             }))
             .collect::<Vec<_>>();
-        child_rows.sort_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
+        child_rows.sort_by(|left, right| left.row_pk.cmp(&right.row_pk));
         for row in &mut child_rows {
             row.created_at = "2026-02-01T00:00:00Z".to_string();
             row.updated_at = "2026-03-01T00:00:00Z".to_string();
@@ -5896,7 +5896,7 @@ mod tests {
                 &TrackedStateKey {
                     schema_key: "test_schema".to_string(),
                     file_id: None,
-                    entity_pk: EntityPk::single("entity-00000"),
+                    row_pk: RowPk::single("row-00000"),
                 },
             )
             .await
@@ -5919,12 +5919,12 @@ mod tests {
         let parent_commit_id = CommitId::for_test_label("dense-guard-parent").to_string();
         let child_commit_id = CommitId::for_test_label("dense-guard-child").to_string();
         let parent_rows = [
-            row("entity-a", "change-parent-a", "dense-guard-parent"),
-            row("entity-b", "change-parent-b", "dense-guard-parent"),
+            row("row-a", "change-parent-a", "dense-guard-parent"),
+            row("row-b", "change-parent-b", "dense-guard-parent"),
         ];
         let child_rows = [
-            row("entity-a", "change-child-a", "dense-guard-child"),
-            row("entity-b", "change-child-b", "dense-guard-child"),
+            row("row-a", "change-child-a", "dense-guard-child"),
+            row("row-b", "change-child-b", "dense-guard-child"),
         ];
         let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
@@ -5968,12 +5968,12 @@ mod tests {
         let parent_commit_id = CommitId::for_test_label("dense-tombstone-parent").to_string();
         let child_commit_id = CommitId::for_test_label("dense-tombstone-child").to_string();
         let parent_rows = [
-            tombstone("entity-a", "change-parent-a", "dense-tombstone-parent"),
-            row("entity-b", "change-parent-b", "dense-tombstone-parent"),
+            tombstone("row-a", "change-parent-a", "dense-tombstone-parent"),
+            row("row-b", "change-parent-b", "dense-tombstone-parent"),
         ];
         let child_rows = [
-            row("entity-a", "change-child-a", "dense-tombstone-child"),
-            row("entity-b", "change-child-b", "dense-tombstone-child"),
+            row("row-a", "change-child-a", "dense-tombstone-child"),
+            row("row-b", "change-child-b", "dense-tombstone-child"),
         ];
         let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
@@ -6024,7 +6024,7 @@ mod tests {
         let parent_rows = (0..PARENT_ROWS)
             .map(|index| {
                 row(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("change-parent-{index:05}"),
                     "dense-append-parent",
                 )
@@ -6033,7 +6033,7 @@ mod tests {
         let child_rows = (0..APPENDED_ROWS)
             .map(|index| {
                 row(
-                    &format!("entity-1{index:04}"),
+                    &format!("row-1{index:04}"),
                     &format!("change-child-{index:05}"),
                     "dense-append-child",
                 )
@@ -6102,7 +6102,7 @@ mod tests {
                     &TrackedStateKey {
                         schema_key: last_child.schema_key.clone(),
                         file_id: last_child.file_id.clone(),
-                        entity_pk: last_child.entity_pk.clone(),
+                        row_pk: last_child.row_pk.clone(),
                     },
                 )
                 .await
@@ -6124,7 +6124,7 @@ mod tests {
         let parent_rows = (0..PARENT_ROWS)
             .map(|index| {
                 row(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("change-parent-{index:05}"),
                     "dominant-append-parent",
                 )
@@ -6133,7 +6133,7 @@ mod tests {
         let child_rows = (0..APPENDED_ROWS)
             .map(|index| {
                 row(
-                    &format!("entity-1{index:05}"),
+                    &format!("row-1{index:05}"),
                     &format!("change-child-{index:05}"),
                     "dominant-append-child",
                 )
@@ -6225,7 +6225,7 @@ mod tests {
                         &TrackedStateKey {
                             schema_key: expected.schema_key.clone(),
                             file_id: expected.file_id.clone(),
-                            entity_pk: expected.entity_pk.clone(),
+                            row_pk: expected.row_pk.clone(),
                         },
                     )
                     .await
@@ -6249,7 +6249,7 @@ mod tests {
         let parent_rows = (0..PARENT_ROWS)
             .map(|index| {
                 row(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("change-parent-{index:05}"),
                     "substantial-append-parent",
                 )
@@ -6258,7 +6258,7 @@ mod tests {
         let child_rows = (0..APPENDED_ROWS)
             .map(|index| {
                 row(
-                    &format!("entity-1{index:05}"),
+                    &format!("row-1{index:05}"),
                     &format!("change-child-{index:05}"),
                     "substantial-append-child",
                 )
@@ -6331,7 +6331,7 @@ mod tests {
         let parent_rows = (0..8)
             .map(|index| {
                 let mut row = row(
-                    &format!("entity-{index:02}"),
+                    &format!("row-{index:02}"),
                     &format!("change-cascade-parent-{index:02}"),
                     "cascade-append-parent",
                 );
@@ -6344,7 +6344,7 @@ mod tests {
             tombstone(FILE_ID, "change-cascade-descriptor", "cascade-append-child");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         descriptor.file_id = Some(FILE_ID.to_string());
-        let mut tail = row("entity-tail", "change-cascade-tail", "cascade-append-child");
+        let mut tail = row("row-tail", "change-cascade-tail", "cascade-append-child");
         tail.schema_key = "z_schema".to_string();
         let child_rows = [descriptor, tail];
         let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
@@ -6412,7 +6412,7 @@ mod tests {
                 &TrackedStateKey {
                     schema_key: parent_rows[0].schema_key.clone(),
                     file_id: parent_rows[0].file_id.clone(),
-                    entity_pk: parent_rows[0].entity_pk.clone(),
+                    row_pk: parent_rows[0].row_pk.clone(),
                 },
             )
             .await
@@ -6431,7 +6431,7 @@ mod tests {
             &tracked_state,
             "commit-a",
             None,
-            &[row("entity-a", "change-a", "commit-a")],
+            &[row("row-a", "change-a", "commit-a")],
         )
         .await
         .expect("committed root should write");
@@ -6495,7 +6495,7 @@ mod tests {
             &tracked_state,
             "parent",
             None,
-            &[row("entity-a", "change-parent", "parent")],
+            &[row("row-a", "change-parent", "parent")],
         )
         .await
         .expect("parent root should write");
@@ -6561,10 +6561,10 @@ mod tests {
     #[tokio::test]
     async fn plan_merge_from_roots_applies_source_only_change() {
         let (storage, tracked_state) = seed_merge_roots(
-            &[row_with_value("entity-a", "change-base", "base", "base")],
-            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 "change-source",
                 "source",
                 "source",
@@ -6588,16 +6588,16 @@ mod tests {
             .await
             .expect("merge should plan");
 
-        assert_eq!(merge_pick_ids(&plan), vec!["entity-a"]);
+        assert_eq!(merge_pick_ids(&plan), vec!["row-a"]);
         assert!(plan.conflicts.is_empty());
     }
 
     #[tokio::test]
     async fn plan_merge_from_roots_keeps_target_only_change() {
         let (storage, tracked_state) = seed_merge_roots(
-            &[row("entity-a", "change-base", "base")],
-            &[row("entity-a", "change-target", "target")],
-            &[row("entity-a", "change-base", "base")],
+            &[row("row-a", "change-base", "base")],
+            &[row("row-a", "change-target", "target")],
+            &[row("row-a", "change-base", "base")],
         )
         .await;
 
@@ -6624,15 +6624,15 @@ mod tests {
     #[tokio::test]
     async fn plan_merge_from_roots_reports_divergent_modification_conflict() {
         let (storage, tracked_state) = seed_merge_roots(
-            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 "change-target",
                 "target",
                 "target",
             )],
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 "change-source",
                 "source",
                 "source",
@@ -6657,15 +6657,15 @@ mod tests {
             .expect("merge should plan");
 
         assert!(plan.picks.is_empty());
-        assert_eq!(merge_conflict_ids(&plan), vec!["entity-a"]);
+        assert_eq!(merge_conflict_ids(&plan), vec!["row-a"]);
     }
 
     #[tokio::test]
     async fn plan_merge_from_roots_applies_source_tombstone() {
         let (storage, tracked_state) = seed_merge_roots(
-            &[row("entity-a", "change-base", "base")],
-            &[row("entity-a", "change-base", "base")],
-            &[tombstone("entity-a", "change-source-delete", "source")],
+            &[row("row-a", "change-base", "base")],
+            &[row("row-a", "change-base", "base")],
+            &[tombstone("row-a", "change-source-delete", "source")],
         )
         .await;
 
@@ -6685,7 +6685,7 @@ mod tests {
             .await
             .expect("merge should plan");
 
-        assert_eq!(merge_pick_ids(&plan), vec!["entity-a"]);
+        assert_eq!(merge_pick_ids(&plan), vec!["row-a"]);
         assert!(plan.picks[0].source_row().deleted);
         assert_eq!(
             plan.picks[0].source_change_id(),
@@ -6702,7 +6702,7 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
         )
         .await
         .expect("base root should write");
@@ -6711,7 +6711,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("base"),
-            &[row_with_value("entity-a", "change-child", "child", "child")],
+            &[row_with_value("row-a", "change-child", "child", "child")],
         )
         .await
         .expect("child root should write");
@@ -6749,7 +6749,7 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
         )
         .await
         .expect("base root should write");
@@ -6759,7 +6759,7 @@ mod tests {
             "middle",
             Some("base"),
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 "change-middle",
                 "middle",
                 "middle",
@@ -6772,7 +6772,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("middle"),
-            &[row_with_value("entity-a", "change-child", "child", "child")],
+            &[row_with_value("row-a", "change-child", "child", "child")],
         )
         .await
         .expect("child root should write");
@@ -6824,7 +6824,7 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
         )
         .await
         .expect("base root should write");
@@ -6834,7 +6834,7 @@ mod tests {
             "middle",
             Some("base"),
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 "change-middle",
                 "middle",
                 "middle",
@@ -6847,7 +6847,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("middle"),
-            &[row_with_value("entity-a", "change-child", "child", "child")],
+            &[row_with_value("row-a", "change-child", "child", "child")],
         )
         .await
         .expect("child root should write");
@@ -6892,7 +6892,7 @@ mod tests {
             "commit-a",
             None,
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 "commit-a:change",
                 "commit-a",
                 "a",
@@ -6906,7 +6906,7 @@ mod tests {
             "commit-b",
             Some("commit-a"),
             &[row_with_value(
-                "entity-b",
+                "row-b",
                 "commit-b:change",
                 "commit-b",
                 "b",
@@ -7006,7 +7006,7 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
         )
         .await
         .expect("base root should write");
@@ -7015,7 +7015,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("base"),
-            &[row_with_value("entity-a", "change-child", "child", "child")],
+            &[row_with_value("row-a", "change-child", "child", "child")],
         )
         .await
         .expect("child root should write");
@@ -7077,7 +7077,7 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("row-a", "change-base", "base", "base")],
         )
         .await
         .expect("base root should write");
@@ -7086,7 +7086,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("base"),
-            &[row_with_value("entity-a", "change-child", "child", "child")],
+            &[row_with_value("row-a", "change-child", "child", "child")],
         )
         .await
         .expect("child root should write");
@@ -7132,8 +7132,8 @@ mod tests {
     async fn explicit_rebuild_rejects_stale_immutable_root_missing_inherited_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let inherited = row_with_value("entity-a", "change-base", "base", "base");
-        let child = row_with_value("entity-b", "change-child", "child", "child");
+        let inherited = row_with_value("row-a", "change-base", "base", "base");
+        let child = row_with_value("row-b", "change-child", "child", "child");
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -7175,9 +7175,9 @@ mod tests {
     async fn scan_rows_filters_by_file() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut file_a = row("entity-a", "change-a", "commit-1");
+        let mut file_a = row("row-a", "change-a", "commit-1");
         file_a.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
-        let mut file_b = row("entity-b", "change-b", "commit-1");
+        let mut file_b = row("row-b", "change-b", "commit-1");
         file_b.file_id = Some("01920000-0000-7000-8000-0000000000b2.json".to_string());
         write_root_for_test(
             &storage,
@@ -7215,10 +7215,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
-                .expect("entity pk"),
-            "entity-a"
+                .expect("row pk"),
+            "row-a"
         );
         assert_eq!(
             rows[0].file_id.as_deref(),
@@ -7230,7 +7230,7 @@ mod tests {
     async fn file_filtered_header_scan_fetches_primary_payload_only_when_requested() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut row = row("entity-a", "change-a", "commit-1");
+        let mut row = row("row-a", "change-a", "commit-1");
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         let expected_snapshot = row.snapshot_content.clone();
         write_root_for_test(
@@ -7260,7 +7260,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_pk".to_string()],
+                        columns: vec!["row_pk".to_string()],
                     },
                     ..Default::default()
                 },
@@ -7293,7 +7293,7 @@ mod tests {
     async fn null_file_rows_match_null_file_filter() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let row = row("entity-a", "change-a", "commit-1");
+        let row = row("row-a", "change-a", "commit-1");
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -7329,10 +7329,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
-                .expect("entity pk"),
-            "entity-a"
+                .expect("row pk"),
+            "row-a"
         );
     }
 
@@ -7340,8 +7340,8 @@ mod tests {
     async fn mixed_null_and_concrete_file_scan_uses_primary_tree() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let null_row = row("entity-null", "change-null", "commit-1");
-        let mut file_row = row("entity-file", "change-file", "commit-2");
+        let null_row = row("row-null", "change-null", "commit-1");
+        let mut file_row = row("row-file", "change-file", "commit-2");
         file_row.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         write_root_for_test(
             &storage,
@@ -7389,21 +7389,21 @@ mod tests {
             .expect("mixed scan should use primary tree")
             .into_rows();
 
-        let mut entity_pks = rows
+        let mut row_pks = rows
             .iter()
-            .map(|row| row.entity_pk.as_single_string_owned().expect("entity pk"))
+            .map(|row| row.row_pk.as_single_string_owned().expect("row pk"))
             .collect::<Vec<_>>();
-        entity_pks.sort();
-        assert_eq!(entity_pks, vec!["entity-file", "entity-null"]);
+        row_pks.sort();
+        assert_eq!(row_pks, vec!["row-file", "row-null"]);
     }
 
     #[tokio::test]
     async fn file_filtered_header_scan_filters_tombstones_without_payload_sentinel() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut live = row("entity-live", "change-live", "commit-1");
+        let mut live = row("row-live", "change-live", "commit-1");
         live.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
-        let mut deleted = tombstone("entity-deleted", "change-delete", "commit-1");
+        let mut deleted = tombstone("row-deleted", "change-delete", "commit-1");
         deleted.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         write_root_for_test(&storage, &tracked_state, "commit-1", None, &[live, deleted])
             .await
@@ -7426,7 +7426,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_pk".to_string()],
+                        columns: vec!["row_pk".to_string()],
                     },
                     ..Default::default()
                 },
@@ -7438,10 +7438,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
-                .expect("entity pk"),
-            "entity-live"
+                .expect("row pk"),
+            "row-live"
         );
     }
 
@@ -7449,8 +7449,8 @@ mod tests {
     async fn child_root_tombstone_hides_materialized_base_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let base = row("entity-a", "change-base", "base");
-        let delete = tombstone("entity-a", "change-delete", "child");
+        let base = row("row-a", "change-base", "base");
+        let delete = tombstone("row-a", "change-delete", "child");
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -7509,10 +7509,10 @@ mod tests {
             "commit-1",
             None,
             &[
-                row_with_value("entity-a", "change-a1", "commit-1", "first"),
-                row_with_value("entity-b", "change-b", "commit-1", "middle"),
-                row_with_value("entity-a", "change-a2", "commit-1", "second"),
-                tombstone("entity-c", "change-c1", "commit-1"),
+                row_with_value("row-a", "change-a1", "commit-1", "first"),
+                row_with_value("row-b", "change-b", "commit-1", "middle"),
+                row_with_value("row-a", "change-a2", "commit-1", "second"),
+                tombstone("row-c", "change-c1", "commit-1"),
             ],
         )
         .await
@@ -7534,17 +7534,17 @@ mod tests {
         assert_eq!(
             rows.iter()
                 .map(|row| (
-                    row.entity_pk.as_single_string_owned().expect("entity pk"),
+                    row.row_pk.as_single_string_owned().expect("row pk"),
                     row.snapshot_content.as_ref().map(ToString::to_string)
                 ))
                 .collect::<Vec<_>>(),
             vec![
                 (
-                    "entity-a".to_string(),
+                    "row-a".to_string(),
                     Some("{\"value\":\"second\"}".to_string())
                 ),
                 (
-                    "entity-b".to_string(),
+                    "row-b".to_string(),
                     Some("{\"value\":\"middle\"}".to_string())
                 ),
             ]
@@ -7561,8 +7561,8 @@ mod tests {
             "commit-1",
             None,
             &[
-                tombstone("entity-a", "change-delete", "commit-1"),
-                row("entity-b", "change-live", "commit-1"),
+                tombstone("row-a", "change-delete", "commit-1"),
+                row("row-b", "change-live", "commit-1"),
             ],
         )
         .await
@@ -7593,10 +7593,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
-                .expect("entity pk"),
-            "entity-b"
+                .expect("row pk"),
+            "row-b"
         );
     }
 
@@ -7604,9 +7604,9 @@ mod tests {
     async fn file_filtered_scan_limit_applies_after_tombstone_visibility() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut deleted = tombstone("entity-a", "change-delete", "commit-1");
+        let mut deleted = tombstone("row-a", "change-delete", "commit-1");
         deleted.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
-        let mut live = row("entity-b", "change-live", "commit-1");
+        let mut live = row("row-b", "change-live", "commit-1");
         live.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         write_root_for_test(&storage, &tracked_state, "commit-1", None, &[deleted, live])
             .await
@@ -7629,7 +7629,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_pk".to_string()],
+                        columns: vec!["row_pk".to_string()],
                     },
                     limit: Some(1),
                 },
@@ -7641,10 +7641,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
-                .expect("entity pk"),
-            "entity-b"
+                .expect("row pk"),
+            "row-b"
         );
     }
 
@@ -7653,7 +7653,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(1536);
-        let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
+        let row = row_with_value("row-a", "change-a", "commit-1", &large_value);
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -7675,7 +7675,7 @@ mod tests {
                 "commit-1",
                 &[TrackedStateKey {
                     schema_key: row.schema_key.clone(),
-                    entity_pk: row.entity_pk.clone(),
+                    row_pk: row.row_pk.clone(),
                     file_id: None,
                 }],
             )
@@ -7699,7 +7699,7 @@ mod tests {
     async fn missing_packed_authority_for_live_row_errors_clearly() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let row = row("entity-a", "change-a", "commit-1");
+        let row = row("row-a", "change-a", "commit-1");
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -7762,13 +7762,13 @@ mod tests {
         let over_len = at_len + 1;
         let rows = [
             row_with_value(
-                "entity-at",
+                "row-at",
                 "change-at",
                 "commit-1",
                 &"a".repeat(at_len - 12),
             ),
             row_with_value(
-                "entity-over",
+                "row-over",
                 "change-over",
                 "commit-1",
                 &"b".repeat(over_len - 12),
@@ -7817,14 +7817,14 @@ mod tests {
         let by_pk = |pk: &str| {
             scanned
                 .iter()
-                .find(|row| row.entity_pk.as_single_string().ok() == Some(pk))
+                .find(|row| row.row_pk.as_single_string().ok() == Some(pk))
                 .expect("row should exist")
                 .snapshot_content
                 .clone()
         };
-        assert_eq!(by_pk("entity-at").as_deref(), Some(at_threshold.as_str()));
+        assert_eq!(by_pk("row-at").as_deref(), Some(at_threshold.as_str()));
         assert_eq!(
-            by_pk("entity-over").as_deref(),
+            by_pk("row-over").as_deref(),
             Some(over_threshold.as_str())
         );
     }
@@ -7833,7 +7833,7 @@ mod tests {
     async fn commit_root_cache_uses_seen_updated_at_not_change_created_at() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut row = row("entity-a", "change-a", "commit-1");
+        let mut row = row("row-a", "change-a", "commit-1");
         row.created_at = "2026-01-01T00:00:00Z".to_string();
         row.updated_at = "2026-01-02T00:00:00Z".to_string();
         write_root_for_test(
@@ -7857,7 +7857,7 @@ mod tests {
                 "commit-1",
                 &[TrackedStateKey {
                     schema_key: row.schema_key.clone(),
-                    entity_pk: row.entity_pk.clone(),
+                    row_pk: row.row_pk.clone(),
                     file_id: None,
                 }],
             )
@@ -7876,7 +7876,7 @@ mod tests {
     async fn updates_preserve_first_visible_created_at_across_rebuild() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut parent = row("entity-a", "change-parent", "parent");
+        let mut parent = row("row-a", "change-parent", "parent");
         parent.created_at = "2026-01-01T00:00:00Z".to_string();
         parent.updated_at = "2026-01-01T00:00:00Z".to_string();
         write_root_for_test(
@@ -7889,7 +7889,7 @@ mod tests {
         .await
         .expect("parent root should write");
 
-        let mut child = row("entity-a", "change-child", "child");
+        let mut child = row("row-a", "change-child", "child");
         child.created_at = "2026-01-02T00:00:00Z".to_string();
         child.updated_at = "2026-01-03T00:00:00Z".to_string();
         write_root_for_test(
@@ -7905,7 +7905,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: child.schema_key.clone(),
             file_id: child.file_id.clone(),
-            entity_pk: child.entity_pk.clone(),
+            row_pk: child.row_pk.clone(),
         };
         let loaded = tracked_state
             .reader(
@@ -7965,7 +7965,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(1536);
-        let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
+        let row = row_with_value("row-a", "change-a", "commit-1", &large_value);
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -7991,7 +7991,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_pk".to_string()],
+                        columns: vec!["row_pk".to_string()],
                     },
                     ..Default::default()
                 },
@@ -8041,7 +8041,7 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity()
-                    .entity_pk()
+                    .row_pk()
                     .as_single_string_owned()
                     .expect("identity")
             })
@@ -8054,7 +8054,7 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity
-                    .entity_pk()
+                    .row_pk()
                     .as_single_string_owned()
                     .expect("identity")
             })
@@ -8123,7 +8123,7 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-a", "base-a", "base", "base")],
+            &[row_with_value("row-a", "base-a", "base", "base")],
         )
         .await
         .expect("base root should write");
@@ -8132,7 +8132,7 @@ mod tests {
             "rootless",
             "base",
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 "rootless-a",
                 "rootless",
                 "updated",
@@ -8166,14 +8166,14 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-base", "base-a", "base", "base")],
+            &[row_with_value("row-base", "base-a", "base", "base")],
         )
         .await
         .expect("base root should write");
         let rootless_rows = (0..300)
             .map(|index| {
                 row_with_value(
-                    &format!("entity-{index:04}"),
+                    &format!("row-{index:04}"),
                     &format!("rootless-{index:04}"),
                     "rootless",
                     "rootless",
@@ -8186,7 +8186,7 @@ mod tests {
             "child",
             "rootless",
             &[row_with_value(
-                "entity-0150",
+                "row-0150",
                 "child-0150",
                 "child",
                 "child",
@@ -8311,7 +8311,7 @@ mod tests {
         assert_eq!(rows.len(), 301);
         assert_eq!(
             rows.iter()
-                .find(|row| row.entity_pk() == &EntityPk::single("entity-0150"))
+                .find(|row| row.row_pk() == &RowPk::single("row-0150"))
                 .and_then(|row| row.snapshot_content())
                 .map(AsRef::as_ref),
             Some("{\"value\":\"child\"}")
@@ -8332,7 +8332,7 @@ mod tests {
             tracked_state,
             "gen",
             None,
-            &[row_with_value("entity-gen", "gen-change", "gen", "gen")],
+            &[row_with_value("row-gen", "gen-change", "gen", "gen")],
         )
         .await
         .expect("genesis root should write");
@@ -8344,14 +8344,14 @@ mod tests {
                 &parent,
                 &[
                     row_with_value(
-                        &format!("entity-{commit}"),
+                        &format!("row-{commit}"),
                         &format!("{commit}-change"),
                         commit,
                         commit,
                     ),
                     // Rewrite a shared key in every commit so the interval is
                     // order sensitive rather than a disjoint insert stream.
-                    row_with_value("entity-shared", &format!("{commit}-shared"), commit, commit),
+                    row_with_value("row-shared", &format!("{commit}-shared"), commit, commit),
                 ],
             )
             .await;
@@ -8367,12 +8367,12 @@ mod tests {
                 &parent,
                 &[
                     row_with_value(
-                        &format!("entity-{commit}"),
+                        &format!("row-{commit}"),
                         &format!("{commit}-change"),
                         commit,
                         commit,
                     ),
-                    row_with_value("entity-shared", &format!("{commit}-shared"), commit, commit),
+                    row_with_value("row-shared", &format!("{commit}-shared"), commit, commit),
                 ],
             )
             .await;
@@ -8604,7 +8604,7 @@ mod tests {
         let rows = (0..4000)
             .map(|index| {
                 row_with_value(
-                    &format!("entity-{index:06}"),
+                    &format!("row-{index:06}"),
                     &format!("gen-change-{index}"),
                     "gen",
                     "gen",
@@ -8624,7 +8624,7 @@ mod tests {
                 &storage,
                 "a1",
                 "gen",
-                &[row_with_value("entity-a1", "a1-change", "a1", "a1")],
+                &[row_with_value("row-a1", "a1-change", "a1", "a1")],
             )
             .await;
             storage
@@ -8782,7 +8782,7 @@ mod tests {
             &tracked_state,
             "base",
             None,
-            &[row_with_value("entity-a", "base-a", "base", "base")],
+            &[row_with_value("row-a", "base-a", "base", "base")],
         )
         .await
         .expect("base root should write");
@@ -8791,8 +8791,8 @@ mod tests {
             "generation-1",
             "base",
             &[
-                row_with_value("entity-a", "generation-1-a", "generation-1", "middle"),
-                row_with_value("entity-b", "generation-1-b", "generation-1", "created"),
+                row_with_value("row-a", "generation-1-a", "generation-1", "middle"),
+                row_with_value("row-b", "generation-1-b", "generation-1", "created"),
             ],
         )
         .await;
@@ -8803,8 +8803,8 @@ mod tests {
             &[
                 // The endpoint payload returns to the base value, but stale
                 // admission must still know that this identity was touched.
-                row_with_value("entity-a", "generation-2-a", "generation-2", "base"),
-                row_with_value("entity-c", "generation-2-c", "generation-2", "created"),
+                row_with_value("row-a", "generation-2-a", "generation-2", "base"),
+                row_with_value("row-c", "generation-2-c", "generation-2", "created"),
             ],
         )
         .await;
@@ -8822,9 +8822,9 @@ mod tests {
         assert_eq!(
             identities
                 .iter()
-                .map(|identity| { identity.entity_pk().as_single_string().unwrap().to_owned() })
+                .map(|identity| { identity.row_pk().as_single_string().unwrap().to_owned() })
                 .collect::<Vec<_>>(),
-            ["entity-a", "entity-b", "entity-c"]
+            ["row-a", "row-b", "row-c"]
         );
     }
 
@@ -8844,7 +8844,7 @@ mod tests {
         let base_rows = (0..rows)
             .map(|index| {
                 row_with_value(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("base-change-{index:05}"),
                     "base",
                     "base",
@@ -8857,7 +8857,7 @@ mod tests {
         let changed_rows = (0..rows)
             .map(|index| {
                 row_with_value(
-                    &format!("entity-{index:05}"),
+                    &format!("row-{index:05}"),
                     &format!("changed-{index:05}"),
                     "after",
                     "after",
@@ -8931,7 +8931,7 @@ mod tests {
         let rows = (0..ROW_COUNT)
             .map(|index| {
                 row_with_value(
-                    &format!("entity-{index:03}"),
+                    &format!("row-{index:03}"),
                     &format!("rootless-bulk-change-{index:03}"),
                     COMMIT_ID,
                     &format!("value-{index:03}"),
@@ -8943,7 +8943,7 @@ mod tests {
         let key_for_row = |row: &MaterializedTrackedStateRow| TrackedStateKey {
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
         };
         let duplicate_key = key_for_row(&rows[ROW_COUNT / 2]);
         let mut requested = Vec::with_capacity(ROW_COUNT + 3);
@@ -8951,7 +8951,7 @@ mod tests {
         requested.push(TrackedStateKey {
             schema_key: "test_schema".to_owned(),
             file_id: None,
-            entity_pk: EntityPk::single("missing-entity"),
+            row_pk: RowPk::single("missing-row"),
         });
         requested.extend(rows.iter().rev().map(key_for_row));
         requested.push(duplicate_key);
@@ -8974,7 +8974,7 @@ mod tests {
             let actual = exact
                 .row(offset + 2)
                 .expect("every committed input should remain present");
-            assert_eq!(actual.entity_pk(), &expected.entity_pk);
+            assert_eq!(actual.row_pk(), &expected.row_pk);
             assert_eq!(
                 actual.snapshot_content().map(SharedStr::as_str),
                 expected.snapshot_content.as_deref()
@@ -8985,7 +8985,7 @@ mod tests {
             .row(exact.len() - 1)
             .expect("last duplicate should be present");
         assert!(
-            std::ptr::eq(first_duplicate.entity_pk(), last_duplicate.entity_pk()),
+            std::ptr::eq(first_duplicate.row_pk(), last_duplicate.row_pk()),
             "duplicate input slots should select the same materialized batch row"
         );
         assert!(
@@ -9043,7 +9043,7 @@ mod tests {
             page,
         )
         .expect("test schema-row page");
-        let batches = [WasmCertifiedEntityBatch {
+        let batches = [WasmCertifiedRowBatch {
             format: 1,
             schema_keys: vec![SCHEMA_KEY.to_owned()],
             row_count: 1,
@@ -9052,7 +9052,7 @@ mod tests {
             complete_file_state: true,
             pages: vec![Bytes::from(page)],
         }];
-        let files = [CertifiedEntityBatchFileRef {
+        let files = [CertifiedRowBatchFileRef {
             branch_id: BRANCH_ID,
             file_id: FILE_ID,
             batches: &batches,
@@ -9080,7 +9080,7 @@ mod tests {
             .await
             .expect("certified batch read should open");
         let mut writes = storage.new_write_set();
-        crate::hot_state::stage_certified_entity_batches(
+        crate::hot_state::stage_certified_row_batches(
             &read,
             &mut writes,
             &files,
@@ -9103,7 +9103,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: SCHEMA_KEY.to_owned(),
             file_id: Some(FILE_ID.to_owned()),
-            entity_pk: EntityPk::uuid_from_bytes(id),
+            row_pk: RowPk::uuid_from_bytes(id),
         };
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -9115,7 +9115,7 @@ mod tests {
             &TrackedStateScanRequest {
                 filter: crate::tracked_state::TrackedStateFilter {
                     schema_keys: vec![SCHEMA_KEY.to_owned()],
-                    entity_pks: vec![key.entity_pk.clone()],
+                    row_pks: vec![key.row_pk.clone()],
                     file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_owned())],
                     include_tombstones: true,
                 },
@@ -9143,7 +9143,7 @@ mod tests {
                 delta: TrackedStateDeltaRef {
                     schema_key: SCHEMA_KEY,
                     file_id: Some(FILE_ID),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                     change_id: durable_change_id,
                     commit_id,
                     deleted: false,
@@ -9228,7 +9228,7 @@ mod tests {
         let rows = (0..ROW_COUNT)
             .map(|index| {
                 row_with_value(
-                    &format!("scan-entity-{index:03}"),
+                    &format!("scan-row-{index:03}"),
                     &format!("rootless-scan-change-{index:03}"),
                     COMMIT_ID,
                     &format!("scan-value-{index:03}"),
@@ -9277,8 +9277,8 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
-        descriptor.entity_pk =
-            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
+        descriptor.row_pk =
+            RowPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         descriptor.file_id = Some(FILE_ID.to_string());
         let mut semantic = row("line-1", "semantic-create", "initial");
@@ -9356,8 +9356,8 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
-        descriptor.entity_pk =
-            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
+        descriptor.row_pk =
+            RowPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         descriptor.file_id = Some(FILE_ID.to_string());
         let mut semantic = row("line-1", "semantic-create", "initial");
@@ -9389,7 +9389,7 @@ mod tests {
         let semantic_key = TrackedStateKey {
             schema_key: semantic.schema_key.clone(),
             file_id: semantic.file_id.clone(),
-            entity_pk: semantic.entity_pk.clone(),
+            row_pk: semantic.row_pk.clone(),
         };
         let mut reader = tracked_state.reader(
             storage
@@ -9509,8 +9509,8 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
-        descriptor.entity_pk =
-            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
+        descriptor.row_pk =
+            RowPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         descriptor.file_id = Some(FILE_ID.to_string());
         let mut semantic = row("line-1", "semantic-create", "initial");
@@ -9609,7 +9609,7 @@ mod tests {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
-                        entity_pks: vec![EntityPk::single("line-1")],
+                        row_pks: vec![RowPk::single("line-1")],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -9629,7 +9629,7 @@ mod tests {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
-                        entity_pks: vec![EntityPk::single("line-1")],
+                        row_pks: vec![RowPk::single("line-1")],
                         include_tombstones: true,
                         ..Default::default()
                     },
@@ -9704,7 +9704,7 @@ mod tests {
                 let key = TrackedStateKey {
                     schema_key: row.schema_key.clone(),
                     file_id: row.file_id.clone(),
-                    entity_pk: row.entity_pk.clone(),
+                    row_pk: row.row_pk.clone(),
                 };
                 let value = TrackedStateIndexValue {
                     change_id: row.change_id.clone(),
@@ -9784,24 +9784,24 @@ mod tests {
         }
     }
 
-    fn tombstone(entity_pk: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
-        let mut row = row(entity_pk, change_id, commit_id);
+    fn tombstone(row_pk: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
+        let mut row = row(row_pk, change_id, commit_id);
         row.snapshot_content = None;
         row
     }
 
-    fn row(entity_pk: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
-        row_with_value(entity_pk, change_id, commit_id, "value")
+    fn row(row_pk: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
+        row_with_value(row_pk, change_id, commit_id, "value")
     }
 
     fn row_with_value(
-        entity_pk: &str,
+        row_pk: &str,
         change_id: &str,
         commit_id: &str,
         value: &str,
     ) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
             schema_key: "test_schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
@@ -9818,7 +9818,7 @@ mod tests {
         TrackedStateDeltaRef {
             schema_key: &row.schema_key,
             file_id: row.file_id.as_deref(),
-            entity_pk: &row.entity_pk,
+            row_pk: &row.row_pk,
             change_id: row.change_id,
             commit_id: row.commit_id,
             deleted: row.snapshot_content.is_none(),
@@ -9831,7 +9831,7 @@ mod tests {
         crate::tracked_state::codec::encode_key_ref(TrackedStateKeyRef {
             schema_key: &row.schema_key,
             file_id: row.file_id.as_deref(),
-            entity_pk: &row.entity_pk,
+            row_pk: &row.row_pk,
         })
     }
 }

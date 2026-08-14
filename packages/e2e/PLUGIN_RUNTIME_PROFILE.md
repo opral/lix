@@ -81,7 +81,7 @@ reconciliation and storage dominate.
 Prototype B emits bounded batches of row ordinals, order ranks, decoded cells,
 and lexical layout. Wasm creates neither row UUID strings nor row JSON
 snapshots. Boundary traffic falls 28.5%, but the host immediately rebuilds
-220k canonical entity snapshots for the unchanged v2 transaction path.
+220k canonical row snapshots for the unchanged v2 transaction path.
 Cumulative host allocation therefore does not fall and peak live allocation
 moves by only 0.2%. This is direct evidence that a storage-native sink is
 required; typed transport alone merely moves materialization across the Wasm
@@ -180,7 +180,7 @@ No backward compatibility should be carried on the hot path.
 4. Add a compact, content-addressed per-file actor checkpoint. Cold hydration
    should read one checkpoint plus changes after its root, rather than
    materializing every semantic row and replaying them through packet cursors.
-5. Add a storage-native file entity batch. Validate ownership once per batch,
+5. Add a storage-native file row batch. Validate ownership once per batch,
    sort once, lower once, and persist packed column buffers/ranges rather than
    independently staging and validating every semantic row.
 6. Preserve the existing sparse edit path. The 10 MiB JSON edit is already
@@ -198,9 +198,9 @@ the caller only needs the successor.
 API v3 should expose three different operations:
 
 1. `apply-warm(document, edit, source, sink)` for an actor already in memory;
-2. `apply-cold-successor(durable-entities, new-source, sink)` for an evicted
+2. `apply-cold-successor(durable-rows, new-source, sink)` for an evicted
    actor, producing the successor directly without rendering the predecessor;
-3. `hydrate(durable-entities)` only when a retained document is actually
+3. `hydrate(durable-rows)` only when a retained document is actually
    needed for a later read or semantic edit.
 
 The scheduler should route cache misses during replay to cold-successor and run
@@ -221,7 +221,7 @@ cold-successor removes the work before bounded parallel scheduling is applied.
 | Cut | Target workload | Expected result |
 | --- | --- | --- |
 | Fused transition + fixed executor | Small files and many-file commits | 1.5-2x |
-| Packed entity batch + batch ownership validation | Bulk CSV/JSON imports | 2-3x, much lower host allocation |
+| Packed row batch + batch ownership validation | Bulk CSV/JSON imports | 2-3x, much lower host allocation |
 | Actor checkpoints | Cold edits and histories wider than the 16-actor cache | 2-5x and lower boundary traffic |
 | Parser arenas/local IDs | Format-specific memory peaks | Useful where copies remain, but not the shared multiplier |
 
@@ -232,7 +232,7 @@ imports, the Wasm plugin layer itself is currently just 9.6% of JSON time and
 ## Large CSV/JSON v3 push profile
 
 JSON v3 reuses the JSON v2 parser and packet-v1 snapshots. Seven release
-samples on the 10 MiB / 39,871-entity flat-object import produced:
+samples on the 10 MiB / 39,871-row flat-object import produced:
 
 | lane | p50 | p95 | exports | imports | peak host allocation |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -266,7 +266,7 @@ shows that the remaining peak is downstream of the Component boundary. A real ne
 must replace the complete `ValidatedFileTransition.changes` owner with a
 transaction-native page-backed batch, preserve transition-wide uniqueness and
 rollback metadata separately, and let storage lowering consume those pages
-without a `Vec<EntityChange>` materialization.
+without a `Vec<RowChange>` materialization.
 
 A follow-up experiment made the deferred RocksDB encoder the unique owner of
 the prepared batch and released canonical snapshot owners after each 4,096-row
@@ -276,21 +276,21 @@ as the remaining peak and keeps the next cut focused on eliminating the
 complete generic/prepared row representation, not incrementally clearing its
 already-shared payloads.
 
-## Immutable entity-batch segment result
+## Immutable row-batch segment result
 
 The next prototype removed that generic row representation. A v3 transition
 may now hand the transaction a bounded, host-certified encoded batch. The
 engine validates its schema membership, packet framing, primary keys, and
 canonical snapshots before commit. Current-state queries decode the immutable
 segment lazily; RocksDB receives one batch owner rather than one hot row,
-history segment, and locator per semantic entity.
+history segment, and locator per semantic row.
 
 Five release samples after this cut:
 
 | workload | old lane p50 | segment p50 | segment p95 | peak live allocation | cumulative allocation |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | CSV, 10.68 MiB / 220,000 rows | 5.227 s | 129.4 ms | 171.8 ms | 36.1 MB | 65.5 MB |
-| JSON, 10 MiB / 39,871 entities | 625.6 ms | 258.0 ms | 273.5 ms | 45.5 MB | 103.4 MB |
+| JSON, 10 MiB / 39,871 rows | 625.6 ms | 258.0 ms | 273.5 ms | 45.5 MB | 103.4 MB |
 
 CSV is 40.4x faster than the original storage-materializing lane and uses
 about 26x less peak live host allocation than its approximately 930 MB
@@ -375,7 +375,7 @@ for v3 (5.84x), with peak host allocation falling from 11.247 MB to 3.756 MB
 and Component boundary traffic falling from 1.651 MB to roughly 3 KiB.
 
 Bulk JSON had the same smaller-scale duplicate-materialization pattern. Its
-packet encoder allocated and copied one temporary vector per entity, while
+packet encoder allocated and copied one temporary vector per row, while
 the sparse arena index generated a complete scalar snapshot, parsed that JSON
 back into a value tree to remove `scalar_json`, and serialized it again.
 Encoding directly into the bounded sink page and serializing arena metadata
@@ -411,10 +411,10 @@ non-duplicated-source policies:
 
 | workload | v3 p50 | v3 p95 | peak host allocation | guest high water |
 | --- | ---: | ---: | ---: | ---: |
-| CSV, 10.68 MiB / 220,001 entities | 137.8 ms | 418.2 ms | 34.8 MB | 41.2 MB |
-| JSON, 10 MiB / 39,871 entities | 264.6 ms | 281.4 ms | 55.2 MB | 35.3 MB |
-| Markdown, 1.24 MiB / 3,808 entities | 5.702 ms | 5.789 ms | 3.756 MB | 53.477 MB |
-| Excalidraw, 1.85 MiB / 20,000 entities | 3.482 ms | 3.659 ms | 2.959 MB | 25.166 MB |
+| CSV, 10.68 MiB / 220,001 rows | 137.8 ms | 418.2 ms | 34.8 MB | 41.2 MB |
+| JSON, 10 MiB / 39,871 rows | 264.6 ms | 281.4 ms | 55.2 MB | 35.3 MB |
+| Markdown, 1.24 MiB / 3,808 rows | 5.702 ms | 5.789 ms | 3.756 MB | 53.477 MB |
+| Excalidraw, 1.85 MiB / 20,000 rows | 3.482 ms | 3.659 ms | 2.959 MB | 25.166 MB |
 
 All four lanes remain Wasm components. They use one guest export and bounded
 push pages, preserve exact file bytes and semantic cardinality, and retain the
@@ -422,14 +422,14 @@ format-specific history and RocksDB reopen checks. CSV creates no per-row
 history segments or locator records before hot publication.
 
 The subsequent hard API cut added the borrowed atomic transition,
-host-imported conflict-resolution sink, lazy conflict/entity sources, and the
+host-imported conflict-resolution sink, lazy conflict/row sources, and the
 fused semantic renderer. Paired release verification on the `origin/main`
 tracked-head/protocol changes merged in #976 shows that this control-flow cut
 retains the optimized paths:
 
 | workload | v2 p50 | hard-cut v3 p50 | speedup | v3 peak host allocation |
 | --- | ---: | ---: | ---: | ---: |
-| JSON, 10 MiB / 39,871 entities | 618.340 ms | 287.018 ms | 2.15x | 55.294 MB |
+| JSON, 10 MiB / 39,871 rows | 618.340 ms | 287.018 ms | 2.15x | 55.294 MB |
 | Markdown, exact VS Code API transition | 34.090 ms | 6.236 ms | 5.47x | 3.756 MB |
 | Excalidraw, 20,000 elements | 243.150 ms | 3.507 ms | 69.33x | 2.959 MB |
 

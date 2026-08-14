@@ -1,5 +1,5 @@
 ---
-description: Define PostgreSQL-derived entity schemas with Lix Schema v1.
+description: Define PostgreSQL-derived row schemas with Lix Schema v1.
 ---
 
 # Schemas
@@ -38,7 +38,7 @@ VALUES ('acme_section', '{
 ```
 
 `schema_key` must equal `value.key`. After registration, `acme_section`,
-`acme_section_by_branch`, and `acme_section_history()` expose the typed entity.
+`acme_section_by_branch`, and `acme_section_history()` expose the typed row.
 
 ## Contract
 
@@ -91,8 +91,9 @@ schema key for an incompatible model until an explicit migration API exists.
 ## Naming
 
 Use an owner prefix such as `acme_task` or `xlsx_cell`. The `lix` and `lix_*`
-names are reserved for Lix. A schema key is both durable entity identity and
-SQL table name, so treat it like a stable package name.
+names are reserved for Lix. A schema key identifies the durable schema and its
+SQL surface, so treat it like a stable package name. Each row has its own
+primary-key identity within that schema.
 
 The complete machine-readable meta-schema and semantic mapping live in the
 standalone `lix-schema` crate under `schema/schema-v1.json` and

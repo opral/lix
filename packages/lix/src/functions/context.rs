@@ -131,7 +131,7 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::hot_state::HotStateContext;
@@ -300,7 +300,7 @@ mod tests {
             .load_row(&crate::hot_state::HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                row_pk: RowPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: crate::NullableKeyFilter::Null,
             })
             .await
@@ -353,7 +353,7 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
-        let entity_pk = EntityPk::single(key);
+        let row_pk = RowPk::single(key);
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -377,7 +377,7 @@ mod tests {
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: Some(ChangeId::for_test_label("functions-context-sequence")),
                     commit_id: None,
                     untracked: true,

@@ -1,7 +1,7 @@
 //! Which physical route the write path's pre-image read takes, as a function
 //! of the predicate shape.
 //!
-//! `scan_entity_candidates` binds `entity_pks` only when the WHERE clause is a
+//! `scan_row_candidates` binds `row_pks` only when the WHERE clause is a
 //! primary-key predicate. When it does not, `hot_scan_entries` has no identity
 //! to seek with and falls through to the primary-prefix arm, which walks every
 //! row of the schema in the branch and rejects non-matches with

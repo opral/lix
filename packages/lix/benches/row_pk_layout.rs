@@ -168,7 +168,7 @@ fn measure<T: Tuple>(name: &str, workload: &str, make: impl Fn(usize) -> T) {
     }
     samples.sort_unstable();
     println!(
-        "entity_pk_layout name={name} workload={workload} rows={ROWS} median_ns={} spills={spills} encoded_bytes={encoded_bytes}",
+        "row_pk_layout name={name} workload={workload} rows={ROWS} median_ns={} spills={spills} encoded_bytes={encoded_bytes}",
         samples[CYCLES / 2]
     );
 }
@@ -177,7 +177,7 @@ fn main() {
     // Keep every production variant represented in the layout measurement.
     black_box(Component::Bytes(Box::from([0_u8; 4])));
     println!(
-        "entity_pk_layout_size component={} vec={} inline1={} inline2={}",
+        "row_pk_layout_size component={} vec={} inline1={} inline2={}",
         size_of::<Component>(),
         size_of::<VecTuple>(),
         size_of::<InlineOne>(),

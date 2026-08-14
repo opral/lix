@@ -149,7 +149,7 @@ where
 mod tests {
     use super::*;
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::hot_state::{HotStateFilter, MaterializedHotStateRow};
 
     struct SplitCurrentAndTrackedReader {
@@ -290,7 +290,7 @@ mod tests {
 
     fn schema_row(snapshot_content: &str, untracked: bool) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: EntityPk::single("example_schema"),
+            row_pk: RowPk::single("example_schema"),
             schema_key: "lix_registered_schema".to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string().into()),

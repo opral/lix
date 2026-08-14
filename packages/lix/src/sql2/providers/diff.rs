@@ -10,7 +10,7 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
@@ -115,7 +115,7 @@ where
         if filter
             .column_refs()
             .iter()
-            .any(|column| matches!(column.name.as_str(), "entity_pk" | "schema_key" | "file_id"))
+            .any(|column| matches!(column.name.as_str(), "row_pk" | "schema_key" | "file_id"))
         {
             TableProviderFilterPushDown::Inexact
         } else {
@@ -163,7 +163,7 @@ where
                         }
                         rows.push(DiffSqlRow {
                             diff_id: entry.diff_id(),
-                            entity_pk: entry.identity.entity_pk().as_json_array_text(),
+                            row_pk: entry.identity.row_pk().as_json_array_text(),
                             schema_key: entry.identity.schema_key().to_owned(),
                             file_id: entry.identity.file_id().map(str::to_owned),
                             diff_type: match entry.kind {
@@ -195,23 +195,23 @@ impl DiffRoute {
     fn from_filters(filters: &[Expr]) -> Self {
         let conjuncts = filter_conjuncts(filters);
         let schema_keys = optional_values(&conjuncts, "schema_key");
-        let entity_pk_values = optional_values(&conjuncts, "entity_pk");
+        let row_pk_values = optional_values(&conjuncts, "row_pk");
         let file_ids = optional_values(&conjuncts, "file_id");
         let mut contradictory = schema_keys.as_ref().is_some_and(Vec::is_empty)
-            || entity_pk_values.as_ref().is_some_and(Vec::is_empty)
+            || row_pk_values.as_ref().is_some_and(Vec::is_empty)
             || file_ids.as_ref().is_some_and(Vec::is_empty);
-        let explicit_entity_filter = entity_pk_values.is_some();
-        let entity_pks = entity_pk_values
+        let explicit_row_filter = row_pk_values.is_some();
+        let row_pks = row_pk_values
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|value| EntityPk::from_json_array_text(&value).ok())
+            .filter_map(|value| RowPk::from_json_array_text(&value).ok())
             .collect::<Vec<_>>();
-        contradictory |= explicit_entity_filter && entity_pks.is_empty();
+        contradictory |= explicit_row_filter && row_pks.is_empty();
         Self {
             request: TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
                     schema_keys: schema_keys.unwrap_or_default(),
-                    entity_pks,
+                    row_pks,
                     file_ids: file_ids
                         .unwrap_or_default()
                         .into_iter()
@@ -237,7 +237,7 @@ fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<Strin
 fn diff_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("diff_id", DataType::Utf8, false),
-        json_field("entity_pk", false),
+        json_field("row_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         Field::new("diff_type", DataType::Utf8, false),
@@ -248,7 +248,7 @@ fn diff_schema() -> SchemaRef {
 
 struct DiffSqlRow {
     diff_id: Result<String, LixError>,
-    entity_pk: Result<String, LixError>,
+    row_pk: Result<String, LixError>,
     schema_key: String,
     file_id: Option<String>,
     diff_type: &'static str,
@@ -263,8 +263,8 @@ static DIFF_COLS: ColumnTable<DiffSqlRow> = ColumnTable {
             Col::Utf8Fallible(|row| row.diff_id.clone().map(Some)),
         ),
         (
-            "entity_pk",
-            Col::Utf8Fallible(|row| row.entity_pk.clone().map(Some)),
+            "row_pk",
+            Col::Utf8Fallible(|row| row.row_pk.clone().map(Some)),
         ),
         ("schema_key", Col::Utf8(|row| Some(&row.schema_key))),
         ("file_id", Col::Utf8(|row| row.file_id.as_deref())),

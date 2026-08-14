@@ -1,6 +1,6 @@
 //! Schema v1 typed-row body encoding: the *value* half of the typed-row layout.
 //!
-//! Layout (envelope carries `schema_key`, `entity_pk`, `schema_fingerprint`):
+//! Layout (envelope carries `schema_key`, `row_pk`, `schema_fingerprint`):
 //!
 //! ```text
 //! [1B header: version:4 | wide_offsets:1 | reserved:3]

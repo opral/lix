@@ -1,7 +1,7 @@
 //! Durable, branch-local plugin registry state.
 //!
-//! The registry is one tracked `lix_key_value` entity per branch. File
-//! ownership uses the same reserved entity key for every file and relies on
+//! The registry is one tracked `lix_key_value` row per branch. File
+//! ownership uses the same reserved row key for every file and relies on
 //! `file_id` for identity. That layout gives the transaction hot paths one
 //! exact registry read and one batched owner read instead of a filesystem
 //! scan.
@@ -18,8 +18,8 @@ use serde_json::{Value as JsonValue, json};
 use crate::binary_cas::BlobId;
 use crate::branch::BranchHeadControl;
 use crate::changelog::{ChangeRecordProjection, CommitId};
-use crate::entity_pk::EntityPk;
 use crate::hot_state::MaterializedHotStateRow;
+use crate::row_pk::RowPk;
 use crate::tracked_state::{
     MaterializedTrackedStateRowRef, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest, TrackedStateStoreReader,
@@ -336,7 +336,7 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Decode the JSON held in the `value` field. A missing entity is the
+    /// Decode the JSON held in the `value` field. A missing row is the
     /// canonical empty registry and requires no filesystem discovery.
     pub(crate) fn from_optional_value(value: Option<&JsonValue>) -> Result<Self, LixError> {
         let Some(value) = value else {
@@ -468,7 +468,7 @@ where
 {
     let registry_key = crate::tracked_state::TrackedStateKey {
         schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
-        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+        row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
         file_id: None,
     };
     let rows = reader
@@ -511,7 +511,7 @@ where
     let request = TrackedStateScanRequest {
         filter: TrackedStateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
-            entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+            row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
             file_ids: vec![NullableKeyFilter::Null],
             ..TrackedStateFilter::default()
         },
@@ -543,7 +543,7 @@ where
         {
             if row.deleted
                 || row.key.file_id.is_some()
-                || row.key.entity_pk != EntityPk::single(PLUGIN_REGISTRY_KEY)
+                || row.key.row_pk != RowPk::single(PLUGIN_REGISTRY_KEY)
             {
                 continue;
             }
@@ -663,9 +663,7 @@ impl PluginFileOwner {
         let file_id = row.file_id.as_deref().ok_or_else(|| {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
-        if row.schema_key != KEY_VALUE_SCHEMA_KEY
-            || row.entity_pk != EntityPk::single(PLUGIN_OWNER_KEY)
-        {
+        if row.schema_key != KEY_VALUE_SCHEMA_KEY || row.row_pk != RowPk::single(PLUGIN_OWNER_KEY) {
             return Err(invalid_registry(
                 "tracked plugin owner row has an invalid storage identity",
             ));
@@ -691,7 +689,7 @@ impl PluginFileOwner {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
         if row.schema_key() != KEY_VALUE_SCHEMA_KEY
-            || row.entity_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+            || row.row_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
         {
             return Err(invalid_registry(
                 "tracked plugin owner row has an invalid storage identity",
@@ -1191,7 +1189,7 @@ fn plugin_key_value_write_row(
         .map(|snapshot| TransactionJson::from_value(snapshot, "plugin registry key-value row"))
         .transpose()?;
     Ok(TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(key)),
+        row_pk: Some(RowPk::single(key)),
         schema_key: KEY_VALUE_SCHEMA_KEY.into(),
         file_id: file_id.map(Into::into),
         snapshot,
@@ -1216,7 +1214,7 @@ fn validate_hot_state_identity(
 ) -> Result<(), LixError> {
     validate_branch_local_scope(branch_id)?;
     if row.schema_key != KEY_VALUE_SCHEMA_KEY
-        || row.entity_pk.as_single_string().ok() != Some(key)
+        || row.row_pk.as_single_string().ok() != Some(key)
         || row.file_id.as_deref() != expected_file_id
         || row.global
         // A file-scoped reserved row lives in its own file's lane. The branch
@@ -1525,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_rows_share_one_entity_key_and_use_file_id_identity() {
+    fn owner_rows_share_one_row_key_and_use_file_id_identity() {
         let owner = PluginFileOwner::new(
             "01920000-0000-7000-8000-0000000000a2",
             "plugin_a",
@@ -1534,7 +1532,7 @@ mod tests {
         .unwrap();
         let row = owner.write_row("main", false).unwrap();
         assert_eq!(
-            row.entity_pk.unwrap().as_single_string().unwrap(),
+            row.row_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_OWNER_KEY
         );
         assert_eq!(
@@ -1550,7 +1548,7 @@ mod tests {
         let registry_row = PluginRegistry::empty().write_row("main").unwrap();
         assert_eq!(registry_row.file_id, None);
         assert_eq!(
-            registry_row.entity_pk.unwrap().as_single_string().unwrap(),
+            registry_row.row_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_REGISTRY_KEY
         );
     }

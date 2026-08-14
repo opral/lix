@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_change",
-  "description": "A change records one edit to a Lix entity, including what changed, when it changed, and which entity was affected.",
+  "description": "A change records one edit to a Lix row, including what changed, when it changed, and which row was affected.",
   "columns": [
     {
       "name": "account_id",
@@ -19,16 +19,16 @@
       ]
     },
     {
-      "name": "entity_pk",
+      "name": "row_pk",
       "type": "jsonb",
       "nullable": false,
-      "description": "Canonical JSON primary-key tuple for the entity this change applies to, scoped by (`schema_key`, `file_id`). Values are ordered according to the target schema's `x-lix-primary-key`."
+      "description": "Canonical JSON primary-key tuple for the row this change applies to, scoped by (`schema_key`, `file_id`). Values are ordered according to the target schema's `x-lix-primary-key`."
     },
     {
       "name": "file_id",
       "type": "text",
       "nullable": true,
-      "description": "Filesystem-scoped file identifier when the change belongs to a file; NULL for engine-internal entities (commits, branches, settings)."
+      "description": "Filesystem-scoped file identifier when the change belongs to a file; NULL for engine-internal rows (commits, branches, settings)."
     },
     {
       "name": "id",
@@ -53,13 +53,13 @@
       "name": "schema_key",
       "type": "text",
       "nullable": false,
-      "description": "Schema identifier of the entity (e.g. `lix_file_descriptor`, `lix_commit`, or a user-registered key)."
+      "description": "Schema identifier of the row (e.g. `lix_file_descriptor`, `lix_commit`, or a user-registered key)."
     },
     {
       "name": "snapshot_content",
       "type": "jsonb",
       "nullable": true,
-      "description": "Entity JSON body at this change; NULL represents a tombstone (deletion)."
+      "description": "Row JSON body at this change; NULL represents a tombstone (deletion)."
     }
   ],
   "primary_key": [

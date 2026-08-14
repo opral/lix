@@ -455,9 +455,9 @@ mod tests {
         }
     }
 
-    fn directory_row(entity_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
+    fn directory_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
         live_row(
-            entity_pk,
+            row_pk,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             None,
             Some(snapshot_content),
@@ -465,9 +465,9 @@ mod tests {
         )
     }
 
-    fn file_row(entity_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
+    fn file_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
         live_row(
-            entity_pk,
+            row_pk,
             FILE_DESCRIPTOR_SCHEMA_KEY,
             None,
             Some(snapshot_content),
@@ -475,11 +475,11 @@ mod tests {
         )
     }
 
-    fn blob_ref_row(entity_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
+    fn blob_ref_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
         live_row(
-            entity_pk,
+            row_pk,
             BLOB_REF_SCHEMA_KEY,
-            Some(entity_pk.to_string()),
+            Some(row_pk.to_string()),
             Some(snapshot_content),
             "01920000-0000-7000-8000-0000000000a1",
         )
@@ -493,22 +493,22 @@ mod tests {
     }
 
     fn live_row(
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         file_id: Option<String>,
         snapshot_content: Option<&str>,
         branch_id: &str,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            row_pk: crate::row_pk::RowPk::single(row_pk),
             schema_key: schema_key.to_string(),
             file_id,
             snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse(

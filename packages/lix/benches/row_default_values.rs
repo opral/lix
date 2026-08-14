@@ -55,9 +55,9 @@ fn execute(runtime: &tokio::runtime::Runtime, session: &Lix<Memory>, sql: &str) 
     );
 }
 
-fn entity_default_values(c: &mut Criterion) {
+fn row_default_values(c: &mut Criterion) {
     let runtime = runtime();
-    let mut group = c.benchmark_group("entity_default_values");
+    let mut group = c.benchmark_group("row_default_values");
     group.throughput(Throughput::Elements(1));
     // Each sample receives a fresh preconfigured session, so this captures
     // cold transaction behavior without charging lix boot or registration.
@@ -78,5 +78,5 @@ fn entity_default_values(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, entity_default_values);
+criterion_group!(benches, row_default_values);
 criterion_main!(benches);

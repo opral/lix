@@ -38,7 +38,7 @@ struct CacheInner {
     changes: watch::Sender<u64>,
     max_bytes: usize,
     max_entries: usize,
-    array_budget: Arc<crate::hot_state::EntityColumnarArrayBudget>,
+    array_budget: Arc<crate::hot_state::RowColumnarArrayBudget>,
     #[cfg(test)]
     waiter_observed: tokio::sync::Notify,
 }
@@ -57,11 +57,11 @@ impl Drop for CacheInner {
 }
 
 #[derive(Clone)]
-pub(crate) struct EntityDecodedColumnCache {
+pub(crate) struct RowDecodedColumnCache {
     inner: Arc<CacheInner>,
 }
 
-impl Default for EntityDecodedColumnCache {
+impl Default for RowDecodedColumnCache {
     fn default() -> Self {
         Self::with_limits(
             DECODED_COLUMN_CACHE_MAX_BYTES,
@@ -70,17 +70,17 @@ impl Default for EntityDecodedColumnCache {
     }
 }
 
-impl EntityDecodedColumnCache {
+impl RowDecodedColumnCache {
     fn with_limits(max_bytes: usize, max_entries: usize) -> Self {
         Self::with_limits_and_budget(
             max_bytes,
             max_entries,
-            Arc::new(crate::hot_state::EntityColumnarArrayBudget::new(max_bytes)),
+            Arc::new(crate::hot_state::RowColumnarArrayBudget::new(max_bytes)),
         )
     }
 
     pub(crate) fn with_array_budget(
-        array_budget: Arc<crate::hot_state::EntityColumnarArrayBudget>,
+        array_budget: Arc<crate::hot_state::RowColumnarArrayBudget>,
     ) -> Self {
         Self::with_limits_and_budget(
             DECODED_COLUMN_CACHE_MAX_BYTES,
@@ -92,7 +92,7 @@ impl EntityDecodedColumnCache {
     fn with_limits_and_budget(
         max_bytes: usize,
         max_entries: usize,
-        array_budget: Arc<crate::hot_state::EntityColumnarArrayBudget>,
+        array_budget: Arc<crate::hot_state::RowColumnarArrayBudget>,
     ) -> Self {
         let (changes, _) = watch::channel(0);
         Self {
@@ -445,7 +445,7 @@ mod tests {
                 .expect("begin read"),
             column_reads: Arc::clone(&column_reads),
         };
-        let cache = EntityDecodedColumnCache::default();
+        let cache = RowDecodedColumnCache::default();
         let digest = encoded.manifest.content_digest().expect("manifest digest");
 
         let first = cache
@@ -477,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_projection_never_invokes_loader() {
-        let cache = EntityDecodedColumnCache::default();
+        let cache = RowDecodedColumnCache::default();
         let loads = AtomicUsize::new(0);
         let arrays = cache
             .load_projection_with(RowGroupSetId::new([16; 16]), [17; 32], 0, &[], |_columns| {
@@ -492,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn overlapping_ordered_projections_reuse_array_identity() {
-        let cache = EntityDecodedColumnCache::default();
+        let cache = RowDecodedColumnCache::default();
         let loads = Arc::new(Mutex::new(Vec::<Vec<usize>>::new()));
         let first = cache
             .load_projection_with(RowGroupSetId::new([1; 16]), [2; 32], 3, &[2, 0], {
@@ -538,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_overlaps_claim_each_missing_column_once() {
-        let cache = EntityDecodedColumnCache::default();
+        let cache = RowDecodedColumnCache::default();
         let first_started = Arc::new(tokio::sync::Barrier::new(2));
         let release_first = Arc::new(Notify::new());
         let first_loads = Arc::new(Mutex::new(Vec::new()));
@@ -605,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiters_retry_after_owner_error_and_cancellation() {
-        let cache = EntityDecodedColumnCache::default();
+        let cache = RowDecodedColumnCache::default();
         let started = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(Notify::new());
         let owner = tokio::spawn({
@@ -716,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn digest_entry_byte_and_oversize_limits_are_enforced() {
         let bytes = array(0).get_array_memory_size();
-        let entry_cache = EntityDecodedColumnCache::with_limits(usize::MAX, 2);
+        let entry_cache = RowDecodedColumnCache::with_limits(usize::MAX, 2);
         let entry_loads = Arc::new(AtomicUsize::new(0));
         for projection in [&[0, 1][..], &[2][..], &[0][..]] {
             entry_cache
@@ -732,7 +732,7 @@ mod tests {
         }
         assert_eq!(entry_loads.load(Ordering::SeqCst), 4);
 
-        let byte_cache = EntityDecodedColumnCache::with_limits(bytes, 8);
+        let byte_cache = RowDecodedColumnCache::with_limits(bytes, 8);
         byte_cache
             .load_projection_with(
                 RowGroupSetId::new([9; 16]),
@@ -745,7 +745,7 @@ mod tests {
             .expect("byte-bounded load");
         assert_eq!(byte_cache.lock().expect("cache lock").entries.len(), 1);
 
-        let oversize = EntityDecodedColumnCache::with_limits(bytes - 1, 8);
+        let oversize = RowDecodedColumnCache::with_limits(bytes - 1, 8);
         let oversize_loads = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             oversize
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(oversize_loads.load(Ordering::SeqCst), 2);
         assert!(oversize.lock().expect("cache lock").entries.is_empty());
 
-        let digest_cache = EntityDecodedColumnCache::default();
+        let digest_cache = RowDecodedColumnCache::default();
         let digest_loads = Arc::new(AtomicUsize::new(0));
         for digest in [[13; 32], [14; 32]] {
             digest_cache
@@ -783,10 +783,10 @@ mod tests {
     async fn shared_budget_bounds_exact_batch_and_decoded_layers() {
         let resident_array = array(0);
         let bytes = resident_array.get_array_memory_size();
-        let budget = Arc::new(crate::hot_state::EntityColumnarArrayBudget::new(bytes));
+        let budget = Arc::new(crate::hot_state::RowColumnarArrayBudget::new(bytes));
         let mut exact =
-            crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(Arc::clone(&budget));
-        let shadow = crate::hot_state::EntityColumnarShadowMaskKey {
+            crate::hot_state::RowColumnarShadowMaskCache::with_array_budget(Arc::clone(&budget));
+        let shadow = crate::hot_state::RowColumnarShadowMaskKey {
             row_groups: RowGroupSetId::new([18; 16]),
             branch_id: Arc::from("main"),
             head_commit_id: crate::changelog::CommitId::for_test_label(
@@ -806,7 +806,7 @@ mod tests {
         exact.insert_batch(shadow.clone(), vec![0], exact_batch);
 
         let decoded =
-            EntityDecodedColumnCache::with_limits_and_budget(usize::MAX, 8, Arc::clone(&budget));
+            RowDecodedColumnCache::with_limits_and_budget(usize::MAX, 8, Arc::clone(&budget));
         let decoded_loads = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             decoded
@@ -836,13 +836,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_one_cache_releases_capacity_to_its_sibling() {
         let bytes = array(0).get_array_memory_size();
-        let budget = Arc::new(crate::hot_state::EntityColumnarArrayBudget::new(bytes));
+        let budget = Arc::new(crate::hot_state::RowColumnarArrayBudget::new(bytes));
         {
-            let mut exact = crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(
+            let mut exact = crate::hot_state::RowColumnarShadowMaskCache::with_array_budget(
                 Arc::clone(&budget),
             );
             exact.insert_batch(
-                crate::hot_state::EntityColumnarShadowMaskKey {
+                crate::hot_state::RowColumnarShadowMaskKey {
                     row_groups: RowGroupSetId::new([21; 16]),
                     branch_id: Arc::from("main"),
                     head_commit_id: crate::changelog::CommitId::for_test_label(
@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
 
         let decoded =
-            EntityDecodedColumnCache::with_limits_and_budget(usize::MAX, 8, Arc::clone(&budget));
+            RowDecodedColumnCache::with_limits_and_budget(usize::MAX, 8, Arc::clone(&budget));
         let loads = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             decoded

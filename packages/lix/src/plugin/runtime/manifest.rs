@@ -361,7 +361,7 @@ mod tests {
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
-                        "columns": ["entity_pk", "schema_key", "snapshot_content"]
+                        "columns": ["row_pk", "schema_key", "snapshot_content"]
                     }
                 }
             }"#,

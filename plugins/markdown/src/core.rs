@@ -34,8 +34,8 @@ pub struct File {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntityState {
-    pub entity_pk: Vec<String>,
+pub struct RowState {
+    pub row_pk: Vec<String>,
     pub schema_key: String,
     pub snapshot_content: String,
     pub metadata: Option<String>,
@@ -43,7 +43,7 @@ pub struct EntityState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetectedChange {
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub schema_key: String,
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
@@ -162,18 +162,18 @@ pub struct MarkdownPlugin;
 
 impl MarkdownPlugin {
     pub fn detect_changes(
-        state: Vec<EntityState>,
+        state: Vec<RowState>,
         file: File,
     ) -> Result<Vec<DetectedChange>, PluginError> {
         Self::detect_changes_with_namespace(state, file, IdNamespace::default())
     }
 
     pub fn detect_changes_with_namespace(
-        state: Vec<EntityState>,
+        state: Vec<RowState>,
         file: File,
         namespace: IdNamespace,
     ) -> Result<Vec<DetectedChange>, PluginError> {
-        let before = Projection::from_entity_state(state.into_iter())?;
+        let before = Projection::from_row_state(state.into_iter())?;
         let before_root = if before.nodes_by_id.is_empty() {
             None
         } else {
@@ -187,8 +187,8 @@ impl MarkdownPlugin {
         Ok(changes)
     }
 
-    pub fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
-        let projection = Projection::from_entity_state(state.into_iter())?;
+    pub fn render(state: Vec<RowState>) -> Result<Vec<u8>, PluginError> {
+        let projection = Projection::from_row_state(state.into_iter())?;
         let root = projection.to_tree()?;
         render_tree_with_lexical_fallback(&root)
     }
@@ -1275,7 +1275,7 @@ fn diff_tree(
     for id in before.nodes_by_id.keys().copied() {
         if !after.nodes_by_id.contains_key(id) {
             changes.push(DetectedChange {
-                entity_pk: vec![id.to_owned()],
+                row_pk: vec![id.to_owned()],
                 schema_key: NODE_SCHEMA_KEY.to_string(),
                 snapshot_content: None,
                 metadata: None,
@@ -1290,7 +1290,7 @@ fn diff_tree(
             PluginError::Internal(format!("failed to serialize Markdown node '{id}': {error}"))
         })?;
         changes.push(DetectedChange {
-            entity_pk: vec![(*id).to_owned()],
+            row_pk: vec![(*id).to_owned()],
             schema_key: NODE_SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content),
             metadata: change_metadata(before.nodes_by_id.get(id).copied(), node),
@@ -1314,39 +1314,39 @@ fn change_metadata(before: Option<&NodeSnapshot>, after: &NodeSnapshot) -> Optio
     }
 }
 
-fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
-    if entity_pk.len() != 1 {
+fn single_row_pk(mut row_pk: Vec<String>) -> Result<String, PluginError> {
+    if row_pk.len() != 1 {
         return Err(PluginError::InvalidInput(format!(
-            "expected single-component entity_pk, got {} components",
-            entity_pk.len()
+            "expected single-component row_pk, got {} components",
+            row_pk.len()
         )));
     }
-    Ok(entity_pk.remove(0))
+    Ok(row_pk.remove(0))
 }
 
 impl Projection {
-    fn from_entity_state(rows: impl Iterator<Item = EntityState>) -> Result<Self, PluginError> {
+    fn from_row_state(rows: impl Iterator<Item = RowState>) -> Result<Self, PluginError> {
         let mut nodes_by_id = BTreeMap::new();
         for row in rows {
             if row.schema_key != NODE_SCHEMA_KEY {
                 continue;
             }
-            let entity_pk = single_entity_pk(row.entity_pk)?;
+            let row_pk = single_row_pk(row.row_pk)?;
             let node: NodeSnapshot =
                 serde_json::from_str(&row.snapshot_content).map_err(|error| {
                     PluginError::InvalidInput(format!(
-                        "invalid Markdown node snapshot for entity_pk '{entity_pk}': {error}"
+                        "invalid Markdown node snapshot for row_pk '{row_pk}': {error}"
                     ))
                 })?;
-            if node.id != entity_pk {
+            if node.id != row_pk {
                 return Err(PluginError::InvalidInput(format!(
-                    "Markdown node snapshot id '{}' does not match entity_pk '{entity_pk}'",
+                    "Markdown node snapshot id '{}' does not match row_pk '{row_pk}'",
                     node.id
                 )));
             }
-            if nodes_by_id.insert(entity_pk.clone(), node).is_some() {
+            if nodes_by_id.insert(row_pk.clone(), node).is_some() {
                 return Err(PluginError::InvalidInput(format!(
-                    "duplicate Markdown node entity_pk '{entity_pk}'"
+                    "duplicate Markdown node row_pk '{row_pk}'"
                 )));
             }
         }
@@ -1501,16 +1501,16 @@ pub enum ChangeEffect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntityRecord {
+pub struct RowRecord {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntityChange {
+pub struct RowChange {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Option<Vec<u8>>,
     pub effect: ChangeEffect,
 }
@@ -1877,15 +1877,15 @@ fn wire_to_logical(snapshot: &[u8]) -> Result<String, PluginError> {
     })
 }
 
-fn detected_to_entity_change(change: DetectedChange) -> Result<EntityChange, PluginError> {
+fn detected_to_row_change(change: DetectedChange) -> Result<RowChange, PluginError> {
     let effect = if change.metadata.as_deref() == Some(r#"{"impact":"format"}"#) {
         ChangeEffect::FormatOnly
     } else {
         ChangeEffect::Content
     };
-    Ok(EntityChange {
+    Ok(RowChange {
         schema_key: change.schema_key,
-        entity_pk: change.entity_pk,
+        row_pk: change.row_pk,
         snapshot: change
             .snapshot_content
             .as_deref()
@@ -1895,7 +1895,7 @@ fn detected_to_entity_change(change: DetectedChange) -> Result<EntityChange, Plu
     })
 }
 
-fn entity_change_to_detected(change: EntityChange) -> Result<DetectedChange, PluginError> {
+fn row_change_to_detected(change: RowChange) -> Result<DetectedChange, PluginError> {
     if change.schema_key != NODE_SCHEMA_KEY {
         return Err(PluginError::InvalidInput(format!(
             "Markdown transition received foreign schema '{}'",
@@ -1904,7 +1904,7 @@ fn entity_change_to_detected(change: EntityChange) -> Result<DetectedChange, Plu
     }
     Ok(DetectedChange {
         schema_key: change.schema_key,
-        entity_pk: change.entity_pk,
+        row_pk: change.row_pk,
         snapshot_content: change
             .snapshot
             .as_deref()
@@ -1990,8 +1990,8 @@ fn projection_after_detected_changes(
         format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
     }
     for change in changes {
-        let id = change.entity_pk.first().ok_or_else(|| {
-            PluginError::InvalidInput("Markdown entity_pk must contain one id".into())
+        let id = change.row_pk.first().ok_or_else(|| {
+            PluginError::InvalidInput("Markdown row_pk must contain one id".into())
         })?;
         if let Some(snapshot_content) = &change.snapshot_content {
             let node: NodeSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
@@ -2008,7 +2008,7 @@ fn projection_after_detected_changes(
 }
 
 impl Document {
-    /// Resolves one concurrent Markdown entity change without depending on a
+    /// Resolves one concurrent Markdown row change without depending on a
     /// hydrated document.
     ///
     /// `a` and `b` are already in the engine's stable merge order.
@@ -2017,7 +2017,7 @@ impl Document {
     /// can safely retain both edits instead. Everything structural, formatted,
     /// deleted, malformed, or overlapping deliberately takes the b
     /// snapshot unchanged.
-    pub fn resolve_entity_conflict(
+    pub fn resolve_row_conflict(
         base: Option<Vec<u8>>,
         a: Option<Vec<u8>>,
         b: Option<Vec<u8>>,
@@ -2034,7 +2034,7 @@ impl Document {
         bytes: Vec<u8>,
         path: Option<&str>,
         namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), PluginError> {
+    ) -> Result<(Self, Vec<RowChange>), PluginError> {
         Self::open_file_with_literal_fast_path(bytes, path, namespace, true)
     }
 
@@ -2043,7 +2043,7 @@ impl Document {
         bytes: Vec<u8>,
         path: Option<&str>,
         namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), PluginError> {
+    ) -> Result<(Self, Vec<RowChange>), PluginError> {
         Self::open_file_with_literal_fast_path(bytes, path, namespace, false)
     }
 
@@ -2052,7 +2052,7 @@ impl Document {
         path: Option<&str>,
         namespace: IdNamespace,
         allow_literal_fast_path: bool,
-    ) -> Result<(Self, Vec<EntityChange>), PluginError> {
+    ) -> Result<(Self, Vec<RowChange>), PluginError> {
         let file = File {
             filename: path.map(ToOwned::to_owned),
             content: bytes.clone(),
@@ -2064,7 +2064,7 @@ impl Document {
             detect_changes_for_markdown(&ProjectionView::default(), None, parsed, namespace, 0)?;
         let changes = detected
             .into_iter()
-            .map(detected_to_entity_change)
+            .map(detected_to_row_change)
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
             Self {
@@ -2076,8 +2076,8 @@ impl Document {
         ))
     }
 
-    pub fn open_entities(
-        records: Vec<EntityRecord>,
+    pub fn open_rows(
+        records: Vec<RowRecord>,
         accepted: Option<Vec<u8>>,
     ) -> Result<(Self, Vec<ByteEdit>), PluginError> {
         let state = records
@@ -2089,15 +2089,15 @@ impl Document {
                         record.schema_key
                     )));
                 }
-                Ok(EntityState {
-                    entity_pk: record.entity_pk,
+                Ok(RowState {
+                    row_pk: record.row_pk,
                     schema_key: record.schema_key,
                     snapshot_content: wire_to_logical(&record.snapshot)?,
                     metadata: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let projection = Projection::from_entity_state(state.iter().cloned())?;
+        let projection = Projection::from_row_state(state.iter().cloned())?;
         let mut root = projection.to_tree()?;
         let source_required = root
             .node
@@ -2259,7 +2259,7 @@ impl Document {
         splice: FileEdit<'_>,
         namespace: IdNamespace,
         minimum_ordinal: u32,
-    ) -> Result<Option<(Vec<EntityChange>, Vec<u8>, Vec<u8>)>, PluginError> {
+    ) -> Result<Option<(Vec<RowChange>, Vec<u8>, Vec<u8>)>, PluginError> {
         let (&fallback_flag, root_json) = root_json
             .split_first()
             .ok_or_else(|| PluginError::InvalidInput("Markdown arena root is empty".to_owned()))?;
@@ -2295,7 +2295,7 @@ impl Document {
         };
         let changes = detected
             .into_iter()
-            .map(detected_to_entity_change)
+            .map(detected_to_row_change)
             .collect::<Result<Vec<_>, _>>()?;
         let successor = Self {
             bytes: successor_bytes,
@@ -2320,7 +2320,7 @@ impl Document {
         &self,
         splices: &[FileEdit<'_>],
         namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), PluginError> {
+    ) -> Result<(Self, Vec<RowChange>), PluginError> {
         let successor_bytes = self.bytes.splice(splices)?;
         let (detected, top_level_ranges, tree) = if let Some(incremental) =
             self.try_paragraph_replacement(splices, &successor_bytes, namespace)?
@@ -2347,7 +2347,7 @@ impl Document {
         };
         let changes = detected
             .into_iter()
-            .map(detected_to_entity_change)
+            .map(detected_to_row_change)
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
             Self {
@@ -2359,16 +2359,16 @@ impl Document {
         ))
     }
 
-    pub fn entities_changed(
+    pub fn rows_changed(
         &self,
-        changes: Vec<EntityChange>,
+        changes: Vec<RowChange>,
     ) -> Result<(Self, Vec<ByteEdit>), PluginError> {
         let detected = changes
             .into_iter()
-            .map(entity_change_to_detected)
+            .map(row_change_to_detected)
             .collect::<Result<Vec<_>, _>>()?;
         if let Some((bytes, top_level_ranges, edits, tree)) =
-            self.try_paragraph_entity_change(&detected)?
+            self.try_paragraph_row_change(&detected)?
         {
             return Ok((
                 Self {
@@ -2396,7 +2396,7 @@ impl Document {
         ))
     }
 
-    fn try_paragraph_entity_change(
+    fn try_paragraph_row_change(
         &self,
         changes: &[DetectedChange],
     ) -> Result<
@@ -2428,7 +2428,7 @@ impl Document {
             .base
             .children
             .iter()
-            .position(|child| change.entity_pk == [child.node.id.clone()])
+            .position(|child| change.row_pk == [child.node.id.clone()])
         else {
             return Ok(None);
         };
@@ -2594,7 +2594,7 @@ impl Document {
                 ))
             })?;
             vec![DetectedChange {
-                entity_pk: vec![new.node.id.clone()],
+                row_pk: vec![new.node.id.clone()],
                 schema_key: NODE_SCHEMA_KEY.to_owned(),
                 snapshot_content: Some(snapshot_content),
                 metadata: change_metadata(Some(&old.node), &new.node),
@@ -2923,7 +2923,7 @@ fn chars_to_string(base: &[char], edits: &[TextReplacement]) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn semantic_records_without_raw_source(source: Vec<u8>) -> Vec<EntityRecord> {
+    fn semantic_records_without_raw_source(source: Vec<u8>) -> Vec<RowRecord> {
         let (_, mut changes) = Document::open_file(
             source,
             Some("competitors.md"),
@@ -2955,9 +2955,9 @@ mod tests {
         changes
             .into_iter()
             .filter_map(|change| {
-                change.snapshot.map(|snapshot| EntityRecord {
+                change.snapshot.map(|snapshot| RowRecord {
                     schema_key: change.schema_key,
-                    entity_pk: change.entity_pk,
+                    row_pk: change.row_pk,
                     snapshot,
                 })
             })
@@ -2996,13 +2996,13 @@ Another paragraph with *single-asterisk emphasis* and `inline code`.
             "the fixture must take the noncanonical source path"
         );
         let records = semantic_records_without_raw_source(source.clone());
-        let error = Document::open_entities(records.clone(), None)
+        let error = Document::open_rows(records.clone(), None)
             .expect_err("a noncanonical restore without accepted bytes must fail closed");
         assert!(
             matches!(error, PluginError::InvalidInput(message) if message.contains("accepted file bytes"))
         );
         let (restored, edits) =
-            Document::open_entities(records, Some(source.clone())).expect("accepted bytes restore");
+            Document::open_rows(records, Some(source.clone())).expect("accepted bytes restore");
         assert!(edits.is_empty());
         assert_eq!(restored.bytes.materialize(), source);
     }
@@ -3018,9 +3018,8 @@ Another paragraph with *single-asterisk emphasis* and `inline code`.
         for source in corpus {
             let source = source.as_bytes().to_vec();
             let records = semantic_records_without_raw_source(source.clone());
-            let (first, first_edits) =
-                Document::open_entities(records.clone(), Some(source.clone()))
-                    .expect("first accepted restore");
+            let (first, first_edits) = Document::open_rows(records.clone(), Some(source.clone()))
+                .expect("first accepted restore");
             assert!(first_edits.is_empty());
             let (first_root, first_blocks) = first.arena_state().expect("first arena state");
             let second =
@@ -3048,7 +3047,7 @@ Another paragraph must survive an unrelated semantic edit.
         .to_vec();
         let records = semantic_records_without_raw_source(source.clone());
         let (restored, edits) =
-            Document::open_entities(records, Some(source.clone())).expect("accepted bytes restore");
+            Document::open_rows(records, Some(source.clone())).expect("accepted bytes restore");
         assert!(edits.is_empty());
         let expected_tree = restored.tree.materialize();
         let expected_child_count = expected_tree.children.len();
@@ -3085,9 +3084,9 @@ Another paragraph must survive an unrelated semantic edit.
         )
         .expect("edited wire Markdown snapshot");
         let (successor, _) = reopened
-            .entities_changed(vec![EntityChange {
+            .rows_changed(vec![RowChange {
                 schema_key: NODE_SCHEMA_KEY.to_owned(),
-                entity_pk: vec![edited_id.clone()],
+                row_pk: vec![edited_id.clone()],
                 snapshot: Some(snapshot),
                 effect: ChangeEffect::Content,
             }])

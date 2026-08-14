@@ -73,7 +73,7 @@ Use `lix_registered_schema` to discover available schemas. Use `lix_change` for 
 
 ## Conflicts
 
-Merge is per entity today. Two branches that edit different rows can merge cleanly. Two branches that edit the same row produce a `sameEntityChanged` conflict.
+Merge is per row today. Two branches that edit different rows can merge cleanly. Two branches that edit the same row produce a `sameRowChanged` conflict.
 
 See [Branching](./branching.md) for preview results and conflict handling.
 

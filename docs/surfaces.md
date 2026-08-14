@@ -1,5 +1,5 @@
 ---
-description: "The application-oriented SQL surfaces in Lix: typed entities, files, directories, schema discovery, and insert policies."
+description: "The application-oriented SQL surfaces in Lix: typed rows, files, directories, schema discovery, and insert policies."
 ---
 
 # SQL Surfaces
@@ -8,7 +8,7 @@ Lix exposes logical application data through typed SQL relations:
 
 | Data                              | Active branch                | Cross-branch                           | History / diff functions           |
 | :-------------------------------- | :--------------------------- | :------------------------------------- | :--------------------------------- |
-| Registered application entity `X` | `<schema>`                   | `<schema>_by_branch`                   | `<schema>_history()`               |
+| Registered application row `X` | `<schema>`                   | `<schema>_by_branch`                   | `<schema>_history()`               |
 | Files                             | `lix_file`                   | `lix_file_by_branch`                   | `lix_file_history()`               |
 | Directories                       | `lix_directory`              | `lix_directory_by_branch`              | `lix_directory_history()`          |
 | Working diffs                     | `lix_working_diff`           | `lix_working_diff_by_branch`           | `lix_diff(from_commit, to_commit)` |
@@ -86,11 +86,11 @@ omitted on insert, and rejects an explicit `NULL`.
 | `CONDITIONAL` | Whether the column is required depends on the row's other inputs. |
 
 `CONDITIONAL` covers deliberate alternative forms: filesystem rows can use a
-`path` or their directory/name fields, and typed entities can derive
-`lixcol_entity_pk` from their public primary-key columns. These policies
+`path` or their directory/name fields, and typed rows can derive
+`lixcol_row_pk` from their public primary-key columns. These policies
 describe omission only; `is_nullable` still describes read values.
 
-## Typed entity surfaces
+## Typed schema surfaces
 
 Registering a Schema v1 document with `key: "acme_task"` produces:
 

@@ -205,7 +205,7 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
 }
 
 #[tokio::test]
-#[ignore = "single entity exceeds the deliberately bounded v3 page contract"]
+#[ignore = "single row exceeds the deliberately bounded v3 page contract"]
 async fn git_text_plugin_reads_only_a_large_after_range_and_updates_one_line_row() {
     const MIB: usize = 1024 * 1024;
 
@@ -363,7 +363,7 @@ where
 {
     let result = lix
         .execute(
-            "SELECT lixcol_entity_pk, id, order_key, content_base64 \
+            "SELECT lixcol_row_pk, id, order_key, content_base64 \
              FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_owned())],
         )
@@ -375,7 +375,7 @@ where
         .map(|row| {
             let id = row.get::<String>("id").expect("line id should be text");
             assert_eq!(
-                row.get::<serde_json::Value>("lixcol_entity_pk")
+                row.get::<serde_json::Value>("lixcol_row_pk")
                     .expect("line primary key should be JSON"),
                 serde_json::json!([id.clone()]),
                 "line snapshot identity must equal its durable primary key"

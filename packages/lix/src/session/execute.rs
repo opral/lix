@@ -1871,7 +1871,7 @@ where
                             // Keep the large statement executor behind a heap boundary. The
                             // lending transaction closure already carries the whole parsed batch;
                             // embedding this future in it makes debug poll stacks exceed the
-                            // standard 2 MiB worker stack for ordinary entity writes.
+                            // standard 2 MiB worker stack for ordinary row writes.
                             let operation = Box::pin(execute_transaction_statement(
                                 transaction,
                                 &sql,
@@ -3478,10 +3478,10 @@ where
 /// Returns true only when SQL directly delivers one file's bytes to the
 /// caller. Materializing `data` inside an aggregate, join, filter, or derived
 /// expression is not acknowledgement: the caller did not receive those bytes
-/// and must not gain the ability to delete entities that only existed there.
+/// and must not gain the ability to delete rows that only existed there.
 ///
 /// This intentionally recognizes a narrow, predictable MVP surface. False
-/// negatives merely preserve an omitted entity; false positives can lose one.
+/// negatives merely preserve an omitted row; false positives can lose one.
 fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
     let Some(point_read) = simple_point_read(statement) else {
         return false;
@@ -4497,7 +4497,7 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 mod tests {
     use super::*;
     use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
     };
@@ -4555,7 +4555,7 @@ mod tests {
         let overlay_rows = session
             .hot_state
             .reader(&read)
-            .entity_columnar_overlay_len_for_test(&branch_id, schema_key)
+            .row_columnar_overlay_len_for_test(&branch_id, schema_key)
             .await
             .expect("columnar route should plan")
             .expect("fixture must retain the authenticated columnar path");
@@ -4594,7 +4594,7 @@ mod tests {
                 .expect("replacement metadata should load")
                 .expect("current head must publish replacement metadata");
         assert_eq!(u64::from(replay.member_count), expected_rows);
-        let id = crate::hot_state::entity_row_group_set_id(head.commit_id, schema_key);
+        let id = crate::hot_state::row_group_set_id(head.commit_id, schema_key);
         let manifest = crate::columnar_row_group::load_row_group_manifest(&state_read, id)
             .await
             .expect("columnar manifest lookup should succeed");
@@ -5273,7 +5273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_lowers_distinct_bound_entity_inserts_once() {
+    async fn execute_batch_lowers_distinct_bound_row_inserts_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -5292,7 +5292,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql = "INSERT INTO parameter_insert_batch_probe (id, value) VALUES ($1, $2)";
         let results = session
             .execute_batch(&[
@@ -5317,7 +5317,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             1
         );
         assert_eq!(
@@ -5337,7 +5337,7 @@ mod tests {
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "value-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "value-b");
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -5361,7 +5361,7 @@ mod tests {
             .expect_err("the second INSERT conflicts with committed row b");
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         let rows = session
@@ -6066,7 +6066,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("sidecar read scope should open");
-        let row_group_id = crate::hot_state::entity_row_group_set_id(
+        let row_group_id = crate::hot_state::row_group_set_id(
             crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle insert head")
                 .expect("insert head should be canonical"),
             "columnar_lifecycle_probe",
@@ -6160,13 +6160,13 @@ mod tests {
         let point_keys = point_ids
             .iter()
             .map(|identity| {
-                let entity_pk = EntityPk::from_json_array_text(&format!("[\"{identity}\"]"))
+                let row_pk = RowPk::from_json_array_text(&format!("[\"{identity}\"]"))
                     .expect("test identity should parse");
                 bytes::Bytes::from(crate::tracked_state::encode_key_ref(
                     crate::tracked_state::TrackedStateKeyRef {
                         schema_key: "columnar_lifecycle_probe",
                         file_id: None,
-                        entity_pk: &entity_pk,
+                        row_pk: &row_pk,
                     },
                 ))
             })
@@ -6799,7 +6799,7 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = CAST('[\"amended_parameter_insert_probe\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"amended_parameter_insert_probe\"]' AS JSONB)",
                 &[Value::Json(amended_schema.into())],
             )
             .await
@@ -6811,7 +6811,7 @@ mod tests {
                 label: None,
                 sql: sql.to_string(),
                 params: vec![
-                    Value::Text(format!("entity-{index:05}")),
+                    Value::Text(format!("row-{index:05}")),
                     Value::Text(format!("value-{index:05}")),
                 ],
             })
@@ -6896,7 +6896,7 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = CAST('[\"amended_parameter_update_probe\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"amended_parameter_update_probe\"]' AS JSONB)",
                 &[Value::Json(amended_schema.into())],
             )
             .await
@@ -7191,7 +7191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_declines_uncertified_entity_insert_rows() {
+    async fn execute_batch_declines_uncertified_row_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -7210,7 +7210,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql =
             "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
         let error = session
@@ -7237,7 +7237,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
     }
@@ -7262,7 +7262,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql = "INSERT INTO parameter_insert_json_string_probe (id, value) VALUES ($1, $2)";
         let error = session
             .execute_batch(&[
@@ -7287,7 +7287,7 @@ mod tests {
             .expect_err("JSON objects must not be coerced into string column values");
         assert_eq!(error.details.unwrap()["statementIndex"], 0);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         let rows = session
@@ -7317,7 +7317,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql = "INSERT INTO parameter_insert_error_order_probe (id, value) VALUES ($1, $2)";
         let error = session
             .execute_batch(&[
@@ -7348,7 +7348,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         let rows = session
@@ -7490,7 +7490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
+    async fn execute_batch_lowers_distinct_bound_row_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -7517,7 +7517,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_probe SET value = $1 WHERE id = $2";
         let results = session
             .execute_batch(&[
@@ -7541,7 +7541,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 1);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 1);
         assert_eq!(
             results
                 .iter()
@@ -7675,7 +7675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_lowers_distinct_literal_entity_updates_once() {
+    async fn execute_batch_lowers_distinct_literal_row_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -7702,7 +7702,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let results = session
             .execute_batch(&[
                 batch_statement(
@@ -7715,7 +7715,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 1);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 1);
         assert_eq!(
             results
                 .iter()
@@ -7735,7 +7735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entity_insert_values_use_one_certified_canonical_batch() {
+    async fn row_insert_values_use_one_certified_canonical_batch() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -7754,7 +7754,7 @@ mod tests {
             .await
             .expect("schema registration should succeed");
 
-        sql2::take_certified_entity_insert_batch_executions();
+        sql2::take_certified_row_insert_batch_executions();
         session
             .execute(
                 "INSERT INTO certified_insert_probe (value, id) VALUES \
@@ -7764,7 +7764,7 @@ mod tests {
             .await
             .expect("certified insert batch should commit");
 
-        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 1);
+        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 1);
         let rows = session
             .execute(
                 "SELECT id, value FROM certified_insert_probe ORDER BY id",
@@ -7803,7 +7803,7 @@ mod tests {
             .await
             .expect("seed row should commit");
 
-        sql2::take_certified_entity_insert_batch_executions();
+        sql2::take_certified_row_insert_batch_executions();
         session
             .execute(
                 "INSERT INTO conflict_validation_probe (id, value) VALUES ('a', 'x') \
@@ -7813,7 +7813,7 @@ mod tests {
             .await
             .expect("conflicting invalid payload should be discarded before validation");
 
-        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 0);
+        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 0);
         let rows = session
             .execute(
                 "SELECT value FROM conflict_validation_probe WHERE id = 'a'",
@@ -7846,10 +7846,10 @@ mod tests {
             .await
             .expect("schema registration should succeed");
 
-        sql2::take_certified_entity_insert_batch_executions();
+        sql2::take_certified_row_insert_batch_executions();
         session
             .execute(
-                "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_entity_pk) \
+                "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_row_pk) \
                  VALUES ($1, 'value', CAST($2 AS JSONB))",
                 &[
                     Value::Text(UUID.to_string()),
@@ -7859,7 +7859,7 @@ mod tests {
             .await
             .expect("matching typed and external UUID keys should commit");
 
-        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 1);
+        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 1);
         let rows = session
             .execute(
                 "SELECT value FROM explicit_uuid_key_probe WHERE id = $1",
@@ -8552,7 +8552,7 @@ mod tests {
             .unwrap();
         let reinserted_created_at = reinserted
             .iter()
-            .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
+            .find(|row| row.row_pk().as_single_string().ok() == Some("/32767"))
             .expect("reinserted row must be visible")
             .created_at();
 
@@ -8603,7 +8603,7 @@ mod tests {
         assert_eq!(
             post_reinsert
                 .iter()
-                .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
+                .find(|row| row.row_pk().as_single_string().ok() == Some("/32767"))
                 .expect("updated reinserted row must be visible")
                 .created_at(),
             reinserted_created_at,
@@ -8796,7 +8796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_keeps_repeated_generic_entity_identity_sequential() {
+    async fn execute_batch_keeps_repeated_generic_row_identity_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -8814,7 +8814,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let insert_sql = "INSERT INTO parameter_batch_repeat_probe (id, value) VALUES ($1, $2)";
         let error = session
             .execute_batch(&[
@@ -8839,7 +8839,7 @@ mod tests {
             .expect_err("the second INSERT repeats the first identity");
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         session
@@ -8850,7 +8850,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_repeat_probe SET value = $1 WHERE id = $2";
         session
             .execute_batch(&[
@@ -8874,7 +8874,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
         let row = session
             .execute(
                 "SELECT value FROM parameter_batch_repeat_probe WHERE id = 'a'",
@@ -8912,7 +8912,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let results = session
             .execute_batch(&[
                 batch_statement(
@@ -8933,7 +8933,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 1]
         );
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
         let row = session
             .execute(
                 "SELECT value FROM parameterless_batch_probe WHERE id = 'a'",
@@ -8973,7 +8973,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let insert_sql = "INSERT INTO parameter_batch_constraint_probe (id, value) VALUES ($1, $2)";
         session
             .execute_batch(&[
@@ -8997,11 +8997,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_constraint_probe SET value = $1 WHERE id = $2";
         session
             .execute_batch(&[
@@ -9025,7 +9025,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
     }
 
     #[tokio::test]
@@ -9056,7 +9056,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_error_probe SET value = CAST($1 AS JSONB) WHERE id = $2";
         let error = session
             .execute_batch(&[
@@ -9081,7 +9081,7 @@ mod tests {
             .expect_err("the second statement has invalid JSON");
 
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
         let rows = session
             .execute(
                 "SELECT id, value FROM parameter_batch_error_probe ORDER BY id",
@@ -9592,9 +9592,9 @@ mod tests {
                  FROM files AS file_a \
                  JOIN files AS file_b ON file_a.id = file_b.id \
                  LEFT JOIN (\
-                     SELECT entity_pk FROM lix_change \
+                     SELECT row_pk FROM lix_change \
                      UNION ALL \
-                     SELECT entity_pk FROM lix_change\
+                     SELECT row_pk FROM lix_change\
                  ) AS changes ON false",
                 &[],
             )
@@ -9633,11 +9633,11 @@ mod tests {
         session
             .execute("SELECT COUNT(*) AS rows FROM lix_key_value", &[])
             .await
-            .expect("fixed entity surface should execute");
+            .expect("fixed schema surface should execute");
         assert_eq!(
             schema_loads(),
             before,
-            "fixed entity metadata comes from compile-time schemas"
+            "fixed row metadata comes from compile-time schemas"
         );
 
         session
@@ -9697,11 +9697,11 @@ mod tests {
         session
             .execute("SELECT COUNT(*) AS rows FROM custom_catalog_probe", &[])
             .await
-            .expect("custom entity should execute");
+            .expect("custom row should execute");
         assert_eq!(
             schema_loads(),
             before_custom_read,
-            "custom entity metadata must use the compiled catalog instead of rescanning schemas"
+            "custom row metadata must use the compiled catalog instead of rescanning schemas"
         );
 
         let before_mixed_join = schema_loads();
@@ -9750,7 +9750,7 @@ mod tests {
 
         fn row(value: &str, created_at: Option<&str>) -> TransactionWriteRow {
             TransactionWriteRow {
-                entity_pk: Some(EntityPk::single(KEY)),
+                row_pk: Some(RowPk::single(KEY)),
                 schema_key: "lix_key_value".into(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(serde_json::json!({

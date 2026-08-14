@@ -79,7 +79,7 @@ physical device traffic: a zero read delta does not prove zero logical reads or
 absence of read amplification. Use isolated cold-cache runs or backend-native
 logical counters when making cold-read amplification claims.
 
-Normalized-row cases compare Lix with a separate entity-level three-way model and
+Normalized-row cases compare Lix with a separate row-level three-way model and
 compare `lix_diff` row counts with an independent map diff. Branch fanout reports
 first, median, last, and maximum creation latency instead of hiding progression in
 one batch mean. They assert preview non-mutation, preview/commit agreement, failed-merge
@@ -110,7 +110,7 @@ are host-independent:
 - Historical diff must scale with changed rows, not repository rows or common history.
 - Unrelated common history may affect merge-base lookup but must not amplify
   row analysis or plugin materialization.
-- Incremental peak RSS must scale with changed entities and affected files, not
+- Incremental peak RSS must scale with changed rows and affected files, not
   all live rows or all installed plugins.
 - Preview must retain no durable state; rejected merge must retain neither rows
   nor a branch-head move.

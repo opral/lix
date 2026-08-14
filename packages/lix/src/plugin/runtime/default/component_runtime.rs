@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::plugin::wire::{Operation, Page as EntityPage, Representation, encode_single_section};
+use crate::plugin::wire::{Operation, Page as RowPage, Representation, encode_single_section};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lix::plugin::runtime::v1::{
@@ -16,16 +16,16 @@ use lix::plugin::runtime::v1::{
     Transaction as ArenaTransaction,
 };
 use lix::plugin::runtime::{
-    PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedCreateRange, WasmCertifiedEntityBatch,
+    PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedCreateRange, WasmCertifiedRowBatch,
     WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictResolutionPage,
     WasmConflictTake, WasmConflictTransition, WasmConflictUpdate, WasmCreateContext,
     WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
-    WasmEditCursorHandle, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChanges,
-    WasmEntityKey, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
-    WasmGuestBytes, WasmHostBytes, WasmHostEntityConflict, WasmInputBytes, WasmOpenEntitiesInput,
-    WasmOpenFileInput, WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle,
-    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    WasmEditCursorHandle, WasmEditPage, WasmFileTransition, WasmFileUpdate, WasmGuestBytes,
+    WasmHostBytes, WasmHostRowConflict, WasmInputBytes, WasmOpenFileInput, WasmOpenRowsInput,
+    WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle, WasmRow, WasmRowChange,
+    WasmRowChanges, WasmRowKey, WasmRowTransition, WasmRowUpdate, WasmTransitionCounters,
+    WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix::wasm::WasmLimits;
 use lix::{LixError, SharedStr};
@@ -38,7 +38,7 @@ use super::{
 };
 
 // Warm transitions normally retain the engine's 2 MiB fixed page schedule.
-// Cold admission may scale as high as 16 MiB so a valid single text entity
+// Cold admission may scale as high as 16 MiB so a valid single text row
 // (for example a one-line source map) can cross the fused push sink.
 const COMPONENT_MAX_BATCH_BYTES: u32 = 16 * 1024 * 1024;
 // Admit one fused export per compiled plugin component before allocating its
@@ -65,7 +65,7 @@ pub(super) mod bindings {
             "lix:plugin/host.snapshot": super::SnapshotResource,
             "lix:plugin/host.transition": super::TransitionResource,
             "lix:plugin/host.conflict-source": super::ConflictSourceResource,
-            "lix:plugin/host.entity-source": super::EntitySourceResource,
+            "lix:plugin/host.row-source": super::RowSourceResource,
             "lix:plugin/host.resolution-sink": super::ResolutionSinkResource,
         },
     });
@@ -85,8 +85,8 @@ pub struct ConflictSourceResource {
     state: SharedResolutionState,
 }
 
-pub struct EntitySourceResource {
-    state: SharedEntityChangeState,
+pub struct RowSourceResource {
+    state: SharedRowChangeState,
 }
 
 pub struct ResolutionSinkResource {
@@ -95,7 +95,7 @@ pub struct ResolutionSinkResource {
 
 type SharedTransitionState = Arc<Mutex<TransitionState>>;
 type SharedResolutionState = Arc<Mutex<ResolutionState>>;
-type SharedEntityChangeState = Arc<Mutex<EntityChangeState>>;
+type SharedRowChangeState = Arc<Mutex<RowChangeState>>;
 type SharedByteBudget = Arc<Mutex<u64>>;
 
 struct TransitionState {
@@ -105,7 +105,7 @@ struct TransitionState {
     total_bytes: SharedByteBudget,
     pages: VecDeque<PendingChangePage>,
     attachments: Vec<Bytes>,
-    pending_attachment: Option<PendingEntityAttachment>,
+    pending_attachment: Option<PendingRowAttachment>,
     counters: WasmTransitionCounters,
     allow_file_replacement: bool,
     file_replacement: Option<PendingFileReplacement>,
@@ -117,31 +117,31 @@ struct PendingFileReplacement {
     complete: bool,
 }
 
-struct PendingEntityAttachment {
+struct PendingRowAttachment {
     expected_len: u64,
     bytes: Vec<u8>,
 }
 
-struct EntityChangeState {
+struct RowChangeState {
     limits: WasmTransitionLimits,
     started: Instant,
     total_bytes: SharedByteBudget,
-    source: EntityChangeInputSource,
+    source: RowChangeInputSource,
     next_ordinal: u32,
     lazy_snapshots: HashMap<u32, WasmHostBytes>,
     counters: WasmTransitionCounters,
 }
 
-enum EntityChangeInputSource {
-    Entities(Box<dyn lix::plugin::runtime::WasmEntitySource>),
-    Changes(Box<dyn lix::plugin::runtime::WasmEntityChangeSource>),
+enum RowChangeInputSource {
+    Rows(Box<dyn lix::plugin::runtime::WasmRowSource>),
+    Changes(Box<dyn lix::plugin::runtime::WasmRowChangeSource>),
 }
 
 struct ResolutionState {
     limits: WasmTransitionLimits,
     started: Instant,
     total_bytes: u64,
-    conflicts: Vec<WasmHostEntityConflict>,
+    conflicts: Vec<WasmHostRowConflict>,
     resolutions: Vec<ComponentResolution>,
     pending: Option<PendingReplacement>,
     counters: WasmTransitionCounters,
@@ -165,8 +165,8 @@ struct PendingReplacement {
 /// Host-owned wire pages retained until the engine asks for the next page.
 ///
 /// The first fused implementation decoded every pushed page immediately and retained
-/// the resulting entity graph until the guest export returned. Large imports
-/// therefore held all generic entity objects plus the gradually constructed
+/// the resulting row graph until the guest export returned. Large imports
+/// therefore held all generic row objects plus the gradually constructed
 /// canonical output. Keeping the bounded wire pages defers ownership expansion
 /// to the existing one-page-at-a-time drain.
 enum PendingChangePage {
@@ -231,7 +231,7 @@ fn decode_inline_change_page(
 
     let payload = Bytes::from(payload);
     let mut framed = PacketReader::new(&payload);
-    let row_size = size_of::<WasmEntityChange<WasmGuestBytes>>();
+    let row_size = size_of::<WasmRowChange<WasmGuestBytes>>();
     let capacity = record_count.min(payload.len().checked_div(row_size).unwrap_or(record_count));
     let mut changes = Vec::with_capacity(capacity);
     for _ in 0..record_count {
@@ -244,22 +244,22 @@ fn decode_inline_change_page(
         let mut record = framed.read_reader(record_len)?;
         let change = match record.read_u8()? {
             0 => {
-                let key = decode_entity_key(&mut record)?;
+                let key = decode_row_key(&mut record)?;
                 let effect = match record.read_u8()? {
                     0 => WasmChangeEffect::Content,
                     1 => WasmChangeEffect::FormatOnly,
                     _ => return Err(component_error("unknown change effect tag")),
                 };
-                WasmEntityChange::Upsert {
-                    entity: WasmEntity {
+                WasmRowChange::Upsert {
+                    row: WasmRow {
                         key,
                         snapshot_content: decode_guest_blob(&mut record, attachments)?,
                     },
                     effect,
                 }
             }
-            1 => WasmEntityChange::Delete(decode_entity_key(&mut record)?),
-            2 => WasmEntityChange::Create {
+            1 => WasmRowChange::Delete(decode_row_key(&mut record)?),
+            2 => WasmRowChange::Create {
                 schema_key: record.read_text()?.to_string(),
                 local_ref: record.read_u64()?,
                 resolved_key: None,
@@ -273,7 +273,7 @@ fn decode_inline_change_page(
     framed.finish()?;
     Ok(WasmChangePage {
         format_version: PACKET_FORMAT_V1,
-        changes: WasmEntityChanges { changes },
+        changes: WasmRowChanges { changes },
         outputs: None,
     })
 }
@@ -281,24 +281,24 @@ fn decode_inline_change_page(
 fn encode_packet_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
     output.extend_from_slice(
         &u32::try_from(value.len())
-            .map_err(|_| component_error("entity packet text exceeds u32"))?
+            .map_err(|_| component_error("row packet text exceeds u32"))?
             .to_le_bytes(),
     );
     output.extend_from_slice(value.as_bytes());
     Ok(())
 }
 
-fn decode_entity_key(reader: &mut PacketReader<'_>) -> Result<WasmEntityKey, LixError> {
+fn decode_row_key(reader: &mut PacketReader<'_>) -> Result<WasmRowKey, LixError> {
     let schema_key = reader.read_text()?;
     let pk_count = reader.read_u32()?;
     if pk_count as usize > reader.remaining() / size_of::<u32>() {
         return Err(component_error(
-            "entity primary-key component count exceeds packet bounds",
+            "row primary-key component count exceeds packet bounds",
         ));
     }
-    let mut key = WasmEntityKey::from_shared_parts(schema_key, std::iter::empty());
+    let mut key = WasmRowKey::from_shared_parts(schema_key, std::iter::empty());
     for _ in 0..pk_count {
-        key.entity_pk.push(reader.read_text()?);
+        key.row_pk.push(reader.read_text()?);
     }
     Ok(key)
 }
@@ -317,9 +317,9 @@ fn decode_guest_blob(
             let length = reader.read_u64()?;
             let bytes = attachments
                 .get(ordinal as usize)
-                .ok_or_else(|| component_error("entity attachment ordinal is out of bounds"))?;
+                .ok_or_else(|| component_error("row attachment ordinal is out of bounds"))?;
             if bytes.len() as u64 != length {
-                return Err(component_error("entity attachment length does not match"));
+                return Err(component_error("row attachment length does not match"));
             }
             Ok(WasmGuestBytes::Inline(bytes.clone()))
         }
@@ -464,7 +464,7 @@ impl TransitionState {
     fn take_pages(&mut self) -> Result<VecDeque<PendingChangePage>, LixError> {
         if self.pending_attachment.is_some() {
             return Err(component_error(
-                "entity attachment remained incomplete after plugin return",
+                "row attachment remained incomplete after plugin return",
             ));
         }
         Ok(std::mem::take(&mut self.pages))
@@ -514,7 +514,7 @@ impl TransitionState {
 impl ResolutionState {
     fn new(
         limits: WasmTransitionLimits,
-        conflicts: Vec<WasmHostEntityConflict>,
+        conflicts: Vec<WasmHostRowConflict>,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
@@ -592,17 +592,17 @@ impl ResolutionState {
     }
 }
 
-impl EntityChangeState {
-    fn from_entities(
+impl RowChangeState {
+    fn from_rows(
         limits: WasmTransitionLimits,
-        source: Box<dyn lix::plugin::runtime::WasmEntitySource>,
+        source: Box<dyn lix::plugin::runtime::WasmRowSource>,
         total_bytes: SharedByteBudget,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
             started: Instant::now(),
             total_bytes,
-            source: EntityChangeInputSource::Entities(source),
+            source: RowChangeInputSource::Rows(source),
             next_ordinal: 0,
             lazy_snapshots: HashMap::new(),
             counters: WasmTransitionCounters::default(),
@@ -611,14 +611,14 @@ impl EntityChangeState {
 
     fn from_changes(
         limits: WasmTransitionLimits,
-        source: Box<dyn lix::plugin::runtime::WasmEntityChangeSource>,
+        source: Box<dyn lix::plugin::runtime::WasmRowChangeSource>,
         total_bytes: SharedByteBudget,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
             started: Instant::now(),
             total_bytes,
-            source: EntityChangeInputSource::Changes(source),
+            source: RowChangeInputSource::Changes(source),
             next_ordinal: 0,
             lazy_snapshots: HashMap::new(),
             counters: WasmTransitionCounters::default(),
@@ -628,20 +628,18 @@ impl EntityChangeState {
     fn next_page(
         &mut self,
         max_bytes: u32,
-    ) -> Result<Option<Vec<WasmEntityChange<WasmHostBytes>>>, LixError> {
+    ) -> Result<Option<Vec<WasmRowChange<WasmHostBytes>>>, LixError> {
         match &mut self.source {
-            EntityChangeInputSource::Entities(source) => {
-                Ok(source.next_page(max_bytes)?.map(|page| {
-                    page.entities
-                        .into_iter()
-                        .map(|entity| WasmEntityChange::Upsert {
-                            entity,
-                            effect: WasmChangeEffect::Content,
-                        })
-                        .collect()
-                }))
-            }
-            EntityChangeInputSource::Changes(source) => {
+            RowChangeInputSource::Rows(source) => Ok(source.next_page(max_bytes)?.map(|page| {
+                page.rows
+                    .into_iter()
+                    .map(|row| WasmRowChange::Upsert {
+                        row,
+                        effect: WasmChangeEffect::Content,
+                    })
+                    .collect()
+            })),
+            RowChangeInputSource::Changes(source) => {
                 Ok(source.next_page(max_bytes)?.map(|page| page.changes))
             }
         }
@@ -650,7 +648,7 @@ impl EntityChangeState {
     fn check_active(&self) -> Result<(), bindings::lix::plugin::host::HostError> {
         if self.started.elapsed().as_nanos() >= u128::from(self.limits.total_deadline_nanoseconds) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "component entity transition deadline elapsed".to_owned(),
+                "component row transition deadline elapsed".to_owned(),
             ));
         }
         Ok(())
@@ -660,7 +658,7 @@ impl EntityChangeState {
         self.check_active()?;
         if bytes > self.limits.max_page_bytes as usize {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "component entity-change chunk exceeds max-page-bytes".to_owned(),
+                "component row-change chunk exceeds max-page-bytes".to_owned(),
             ));
         }
         let mut total_bytes = self
@@ -669,12 +667,12 @@ impl EntityChangeState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *total_bytes = total_bytes.checked_add(bytes as u64).ok_or_else(|| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "component entity-change byte count overflowed".to_owned(),
+                "component row-change byte count overflowed".to_owned(),
             )
         })?;
         if *total_bytes > self.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "component entity transition exceeds max-total-bytes".to_owned(),
+                "component row transition exceeds max-total-bytes".to_owned(),
             ));
         }
         self.counters.component_boundary_bytes = self
@@ -685,29 +683,26 @@ impl EntityChangeState {
     }
 }
 
-fn merge_entity_input_profile(
-    target: &mut WasmTransitionCounters,
-    source: &WasmTransitionCounters,
-) {
-    target.entity_input_pages = target
-        .entity_input_pages
-        .saturating_add(source.entity_input_pages);
-    target.entity_input_records = target
-        .entity_input_records
-        .saturating_add(source.entity_input_records);
-    target.entity_input_wire_bytes = target
-        .entity_input_wire_bytes
-        .saturating_add(source.entity_input_wire_bytes);
-    target.entity_input_attachment_reads = target
-        .entity_input_attachment_reads
-        .saturating_add(source.entity_input_attachment_reads);
-    target.entity_input_attachment_bytes = target
-        .entity_input_attachment_bytes
-        .saturating_add(source.entity_input_attachment_bytes);
+fn merge_row_input_profile(target: &mut WasmTransitionCounters, source: &WasmTransitionCounters) {
+    target.row_input_pages = target
+        .row_input_pages
+        .saturating_add(source.row_input_pages);
+    target.row_input_records = target
+        .row_input_records
+        .saturating_add(source.row_input_records);
+    target.row_input_wire_bytes = target
+        .row_input_wire_bytes
+        .saturating_add(source.row_input_wire_bytes);
+    target.row_input_attachment_reads = target
+        .row_input_attachment_reads
+        .saturating_add(source.row_input_attachment_reads);
+    target.row_input_attachment_bytes = target
+        .row_input_attachment_bytes
+        .saturating_add(source.row_input_attachment_bytes);
 }
 
 fn conflict_value<'a>(
-    conflict: &'a WasmHostEntityConflict,
+    conflict: &'a WasmHostRowConflict,
     side: bindings::lix::plugin::host::ConflictSide,
 ) -> Option<&'a WasmHostBytes> {
     match side {
@@ -757,14 +752,14 @@ fn create_context_from_uuid(value: &str) -> Option<WasmCreateContext> {
 }
 
 #[cfg(test)]
-fn create_context_from_generated_entity(
+fn create_context_from_generated_row(
     generated_schema: &str,
-    entity: &WasmEntity<WasmHostBytes>,
+    row: &WasmRow<WasmHostBytes>,
 ) -> Option<WasmCreateContext> {
-    if entity.key.schema_key.as_str() != generated_schema {
+    if row.key.schema_key.as_str() != generated_schema {
         return None;
     }
-    let [id] = entity.key.entity_pk.as_slice() else {
+    let [id] = row.key.row_pk.as_slice() else {
         return None;
     };
     create_context_from_uuid(id.as_str())
@@ -1003,7 +998,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         Ok(())
     }
 
-    fn begin_entity_attachment(
+    fn begin_row_attachment(
         &mut self,
         resource: Resource<TransitionResource>,
         total_length: u64,
@@ -1020,30 +1015,30 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         state.check_active()?;
         if state.pending_attachment.is_some() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "entity attachment is already open".to_owned(),
+                "row attachment is already open".to_owned(),
             ));
         }
         if state.attachments.len() >= state.limits.max_attachment_refs as usize {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity attachment count exceeds its transition limit".to_owned(),
+                "row attachment count exceeds its transition limit".to_owned(),
             ));
         }
         if total_length > state.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity attachment exceeds max-total-bytes".to_owned(),
+                "row attachment exceeds max-total-bytes".to_owned(),
             ));
         }
         let capacity = usize::try_from(total_length).map_err(|_| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity attachment exceeds host address space".to_owned(),
+                "row attachment exceeds host address space".to_owned(),
             )
         })?;
         let ordinal = u32::try_from(state.attachments.len()).map_err(|_| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity attachment ordinal exceeds u32".to_owned(),
+                "row attachment ordinal exceeds u32".to_owned(),
             )
         })?;
-        state.pending_attachment = Some(PendingEntityAttachment {
+        state.pending_attachment = Some(PendingRowAttachment {
             expected_len: total_length,
             bytes: Vec::with_capacity(capacity),
         });
@@ -1052,7 +1047,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         Ok(ordinal)
     }
 
-    fn write_entity_attachment(
+    fn write_row_attachment(
         &mut self,
         resource: Resource<TransitionResource>,
         chunk: Vec<u8>,
@@ -1069,7 +1064,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         state.charge_page(chunk.len())?;
         let pending = state.pending_attachment.as_mut().ok_or_else(|| {
             bindings::lix::plugin::host::HostError::Rejected(
-                "entity attachment chunk has no open attachment".to_owned(),
+                "row attachment chunk has no open attachment".to_owned(),
             )
         })?;
         let next_len = pending
@@ -1078,29 +1073,29 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             .checked_add(chunk.len())
             .ok_or_else(|| {
                 bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "entity attachment length overflowed".to_owned(),
+                    "row attachment length overflowed".to_owned(),
                 )
             })?;
         if next_len as u64 > pending.expected_len {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "entity attachment exceeds its declared length".to_owned(),
+                "row attachment exceeds its declared length".to_owned(),
             ));
         }
         pending.bytes.extend_from_slice(&chunk);
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
-        state.counters.entity_output_attachment_writes = state
+        state.counters.row_output_attachment_writes = state
             .counters
-            .entity_output_attachment_writes
+            .row_output_attachment_writes
             .saturating_add(1);
-        state.counters.entity_output_attachment_bytes = state
+        state.counters.row_output_attachment_bytes = state
             .counters
-            .entity_output_attachment_bytes
+            .row_output_attachment_bytes
             .saturating_add(chunk.len() as u64);
         Ok(())
     }
 
-    fn finish_entity_attachment(
+    fn finish_row_attachment(
         &mut self,
         resource: Resource<TransitionResource>,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
@@ -1116,12 +1111,12 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         state.check_active()?;
         let pending = state.pending_attachment.take().ok_or_else(|| {
             bindings::lix::plugin::host::HostError::Rejected(
-                "entity attachment finish has no open attachment".to_owned(),
+                "row attachment finish has no open attachment".to_owned(),
             )
         })?;
         if pending.bytes.len() as u64 != pending.expected_len {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "entity attachment ended before its declared length".to_owned(),
+                "row attachment ended before its declared length".to_owned(),
             ));
         }
         state.attachments.push(Bytes::from(pending.bytes));
@@ -1130,10 +1125,10 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         Ok(())
     }
 
-    fn emit_entities(
+    fn emit_rows(
         &mut self,
         resource: Resource<TransitionResource>,
-        mut page: bindings::lix::plugin::host::EntityPage,
+        mut page: bindings::lix::plugin::host::RowPage,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
         let state = self
             .table
@@ -1145,15 +1140,13 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.check_active()?;
-        let decoded = EntityPage::decode(&page.payload).map_err(|error| {
-            bindings::lix::plugin::host::HostError::Rejected(format!(
-                "invalid entity page: {error:?}"
-            ))
+        let decoded = RowPage::decode(&page.payload).map_err(|error| {
+            bindings::lix::plugin::host::HostError::Rejected(format!("invalid row page: {error:?}"))
         })?;
         let page_wire_bytes = page.payload.len() as u64;
         if state.counters.packet_pages.saturating_add(1) > u64::from(state.limits.max_pages) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity page count exceeds its transition limit".to_owned(),
+                "row page count exceeds its transition limit".to_owned(),
             ));
         }
         state.charge_page(page.payload.len())?;
@@ -1163,14 +1156,14 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         let total_record_count = decoded.record_count();
         let section = decoded.section().map_err(|error| {
             bindings::lix::plugin::host::HostError::Rejected(format!(
-                "invalid entity page section: {error:?}"
+                "invalid row page section: {error:?}"
             ))
         })?;
         let payload_end = section.payload.len();
         let record_count = section.record_count;
         if section.representation != Representation::Snapshots {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "entity page must use snapshot records".to_owned(),
+                "row page must use snapshot records".to_owned(),
             ));
         }
         page.payload.truncate(payload_end);
@@ -1189,14 +1182,14 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             .counters
             .packet_records
             .saturating_add(u64::from(total_record_count));
-        state.counters.entity_output_pages = state.counters.entity_output_pages.saturating_add(1);
-        state.counters.entity_output_records = state
+        state.counters.row_output_pages = state.counters.row_output_pages.saturating_add(1);
+        state.counters.row_output_records = state
             .counters
-            .entity_output_records
+            .row_output_records
             .saturating_add(u64::from(total_record_count));
-        state.counters.entity_output_wire_bytes = state
+        state.counters.row_output_wire_bytes = state
             .counters
-            .entity_output_wire_bytes
+            .row_output_wire_bytes
             .saturating_add(page_wire_bytes);
         state.pages.push_back(pending);
         Ok(())
@@ -1328,15 +1321,13 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
     }
 }
 
-impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
+impl bindings::lix::plugin::host::HostRowSource for WasiHostState {
     fn next_page(
         &mut self,
-        resource: Resource<EntitySourceResource>,
+        resource: Resource<RowSourceResource>,
         max_bytes: u32,
-    ) -> Result<
-        Option<bindings::lix::plugin::host::EntityPage>,
-        bindings::lix::plugin::host::HostError,
-    > {
+    ) -> Result<Option<bindings::lix::plugin::host::RowPage>, bindings::lix::plugin::host::HostError>
+    {
         let shared = self
             .table
             .get(&resource)
@@ -1354,7 +1345,7 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
         .expect("fixed page overhead fits u32");
         let payload_budget = max_bytes.checked_sub(envelope_bytes).ok_or_else(|| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity input page budget cannot hold its envelope".to_owned(),
+                "row input page budget cannot hold its envelope".to_owned(),
             )
         })?;
         let Some(changes) = state
@@ -1367,13 +1358,13 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
         };
         if changes.is_empty() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "component entity source returned an empty page".to_owned(),
+                "component row source returned an empty page".to_owned(),
             ));
         }
         state.lazy_snapshots.clear();
         let record_count = u32::try_from(changes.len()).map_err(|_| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity input page record count exceeds u32".to_owned(),
+                "row input page record count exceeds u32".to_owned(),
             )
         })?;
         let mut payload = Vec::new();
@@ -1381,11 +1372,11 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
             let ordinal = state.next_ordinal;
             state.next_ordinal = state.next_ordinal.checked_add(1).ok_or_else(|| {
                 bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "component entity input ordinal overflowed".to_owned(),
+                    "component row input ordinal overflowed".to_owned(),
                 )
             })?;
-            let (schema_key, entity_pk, snapshot_content, effect) = match change {
-                WasmEntityChange::Create {
+            let (schema_key, row_pk, snapshot_content, effect) = match change {
+                WasmRowChange::Create {
                     schema_key,
                     resolved_key,
                     snapshot_content,
@@ -1393,12 +1384,12 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
                 } => {
                     let key = resolved_key.ok_or_else(|| {
                         bindings::lix::plugin::host::HostError::Rejected(
-                            "host-to-guest entity input contains an unresolved create".to_owned(),
+                            "host-to-guest row input contains an unresolved create".to_owned(),
                         )
                     })?;
                     (
                         schema_key,
-                        key.entity_pk
+                        key.row_pk
                             .iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>(),
@@ -1406,20 +1397,15 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
                         WasmChangeEffect::Content,
                     )
                 }
-                WasmEntityChange::Upsert { entity, effect } => (
-                    entity.key.schema_key.to_string(),
-                    entity
-                        .key
-                        .entity_pk
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                    Some(entity.snapshot_content),
+                WasmRowChange::Upsert { row, effect } => (
+                    row.key.schema_key.to_string(),
+                    row.key.row_pk.iter().map(ToString::to_string).collect(),
+                    Some(row.snapshot_content),
                     effect,
                 ),
-                WasmEntityChange::Delete(key) => (
+                WasmRowChange::Delete(key) => (
                     key.schema_key.to_string(),
-                    key.entity_pk.iter().map(ToString::to_string).collect(),
+                    key.row_pk.iter().map(ToString::to_string).collect(),
                     None,
                     WasmChangeEffect::Content,
                 ),
@@ -1434,15 +1420,15 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
             encode_packet_text(&mut payload, &schema_key)
                 .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
             payload.extend_from_slice(
-                &u32::try_from(entity_pk.len())
+                &u32::try_from(row_pk.len())
                     .map_err(|_| {
                         bindings::lix::plugin::host::HostError::LimitExceeded(
-                            "entity input primary key has too many components".to_owned(),
+                            "row input primary key has too many components".to_owned(),
                         )
                     })?
                     .to_le_bytes(),
             );
-            for component in &entity_pk {
+            for component in &row_pk {
                 encode_packet_text(&mut payload, component).map_err(|error| {
                     bindings::lix::plugin::host::HostError::Rejected(error.message)
                 })?;
@@ -1480,7 +1466,7 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
             }
             let record_len = u32::try_from(payload.len() - record_start - 4).map_err(|_| {
                 bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "entity input record exceeds u32".to_owned(),
+                    "row input record exceeds u32".to_owned(),
                 )
             })?;
             payload[record_start..record_start + 4].copy_from_slice(&record_len.to_le_bytes());
@@ -1495,12 +1481,12 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
         )
         .map_err(|error| {
             bindings::lix::plugin::host::HostError::Rejected(format!(
-                "failed to encode entity input page: {error:?}"
+                "failed to encode row input page: {error:?}"
             ))
         })?;
         if page.len() > max_bytes as usize {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "entity input page exceeds the requested byte limit".to_owned(),
+                "row input page exceeds the requested byte limit".to_owned(),
             ));
         }
         let boundary_bytes = page.len();
@@ -1512,23 +1498,21 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
             .counters
             .source_bytes_read
             .saturating_add(boundary_bytes as u64);
-        state.counters.entity_input_pages = state.counters.entity_input_pages.saturating_add(1);
-        state.counters.entity_input_records = state
+        state.counters.row_input_pages = state.counters.row_input_pages.saturating_add(1);
+        state.counters.row_input_records = state
             .counters
-            .entity_input_records
+            .row_input_records
             .saturating_add(u64::from(record_count));
-        state.counters.entity_input_wire_bytes = state
+        state.counters.row_input_wire_bytes = state
             .counters
-            .entity_input_wire_bytes
+            .row_input_wire_bytes
             .saturating_add(boundary_bytes as u64);
-        Ok(Some(bindings::lix::plugin::host::EntityPage {
-            payload: page,
-        }))
+        Ok(Some(bindings::lix::plugin::host::RowPage { payload: page }))
     }
 
     fn read_attachment(
         &mut self,
-        resource: Resource<EntitySourceResource>,
+        resource: Resource<RowSourceResource>,
         ordinal: u32,
         offset: u64,
         length: u32,
@@ -1558,18 +1542,16 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
             .counters
             .source_bytes_read
             .saturating_add(bytes.len() as u64);
-        state.counters.entity_input_attachment_reads = state
+        state.counters.row_input_attachment_reads =
+            state.counters.row_input_attachment_reads.saturating_add(1);
+        state.counters.row_input_attachment_bytes = state
             .counters
-            .entity_input_attachment_reads
-            .saturating_add(1);
-        state.counters.entity_input_attachment_bytes = state
-            .counters
-            .entity_input_attachment_bytes
+            .row_input_attachment_bytes
             .saturating_add(bytes.len() as u64);
         Ok(Some(bytes))
     }
 
-    fn drop(&mut self, resource: Resource<EntitySourceResource>) -> wasmtime::Result<()> {
+    fn drop(&mut self, resource: Resource<RowSourceResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
         Ok(())
     }
@@ -1613,9 +1595,9 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
         let meta = bindings::lix::plugin::host::ConflictMeta {
             ordinal: conflict.ordinal,
             schema_key: conflict.key.schema_key.to_string(),
-            entity_pk: conflict
+            row_pk: conflict
                 .key
-                .entity_pk
+                .row_pk
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
@@ -1624,7 +1606,7 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
             b_len: conflict.b.as_ref().map(WasmHostBytes::len),
         };
         let metadata_bytes =
-            meta.schema_key.len() + meta.entity_pk.iter().map(String::len).sum::<usize>() + 32;
+            meta.schema_key.len() + meta.row_pk.iter().map(String::len).sum::<usize>() + 32;
         state.charge(metadata_bytes)?;
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
@@ -1895,7 +1877,7 @@ enum ValidatedPacketIdentity {
 }
 
 enum CreatedPacketIdentity {
-    Explicit(WasmEntityKey),
+    Explicit(WasmRowKey),
     Create { schema_key: String, local_ref: u64 },
 }
 
@@ -1908,11 +1890,11 @@ struct CertifiedPacketSchemaKeys {
 }
 
 #[derive(Debug, Default)]
-struct CertifiedPacketEntityKeys {
+struct CertifiedPacketRowKeys {
     schemas: std::collections::BTreeMap<String, CertifiedPacketSchemaKeys>,
 }
 
-impl CertifiedPacketEntityKeys {
+impl CertifiedPacketRowKeys {
     fn contains_create_ref(keys: &CertifiedPacketSchemaKeys, local_ref: u64) -> bool {
         keys.create_refs.contains(&local_ref)
             || keys
@@ -1975,7 +1957,7 @@ impl CertifiedPacketEntityKeys {
         let (schema_key, explicit_key, create_ref) = match identity {
             CreatedPacketIdentity::Explicit(key) => {
                 let components = key
-                    .entity_pk
+                    .row_pk
                     .into_iter()
                     .map(|component| component.as_str().to_owned())
                     .collect::<Vec<_>>();
@@ -2134,24 +2116,18 @@ impl CertifiedPacketEntityKeys {
 }
 
 fn duplicate_certified_packet_key() -> LixError {
-    component_error("a component entity key may occur only once across certified packet pages")
+    component_error("a component row key may occur only once across certified packet pages")
 }
 
 fn validate_new_certified_packet_keys(
     page: ValidatedCreatedPacketPage,
-    existing: &CertifiedPacketEntityKeys,
-) -> Result<
-    (
-        std::collections::BTreeSet<String>,
-        CertifiedPacketEntityKeys,
-    ),
-    LixError,
-> {
+    existing: &CertifiedPacketRowKeys,
+) -> Result<(std::collections::BTreeSet<String>, CertifiedPacketRowKeys), LixError> {
     let ValidatedCreatedPacketPage {
         schemas,
         identities,
     } = page;
-    let mut page_keys = CertifiedPacketEntityKeys::default();
+    let mut page_keys = CertifiedPacketRowKeys::default();
     for identity in identities {
         page_keys.insert_validated(identity, &schemas, existing)?;
     }
@@ -2161,12 +2137,12 @@ fn validate_new_certified_packet_keys(
 fn validate_ordinary_packet_page_keys(
     page: &WasmChangePage,
     creates: WasmCreateContext,
-    existing: &CertifiedPacketEntityKeys,
-) -> Result<CertifiedPacketEntityKeys, LixError> {
-    let mut page_keys = CertifiedPacketEntityKeys::default();
+    existing: &CertifiedPacketRowKeys,
+) -> Result<CertifiedPacketRowKeys, LixError> {
+    let mut page_keys = CertifiedPacketRowKeys::default();
     for change in &page.changes.changes {
         let identity = match change {
-            WasmEntityChange::Create {
+            WasmRowChange::Create {
                 schema_key,
                 local_ref,
                 ..
@@ -2174,10 +2150,8 @@ fn validate_ordinary_packet_page_keys(
                 schema_key: schema_key.clone(),
                 local_ref: *local_ref,
             },
-            WasmEntityChange::Upsert { entity, .. } => {
-                CreatedPacketIdentity::Explicit(entity.key.clone())
-            }
-            WasmEntityChange::Delete(key) => CreatedPacketIdentity::Explicit(key.clone()),
+            WasmRowChange::Upsert { row, .. } => CreatedPacketIdentity::Explicit(row.key.clone()),
+            WasmRowChange::Delete(key) => CreatedPacketIdentity::Explicit(key.clone()),
         };
         page_keys.insert(identity, creates, existing)?;
     }
@@ -2253,7 +2227,7 @@ fn validate_created_packet_page(
                     schema_index,
                     fingerprint: *fingerprint.finalize().as_bytes(),
                     generated_local_ref: only_component.and_then(|component| {
-                        CertifiedPacketEntityKeys::generated_local_ref_component(component, creates)
+                        CertifiedPacketRowKeys::generated_local_ref_component(component, creates)
                     }),
                 });
             }
@@ -2478,7 +2452,7 @@ struct ResolutionWorkerOutput {
     counters: WasmTransitionCounters,
 }
 
-struct EntityWorkerOutput {
+struct RowWorkerOutput {
     replacement: Bytes,
     counters: WasmTransitionCounters,
 }
@@ -2647,7 +2621,7 @@ impl ComponentWorker {
             .table
             .push(SnapshotResource {
                 // Byte-successor parsing is defined over accepted bytes plus
-                // opaque plugin state. Semantic entities are outputs and host
+                // opaque plugin state. Semantic rows are outputs and host
                 // authority, not an additional warm-only input dependency.
                 root: root.successor_checkpoint(),
                 state: state.clone(),
@@ -2812,21 +2786,21 @@ impl ComponentWorker {
                     "failed to register component cold-successor snapshot: {error}"
                 ))
             })?;
-        let entity_state = Arc::new(Mutex::new(EntityChangeState::from_entities(
+        let row_state = Arc::new(Mutex::new(RowChangeState::from_rows(
             limits,
-            cold.entities,
+            cold.rows,
             total_bytes,
         )?));
         let source = self
             .store
             .data_mut()
             .table
-            .push(EntitySourceResource {
-                state: entity_state.clone(),
+            .push(RowSourceResource {
+                state: row_state.clone(),
             })
             .map_err(|error| {
                 component_error(format!(
-                    "failed to register component cold-successor entity source: {error}"
+                    "failed to register component cold-successor row source: {error}"
                 ))
             })?;
         let mut transaction = root.transaction();
@@ -2884,7 +2858,7 @@ impl ComponentWorker {
                 )?,
                 before,
                 edits: binding_edits,
-                entities: source,
+                rows: source,
                 creates: bindings::exports::lix::plugin::api::CreateContext {
                     high: cold.creates.high,
                     low: cold.creates.low,
@@ -2935,8 +2909,8 @@ impl ComponentWorker {
         })?;
         self.documents.insert(document, ComponentDocument { root });
         self.next_document = self.next_document.max(document.saturating_add(1));
-        let entity_state = Arc::try_unwrap(entity_state)
-            .map_err(|_| component_error("component cold-successor entity source remained live"))?
+        let row_state = Arc::try_unwrap(row_state)
+            .map_err(|_| component_error("component cold-successor row source remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = Arc::try_unwrap(state)
@@ -2946,20 +2920,20 @@ impl ComponentWorker {
         state.counters.component_import_calls = state
             .counters
             .component_import_calls
-            .saturating_add(entity_state.counters.component_import_calls);
+            .saturating_add(row_state.counters.component_import_calls);
         state.counters.component_boundary_bytes = state
             .counters
             .component_boundary_bytes
-            .saturating_add(entity_state.counters.component_boundary_bytes);
+            .saturating_add(row_state.counters.component_boundary_bytes);
         state.counters.source_read_calls = state
             .counters
             .source_read_calls
-            .saturating_add(entity_state.counters.source_read_calls);
+            .saturating_add(row_state.counters.source_read_calls);
         state.counters.source_bytes_read = state
             .counters
             .source_bytes_read
-            .saturating_add(entity_state.counters.source_bytes_read);
-        merge_entity_input_profile(&mut state.counters, &entity_state.counters);
+            .saturating_add(row_state.counters.source_bytes_read);
+        merge_row_input_profile(&mut state.counters, &row_state.counters);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
         let pages = state.take_pages()?;
@@ -3076,13 +3050,13 @@ impl ComponentWorker {
         })
     }
 
-    fn entities_changed(
+    fn rows_changed(
         &mut self,
         document: u64,
         next_document: u64,
         limits: WasmTransitionLimits,
-        update: WasmEntityUpdate,
-    ) -> Result<EntityWorkerOutput, LixError> {
+        update: WasmRowUpdate,
+    ) -> Result<RowWorkerOutput, LixError> {
         let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
@@ -3093,7 +3067,7 @@ impl ComponentWorker {
             .map(|document| document.root.clone())
             .ok_or_else(|| component_error("unknown component document handle"))?;
         let total_bytes = SharedByteBudget::default();
-        let entity_state = Arc::new(Mutex::new(EntityChangeState::from_changes(
+        let row_state = Arc::new(Mutex::new(RowChangeState::from_changes(
             limits,
             update.changes,
             total_bytes.clone(),
@@ -3114,19 +3088,19 @@ impl ComponentWorker {
             })
             .map_err(|error| {
                 component_error(format!(
-                    "failed to register component entity snapshot: {error}"
+                    "failed to register component row snapshot: {error}"
                 ))
             })?;
         let source = self
             .store
             .data_mut()
             .table
-            .push(EntitySourceResource {
-                state: entity_state.clone(),
+            .push(RowSourceResource {
+                state: row_state.clone(),
             })
             .map_err(|error| {
                 component_error(format!(
-                    "failed to register component entity-change source: {error}"
+                    "failed to register component row-change source: {error}"
                 ))
             })?;
         let transition = self
@@ -3139,15 +3113,15 @@ impl ComponentWorker {
             })
             .map_err(|error| {
                 component_error(format!(
-                    "failed to register component entity transition: {error}"
+                    "failed to register component row transition: {error}"
                 ))
             })?;
         let transition_rep = transition.rep();
-        let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::EntitiesChanged(
-            bindings::exports::lix::plugin::api::EntitiesChangedRequest {
+        let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::RowsChanged(
+            bindings::exports::lix::plugin::api::RowsChangedRequest {
                 before_path: required_plugin_path(
                     update.before_descriptor.path,
-                    "entities-changed predecessor",
+                    "rows-changed predecessor",
                 )?,
                 before,
                 changes: source,
@@ -3161,22 +3135,19 @@ impl ComponentWorker {
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
-            "failed to recover component entity transition",
+            "failed to recover component row transition",
         )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 drop(transition);
                 return Err(component_error(format!(
-                    "component entities-changed rejected input: {error:?}"
+                    "component rows-changed rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error(
-                    "component entities-changed trapped",
-                    error,
-                ));
+                return Err(wasm_runtime_error("component rows-changed trapped", error));
             }
         }
         let TransitionResource {
@@ -3185,15 +3156,15 @@ impl ComponentWorker {
         } = transition;
         drop(transaction_state);
         let mut state = Arc::try_unwrap(transition_state)
-            .map_err(|_| component_error("component entity transition resources remained live"))?
+            .map_err(|_| component_error("component row transition resources remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let replacement = state.file_replacement.take().ok_or_else(|| {
-            component_error("component entities-changed did not emit a file replacement")
+            component_error("component rows-changed did not emit a file replacement")
         })?;
         if !replacement.complete {
             return Err(component_error(
-                "component entities-changed file replacement is incomplete",
+                "component rows-changed file replacement is incomplete",
             ));
         }
         transaction.edit_bytes(ArenaByteEdit {
@@ -3202,35 +3173,35 @@ impl ComponentWorker {
             insert: replacement.bytes.clone(),
         });
         let successor = transaction.commit().map_err(|error| {
-            component_error(format!("failed to commit component entity root: {error}"))
+            component_error(format!("failed to commit component row root: {error}"))
         })?;
         self.documents
             .insert(next_document, ComponentDocument { root: successor });
         self.next_document = self.next_document.max(next_document.saturating_add(1));
-        let entity_state = Arc::try_unwrap(entity_state)
-            .map_err(|_| component_error("component entity-change source remained live"))?
+        let row_state = Arc::try_unwrap(row_state)
+            .map_err(|_| component_error("component row-change source remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.counters.component_import_calls = state
             .counters
             .component_import_calls
-            .saturating_add(entity_state.counters.component_import_calls);
+            .saturating_add(row_state.counters.component_import_calls);
         state.counters.component_boundary_bytes = state
             .counters
             .component_boundary_bytes
-            .saturating_add(entity_state.counters.component_boundary_bytes);
+            .saturating_add(row_state.counters.component_boundary_bytes);
         state.counters.source_read_calls = state
             .counters
             .source_read_calls
-            .saturating_add(entity_state.counters.source_read_calls);
+            .saturating_add(row_state.counters.source_read_calls);
         state.counters.source_bytes_read = state
             .counters
             .source_bytes_read
-            .saturating_add(entity_state.counters.source_bytes_read);
-        merge_entity_input_profile(&mut state.counters, &entity_state.counters);
+            .saturating_add(row_state.counters.source_bytes_read);
+        merge_row_input_profile(&mut state.counters, &row_state.counters);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
-        Ok(EntityWorkerOutput {
+        Ok(RowWorkerOutput {
             replacement: Bytes::from(replacement.bytes),
             counters: state.counters,
         })
@@ -3240,7 +3211,7 @@ impl ComponentWorker {
         &mut self,
         document: u64,
         limits: WasmTransitionLimits,
-        input: WasmOpenEntitiesInput,
+        input: WasmOpenRowsInput,
     ) -> Result<HydrateWorkerOutput, LixError> {
         let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
@@ -3259,9 +3230,9 @@ impl ComponentWorker {
             .transpose()?
             .unwrap_or_default();
         let total_bytes = SharedByteBudget::default();
-        let entity_state = Arc::new(Mutex::new(EntityChangeState::from_entities(
+        let row_state = Arc::new(Mutex::new(RowChangeState::from_rows(
             limits,
-            input.entities,
+            input.rows,
             total_bytes.clone(),
         )?));
         let root = ArenaRoot::import(
@@ -3296,8 +3267,8 @@ impl ComponentWorker {
             .store
             .data_mut()
             .table
-            .push(EntitySourceResource {
-                state: entity_state.clone(),
+            .push(RowSourceResource {
+                state: row_state.clone(),
             })
             .map_err(|error| {
                 component_error(format!(
@@ -3321,7 +3292,7 @@ impl ComponentWorker {
         let request = bindings::exports::lix::plugin::api::TransitionRequest::Restore(
             bindings::exports::lix::plugin::api::RestoreRequest {
                 accepted,
-                entities: source,
+                rows: source,
             },
         );
         let result = self.guest.call_apply(
@@ -3389,17 +3360,17 @@ impl ComponentWorker {
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .counters;
-        let entity_state = Arc::try_unwrap(entity_state)
+        let row_state = Arc::try_unwrap(row_state)
             .map_err(|_| component_error("component hydration source remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         counters.component_import_calls = counters
             .component_import_calls
-            .saturating_add(entity_state.counters.component_import_calls);
+            .saturating_add(row_state.counters.component_import_calls);
         counters.component_boundary_bytes = counters
             .component_boundary_bytes
-            .saturating_add(entity_state.counters.component_boundary_bytes);
-        merge_entity_input_profile(&mut counters, &entity_state.counters);
+            .saturating_add(row_state.counters.component_boundary_bytes);
+        merge_row_input_profile(&mut counters, &row_state.counters);
         counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
         Ok(HydrateWorkerOutput {
@@ -3439,12 +3410,12 @@ struct CursorState {
     /// published commit has no root to expand a packet from, so its pages take
     /// the ordinary decode path instead.
     certified_packets_available: bool,
-    certified_all_entity_keys: CertifiedPacketEntityKeys,
+    certified_all_row_keys: CertifiedPacketRowKeys,
     certified_packet_pages: Vec<Bytes>,
     certified_packet_rows: u64,
     certified_packet_creates: Option<WasmCreateContext>,
     certified_packet_schema_keys: std::collections::BTreeSet<String>,
-    certified_packet_entity_keys: CertifiedPacketEntityKeys,
+    certified_packet_row_keys: CertifiedPacketRowKeys,
 }
 
 struct ResolutionCursorState {
@@ -3584,7 +3555,7 @@ impl WasmComponentActor for ComponentActor {
         true
     }
 
-    fn cold_open_requires_entities(&self) -> bool {
+    fn cold_open_requires_rows(&self) -> bool {
         true
     }
 
@@ -3704,12 +3675,12 @@ impl WasmComponentActor for ComponentActor {
                 pages: output.pages,
                 complete_file_state: true,
                 certified_packets_available,
-                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_all_row_keys: CertifiedPacketRowKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
                 certified_packet_schema_keys: std::collections::BTreeSet::new(),
-                certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
         self.transition_permits.insert(transition.0, permit);
@@ -3721,11 +3692,11 @@ impl WasmComponentActor for ComponentActor {
         })
     }
 
-    async fn open_entities(
+    async fn open_rows(
         &mut self,
         limits: WasmTransitionLimits,
-        input: WasmOpenEntitiesInput,
-    ) -> Result<WasmEntityTransition, LixError> {
+        input: WasmOpenRowsInput,
+    ) -> Result<WasmRowTransition, LixError> {
         let document = self.allocate_document()?;
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let edits = WasmEditCursorHandle(self.allocate_handle()?);
@@ -3765,7 +3736,7 @@ impl WasmComponentActor for ComponentActor {
         self.edit_cursors
             .insert(edits.0, ComponentEditCursorState { transition, page });
         self.transition_permits.insert(transition.0, permit);
-        Ok(WasmEntityTransition {
+        Ok(WasmRowTransition {
             transition,
             document: WasmDocumentHandle(document),
             edits,
@@ -3806,12 +3777,12 @@ impl WasmComponentActor for ComponentActor {
                 pages: output.pages,
                 complete_file_state: false,
                 certified_packets_available: true,
-                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_all_row_keys: CertifiedPacketRowKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
                 certified_packet_schema_keys: std::collections::BTreeSet::new(),
-                certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
         self.transition_permits.insert(transition.0, permit);
@@ -3854,12 +3825,12 @@ impl WasmComponentActor for ComponentActor {
                 pages: output.pages,
                 complete_file_state: false,
                 certified_packets_available: true,
-                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_all_row_keys: CertifiedPacketRowKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
                 certified_packet_schema_keys: std::collections::BTreeSet::new(),
-                certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
         self.transition_permits.insert(transition.0, permit);
@@ -3871,12 +3842,12 @@ impl WasmComponentActor for ComponentActor {
         })
     }
 
-    async fn entities_changed(
+    async fn rows_changed(
         &mut self,
         document: WasmDocumentHandle,
         limits: WasmTransitionLimits,
-        update: WasmEntityUpdate,
-    ) -> Result<WasmEntityTransition, LixError> {
+        update: WasmRowUpdate,
+    ) -> Result<WasmRowTransition, LixError> {
         let next_document = self.allocate_document()?;
         let before_len = update.before.len();
         self.ensure_active()?;
@@ -3887,7 +3858,7 @@ impl WasmComponentActor for ComponentActor {
         .await?;
         let resolved = self
             .worker
-            .entities_changed(document.0, next_document, limits, update);
+            .rows_changed(document.0, next_document, limits, update);
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -3927,7 +3898,7 @@ impl WasmComponentActor for ComponentActor {
             },
         );
         self.transition_permits.insert(transition.0, permit);
-        Ok(WasmEntityTransition {
+        Ok(WasmRowTransition {
             transition,
             document: WasmDocumentHandle(next_document),
             edits,
@@ -4063,7 +4034,7 @@ impl WasmComponentActor for ComponentActor {
                         // ordinary path even for a complete parse, because a
                         // certified packet is materialized by expanding it from
                         // the file's commit root and there is none to expand
-                        // from. Same entities, row-shaped instead of packed.
+                        // from. Same rows, row-shaped instead of packed.
                         if !cursor.complete_file_state || !cursor.certified_packets_available {
                             let decoded = PendingChangePage::Packet {
                                 record_count,
@@ -4077,9 +4048,9 @@ impl WasmComponentActor for ComponentActor {
                             let page_keys = validate_ordinary_packet_page_keys(
                                 &decoded,
                                 creates,
-                                &cursor.certified_all_entity_keys,
+                                &cursor.certified_all_row_keys,
                             )?;
-                            cursor.certified_all_entity_keys.extend(page_keys);
+                            cursor.certified_all_row_keys.extend(page_keys);
                             return Ok(Some(decoded));
                         }
                         if cursor
@@ -4092,7 +4063,7 @@ impl WasmComponentActor for ComponentActor {
                         }
                         let (schema_keys, page_keys) = validate_new_certified_packet_keys(
                             validated_page,
-                            &cursor.certified_all_entity_keys,
+                            &cursor.certified_all_row_keys,
                         )?;
                         cursor.certified_packet_creates = Some(creates);
                         cursor.certified_packet_rows = cursor
@@ -4102,8 +4073,8 @@ impl WasmComponentActor for ComponentActor {
                                 component_error("certified packet row count overflowed")
                             })?;
                         cursor.certified_packet_schema_keys.extend(schema_keys);
-                        cursor.certified_all_entity_keys.extend_ref(&page_keys);
-                        cursor.certified_packet_entity_keys.extend(page_keys);
+                        cursor.certified_all_row_keys.extend_ref(&page_keys);
+                        cursor.certified_packet_row_keys.extend(page_keys);
                         cursor.certified_packet_pages.push(Bytes::from(payload));
                     } else {
                         let decoded = PendingChangePage::Packet {
@@ -4118,9 +4089,9 @@ impl WasmComponentActor for ComponentActor {
                         let page_keys = validate_ordinary_packet_page_keys(
                             &decoded,
                             creates,
-                            &cursor.certified_all_entity_keys,
+                            &cursor.certified_all_row_keys,
                         )?;
-                        cursor.certified_all_entity_keys.extend(page_keys);
+                        cursor.certified_all_row_keys.extend(page_keys);
                         return Ok(Some(decoded));
                     }
                 }
@@ -4147,10 +4118,10 @@ impl WasmComponentActor for ComponentActor {
         Ok(cursor.pages.pop_front())
     }
 
-    fn take_certified_entity_batches(
+    fn take_certified_row_batches(
         &mut self,
         transition: WasmTransitionHandle,
-    ) -> Vec<WasmCertifiedEntityBatch> {
+    ) -> Vec<WasmCertifiedRowBatch> {
         let Some(cursor) = self
             .cursors
             .values_mut()
@@ -4164,10 +4135,10 @@ impl WasmComponentActor for ComponentActor {
                 .into_iter()
                 .collect::<Vec<_>>();
             let create_ranges = cursor
-                .certified_packet_entity_keys
+                .certified_packet_row_keys
                 .take_create_ranges_for(&schema_keys);
-            cursor.certified_packet_entity_keys = CertifiedPacketEntityKeys::default();
-            batches.push(WasmCertifiedEntityBatch {
+            cursor.certified_packet_row_keys = CertifiedPacketRowKeys::default();
+            batches.push(WasmCertifiedRowBatch {
                 format: CERTIFIED_CREATED_PACKET_V1,
                 schema_keys,
                 row_count: std::mem::take(&mut cursor.certified_packet_rows),
@@ -4177,7 +4148,7 @@ impl WasmComponentActor for ComponentActor {
                 pages: std::mem::take(&mut cursor.certified_packet_pages),
             });
         }
-        cursor.certified_all_entity_keys = CertifiedPacketEntityKeys::default();
+        cursor.certified_all_row_keys = CertifiedPacketRowKeys::default();
         batches
     }
 
@@ -4372,20 +4343,20 @@ mod tests {
     }
 
     #[cfg(any())]
-    struct JsonTestEntitySource {
-        entities: Option<Vec<WasmEntity<WasmHostBytes>>>,
+    struct JsonTestRowSource {
+        rows: Option<Vec<WasmRow<WasmHostBytes>>>,
     }
 
     #[cfg(any())]
-    impl lix::plugin::runtime::WasmEntitySource for JsonTestEntitySource {
+    impl lix::plugin::runtime::WasmRowSource for JsonTestRowSource {
         fn next_page(
             &mut self,
             _max_bytes: u32,
-        ) -> Result<Option<lix::plugin::runtime::WasmEntityPage>, LixError> {
+        ) -> Result<Option<lix::plugin::runtime::WasmRowPage>, LixError> {
             Ok(self
-                .entities
+                .rows
                 .take()
-                .map(|entities| lix::plugin::runtime::WasmEntityPage { entities }))
+                .map(|rows| lix::plugin::runtime::WasmRowPage { rows }))
         }
     }
 
@@ -4400,10 +4371,10 @@ mod tests {
             3,
             "cold fallback should retain only namespace, fallback manifest, and one fallback page"
         );
-        assert!(keys.contains(&b"json/fallback-entities".as_slice()));
+        assert!(keys.contains(&b"json/fallback-rows".as_slice()));
         assert!(
             keys.iter()
-                .any(|key| key.starts_with(b"json/fallback-entity-page/"))
+                .any(|key| key.starts_with(b"json/fallback-row-page/"))
         );
         assert!(!keys.contains(&b"json/scalar-index".as_slice()));
         assert!(
@@ -4436,15 +4407,15 @@ mod tests {
         let creates = WasmCreateContext { high: 13, low: 17 };
         let before = br#"{"a":"one","b":"two"}"#.to_vec();
         let cold_after = br#"{"a":"ONE","b":"two"}"#.to_vec();
-        let entities = vec![
-            WasmEntity {
-                key: WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+        let rows = vec![
+            WasmRow {
+                key: WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
                 snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
                     br#"{"id":"root","kind":"object"}"#,
                 )),
             },
-            WasmEntity {
-                key: WasmEntityKey::from_owned_parts(
+            WasmRow {
+                key: WasmRowKey::from_owned_parts(
                     "json_object_member",
                     vec!["root".to_owned(), "a".to_owned()],
                 ),
@@ -4452,8 +4423,8 @@ mod tests {
                     br#"{"parent_id":"root","key":"a","order_key":"40","kind":"string","scalar_json":"\"one\""}"#,
                 )),
             },
-            WasmEntity {
-                key: WasmEntityKey::from_owned_parts(
+            WasmRow {
+                key: WasmRowKey::from_owned_parts(
                     "json_object_member",
                     vec!["root".to_owned(), "b".to_owned()],
                 ),
@@ -4478,9 +4449,7 @@ mod tests {
                     }],
                     after: Arc::new(JsonTestSource(cold_after.clone())),
                     creates,
-                    entities: Box::new(JsonTestEntitySource {
-                        entities: Some(entities),
-                    }),
+                    rows: Box::new(JsonTestRowSource { rows: Some(rows) }),
                 },
             )
             .await
@@ -4552,13 +4521,13 @@ mod tests {
             "reopened successor should read namespace, fallback manifest, and fallback page"
         );
         assert_eq!(changes.len(), 1);
-        let WasmEntityChange::Upsert { entity, effect } = &changes[0] else {
+        let WasmRowChange::Upsert { row, effect } = &changes[0] else {
             panic!("successor should upsert the edited JSON member");
         };
         assert_eq!(*effect, WasmChangeEffect::Content);
-        assert_eq!(entity.key.schema_key.as_str(), "json_object_member");
-        assert_eq!(entity.key.entity_pk[1].as_str(), "b");
-        let WasmGuestBytes::Inline(snapshot) = &entity.snapshot_content else {
+        assert_eq!(row.key.schema_key.as_str(), "json_object_member");
+        assert_eq!(row.key.row_pk[1].as_str(), "b");
+        let WasmGuestBytes::Inline(snapshot) = &row.snapshot_content else {
             panic!("small JSON snapshot should remain inline");
         };
         let snapshot: serde_json::Value =
@@ -4694,7 +4663,7 @@ mod tests {
     fn accept_page(
         payload: &[u8],
         creates: WasmCreateContext,
-        existing: &mut CertifiedPacketEntityKeys,
+        existing: &mut CertifiedPacketRowKeys,
     ) -> Result<(), LixError> {
         let page = validate_created_packet_page(1, payload, creates)
             .expect("well-framed packet")
@@ -4705,19 +4674,19 @@ mod tests {
     }
 
     #[test]
-    fn certified_packet_rejects_duplicate_entity_keys_across_pages() {
+    fn certified_packet_rejects_duplicate_row_keys_across_pages() {
         let creates = WasmCreateContext {
             high: 0x019a_0000_0000_7000,
             low: 0x8000_0000,
         };
-        let mut existing = CertifiedPacketEntityKeys::default();
+        let mut existing = CertifiedPacketRowKeys::default();
 
         accept_page(&create_page("row", 7), creates, &mut existing).expect("first page is unique");
         let duplicate_create = accept_page(&create_page("row", 7), creates, &mut existing)
             .expect_err("a later page must not repeat a create identity");
         assert_eq!(
             duplicate_create.message,
-            "a component entity key may occur only once across certified packet pages"
+            "a component row key may occur only once across certified packet pages"
         );
 
         let generated_id = creates.component(7).expect("create identity");
@@ -4726,10 +4695,10 @@ mod tests {
                 .expect_err("an explicit key must not collide with an earlier create");
         assert_eq!(
             explicit_collision.message,
-            "a component entity key may occur only once across certified packet pages"
+            "a component row key may occur only once across certified packet pages"
         );
 
-        let mut explicit_keys = CertifiedPacketEntityKeys::default();
+        let mut explicit_keys = CertifiedPacketRowKeys::default();
         accept_page(
             &upsert_page("row", "stable-key"),
             creates,
@@ -4744,10 +4713,10 @@ mod tests {
         .expect_err("a later page must not repeat an explicit key");
         assert_eq!(
             duplicate_explicit.message,
-            "a component entity key may occur only once across certified packet pages"
+            "a component row key may occur only once across certified packet pages"
         );
 
-        let mut canonical_keys = CertifiedPacketEntityKeys::default();
+        let mut canonical_keys = CertifiedPacketRowKeys::default();
         accept_page(&create_page("row", 7), creates, &mut canonical_keys)
             .expect("canonical generated key");
         accept_page(
@@ -4757,7 +4726,7 @@ mod tests {
         )
         .expect("noncanonical UUID spelling is a distinct explicit key");
 
-        let mut component_boundaries = CertifiedPacketEntityKeys::default();
+        let mut component_boundaries = CertifiedPacketRowKeys::default();
         accept_page(
             &upsert_components_page("row", &["ab", "c"]),
             creates,
@@ -4803,7 +4772,7 @@ mod tests {
         )
         .expect("ordinary packet decodes");
 
-        let mut certified_first = CertifiedPacketEntityKeys::default();
+        let mut certified_first = CertifiedPacketRowKeys::default();
         accept_page(&create_page("row", 7), creates, &mut certified_first)
             .expect("certified create is unique");
         let duplicate_ordinary =
@@ -4811,10 +4780,10 @@ mod tests {
                 .expect_err("ordinary write must not repeat a certified identity");
         assert_eq!(
             duplicate_ordinary.message,
-            "a component entity key may occur only once across certified packet pages"
+            "a component row key may occur only once across certified packet pages"
         );
 
-        let mut ordinary_first = CertifiedPacketEntityKeys::default();
+        let mut ordinary_first = CertifiedPacketRowKeys::default();
         let ordinary_keys = validate_ordinary_packet_page_keys(&ordinary, creates, &ordinary_first)
             .expect("ordinary write is initially unique");
         ordinary_first.extend(ordinary_keys);
@@ -4826,7 +4795,7 @@ mod tests {
         .expect_err("certified write must not repeat an ordinary identity");
         assert_eq!(
             duplicate_certified.message,
-            "a component entity key may occur only once across certified packet pages"
+            "a component row key may occur only once across certified packet pages"
         );
     }
 
@@ -4836,7 +4805,7 @@ mod tests {
             high: 0x019a_0000_0000_7000,
             low: 0x8000_0000,
         };
-        let mut keys = CertifiedPacketEntityKeys::default();
+        let mut keys = CertifiedPacketRowKeys::default();
         for local_ref in [7, 8, 9, 12] {
             accept_page(&create_page("row", local_ref), creates, &mut keys)
                 .expect("create identity is unique");
@@ -4891,13 +4860,13 @@ mod tests {
     }
 
     #[test]
-    fn entity_sources_and_transition_sinks_share_one_byte_budget() {
-        struct EmptyEntitySource;
-        impl lix::plugin::runtime::WasmEntitySource for EmptyEntitySource {
+    fn row_sources_and_transition_sinks_share_one_byte_budget() {
+        struct EmptyRowSource;
+        impl lix::plugin::runtime::WasmRowSource for EmptyRowSource {
             fn next_page(
                 &mut self,
                 _max_bytes: u32,
-            ) -> Result<Option<lix::plugin::runtime::WasmEntityPage>, LixError> {
+            ) -> Result<Option<lix::plugin::runtime::WasmRowPage>, LixError> {
                 Ok(None)
             }
         }
@@ -4909,7 +4878,7 @@ mod tests {
         limits.max_inline_input_bytes = 10;
         let budget = SharedByteBudget::default();
         let mut source =
-            EntityChangeState::from_entities(limits, Box::new(EmptyEntitySource), budget.clone())
+            RowChangeState::from_rows(limits, Box::new(EmptyRowSource), budget.clone())
                 .expect("source state");
         let mut sink = TransitionState::new(
             limits,
@@ -4979,8 +4948,8 @@ mod tests {
             low: 0x8000_0000,
         };
         let generated_id = creates.component(7).expect("generated id");
-        let user_key = WasmEntity {
-            key: WasmEntityKey::from_owned_parts(
+        let user_key = WasmRow {
+            key: WasmRowKey::from_owned_parts(
                 "json_object_member",
                 vec!["root".to_owned(), generated_id.clone()],
             ),
@@ -4989,16 +4958,16 @@ mod tests {
             ))),
         };
         assert_eq!(
-            create_context_from_generated_entity("json_array_item", &user_key),
+            create_context_from_generated_row("json_array_item", &user_key),
             None
         );
 
-        let generated_item = WasmEntity {
-            key: WasmEntityKey::from_owned_parts("json_array_item", vec![generated_id]),
+        let generated_item = WasmRow {
+            key: WasmRowKey::from_owned_parts("json_array_item", vec![generated_id]),
             snapshot_content: WasmHostBytes::Inline(Bytes::from_static(b"{}")),
         };
         assert_eq!(
-            create_context_from_generated_entity("json_array_item", &generated_item),
+            create_context_from_generated_row("json_array_item", &generated_item),
             Some(creates)
         );
     }

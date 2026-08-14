@@ -19,9 +19,9 @@ Lix is an **embeddable version control system** that can be imported as a librar
 
 ## Semantic change tracking
 
-Lix doesn't track line-by-line text changes. It tracks **semantic changes** at the entity level via plugins.
+Lix doesn't track line-by-line text changes. It tracks **semantic changes** at the row level via plugins.
 
-A plugin parses a format (or a piece of app state) into structured entities. Then Lix stores **what changed** — not just which bytes differ.
+A plugin parses a format (or a piece of app state) into structured rows. Then Lix stores **what changed** — not just which bytes differ.
 
 **Before:**
 ```json
@@ -84,11 +84,11 @@ The same approach extends to any other format your product cares about — **as 
 Lix is **change-first**: it stores semantic changes as queryable data, not snapshots.
 
 That means audit trails, rollbacks, and “blame” are exposed through each
-registered entity schema's typed history surface.
+registered row schema's typed history surface.
 
 Lix uses existing SQL databases as both **query engine** and **persistence layer**.
 
-Plugins parse files (including binary formats) into "meaningful changes" e.g. cells, properties, whitespace, etc. Lix stores those changes as typed entity rows with corresponding history queries.
+Plugins parse files (including binary formats) into "meaningful changes" e.g. cells, properties, whitespace, etc. Lix stores those changes as typed rows with corresponding history queries.
 
 Why this matters:
 
@@ -125,7 +125,7 @@ Lix’s format support depends on plugins. Here’s the current status:
 | Markdown | `@lix-js/plugin-md` | Beta |
 | ProseMirror | `@lix-js/plugin-prosemirror` | Stable |
 
-**Building your own plugin:** take an off-the-shelf parser for your format, map it to Lix’s entity/change schema, and you get semantic diffs + history for that format. [Plugin documentation →](https://lix.dev/docs/plugins)
+**Building your own plugin:** take an off-the-shelf parser for your format, map it to Lix’s row/change schema, and you get semantic diffs + history for that format. [Plugin documentation →](https://lix.dev/docs/plugins)
 
 ## Why did we build Lix?
 

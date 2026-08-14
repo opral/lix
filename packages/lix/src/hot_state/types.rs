@@ -14,7 +14,7 @@ use crate::common::{
     FastHashBuilder, LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder,
     fast_hash_builder,
 };
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
 
@@ -24,7 +24,7 @@ use crate::{NullableKeyFilter, Value};
 /// exchange [`MaterializedHotStateBatch`] owners and borrowed row views.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedHotStateRow {
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
@@ -82,7 +82,7 @@ pub(crate) struct MaterializedHotStateBatch {
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
     branch_ids: Vec<BranchIdId>,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
     snapshot_content: Vec<Option<SharedStr>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
@@ -131,11 +131,11 @@ impl MaterializedHotStateBatch {
     pub(crate) fn len(&self) -> usize {
         self.singleton
             .as_ref()
-            .map_or_else(|| self.entity_pks.len(), |_| 1)
+            .map_or_else(|| self.row_pks.len(), |_| 1)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.singleton.is_none() && self.entity_pks.is_empty()
+        self.singleton.is_none() && self.row_pks.is_empty()
     }
 
     pub(crate) fn row(&self, index: usize) -> MaterializedHotStateRowRef<'_> {
@@ -186,14 +186,14 @@ impl MaterializedHotStateBatch {
         if !ordinals.is_sorted_by(|left, right| {
             let left = self.row(*left);
             let right = self.row(*right);
-            left.entity_pk() < right.entity_pk()
-                || (left.entity_pk() == right.entity_pk() && left.file_id() <= right.file_id())
+            left.row_pk() < right.row_pk()
+                || (left.row_pk() == right.row_pk() && left.file_id() <= right.file_id())
         }) {
             ordinals.sort_unstable_by(|left, right| {
                 let left = self.row(*left);
                 let right = self.row(*right);
-                left.entity_pk()
-                    .cmp(right.entity_pk())
+                left.row_pk()
+                    .cmp(right.row_pk())
                     .then_with(|| left.file_id().cmp(&right.file_id()))
             });
         }
@@ -216,25 +216,25 @@ impl MaterializedHotStateBatch {
             .collect()
     }
 
-    /// Consumes the batch into entity keys ordered by their logical primary
+    /// Consumes the batch into row keys ordered by their logical primary
     /// key.  The direct SQL provider uses this when its entire visible
     /// projection is primary-key columns, so no snapshot JSON needs decoding.
-    pub(crate) fn into_identity_ordered_primary_keys(mut self) -> Vec<EntityPk> {
+    pub(crate) fn into_identity_ordered_primary_keys(mut self) -> Vec<RowPk> {
         if let Some(singleton) = self.singleton.take() {
-            return vec![singleton.row.entity_pk];
+            return vec![singleton.row.row_pk];
         }
         let mut ordinals = (0..self.len()).collect::<Vec<_>>();
-        if !ordinals.is_sorted_by(|left, right| self.entity_pks[*left] <= self.entity_pks[*right]) {
+        if !ordinals.is_sorted_by(|left, right| self.row_pks[*left] <= self.row_pks[*right]) {
             ordinals.sort_unstable_by(|left, right| {
-                self.entity_pks[*left].cmp(&self.entity_pks[*right])
+                self.row_pks[*left].cmp(&self.row_pks[*right])
             });
         }
         if ordinals.iter().copied().eq(0..self.len()) {
-            return self.entity_pks;
+            return self.row_pks;
         }
         ordinals
             .into_iter()
-            .map(|index| self.entity_pks[index].clone())
+            .map(|index| self.row_pks[index].clone())
             .collect()
     }
 
@@ -263,7 +263,7 @@ impl MaterializedHotStateBatch {
     ///
     /// **This consumes the batch on purpose.** Filtering used to build a
     /// second columnar owner row by row, which cloned every `SharedStr` and
-    /// every `EntityPk` component of every surviving row — one atomic
+    /// every `RowPk` component of every surviving row — one atomic
     /// increment per shared buffer per row, plus the matching decrement when
     /// the source batch was dropped. None of that traffic moves any bytes.
     /// Compacting in place *moves* the same buffers instead, so a filter now
@@ -307,7 +307,7 @@ impl MaterializedHotStateBatch {
         retain_by_mask(&mut self.schema_keys, &mask);
         retain_by_mask(&mut self.file_ids, &mask);
         retain_by_mask(&mut self.branch_ids, &mask);
-        retain_by_mask(&mut self.entity_pks, &mask);
+        retain_by_mask(&mut self.row_pks, &mask);
         retain_by_mask(&mut self.snapshot_content, &mask);
         retain_by_mask(&mut self.metadata, &mask);
         retain_by_mask(&mut self.deleted, &mask);
@@ -321,7 +321,7 @@ impl MaterializedHotStateBatch {
         if let Some(coordinates) = self.columnar_base_coordinate.as_mut() {
             retain_by_mask(coordinates, &mask);
         }
-        debug_assert_eq!(self.entity_pks.len(), kept);
+        debug_assert_eq!(self.row_pks.len(), kept);
         self
     }
 
@@ -382,11 +382,11 @@ impl MaterializedHotStateBatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn entity_column_ptr(&self) -> *const EntityPk {
+    pub(crate) fn row_column_ptr(&self) -> *const RowPk {
         if let Some(singleton) = &self.singleton {
-            return &singleton.row.entity_pk;
+            return &singleton.row.row_pk;
         }
-        self.entity_pks.as_ptr()
+        self.row_pks.as_ptr()
     }
 
     #[cfg(test)]
@@ -398,7 +398,7 @@ impl MaterializedHotStateBatch {
             self.schema_keys.capacity() * size_of::<SchemaKeyId>(),
             self.file_ids.capacity() * size_of::<Option<FileIdId>>(),
             self.branch_ids.capacity() * size_of::<BranchIdId>(),
-            self.entity_pks.capacity() * size_of::<EntityPk>(),
+            self.row_pks.capacity() * size_of::<RowPk>(),
             self.snapshot_content.capacity() * size_of::<Option<SharedStr>>(),
             self.metadata.capacity() * size_of::<Option<SharedStr>>(),
             self.deleted.capacity() * size_of::<bool>(),
@@ -440,10 +440,10 @@ impl<'a> MaterializedHotStateRowRef<'a> {
         self.batch.singleton.as_deref()
     }
 
-    pub(crate) fn entity_pk(self) -> &'a EntityPk {
+    pub(crate) fn row_pk(self) -> &'a RowPk {
         self.singleton().map_or_else(
-            || &self.batch.entity_pks[self.index],
-            |singleton| &singleton.row.entity_pk,
+            || &self.batch.row_pks[self.index],
+            |singleton| &singleton.row.row_pk,
         )
     }
 
@@ -574,7 +574,7 @@ impl<'a> MaterializedHotStateRowRef<'a> {
 
     fn to_owned_with_branch(self, branch_id: Arc<str>) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: self.entity_pk().clone(),
+            row_pk: self.row_pk().clone(),
             schema_key: self.schema_key().to_owned(),
             file_id: self.file_id().map(str::to_owned),
             snapshot_content: self.snapshot_content().cloned(),
@@ -797,7 +797,7 @@ pub(crate) struct MaterializedHotStateBatchBuilder {
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
     branch_ids: Vec<BranchIdId>,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
     snapshot_content: Vec<Option<SharedStr>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
@@ -864,7 +864,7 @@ impl MaterializedHotStateBatchBuilder {
             schema_keys: Vec::with_capacity(column_capacity),
             file_ids: Vec::with_capacity(column_capacity),
             branch_ids: Vec::with_capacity(column_capacity),
-            entity_pks: Vec::with_capacity(column_capacity),
+            row_pks: Vec::with_capacity(column_capacity),
             snapshot_content: Vec::with_capacity(column_capacity),
             metadata: Vec::with_capacity(column_capacity),
             deleted: Vec::with_capacity(column_capacity),
@@ -882,7 +882,7 @@ impl MaterializedHotStateBatchBuilder {
     pub(crate) fn len(&self) -> usize {
         self.singleton
             .as_ref()
-            .map_or_else(|| self.entity_pks.len(), |_| 1)
+            .map_or_else(|| self.row_pks.len(), |_| 1)
     }
 
     fn intern_owned(&mut self, value: String) -> u32 {
@@ -894,7 +894,7 @@ impl MaterializedHotStateBatchBuilder {
     }
 
     pub(crate) fn push_owned(&mut self, row: MaterializedHotStateRow) {
-        if self.singleton_capacity && self.singleton.is_none() && self.entity_pks.is_empty() {
+        if self.singleton_capacity && self.singleton.is_none() && self.row_pks.is_empty() {
             self.singleton = Some(Box::new(MaterializedHotStateSingleton {
                 row,
                 durable_predecessor: None,
@@ -926,7 +926,7 @@ impl MaterializedHotStateBatchBuilder {
         columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     ) {
         let MaterializedHotStateRow {
-            entity_pk,
+            row_pk,
             schema_key,
             file_id,
             snapshot_content,
@@ -947,7 +947,7 @@ impl MaterializedHotStateBatchBuilder {
             schema_key,
             file_id,
             branch_id,
-            entity_pk,
+            row_pk,
             snapshot_content,
             metadata,
             deleted,
@@ -970,7 +970,7 @@ impl MaterializedHotStateBatchBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_materialized(
         &mut self,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         schema_key: String,
         file_id: Option<String>,
         snapshot_content: Option<SharedStr>,
@@ -987,7 +987,7 @@ impl MaterializedHotStateBatchBuilder {
         let ordinal = self.len();
         if self.singleton_capacity {
             self.push_owned(MaterializedHotStateRow {
-                entity_pk,
+                row_pk,
                 schema_key,
                 file_id,
                 snapshot_content,
@@ -1010,7 +1010,7 @@ impl MaterializedHotStateBatchBuilder {
             schema_key,
             file_id,
             branch_id,
-            entity_pk,
+            row_pk,
             snapshot_content,
             metadata,
             deleted,
@@ -1027,7 +1027,7 @@ impl MaterializedHotStateBatchBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_materialized_ref(
         &mut self,
-        entity_pk: &EntityPk,
+        row_pk: &RowPk,
         schema_key: &str,
         file_id: Option<&str>,
         snapshot_content: Option<SharedStr>,
@@ -1043,10 +1043,10 @@ impl MaterializedHotStateBatchBuilder {
     ) -> usize {
         #[cfg(feature = "storage-benches")]
         {
-            crate::storage_bench::record_hot_scan_row_handle_clones(entity_pk.shared_handle_count());
+            crate::storage_bench::record_hot_scan_row_handle_clones(row_pk.shared_handle_count());
         }
         self.push_materialized_interned(
-            entity_pk.clone(),
+            row_pk.clone(),
             schema_key,
             file_id,
             snapshot_content,
@@ -1065,7 +1065,7 @@ impl MaterializedHotStateBatchBuilder {
     /// Appends a row whose identity strings are interned from borrows but
     /// whose primary key is **moved** into the column.
     ///
-    /// A decoded HOT scan row already owns its `EntityPk`, and every component
+    /// A decoded HOT scan row already owns its `RowPk`, and every component
     /// of that key is a `Bytes` slice of the retained physical key. Handing it
     /// to [`Self::push_materialized_ref`] clones each component — an atomic
     /// increment per component per row, immediately followed by the matching
@@ -1074,7 +1074,7 @@ impl MaterializedHotStateBatchBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_materialized_interned(
         &mut self,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         schema_key: &str,
         file_id: Option<&str>,
         snapshot_content: Option<SharedStr>,
@@ -1091,7 +1091,7 @@ impl MaterializedHotStateBatchBuilder {
         let ordinal = self.len();
         if self.singleton_capacity {
             self.push_owned(MaterializedHotStateRow {
-                entity_pk,
+                row_pk,
                 schema_key: schema_key.to_owned(),
                 file_id: file_id.map(str::to_owned),
                 snapshot_content,
@@ -1114,7 +1114,7 @@ impl MaterializedHotStateBatchBuilder {
             schema_key,
             file_id,
             branch_id,
-            entity_pk,
+            row_pk,
             snapshot_content,
             metadata,
             deleted,
@@ -1136,7 +1136,7 @@ impl MaterializedHotStateBatchBuilder {
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_hot_scan_row_handle_clones(
-                row.entity_pk().shared_handle_count()
+                row.row_pk().shared_handle_count()
                     + usize::from(row.snapshot_content().is_some())
                     + usize::from(row.metadata().is_some()),
             );
@@ -1165,7 +1165,7 @@ impl MaterializedHotStateBatchBuilder {
             schema_key,
             file_id,
             branch_id,
-            row.entity_pk().clone(),
+            row.row_pk().clone(),
             row.snapshot_content().cloned(),
             row.metadata().cloned(),
             row.deleted(),
@@ -1192,7 +1192,7 @@ impl MaterializedHotStateBatchBuilder {
         schema_key: SchemaKeyId,
         file_id: Option<FileIdId>,
         branch_id: BranchIdId,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -1206,7 +1206,7 @@ impl MaterializedHotStateBatchBuilder {
         self.schema_keys.push(schema_key);
         self.file_ids.push(file_id);
         self.branch_ids.push(branch_id);
-        self.entity_pks.push(entity_pk);
+        self.row_pks.push(row_pk);
         self.snapshot_content.push(snapshot_content);
         self.metadata.push(metadata);
         self.deleted.push(deleted);
@@ -1265,7 +1265,7 @@ impl MaterializedHotStateBatchBuilder {
         }
         assert!(row < self.len(), "live-state row ordinal out of bounds");
         self.columnar_base_coordinate.get_or_insert_with(|| {
-            vec![ColumnarBaseCoordinate::default(); self.entity_pks.len()]
+            vec![ColumnarBaseCoordinate::default(); self.row_pks.len()]
         })[row] = value;
     }
 
@@ -1276,7 +1276,7 @@ impl MaterializedHotStateBatchBuilder {
             schema_keys: self.schema_keys,
             file_ids: self.file_ids,
             branch_ids: self.branch_ids,
-            entity_pks: self.entity_pks,
+            row_pks: self.row_pks,
             snapshot_content: self.snapshot_content,
             metadata: self.metadata,
             deleted: self.deleted,
@@ -1316,7 +1316,7 @@ impl TryFrom<&MaterializedHotStateRow> for MaterializedTrackedStateRow {
         };
 
         Ok(Self {
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
@@ -1333,7 +1333,7 @@ impl TryFrom<&MaterializedHotStateRow> for MaterializedTrackedStateRow {
 /// Which indexed field a live-state scan constraint applies to.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ScanField {
-    EntityPk,
+    RowPk,
     FileId,
 }
 
@@ -1389,7 +1389,7 @@ pub(crate) struct DeclaredColumnRange {
     pub(crate) upper: Option<(crate::hot_state::HotIndexValue, bool)>,
 }
 
-/// Identity-centered filter for visible live entities.
+/// Identity-centered filter for visible live rows.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct HotStateFilter {
     #[serde(default)]
@@ -1397,7 +1397,7 @@ pub(crate) struct HotStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) row_pks: Vec<RowPk>,
     #[serde(default)]
     pub(crate) branch_ids: Vec<String>,
     #[serde(default)]
@@ -1408,7 +1408,7 @@ pub(crate) struct HotStateFilter {
     pub(crate) constraints: Vec<ScanConstraint>,
     /// Equality on a declared column, to be served by the hot index plane.
     ///
-    /// Resolved into [`Self::entity_pks`] before any scan route is chosen, so
+    /// Resolved into [`Self::row_pks`] before any scan route is chosen, so
     /// no route below this ever sees it. The predicate is *not* removed from
     /// the caller's own filtering when this is set: index entries are
     /// candidates, so the caller's predicate is what rejects stale ones.
@@ -1460,7 +1460,7 @@ pub(crate) struct HotStateScanRequest {
 pub(crate) struct HotStateRowRequest {
     pub(crate) schema_key: String,
     pub(crate) branch_id: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) file_id: NullableKeyFilter<String>,
 }
 
@@ -1468,12 +1468,12 @@ pub(crate) struct HotStateRowRequest {
 ///
 /// Unlike [`HotStateFilter`], the identity fields in this request are
 /// correlated. Implementations must never expand multiple requests into the
-/// Cartesian product of their schema, entity, and file dimensions.
+/// Cartesian product of their schema, row, and file dimensions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct HotStateExactRowRequest {
     pub(crate) schema_key: String,
     pub(crate) branch_id: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -1495,7 +1495,7 @@ impl HotStateExactBatchRequest {
         HotStateScanRequest {
             filter: HotStateFilter {
                 schema_keys: vec![row.schema_key.clone()],
-                entity_pks: vec![row.entity_pk.clone()],
+                row_pks: vec![row.row_pk.clone()],
                 branch_ids: vec![row.branch_id.clone()],
                 file_ids: vec![
                     row.file_id
@@ -1517,12 +1517,12 @@ impl HotStateExactBatchRequest {
 /// Borrowed visible-row identity used for overlay composition.
 ///
 /// Overlay maps own only these references and row ordinals. They never clone
-/// schema, file, branch, or entity-key storage.
+/// schema, file, branch, or row-key storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct HotStateRowIdentityRef<'a> {
     pub(crate) branch_id: &'a str,
     pub(crate) schema_key: &'a str,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
     pub(crate) file_id: Option<&'a str>,
 }
 
@@ -1530,10 +1530,10 @@ pub(crate) struct HotStateRowIdentityRef<'a> {
 mod batch_tests {
     use super::*;
 
-    fn row(entity_pk: EntityPk) -> MaterializedHotStateRow {
+    fn row(row_pk: RowPk) -> MaterializedHotStateRow {
         let timestamp = LixTimestamp::expect_parse("batch test timestamp", "2026-01-01T00:00:00Z");
         MaterializedHotStateRow {
-            entity_pk,
+            row_pk,
             schema_key: "shared_schema".to_owned(),
             file_id: Some("shared_file".to_owned()),
             snapshot_content: None,
@@ -1551,9 +1551,9 @@ mod batch_tests {
 
     #[test]
     fn materialized_batch_stores_repeated_identity_metadata_once() {
-        let entity_pk = EntityPk::single("shared_entity");
+        let row_pk = RowPk::single("shared_row");
         let batch = MaterializedHotStateBatch::from_rows(
-            (0..10_000).map(|_| row(entity_pk.clone())).collect(),
+            (0..10_000).map(|_| row(row_pk.clone())).collect(),
         );
 
         assert_eq!(batch.len(), 10_000);
@@ -1579,14 +1579,14 @@ mod batch_tests {
     #[test]
     fn one_row_builder_uses_boxed_singleton_storage() {
         let mut builder = MaterializedHotStateBatchBuilder::with_capacity(1);
-        builder.push_owned(row(EntityPk::single("only")));
+        builder.push_owned(row(RowPk::single("only")));
         builder.set_snapshot_content(0, SharedStr::from_static(r#"{"path":"only"}"#));
         builder.set_metadata(0, SharedStr::from_static(r#"{"source":"test"}"#));
 
         let batch = builder.finish();
 
         assert!(batch.singleton.is_some());
-        assert!(batch.entity_pks.is_empty());
+        assert!(batch.row_pks.is_empty());
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.row(0).schema_key(), "shared_schema");
         assert_eq!(batch.row(0).file_id(), Some("shared_file"));
@@ -1609,20 +1609,20 @@ mod batch_tests {
             group_index: 3,
             row_index: 19,
         };
-        builder.push_owned(row(EntityPk::single("first")));
+        builder.push_owned(row(RowPk::single("first")));
         builder.set_columnar_base_coordinate(0, coordinate);
-        builder.push_owned(row(EntityPk::single("second")));
+        builder.push_owned(row(RowPk::single("second")));
 
         let batch = builder.finish();
 
         assert!(batch.singleton.is_none());
         assert_eq!(batch.len(), 2);
         assert_eq!(
-            batch.row(0).entity_pk().as_single_string().unwrap(),
+            batch.row(0).row_pk().as_single_string().unwrap(),
             "first"
         );
         assert_eq!(
-            batch.row(1).entity_pk().as_single_string().unwrap(),
+            batch.row(1).row_pk().as_single_string().unwrap(),
             "second"
         );
         assert_eq!(batch.row(0).columnar_base_coordinate(), Some(coordinate));
@@ -1632,9 +1632,9 @@ mod batch_tests {
     #[test]
     fn coordinate_free_multi_row_batch_does_not_allocate_coordinate_column() {
         let batch = MaterializedHotStateBatch::from_rows(vec![
-            row(EntityPk::single("first")),
-            row(EntityPk::single("second")),
-            row(EntityPk::single("third")),
+            row(RowPk::single("first")),
+            row(RowPk::single("second")),
+            row(RowPk::single("third")),
         ]);
 
         assert!(batch.singleton.is_none());
@@ -1649,9 +1649,9 @@ mod batch_tests {
     #[test]
     fn late_coordinate_allocation_backfills_existing_rows_and_extends_with_none() {
         let mut builder = MaterializedHotStateBatchBuilder::with_capacity(4);
-        builder.push_owned(row(EntityPk::single("first")));
-        builder.push_owned(row(EntityPk::single("second")));
-        builder.push_owned(row(EntityPk::single("third")));
+        builder.push_owned(row(RowPk::single("first")));
+        builder.push_owned(row(RowPk::single("second")));
+        builder.push_owned(row(RowPk::single("third")));
         assert!(builder.columnar_base_coordinate.is_none());
 
         let coordinate = ColumnarBaseCoordinate {
@@ -1660,7 +1660,7 @@ mod batch_tests {
             row_index: 23,
         };
         builder.set_columnar_base_coordinate(1, coordinate);
-        builder.push_owned(row(EntityPk::single("fourth")));
+        builder.push_owned(row(RowPk::single("fourth")));
 
         let batch = builder.finish();
         assert_eq!(
@@ -1677,7 +1677,7 @@ mod batch_tests {
     fn identity_ordered_snapshots_transfer_shared_payload_buffers() {
         let payload = Bytes::from_static(br#"{"path":"a"}"#);
         let payload_ptr = payload.as_ptr();
-        let mut source = row(EntityPk::single("a"));
+        let mut source = row(RowPk::single("a"));
         source.snapshot_content = Some(
             SharedStr::from_utf8(payload).expect("snapshot fixture should contain valid UTF-8"),
         );
@@ -1691,9 +1691,9 @@ mod batch_tests {
 
     #[test]
     fn unordered_snapshots_restore_logical_identity_order() {
-        let mut second = row(EntityPk::single("b"));
+        let mut second = row(RowPk::single("b"));
         second.snapshot_content = Some(SharedStr::from_static(r#"{"path":"b"}"#));
-        let mut first = row(EntityPk::single("a"));
+        let mut first = row(RowPk::single("a"));
         first.snapshot_content = Some(SharedStr::from_static(r#"{"path":"a"}"#));
 
         let snapshots = MaterializedHotStateBatch::from_rows(vec![second, first])
@@ -1705,10 +1705,10 @@ mod batch_tests {
 
     #[test]
     fn materialized_batch_uses_one_utf8_arena_for_10k_distinct_file_ids() {
-        let entity_pk = EntityPk::single("shared_entity");
+        let row_pk = RowPk::single("shared_row");
         let rows = (0..10_000)
             .map(|index| {
-                let mut row = row(entity_pk.clone());
+                let mut row = row(row_pk.clone());
                 row.file_id = Some(format!("file-{index:08}"));
                 row
             })
@@ -1757,12 +1757,12 @@ mod batch_tests {
     #[test]
     fn materialized_builder_promotes_once_for_10k_distinct_file_ids() {
         let timestamp = LixTimestamp::expect_parse("batch test timestamp", "2026-01-01T00:00:00Z");
-        let entity_pk = EntityPk::single("shared_entity");
+        let row_pk = RowPk::single("shared_row");
         let mut builder = MaterializedHotStateBatchBuilder::with_capacity(10_000);
         for index in 0..10_000 {
             let file_id = format!("file-{index:08}");
             builder.push_materialized_ref(
-                &entity_pk,
+                &row_pk,
                 "shared_schema",
                 Some(&file_id),
                 None,
@@ -1796,9 +1796,9 @@ mod batch_tests {
 
     #[test]
     fn rebatching_borrowed_rows_does_not_retain_per_row_identity_strings() {
-        let entity_pk = EntityPk::single("shared_entity");
+        let row_pk = RowPk::single("shared_row");
         let batch = MaterializedHotStateBatch::from_rows(
-            (0..10_000).map(|_| row(entity_pk.clone())).collect(),
+            (0..10_000).map(|_| row(row_pk.clone())).collect(),
         );
         let dictionary_bytes_len = batch.dictionary_bytes_len();
         let filtered = batch.filter(|_| true, None);
@@ -1814,34 +1814,34 @@ mod batch_tests {
 
     #[test]
     fn filtering_moves_surviving_rows_instead_of_cloning_their_buffers() {
-        let shared = EntityPk::single("shared_entity");
+        let shared = RowPk::single("shared_row");
         let batch = MaterializedHotStateBatch::from_rows(
             (0..1_000)
                 .map(|index| {
                     row(if index % 2 == 0 {
                         shared.clone()
                     } else {
-                        EntityPk::single("dropped_entity")
+                        RowPk::single("dropped_row")
                     })
                 })
                 .collect(),
         );
         let survivors = batch
             .iter()
-            .filter(|row| row.entity_pk() == &shared)
+            .filter(|row| row.row_pk() == &shared)
             .count();
         assert_eq!(survivors, 500);
-        let entity_column = batch.entity_column_ptr();
+        let row_column = batch.row_column_ptr();
 
-        let filtered = batch.filter(|row| row.entity_pk() == &shared, None);
+        let filtered = batch.filter(|row| row.row_pk() == &shared, None);
 
         assert_eq!(filtered.len(), 500);
-        assert!(filtered.iter().all(|row| row.entity_pk() == &shared));
+        assert!(filtered.iter().all(|row| row.row_pk() == &shared));
         // The surviving rows still live in the allocation they were built in.
-        // A row-by-row rebuild would have cloned every `EntityPk` component
+        // A row-by-row rebuild would have cloned every `RowPk` component
         // and every `SharedStr` into a second owner, which is the atomic
         // refcount traffic this filter exists to avoid.
-        assert_eq!(filtered.entity_column_ptr(), entity_column);
+        assert_eq!(filtered.row_column_ptr(), row_column);
         // The dictionary is carried over rather than rebuilt, so every
         // surviving row still points at the same interned schema key.
         assert_eq!(
@@ -1853,7 +1853,7 @@ mod batch_tests {
     #[test]
     fn filtering_stops_calling_the_predicate_once_the_limit_is_reached() {
         let batch = MaterializedHotStateBatch::from_rows(
-            (0..16).map(|_| row(EntityPk::single("row"))).collect(),
+            (0..16).map(|_| row(RowPk::single("row"))).collect(),
         );
         let mut visited = 0_usize;
 
@@ -1872,8 +1872,8 @@ mod batch_tests {
     #[test]
     fn filtering_with_a_zero_limit_returns_no_rows() {
         let batch = MaterializedHotStateBatch::from_rows(vec![
-            row(EntityPk::single("first")),
-            row(EntityPk::single("second")),
+            row(RowPk::single("first")),
+            row(RowPk::single("second")),
         ]);
 
         let filtered = batch.filter(|_| true, Some(0));
@@ -1886,20 +1886,20 @@ mod batch_tests {
     #[test]
     fn exact_present_batch_moves_identity_ordered_owner_without_rebatching() {
         let batch = MaterializedHotStateBatch::from_rows(vec![
-            row(EntityPk::single("first")),
-            row(EntityPk::single("second")),
+            row(RowPk::single("first")),
+            row(RowPk::single("second")),
         ]);
-        let entity_column = batch.entity_column_ptr();
+        let row_column = batch.row_column_ptr();
         let exact = MaterializedHotStateExactBatch::new(batch, vec![Some(0), Some(1)])
             .expect("identity slots should be valid");
 
         let present = exact.into_present_batch();
 
-        assert_eq!(present.entity_column_ptr(), entity_column);
+        assert_eq!(present.row_column_ptr(), row_column);
         assert_eq!(
             present
                 .row(0)
-                .entity_pk()
+                .row_pk()
                 .as_single_string()
                 .expect("single key"),
             "first"
@@ -1907,7 +1907,7 @@ mod batch_tests {
         assert_eq!(
             present
                 .row(1)
-                .entity_pk()
+                .row_pk()
                 .as_single_string()
                 .expect("single key"),
             "second"
@@ -1917,8 +1917,8 @@ mod batch_tests {
     #[test]
     fn exact_present_batch_compacts_sparse_slots_in_request_order() {
         let batch = MaterializedHotStateBatch::from_rows(vec![
-            row(EntityPk::single("first")),
-            row(EntityPk::single("second")),
+            row(RowPk::single("first")),
+            row(RowPk::single("second")),
         ]);
         let exact =
             MaterializedHotStateExactBatch::new(batch, vec![Some(1), None, Some(0), Some(1)])
@@ -1930,7 +1930,7 @@ mod batch_tests {
         assert_eq!(
             present
                 .row(0)
-                .entity_pk()
+                .row_pk()
                 .as_single_string()
                 .expect("single key"),
             "second"
@@ -1938,7 +1938,7 @@ mod batch_tests {
         assert_eq!(
             present
                 .row(1)
-                .entity_pk()
+                .row_pk()
                 .as_single_string()
                 .expect("single key"),
             "first"
@@ -1946,7 +1946,7 @@ mod batch_tests {
         assert_eq!(
             present
                 .row(2)
-                .entity_pk()
+                .row_pk()
                 .as_single_string()
                 .expect("single key"),
             "second"

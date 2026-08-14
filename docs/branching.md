@@ -83,20 +83,20 @@ if (preview.conflicts.length === 0) {
 
 ## Conflicts
 
-If both branches changed the same entity after their merge base, the preview includes a `sameEntityChanged` conflict. `mergeBranch()` throws a `LixError` until the caller resolves it.
+If both branches changed the same row after their merge base, the preview includes a `sameRowChanged` conflict. `mergeBranch()` throws a `LixError` until the caller resolves it.
 
 ```ts
 {
-	kind: "sameEntityChanged",
+	kind: "sameRowChanged",
 	schemaKey: "acme_section",
-	entityPk: ["s1"],
+	rowPk: ["s1"],
 	fileId: null,
 	target: { kind: "modified", beforeChangeId, afterChangeId },
 	source: { kind: "modified", beforeChangeId, afterChangeId },
 }
 ```
 
-Conflict detection is row-level today. Two branches that edit different fields of the same row still conflict. Design entities for how your app reads them, not around the current merge rule.
+Conflict detection is row-level today. Two branches that edit different fields of the same row still conflict. Design rows for how your app reads them, not around the current merge rule.
 
 ## Hide or delete a branch
 

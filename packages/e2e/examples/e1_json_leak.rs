@@ -33,9 +33,9 @@
 //!
 //! Two churn shapes, because they bound the answer from both sides:
 //!
-//! * `rewrite` — one entity, rewritten `n` times. Exactly **one** payload is
+//! * `rewrite` — one row, rewritten `n` times. Exactly **one** payload is
 //!   live at the end and the other `n` are superseded. This is the leak arm.
-//! * `insert` — `n` distinct entities, each written once. **All** payloads are
+//! * `insert` — `n` distinct rows, each written once. **All** payloads are
 //!   live. This is the control: a sweep that reclaims anything here is wrong,
 //!   so it separates "reclaims dead payloads" from "reclaims payloads".
 //!
@@ -198,7 +198,7 @@ async fn run_cell(shape: &str, cadence: usize, edits: usize) {
     let (manifests_after, _) =
         space_rows(&storage, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.name).await;
 
-    // `rewrite` leaves one live payload; `insert` leaves one per entity.
+    // `rewrite` leaves one live payload; `insert` leaves one per row.
     let live_payloads = if shape == "insert" { edits + 1 } else { 1 };
     let leaked = json_after.saturating_sub(live_payloads);
 

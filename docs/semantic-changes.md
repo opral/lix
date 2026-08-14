@@ -1,10 +1,10 @@
 ---
-description: A file is not a byte stream. It has entities. Lix records each change as a SQL row that says which entity changed and how.
+description: A file is not a byte stream. It has rows. Lix records each change as a SQL row that says which row changed and how.
 ---
 
 # Semantic Changes
 
-A file is not a byte stream. It has entities: a paragraph, a cell, a property, a record. A semantic change says which entity changed and how. Lix stores it as a row you can query with SQL.
+A file is not a byte stream. It has rows: a paragraph, a cell, a property, a record. A semantic change says which row changed and how. Lix stores it as a row you can query with SQL.
 
 That means Lix can represent:
 
@@ -46,7 +46,7 @@ A text diff sees the whole line and no meaning:
 
 Lix stores the change as a row in `lix_change`:
 
-| schema_key | entity_pk  | snapshot_content                                                   |
+| schema_key | row_pk  | snapshot_content                                                   |
 | ---------- | ---------- | ------------------------------------------------------------------ |
 | `csv_row`  | `["1002"]` | `{"order_id": "1002", "product": "Widget B", "status": "shipped"}` |
 
@@ -59,18 +59,18 @@ order_id 1002 status:
 + shipped
 ```
 
-## Where entities come from
+## Where rows come from
 
-Plugins define the entities of a file format. The Markdown plugin defines blocks. The CSV plugin defines records. Both ship with the JavaScript SDK. Other formats, such as JSON, XLSX, or DOCX, need a plugin.
+Plugins define the rows of a file format. The Markdown plugin defines blocks. The CSV plugin defines records. Both ship with the JavaScript SDK. Other formats, such as JSON, XLSX, or DOCX, need a plugin.
 
-<img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
+<img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with row, field, and value columns" width="760" />
 
 App data that does not come from a file uses the same model. Register a schema, and Lix tracks changes to its rows the same way.
 
 ## What change rows buy you
 
 - **Review the thing that changed.** Show a record, field, or paragraph instead of a patch hunk.
-- **Ask precise questions.** Query changes by schema, file, entity, branch, or time.
+- **Ask precise questions.** Query changes by schema, file, row, branch, or time.
 - **Revert one field, not the whole file.**
 
 ## Query changes with SQL
@@ -80,7 +80,7 @@ App data that does not come from a file uses the same model. Register a schema, 
 ```sql
 SELECT
   f.path,
-  c.entity_pk ->> 0 AS row_id,
+  c.row_pk ->> 0 AS row_id,
   c.snapshot_content AS change
 FROM lix_change AS c
 JOIN lix_file AS f
@@ -93,4 +93,4 @@ ORDER BY c.created_at DESC;
 ## Learn more
 
 - [SQL Surfaces](./surfaces.md) and [Change History](./history.md): branch-scoped state and history queries.
-- [Schemas](./schemas.md): define entities for app data.
+- [Schemas](./schemas.md): define rows for app data.

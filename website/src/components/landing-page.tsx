@@ -332,7 +332,7 @@ const whatYouGet = [
   {
     title: "Files, in any format",
     description:
-      "Text and Markdown, but also DOCX, XLSX, and CAD. Plugins map any format to versioned entities.",
+      "Text and Markdown, but also DOCX, XLSX, and CAD. Plugins map any format to versioned rows.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect

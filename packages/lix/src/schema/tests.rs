@@ -83,7 +83,7 @@ fn restricts_defaults_to_supported_postgresql_expression() {
 }
 
 #[tokio::test]
-async fn postgresql_jsonb_syntax_registers_queries_and_updates_entities() {
+async fn postgresql_jsonb_syntax_registers_queries_and_updates_rows() {
     use crate::Value;
     use crate::engine::Engine;
     use crate::storage::Memory;

@@ -65,14 +65,14 @@ pub(crate) fn diff_command_query(
 
 /// Returns whether an explicit transaction needs a statement checkpoint
 /// before executing this `RETURNING` write. Generic providers construct their
-/// result from a staged postimage. Direct entity writes are the one fast path
+/// result from a staged postimage. Direct row writes are the one fast path
 /// that can safely evaluate ordinary visible columns before staging.
 pub(crate) fn write_plan_requires_post_stage_returning_checkpoint(plan: &SqlLogicalPlan) -> bool {
     let SqlLogicalPlan::Write(write) = plan else {
         return false;
     };
     write.plan.bound.returning.is_some()
-        && !super::bound_public_write::entity_returning_projects_before_stage(&write.plan)
+        && !super::bound_public_write::row_returning_projects_before_stage(&write.plan)
 }
 
 #[cfg(test)]
@@ -363,7 +363,7 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
         return Ok(None);
     };
     validate_write_parameter_count(&write_plan.plan, parameter_batch.num_columns())?;
-    if let Some(results) = super::bound_public_write::try_execute_entity_insert_parameter_batch(
+    if let Some(results) = super::bound_public_write::try_execute_row_insert_parameter_batch(
         ctx,
         &write_plan.plan,
         parameter_batch,
@@ -373,7 +373,7 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
     {
         return Ok(Some(results));
     }
-    super::bound_public_write::try_execute_entity_update_parameter_batch(
+    super::bound_public_write::try_execute_row_update_parameter_batch(
         ctx,
         &write_plan.plan,
         parameter_batch,
@@ -402,7 +402,7 @@ pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
         PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
         return Ok(Some(results));
     }
-    if let Some(results) = super::bound_public_write::try_execute_entity_insert_prepared_batch(
+    if let Some(results) = super::bound_public_write::try_execute_row_insert_prepared_batch(
         ctx,
         &write_plan.plan,
         parameter_batch,
@@ -413,7 +413,7 @@ pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
         PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
         return Ok(Some(results));
     }
-    let results = super::bound_public_write::try_execute_entity_update_prepared_batch(
+    let results = super::bound_public_write::try_execute_row_update_prepared_batch(
         ctx,
         &write_plan.plan,
         parameter_batch,
@@ -441,7 +441,7 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
         return Ok(None);
     }
     validate_write_parameter_count(&write_plan.plan, first.len())?;
-    if let Some(results) = super::bound_public_write::try_execute_entity_insert_value_batch(
+    if let Some(results) = super::bound_public_write::try_execute_row_insert_value_batch(
         ctx,
         &write_plan.plan,
         parameter_rows,
@@ -451,7 +451,7 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
     {
         return Ok(Some(results));
     }
-    super::bound_public_write::try_execute_entity_update_value_batch(
+    super::bound_public_write::try_execute_row_update_value_batch(
         ctx,
         &write_plan.plan,
         parameter_rows,
@@ -643,7 +643,7 @@ fn resolve_parameterized_branch_scope(
 
 fn branch_column_for_target(target: &BoundWriteTarget) -> Option<&'static str> {
     match target {
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::ByBranch {
             ..
         })
         | BoundWriteTarget::File(crate::sql2::bind::write::FileWriteSurface::ByBranch)

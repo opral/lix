@@ -11,7 +11,7 @@ use tracing::Instrument;
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
-use crate::entity_pk::{EntityPk, EntityPkComponent};
+use crate::row_pk::{RowPk, RowPkComponent};
 use crate::hot_state::{HotStateRowFilter, HotStateScanRequest, MaterializedHotStateRow};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
@@ -122,14 +122,14 @@ where
 }
 
 #[async_trait]
-trait DerivedEntityPointProvider<S>: DerivedHotStateProvider<S>
+trait DerivedRowPointProvider<S>: DerivedHotStateProvider<S>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    async fn load_entity_points(
+    async fn load_row_points(
         &self,
         reads: &mut DerivedReadContext<'_, S>,
-        entity_pks: &[EntityPk],
+        row_pks: &[RowPk],
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedHotStateRow>, LixError>;
 }
@@ -167,19 +167,19 @@ where
 }
 
 #[async_trait]
-impl<S> DerivedEntityPointProvider<S> for CommitProvider
+impl<S> DerivedRowPointProvider<S> for CommitProvider
 where
     S: StorageAdapterRead + ?Sized,
 {
-    async fn load_entity_points(
+    async fn load_row_points(
         &self,
         reads: &mut DerivedReadContext<'_, S>,
-        entity_pks: &[EntityPk],
+        row_pks: &[RowPk],
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
-        let commit_ids = entity_pks
+        let commit_ids = row_pks
             .iter()
-            .filter_map(commit_id_from_entity_pk)
+            .filter_map(commit_id_from_row_pk)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -239,19 +239,19 @@ where
 }
 
 #[async_trait]
-impl<S> DerivedEntityPointProvider<S> for CommitEdgeProvider
+impl<S> DerivedRowPointProvider<S> for CommitEdgeProvider
 where
     S: StorageAdapterRead + ?Sized,
 {
-    async fn load_entity_points(
+    async fn load_row_points(
         &self,
         reads: &mut DerivedReadContext<'_, S>,
-        entity_pks: &[EntityPk],
+        row_pks: &[RowPk],
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
-        let edge_ids = entity_pks
+        let edge_ids = row_pks
             .iter()
-            .filter_map(commit_edge_id_from_entity_pk)
+            .filter_map(commit_edge_id_from_row_pk)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -325,14 +325,14 @@ where
 }
 
 #[async_trait]
-impl<S> DerivedEntityPointProvider<S> for BranchRefProvider
+impl<S> DerivedRowPointProvider<S> for BranchRefProvider
 where
     S: StorageAdapterRead + ?Sized,
 {
-    async fn load_entity_points(
+    async fn load_row_points(
         &self,
         reads: &mut DerivedReadContext<'_, S>,
-        entity_pks: &[EntityPk],
+        row_pks: &[RowPk],
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
         if !scope
@@ -342,9 +342,9 @@ where
         {
             return Ok(Vec::new());
         }
-        let branch_ids = entity_pks
+        let branch_ids = row_pks
             .iter()
-            .filter_map(uuid_string_from_entity_pk)
+            .filter_map(uuid_string_from_row_pk)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -434,14 +434,14 @@ async fn append_point_provider_rows<S, P>(
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + ?Sized,
-    P: DerivedEntityPointProvider<S>,
+    P: DerivedRowPointProvider<S>,
 {
     let descriptor = provider.descriptor();
     if !provider_filter_allows(request, scope, descriptor) {
         return Ok(());
     }
 
-    let mut provider_rows = if request.filter.entity_pks.is_empty() {
+    let mut provider_rows = if request.filter.row_pks.is_empty() {
         provider
             .scan_all(reads, scope)
             .instrument(tracing::debug_span!(
@@ -452,16 +452,16 @@ where
             .await?
     } else {
         provider
-            .load_entity_points(reads, &request.filter.entity_pks, scope)
+            .load_row_points(reads, &request.filter.row_pks, scope)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
-                "lix.perf.derived.entity_points",
+                "lix.perf.derived.row_points",
                 schema_key = descriptor.schema_key,
             ))
             .await?
     };
-    if !request.filter.entity_pks.is_empty() {
-        provider_rows.retain(|row| request.filter.entity_pks.contains(&row.entity_pk));
+    if !request.filter.row_pks.is_empty() {
+        provider_rows.retain(|row| request.filter.row_pks.contains(&row.row_pk));
     }
     rows.extend(provider_rows);
     Ok(())
@@ -521,18 +521,18 @@ fn file_filter_allows(
     }
 }
 
-fn commit_id_from_entity_pk(entity_pk: &EntityPk) -> Option<CommitId> {
-    let [EntityPkComponent::Uuid(bytes)] = entity_pk.components.as_slice() else {
+fn commit_id_from_row_pk(row_pk: &RowPk) -> Option<CommitId> {
+    let [RowPkComponent::Uuid(bytes)] = row_pk.components.as_slice() else {
         return None;
     };
     Some(CommitId::new(uuid::Uuid::from_bytes(*bytes)))
 }
 
-fn commit_edge_id_from_entity_pk(entity_pk: &EntityPk) -> Option<(CommitId, u32)> {
+fn commit_edge_id_from_row_pk(row_pk: &RowPk) -> Option<(CommitId, u32)> {
     let [
-        EntityPkComponent::Uuid(bytes),
-        EntityPkComponent::Integer(parent_order),
-    ] = entity_pk.components.as_slice()
+        RowPkComponent::Uuid(bytes),
+        RowPkComponent::Integer(parent_order),
+    ] = row_pk.components.as_slice()
     else {
         return None;
     };
@@ -542,8 +542,8 @@ fn commit_edge_id_from_entity_pk(entity_pk: &EntityPk) -> Option<(CommitId, u32)
     ))
 }
 
-fn uuid_string_from_entity_pk(entity_pk: &EntityPk) -> Option<String> {
-    let [EntityPkComponent::Uuid(bytes)] = entity_pk.components.as_slice() else {
+fn uuid_string_from_row_pk(row_pk: &RowPk) -> Option<String> {
+    let [RowPkComponent::Uuid(bytes)] = row_pk.components.as_slice() else {
         return None;
     };
     Some(uuid::Uuid::from_bytes(*bytes).as_hyphenated().to_string())
@@ -579,7 +579,7 @@ fn commit_row(
             )
         })?;
     Ok(MaterializedHotStateRow {
-        entity_pk: EntityPk::uuid_from_bytes(*commit_id.as_uuid().as_bytes()),
+        row_pk: RowPk::uuid_from_bytes(*commit_id.as_uuid().as_bytes()),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content.into()),
@@ -611,9 +611,9 @@ fn commit_edge_row(
         )
     })?;
     Ok(MaterializedHotStateRow {
-        entity_pk: EntityPk::from_components(smallvec::smallvec![
-            EntityPkComponent::Uuid(*edge.child_commit_id.as_uuid().as_bytes()),
-            EntityPkComponent::Integer(i64::from(edge.parent_order)),
+        row_pk: RowPk::from_components(smallvec::smallvec![
+            RowPkComponent::Uuid(*edge.child_commit_id.as_uuid().as_bytes()),
+            RowPkComponent::Integer(i64::from(edge.parent_order)),
         ])
         .expect("commit edge primary key has two components"),
         schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
@@ -646,7 +646,7 @@ fn branch_ref_row(
         )
     })?;
     Ok(MaterializedHotStateRow {
-        entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+        row_pk: RowPk::uuid_from_canonical(branch_id).map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("direct branch-ref id is not a canonical UUID: {error}"),

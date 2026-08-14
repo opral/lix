@@ -14,7 +14,7 @@ use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::hot_state::{
     HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRow,
@@ -129,7 +129,7 @@ impl FilesystemPathEntry {
             }),
         };
         MaterializedHotStateRow {
-            entity_pk: EntityPk::uuid_from_canonical(self.id())
+            row_pk: RowPk::uuid_from_canonical(self.id())
                 .expect("filesystem descriptor IDs are validated canonical UUIDs"),
             schema_key: match self.kind {
                 FilesystemPathKind::File => FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -200,7 +200,7 @@ impl FilesystemPathEntry {
             + self.updated_at.capacity()
             + self.blob_ref.as_ref().map_or(0, |row| {
                 row.schema_key.capacity()
-                    + row.entity_pk.estimated_heap_bytes()
+                    + row.row_pk.estimated_heap_bytes()
                     + row.file_id.as_ref().map_or(0, String::capacity)
                     + row
                         .snapshot_content
@@ -742,7 +742,7 @@ impl FilesystemPathIndex {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             })
-            .unwrap_or(row.entity_pk.as_single_string_owned()?);
+            .unwrap_or(row.row_pk.as_single_string_owned()?);
         let blob_ref_key = FilesystemBlobRefKey::from_live_row(row, descriptor_id.clone());
         let entry = self
             .entries_by_descriptor_id
@@ -781,7 +781,7 @@ impl FilesystemPathIndex {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             })
-            .unwrap_or(row.entity_pk.as_single_string_owned()?);
+            .unwrap_or(row.row_pk.as_single_string_owned()?);
         let same_id = self
             .entries_by_descriptor_id
             .values_equal_by(descriptor_id.as_str(), |key| key.id.as_str())
@@ -848,7 +848,7 @@ impl FilesystemPathIndex {
         if let Some(prior) = prior.as_ref() {
             // Descriptor writes in the transaction overlay carry the current
             // change timestamp. Replacing the same identity must retain the
-            // entity's first visible timestamp.
+            // row's first visible timestamp.
             entry.created_at.clone_from(&prior.created_at);
         }
         entry.blob_ref = prior_blob_ref;
@@ -1554,7 +1554,7 @@ struct FileRecord {
 mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::hot_state::MaterializedHotStateBatchBuilder;
 
     fn path_index_from_rows(
@@ -2225,7 +2225,7 @@ mod tests {
         global: bool,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: EntityPk::single(id),
+            row_pk: RowPk::single(id),
             schema_key: schema_key.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.into()),

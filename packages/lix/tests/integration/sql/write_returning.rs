@@ -3,7 +3,7 @@ use lix::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
-    registered_entity_returning_uses_generated_postimages_for_insert_update_and_upsert,
+    registered_row_returning_uses_generated_postimages_for_insert_update_and_upsert,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -26,7 +26,7 @@ simulation_test!(
                 &[Value::Text("Created through RETURNING".to_string())],
             )
             .await
-            .expect("registered entity INSERT RETURNING should succeed");
+            .expect("registered row INSERT RETURNING should succeed");
         assert_eq!(inserted.rows_affected(), 1);
         assert_eq!(inserted.columns(), ["id", "title"]);
         let [Value::Text(id), Value::Text(title)] = inserted.rows()[0].values() else {
@@ -46,7 +46,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("multi-row entity INSERT RETURNING * should succeed");
+            .expect("multi-row INSERT RETURNING * should succeed");
         assert_eq!(wildcard.rows_affected(), 2);
         assert_eq!(wildcard.rows().len(), 2);
         assert!(
@@ -68,7 +68,7 @@ simulation_test!(
                 ],
             )
             .await
-            .expect("registered entity UPDATE RETURNING should succeed");
+            .expect("registered row UPDATE RETURNING should succeed");
         assert_eq!(updated.rows_affected(), 1);
         assert_eq!(
             updated.columns(),
@@ -115,7 +115,7 @@ simulation_test!(
                 ],
             )
             .await
-            .expect("entity UPSERT RETURNING should expose its postimage");
+            .expect("row UPSERT RETURNING should expose its postimage");
         assert_eq!(upserted.rows_affected(), 1);
         assert_rows_eq(
             upserted,
@@ -148,7 +148,7 @@ simulation_test!(
                 &[Value::Text(sim.main_branch_id().to_string())],
             )
             .await
-            .expect("by-branch entity INSERT RETURNING should succeed");
+            .expect("by-branch row INSERT RETURNING should succeed");
         assert_rows_eq(
             by_branch,
             vec![vec![
@@ -478,7 +478,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("atomic-returning entity seed should succeed");
+            .expect("atomic-returning row seed should succeed");
         session
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ('/42', CAST('byte-01' AS BYTEA))",
@@ -545,7 +545,7 @@ simulation_test!(
             )]],
         );
 
-        // Entity audit fields require the direct executor's staged postimage
+        // Row audit fields require the direct executor's staged postimage
         // path too. Keep the same cast to prove it is rolled back by the
         // shared statement checkpoint rather than a provider-specific guard.
         let error = transaction
@@ -556,7 +556,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("staged entity RETURNING cast should fail");
+            .expect_err("staged row RETURNING cast should fail");
         assert_eq!(error.code, "LIX_TYPE_MISMATCH");
         assert_rows_eq(
             transaction
@@ -565,7 +565,7 @@ simulation_test!(
                     &[],
                 )
                 .await
-                .expect("failed entity RETURNING should restore the postimage"),
+                .expect("failed row RETURNING should restore the postimage"),
             vec![vec![
                 Value::Text("task".to_string()),
                 Value::Text("42".to_string()),
@@ -590,7 +590,7 @@ simulation_test!(
                     &[],
                 )
                 .await
-                .expect("failed entity RETURNING must not persist"),
+                .expect("failed row RETURNING must not persist"),
             vec![vec![
                 Value::Text("task".to_string()),
                 Value::Text("42".to_string()),

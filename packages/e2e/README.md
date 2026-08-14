@@ -11,7 +11,7 @@ That is the whole rule. A bench that opens an in-memory `lix::Memory` engine and
 measures the SQL or version-control surface does not belong in this crate: it
 would drag RocksDB, SlateDB, `object_store` and their transitive trees into a
 build that never touches them. `diff_commands`, `undo_redo`,
-`entity_default_values`, `entity_pk_layout`, `registered_entity_returning` and
+`row_default_values`, `row_pk_layout`, `registered_row_returning` and
 `commit_graph_scale` live in `packages/lix/benches/` for exactly that reason.
 
 Conversely, anything that needs `lix-storage-rocksdb`, `lix-storage-slatedb`,

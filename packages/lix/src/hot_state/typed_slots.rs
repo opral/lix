@@ -1,4 +1,4 @@
-//! Typed column slots for scalar-declared entity columns.
+//! Typed column slots for scalar-declared row columns.
 //!
 //! Current-state snapshots are stored as UTF-8 JSON text. Every read that needs
 //! one named column still runs a deserializer across the whole document: the
@@ -8,7 +8,7 @@
 //!
 //! Schemas in this repository are closed — `additionalProperties: false` is
 //! required-present-and-required-false in `schema/definition.json`, and
-//! `assert_entity_properties_have_projectable_types` rejects any property whose
+//! `assert_row_properties_have_projectable_types` rejects any property whose
 //! declared type does not resolve. So the set of columns a snapshot may carry is
 //! known from the schema alone, and a record can address them *positionally*
 //! instead of by key.
@@ -48,8 +48,8 @@
 //! missing from the snapshot map. Encoding therefore materializes *every*
 //! declared column and writes a null slot where the key was absent.
 //!
-//! This is safe at the entity surface because that surface already erases the
-//! distinction: `entity_json_text_value` maps both `None` and
+//! This is safe at the schema surface because that surface already erases the
+//! distinction: `row_json_text_value` maps both `None` and
 //! `Some(JsonValue::Null)` to SQL `NULL`. It does not disturb the write path's
 //! deliberate absent-vs-null distinction either, because that distinction is
 //! consumed during normalization (defaults apply to absent keys and not to
@@ -115,7 +115,7 @@ fn typed_slots_json_parse_count() -> usize {
 /// The declared type of a column, as the schema catalog resolves it.
 ///
 /// Deliberately a local enum rather than a re-export of the SQL surface's
-/// `EntityColumnType`: this module sits below the catalog, and importing the
+/// `SchemaColumnType`: this module sits below the catalog, and importing the
 /// catalog here would invert that layering for no gain. The SQL side maps its
 /// own enum onto this one at the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +239,7 @@ pub(crate) enum TypedSlot<'a> {
     Null,
     /// The column was absent from the snapshot map.
     ///
-    /// Reads that go to the entity surface must treat this exactly as `Null`;
+    /// Reads that go to the schema surface must treat this exactly as `Null`;
     /// the two are distinguished here only so the record does not destroy
     /// information the write path took care to preserve.
     Absent,
@@ -253,7 +253,7 @@ pub(crate) enum TypedSlot<'a> {
 }
 
 impl TypedSlot<'_> {
-    /// Whether this slot reads as SQL `NULL` at the entity surface.
+    /// Whether this slot reads as SQL `NULL` at the schema surface.
     pub(crate) fn is_sql_null(self) -> bool {
         matches!(self, Self::Null | Self::Absent)
     }
@@ -684,7 +684,7 @@ mod tests {
             layout.is_all_scalar(),
             "this lane is the all-scalar case the format targets"
         );
-        let text = r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","note":"a longer trailing column that a predicate on id never needs to look at","ratio":1.5}"#;
+        let text = r#"{"count":7,"enabled":true,"id":"record-1","label":"second","note":"a longer trailing column that a predicate on id never needs to look at","ratio":1.5}"#;
         let snapshot = object(text);
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
@@ -698,7 +698,7 @@ mod tests {
             0,
             "an all-scalar record must reach no JSON tokenizer at all"
         );
-        assert_eq!(projected["id"], JsonValue::String("entity-1".to_string()));
+        assert_eq!(projected["id"], JsonValue::String("record-1".to_string()));
         assert_eq!(projected["count"], JsonValue::Number(JsonNumber::from(7)));
         assert_eq!(
             projected.as_object().expect("object").len(),
@@ -765,14 +765,14 @@ mod tests {
         // colliding values cannot detect a permuted slot order.
         let layout = layout();
         let snapshot =
-            object(r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#);
+            object(r#"{"count":7,"enabled":true,"id":"row-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#);
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 
         assert_eq!(record.len(), 6);
         assert_eq!(
             record.slot(layout.index_of("id").expect("id")).expect("id"),
-            TypedSlot::Str("entity-1")
+            TypedSlot::Str("row-1")
         );
         assert_eq!(
             record
@@ -812,7 +812,7 @@ mod tests {
     fn canonical_json_reconstruction_is_byte_identical_to_the_normalized_text() {
         let layout = layout();
         for text in [
-            r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#,
+            r#"{"count":7,"enabled":true,"id":"row-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#,
             r#"{"count":0,"enabled":false,"id":"","label":"a\"b\nc","payload":null,"ratio":-0.25}"#,
             r#"{"count":-9007199254740993,"enabled":true,"id":"unicode-é","label":"ok","payload":[],"ratio":1e10}"#,
             r#"{"id":"only-required"}"#,
@@ -833,7 +833,7 @@ mod tests {
     }
 
     /// Absent and explicit-null are distinct in the record, and identical at
-    /// the entity surface. Both halves matter: the first is what keeps the
+    /// the schema surface. Both halves matter: the first is what keeps the
     /// write path's distinction readable, the second is what makes
     /// materializing every declared column safe.
     #[test]
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn a_truncated_record_is_rejected_rather_than_read_out_of_bounds() {
         let layout = layout();
-        let bytes = encode_typed_slots(&layout, &object(r#"{"id":"entity-1"}"#)).expect("encode");
+        let bytes = encode_typed_slots(&layout, &object(r#"{"id":"row-1"}"#)).expect("encode");
         for truncated in 1..bytes.len() {
             let _ = TypedSlotsRef::parse(&bytes[..truncated]);
         }

@@ -13,12 +13,12 @@
 //!   `sql2/exec/bound_public_write.rs`) rows,
 //! * in a single `execute_batch` of same-shape parameterized single-row
 //!   INSERTs,
-//! * against a **user-registered** entity schema.
+//! * against a **user-registered** row schema.
 //!
 //! `PACKED_CURRENT_BASE_MIN_ROWS` (`512`, in `transaction/commit.rs`) is
 //! necessary but *not* sufficient, and reading it as the threshold is why this
 //! mechanism looked untestable: at 512–32,767 rows the batch still certifies
-//! and the columnar arm is still never taken. `certified_entity_insert_*`
+//! and the columnar arm is still never taken. `certified_row_insert_*`
 //! counters therefore cannot stand in for the assertions below — they are
 //! already non-zero at 511 rows with no columnar publication anywhere.
 //!

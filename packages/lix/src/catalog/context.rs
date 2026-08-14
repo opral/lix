@@ -234,7 +234,7 @@ impl CatalogContext {
                         "SQL surface schema '{schema_key}' is visible from more than one schema catalog fact"
                     ),
                 )
-                .with_hint("SQL entity surfaces are named by schema_key. Keep exactly one visible schema per schema_key for SQL planning."));
+                .with_hint("SQL schema surfaces are named by schema_key. Keep exactly one visible schema per schema_key for SQL planning."));
             }
         }
         Ok(schemas.into_values().collect())
@@ -801,7 +801,7 @@ mod tests {
 
     fn registered_schema_row(schema_key: &str) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: registered_schema_entity_pk(schema_key),
+            row_pk: registered_schema_row_pk(schema_key),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             branch_id: GLOBAL_BRANCH_ID.into(),
@@ -835,8 +835,8 @@ mod tests {
         }
     }
 
-    fn registered_schema_entity_pk(schema_key: &str) -> crate::entity_pk::EntityPk {
-        crate::entity_pk::EntityPk::from_primary_key_paths(
+    fn registered_schema_row_pk(schema_key: &str) -> crate::row_pk::RowPk {
+        crate::row_pk::RowPk::from_primary_key_paths(
             &json!({ "schema_key": schema_key }),
             &[vec!["schema_key".to_string()]],
         )

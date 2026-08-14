@@ -394,9 +394,9 @@ type MergeChangeStats = {
 
 ```ts
 type MergeConflict = {
-  kind: "sameEntityChanged";
+  kind: "sameRowChanged";
   schemaKey: string;
-  entityPk: unknown;
+  rowPk: unknown;
   fileId: string | null;
   target: MergeConflictSide;
   source: MergeConflictSide;

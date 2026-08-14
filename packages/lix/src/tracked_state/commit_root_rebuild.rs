@@ -5,7 +5,7 @@ use crate::changelog::{
     ChangeId, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, CommitRecord,
 };
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::context::{
     TrackedStateContext, TrackedStateRootRebuilder, TrackedStateTransientRebuildState,
@@ -25,7 +25,7 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) struct CommitRootRebuildDelta {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
@@ -373,7 +373,7 @@ where
         .map(|(key, _)| {
             (key.schema_key.len()
                 + key.file_id.as_ref().map(String::len).unwrap_or(0)
-                + key.entity_pk.estimated_heap_bytes()) as u64
+                + key.row_pk.estimated_heap_bytes()) as u64
         })
         .sum::<u64>();
     #[cfg(feature = "root-replay-trace")]
@@ -387,7 +387,7 @@ where
         .map(|(key, value)| CommitRootRebuildDelta {
             schema_key: key.schema_key,
             file_id: key.file_id,
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
             change_id: value.change_id,
             commit_id: value.commit_id,
             deleted: value.deleted,
@@ -416,7 +416,7 @@ where
         .map(|delta| TrackedStateDeltaRef {
             schema_key: &delta.schema_key,
             file_id: delta.file_id.as_deref(),
-            entity_pk: &delta.entity_pk,
+            row_pk: &delta.row_pk,
             change_id: delta.change_id,
             commit_id: delta.commit_id,
             deleted: delta.deleted,
@@ -479,7 +479,7 @@ where
             let key = TrackedStateKey {
                 schema_key: delta.schema_key.clone(),
                 file_id: delta.file_id.clone(),
-                entity_pk: delta.entity_pk.clone(),
+                row_pk: delta.row_pk.clone(),
             };
             match terminal_by_key.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -503,7 +503,7 @@ where
         .map(|delta| TrackedStateDeltaRef {
             schema_key: &delta.schema_key,
             file_id: delta.file_id.as_deref(),
-            entity_pk: &delta.entity_pk,
+            row_pk: &delta.row_pk,
             change_id: delta.change_id,
             commit_id: delta.commit_id,
             deleted: delta.deleted,
@@ -540,9 +540,9 @@ mod tests {
         deleted: bool,
     ) -> CommitRootRebuildDelta {
         CommitRootRebuildDelta {
-            schema_key: "test_entity".to_owned(),
+            schema_key: "test_row".to_owned(),
             file_id: None,
-            entity_pk: EntityPk::single(key),
+            row_pk: RowPk::single(key),
             change_id: ChangeId::for_test_label(&format!("{commit}-{key}")),
             commit_id: CommitId::for_test_label(commit),
             deleted,
@@ -683,7 +683,7 @@ mod tests {
                     [TrackedStateDeltaRef {
                         schema_key: &child_delta.schema_key,
                         file_id: child_delta.file_id.as_deref(),
-                        entity_pk: &child_delta.entity_pk,
+                        row_pk: &child_delta.row_pk,
                         change_id: child_delta.change_id,
                         commit_id: child_delta.commit_id,
                         deleted: child_delta.deleted,

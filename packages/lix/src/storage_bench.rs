@@ -45,11 +45,11 @@ static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
 static ROOT_BASE_BATCH_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static ROOT_BASE_BATCH_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static TRACKED_SCAN_DURABLE_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -70,8 +70,8 @@ static MATERIALIZE_OWNED_KEY_BUILDS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_OWNED_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_REVERIFY_ROWS: AtomicU64 = AtomicU64::new(0);
 static COMMIT_DELTA_COLUMNAR_ROWS: AtomicU64 = AtomicU64::new(0);
-static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static ROW_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static ROW_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -451,12 +451,12 @@ pub fn take_media_structural_accounting() -> MediaStructuralAccounting {
     }
 }
 
-pub(crate) fn record_certified_entity_insert_parameter_batch_certification() {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_certified_row_insert_parameter_batch_certification() {
+    CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CertifiedEntityInsertParameterBatchCounters {
+pub struct CertifiedRowInsertParameterBatchCounters {
     pub certifications: u64,
     pub executions: u64,
 }
@@ -464,17 +464,17 @@ pub struct CertifiedEntityInsertParameterBatchCounters {
 /// Reads the cumulative certified parameter-batch INSERT phase counters
 /// without resetting them. Callers measuring one fixture/sample must subtract
 /// a pre-operation snapshot from a post-operation snapshot.
-pub fn certified_entity_insert_parameter_batch_counters()
--> CertifiedEntityInsertParameterBatchCounters {
-    CertifiedEntityInsertParameterBatchCounters {
-        certifications: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS
+pub fn certified_row_insert_parameter_batch_counters()
+-> CertifiedRowInsertParameterBatchCounters {
+    CertifiedRowInsertParameterBatchCounters {
+        certifications: CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS
             .load(Ordering::Relaxed),
-        executions: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
+        executions: CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
     }
 }
 
-pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_certified_row_insert_parameter_batch_execution() {
+    CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Returns and resets the number of certified parameter-batch INSERT routes
@@ -482,8 +482,8 @@ pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
 ///
 /// Benchmark fixtures use this as a route certificate so a schema change
 /// cannot silently turn the measured bulk INSERT back into sequential writes.
-pub fn take_certified_entity_insert_parameter_batch_executions() -> u64 {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed)
+pub fn take_certified_row_insert_parameter_batch_executions() -> u64 {
+    CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -494,20 +494,20 @@ pub struct CrudCertificateAccounting {
     pub certified_rows: u64,
 }
 
-pub(crate) fn record_certified_entity_update_value_batch_attempt() {
-    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_certified_row_update_value_batch_attempt() {
+    CERTIFIED_ROW_UPDATE_VALUE_BATCH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_certified_entity_update_value_batch_hit(row_count: usize) {
-    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.fetch_add(1, Ordering::Relaxed);
-    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.fetch_add(row_count as u64, Ordering::Relaxed);
+pub(crate) fn record_certified_row_update_value_batch_hit(row_count: usize) {
+    CERTIFIED_ROW_UPDATE_VALUE_BATCH_HITS.fetch_add(1, Ordering::Relaxed);
+    CERTIFIED_ROW_UPDATE_VALUE_BATCH_ROWS.fetch_add(row_count as u64, Ordering::Relaxed);
 }
 
 /// Returns and resets generated UPDATE certificate hit/miss accounting.
-pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateAccounting {
-    let attempts = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.swap(0, Ordering::Relaxed);
-    let hits = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.swap(0, Ordering::Relaxed);
-    let certified_rows = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.swap(0, Ordering::Relaxed);
+pub fn take_certified_row_update_value_batch_accounting() -> CrudCertificateAccounting {
+    let attempts = CERTIFIED_ROW_UPDATE_VALUE_BATCH_ATTEMPTS.swap(0, Ordering::Relaxed);
+    let hits = CERTIFIED_ROW_UPDATE_VALUE_BATCH_HITS.swap(0, Ordering::Relaxed);
+    let certified_rows = CERTIFIED_ROW_UPDATE_VALUE_BATCH_ROWS.swap(0, Ordering::Relaxed);
     CrudCertificateAccounting {
         attempts,
         hits,
@@ -517,7 +517,7 @@ pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateA
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EntityPointSnapshotCacheAccounting {
+pub struct RowPointSnapshotCacheAccounting {
     pub hits: u64,
     pub misses: u64,
 }
@@ -771,7 +771,7 @@ pub fn take_tracked_key_allocation_census() -> TrackedKeyAllocationCensus {
 
 /// Hot-index probe routing, counted where the probe *decides*.
 ///
-/// A probe that resolves candidates rewrites the request's `entity_pks`, which
+/// A probe that resolves candidates rewrites the request's `row_pks`, which
 /// sends `hot_scan_entries` down its point-batch arm instead of the
 /// full-prefix fallback. Counting the decision here rather than the rows the
 /// scan returns is what distinguishes a seek from a walk: a count taken at the
@@ -835,18 +835,18 @@ pub fn take_hot_index_probe_census() -> HotIndexProbeCensus {
     }
 }
 
-pub(crate) fn record_entity_point_snapshot_cache_hit() {
-    ENTITY_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_row_point_snapshot_cache_hit() {
+    ROW_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_entity_point_snapshot_cache_miss() {
-    ENTITY_POINT_SNAPSHOT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_row_point_snapshot_cache_miss() {
+    ROW_POINT_SNAPSHOT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn take_entity_point_snapshot_cache_accounting() -> EntityPointSnapshotCacheAccounting {
-    EntityPointSnapshotCacheAccounting {
-        hits: ENTITY_POINT_SNAPSHOT_CACHE_HITS.swap(0, Ordering::Relaxed),
-        misses: ENTITY_POINT_SNAPSHOT_CACHE_MISSES.swap(0, Ordering::Relaxed),
+pub fn take_row_point_snapshot_cache_accounting() -> RowPointSnapshotCacheAccounting {
+    RowPointSnapshotCacheAccounting {
+        hits: ROW_POINT_SNAPSHOT_CACHE_HITS.swap(0, Ordering::Relaxed),
+        misses: ROW_POINT_SNAPSHOT_CACHE_MISSES.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -967,7 +967,7 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
 ///   columnar parts bootstrapped a scoped root out of the `parent_root ==
 ///   None` fixed point. Reached only by a certified typed INSERT batch of at
 ///   least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows against a
-///   user-registered entity schema.
+///   user-registered row schema.
 /// * `parent_root_hits` — a later publication found a parent scoped root and
 ///   carried it forward. This is what proves the accelerator *sustains*; a
 ///   regression that bootstraps and then self-extinguishes leaves
@@ -1885,7 +1885,7 @@ where
             .change_history_from_commit(
                 &head_commit_id,
                 &crate::commit_graph::CommitGraphChangeHistoryRequest {
-                    entity_pks: Vec::new(),
+                    row_pks: Vec::new(),
                     schema_keys: vec![COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY.to_string()],
                     file_ids: Vec::new(),
                     min_depth: None,
@@ -1985,7 +1985,7 @@ where
             commit_id,
             "commit graph benchmark member commit",
         )?;
-        let entity_pk = crate::entity_pk::EntityPk::single(format!("bench-member-{index:08}"));
+        let row_pk = crate::row_pk::RowPk::single(format!("bench-member-{index:08}"));
         let snapshot = crate::json_store::JsonSlot::from_json(&format!(
             "{{\"index\":{index},\"payload\":\"{}\"}}",
             "x".repeat(192)
@@ -1996,7 +1996,7 @@ where
                 delta: crate::tracked_state::TrackedStateDeltaRef {
                     schema_key: COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY,
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: crate::changelog::ChangeId::for_test_label(&format!(
                         "commit-graph-bench-member-{index}"
                     )),
@@ -3664,7 +3664,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
 /// rather than assume it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentAddressRule {
-    /// The key carries an identity (commit id, entity path, ordinal) that is
+    /// The key carries an identity (commit id, row path, ordinal) that is
     /// independent of the value bytes. Equal payloads under distinct keys are
     /// stored twice by construction.
     NotContentAddressed,
@@ -3858,7 +3858,7 @@ where
 // ---------------------------------------------------------------------------
 
 pub const CRUD_PHASE_OTHER: usize = 0;
-/// The write-side read: `scan_entity_candidates*` locating the target row.
+/// The write-side read: `scan_row_candidates*` locating the target row.
 pub const CRUD_PHASE_WRITE_READ: usize = 1;
 /// `Transaction::commit_prepared` — publication of the new write set.
 pub const CRUD_PHASE_COMMIT: usize = 2;
@@ -4284,13 +4284,13 @@ pub(crate) fn record_hot_scan_file_prefix() {
     HOT_SCAN_FILE_PREFIX[crud_phase()].fetch_add(1, Ordering::Relaxed);
 }
 
-/// `has_entity_pks` separates the two ways the primary-prefix arm is reached:
+/// `has_row_pks` separates the two ways the primary-prefix arm is reached:
 /// a predicate that bound no identity at all, and a bound identity that the
 /// point-batch arm still refused (a schema with file-backed members).
-pub(crate) fn record_hot_scan_fallback(has_entity_pks: bool) {
+pub(crate) fn record_hot_scan_fallback(has_row_pks: bool) {
     let phase = crud_phase();
     HOT_SCAN_FALLBACK[phase].fetch_add(1, Ordering::Relaxed);
-    if has_entity_pks {
+    if has_row_pks {
         HOT_SCAN_FALLBACK_WITH_PKS[phase].fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -4325,7 +4325,7 @@ pub struct HotScanRouteCensus {
     pub point_batch: u64,
     pub file_prefix: u64,
     pub fallback: u64,
-    pub fallback_with_entity_pks: u64,
+    pub fallback_with_row_pks: u64,
     pub fallback_entries_decoded: u64,
     pub fallback_entries_matched: u64,
     /// `FILE_SPACE` point reads issued by the point-batch arm's guard.
@@ -4339,7 +4339,7 @@ pub fn take_hot_scan_route_census() -> [HotScanRouteCensus; CRUD_PHASE_COUNT] {
         point_batch: HOT_SCAN_POINT_BATCH[phase].swap(0, Ordering::Relaxed),
         file_prefix: HOT_SCAN_FILE_PREFIX[phase].swap(0, Ordering::Relaxed),
         fallback: HOT_SCAN_FALLBACK[phase].swap(0, Ordering::Relaxed),
-        fallback_with_entity_pks: HOT_SCAN_FALLBACK_WITH_PKS[phase].swap(0, Ordering::Relaxed),
+        fallback_with_row_pks: HOT_SCAN_FALLBACK_WITH_PKS[phase].swap(0, Ordering::Relaxed),
         fallback_entries_decoded: HOT_SCAN_FALLBACK_DECODED[phase].swap(0, Ordering::Relaxed),
         fallback_entries_matched: HOT_SCAN_FALLBACK_MATCHED[phase].swap(0, Ordering::Relaxed),
         file_member_guard_reads: HOT_SCAN_FILE_MEMBER_GUARD_READS[phase]
@@ -4461,7 +4461,7 @@ pub(crate) fn record_hot_blob_ref_scan_entry(matched: bool) {
     }
 }
 
-/// Accounting for the single-entity `lix_binary_blob_ref` probe every
+/// Accounting for the single-row `lix_binary_blob_ref` probe every
 /// `lix_file` content update issues:
 /// `(calls, point_batch, file_prefix, fallback, entries_decoded, entries_matched)`.
 ///

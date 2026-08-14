@@ -145,7 +145,7 @@ async fn markdown_syntax_rich_initial_import_control() {
             !markdown_nodes_by_kind(&lix, &file_id, "table_cell")
                 .await
                 .is_empty(),
-            "syntax-rich import must materialize semantic table-cell entities"
+            "syntax-rich import must materialize semantic table-cell rows"
         );
         lix.close()
             .await
@@ -162,7 +162,7 @@ async fn markdown_syntax_rich_initial_import_control() {
 
 #[tokio::test]
 #[ignore = "manual Git versus Lix Markdown benchmark"]
-async fn markdown_git_semantic_entities_benchmark() {
+async fn markdown_git_semantic_rows_benchmark() {
     init_perf_tracing();
 
     let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
@@ -286,7 +286,7 @@ async fn markdown_git_semantic_entities_benchmark() {
             source_branch_id: source.id,
         })
         .await
-        .expect("unrelated Markdown entities should merge");
+        .expect("unrelated Markdown rows should merge");
         lix_merges.push(started.elapsed());
         lix_main_state[corpus.edit_offsets[source_index]] = edit_replacement(
             corpus.bytes[corpus.edit_offsets[source_index]],
@@ -313,7 +313,7 @@ async fn markdown_git_semantic_entities_benchmark() {
             let actual = &final_nodes[&initial_nodes[index].id];
             assert_eq!(
                 actual, &expected,
-                "semantic {side} entity from merge sample {sample} must remain visible"
+                "semantic {side} row from merge sample {sample} must remain visible"
             );
         }
     }
@@ -466,8 +466,8 @@ async fn markdown_git_semantic_entities_benchmark() {
         &lix_cold_edits.engine_open,
     );
     print_duration_metric("cold_sparse_edit_write", "lix-byte", &lix_cold_edits.write);
-    print_duration_metric("unrelated_entity_merge", "lix-semantic", &lix_merges);
-    print_duration_metric("unrelated_entity_merge", "git", &git_merges);
+    print_duration_metric("unrelated_row_merge", "lix-semantic", &lix_merges);
+    print_duration_metric("unrelated_row_merge", "git", &git_merges);
     print_duration_metric("cold_open_read", "lix-semantic", &lix_cold.total);
     print_duration_metric("cold_storage_open", "lix-semantic", &lix_cold.storage_open);
     print_duration_metric("cold_engine_open", "lix-semantic", &lix_cold.engine_open);
@@ -675,12 +675,12 @@ async fn semantic_table_merge_quality(archive: &[u8]) {
     let alpha = cells
         .iter()
         .find(|node| payload_contains_text(&node.payload_json, "alpha"))
-        .expect("Markdown table should expose alpha as a cell entity");
+        .expect("Markdown table should expose alpha as a cell row");
     let beta = cells
         .iter()
         .find(|node| payload_contains_text(&node.payload_json, "beta"))
-        .expect("Markdown table should expose beta as a cell entity");
-    assert_ne!(alpha.id, beta.id, "table cells must be distinct entities");
+        .expect("Markdown table should expose beta as a cell row");
+    assert_ne!(alpha.id, beta.id, "table cells must be distinct rows");
 
     let main_branch_id = lix.active_branch_id().await.expect("resolve main branch");
     let source = lix
@@ -719,7 +719,7 @@ async fn semantic_table_merge_quality(archive: &[u8]) {
         source_branch_id: source.id,
     })
     .await
-    .expect("distinct table-cell entities should merge in Lix");
+    .expect("distinct table-cell rows should merge in Lix");
     let rendered = String::from_utf8(read_file(&lix, "/quality.md").await)
         .expect("rendered Markdown table should be UTF-8");
     assert!(
@@ -927,7 +927,7 @@ where
         ],
     )
     .await
-    .expect("query Markdown entities by kind")
+    .expect("query Markdown rows by kind")
     .rows()
     .iter()
     .map(|row| MarkdownNode {
@@ -967,10 +967,10 @@ async fn update_markdown_node<StorageImpl>(
             Err(error) if error.code == "LIX_TRANSACTION_CONFLICT" && attempt < 4 => {
                 tokio::task::yield_now().await;
             }
-            Err(error) => panic!("update Markdown semantic entity: {error:?}"),
+            Err(error) => panic!("update Markdown semantic row: {error:?}"),
         }
     }
-    unreachable!("bounded Markdown entity update retry loop returns or panics");
+    unreachable!("bounded Markdown row update retry loop returns or panics");
 }
 
 fn init_perf_tracing() {

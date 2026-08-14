@@ -1,7 +1,7 @@
 use lix::{LixError, Value};
 
 simulation_test!(
-    read_only_branch_components_reject_direct_entity_writes,
+    read_only_branch_components_reject_direct_row_writes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -128,7 +128,7 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"read_only_history_entity\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"read_only_history_row\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              true\
              )",
@@ -140,12 +140,12 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
     assert_read_only_error(
         session
             .execute(
-                "INSERT INTO read_only_history_entity_history (id) VALUES ('entity-a')",
+                "INSERT INTO read_only_history_row_history (id) VALUES ('row-a')",
                 &[],
             )
             .await
             .expect_err("typed history insert should be read-only"),
-        "read_only_history_entity_history",
+        "read_only_history_row_history",
         "History views are query-only",
     );
 });

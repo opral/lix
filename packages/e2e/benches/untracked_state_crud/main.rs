@@ -547,8 +547,7 @@ fn profile_session_untracked_crud(runtime: &Runtime, all_rows: &[PointerRow]) {
                     runtime.block_on(session.insert_untracked_json_pointer_rows(rows));
                 }
                 let rss_before = process_resident_bytes();
-                let _ =
-                    lix::storage_bench::take_certified_entity_insert_parameter_batch_executions();
+                let _ = lix::storage_bench::take_certified_row_insert_parameter_batch_executions();
                 let _ = lix::storage_bench::take_crud_physical_write_accounting();
                 reset_profile_allocations();
                 let started = Instant::now();
@@ -574,7 +573,7 @@ fn profile_session_untracked_crud(runtime: &Runtime, all_rows: &[PointerRow]) {
                 let (alloc_bytes, alloc_calls) = profile_allocations();
                 let rss_after = process_resident_bytes();
                 let certified_batches =
-                    lix::storage_bench::take_certified_entity_insert_parameter_batch_executions();
+                    lix::storage_bench::take_certified_row_insert_parameter_batch_executions();
                 let physical = lix::storage_bench::take_crud_physical_write_accounting();
                 println!(
                     "| {} | {} | {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
@@ -1342,11 +1341,11 @@ fn escape_json_pointer(value: &str) -> String {
 fn bench_rows(rows: &[PointerRow]) -> Vec<BenchRow> {
     rows.iter()
         .map(|row| {
-            let entity_pk = entity_pk(row);
+            let row_pk = row_pk(row);
             let value = snapshot_value(row.path.as_str(), row.value_json.as_str());
             let updated_value = snapshot_value(row.path.as_str(), row.updated_value_json.as_str());
             BenchRow {
-                key: Key(Bytes::from(row_key(&entity_pk))),
+                key: Key(Bytes::from(row_key(&row_pk))),
                 value: StorageValue {
                     bytes: Bytes::from(value),
                 },
@@ -1384,15 +1383,15 @@ fn update_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
     )
 }
 
-fn entity_pk(row: &PointerRow) -> String {
+fn row_pk(row: &PointerRow) -> String {
     row.path.clone()
 }
 
-fn row_key(entity_pk: &str) -> Vec<u8> {
+fn row_key(row_pk: &str) -> Vec<u8> {
     let mut out = Vec::new();
     push_component(&mut out, "bench-branch");
     push_component(&mut out, "json_pointer");
-    push_component(&mut out, entity_pk);
+    push_component(&mut out, row_pk);
     push_component(&mut out, "");
     out
 }

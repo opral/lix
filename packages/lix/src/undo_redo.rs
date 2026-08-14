@@ -25,7 +25,7 @@ pub(crate) struct UndoRedoMarker {
 
 pub(crate) fn marker_stage_row(marker: &UndoRedoMarker) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: None,
+        row_pk: None,
         schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.into(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({

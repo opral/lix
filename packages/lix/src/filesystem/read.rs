@@ -382,7 +382,7 @@ fn filesystem_conflict_error(message: String) -> LixError {
 mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::hot_state::{MaterializedHotStateBatch, MaterializedHotStateRow};
 
     use super::{
@@ -509,28 +509,28 @@ mod tests {
             .find_map(|(entry_path, file)| (entry_path == path).then_some(file))
     }
 
-    fn directory_row(entity_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
-        live_row(entity_pk, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, snapshot_content)
+    fn directory_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
+        live_row(row_pk, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, snapshot_content)
     }
 
-    fn file_row(entity_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
+    fn file_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
         live_row_with_scope(
-            entity_pk,
+            row_pk,
             FILE_DESCRIPTOR_SCHEMA_KEY,
             snapshot_content,
             "01920000-0000-7000-8000-0000000000a1",
             false,
-            Some(entity_pk.to_string()),
+            Some(row_pk.to_string()),
         )
     }
 
     fn live_row(
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         snapshot_content: &str,
     ) -> MaterializedHotStateRow {
         live_row_with_scope(
-            entity_pk,
+            row_pk,
             schema_key,
             snapshot_content,
             "01920000-0000-7000-8000-0000000000a1",
@@ -540,7 +540,7 @@ mod tests {
     }
 
     fn live_row_with_scope(
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         snapshot_content: &str,
         branch_id: &str,
@@ -548,15 +548,15 @@ mod tests {
         file_id: Option<String>,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
             schema_key: schema_key.to_string(),
             file_id,
             snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked,
             created_at: LixTimestamp::expect_parse(

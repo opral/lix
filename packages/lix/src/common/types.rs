@@ -346,7 +346,7 @@ impl<'de> serde::Deserialize<'de> for SharedStr {
 /// Canonical JSON text carried by a SQL value.
 ///
 /// Every JSON payload the engine accepts is normalized to serde_json's stable
-/// compact form at the write boundary, and the entity projection decoder hands
+/// compact form at the write boundary, and the row projection decoder hands
 /// those exact bytes to Arrow as UTF-8. A JSON result column is therefore
 /// already the byte string a caller receives, so `Json` retains the bytes
 /// instead of rebuilding a `serde_json::Value` DOM for every row on every scan.

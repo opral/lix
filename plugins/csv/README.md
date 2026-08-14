@@ -5,8 +5,8 @@ in [the universal plugin API](../../docs/universal-plugin-api.md). It preserves
 table and row identity, exact source bytes, dialect metadata, sparse edits,
 cold successors, and reopen behavior.
 
-All entity mutations, including initial import, use complete snapshots through
-the universal entity output method. The SDK owns page framing, batching,
+All row mutations, including initial import, use complete snapshots through
+the universal row output method. The SDK owns page framing, batching,
 generated primary keys, final flush, and oversized attachments. CSV streams
 rows into that method without constructing a persistent document first.
 

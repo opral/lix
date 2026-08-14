@@ -36,7 +36,7 @@
 //! The key census is decoder-free on purpose: it does not parse per-space key
 //! grammars, which differ per space and would rot. It finds maximal runs of
 //! printable ASCII inside the raw key and buckets them. Every identifier of
-//! interest — branch ids, schema keys, file ids, entity primary keys — is
+//! interest — branch ids, schema keys, file ids, row primary keys — is
 //! ASCII and cannot contain an unescaped NUL, so a raw run scan is exact.
 
 use std::collections::BTreeMap;

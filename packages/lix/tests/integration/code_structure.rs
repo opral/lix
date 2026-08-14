@@ -2711,7 +2711,7 @@ fn sql2_public_boundary_does_not_reintroduce_stringly_validation() {
             "public_input::expect_json_text(\"",
             "public_input::expect_file_path_public(\"",
             "public_input::expect_directory_path_public(\"",
-            "public_input::expect_entity_pk_public(\"",
+            "public_input::expect_row_pk_public(\"",
             "public_input::expect_non_blob_public_id(\"",
             "require_write(\"",
             "routed_surface(",
@@ -2758,8 +2758,8 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "mod change;",
             "mod directory;",
             "mod directory_history;",
-            "mod entity;",
-            "mod entity_history;",
+            "mod schema;",
+            "mod schema_history;",
             "mod file;",
             "mod file_history;",
             "mod history_util;",
@@ -2799,7 +2799,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "directory::register_lix_directory_by_branch_provider",
             "file::register_lix_file_active_provider",
             "file::register_lix_file_by_branch_provider",
-            "entity::register_entity_providers",
+            "schema::register_row_providers",
         ],
     );
     assert_source_contains_none(
@@ -2809,7 +2809,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "register_lix_branch_write_provider",
             "register_lix_directory_write_providers",
             "register_lix_file_write_providers",
-            "register_entity_write_providers",
+            "register_row_write_providers",
             "register_lix_branch_provider",
             "register_lix_change_provider",
             "register_history_providers",
@@ -2868,7 +2868,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "file::register_by_branch_write_provider",
             "directory::register_active_write_provider",
             "directory::register_by_branch_write_provider",
-            "entity::register_entity_write_providers",
+            "schema::register_row_write_providers",
         ],
     );
     assert_source_contains_none(
@@ -2885,7 +2885,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "register_lix_directory_history_provider",
             "register_lix_directory_providers",
             "register_lix_file_providers",
-            "register_entity_providers",
+            "register_row_providers",
             "register_lix_branch_write_provider",
             "register_lix_branch_write_surface",
             "register_lix_directory_active_write_provider",
@@ -2910,21 +2910,21 @@ fn session_transaction_commits_go_through_commit_boundary() {
 }
 
 #[test]
-fn sql2_entity_provider_registration_is_catalog_driven() {
-    let relative = "sql2/providers/entity.rs";
+fn sql2_row_provider_registration_is_catalog_driven() {
+    let relative = "sql2/providers/schema.rs";
     let source = read_engine_source(relative);
     let non_test_source = strip_test_code(&source);
     let read_registration = source_between(
         relative,
         &source,
-        "pub(crate) async fn register_entity_providers",
-        "pub(crate) async fn register_entity_write_providers",
+        "pub(crate) async fn register_row_providers",
+        "pub(crate) async fn register_row_write_providers",
     );
     let write_registration = source_between(
         relative,
         &source,
-        "pub(crate) async fn register_entity_write_providers",
-        "fn catalog_entity_spec",
+        "pub(crate) async fn register_row_write_providers",
+        "fn catalog_schema_spec",
     );
 
     assert_source_contains_all(
@@ -2932,9 +2932,9 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         read_registration,
         &[
             "catalog.surfaces()",
-            "PublicSurfaceKind::EntityBase",
-            "PublicSurfaceKind::EntityByBranch",
-            "PublicSurfaceKind::EntityHistory",
+            "PublicSurfaceKind::SchemaBase",
+            "PublicSurfaceKind::SchemaByBranch",
+            "PublicSurfaceKind::SchemaHistory",
         ],
     );
     assert_source_contains_all(
@@ -2942,8 +2942,8 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         write_registration,
         &[
             "catalog.surfaces()",
-            "PublicSurfaceKind::EntityBase",
-            "PublicSurfaceKind::EntityByBranch",
+            "PublicSurfaceKind::SchemaBase",
+            "PublicSurfaceKind::SchemaByBranch",
         ],
     );
     assert_source_contains_none(
@@ -2951,9 +2951,9 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         read_registration,
         &[
             "schema_definitions",
-            "derive_entity_surface_spec_from_schema",
-            "schema_exposed_as_entity_surface",
-            "schema_exposed_as_entity_history_surface",
+            "derive_schema_surface_spec_from_schema",
+            "schema_exposed_as_schema_surface",
+            "schema_exposed_as_history_surface",
         ],
     );
     assert_source_contains_none(
@@ -2961,18 +2961,18 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         write_registration,
         &[
             "schema_definitions",
-            "derive_entity_surface_spec_from_schema",
-            "schema_exposed_as_entity_surface",
-            "schema_exposed_as_entity_history_surface",
+            "derive_schema_surface_spec_from_schema",
+            "schema_exposed_as_schema_surface",
+            "schema_exposed_as_history_surface",
         ],
     );
     assert_source_contains_none(
         relative,
         &non_test_source,
         &[
-            "schema_exposed_as_entity_surface",
-            "schema_exposed_as_entity_history_surface",
-            "derive_entity_surface_spec_from_schema(",
+            "schema_exposed_as_schema_surface",
+            "schema_exposed_as_history_surface",
+            "derive_schema_surface_spec_from_schema(",
         ],
     );
 }

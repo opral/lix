@@ -9,7 +9,7 @@
 
 mod hot;
 #[cfg(test)]
-pub(crate) use hot::hot_decode_entity_pk_probe;
+pub(crate) use hot::hot_decode_row_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
 #[cfg(any(test, feature = "storage-benches"))]
@@ -27,14 +27,14 @@ pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
     RootBaseBatchCache,
-    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-    CERTIFIED_ENTITY_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedEntityBatchFileRef,
+    CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE,
+    CERTIFIED_ROW_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef,
     DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
-    EntityColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache,
+    RowColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache,
     HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
     ROW_SPACE, load_certified_rows_at_commit, materialize_certified_root_rows,
-    scan_certified_history_rows, stage_certified_entity_batches, stage_hot_index_entries,
+    scan_certified_history_rows, stage_certified_row_batches, stage_hot_index_entries,
     stage_retire_hot_generation,
 };
 
@@ -64,7 +64,7 @@ use crate::branch::stage_branch_head_control;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
     MaterializedHotStateRow, MaterializedHotStateRowRef,
@@ -218,7 +218,7 @@ struct HeadIdentity {
     branch_id: String,
     generation: CommitId,
     schema_key: String,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     #[musli(with = storage_codec::option)]
     file_id: Option<String>,
 }
@@ -231,7 +231,7 @@ struct HeadIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct HeadRowIdentity {
     schema_key: String,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     file_id: Option<String>,
 }
 
@@ -239,7 +239,7 @@ impl HeadIdentity {
     fn into_row_identity(self) -> HeadRowIdentity {
         HeadRowIdentity {
             schema_key: self.schema_key,
-            entity_pk: self.entity_pk,
+            row_pk: self.row_pk,
             file_id: self.file_id,
         }
     }
@@ -319,7 +319,7 @@ struct BranchRefKey {
 pub(crate) struct TrackedHeadDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
@@ -335,7 +335,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
         CurrentStateDeltaRef {
             schema_key: self.schema_key,
             file_id: self.file_id,
-            entity_pk: self.entity_pk,
+            row_pk: self.row_pk,
             change_id: Some(self.change_id),
             commit_id: Some(self.commit_id),
             untracked: false,
@@ -359,7 +359,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
 pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
     pub(crate) change_id: Option<ChangeId>,
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
@@ -380,7 +380,7 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
 pub(crate) struct CertifiedCurrentStatePredecessorRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
     pub(crate) value: &'a CertifiedCurrentStatePredecessor,
 }
 
@@ -602,8 +602,8 @@ fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixE
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!(
-            "current-state commit contains duplicate mutation for schema '{}' entity_pk '{:?}' file_id '{:?}'",
-            delta.schema_key, delta.entity_pk, delta.file_id
+            "current-state commit contains duplicate mutation for schema '{}' row_pk '{:?}' file_id '{:?}'",
+            delta.schema_key, delta.row_pk, delta.file_id
         ),
     )
 }
@@ -618,7 +618,7 @@ fn reject_guarded_live_member(
     }
     let key = TrackedStateKey {
         schema_key: delta.schema_key.to_string(),
-        entity_pk: delta.entity_pk.clone(),
+        row_pk: delta.row_pk.clone(),
         file_id: delta.file_id.map(str::to_string),
     };
     if absence_guards.contains(&key) {
@@ -646,14 +646,14 @@ fn reject_borrowed_guarded_live_member(
             guard
                 .schema_key
                 .cmp(delta.schema_key)
-                .then_with(|| guard.entity_pk.cmp(delta.entity_pk))
+                .then_with(|| guard.row_pk.cmp(delta.row_pk))
                 .then_with(|| guard.file_id.cmp(&delta.file_id))
         })
         .is_ok();
     if guarded {
         return Err(tracked_head_duplicate_insert_error_ref(
             delta.schema_key,
-            delta.entity_pk,
+            delta.row_pk,
         ));
     }
     Ok(())
@@ -679,17 +679,17 @@ fn reject_retention_change(
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,
                 format!(
-                    "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
-                    delta.schema_key, delta.entity_pk,
+                    "cannot insert tracked row in schema '{}' row_pk {:?}: a canonical untracked row already exists; delete it first",
+                    delta.schema_key, delta.row_pk,
                 ),
             ));
         }
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
-                "cannot change retention for existing current-state row in schema '{}' entity_pk {:?}; delete it before inserting it as {}",
+                "cannot change retention for existing current-state row in schema '{}' row_pk {:?}; delete it before inserting it as {}",
                 delta.schema_key,
-                delta.entity_pk,
+                delta.row_pk,
                 if delta.untracked {
                     "untracked"
                 } else {
@@ -702,17 +702,17 @@ fn reject_retention_change(
 }
 
 fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
-    tracked_head_duplicate_insert_error_ref(&key.schema_key, &key.entity_pk)
+    tracked_head_duplicate_insert_error_ref(&key.schema_key, &key.row_pk)
 }
 
-fn tracked_head_duplicate_insert_error_ref(schema_key: &str, entity_pk: &EntityPk) -> LixError {
-    let entity_pk = entity_pk
+fn tracked_head_duplicate_insert_error_ref(schema_key: &str, row_pk: &RowPk) -> LixError {
+    let row_pk = row_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
-            "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
+            "primary-key constraint violation on schema '{}': INSERT would duplicate row_pk '{row_pk}'",
             schema_key
         ),
     )
@@ -720,7 +720,7 @@ fn tracked_head_duplicate_insert_error_ref(schema_key: &str, entity_pk: &EntityP
 
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&identity.schema_key))
-        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&identity.entity_pk))
+        && (filter.row_pks.is_empty() || filter.row_pks.contains(&identity.row_pk))
         && matches_file_filter(identity.file_id.as_ref(), &filter.file_ids)
 }
 
@@ -966,8 +966,8 @@ const GENERATION_BYTES: usize = 16;
 ///
 /// The head table is the normal read serving index, so its storage ordering is
 /// also the visible row ordering: `(branch, generation, schema, file,
-/// entity)` - see `encode_hot_row_key_parts`, which writes the file id before
-/// the entity primary key. Musli's storage encoding is excellent for values and structural
+/// row)` - see `encode_hot_row_key_parts`, which writes the file id before
+/// the row primary key. Musli's storage encoding is excellent for values and structural
 /// prefixes, but length-prefixed strings do not preserve lexical order. This
 /// codec retains exact prefix scans while making every table scan already
 /// ordered and duplicate-free for one branch generation.
@@ -994,119 +994,119 @@ fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixErro
 /// Test-only shim so the shared codec's three-way differential can drive this
 /// plane's decoder. See `crate::order_preserving_key::tests`.
 #[cfg(test)]
-pub(crate) fn head_decode_entity_pk_probe(bytes: &[u8]) -> Option<(EntityPk, usize)> {
+pub(crate) fn head_decode_row_pk_probe(bytes: &[u8]) -> Option<(RowPk, usize)> {
     let mut offset = 0usize;
-    read_entity_pk(bytes, &mut offset)
+    read_row_pk(bytes, &mut offset)
         .ok()
-        .map(|entity_pk| (entity_pk, offset))
+        .map(|row_pk| (row_pk, offset))
 }
 
-fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError> {
+fn read_row_pk(bytes: &[u8], offset: &mut usize) -> Result<RowPk, LixError> {
     let version = bytes
         .get(*offset)
         .copied()
-        .ok_or_else(|| key_codec_error("is truncated before entity primary key version"))?;
+        .ok_or_else(|| key_codec_error("is truncated before row primary key version"))?;
     *offset += 1;
-    if version != ENTITY_PK_CODEC_V1 {
+    if version != ROW_PK_CODEC_V1 {
         return Err(key_codec_error(&format!(
-            "has unsupported entity primary key codec version {version}"
+            "has unsupported row primary key codec version {version}"
         )));
     }
     let mut components = SmallVec::new();
     loop {
-        let (part, terminator) = read_entity_pk_part(bytes, offset)?;
+        let (part, terminator) = read_row_pk_part(bytes, offset)?;
         components.push(part);
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
             _ => {
                 return Err(key_codec_error(
-                    "entity primary key has an invalid terminator",
+                    "row primary key has an invalid terminator",
                 ));
             }
         }
     }
-    EntityPk::from_components(components).map_err(|error| {
-        key_codec_error(&format!("contains an invalid entity primary key: {error}"))
+    RowPk::from_components(components).map_err(|error| {
+        key_codec_error(&format!("contains an invalid row primary key: {error}"))
     })
 }
 
-fn read_entity_pk_part(
+fn read_row_pk_part(
     bytes: &[u8],
     offset: &mut usize,
-) -> Result<(crate::entity_pk::EntityPkComponent, u8), LixError> {
+) -> Result<(crate::row_pk::RowPkComponent, u8), LixError> {
     let tag = bytes
         .get(*offset)
         .copied()
-        .ok_or_else(|| key_codec_error("is truncated before entity primary key part tag"))?;
+        .ok_or_else(|| key_codec_error("is truncated before row primary key part tag"))?;
     *offset += 1;
     match tag {
-        ENTITY_PK_STRING => {
-            let (value, terminator) = read_key_string(bytes, offset, "entity primary key")?;
+        ROW_PK_STRING => {
+            let (value, terminator) = read_key_string(bytes, offset, "row primary key")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::String(value.into()),
+                crate::row_pk::RowPkComponent::String(value.into()),
                 terminator,
             ))
         }
-        ENTITY_PK_BYTES => {
-            let (value, terminator) = read_key_bytes(bytes, offset, "entity primary key bytes")?;
+        ROW_PK_BYTES => {
+            let (value, terminator) = read_key_bytes(bytes, offset, "row primary key bytes")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::Bytes(value.into()),
+                crate::row_pk::RowPkComponent::Bytes(value.into()),
                 terminator,
             ))
         }
-        ENTITY_PK_UUID => {
+        ROW_PK_UUID => {
             let uuid_end = offset
-                .checked_add(ENTITY_PK_UUID_BYTES)
-                .ok_or_else(|| key_codec_error("UUIDv7 entity primary key offset overflow"))?;
+                .checked_add(ROW_PK_UUID_BYTES)
+                .ok_or_else(|| key_codec_error("UUIDv7 row primary key offset overflow"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
-                .ok_or_else(|| key_codec_error("is truncated in UUIDv7 entity primary key"))?
+                .ok_or_else(|| key_codec_error("is truncated in UUIDv7 row primary key"))?
                 .try_into()
                 .expect("UUIDv7 slice has fixed length");
             let terminator = bytes
                 .get(uuid_end)
                 .copied()
-                .ok_or_else(|| key_codec_error("is truncated after UUIDv7 entity primary key"))?;
+                .ok_or_else(|| key_codec_error("is truncated after UUIDv7 row primary key"))?;
             if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
-                    "UUIDv7 entity primary key has an invalid terminator",
+                    "UUIDv7 row primary key has an invalid terminator",
                 ));
             }
             *offset = uuid_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Uuid(uuid_bytes),
+                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
                 terminator,
             ))
         }
-        ENTITY_PK_INTEGER => {
+        ROW_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(ENTITY_PK_INTEGER_BYTES)
-                .ok_or_else(|| key_codec_error("integer entity primary key offset overflow"))?;
+                .checked_add(ROW_PK_INTEGER_BYTES)
+                .ok_or_else(|| key_codec_error("integer row primary key offset overflow"))?;
             let ordered = u64::from_be_bytes(
                 bytes
                     .get(*offset..integer_end)
-                    .ok_or_else(|| key_codec_error("is truncated in integer entity primary key"))?
+                    .ok_or_else(|| key_codec_error("is truncated in integer row primary key"))?
                     .try_into()
                     .expect("integer slice has fixed length"),
             );
             let terminator = bytes
                 .get(integer_end)
                 .copied()
-                .ok_or_else(|| key_codec_error("is truncated after integer entity primary key"))?;
+                .ok_or_else(|| key_codec_error("is truncated after integer row primary key"))?;
             if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
-                    "integer entity primary key has an invalid terminator",
+                    "integer row primary key has an invalid terminator",
                 ));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64_from_ordered_integer(ordered)),
+                crate::row_pk::RowPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }
         _ => Err(key_codec_error(
-            "has an unknown entity primary key part tag",
+            "has an unknown row primary key part tag",
         )),
     }
 }
@@ -2144,7 +2144,7 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
         branch_id: &str,
     ) {
         rows.push_materialized(
-            self.entity_pk,
+            self.row_pk,
             self.schema_key,
             self.file_id,
             snapshot_content,
@@ -2177,7 +2177,7 @@ impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
         branch_id: &str,
     ) {
         rows.push_materialized_ref(
-            self.entity_pk,
+            self.row_pk,
             self.schema_key,
             self.file_id,
             snapshot_content,
@@ -2349,12 +2349,12 @@ mod tests {
         LixTimestamp::expect_parse("test timestamp", value)
     }
 
-    fn identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {
+    fn identity(branch_id: &str, generation: CommitId, row: &str) -> HeadIdentity {
         HeadIdentity {
             branch_id: branch_id.to_string(),
             generation,
             schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single(entity),
+            row_pk: RowPk::single(row),
             file_id: None,
         }
     }
@@ -2391,7 +2391,7 @@ mod tests {
     }
 
     fn working_diff_delta<'a>(
-        entity_pk: &'a EntityPk,
+        row_pk: &'a RowPk,
         file_id: Option<&'a str>,
         change: &str,
         commit_id: CommitId,
@@ -2403,7 +2403,7 @@ mod tests {
         TrackedHeadDeltaRef {
             schema_key: "schema",
             file_id,
-            entity_pk,
+            row_pk,
             change_id: ChangeId::for_test_label(change),
             commit_id,
             deleted,
@@ -2710,7 +2710,7 @@ mod tests {
         let checkpoint = CommitId::for_test_label("checkpoint");
         let delete_head = CommitId::for_test_label("delete");
         let reinsert_head = CommitId::for_test_label("reinsert");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let mut coverage = WorkingDiffIndexCoverage::default();
 
         publish_working_diff_commit(
@@ -2725,7 +2725,7 @@ mod tests {
         .await;
 
         let delete = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             None,
             "delete-absent",
             delete_head,
@@ -2759,7 +2759,7 @@ mod tests {
         );
 
         let reinsert = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             None,
             "reinsert",
             reinsert_head,
@@ -2824,15 +2824,15 @@ mod tests {
         )
         .await;
 
-        let direct_entities = (0..32)
-            .map(|index| EntityPk::single(format!("direct-{index:03}")))
+        let direct_rows = (0..32)
+            .map(|index| RowPk::single(format!("direct-{index:03}")))
             .collect::<Vec<_>>();
-        let direct = direct_entities
+        let direct = direct_rows
             .iter()
             .enumerate()
-            .map(|(index, entity_pk)| {
+            .map(|(index, row_pk)| {
                 working_diff_delta(
-                    entity_pk,
+                    row_pk,
                     None,
                     &format!("direct-{index}"),
                     direct_head,
@@ -2854,15 +2854,15 @@ mod tests {
         )
         .await;
 
-        let segmented_entities = (0..96)
-            .map(|index| EntityPk::single(format!("segmented-{index:03}")))
+        let segmented_rows = (0..96)
+            .map(|index| RowPk::single(format!("segmented-{index:03}")))
             .collect::<Vec<_>>();
-        let segmented = segmented_entities
+        let segmented = segmented_rows
             .iter()
             .enumerate()
-            .map(|(index, entity_pk)| {
+            .map(|(index, row_pk)| {
                 working_diff_delta(
-                    entity_pk,
+                    row_pk,
                     None,
                     &format!("segmented-{index}"),
                     segmented_head,
@@ -2910,11 +2910,11 @@ mod tests {
         let checkpoint = CommitId::for_test_label("checkpoint");
         let delete_head = CommitId::for_test_label("delete");
         let restore_head = CommitId::for_test_label("restore");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let mut coverage = WorkingDiffIndexCoverage::default();
 
         let initial = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             None,
             "initial",
             checkpoint,
@@ -2935,7 +2935,7 @@ mod tests {
         .await;
 
         let delete = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             None,
             "delete",
             delete_head,
@@ -2956,7 +2956,7 @@ mod tests {
         .await;
 
         let restore = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             None,
             "restore",
             restore_head,
@@ -3001,11 +3001,11 @@ mod tests {
         let branch_id = "branch";
         let checkpoint = CommitId::for_test_label("checkpoint");
         let update_head = CommitId::for_test_label("metadata-update");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let mut coverage = WorkingDiffIndexCoverage::default();
 
         let initial = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             None,
             "initial",
             checkpoint,
@@ -3026,7 +3026,7 @@ mod tests {
         .await;
 
         let update = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             None,
             "metadata-update",
             update_head,
@@ -3082,12 +3082,12 @@ mod tests {
         let branch_id = "branch";
         let checkpoint = CommitId::for_test_label("checkpoint");
         let update_head = CommitId::for_test_label("file-update");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let file_id = "files/app.json";
         let mut coverage = WorkingDiffIndexCoverage::default();
 
         let initial = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             Some(file_id),
             "initial-file",
             checkpoint,
@@ -3108,7 +3108,7 @@ mod tests {
         .await;
 
         let update = [working_diff_delta(
-            &entity_pk,
+            &row_pk,
             Some(file_id),
             "updated-file",
             update_head,
@@ -3131,7 +3131,7 @@ mod tests {
         let request = TrackedStateDiffRequest {
             filter: TrackedStateFilter {
                 schema_keys: vec!["schema".to_string()],
-                entity_pks: vec![entity_pk.clone()],
+                row_pks: vec![row_pk.clone()],
                 file_ids: vec![NullableKeyFilter::Value(file_id.to_string())],
                 ..Default::default()
             },
@@ -3149,7 +3149,7 @@ mod tests {
         assert_eq!(diff.diff.entries.len(), 1);
         let entry = &diff.diff.entries[0];
         assert_eq!(entry.kind, TrackedStateDiffKind::Modified);
-        assert_eq!(entry.identity.entity_pk(), &entity_pk);
+        assert_eq!(entry.identity.row_pk(), &row_pk);
         assert_eq!(entry.identity.file_id(), Some(file_id));
         assert_eq!(
             entry
@@ -3177,7 +3177,7 @@ mod tests {
         let first_head = CommitId::for_test_label("first-head");
         let no_op_checkpoint = CommitId::for_test_label("no-op-checkpoint");
         let second_head = CommitId::for_test_label("second-head");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let control = |head_commit_id, generation, checkpoint_commit_id| BranchHeadControl {
             head_commit_id,
             tracked_generation: generation,
@@ -3204,7 +3204,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("initial-change"),
                     commit_id: checkpoint,
                     deleted: false,
@@ -3258,7 +3258,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("first-change"),
                     commit_id: first_head,
                     deleted: false,
@@ -3338,7 +3338,7 @@ mod tests {
         let selected = TrackedHeadDeltaRef {
             schema_key: "schema",
             file_id: None,
-            entity_pk: &entity_pk,
+            row_pk: &row_pk,
             change_id: ChangeId::for_test_label("first-change"),
             commit_id: first_head,
             deleted: false,
@@ -3368,7 +3368,7 @@ mod tests {
                     branch_id: branch_id.to_owned(),
                     generation: checkpoint,
                     schema_key: "schema".to_owned(),
-                    entity_pk: entity_pk.clone(),
+                    row_pk: row_pk.clone(),
                     file_id: None,
                 }),
             ),
@@ -3404,7 +3404,7 @@ mod tests {
             branch_id: branch_id.to_owned(),
             generation: checkpoint,
             schema_key: "schema".to_owned(),
-            entity_pk: entity_pk.clone(),
+            row_pk: row_pk.clone(),
             file_id: None,
         });
         let value = PointReadPlan::new(ROW_SPACE, &[StorageKey(Bytes::from(hot_key))])
@@ -3464,7 +3464,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema".to_owned()],
-                        entity_pks: vec![entity_pk.clone()],
+                        row_pks: vec![row_pk.clone()],
                         ..TrackedStateFilter::default()
                     },
                     ..TrackedStateDiffRequest::default()
@@ -3493,7 +3493,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("second-change"),
                     commit_id: second_head,
                     deleted: false,
@@ -3584,7 +3584,7 @@ mod tests {
             TrackedStateDiffRequest::default(),
             TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
-                    entity_pks: vec![entity_pk.clone()],
+                    row_pks: vec![row_pk.clone()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3718,17 +3718,17 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open direct entity snapshot read");
-        let exact_entity_pks = vec![
-            EntityPk::single("missing"),
-            EntityPk::single("row"),
-            EntityPk::single("row"),
+            .expect("open direct row snapshot read");
+        let exact_row_pks = vec![
+            RowPk::single("missing"),
+            RowPk::single("row"),
+            RowPk::single("row"),
         ];
         let snapshots = TrackedHeadContext::new()
             .reader(read)
-            .scan_entity_snapshots(branch_id, control, "schema", &exact_entity_pks, None)
+            .scan_row_snapshots(branch_id, control, "schema", &exact_row_pks, None)
             .await
-            .expect("direct entity snapshots should read");
+            .expect("direct row snapshots should read");
         assert_eq!(snapshots.len(), 1, "tombstone must not reach SQL rows");
         assert_eq!(
             snapshots[0]
@@ -3741,12 +3741,12 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open limited direct entity snapshot read");
+            .expect("open limited direct row snapshot read");
         let snapshots = TrackedHeadContext::new()
             .reader(read)
-            .scan_entity_snapshots(branch_id, control, "schema", &[], Some(1))
+            .scan_row_snapshots(branch_id, control, "schema", &[], Some(1))
             .await
-            .expect("limited direct entity snapshots should read");
+            .expect("limited direct row snapshots should read");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(
             snapshots[0]
@@ -3791,12 +3791,12 @@ mod tests {
         let keys = vec![
             TrackedStateKey {
                 schema_key: "schema".to_string(),
-                entity_pk: EntityPk::single("row"),
+                row_pk: RowPk::single("row"),
                 file_id: None,
             },
             TrackedStateKey {
                 schema_key: "schema".to_string(),
-                entity_pk: EntityPk::single("row"),
+                row_pk: RowPk::single("row"),
                 file_id: None,
             },
         ];
@@ -3821,7 +3821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entity_snapshot_scan_restores_logical_primary_key_order() {
+    async fn row_snapshot_scan_restores_logical_primary_key_order() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let generation = CommitId::for_test_label("generation");
@@ -3837,25 +3837,25 @@ mod tests {
             ref_change_id: ChangeId::for_test_label("branch-ref"),
         };
         let mut writes = StorageWriteSet::new();
-        for (entity, file_id) in [("a", "z-file"), ("b", "a-file")] {
+        for (row, file_id) in [("a", "z-file"), ("b", "a-file")] {
             let identity = HeadIdentity {
                 branch_id: branch_id.to_string(),
                 generation,
                 schema_key: "schema".to_string(),
-                entity_pk: EntityPk::single(entity),
+                row_pk: RowPk::single(row),
                 file_id: Some(file_id.to_string()),
             };
             stage_put(
                 &mut writes,
                 &identity,
                 &HeadValue {
-                    change_id: Some(ChangeId::for_test_label(entity)),
+                    change_id: Some(ChangeId::for_test_label(row)),
                     commit_id: Some(head),
                     untracked: false,
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-01T00:00:00Z"),
-                    snapshot: JsonSlot::from_json(&format!(r#"{{"entity":"{entity}"}}"#)),
+                    snapshot: JsonSlot::from_json(&format!(r#"{{"row":"{row}"}}"#)),
                     metadata: JsonSlot::None,
                     columnar_base_coordinate: None,
                 },
@@ -3872,10 +3872,10 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open entity snapshot read");
+            .expect("open row snapshot read");
         let snapshots = TrackedHeadContext::new()
             .reader(read)
-            .scan_entity_snapshots(branch_id, control, "schema", &[], None)
+            .scan_row_snapshots(branch_id, control, "schema", &[], None)
             .await
             .expect("scan snapshots");
         let snapshots = snapshots
@@ -3885,7 +3885,7 @@ mod tests {
                     .expect("snapshot is UTF-8")
             })
             .collect::<Vec<_>>();
-        assert_eq!(snapshots, [r#"{"entity":"a"}"#, r#"{"entity":"b"}"#]);
+        assert_eq!(snapshots, [r#"{"row":"a"}"#, r#"{"row":"b"}"#]);
     }
 
     #[tokio::test]
@@ -3903,13 +3903,13 @@ mod tests {
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
         };
-        let entity_pk = EntityPk::single("row");
-        let second_entity_pk = EntityPk::single("row-2");
+        let row_pk = RowPk::single("row");
+        let second_row_pk = RowPk::single("row-2");
         let deltas = [
             TrackedHeadDeltaRef {
                 schema_key: "schema",
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 change_id: ChangeId::for_test_label("none"),
                 commit_id: head,
                 deleted: false,
@@ -3921,7 +3921,7 @@ mod tests {
             TrackedHeadDeltaRef {
                 schema_key: "schema",
                 file_id: Some("01920000-0000-7000-8000-0000000000a2"),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 change_id: ChangeId::for_test_label("01920000-0000-7000-8000-0000000000a2"),
                 commit_id: head,
                 deleted: false,
@@ -3933,7 +3933,7 @@ mod tests {
             TrackedHeadDeltaRef {
                 schema_key: "schema",
                 file_id: Some("01920000-0000-7000-8000-0000000000b2"),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 change_id: ChangeId::for_test_label("01920000-0000-7000-8000-0000000000b2"),
                 commit_id: head,
                 deleted: false,
@@ -3945,7 +3945,7 @@ mod tests {
             TrackedHeadDeltaRef {
                 schema_key: "schema",
                 file_id: Some("01920000-0000-7000-8000-0000000000b2"),
-                entity_pk: &second_entity_pk,
+                row_pk: &second_row_pk,
                 change_id: ChangeId::for_test_label("second-01920000-0000-7000-8000-0000000000b2"),
                 commit_id: head,
                 deleted: false,
@@ -3995,7 +3995,7 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema".to_string()],
-                        entity_pks: vec![entity_pk.clone()],
+                        row_pks: vec![row_pk.clone()],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -4028,7 +4028,7 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema".to_string()],
-                        entity_pks: vec![entity_pk.clone()],
+                        row_pks: vec![row_pk.clone()],
                         file_ids: vec![NullableKeyFilter::Null],
                         ..Default::default()
                     },
@@ -4053,7 +4053,7 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema".to_string()],
-                        entity_pks: vec![entity_pk.clone()],
+                        row_pks: vec![row_pk.clone()],
                         file_ids: vec![NullableKeyFilter::Value(
                             "01920000-0000-7000-8000-0000000000b2".to_string(),
                         )],
@@ -4073,7 +4073,7 @@ mod tests {
 
         // A schema-scoped `file_id = $1` query reads the hydrated file-first
         // primary range directly. This is the access pattern used by
-        // filesystem-backed entity scans, where the entity PK is not known
+        // filesystem-backed row scans, where the row PK is not known
         // before the query.
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4101,7 +4101,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows.iter()
-                .map(|row| row.entity_pk.as_single_string().expect("single key"))
+                .map(|row| row.row_pk.as_single_string().expect("single key"))
                 .collect::<Vec<_>>(),
             vec!["row", "row-2"]
         );
@@ -4154,7 +4154,7 @@ mod tests {
                 &head.to_string(),
                 &[TrackedStateKey {
                     schema_key: "schema".to_string(),
-                    entity_pk,
+                    row_pk,
                     file_id: Some("01920000-0000-7000-8000-0000000000b2".to_string()),
                 }],
                 &ChangeRecordProjection::full(),
@@ -4181,7 +4181,7 @@ mod tests {
                 control,
                 &[TrackedStateKey {
                     schema_key: "schema".to_string(),
-                    entity_pk: EntityPk::single("row"),
+                    row_pk: RowPk::single("row"),
                     file_id: Some("01920000-0000-7000-8000-0000000000b2".to_string()),
                 }],
                 &ChangeRecordProjection::full(),
@@ -4209,21 +4209,21 @@ mod tests {
                 branch_id: "branch".to_string(),
                 generation,
                 schema_key: "schema-z".to_string(),
-                entity_pk: EntityPk::single("entity-a"),
+                row_pk: RowPk::single("row-a"),
                 file_id: None,
             },
             HeadIdentity {
                 branch_id: "branch".to_string(),
                 generation,
                 schema_key: "schema-a".to_string(),
-                entity_pk: EntityPk::single("entity-z"),
+                row_pk: RowPk::single("row-z"),
                 file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             },
             HeadIdentity {
                 branch_id: "branch".to_string(),
                 generation,
                 schema_key: "schema-a".to_string(),
-                entity_pk: EntityPk::single("entity-a"),
+                row_pk: RowPk::single("row-a"),
                 file_id: None,
             },
         ];
@@ -4267,11 +4267,11 @@ mod tests {
         );
         assert_eq!(
             rows.into_iter()
-                .map(|row| (row.schema_key, row.entity_pk, row.file_id))
+                .map(|row| (row.schema_key, row.row_pk, row.file_id))
                 .collect::<Vec<_>>(),
             expected
                 .into_iter()
-                .map(|identity| (identity.schema_key, identity.entity_pk, identity.file_id))
+                .map(|identity| (identity.schema_key, identity.row_pk, identity.file_id))
                 .collect::<Vec<_>>()
         );
     }
@@ -4343,7 +4343,7 @@ mod tests {
     async fn incremental_commit_preserves_first_created_at() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let first_head = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
 
@@ -4361,7 +4361,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("first-change"),
                     commit_id: first_head,
                     deleted: false,
@@ -4395,7 +4395,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("second-change"),
                     commit_id: second_head,
                     deleted: false,
@@ -4441,7 +4441,7 @@ mod tests {
         let branch_id = "branch";
         let generation = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
 
         let mut writes = StorageWriteSet::new();
         for (file_id, change_id) in [
@@ -4461,7 +4461,7 @@ mod tests {
                     branch_id: branch_id.to_string(),
                     generation,
                     schema_key: "schema".to_string(),
-                    entity_pk: entity_pk.clone(),
+                    row_pk: row_pk.clone(),
                     file_id: file_id.map(str::to_string),
                 },
                 &head_value(change_id, generation),
@@ -4489,7 +4489,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: Some("01920000-0000-7000-8000-0000000000a2"),
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label(
                         "01920000-0000-7000-8000-0000000000a2-second",
                     ),
@@ -4574,8 +4574,8 @@ mod tests {
         let branch_id = "branch";
         let generation = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
-        let entity_pk = EntityPk::single("row");
-        let unrelated_pk = EntityPk::single("unrelated");
+        let row_pk = RowPk::single("row");
+        let unrelated_pk = RowPk::single("unrelated");
 
         let mut initial_writes = StorageWriteSet::new();
         stage_put(
@@ -4584,7 +4584,7 @@ mod tests {
                 branch_id: branch_id.to_string(),
                 generation,
                 schema_key: "schema".to_string(),
-                entity_pk: entity_pk.clone(),
+                row_pk: row_pk.clone(),
                 file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             },
             &head_value("01920000-0000-7000-8000-0000000000a2-first", generation),
@@ -4596,7 +4596,7 @@ mod tests {
                 branch_id: branch_id.to_string(),
                 generation,
                 schema_key: "schema".to_string(),
-                entity_pk: unrelated_pk,
+                row_pk: unrelated_pk,
                 file_id: None,
             },
             &head_value("unrelated", generation),
@@ -4651,7 +4651,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: Some("01920000-0000-7000-8000-0000000000a2"),
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label(
                         "01920000-0000-7000-8000-0000000000a2-second",
                     ),
@@ -4684,7 +4684,7 @@ mod tests {
                 &second_head.to_string(),
                 &[TrackedStateKey {
                     schema_key: "schema".to_string(),
-                    entity_pk,
+                    row_pk,
                     file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
                 }],
                 &ChangeRecordProjection::full(),
@@ -4709,7 +4709,7 @@ mod tests {
         let branch_id = "branch";
         let generation = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let identity = identity(branch_id, generation, "row");
 
         let mut writes = StorageWriteSet::new();
@@ -4733,7 +4733,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let absence_guards = BTreeSet::from([TrackedStateKey {
             schema_key: "schema".to_string(),
-            entity_pk: entity_pk.clone(),
+            row_pk: row_pk.clone(),
             file_id: None,
         }]);
         let error = TrackedHeadContext::new()
@@ -4745,7 +4745,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("second-change"),
                     commit_id: second_head,
                     deleted: false,
@@ -4769,9 +4769,9 @@ mod tests {
         let first_head = CommitId::for_test_label("file-cascade-first");
         let delete_head = CommitId::for_test_label("file-cascade-delete");
         let recreate_head = CommitId::for_test_label("file-cascade-recreate");
-        let file_pk = EntityPk::single("file-a");
-        let file_row_pk = EntityPk::single("file-row");
-        let unrelated_pk = EntityPk::single("unrelated-row");
+        let file_pk = RowPk::single("file-a");
+        let file_row_pk = RowPk::single("file-row");
+        let unrelated_pk = RowPk::single("unrelated-row");
 
         let mut writes = StorageWriteSet::new();
         let read = storage
@@ -4788,7 +4788,7 @@ mod tests {
                     TrackedHeadDeltaRef {
                         schema_key: "lix_file_descriptor",
                         file_id: None,
-                        entity_pk: &file_pk,
+                        row_pk: &file_pk,
                         change_id: ChangeId::for_test_label("file-create"),
                         commit_id: first_head,
                         deleted: false,
@@ -4800,7 +4800,7 @@ mod tests {
                     TrackedHeadDeltaRef {
                         schema_key: "semantic",
                         file_id: Some("file-a"),
-                        entity_pk: &file_row_pk,
+                        row_pk: &file_row_pk,
                         change_id: ChangeId::for_test_label("file-row-create"),
                         commit_id: first_head,
                         deleted: false,
@@ -4812,7 +4812,7 @@ mod tests {
                     TrackedHeadDeltaRef {
                         schema_key: "semantic",
                         file_id: Some("file-b"),
-                        entity_pk: &unrelated_pk,
+                        row_pk: &unrelated_pk,
                         change_id: ChangeId::for_test_label("unrelated-create"),
                         commit_id: first_head,
                         deleted: false,
@@ -4847,7 +4847,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "lix_file_descriptor",
                     file_id: None,
-                    entity_pk: &file_pk,
+                    row_pk: &file_pk,
                     change_id: ChangeId::for_test_label("file-delete"),
                     commit_id: delete_head,
                     deleted: true,
@@ -4881,7 +4881,7 @@ mod tests {
             .expect("matching delete head");
         let cascaded = rows
             .iter()
-            .find(|row| row.entity_pk == file_row_pk)
+            .find(|row| row.row_pk == file_row_pk)
             .expect("file-scoped row remains as a visibility tombstone");
         assert!(cascaded.deleted);
         assert_eq!(
@@ -4890,7 +4890,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|row| row.entity_pk == unrelated_pk && !row.deleted),
+                .any(|row| row.row_pk == unrelated_pk && !row.deleted),
             "unrelated file state must remain live"
         );
 
@@ -4908,7 +4908,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "lix_file_descriptor",
                     file_id: None,
-                    entity_pk: &file_pk,
+                    row_pk: &file_pk,
                     change_id: ChangeId::for_test_label("file-recreate"),
                     commit_id: recreate_head,
                     deleted: false,
@@ -4943,7 +4943,7 @@ mod tests {
             .expect("scan recreated state")
             .expect("matching recreate head");
         assert!(
-            rows.iter().all(|row| row.entity_pk != file_row_pk),
+            rows.iter().all(|row| row.row_pk != file_row_pk),
             "recreating a file descriptor must not resurrect old scoped state"
         );
     }
@@ -4954,7 +4954,7 @@ mod tests {
         let branch_id = "branch";
         let generation = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let identity = identity(branch_id, generation, "row");
 
         let mut tombstone = head_value("first-delete", generation);
@@ -4978,7 +4978,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let absence_guards = BTreeSet::from([TrackedStateKey {
             schema_key: "schema".to_string(),
-            entity_pk: entity_pk.clone(),
+            row_pk: row_pk.clone(),
             file_id: None,
         }]);
         TrackedHeadContext::new()
@@ -4990,7 +4990,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("second-insert"),
                     commit_id: second_head,
                     deleted: false,
@@ -5038,11 +5038,11 @@ mod tests {
     async fn bootstrap_overlays_parent_identity_without_duplicate_write() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let parent_head = CommitId::for_test_label("parent-head");
         let child_head = CommitId::for_test_label("child-head");
         let parent_rows = vec![MaterializedTrackedStateRow {
-            entity_pk: entity_pk.clone(),
+            row_pk: row_pk.clone(),
             schema_key: "schema".to_string(),
             file_id: None,
             snapshot_content: Some("{\"value\":1}".into()),
@@ -5067,7 +5067,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: ChangeId::for_test_label("child-change"),
                     commit_id: child_head,
                     deleted: false,

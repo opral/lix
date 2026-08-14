@@ -25,16 +25,16 @@ interface host {
     ) -> result<option<record-chunk>, host-error>;
   }
 
-  /// One bounded, self-describing page of entity mutations.
-  record entity-page {
+  /// One bounded, self-describing page of row mutations.
+  record row-page {
     payload: bytes,
   }
 
-  resource entity-source {
-    /// Pull the same universal page envelope accepted by `emit-entities`.
+  resource row-source {
+    /// Pull the same universal page envelope accepted by `emit-rows`.
     next-page: func(
       max-bytes: u32,
-    ) -> result<option<entity-page>, host-error>;
+    ) -> result<option<row-page>, host-error>;
     /// Read an oversized value referenced by the most recent page.
     read-attachment: func(
       ordinal: u32,
@@ -49,12 +49,12 @@ interface host {
     max-batch-bytes: func() -> u32;
     put-state: func(key: bytes, value: bytes) -> result<_, host-error>;
     delete-state: func(key: bytes) -> result<_, host-error>;
-    emit-entities: func(page: entity-page) -> result<_, host-error>;
-    /// Stages one oversized entity snapshot. The returned ordinal is encoded
-    /// by the SDK in the next universal entity page.
-    begin-entity-attachment: func(total-length: u64) -> result<u32, host-error>;
-    write-entity-attachment: func(chunk: bytes) -> result<_, host-error>;
-    finish-entity-attachment: func() -> result<_, host-error>;
+    emit-rows: func(page: row-page) -> result<_, host-error>;
+    /// Stages one oversized row snapshot. The returned ordinal is encoded
+    /// by the SDK in the next universal row page.
+    begin-row-attachment: func(total-length: u64) -> result<u32, host-error>;
+    write-row-attachment: func(chunk: bytes) -> result<_, host-error>;
+    finish-row-attachment: func() -> result<_, host-error>;
     begin-file-replacement: func(total-length: u64) -> result<_, host-error>;
     write-file-replacement: func(chunk: bytes) -> result<_, host-error>;
     finish-file-replacement: func() -> result<_, host-error>;
@@ -69,7 +69,7 @@ interface host {
   record conflict-meta {
     ordinal: u32,
     schema-key: string,
-    entity-pk: list<string>,
+    row-pk: list<string>,
     base-len: option<u64>,
     a-len: option<u64>,
     b-len: option<u64>,
@@ -103,7 +103,7 @@ interface host {
 }
 
 interface api {
-  use host.{bytes, conflict-source, entity-source, resolution-sink, snapshot, transition};
+  use host.{bytes, conflict-source, row-source, resolution-sink, snapshot, transition};
 
   variant plugin-error {
     invalid-input(string),
@@ -132,7 +132,7 @@ interface api {
     before-path: string,
     after-path: string,
     /// Accepted predecessor bytes plus opaque plugin state. Byte updates do
-    /// not expose semantic entities through this snapshot; entities are
+    /// not expose semantic rows through this snapshot; rows are
     /// transition outputs and host authority. This contract is identical for
     /// warm execution and durable cold restoration.
     before: own<snapshot>,
@@ -145,26 +145,26 @@ interface api {
     conflicts: own<conflict-source>,
   }
 
-  record entities-changed-request {
+  record rows-changed-request {
     before-path: string,
     before: own<snapshot>,
-    changes: own<entity-source>,
+    changes: own<row-source>,
   }
 
   record restore-request {
     accepted: option<own<snapshot>>,
-    entities: own<entity-source>,
+    rows: own<row-source>,
   }
 
   /// Rebuild an evicted actor directly as the successor of a byte transition.
-  /// Durable entities provide semantic identity while the accepted blob and
+  /// Durable rows provide semantic identity while the accepted blob and
   /// sparse edits provide byte authority.
   record cold-file-changed-request {
     before-path: string,
     after-path: string,
     before: own<snapshot>,
     edits: list<file-edit>,
-    entities: own<entity-source>,
+    rows: own<row-source>,
     creates: create-context,
   }
 
@@ -174,7 +174,7 @@ interface api {
   variant transition-request {
     open(open-request),
     file-changed(file-changed-request),
-    entities-changed(entities-changed-request),
+    rows-changed(rows-changed-request),
     restore(restore-request),
     cold-file-changed(cold-file-changed-request),
   }

@@ -558,7 +558,7 @@ fn profile_hot_sql_session_operations(
         rows,
         read_many_pk_count,
     ));
-    let _ = lix::storage_bench::take_entity_point_snapshot_cache_accounting();
+    let _ = lix::storage_bench::take_row_point_snapshot_cache_accounting();
     if sql_session::selected_olap_read_shape().is_some() {
         // Full semantic validation is intentionally outside the samples. This
         // keeps Rust-vs-JavaScript assertion work out of the engine ratio while
@@ -627,7 +627,7 @@ fn profile_hot_sql_session_operations(
         );
     }
     if matches!(operation, TransactionBenchOp::ReadOneByPk) {
-        let cache = lix::storage_bench::take_entity_point_snapshot_cache_accounting();
+        let cache = lix::storage_bench::take_row_point_snapshot_cache_accounting();
         println!(
             "tracked_state_crud point cache accounting: hits={} misses={}",
             cache.hits, cache.misses
@@ -896,7 +896,7 @@ fn profile_sql_session_bound_updates(
         let _ = lix::storage_bench::take_crud_physical_write_accounting();
         let _ = lix::storage_bench::take_crud_commit_state_manifest_bytes();
         let _ = lix::storage_bench::take_crud_current_state_scoped_range_fallbacks();
-        let _ = lix::storage_bench::take_certified_entity_update_value_batch_accounting();
+        let _ = lix::storage_bench::take_certified_row_update_value_batch_accounting();
         let start = Instant::now();
         let result = if spread {
             runtime.block_on(fixture.update_spread_bound_rows(bound_update_row_count))
@@ -912,7 +912,7 @@ fn profile_sql_session_bound_updates(
         if ownership_accounting {
             print_ownership_accounting(lix::storage_bench::take_crud_ownership_accounting());
         }
-        let certificate = lix::storage_bench::take_certified_entity_update_value_batch_accounting();
+        let certificate = lix::storage_bench::take_certified_row_update_value_batch_accounting();
         let physical = lix::storage_bench::take_crud_physical_write_accounting();
         let manifest_bytes = lix::storage_bench::take_crud_commit_state_manifest_bytes();
         let scoped_range_fallbacks =

@@ -50,8 +50,8 @@ const DEFAULT_UNRELATED_HISTORY_WIDTH: usize = 1;
 const UNRELATED_HISTORY_STORAGE_BATCH: usize = 100_000;
 const INSERT_BATCH_SIZE: usize = 500;
 const MERGE_PREVIEW_SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000901";
-const WORKING_DIFF_SQL: &str = "SELECT entity_pk, schema_key, diff_type, before_change_id, after_change_id \
-    FROM lix_working_diff ORDER BY schema_key, entity_pk";
+const WORKING_DIFF_SQL: &str = "SELECT row_pk, schema_key, diff_type, before_change_id, after_change_id \
+    FROM lix_working_diff ORDER BY schema_key, row_pk";
 
 #[derive(Clone, Copy)]
 enum Shape {

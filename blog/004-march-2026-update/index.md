@@ -15,7 +15,7 @@ og:image:alt: "Lix March 2026 Update: 500 commits with zero corruption, blob com
 - Workload testing worked: 500 real commits replayed with no state corruption bugs
 - Semantic writes still hit a write-amplification bottleneck on large files (500ms+)
 - Without the semantic layer, the file-write-plus-commit workflow is ~8x faster than Git
-- April goal: sub 100ms for 10k entity inserts
+- April goal: sub 100ms for 10k row inserts
 
 ## Workload testing
 
@@ -34,7 +34,7 @@ The best result from the workload replay is that it worked. Replaying 500 real c
 > [!NOTE]
 > **Refresher: What is the semantic layer?**
 >
-> Lix parses files into structured entities like paragraphs, tables, images so it can diff, merge, and sync at that level instead of treating files as opaque blobs.
+> Lix parses files into structured rows like paragraphs, tables, images so it can diff, merge, and sync at that level instead of treating files as opaque blobs.
 >
 > ```
 >   contract.docx
@@ -44,13 +44,13 @@ The best result from the workload replay is that it worked. Replaying 500 real c
 >   diff / merge / history on those units
 > ```
 
-The bottleneck is write amplification. A single file write fans out into many entity rows. Inserting a file with 10k entities means the engine has to process 10k entity rows. On the current path, semantic writes are multi-second operations. Any interaction above 100ms stops feeling instantaneous, so this needs to come down.
+The bottleneck is write amplification. A single file write fans out into many rows. Inserting a file with 10k rows means the engine has to process 10k rows. On the current path, semantic writes are multi-second operations. Any interaction above 100ms stops feeling instantaneous, so this needs to come down.
 
 ```
   contract.docx            Lix engine                    SQL database
   ┌──────────────────┐     ┌─────────────────────┐       ┌──────────────┐
   │ Paragraph 1      │     │ process 10,000      │       │              │
-  │ Paragraph 2      │     │ entity rows         │       │ INSERT row 1 │
+  │ Paragraph 2      │     │ rows         │       │ INSERT row 1 │
   │ Paragraph 3      │────►│                     │──────►│ INSERT row 2 │
   │ Table 1          │     │ validate, transform,│       │ ...          │
   │   Row 1          │     │ detect changes      │       │ INSERT row   │
@@ -59,10 +59,10 @@ The bottleneck is write amplification. A single file write fans out into many en
   │ ...              │     └─────────────────────┘       └──────────────┘
   │ Paragraph 4,291  │
   └──────────────────┘
-  1 file write             N entities to process           N SQL row inserts
+  1 file write             N rows to process           N SQL row inserts
 ```
 
-The engine is not fast enough to handle these large batches. The goal for April is to get 10k entity inserts under 100ms.
+The engine is not fast enough to handle these large batches. The goal for April is to get 10k row inserts under 100ms.
 
 ### Finding 3: Without the semantic layer, the file-write-plus-commit workflow is ~8x faster than Git
 
@@ -118,25 +118,25 @@ OOXML files like `.docx` and `.xlsx` are ZIP packages made of many XML parts, so
 
 So Lix makes semantic state canonical and materializes the blob on demand when someone actually needs the file bytes. The tradeoff is that blob writes pay an upfront parsing cost — which is the write-amplification bottleneck we're now fixing.
 
-Long term, most app and agent writes should bypass blob parsing entirely. They will write entities directly, so the hot path avoids both blob parsing and blob serialization.
+Long term, most app and agent writes should bypass blob parsing entirely. They will write rows directly, so the hot path avoids both blob parsing and blob serialization.
 
 That means the semantic layer must be fast.
 
 ## Prolly trees for cheap versioning
 
-Solving write speed alone isn't enough — storage also needs to scale across versions. Without content deduplication, creating a new version means duplicating all entity data. A 10k-entity Word document across 5 versions = 50k rows stored.
+Solving write speed alone isn't enough — storage also needs to scale across versions. Without content deduplication, creating a new version means duplicating all row data. A 10k-row Word document across 5 versions = 50k rows stored.
 
 ```
   Without deduplication:
 
   version: main              version: draft
   ┌──────────────────┐       ┌──────────────────┐
-  │ 10,000 entities  │       │ 10,000 entities  │  ← full copy
+  │ 10,000 rows  │       │ 10,000 rows  │  ← full copy
   └──────────────────┘       └──────────────────┘
   💥 10,000 rows              💥 10,000 rows (copied)
 ```
 
-[Prolly trees](https://docs.dolthub.com/architecture/storage-engine/prolly-tree) are the most promising fit for this. Entities are grouped into chunks with boundaries determined by content hashes. If one paragraph changes, only the chunk containing that paragraph is new. The rest is shared across versions.
+[Prolly trees](https://docs.dolthub.com/architecture/storage-engine/prolly-tree) are the most promising fit for this. Rows are grouped into chunks with boundaries determined by content hashes. If one paragraph changes, only the chunk containing that paragraph is new. The rest is shared across versions.
 
 ```
   With Prolly trees:
@@ -170,6 +170,6 @@ Solving write speed alone isn't enough — storage also needs to scale across ve
 
 March proved the blob path works. April is about closing the gap so the semantic layer is fast enough and correct enough for real use.
 
-1. **10k entity inserts under 100 ms.** SQLite can insert 10k rows in under 10 ms. That gives us ~90 ms of headroom to work with.
-2. **Prolly trees for cheap branching.** Without content deduplication, every branch copies all entity data. Prolly trees share unchanged chunks across versions, so branching a 10k-entity document is nearly free.
+1. **10k row inserts under 100 ms.** SQLite can insert 10k rows in under 10 ms. That gives us ~90 ms of headroom to work with.
+2. **Prolly trees for cheap branching.** Without content deduplication, every branch copies all row data. Prolly trees share unchanged chunks across versions, so branching a 10k-row document is nearly free.
 3. **Workload testing with the semantic layer on.** March proved the blob path doesn't corrupt state across 500 real commits. April repeats that test with semantic writes enabled.

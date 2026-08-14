@@ -95,7 +95,7 @@ longer retain checkpoint history.
 ## Matched CRUD, merge, and cold-open benchmark
 
 The deterministic Markdown corpus is 524,721 bytes. Baseline and candidate use
-50 byte edits, 50 semantic edits, 15 unrelated-entity merges, and 30 cold
+50 byte edits, 50 semantic edits, 15 unrelated-row merges, and 30 cold
 opens. Values are medians from release builds.
 
 | operation | before | after | delta |
@@ -104,7 +104,7 @@ opens. Values are medians from release builds.
 | hot byte edit | 1.897 ms | 1.805 ms | -4.85% |
 | semantic edit | 6.005 ms | 5.912 ms | -1.55% |
 | cold sparse edit total | 7.874 ms | 7.875 ms | +0.01% |
-| unrelated-entity merge | 7.533 ms | 7.552 ms | +0.25% |
+| unrelated-row merge | 7.533 ms | 7.552 ms | +0.25% |
 | cold materialized read | 0.504 ms | 0.515 ms | +2.18% |
 
 The history-live main-branch database changes from 11,163,356 to 11,226,533

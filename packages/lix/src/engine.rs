@@ -6,7 +6,7 @@ use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::hot_state::HotStateContext;
 use crate::hot_state::HotStateRowRequest;
 use crate::init::InitReceipt;
@@ -224,7 +224,7 @@ where
 
     /// Point-reads one global, untracked `lix_key_value` row by physical key.
     ///
-    /// Client-state rows are ordinary global untracked KV entities, so a single
+    /// Client-state rows are ordinary global untracked KV rows, so a single
     /// preference lookup does not need a SQL context. `open_lix` runs before any
     /// statement in the process, where routing through `execute` would pay
     /// catalog construction and DataFusion planning for one key.
@@ -243,7 +243,7 @@ where
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(physical_key),
+                row_pk: RowPk::single(physical_key),
                 file_id: NullableKeyFilter::Null,
             })
             .await?
@@ -419,7 +419,7 @@ where
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
-        let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
+        let account_pk = RowPk::uuid_from_canonical(account_id).map_err(|_| {
             LixError::new(
                 "LIX_INVALID_ACCOUNT_ID",
                 format!("active account id '{account_id}' is not a canonical UUID"),
@@ -436,7 +436,7 @@ where
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_account".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: account_pk,
+                row_pk: account_pk,
                 file_id: NullableKeyFilter::Null,
             })
             .await?
@@ -487,7 +487,7 @@ where
                 .load_row(&HotStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    entity_pk: EntityPk::single("lix_id"),
+                    row_pk: RowPk::single("lix_id"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await?
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_fast_path_serves_broad_sql_rows() {
+    async fn tracked_row_fast_path_serves_broad_sql_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_provider_preserves_canonical_primary_key_order() {
+    async fn tracked_row_provider_preserves_canonical_primary_key_order() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1144,7 +1144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_public_fast_path_falls_back_for_staged_transaction_rows() {
+    async fn tracked_row_public_fast_path_falls_back_for_staged_transaction_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_state_group_serves_mixed_tracked_and_untracked_entity_rows() {
+    async fn current_state_group_serves_mixed_tracked_and_untracked_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1209,7 +1209,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("write tracked entity row");
+            .expect("write tracked row");
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
@@ -1217,7 +1217,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("write untracked entity row");
+            .expect("write untracked row");
 
         let rows = session
             .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untracked_public_entity_write_is_history_free_and_diff_invisible() {
+    async fn untracked_public_row_write_is_history_free_and_diff_invisible() {
         let storage = Memory::new();
         let receipt = Engine::initialize(storage.clone())
             .await
@@ -1419,7 +1419,7 @@ mod tests {
     /// answer identically for every row state a branch can actually reach.
     ///
     /// The broad path enumerates the sparse `HOT_DIFF` index and then loads
-    /// each dirty identity's primary row; the finite `schema_key + entity_pk`
+    /// each dirty identity's primary row; the finite `schema_key + row_pk`
     /// path skips that index entirely and reads the primary rows directly.
     /// They treat an untracked or absent primary row differently — the broad
     /// path fails closed to canonical replay, the finite path skips the row —
@@ -1548,8 +1548,8 @@ mod tests {
         let index_before = hits.index_scan.load(Ordering::Relaxed);
         let broad = session
             .execute(
-                "SELECT entity_pk, diff_type FROM lix_working_diff \
-                 WHERE schema_key = 'json_pointer' ORDER BY entity_pk",
+                "SELECT row_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'json_pointer' ORDER BY row_pk",
                 &[],
             )
             .await
@@ -1563,8 +1563,8 @@ mod tests {
             .iter()
             .map(|row| {
                 (
-                    row.get::<serde_json::Value>("entity_pk")
-                        .expect("entity_pk should decode")
+                    row.get::<serde_json::Value>("row_pk")
+                        .expect("row_pk should decode")
                         .to_string(),
                     row.get::<String>("diff_type")
                         .expect("diff_type should decode"),
@@ -1593,14 +1593,14 @@ mod tests {
             "/recycled-source",
             "/never-existed",
         ] {
-            let entity_pk = format!("[\"{path}\"]");
+            let requested_row_pk = format!("[\"{path}\"]");
             let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
             let finite = session
                 .execute(
-                    "SELECT entity_pk, diff_type FROM lix_working_diff \
-                     WHERE schema_key = 'json_pointer' AND entity_pk = CAST($1 AS JSONB) \
-                     ORDER BY entity_pk",
-                    &[crate::Value::Text(entity_pk.clone())],
+                    "SELECT row_pk, diff_type FROM lix_working_diff \
+                     WHERE schema_key = 'json_pointer' AND row_pk = CAST($1 AS JSONB) \
+                     ORDER BY row_pk",
+                    &[crate::Value::Text(requested_row_pk.clone())],
                 )
                 .await
                 .expect("finite working-diff read should execute");
@@ -1613,8 +1613,8 @@ mod tests {
                 .iter()
                 .map(|row| {
                     (
-                        row.get::<serde_json::Value>("entity_pk")
-                            .expect("entity_pk should decode")
+                        row.get::<serde_json::Value>("row_pk")
+                            .expect("row_pk should decode")
                             .to_string(),
                         row.get::<String>("diff_type")
                             .expect("diff_type should decode"),
@@ -1623,7 +1623,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let expected = broad_rows
                 .iter()
-                .filter(|(row_pk, _)| row_pk == &entity_pk)
+                .filter(|(row_pk, _)| row_pk == &requested_row_pk)
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -1767,8 +1767,8 @@ mod tests {
                     (
                         row.get::<String>("schema_key")
                             .expect("schema_key should decode"),
-                        row.get::<serde_json::Value>("entity_pk")
-                            .expect("entity_pk should decode")
+                        row.get::<serde_json::Value>("row_pk")
+                            .expect("row_pk should decode")
                             .to_string(),
                         // `file_id` is nullable; a NULL surfaces as a decode
                         // error through the typed accessor.
@@ -1781,7 +1781,7 @@ mod tests {
             rows.sort();
             rows
         }
-        const COLUMNS: &str = "SELECT entity_pk, schema_key, file_id, diff_type \
+        const COLUMNS: &str = "SELECT row_pk, schema_key, file_id, diff_type \
                                FROM lix_working_diff";
 
         use std::sync::atomic::Ordering;
@@ -1875,12 +1875,12 @@ mod tests {
     /// DataFusion drops its residual filter and the answer rests entirely on
     /// `HotStateFilter::file_ids`. Rows can live in four authorities — the
     /// branch-local `HOT_ROW` overlay, a packed current base, a certified
-    /// entity batch, and the root current base — and a file-scoped seek is
+    /// row batch, and the root current base — and a file-scoped seek is
     /// only sound if every one of them applies the same filter. The checkpoint
     /// in the middle republishes the generation, so rows written before and
     /// after it reach the read through different authorities.
     #[tokio::test]
-    async fn file_scoped_entity_read_matches_the_unfiltered_scan() {
+    async fn file_scoped_row_read_matches_the_unfiltered_scan() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -2000,7 +2000,7 @@ mod tests {
             want.sort();
             assert_eq!(
                 filtered_rows, want,
-                "file-scoped entity read must return exactly the rows in {file}"
+                "file-scoped row read must return exactly the rows in {file}"
             );
         }
 
@@ -2140,7 +2140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_reclaims_working_diff_epochs_and_retains_checkpoint_entities() {
+    async fn checkpoint_reclaims_working_diff_epochs_and_retains_checkpoint_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -2186,7 +2186,7 @@ mod tests {
         assert_eq!(
             after.len(),
             1,
-            "the superseded branch epoch must be reclaimed; only the repository-global checkpoint entity may remain dirty"
+            "the superseded branch epoch must be reclaimed; only the repository-global checkpoint row may remain dirty"
         );
         drop(read);
         session
@@ -2201,7 +2201,7 @@ mod tests {
         assert_eq!(
             after_second.len(),
             2,
-            "the second immutable checkpoint entity remains while the superseded branch epoch is reclaimed"
+            "the second immutable checkpoint row remains while the superseded branch epoch is reclaimed"
         );
         let logical = session
             .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
@@ -2216,7 +2216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_public_fast_path_falls_back_for_global_tracked_rows() {
+    async fn tracked_row_public_fast_path_falls_back_for_global_tracked_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -2236,7 +2236,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("write global tracked entity row");
+            .expect("write global tracked row");
 
         let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
@@ -2255,7 +2255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_fast_path_keeps_synthesized_branch_refs_generic() {
+    async fn tracked_row_fast_path_keeps_synthesized_branch_refs_generic() {
         let storage = Memory::new();
         let receipt = Engine::initialize(storage.clone())
             .await

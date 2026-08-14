@@ -40,7 +40,7 @@
 - Introduced Plugin API v1 and migrated the bundled CSV, JSON, Markdown, Excalidraw, and Git text plugins.
 
   Plugin API v1 replaces the previous Wasm plugin contract with a fused, host-owned API.
-- SQL writes now support `RETURNING` across registered entities and writable filesystem and branch surfaces. INSERT and UPDATE return final post-write values (including generated defaults), while DELETE continues to return the removed row values.
+- SQL writes now support `RETURNING` across registered rows and writable filesystem and branch surfaces. INSERT and UPDATE return final post-write values (including generated defaults), while DELETE continues to return the removed row values.
 
 ### Patch
 
@@ -63,7 +63,7 @@
 
 - Directory paths now use the same canonical syntax as file paths.
 
-  Non-root paths must not end with `/`; the typed file or directory surface determines the entity kind. Applications must remove trailing slashes from directory path values.
+  Non-root paths must not end with `/`; the typed file or directory surface determines the row kind. Applications must remove trailing slashes from directory path values.
 - Turn automatic edit history into deliberate checkpoints.
 
   The SDK can create milestones, SQL can query checkpoint history and working diffs, and Lix automatically cleans up superseded automatic commits after a recovery window.
@@ -80,7 +80,7 @@
   Use `example_history()` for history from the active head or `example_history($commit)` for an explicit head. The former `lixcol_as_of_commit_id` result column and predicate-based anchor API have been removed.
 - Structured files now merge incrementally through the new Component v2 plugin platform.
 
-  Reference plugins for CSV and TSV, JSON, Markdown, Excalidraw, and Git-compatible text turn localized file edits into sparse semantic changes without reparsing or rendering the complete document. Concurrent edits merge at the entity level, and plugin authors can build on the same public Rust API used by the bundled plugins.
+  Reference plugins for CSV and TSV, JSON, Markdown, Excalidraw, and Git-compatible text turn localized file edits into sparse semantic changes without reparsing or rendering the complete document. Concurrent edits merge at the row level, and plugin authors can build on the same public Rust API used by the bundled plugins.
 - Git replay can now target RocksDB or SlateDB and compare the full semantic plugin path with an explicit no-plugin control. Replay profiles identify the selected adapter and include per-commit WASM transition work counters.
 - Run Lix repositories remotely with live, low-latency clients.
 
@@ -166,7 +166,7 @@
 - Made the JavaScript SDK's native bindings fully asynchronous.
 
   Awaited methods previously blocked the calling thread inside the native binding, which could freeze an Electron main process. Opening a lix, `execute`, transactions, branch and merge calls, observers, and `close` now return real promises and run their work off-thread.
-- Sped up `INSERT ... ON CONFLICT` entity upserts by scanning only the inserted identity for conflicts instead of the full entity state.
+- Sped up `INSERT ... ON CONFLICT` row upserts by scanning only the inserted identity for conflicts instead of the full row state.
 - Improved `lix_file` read and write performance.
 
   Simple single- and multi-row `lix_file (path, data)` inserts and upserts take a fast path that makes large file writes roughly 10x faster. File bytes are hashed once per write, unchanged chunks skip re-writes, and filesystem sync batches its upserts: in repository benchmarks, a 1,000-row `lix_file` insert dropped from ~95 ms to ~41 ms and a 200-file filesystem cold open from ~780 ms to ~210 ms. `SELECT` queries that project `data` now batch their blob reads.
@@ -181,10 +181,10 @@
 
 ### Minor
 
-- Added `INSERT ... ON CONFLICT` upsert support for entity state.
+- Added `INSERT ... ON CONFLICT` upsert support for row state.
 - Added file format plugins: CSV, Markdown, and plain text files are stored as queryable state instead of blobs.
 
-  Writing a file with a matching plugin stores the changes inside the file as entity state. A CSV cell edit is one row-level change that can be queried, diffed, and merged. Reorders are detected: a moved row or paragraph is recorded as a move, not a delete plus an insert. Files without a plugin keep content-defined chunked blob storage.
+  Writing a file with a matching plugin stores the changes inside the file as row state. A CSV cell edit is one row-level change that can be queried, diffed, and merged. Reorders are detected: a moved row or paragraph is recorded as a move, not a delete plus an insert. Files without a plugin keep content-defined chunked blob storage.
 - Added filesystem sync: a lix can mirror into a plain directory and back.
 
   Edits made in the directory with any tool flow into Lix with full history. Switching branches updates the directory contents.

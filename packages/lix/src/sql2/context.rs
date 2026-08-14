@@ -117,11 +117,11 @@ pub(crate) trait SqlExecutionContext: Sync {
         crate::ANONYMOUS_ACCOUNT_ID
     }
     fn hot_state(&self) -> Arc<dyn HotStateReader>;
-    /// Supplies the committed tracked-head entity snapshot capability when the
+    /// Supplies the committed tracked-head row snapshot capability when the
     /// read context can prove it is scoped to one immutable storage snapshot.
     /// Generic and transaction contexts intentionally retain the default
     /// materialized-row path.
-    fn entity_snapshot_reader(&self) -> Option<Arc<dyn super::EntitySnapshotReader>> {
+    fn row_snapshot_reader(&self) -> Option<Arc<dyn super::RowSnapshotReader>> {
         None
     }
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
@@ -136,7 +136,7 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
-    /// Loads runtime-defined SQL entity metadata when provider selection could
+    /// Loads runtime-defined SQL row metadata when provider selection could
     /// not be satisfied entirely by compile-time system surfaces.
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 

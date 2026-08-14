@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_undo_redo_marker",
-  "description": "Internal tracked marker carrying branch undo/redo cursor state. This schema is intentionally hidden from generated entity SQL surfaces.",
+  "description": "Internal tracked marker carrying branch undo/redo cursor state. This schema is intentionally hidden from generated schema SQL surfaces.",
   "columns": [
     {
       "name": "branch_id",

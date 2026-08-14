@@ -1,8 +1,8 @@
-//! Does a JSON-column equality reach the entity provider?
+//! Does a JSON-column equality reach the row provider?
 //!
 //! Not a product module. `filterable_column_name` returns `None` for
-//! `EntityColumnType::Json`, so a JSON-column equality cannot become an
-//! `EntityRowFilter`. What that costs is the open question: the predicate is
+//! `SchemaColumnType::Json`, so a JSON-column equality cannot become an
+//! `RowFilter`. What that costs is the open question: the predicate is
 //! still *answered*, by DataFusion's `FilterExec` one layer above the
 //! provider, so the rows are materialised and then discarded.
 //!
@@ -12,7 +12,7 @@
 //! `WHERE v = CAST('...' AS JSONB)`, and a String-column arm as the control: same
 //! fixture size, same one-row answer, on a column that *is* pushable.
 //!
-//! Counted at the materialisation boundary (`apply_entity_batch_filters`),
+//! Counted at the materialisation boundary (`apply_row_batch_filters`),
 //! above its `filters.is_empty()` early return, because a profile of that
 //! function reads identically for "nothing to filter" and "never ran".
 
@@ -77,9 +77,9 @@ async fn seed(session: &SessionContext<Memory>, table: &str, count: usize) {
 ///
 /// Counted with `provider_rows_examined`, the engine's own instrument, whose
 /// documentation states the exact contract this probe needs: it is recorded
-/// *before* a provider applies its row filters, at **every route an entity
+/// *before* a provider applies its row filters, at **every route a row
 /// surface can take**, so a route that never reaches
-/// `apply_entity_batch_filters` is still counted. A census at that one
+/// `apply_row_batch_filters` is still counted. A census at that one
 /// function is blind to the columnar and overlay routes, which is how a
 /// "zero frames" reading can mean "different route" rather than "did nothing".
 /// It is also task-local rather than process-global, so it cannot bleed.

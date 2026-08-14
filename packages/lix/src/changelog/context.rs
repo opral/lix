@@ -139,7 +139,7 @@ fn transaction_change_value_capacity(
 ) -> usize {
     96usize
         .saturating_add(change.schema_key.len())
-        .saturating_add(change.entity_pk.estimated_heap_bytes())
+        .saturating_add(change.row_pk.estimated_heap_bytes())
         .saturating_add(change.file_id.map_or(0, str::len))
         .saturating_add(change.origin_key.map_or(0, str::len))
         .saturating_add(json_slot_ref_value_capacity(change.snapshot))

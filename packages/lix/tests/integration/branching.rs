@@ -40,7 +40,7 @@ simulation_test!(create_branch_rejects_existing_id, |sim| async move {
     assert!(
         error
             .to_string()
-            .contains("INSERT would duplicate entity_pk"),
+            .contains("INSERT would duplicate row_pk"),
         "error should explain the duplicate branch id: {error:?}"
     );
     assert_branch_descriptor(&main, "01930000-0000-7000-8000-000000000001", "Draft").await;
@@ -74,7 +74,7 @@ simulation_test!(create_branch_rejects_duplicate_name, |sim| async move {
 });
 
 simulation_test!(
-    branch_descriptor_delete_via_entity_surface_is_rejected_when_ref_exists,
+    branch_descriptor_delete_via_schema_surface_is_rejected_when_ref_exists,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
@@ -84,7 +84,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("descriptor delete through entity surface should fail");
+            .expect_err("descriptor delete through schema surface should fail");
         assert_branch_pair_delete_restricted(&error);
 
         assert_eq!(
@@ -109,7 +109,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    branch_ref_delete_via_entity_surface_is_rejected_when_descriptor_exists,
+    branch_ref_delete_via_schema_surface_is_rejected_when_descriptor_exists,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
@@ -119,7 +119,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("ref delete through entity surface should fail");
+            .expect_err("ref delete through schema surface should fail");
         assert_branch_pair_delete_restricted(&error);
 
         assert_eq!(
@@ -881,10 +881,10 @@ simulation_test!(
         assert_key_value(&main, "main-merge-target", Some("\"main\"")).await;
         let working_diffs = main
             .execute(
-                "SELECT entity_pk, diff_type \
+                "SELECT row_pk, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                 ORDER BY entity_pk",
+                 ORDER BY row_pk",
                 &[],
             )
             .await
@@ -1004,7 +1004,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_branch_does_not_republish_global_checkpoint_entity,
+    merge_branch_does_not_republish_global_checkpoint_row,
     |sim| async move {
         let (_engine, main, draft) = create_draft_from_main(&sim).await;
         main.execute(
@@ -1034,7 +1034,7 @@ simulation_test!(
             .rows()[0]
                 .values(),
             &[Value::Text(checkpoint.commit_id.clone())],
-            "a checkpoint is a global entity inherited by every branch"
+            "a checkpoint is a global row inherited by every branch"
         );
 
         let receipt = main
@@ -1065,7 +1065,7 @@ simulation_test!(
         assert_eq!(
             checkpoints.len(),
             1,
-            "merge must not duplicate the checkpoint entity"
+            "merge must not duplicate the checkpoint row"
         );
         assert_eq!(
             checkpoints.rows()[0].values(),
@@ -1313,7 +1313,7 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND entity_pk = CAST('[\"merge-select-change\"]' AS JSONB) \
+	       AND row_pk = CAST('[\"merge-select-change\"]' AS JSONB) \
 	       AND snapshot_content = CAST('{\"key\":\"merge-select-change\",\"value\":\"source\"}' AS JSONB)",
         )
         .await;
@@ -1404,7 +1404,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_branch_errors_on_divergent_same_entity_change,
+    merge_branch_errors_on_divergent_same_row_change,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -1432,7 +1432,7 @@ simulation_test!(
                 source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
             .await
-            .expect_err("divergent same-entity changes should conflict");
+            .expect_err("divergent same-row changes should conflict");
         assert_merge_conflict_error(&error);
         assert_eq!(
             engine
@@ -2056,7 +2056,7 @@ fn assert_merge_conflict_error(error: &LixError) {
     let conflict = &conflicts[0];
     assert_eq!(
         conflict.get("kind").and_then(JsonValue::as_str),
-        Some("sameEntityChanged")
+        Some("sameRowChanged")
     );
     assert_eq!(
         conflict.get("schemaKey").and_then(JsonValue::as_str),
@@ -2064,10 +2064,10 @@ fn assert_merge_conflict_error(error: &LixError) {
     );
     assert!(
         conflict
-            .get("entityPk")
+            .get("rowPk")
             .and_then(JsonValue::as_array)
             .is_some(),
-        "conflict should include entityPk: {conflict:?}"
+        "conflict should include rowPk: {conflict:?}"
     );
     assert!(
         conflict.get("target").is_some(),
@@ -2206,7 +2206,7 @@ simulation_test!(
                 "SELECT diff_type, before_change_id, after_change_id \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2264,7 +2264,7 @@ simulation_test!(
                 "INSERT INTO lix_revert (diff_id) \
                  SELECT diff_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"branch-revert\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"branch-revert\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2322,7 +2322,7 @@ simulation_test!(
                 "SELECT diff_type, before_change_id \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2373,7 +2373,7 @@ simulation_test!(
             .execute(
                 "SELECT diff_type, before_change_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"branch-delete\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"branch-delete\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2392,8 +2392,8 @@ simulation_test!(
 
         let broad = draft
             .execute(
-                "SELECT entity_pk, diff_type FROM lix_working_diff \
-                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                "SELECT row_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
                 &[],
             )
             .await
@@ -2470,8 +2470,8 @@ simulation_test!(
 
         let rows = draft
             .execute(
-                "SELECT entity_pk, diff_type FROM lix_working_diff \
-                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                "SELECT row_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
                 &[],
             )
             .await
@@ -2550,8 +2550,8 @@ simulation_test!(
 
         let rows = draft
             .execute(
-                "SELECT entity_pk, diff_type FROM lix_working_diff \
-                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                "SELECT row_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
                 &[],
             )
             .await
@@ -2612,7 +2612,7 @@ simulation_test!(
             .execute(
                 "SELECT diff_type, before_change_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2664,7 +2664,7 @@ simulation_test!(
         assert_key_value(&draft, "branch-checkpoint", Some("\"after\"")).await;
         let rows = draft
             .execute(
-                "SELECT entity_pk FROM lix_working_diff WHERE schema_key = 'lix_key_value'",
+                "SELECT row_pk FROM lix_working_diff WHERE schema_key = 'lix_key_value'",
                 &[],
             )
             .await

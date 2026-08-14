@@ -1720,7 +1720,7 @@ impl From<MergeChangeStats> for MergeChangeStatsDto {
 pub struct MergeConflictDto {
     pub kind: String,
     pub schema_key: String,
-    pub entity_pk: serde_json::Value,
+    pub row_pk: serde_json::Value,
     pub file_id: Option<String>,
     pub target: MergeConflictSideDto,
     pub source: MergeConflictSideDto,
@@ -1731,7 +1731,7 @@ impl From<MergeConflict> for MergeConflictDto {
         Self {
             kind: merge_conflict_kind_to_string(conflict.kind),
             schema_key: conflict.schema_key,
-            entity_pk: conflict.entity_pk,
+            row_pk: conflict.row_pk,
             file_id: conflict.file_id,
             target: conflict.target.into(),
             source: conflict.source.into(),
@@ -1741,7 +1741,7 @@ impl From<MergeConflict> for MergeConflictDto {
 
 fn merge_conflict_kind_to_string(kind: MergeConflictKind) -> String {
     match kind {
-        MergeConflictKind::SameEntityChanged => "sameEntityChanged",
+        MergeConflictKind::SameRowChanged => "sameRowChanged",
     }
     .to_string()
 }

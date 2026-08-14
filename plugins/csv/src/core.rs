@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 pub const TABLE_SCHEMA_KEY: &str = "csv_table";
 pub const ROW_SCHEMA_KEY: &str = "csv_row";
-pub const ROOT_ENTITY_PK: &str = "root";
+pub const ROOT_ROW_PK: &str = "root";
 
 const ROWS_PER_CHUNK: usize = 512;
 const IDENTITIES_PER_CHUNK: usize = 64;
@@ -96,7 +96,7 @@ impl Dialect {
         }
     }
 
-    fn validate_entity(self) -> Result<Self, String> {
+    fn validate_row(self) -> Result<Self, String> {
         let safe_delimiter = self.delimiter == b'\t' || matches!(self.delimiter, b' '..=b'~');
         if !safe_delimiter {
             return Err(
@@ -155,17 +155,17 @@ pub enum ChangeEffect {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityChange {
+pub struct RowChange {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Option<Vec<u8>>,
     pub effect: ChangeEffect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityRecord {
+pub struct RowRecord {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Vec<u8>,
 }
 
@@ -433,29 +433,29 @@ fn push_blob_piece(output: &mut Vec<BlobPiece>, piece: BlobPiece) {
     output.push(piece);
 }
 
-impl EntityChange {
-    fn upsert(schema_key: &str, entity_pk: String, snapshot: Vec<u8>) -> Self {
-        Self::upsert_with_effect(schema_key, entity_pk, snapshot, ChangeEffect::Content)
+impl RowChange {
+    fn upsert(schema_key: &str, row_pk: String, snapshot: Vec<u8>) -> Self {
+        Self::upsert_with_effect(schema_key, row_pk, snapshot, ChangeEffect::Content)
     }
 
     fn upsert_with_effect(
         schema_key: &str,
-        entity_pk: String,
+        row_pk: String,
         snapshot: Vec<u8>,
         effect: ChangeEffect,
     ) -> Self {
         Self {
             schema_key: schema_key.to_owned(),
-            entity_pk: vec![entity_pk],
+            row_pk: vec![row_pk],
             snapshot: Some(snapshot),
             effect,
         }
     }
 
-    fn delete(schema_key: &str, entity_pk: String) -> Self {
+    fn delete(schema_key: &str, row_pk: String) -> Self {
         Self {
             schema_key: schema_key.to_owned(),
-            entity_pk: vec![entity_pk],
+            row_pk: vec![row_pk],
             snapshot: None,
             effect: ChangeEffect::Content,
         }
@@ -611,7 +611,7 @@ impl IdentityStore {
             let start = usize::try_from(noncompact.start).expect("u32 fits usize");
             let end = start + usize::try_from(noncompact.len).expect("u32 fits usize");
             return std::str::from_utf8(&self.base_noncompact_bytes[start..end])
-                .expect("noncompact entity IDs were validated as UTF-8")
+                .expect("noncompact row IDs were validated as UTF-8")
                 .to_owned();
         }
         let namespace_index = usize::from(self.base_namespace_indices[index]);
@@ -1527,11 +1527,11 @@ struct ImportedLayout {
 }
 
 /// Incremental cold-start importer. Packet pages are decoded and compacted as
-/// they arrive, so the guest never retains all entity snapshots or a
+/// they arrive, so the guest never retains all row snapshots or a
 /// `Vec<String>` per row. The compact arenas are consumed directly when the
 /// accepted renderer document is constructed.
 #[derive(Debug)]
-pub(crate) struct EntityImportBuilder {
+pub(crate) struct RowImportBuilder {
     dialect: Dialect,
     table_root_seen: bool,
     rows: Vec<ImportedRow>,
@@ -1543,7 +1543,7 @@ pub(crate) struct EntityImportBuilder {
     layout_overrides: Vec<ImportedLayout>,
 }
 
-impl EntityImportBuilder {
+impl RowImportBuilder {
     pub(crate) fn new() -> Self {
         Self {
             dialect: Dialect::for_path(None),
@@ -1556,25 +1556,25 @@ impl EntityImportBuilder {
         }
     }
 
-    pub(crate) fn push(&mut self, entity: EntityRecord) -> Result<(), String> {
-        if entity.entity_pk.len() != 1 {
-            return Err("CSV entities require one primary-key component".to_owned());
+    pub(crate) fn push(&mut self, record: RowRecord) -> Result<(), String> {
+        if record.row_pk.len() != 1 {
+            return Err("CSV rows require one primary-key component".to_owned());
         }
-        match entity.schema_key.as_str() {
+        match record.schema_key.as_str() {
             TABLE_SCHEMA_KEY => {
-                if entity.entity_pk[0] != ROOT_ENTITY_PK {
+                if record.row_pk[0] != ROOT_ROW_PK {
                     return Err("CSV table primary key must be root".to_owned());
                 }
                 if self.table_root_seen {
                     return Err("CSV cold state contains duplicate table root".to_owned());
                 }
-                self.dialect = parse_table_snapshot(&entity.snapshot)?;
+                self.dialect = parse_table_snapshot(&record.snapshot)?;
                 self.table_root_seen = true;
             }
             ROW_SCHEMA_KEY => {
-                let row = parse_row_snapshot(&entity.snapshot)?;
-                if row.id != entity.entity_pk[0] {
-                    return Err("CSV row snapshot id does not match entity key".to_owned());
+                let row = parse_row_snapshot(&record.snapshot)?;
+                if row.id != record.row_pk[0] {
+                    return Err("CSV row snapshot id does not match row key".to_owned());
                 }
                 let id = append_import_bytes(&mut self.id_bytes, row.id.as_bytes())?;
                 if !row.layout.is_default() {
@@ -2072,7 +2072,7 @@ impl Document {
         &self,
         splices: &[FileEdit<'_>],
         namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), String> {
+    ) -> Result<(Self, Vec<RowChange>), String> {
         self.file_changed_with_paths(splices, None, None, namespace)
     }
 
@@ -2082,7 +2082,7 @@ impl Document {
         before_path: Option<&str>,
         after_path: Option<&str>,
         namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), String> {
+    ) -> Result<(Self, Vec<RowChange>), String> {
         validate_splices(self.0.blob.len(), splices)?;
         let before_path_dialect = Dialect::for_path(before_path);
         let after_path_dialect = Dialect::for_path(after_path);
@@ -2159,7 +2159,7 @@ impl Document {
             dialect: self.0.dialect,
             sparse_rows_touched,
         }));
-        let changes = changed_entities(self, &document, &old_locations, &new_drafts)?;
+        let changes = changed_rows(self, &document, &old_locations, &new_drafts)?;
         Ok((document, changes))
     }
 
@@ -2168,7 +2168,7 @@ impl Document {
         after: PersistentBlob,
         after_path: Option<&str>,
         namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), String> {
+    ) -> Result<(Self, Vec<RowChange>), String> {
         let bytes = after.materialize();
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(after_path);
@@ -2196,22 +2196,19 @@ impl Document {
             dialect,
             sparse_rows_touched,
         }));
-        let changes = changed_entities(self, &document, &old_locations, &drafts)?;
+        let changes = changed_rows(self, &document, &old_locations, &drafts)?;
         Ok((document, changes))
     }
 
-    pub fn open_entities(entities: Vec<EntityRecord>) -> Result<(Self, ByteEdit), String> {
-        let mut builder = EntityImportBuilder::new();
-        for entity in entities {
-            builder.push(entity)?;
+    pub fn open_rows(rows: Vec<RowRecord>) -> Result<(Self, ByteEdit), String> {
+        let mut builder = RowImportBuilder::new();
+        for row in rows {
+            builder.push(row)?;
         }
         builder.finish()
     }
 
-    pub fn entities_changed(
-        &self,
-        changes: &[EntityChange],
-    ) -> Result<(Self, Vec<ByteEdit>), String> {
+    pub fn rows_changed(&self, changes: &[RowChange]) -> Result<(Self, Vec<ByteEdit>), String> {
         if changes.is_empty() {
             return Ok((self.clone(), Vec::new()));
         }
@@ -2223,10 +2220,10 @@ impl Document {
         }
         if changes.len() == 1 && changes[0].schema_key == ROW_SCHEMA_KEY {
             let change = &changes[0];
-            if change.entity_pk.len() != 1 {
+            if change.row_pk.len() != 1 {
                 return Err("CSV row changes require one primary-key component".to_owned());
             }
-            let id = &change.entity_pk[0];
+            let id = &change.row_pk[0];
             let slot = self.0.identities.slot_for_id(id);
             let existing = slot.and_then(|slot| self.0.index.location_for_identity_slot(slot));
             match (&change.snapshot, existing) {
@@ -2235,7 +2232,7 @@ impl Document {
                 (Some(snapshot), Some(location)) => {
                     let semantic = parse_row_snapshot(snapshot)?;
                     if semantic.id != *id {
-                        return Err("CSV row snapshot id does not match entity key".to_owned());
+                        return Err("CSV row snapshot id does not match row key".to_owned());
                     }
                     if let Some(result) = self.update_or_reorder_sparse_row(location, &semantic)? {
                         return Ok(result);
@@ -2244,7 +2241,7 @@ impl Document {
                 (Some(snapshot), None) => {
                     let semantic = parse_row_snapshot(snapshot)?;
                     if semantic.id != *id {
-                        return Err("CSV row snapshot id does not match entity key".to_owned());
+                        return Err("CSV row snapshot id does not match row key".to_owned());
                     }
                     return self.insert_sparse_row(slot, &semantic);
                 }
@@ -2254,23 +2251,23 @@ impl Document {
         // Multi-row sparse sets and dialect mutation use the exact cold
         // renderer. Every single-row content/delete/insert/reorder case above
         // stays local except an unterminated-EOF reorder.
-        let records = apply_entity_changes(self.entity_records()?, changes);
-        let (document, mut edit) = Self::open_entities(records)?;
+        let records = apply_row_changes(self.row_records()?, changes);
+        let (document, mut edit) = Self::open_rows(records)?;
         edit.delete_len = u64::try_from(self.0.blob.len()).expect("file length fits u64");
         Ok((document, vec![edit]))
     }
 
-    pub fn entity_records(&self) -> Result<Vec<EntityRecord>, String> {
+    pub fn row_records(&self) -> Result<Vec<RowRecord>, String> {
         let mut records = Vec::with_capacity(self.row_count() + 1);
-        records.push(EntityRecord {
+        records.push(RowRecord {
             schema_key: TABLE_SCHEMA_KEY.to_owned(),
-            entity_pk: vec![ROOT_ENTITY_PK.to_owned()],
+            row_pk: vec![ROOT_ROW_PK.to_owned()],
             snapshot: table_snapshot(self.0.dialect),
         });
         for location in self.0.index.locations() {
-            records.push(EntityRecord {
+            records.push(RowRecord {
                 schema_key: ROW_SCHEMA_KEY.to_owned(),
-                entity_pk: vec![self.row_id(location)],
+                row_pk: vec![self.row_id(location)],
                 snapshot: self.row_snapshot(location)?,
             });
         }
@@ -2705,28 +2702,25 @@ impl Document {
 
 /// Applies a transition batch with the same last-write-wins ordering as the
 /// sequential remove-and-append implementation, without rescanning the full
-/// document for every changed entity.
-fn apply_entity_changes(
-    mut records: Vec<EntityRecord>,
-    changes: &[EntityChange],
-) -> Vec<EntityRecord> {
+/// document for every changed row.
+fn apply_row_changes(mut records: Vec<RowRecord>, changes: &[RowChange]) -> Vec<RowRecord> {
     let mut last_change_by_key = HashMap::<(&str, &[String]), usize>::with_capacity(changes.len());
     for (index, change) in changes.iter().enumerate() {
         last_change_by_key.insert(
-            (change.schema_key.as_str(), change.entity_pk.as_slice()),
+            (change.schema_key.as_str(), change.row_pk.as_slice()),
             index,
         );
     }
     records.retain(|record| {
-        !last_change_by_key.contains_key(&(record.schema_key.as_str(), record.entity_pk.as_slice()))
+        !last_change_by_key.contains_key(&(record.schema_key.as_str(), record.row_pk.as_slice()))
     });
     records.extend(changes.iter().enumerate().filter_map(|(index, change)| {
-        (last_change_by_key.get(&(change.schema_key.as_str(), change.entity_pk.as_slice()))
+        (last_change_by_key.get(&(change.schema_key.as_str(), change.row_pk.as_slice()))
             == Some(&index))
         .then(|| {
-            change.snapshot.as_ref().map(|snapshot| EntityRecord {
+            change.snapshot.as_ref().map(|snapshot| RowRecord {
                 schema_key: change.schema_key.clone(),
-                entity_pk: change.entity_pk.clone(),
+                row_pk: change.row_pk.clone(),
                 snapshot: snapshot.clone(),
             })
         })
@@ -2790,10 +2784,10 @@ impl ColdInitialImport {
         })
     }
 
-    pub fn table_change(&self) -> EntityChange {
-        EntityChange::upsert(
+    pub fn table_change(&self) -> RowChange {
+        RowChange::upsert(
             TABLE_SCHEMA_KEY,
-            ROOT_ENTITY_PK.to_owned(),
+            ROOT_ROW_PK.to_owned(),
             table_snapshot(self.dialect),
         )
     }
@@ -2832,7 +2826,7 @@ impl ColdInitialImport {
         output
     }
 
-    pub fn next_entity_snapshot(&mut self, id: &str) -> Result<Option<(u32, Vec<u8>)>, String> {
+    pub fn next_row_snapshot(&mut self, id: &str) -> Result<Option<(u32, Vec<u8>)>, String> {
         let Some(row) = self.rows.get(self.next_row).copied() else {
             return Ok(None);
         };
@@ -3050,7 +3044,7 @@ impl ArenaRowIndex {
         Ok((ordinal, u64::from(start), end))
     }
 
-    pub fn row_change(&self, ordinal: u32, row_bytes: Vec<u8>) -> Result<EntityChange, String> {
+    pub fn row_change(&self, ordinal: u32, row_bytes: Vec<u8>) -> Result<RowChange, String> {
         let mut rows = scan_rows(&row_bytes, 0, row_bytes.len(), self.dialect)?;
         if rows.len() != 1 {
             return Err("CSV arena successor must contain exactly one row".to_owned());
@@ -3076,7 +3070,7 @@ impl ArenaRowIndex {
         id_bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
         let id = uuid::Uuid::from_bytes(id_bytes).to_string();
         let order_key = format!("{:016x}", row.order_rank);
-        Ok(EntityChange::upsert(
+        Ok(RowChange::upsert(
             ROW_SCHEMA_KEY,
             id.clone(),
             row_snapshot_bytes(&blob, chunk, row, &id, &order_key, self.dialect)?,
@@ -3109,7 +3103,7 @@ fn row_draft_from_rendered(
 ) -> Result<RowDraft, String> {
     let mut drafts = scan_rows(rendered, 0, rendered.len(), dialect)?;
     if drafts.len() != 1 {
-        return Err("rendered CSV entity must contain exactly one row".to_owned());
+        return Err("rendered CSV row must contain exactly one row".to_owned());
     }
     let mut draft = drafts.remove(0);
     draft.start = draft
@@ -3453,20 +3447,20 @@ fn scan_rows(
 #[cfg(test)]
 mod cold_scan_tests {
     use super::{
-        ChangeEffect, ColdInitialImport, Dialect, Document, EntityChange, EntityRecord,
-        IdNamespace, ROOT_ENTITY_PK, ROW_SCHEMA_KEY, RowLayout, RowSnapshot, TABLE_SCHEMA_KEY,
-        apply_entity_changes, canonical_row_snapshot, scan_cold_rows, scan_rows, table_snapshot,
+        ChangeEffect, ColdInitialImport, Dialect, Document, IdNamespace, ROOT_ROW_PK,
+        ROW_SCHEMA_KEY, RowChange, RowLayout, RowRecord, RowSnapshot, TABLE_SCHEMA_KEY,
+        apply_row_changes, canonical_row_snapshot, scan_cold_rows, scan_rows, table_snapshot,
     };
 
     fn row_id(ordinal: usize) -> String {
         IdNamespace::from_namespace_bytes([0x5a; 12]).encode(ordinal as u64)
     }
 
-    fn row_record(ordinal: usize, value: &str) -> EntityRecord {
+    fn row_record(ordinal: usize, value: &str) -> RowRecord {
         let id = row_id(ordinal);
-        EntityRecord {
+        RowRecord {
             schema_key: ROW_SCHEMA_KEY.to_owned(),
-            entity_pk: vec![id.clone()],
+            row_pk: vec![id.clone()],
             snapshot: canonical_row_snapshot(&RowSnapshot {
                 id,
                 order_key: format!("{:016x}", ordinal * 2 + 1),
@@ -3477,43 +3471,43 @@ mod cold_scan_tests {
         }
     }
 
-    fn table_record() -> EntityRecord {
-        EntityRecord {
+    fn table_record() -> RowRecord {
+        RowRecord {
             schema_key: TABLE_SCHEMA_KEY.to_owned(),
-            entity_pk: vec![ROOT_ENTITY_PK.to_owned()],
+            row_pk: vec![ROOT_ROW_PK.to_owned()],
             snapshot: table_snapshot(Dialect::for_path(Some("/fixture.csv"))),
         }
     }
 
-    fn upsert(record: &EntityRecord) -> EntityChange {
-        EntityChange {
+    fn upsert(record: &RowRecord) -> RowChange {
+        RowChange {
             schema_key: record.schema_key.clone(),
-            entity_pk: record.entity_pk.clone(),
+            row_pk: record.row_pk.clone(),
             snapshot: Some(record.snapshot.clone()),
             effect: ChangeEffect::Content,
         }
     }
 
-    fn delete(record: &EntityRecord) -> EntityChange {
-        EntityChange {
+    fn delete(record: &RowRecord) -> RowChange {
+        RowChange {
             schema_key: record.schema_key.clone(),
-            entity_pk: record.entity_pk.clone(),
+            row_pk: record.row_pk.clone(),
             snapshot: None,
             effect: ChangeEffect::Content,
         }
     }
 
-    fn apply_entity_changes_reference(
-        mut records: Vec<EntityRecord>,
-        changes: &[EntityChange],
-    ) -> Vec<EntityRecord> {
+    fn apply_row_changes_reference(
+        mut records: Vec<RowRecord>,
+        changes: &[RowChange],
+    ) -> Vec<RowRecord> {
         for change in changes {
-            let key = (&change.schema_key, &change.entity_pk);
-            records.retain(|record| (&record.schema_key, &record.entity_pk) != key);
+            let key = (&change.schema_key, &change.row_pk);
+            records.retain(|record| (&record.schema_key, &record.row_pk) != key);
             if let Some(snapshot) = &change.snapshot {
-                records.push(EntityRecord {
+                records.push(RowRecord {
                     schema_key: change.schema_key.clone(),
-                    entity_pk: change.entity_pk.clone(),
+                    row_pk: change.row_pk.clone(),
                     snapshot: snapshot.clone(),
                 });
             }
@@ -3522,7 +3516,7 @@ mod cold_scan_tests {
     }
 
     #[test]
-    fn indexed_entity_changes_match_add_update_delete_reference_matrix() {
+    fn indexed_row_changes_match_add_update_delete_reference_matrix() {
         let initial = vec![
             table_record(),
             row_record(0, "old-a"),
@@ -3540,14 +3534,14 @@ mod cold_scan_tests {
 
         for changes in cases {
             assert_eq!(
-                apply_entity_changes(initial.clone(), &changes),
-                apply_entity_changes_reference(initial.clone(), &changes)
+                apply_row_changes(initial.clone(), &changes),
+                apply_row_changes_reference(initial.clone(), &changes)
             );
         }
     }
 
     #[test]
-    fn indexed_entity_changes_preserve_duplicate_last_occurrence_order() {
+    fn indexed_row_changes_preserve_duplicate_last_occurrence_order() {
         let initial = vec![
             table_record(),
             row_record(0, "old-a"),
@@ -3564,20 +3558,20 @@ mod cold_scan_tests {
             upsert(&last_b),
         ];
 
-        let result = apply_entity_changes(initial.clone(), &changes);
-        assert_eq!(result, apply_entity_changes_reference(initial, &changes));
+        let result = apply_row_changes(initial.clone(), &changes);
+        assert_eq!(result, apply_row_changes_reference(initial, &changes));
         assert_eq!(
             result
                 .iter()
                 .skip(1)
-                .map(|record| record.entity_pk[0].clone())
+                .map(|record| record.row_pk[0].clone())
                 .collect::<Vec<_>>(),
             vec![row_id(2), row_id(3), row_id(1)]
         );
     }
 
     #[test]
-    fn indexed_entity_changes_preserve_1500_conflict_outputs_and_render_parity() {
+    fn indexed_row_changes_preserve_1500_conflict_outputs_and_render_parity() {
         const CONFLICTS: usize = 1_500;
         let mut initial = Vec::with_capacity(CONFLICTS + 1);
         initial.push(table_record());
@@ -3586,24 +3580,24 @@ mod cold_scan_tests {
             .map(|ordinal| upsert(&row_record(ordinal, "after")))
             .collect::<Vec<_>>();
 
-        let indexed = apply_entity_changes(initial.clone(), &changes);
-        let reference = apply_entity_changes_reference(initial, &changes);
+        let indexed = apply_row_changes(initial.clone(), &changes);
+        let reference = apply_row_changes_reference(initial, &changes);
         assert_eq!(indexed, reference);
         assert_eq!(indexed.len(), CONFLICTS + 1);
         assert_eq!(
             indexed
                 .iter()
                 .skip(1)
-                .map(|record| record.entity_pk[0].as_str())
+                .map(|record| record.row_pk[0].as_str())
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             CONFLICTS
         );
 
         let (indexed_document, indexed_edit) =
-            Document::open_entities(indexed).expect("indexed render");
+            Document::open_rows(indexed).expect("indexed render");
         let (reference_document, reference_edit) =
-            Document::open_entities(reference).expect("reference render");
+            Document::open_rows(reference).expect("reference render");
         assert_eq!(indexed_document.bytes(), reference_document.bytes());
         assert_eq!(indexed_edit, reference_edit);
         assert_eq!(indexed_document.row_count(), CONFLICTS);
@@ -3640,8 +3634,8 @@ mod cold_scan_tests {
         let mut import = ColdInitialImport::open(bytes, Some("/fixture.csv")).expect("cold import");
         let mut rows = 0u32;
         while let Some((local_ref, _)) = import
-            .next_entity_snapshot("019a0000-0000-7000-8000-000000000001")
-            .expect("entity snapshot")
+            .next_row_snapshot("019a0000-0000-7000-8000-000000000001")
+            .expect("row snapshot")
         {
             assert_eq!(local_ref, rows);
             rows += 1;
@@ -4318,12 +4312,12 @@ fn slice_chunk(
     })
 }
 
-fn changed_entities(
+fn changed_rows(
     before: &Document,
     after: &Document,
     old_locations: &[RowLocation],
     new_drafts: &[RowDraft],
-) -> Result<Vec<EntityChange>, String> {
+) -> Result<Vec<RowChange>, String> {
     let mut old_by_slot = HashMap::new();
     for &location in old_locations {
         let (_, row) = before.0.index.row(location);
@@ -4337,10 +4331,7 @@ fn changed_entities(
     let mut changes = Vec::new();
     for (&slot, &location) in &old_by_slot {
         if !new_slots.contains_key(&slot) {
-            changes.push(EntityChange::delete(
-                ROW_SCHEMA_KEY,
-                before.row_id(location),
-            ));
+            changes.push(RowChange::delete(ROW_SCHEMA_KEY, before.row_id(location)));
         }
     }
     for (&slot, draft) in &new_slots {
@@ -4368,7 +4359,7 @@ fn changed_entities(
             Some(ChangeEffect::Content)
         };
         if let Some(effect) = effect {
-            changes.push(EntityChange::upsert_with_effect(
+            changes.push(RowChange::upsert_with_effect(
                 ROW_SCHEMA_KEY,
                 after.row_id(location),
                 new_snapshot,
@@ -4377,16 +4368,16 @@ fn changed_entities(
         }
     }
     if before.0.dialect != after.0.dialect {
-        changes.push(EntityChange::upsert(
+        changes.push(RowChange::upsert(
             TABLE_SCHEMA_KEY,
-            ROOT_ENTITY_PK.to_owned(),
+            ROOT_ROW_PK.to_owned(),
             table_snapshot(after.0.dialect),
         ));
     }
     changes.sort_by(|left, right| {
         left.schema_key
             .cmp(&right.schema_key)
-            .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+            .then_with(|| left.row_pk.cmp(&right.row_pk))
     });
     Ok(changes)
 }
@@ -4584,7 +4575,7 @@ fn parse_table_snapshot(bytes: &[u8]) -> Result<Dialect, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "CSV table snapshot must be an object".to_owned())?;
-    if object.get("id").and_then(Value::as_str) != Some(ROOT_ENTITY_PK) {
+    if object.get("id").and_then(Value::as_str) != Some(ROOT_ROW_PK) {
         return Err("CSV table id must be root".to_owned());
     }
     if object.len() != 2 || !object.contains_key("dialect") {
@@ -4629,7 +4620,7 @@ fn parse_table_snapshot(bytes: &[u8]) -> Result<Dialect, String> {
         quote,
         terminator,
     }
-    .validate_entity()
+    .validate_row()
 }
 
 #[derive(Clone, Debug)]
@@ -4640,21 +4631,21 @@ pub struct InitialChanges {
 }
 
 impl Iterator for InitialChanges {
-    type Item = Result<EntityChange, String>;
+    type Item = Result<RowChange, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.table_pending {
             self.table_pending = false;
-            return Some(Ok(EntityChange::upsert(
+            return Some(Ok(RowChange::upsert(
                 TABLE_SCHEMA_KEY,
-                ROOT_ENTITY_PK.to_owned(),
+                ROOT_ROW_PK.to_owned(),
                 table_snapshot(self.document.0.dialect),
             )));
         }
         let location = self.document.0.index.ordinal_location(self.row)?;
         self.row += 1;
         Some(self.document.row_snapshot(location).map(|snapshot| {
-            EntityChange::upsert(ROW_SCHEMA_KEY, self.document.row_id(location), snapshot)
+            RowChange::upsert(ROW_SCHEMA_KEY, self.document.row_id(location), snapshot)
         }))
     }
 }

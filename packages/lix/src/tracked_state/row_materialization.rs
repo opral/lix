@@ -10,14 +10,14 @@ use crate::changelog::{
     materialize_known_change_payloads,
 };
 use crate::common::{LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
 
 #[derive(Debug)]
 struct MaterializedTrackedStateDescriptor {
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: u32,
     file_id: Option<u32>,
     snapshot_content: Option<SharedStr>,
@@ -85,7 +85,7 @@ impl MaterializedTrackedStateBatch {
             })?;
             builder.push(
                 TrackedStateKey {
-                    entity_pk: row.entity_pk,
+                    row_pk: row.row_pk,
                     schema_key: row.schema_key,
                     file_id: row.file_id,
                 },
@@ -143,8 +143,8 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
         &self.batch.rows[self.index]
     }
 
-    pub(crate) fn entity_pk(self) -> &'a EntityPk {
-        &self.descriptor().entity_pk
+    pub(crate) fn row_pk(self) -> &'a RowPk {
+        &self.descriptor().row_pk
     }
 
     pub(crate) fn schema_key(self) -> &'a str {
@@ -198,7 +198,7 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
     /// Converts into the legacy DTO only at a terminal compatibility boundary.
     pub(crate) fn to_owned(self) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_pk: self.entity_pk().clone(),
+            row_pk: self.row_pk().clone(),
             schema_key: self.schema_key().to_owned(),
             file_id: self.file_id().map(str::to_owned),
             snapshot_content: self.snapshot_content().cloned(),
@@ -332,7 +332,7 @@ impl MaterializedTrackedStateBatchBuilder {
         let schema_key = self.intern_owned(key.schema_key);
         let file_id = key.file_id.map(|file_id| self.intern_owned(file_id));
         self.rows.push(MaterializedTrackedStateDescriptor {
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
             schema_key,
             file_id,
             snapshot_content,
@@ -355,7 +355,7 @@ impl MaterializedTrackedStateBatchBuilder {
         let schema_key = self.intern_str(key.schema_key);
         let file_id = key.file_id.map(|file_id| self.intern_str(file_id));
         self.rows.push(MaterializedTrackedStateDescriptor {
-            entity_pk: key.entity_pk.clone(),
+            row_pk: key.row_pk.clone(),
             schema_key,
             file_id,
             snapshot_content,
@@ -394,7 +394,7 @@ where
             TrackedStateKey {
                 schema_key: key.schema_key.to_owned(),
                 file_id: key.file_id.map(str::to_owned),
-                entity_pk: key.entity_pk.clone(),
+                row_pk: key.row_pk.clone(),
             },
             value.change_id,
             value.updated_at,
@@ -423,7 +423,7 @@ where
             if record.change_id != change_id
                 || record.schema_key != key.schema_key
                 || record.file_id != key.file_id
-                || record.entity_pk != key.entity_pk
+                || record.row_pk != key.row_pk
                 || record.snapshot.is_none()
                 || record.created_at != updated_at
             {
@@ -477,7 +477,7 @@ where
                 TrackedStateKeyRef {
                     schema_key: &key.schema_key,
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 },
                 value,
             )
@@ -495,7 +495,7 @@ where
                 TrackedStateKeyRef {
                     schema_key: key.schema_key.as_str(),
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 },
                 value.change_id,
             )?
@@ -572,7 +572,7 @@ fn shared_payload_fields(
     })?;
     if let Some(identity) = payload.identity.as_ref()
         && (identity.schema_key != key.schema_key
-            || identity.entity_pk != *key.entity_pk
+            || identity.row_pk != *key.row_pk
             || identity.file_id.as_deref() != key.file_id)
     {
         return Err(LixError::new(
@@ -589,43 +589,43 @@ fn shared_payload_fields(
 mod tests {
     use super::*;
     use crate::changelog::MaterializedChangeIdentity;
-    use crate::entity_pk::{EntityPk, EntityPkComponent};
+    use crate::row_pk::{RowPk, RowPkComponent};
 
-    fn integer_entity_pk(value: i64) -> EntityPk {
-        EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Integer(value)])
-            .expect("one integer is a valid entity primary key")
+    fn integer_row_pk(value: i64) -> RowPk {
+        RowPk::from_components(smallvec::smallvec![RowPkComponent::Integer(value)])
+            .expect("one integer is a valid row primary key")
     }
 
-    /// Which `EntityPk` shapes survive the JSON identity round trip that the
+    /// Which `RowPk` shapes survive the JSON identity round trip that the
     /// **columnar** commit-delta route uses to match a row.
     ///
-    /// `materialize_index_payloads` re-checks `schema_key`/`file_id`/`entity_pk`
+    /// `materialize_index_payloads` re-checks `schema_key`/`file_id`/`row_pk`
     /// on every fetched row. On the packed route that check is
     /// `decode(encode(K)) == K`, guaranteed by the byte-equality assert in
     /// `find_commit_delta_entry_index`. The columnar route
     /// (`load_columnar_owned_entries`) has no such assert: it matches on
     /// `as_json_array_text` and rebuilds the identity with
     /// `from_json_array_text`, and `untyped_component_from_json_value` maps
-    /// every JSON string back to `EntityPkComponent::String`.
+    /// every JSON string back to `RowPkComponent::String`.
     ///
     /// So `Uuid` and `Bytes` components do **not** survive, and on a route that
     /// admitted them the re-check would reject a correctly-fetched row. This
     /// test pins exactly where that boundary is; the companion test below pins
     /// the gate that keeps those shapes off the columnar route entirely.
     #[test]
-    fn only_string_and_integer_entity_pk_components_survive_the_json_identity_round_trip() {
-        fn round_trips(entity_pk: &EntityPk) -> bool {
-            let text = entity_pk
+    fn only_string_and_integer_row_pk_components_survive_the_json_identity_round_trip() {
+        fn round_trips(row_pk: &RowPk) -> bool {
+            let text = row_pk
                 .as_json_array_text()
                 .expect("identity should encode as JSON");
             let decoded =
-                EntityPk::from_json_array_text(&text).expect("identity should decode from JSON");
-            decoded == *entity_pk
+                RowPk::from_json_array_text(&text).expect("identity should decode from JSON");
+            decoded == *row_pk
         }
 
         let string_pk =
-            EntityPk::from_components(smallvec::smallvec![EntityPkComponent::String("row-0".into())])
-                .expect("one string is a valid entity primary key");
+            RowPk::from_components(smallvec::smallvec![RowPkComponent::String("row-0".into())])
+                .expect("one string is a valid row primary key");
         assert!(
             round_trips(&string_pk),
             "a single-string identity must survive; it is the only shape the columnar \
@@ -633,21 +633,21 @@ mod tests {
         );
 
         assert!(
-            round_trips(&integer_entity_pk(42)),
+            round_trips(&integer_row_pk(42)),
             "an integer identity survives as a JSON number"
         );
 
-        let composite = EntityPk::from_components(smallvec::smallvec![
-            EntityPkComponent::String("left".into()),
-            EntityPkComponent::String("right".into())
+        let composite = RowPk::from_components(smallvec::smallvec![
+            RowPkComponent::String("left".into()),
+            RowPkComponent::String("right".into())
         ])
-        .expect("two strings are a valid entity primary key");
+        .expect("two strings are a valid row primary key");
         assert!(round_trips(&composite), "composite strings survive");
 
-        let uuid_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Uuid(
+        let uuid_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Uuid(
             *uuid::Uuid::from_u128(7).as_bytes()
         )])
-        .expect("one uuid is a valid entity primary key");
+        .expect("one uuid is a valid row primary key");
         assert!(
             !round_trips(&uuid_pk),
             "a uuid identity must NOT survive the JSON round trip -- it returns as a \
@@ -655,10 +655,10 @@ mod tests {
              re-check stops being load-bearing and this test should be re-read, not deleted."
         );
 
-        let bytes_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Bytes(
+        let bytes_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Bytes(
             bytes::Bytes::from_static(&[1, 2, 3])
         )])
-        .expect("one byte string is a valid entity primary key");
+        .expect("one byte string is a valid row primary key");
         assert!(
             !round_trips(&bytes_pk),
             "a bytes identity must NOT survive the JSON round trip -- it returns as a \
@@ -670,15 +670,15 @@ mod tests {
     ///
     /// `try_stage_lossless_columnar_mutations` refuses to stage a commit
     /// columnar unless **every** row's identity passes
-    /// `EntityPk::as_single_string()`, which accepts exactly one
-    /// `EntityPkComponent::String`. That is the same predicate, asserted
+    /// `RowPk::as_single_string()`, which accepts exactly one
+    /// `RowPkComponent::String`. That is the same predicate, asserted
     /// directly: the shapes the JSON round trip loses are precisely the shapes
     /// that can never reach the columnar route.
     #[test]
     fn the_columnar_staging_gate_rejects_every_identity_shape_the_json_round_trip_loses() {
         let string_pk =
-            EntityPk::from_components(smallvec::smallvec![EntityPkComponent::String("row-0".into())])
-                .expect("one string is a valid entity primary key");
+            RowPk::from_components(smallvec::smallvec![RowPkComponent::String("row-0".into())])
+                .expect("one string is a valid row primary key");
         assert_eq!(
             string_pk
                 .as_single_string()
@@ -686,34 +686,34 @@ mod tests {
             "row-0"
         );
 
-        let uuid_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Uuid(
+        let uuid_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Uuid(
             *uuid::Uuid::from_u128(7).as_bytes()
         )])
-        .expect("one uuid is a valid entity primary key");
+        .expect("one uuid is a valid row primary key");
         assert!(
             uuid_pk.as_single_string().is_err(),
             "a uuid identity must be refused by the columnar staging gate"
         );
 
-        let bytes_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Bytes(
+        let bytes_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Bytes(
             bytes::Bytes::from_static(&[1, 2, 3])
         )])
-        .expect("one byte string is a valid entity primary key");
+        .expect("one byte string is a valid row primary key");
         assert!(
             bytes_pk.as_single_string().is_err(),
             "a bytes identity must be refused by the columnar staging gate"
         );
 
         assert!(
-            integer_entity_pk(42).as_single_string().is_err(),
+            integer_row_pk(42).as_single_string().is_err(),
             "an integer identity is refused too, so the columnar route never sees one"
         );
 
-        let composite = EntityPk::from_components(smallvec::smallvec![
-            EntityPkComponent::String("left".into()),
-            EntityPkComponent::String("right".into())
+        let composite = RowPk::from_components(smallvec::smallvec![
+            RowPkComponent::String("left".into()),
+            RowPkComponent::String("right".into())
         ])
-        .expect("two strings are a valid entity primary key");
+        .expect("two strings are a valid row primary key");
         assert!(
             composite.as_single_string().is_err(),
             "a composite identity is refused"
@@ -741,7 +741,7 @@ mod tests {
     /// indistinguishable from "the test never built a columnar commit".
     ///
     /// Arm B declares the same schema with `"format": "uuid"` on the primary
-    /// key, which makes the identity an `EntityPkComponent::Uuid` — the shape
+    /// key, which makes the identity an `RowPkComponent::Uuid` — the shape
     /// that does not survive the JSON round trip. It must read back correctly
     /// **and** never take the columnar route. If a future change widens the
     /// staging gate, arm B's rows would be fetched through a JSON identity
@@ -756,7 +756,7 @@ mod tests {
 
         // The dense columnar lane is only taken by a *certified parameter
         // batch* of at least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows;
-        // below that `certified_entity_insert_parameter_batch` falls to the raw
+        // below that `certified_row_insert_parameter_batch` falls to the raw
         // lane, which carries no encoded row groups, and
         // `try_stage_lossless_columnar_mutations` then sees no dense write set.
         // A smaller fixture silently produces no columnar commit at all, which
@@ -809,7 +809,7 @@ mod tests {
                         } else {
                             format!("row-{index:07}")
                         }),
-                        // Distinct per row: `derive_entity_row_groups` refuses
+                        // Distinct per row: `derive_row_groups` refuses
                         // the columnar layout when a non-key string column has
                         // 2..=64 distinct values, so a flag column here would
                         // also silently defeat the fixture.
@@ -893,13 +893,13 @@ mod tests {
         let metadata = SharedStr::from_static(r#"{"impact":"format"}"#);
         let mut builder = MaterializedTrackedStateBatchBuilder::with_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
-            let entity_pk =
-                integer_entity_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk =
+                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             builder.push_ref(
                 TrackedStateKeyRef {
                     schema_key: "shared_schema",
                     file_id: Some("shared_file"),
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                 },
                 index_value(index),
                 Some(snapshot.clone()),
@@ -952,14 +952,14 @@ mod tests {
         let mut builder =
             MaterializedTrackedStateBatchBuilder::with_capacities(ROW_COUNT, ROW_COUNT * 2, 0);
         for index in 0..ROW_COUNT {
-            let entity_pk =
-                integer_entity_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk =
+                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             let file_id = format!("file-{index:05}");
             builder.push_ref(
                 TrackedStateKeyRef {
                     schema_key: "shared_schema",
                     file_id: Some(file_id.as_str()),
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                 },
                 index_value(index),
                 None,
@@ -1004,7 +1004,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "message".to_owned(),
                 file_id: Some("file.md".to_owned()),
-                entity_pk: integer_entity_pk(7),
+                row_pk: integer_row_pk(7),
             },
             index_value(0),
             Some(SharedStr::from_static(r#"{"id":7}"#)),
@@ -1018,7 +1018,7 @@ mod tests {
         let first = exact.row(0).expect("first duplicate");
         assert!(exact.row(1).is_none());
         let duplicate = exact.row(2).expect("second duplicate");
-        assert_eq!(first.entity_pk(), duplicate.entity_pk());
+        assert_eq!(first.row_pk(), duplicate.row_pk());
         assert_eq!(first.schema_key().as_ptr(), duplicate.schema_key().as_ptr());
         assert!(
             first
@@ -1040,13 +1040,13 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: schema_key.to_owned(),
             file_id: Some("file.md".to_owned()),
-            entity_pk: EntityPk::single("entity"),
+            row_pk: RowPk::single("row"),
         };
-        let snapshot = SharedStr::from(r#"{"id":"entity"}"#.to_owned());
+        let snapshot = SharedStr::from(r#"{"id":"row"}"#.to_owned());
         let payload = MaterializedChangePayload {
             identity: Some(MaterializedChangeIdentity {
                 schema_key: "message".to_owned(),
-                entity_pk: EntityPk::single("entity"),
+                row_pk: RowPk::single("row"),
                 file_id: Some("file.md".to_owned()),
             }),
             snapshot_content: Some(snapshot.clone()),
@@ -1067,7 +1067,7 @@ mod tests {
         let key_ref = TrackedStateKeyRef {
             schema_key: key.schema_key.as_str(),
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         };
         let first = shared_payload_fields(&payloads, key_ref, change_id)
             .expect("first payload use")
@@ -1091,7 +1091,7 @@ mod tests {
             TrackedStateKeyRef {
                 schema_key: key.schema_key.as_str(),
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             },
             change_id,
         )

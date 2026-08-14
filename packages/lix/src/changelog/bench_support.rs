@@ -11,7 +11,7 @@ use super::types::{
     CommitRecord, RebuildIndexStats,
 };
 use crate::LixError;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{StorageAdapter, StorageReadOptions, StorageWriteSetStats};
 
@@ -504,13 +504,13 @@ fn direct_append_with_shape(
         for _ in 0..take {
             let change_id = format!("{name}-change-{next_change}");
             let typed_change_id = ChangeId::for_test_label(&change_id);
-            let entity_pk = EntityPk::single(format!("entity-{next_change}"));
+            let row_pk = RowPk::single(format!("row-{next_change}"));
             append.changes.push(ChangeRecord {
                 format_version: 1,
                 change_id: typed_change_id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 schema_key: "message".to_string(),
-                entity_pk: entity_pk.clone(),
+                row_pk: row_pk.clone(),
                 file_id: None,
                 snapshot: crate::json_store::JsonSlot::from_json(&format!(
                     "{{\"value\":{next_change}}}"

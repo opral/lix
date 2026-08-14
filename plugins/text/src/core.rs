@@ -36,7 +36,7 @@ struct DocumentInner {
     lines: Vec<Arc<Line>>,
 }
 
-/// A durable line entity. `bytes` includes its trailing LF when present.
+/// A durable line row. `bytes` includes its trailing LF when present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Line {
     id: String,
@@ -83,7 +83,7 @@ pub(crate) struct AllUpserts {
 }
 
 impl Iterator for AllUpserts {
-    type Item = Result<lix::EntityChange, String>;
+    type Item = Result<lix::RowChange, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let line = self.document.lines().get(self.index)?;
@@ -178,24 +178,24 @@ impl Document {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_entities(
-        records: impl IntoIterator<Item = lix::EntityRecord>,
+    pub(crate) fn open_rows(
+        records: impl IntoIterator<Item = lix::RowRecord>,
     ) -> Result<Self, String> {
-        Self::open_entities_fallible(records.into_iter().map(Ok))
+        Self::open_rows_fallible(records.into_iter().map(Ok))
     }
 
-    pub(crate) fn open_entities_fallible(
-        records: impl IntoIterator<Item = Result<lix::EntityRecord, String>>,
+    pub(crate) fn open_rows_fallible(
+        records: impl IntoIterator<Item = Result<lix::RowRecord, String>>,
     ) -> Result<Self, String> {
         let mut lines = Vec::new();
         for record in records {
             let record = record?;
-            validate_entity_key(&record.schema_key, &record.entity_pk)?;
+            validate_row_key(&record.schema_key, &record.row_pk)?;
             let line = Line::from_snapshot(&record.snapshot)?;
-            if record.entity_pk[0] != line.id {
+            if record.row_pk[0] != line.id {
                 return Err(format!(
-                    "line entity primary key '{}' does not match snapshot id '{}'",
-                    record.entity_pk[0], line.id
+                    "line row primary key '{}' does not match snapshot id '{}'",
+                    record.row_pk[0], line.id
                 ));
             }
             lines.push(line);
@@ -207,7 +207,7 @@ impl Document {
         &self,
         splices: &[FileEdit],
         mut id_for_ordinal: impl FnMut(u64) -> String,
-    ) -> Result<(Self, Vec<lix::EntityChange>), String> {
+    ) -> Result<(Self, Vec<lix::RowChange>), String> {
         let bytes = Arc::new(apply_splices(self.bytes(), splices)?);
         validate_text(&bytes)?;
         let chunks = split_lines(Arc::clone(&bytes));
@@ -242,7 +242,7 @@ impl Document {
             old_used[old_index] = true;
         }
 
-        // Exact byte matches in the changed middle preserve their entity
+        // Exact byte matches in the changed middle preserve their row
         // identity even across a reorder. Remaining old/new positions are
         // paired in order, preserving an edited line's ID without inventing a
         // parser-specific identity rule for arbitrary text.
@@ -344,9 +344,9 @@ impl Document {
         Ok((document, changes))
     }
 
-    pub(crate) fn entities_changed(
+    pub(crate) fn rows_changed(
         &self,
-        changes: impl IntoIterator<Item = lix::EntityChange>,
+        changes: impl IntoIterator<Item = lix::RowChange>,
     ) -> Result<(Self, Vec<lix::ByteEdit>), String> {
         let mut lines = self
             .lines()
@@ -355,14 +355,14 @@ impl Document {
             .collect::<BTreeMap<_, _>>();
 
         for change in changes {
-            validate_entity_key(&change.schema_key, &change.entity_pk)?;
-            let id = &change.entity_pk[0];
+            validate_row_key(&change.schema_key, &change.row_pk)?;
+            let id = &change.row_pk[0];
             match change.snapshot {
                 Some(snapshot) => {
                     let line = Line::from_snapshot(&snapshot)?;
                     if line.id != *id {
                         return Err(format!(
-                            "line entity primary key '{id}' does not match snapshot id '{}'",
+                            "line row primary key '{id}' does not match snapshot id '{}'",
                             line.id
                         ));
                     }
@@ -370,7 +370,7 @@ impl Document {
                 }
                 None => {
                     if lines.remove(id).is_none() {
-                        return Err(format!("cannot delete unknown line entity '{id}'"));
+                        return Err(format!("cannot delete unknown line row '{id}'"));
                     }
                 }
             }
@@ -398,7 +398,7 @@ impl Document {
             }
             validate_line_bytes(line.bytes.as_slice())?;
             if !ids.insert(line.id.clone()) {
-                return Err(format!("duplicate line entity ID '{}'", line.id));
+                return Err(format!("duplicate line row ID '{}'", line.id));
             }
             if !order_keys.insert(line.order_key.clone()) {
                 return Err(format!(
@@ -428,7 +428,7 @@ impl Document {
         })))
     }
 
-    fn changes_to(&self, after: &Self) -> Result<Vec<lix::EntityChange>, String> {
+    fn changes_to(&self, after: &Self) -> Result<Vec<lix::RowChange>, String> {
         let mut before = self
             .lines()
             .iter()
@@ -450,7 +450,7 @@ impl Document {
                 (Some((before_id, before_line)), Some((after_id, after_line))) => {
                     match before_id.cmp(after_id) {
                         std::cmp::Ordering::Less => {
-                            changes.push(lix::EntityChange::delete(
+                            changes.push(lix::RowChange::delete(
                                 LINE_SCHEMA_KEY,
                                 vec![(*before_id).to_owned()],
                             ));
@@ -470,7 +470,7 @@ impl Document {
                     }
                 }
                 (Some((before_id, _)), None) => {
-                    changes.push(lix::EntityChange::delete(
+                    changes.push(lix::RowChange::delete(
                         LINE_SCHEMA_KEY,
                         vec![(*before_id).to_owned()],
                     ));
@@ -648,8 +648,8 @@ impl Line {
         })
     }
 
-    fn upsert_change(&self) -> Result<lix::EntityChange, String> {
-        Ok(lix::EntityChange::upsert(
+    fn upsert_change(&self) -> Result<lix::RowChange, String> {
+        Ok(lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
             vec![self.id.clone()],
             self.snapshot_bytes()?,
@@ -684,7 +684,7 @@ fn split_lines(bytes: Arc<Vec<u8>>) -> Vec<LineBytes> {
 
 fn validate_line_bytes(bytes: &[u8]) -> Result<(), String> {
     let Some((_, prefix)) = bytes.split_last() else {
-        return Err("line entities must contain at least one byte".to_owned());
+        return Err("line rows must contain at least one byte".to_owned());
     };
     if prefix.contains(&b'\n') {
         return Err(
@@ -729,17 +729,17 @@ fn render_lines(lines: &[Line]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn validate_entity_key(schema_key: &str, entity_pk: &[String]) -> Result<(), String> {
+fn validate_row_key(schema_key: &str, row_pk: &[String]) -> Result<(), String> {
     if schema_key != LINE_SCHEMA_KEY {
         return Err(format!(
             "Text plugin only accepts schema '{LINE_SCHEMA_KEY}', got '{schema_key}'"
         ));
     }
-    let [id] = entity_pk else {
-        return Err("Text line entities need exactly one primary-key component".to_owned());
+    let [id] = row_pk else {
+        return Err("Text line rows need exactly one primary-key component".to_owned());
     };
     if id.is_empty() {
-        return Err("Text line entity primary key must not be empty".to_owned());
+        return Err("Text line row primary key must not be empty".to_owned());
     }
     Ok(())
 }

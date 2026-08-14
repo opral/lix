@@ -103,7 +103,7 @@ pub(crate) struct TrackedStateDiffRow {
     /// Shared key owner for the entry and both side rows.
     ///
     /// Tree diff decoding yields an owned key once. Keeping it behind the
-    /// typed identity avoids copying schema/file/entity buffers into every
+    /// typed identity avoids copying schema/file/row buffers into every
     /// before/after row and again into merge planning.
     pub(crate) identity: TrackedStateDiffIdentity,
     pub(crate) deleted: bool,
@@ -118,7 +118,7 @@ pub(crate) struct TrackedStateDiffRow {
 /// Production diff decoding moves every decoded key into this column once.
 /// Entry and side-row identities then carry only an `Arc` to the column plus a
 /// compact ordinal; cloning an identity through merge planning never clones a
-/// schema key, file id, entity pk, or per-key heap owner.
+/// schema key, file id, row pk, or per-key heap owner.
 #[derive(Debug)]
 struct TrackedStateDiffIdentityBatch {
     keys: TrackedStateDiffKeyStorage,
@@ -135,7 +135,7 @@ enum TrackedStateDiffKeyStorage {
 /// Dictionary-encoded identity columns for one diff batch.
 ///
 /// Repeated schema and file identifiers live once in their dictionaries.
-/// Every logical key row is one compact ordinal pair plus the typed entity pk.
+/// Every logical key row is one compact ordinal pair plus the typed row pk.
 #[derive(Debug)]
 struct TrackedStateDiffKeyColumns {
     schema_keys: Vec<SharedStr>,
@@ -162,19 +162,19 @@ struct TrackedStateDiffKeyRow {
     /// `u32::MAX` is the null sentinel. Dictionary sizes are checked before
     /// sealing the batch, so it can never alias a valid file-id ordinal.
     file_id_ordinal: u32,
-    entity_pk: crate::entity_pk::EntityPk,
+    row_pk: crate::row_pk::RowPk,
 }
 
 #[derive(Debug)]
 struct TrackedStateDiffKey {
     schema_key: SharedStr,
     file_id: Option<SharedStr>,
-    entity_pk: crate::entity_pk::EntityPk,
+    row_pk: crate::row_pk::RowPk,
 }
 
 /// Typed tree-diff stage shared directly with diff validation/classification.
 ///
-/// Identity metadata is dictionary encoded once, entity keys occupy one typed
+/// Identity metadata is dictionary encoded once, row keys occupy one typed
 /// column, and both root sides are aligned `TrackedStateIndexValue` columns.
 /// No production `TrackedStateTreeDiffEntry` or row-owned key exists between
 /// tree traversal and the final public diff entries.
@@ -434,7 +434,7 @@ fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeS
     filter.include_tombstones = true;
     TrackedStateTreeScanRequest {
         schema_keys: filter.schema_keys,
-        entity_pks: filter.entity_pks,
+        row_pks: filter.row_pks,
         file_ids: filter.file_ids,
         include_tombstones: true,
         limit: None,
@@ -517,7 +517,7 @@ impl TrackedStateTreeDiffBatchBuilder {
         self.rows.push(TrackedStateDiffKeyRow {
             schema_key_ordinal,
             file_id_ordinal,
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
         });
         self.before.push(before);
         self.after.push(after);
@@ -665,7 +665,7 @@ impl TrackedStateTreeDiffBatch {
                     key: TrackedStateKey {
                         schema_key: identities.schema_key(ordinal).to_owned(),
                         file_id: identities.file_id(ordinal).map(str::to_owned),
-                        entity_pk: identities.entity_pk(ordinal).clone(),
+                        row_pk: identities.row_pk(ordinal).clone(),
                     },
                     before,
                     after,
@@ -684,8 +684,8 @@ impl<'a> TrackedStateTreeDiffRowRef<'a> {
         self.identities.file_id(self.ordinal)
     }
 
-    pub(crate) fn entity_pk(self) -> &'a crate::entity_pk::EntityPk {
-        self.identities.entity_pk(self.ordinal)
+    pub(crate) fn row_pk(self) -> &'a crate::row_pk::RowPk {
+        self.identities.row_pk(self.ordinal)
     }
 
     pub(crate) fn change_id(self) -> ChangeId {
@@ -720,7 +720,7 @@ impl TrackedStateDiffIdentityBatch {
             rows.push(TrackedStateDiffKeyRow {
                 schema_key_ordinal,
                 file_id_ordinal,
-                entity_pk: key.entity_pk,
+                row_pk: key.row_pk,
             });
         }
         Arc::new(Self {
@@ -749,7 +749,7 @@ impl TrackedStateDiffIdentityBatch {
             rows.push(TrackedStateDiffKeyRow {
                 schema_key_ordinal,
                 file_id_ordinal,
-                entity_pk: key.entity_pk.clone(),
+                row_pk: key.row_pk.clone(),
             });
         }
         Arc::new(Self {
@@ -766,7 +766,7 @@ impl TrackedStateDiffIdentityBatch {
             keys: TrackedStateDiffKeyStorage::Singleton(TrackedStateDiffKey {
                 schema_key: key.schema_key.into(),
                 file_id: key.file_id.map(Into::into),
-                entity_pk: key.entity_pk,
+                row_pk: key.row_pk,
             }),
         })
     }
@@ -798,13 +798,13 @@ impl TrackedStateDiffIdentityBatch {
         }
     }
 
-    fn entity_pk(&self, ordinal: u32) -> &crate::entity_pk::EntityPk {
+    fn row_pk(&self, ordinal: u32) -> &crate::row_pk::RowPk {
         match &self.keys {
             TrackedStateDiffKeyStorage::Singleton(key) => {
                 debug_assert_eq!(ordinal, 0);
-                &key.entity_pk
+                &key.row_pk
             }
-            TrackedStateDiffKeyStorage::Batch(keys) => &keys.rows[ordinal as usize].entity_pk,
+            TrackedStateDiffKeyStorage::Batch(keys) => &keys.rows[ordinal as usize].row_pk,
         }
     }
 
@@ -922,7 +922,7 @@ impl TrackedStateDiffKeyColumns {
             schema_key: self.schema_keys[row.schema_key_ordinal as usize].clone(),
             file_id: (row.file_id_ordinal != u32::MAX)
                 .then(|| self.file_ids[row.file_id_ordinal as usize].clone()),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
         }
     }
 }
@@ -933,7 +933,7 @@ impl TrackedStateDiffKey {
         TrackedStateKey {
             schema_key: self.schema_key.to_string(),
             file_id: self.file_id.map(|file_id| file_id.to_string()),
-            entity_pk: self.entity_pk,
+            row_pk: self.row_pk,
         }
     }
 }
@@ -976,7 +976,7 @@ impl TrackedStateDiffIdentity {
     /// Seals borrowed keys behind one shared identity owner.
     ///
     /// Callers expose stable key views by ordinal. Schema/file values are
-    /// interned once into batch dictionaries and entity primary keys clone
+    /// interned once into batch dictionaries and row primary keys clone
     /// only their shared descriptors, avoiding a terminal `String` allocation
     /// per discovered key.
     pub(crate) fn from_key_refs<'a>(
@@ -1016,7 +1016,7 @@ impl TrackedStateDiffIdentity {
         TrackedStateKeyRef {
             schema_key: self.schema_key(),
             file_id: self.file_id(),
-            entity_pk: self.entity_pk(),
+            row_pk: self.row_pk(),
         }
     }
 
@@ -1051,8 +1051,8 @@ impl TrackedStateDiffIdentity {
         }
     }
 
-    pub(crate) fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
-        self.batch.entity_pk(self.ordinal)
+    pub(crate) fn row_pk(&self) -> &crate::row_pk::RowPk {
+        self.batch.row_pk(self.ordinal)
     }
 
     #[cfg(test)]
@@ -1062,7 +1062,7 @@ impl TrackedStateDiffIdentity {
             Err(batch) => TrackedStateKey {
                 schema_key: batch.schema_key(self.ordinal).to_owned(),
                 file_id: batch.file_id(self.ordinal).map(str::to_owned),
-                entity_pk: batch.entity_pk(self.ordinal).clone(),
+                row_pk: batch.row_pk(self.ordinal).clone(),
             },
         }
     }
@@ -1109,7 +1109,7 @@ impl fmt::Debug for TrackedStateDiffIdentity {
             .debug_struct("TrackedStateDiffIdentity")
             .field("schema_key", &self.schema_key())
             .field("file_id", &self.file_id())
-            .field("entity_pk", self.entity_pk())
+            .field("row_pk", self.row_pk())
             .finish()
     }
 }
@@ -1118,7 +1118,7 @@ impl PartialEq for TrackedStateDiffIdentity {
     fn eq(&self, other: &Self) -> bool {
         self.schema_key() == other.schema_key()
             && self.file_id() == other.file_id()
-            && self.entity_pk() == other.entity_pk()
+            && self.row_pk() == other.row_pk()
     }
 }
 
@@ -1135,7 +1135,7 @@ impl Ord for TrackedStateDiffIdentity {
         self.schema_key()
             .cmp(other.schema_key())
             .then_with(|| self.file_id().cmp(&other.file_id()))
-            .then_with(|| self.entity_pk().cmp(other.entity_pk()))
+            .then_with(|| self.row_pk().cmp(other.row_pk()))
     }
 }
 
@@ -1143,7 +1143,7 @@ impl Hash for TrackedStateDiffIdentity {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.schema_key().hash(state);
         self.file_id().hash(state);
-        self.entity_pk().hash(state);
+        self.row_pk().hash(state);
     }
 }
 
@@ -1171,8 +1171,8 @@ impl TrackedStateDiffRow {
         self.identity.file_id()
     }
 
-    pub(crate) fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
-        self.identity.entity_pk()
+    pub(crate) fn row_pk(&self) -> &crate::row_pk::RowPk {
+        self.identity.row_pk()
     }
 
     pub(crate) fn index_value(&self) -> TrackedStateIndexValue {
@@ -1240,7 +1240,7 @@ impl TrackedStateDiffEntry {
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterRead, StorageWriteSet};
     use crate::tracked_state::types::{
@@ -1295,7 +1295,7 @@ mod tests {
         let key = || DecodedTrackedStateKeyShared {
             schema_key: SharedStr::from_static("test_schema"),
             file_id: None,
-            entity_pk: EntityPk::single("entity-0"),
+            row_pk: RowPk::single("row-0"),
         };
         let value = |change_id: ChangeId, deleted: bool| TrackedStateIndexValue {
             change_id,
@@ -1366,7 +1366,7 @@ mod tests {
             DecodedTrackedStateKeyShared {
                 schema_key: SharedStr::from_static("test_schema"),
                 file_id: None,
-                entity_pk: EntityPk::single("entity-0"),
+                row_pk: RowPk::single("row-0"),
             },
             Some(TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("live-before"),
@@ -1415,7 +1415,7 @@ mod tests {
                     file_id: Some(SharedStr::from_static(
                         "01920000-0000-7000-8000-0000000000a2",
                     )),
-                    entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                    row_pk: RowPk::single(format!("row-{index:05}")),
                 },
                 None,
                 Some(TrackedStateIndexValue {
@@ -1455,10 +1455,10 @@ mod tests {
             );
             assert_eq!(
                 identity
-                    .entity_pk()
+                    .row_pk()
                     .as_single_string_owned()
                     .expect("single identity"),
-                format!("entity-{index:05}")
+                format!("row-{index:05}")
             );
             if index > 0 {
                 assert!(rows[index - 1].identity < *identity);
@@ -1477,19 +1477,19 @@ mod tests {
 
     #[test]
     fn ten_thousand_borrowed_keys_intern_batch_metadata_once() {
-        let entity_pks = (0..10_000)
-            .map(|index| EntityPk::single(format!("entity-{index:05}")))
+        let row_pks = (0..10_000)
+            .map(|index| RowPk::single(format!("row-{index:05}")))
             .collect::<Vec<_>>();
         let identities =
-            TrackedStateDiffIdentity::from_key_refs(entity_pks.len(), |index| TrackedStateKeyRef {
+            TrackedStateDiffIdentity::from_key_refs(row_pks.len(), |index| TrackedStateKeyRef {
                 schema_key: "shared_schema",
                 file_id: Some("shared_file"),
-                entity_pk: &entity_pks[index],
+                row_pk: &row_pks[index],
             })
             .expect("borrowed identity batch should seal");
 
-        assert_eq!(identities.len(), entity_pks.len());
-        assert_eq!(identities[0].batch_len(), entity_pks.len());
+        assert_eq!(identities.len(), row_pks.len());
+        assert_eq!(identities[0].batch_len(), row_pks.len());
         assert_eq!(identities[0].batch_dictionary_counts(), (1, 1));
         let capacities = identities[0].batch_dictionary_capacities();
         assert!(
@@ -1511,7 +1511,7 @@ mod tests {
             let encoded = crate::tracked_state::codec::encode_key(&TrackedStateKey {
                 schema_key: "shared_schema".to_string(),
                 file_id: Some("shared_file".to_string()),
-                entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                row_pk: RowPk::single(format!("row-{index:05}")),
             });
             let start = encoded_arena.len();
             encoded_arena.extend_from_slice(&encoded);
@@ -1551,13 +1551,13 @@ mod tests {
                 && keys.file_ids.capacity() <= DIFF_SMALL_STRING_DICTIONARY_LIMIT
         );
         for row in &keys.rows {
-            for component in row.entity_pk.components.iter() {
-                if let crate::entity_pk::EntityPkComponent::String(value) = component {
+            for component in row.row_pk.components.iter() {
+                if let crate::row_pk::RowPkComponent::String(value) = component {
                     let (pointer, len) = value.retained_buffer_identity();
                     let start = pointer as usize;
                     assert!(
                         start >= arena_start && start.saturating_add(len) <= arena_end,
-                        "entity key escaped the shared decoded arena"
+                        "row key escaped the shared decoded arena"
                     );
                 }
             }
@@ -1601,7 +1601,7 @@ mod tests {
                 DecodedTrackedStateKeyShared {
                     schema_key: SharedStr::from_static("test_schema"),
                     file_id: None,
-                    entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                    row_pk: RowPk::single(format!("row-{index:05}")),
                 },
                 None,
                 Some(TrackedStateIndexValue {
@@ -1650,13 +1650,13 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_reports_added_rows() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
+        let (storage, tracked_state) = seed_roots(&[], &[row("row-a", None, "after")]).await;
 
         let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Added)]
         );
         assert!(diff.entries[0].before.is_none());
         assert_eq!(
@@ -1679,13 +1679,13 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_reports_removed_rows_when_right_side_is_absent() {
-        let (storage, tracked_state) = seed_roots(&[row("entity-a", None, "before")], &[]).await;
+        let (storage, tracked_state) = seed_roots(&[row("row-a", None, "before")], &[]).await;
 
         let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Removed)]
         );
         assert_eq!(
             diff.entries[0]
@@ -1702,8 +1702,8 @@ mod tests {
     #[tokio::test]
     async fn diff_commits_reports_removed_rows_when_right_side_is_tombstone() {
         let (storage, tracked_state) = seed_roots(
-            &[row("entity-a", None, "before")],
-            &[tombstone("entity-a", None, "delete")],
+            &[row("row-a", None, "before")],
+            &[tombstone("row-a", None, "delete")],
         )
         .await;
 
@@ -1711,7 +1711,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Removed)]
         );
         let entry = &diff.entries[0];
         assert_eq!(
@@ -1729,8 +1729,8 @@ mod tests {
     #[tokio::test]
     async fn diff_commits_reports_added_rows_when_left_side_is_tombstone() {
         let (storage, tracked_state) = seed_roots(
-            &[tombstone("entity-a", None, "delete")],
-            &[row("entity-a", None, "after")],
+            &[tombstone("row-a", None, "delete")],
+            &[row("row-a", None, "after")],
         )
         .await;
 
@@ -1738,7 +1738,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Added)]
         );
         let entry = &diff.entries[0];
         assert_eq!(
@@ -1756,8 +1756,8 @@ mod tests {
     #[tokio::test]
     async fn diff_commits_reports_modified_rows_for_changed_payload() {
         let (storage, tracked_state) = seed_roots(
-            &[row_with_value("entity-a", None, "before", "one")],
-            &[row_with_value("entity-a", None, "after", "two")],
+            &[row_with_value("row-a", None, "before", "one")],
+            &[row_with_value("row-a", None, "after", "two")],
         )
         .await;
 
@@ -1765,7 +1765,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Modified)]
         );
         assert!(diff.entries[0].before_is_live());
         assert!(diff.entries[0].after_is_live());
@@ -1774,8 +1774,8 @@ mod tests {
     #[tokio::test]
     async fn diff_commits_omits_unchanged_rows_even_when_metadata_differs_only_by_commit() {
         let (storage, tracked_state) = seed_roots(
-            &[row_with_value("entity-a", None, "before", "same")],
-            &[row_with_value("entity-a", None, "after", "same")],
+            &[row_with_value("row-a", None, "before", "same")],
+            &[row_with_value("row-a", None, "after", "same")],
         )
         .await;
 
@@ -1785,15 +1785,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_distinguishes_same_entity_with_different_file_id() {
+    async fn diff_commits_distinguishes_same_row_with_different_file_id() {
         let (storage, tracked_state) = seed_parent_child_delta(
             &[row(
-                "entity-a",
+                "row-a",
                 Some("01920000-0000-7000-8000-0000000000a2"),
                 "before-a",
             )],
             &[row(
-                "entity-a",
+                "row-a",
                 Some("01920000-0000-7000-8000-0000000000b2"),
                 "after-b",
             )],
@@ -1819,18 +1819,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_filters_by_schema_entity_and_file_id() {
+    async fn diff_commits_filters_by_schema_row_and_file_id() {
         let (storage, tracked_state) = seed_roots(
             &[],
             &[
                 row_with_schema(
-                    "entity-a",
+                    "row-a",
                     Some("01920000-0000-7000-8000-0000000000a2"),
                     "schema-a",
                     "change-a",
                 ),
                 row_with_schema(
-                    "entity-b",
+                    "row-b",
                     Some("01920000-0000-7000-8000-0000000000b2"),
                     "schema-b",
                     "change-b",
@@ -1850,7 +1850,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema-b".to_string()],
-                        entity_pks: vec![EntityPk::single("entity-b")],
+                        row_pks: vec![RowPk::single("row-b")],
                         file_ids: vec![NullableKeyFilter::Value(
                             "01920000-0000-7000-8000-0000000000b2".to_string(),
                         )],
@@ -1864,19 +1864,19 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-b".to_string(), TrackedStateDiffKind::Added)]
+            vec![("row-b".to_string(), TrackedStateDiffKind::Added)]
         );
     }
 
     #[tokio::test]
     async fn diff_validation_rejects_row_identity_that_does_not_match_changelog_change() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
+        let (storage, tracked_state) = seed_roots(&[], &[row("row-a", None, "after")]).await;
         let mut diff = diff(&storage, &tracked_state).await;
         diff.entries[0].after.as_mut().expect("after row").identity =
             TrackedStateDiffIdentity::from_key(TrackedStateKey {
                 schema_key: "test_schema".to_owned(),
                 file_id: None,
-                entity_pk: EntityPk::single("entity-corrupt"),
+                row_pk: RowPk::single("row-corrupt"),
             });
 
         let read = storage
@@ -1904,7 +1904,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_validation_rejects_missing_changelog_change() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
+        let (storage, tracked_state) = seed_roots(&[], &[row("row-a", None, "after")]).await;
         let mut diff = diff(&storage, &tracked_state).await;
         diff.entries[0].after.as_mut().expect("after row").change_id =
             ChangeId::for_test_label("missing-change");
@@ -1930,7 +1930,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_validation_rejects_forged_updated_at() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
+        let (storage, tracked_state) = seed_roots(&[], &[row("row-a", None, "after")]).await;
         let mut diff = diff(&storage, &tracked_state).await;
         diff.entries[0]
             .after
@@ -1959,7 +1959,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_validation_rejects_forged_created_at() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
+        let (storage, tracked_state) = seed_roots(&[], &[row("row-a", None, "after")]).await;
         let mut diff = diff(&storage, &tracked_state).await;
         diff.entries[0]
             .after
@@ -1999,7 +1999,7 @@ mod tests {
             "parent",
             None,
             &[row_with_times(
-                "entity-a",
+                "row-a",
                 None,
                 "parent-change",
                 "old",
@@ -2015,7 +2015,7 @@ mod tests {
             "child",
             Some("parent"),
             &[row_with_times(
-                "entity-a",
+                "row-a",
                 None,
                 "child-change",
                 "new",
@@ -2074,7 +2074,7 @@ mod tests {
             &tracked_state,
             "left",
             None,
-            &[row_with_value("entity-a", None, "left-a", "same")],
+            &[row_with_value("row-a", None, "left-a", "same")],
         )
         .await
         .expect("left root should write");
@@ -2083,7 +2083,7 @@ mod tests {
             &tracked_state,
             "right-valid",
             None,
-            &[row_with_value("entity-b", None, "right-b", "same")],
+            &[row_with_value("row-b", None, "right-b", "same")],
         )
         .await
         .expect("right changelog should write");
@@ -2106,7 +2106,7 @@ mod tests {
         let corrupt_key = TrackedStateKey {
             schema_key: "test_schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("entity-a"),
+            row_pk: RowPk::single("row-a"),
         };
         {
             let mut read = storage
@@ -2223,7 +2223,7 @@ mod tests {
             &tracked_state,
             "parent",
             None,
-            &[row_with_value("entity-a", None, "parent-change", "old")],
+            &[row_with_value("row-a", None, "parent-change", "old")],
         )
         .await
         .expect("parent root should write");
@@ -2232,7 +2232,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("parent"),
-            &[row_with_value("entity-a", None, "child-change", "new")],
+            &[row_with_value("row-a", None, "child-change", "new")],
         )
         .await
         .expect("child root should write");
@@ -2286,7 +2286,7 @@ mod tests {
             "unrelated",
             None,
             &[row_with_value(
-                "entity-a",
+                "row-a",
                 None,
                 "unrelated-change",
                 "value",
@@ -2398,7 +2398,7 @@ mod tests {
             &tracked_state,
             "source",
             None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
+            &[row_with_value("row-a", None, "source-change", "value")],
         )
         .await
         .expect("source root should write");
@@ -2474,7 +2474,7 @@ mod tests {
             &tracked_state,
             "source",
             None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
+            &[row_with_value("row-a", None, "source-change", "value")],
         )
         .await
         .expect("source root should write");
@@ -2553,7 +2553,7 @@ mod tests {
             &tracked_state,
             "source",
             None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
+            &[row_with_value("row-a", None, "source-change", "value")],
         )
         .await
         .expect("source root should write");
@@ -2635,7 +2635,7 @@ mod tests {
             &tracked_state,
             "source",
             None,
-            &[row_with_value("entity-b", None, "source-b", "source")],
+            &[row_with_value("row-b", None, "source-b", "source")],
         )
         .await
         .expect("source root should write");
@@ -2644,7 +2644,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("target"),
-            &[row_with_value("entity-a", None, "child-a", "current")],
+            &[row_with_value("row-a", None, "child-a", "current")],
         )
         .await
         .expect("child root should write");
@@ -2704,7 +2704,7 @@ mod tests {
             &tracked_state,
             "grandparent",
             None,
-            &[row_with_value("entity-a", None, "grandparent-a", "old")],
+            &[row_with_value("row-a", None, "grandparent-a", "old")],
         )
         .await
         .expect("grandparent root should write");
@@ -2713,7 +2713,7 @@ mod tests {
             &tracked_state,
             "parent",
             Some("grandparent"),
-            &[row_with_value("entity-a", None, "parent-a", "new")],
+            &[row_with_value("row-a", None, "parent-a", "new")],
         )
         .await
         .expect("parent root should write");
@@ -2776,7 +2776,7 @@ mod tests {
             &tracked_state,
             "parent",
             None,
-            &[row_with_value("entity-a", None, "parent-change", "value")],
+            &[row_with_value("row-a", None, "parent-change", "value")],
         )
         .await
         .expect("parent root should write");
@@ -2796,7 +2796,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Added)]
         );
     }
 
@@ -2813,7 +2813,7 @@ mod tests {
             "source-add",
             None,
             &[row_with_times(
-                "entity-a",
+                "row-a",
                 None,
                 "source-add-a",
                 "old",
@@ -2824,7 +2824,7 @@ mod tests {
         .await
         .expect("source add root should write");
         let mut source_update = row_with_times(
-            "entity-a",
+            "row-a",
             None,
             "source-update-a",
             "new",
@@ -2876,7 +2876,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Added)]
         );
         let row = diff.entries[0].after.as_ref().expect("after row");
         assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.000Z");
@@ -2893,7 +2893,7 @@ mod tests {
             &tracked_state,
             "parent",
             None,
-            &[row_with_value("entity-a", None, "parent-a", "inherited")],
+            &[row_with_value("row-a", None, "parent-a", "inherited")],
         )
         .await
         .expect("parent root should write");
@@ -2902,7 +2902,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("parent"),
-            &[row_with_value("entity-b", None, "child-b", "unrelated")],
+            &[row_with_value("row-b", None, "child-b", "unrelated")],
         )
         .await
         .expect("child root should write");
@@ -2958,7 +2958,7 @@ mod tests {
             &tracked_state,
             "parent",
             None,
-            &[row_with_value("entity-a", None, "parent-a", "old")],
+            &[row_with_value("row-a", None, "parent-a", "old")],
         )
         .await
         .expect("parent root should write");
@@ -2968,8 +2968,8 @@ mod tests {
             "child",
             Some("parent"),
             &[
-                row_with_value("entity-a", None, "child-a", "new"),
-                row_with_value("entity-b", None, "child-b", "unrelated"),
+                row_with_value("row-a", None, "child-a", "new"),
+                row_with_value("row-b", None, "child-b", "unrelated"),
             ],
         )
         .await
@@ -3026,7 +3026,7 @@ mod tests {
             &tracked_state,
             "parent",
             None,
-            &[row_with_value("entity-a", None, "parent-a", "shared")],
+            &[row_with_value("row-a", None, "parent-a", "shared")],
         )
         .await
         .expect("parent root should write");
@@ -3035,7 +3035,7 @@ mod tests {
             &tracked_state,
             "left",
             Some("parent"),
-            &[row_with_value("entity-b", None, "left-b", "left")],
+            &[row_with_value("row-b", None, "left-b", "left")],
         )
         .await
         .expect("left root should write");
@@ -3044,7 +3044,7 @@ mod tests {
             &tracked_state,
             "right",
             Some("parent"),
-            &[row_with_value("entity-c", None, "right-c", "right")],
+            &[row_with_value("row-c", None, "right-c", "right")],
         )
         .await
         .expect("right root should write");
@@ -3131,7 +3131,7 @@ mod tests {
             &tracked_state,
             "source",
             None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
+            &[row_with_value("row-a", None, "source-change", "value")],
         )
         .await
         .expect("source root should write");
@@ -3262,8 +3262,8 @@ mod tests {
             "parent",
             None,
             &[
-                row_with_value("entity-a", None, "parent-a", "before"),
-                row_with_value("entity-b", None, "parent-b", "same"),
+                row_with_value("row-a", None, "parent-a", "before"),
+                row_with_value("row-b", None, "parent-b", "same"),
             ],
         )
         .await
@@ -3283,7 +3283,7 @@ mod tests {
             &tracked_state,
             "child",
             Some("parent"),
-            &[row_with_value("entity-a", None, "child-a", "after")],
+            &[row_with_value("row-a", None, "child-a", "after")],
         )
         .await
         .expect("child should write");
@@ -3304,7 +3304,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Modified)]
         );
         assert_ne!(
             diff.entries[0].before.as_ref().map(|row| row.change_id),
@@ -3316,10 +3316,10 @@ mod tests {
     async fn diff_commits_between_delta_child_and_parent_reports_reverse_suffix_rows() {
         let (storage, tracked_state) = seed_parent_child_delta(
             &[
-                row_with_value("entity-a", None, "parent-a", "before"),
-                row_with_value("entity-b", None, "parent-b", "same"),
+                row_with_value("row-a", None, "parent-a", "before"),
+                row_with_value("row-b", None, "parent-b", "same"),
             ],
-            &[row_with_value("entity-a", None, "child-a", "after")],
+            &[row_with_value("row-a", None, "child-a", "after")],
         )
         .await;
 
@@ -3335,7 +3335,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Modified)]
         );
         assert_ne!(
             diff.entries[0].before.as_ref().map(|row| row.change_id),
@@ -3347,10 +3347,10 @@ mod tests {
     async fn diff_commits_between_delta_parent_and_child_preserves_suffix_tombstones() {
         let (storage, tracked_state) = seed_parent_child_delta(
             &[
-                row_with_value("entity-a", None, "parent-a", "before"),
-                row_with_value("entity-b", None, "parent-b", "same"),
+                row_with_value("row-a", None, "parent-a", "before"),
+                row_with_value("row-b", None, "parent-b", "same"),
             ],
-            &[tombstone("entity-a", None, "child-delete")],
+            &[tombstone("row-a", None, "child-delete")],
         )
         .await;
 
@@ -3366,7 +3366,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
+            vec![("row-a".to_string(), TrackedStateDiffKind::Removed)]
         );
         assert!(diff.entries[0].before_is_live());
         assert!(!diff.entries[0].after_is_live());
@@ -3563,7 +3563,7 @@ mod tests {
                 (
                     entry
                         .identity
-                        .entity_pk()
+                        .row_pk()
                         .as_single_string_owned()
                         .expect("identity"),
                     entry.kind,
@@ -3598,61 +3598,61 @@ mod tests {
     }
 
     fn tombstone(
-        entity_pk: &str,
+        row_pk: &str,
         file_id: Option<&str>,
         change_id: &str,
     ) -> MaterializedTrackedStateRow {
-        let mut row = row(entity_pk, file_id, change_id);
+        let mut row = row(row_pk, file_id, change_id);
         row.snapshot_content = None;
         row.deleted = true;
         row
     }
 
-    fn row(entity_pk: &str, file_id: Option<&str>, change_id: &str) -> MaterializedTrackedStateRow {
-        row_with_schema(entity_pk, file_id, "test_schema", change_id)
+    fn row(row_pk: &str, file_id: Option<&str>, change_id: &str) -> MaterializedTrackedStateRow {
+        row_with_schema(row_pk, file_id, "test_schema", change_id)
     }
 
     fn row_with_schema(
-        entity_pk: &str,
+        row_pk: &str,
         file_id: Option<&str>,
         schema_key: &str,
         change_id: &str,
     ) -> MaterializedTrackedStateRow {
-        row_with_schema_and_value(entity_pk, file_id, schema_key, change_id, "value")
+        row_with_schema_and_value(row_pk, file_id, schema_key, change_id, "value")
     }
 
     fn row_with_value(
-        entity_pk: &str,
+        row_pk: &str,
         file_id: Option<&str>,
         change_id: &str,
         value: &str,
     ) -> MaterializedTrackedStateRow {
-        row_with_schema_and_value(entity_pk, file_id, "test_schema", change_id, value)
+        row_with_schema_and_value(row_pk, file_id, "test_schema", change_id, value)
     }
 
     fn row_with_times(
-        entity_pk: &str,
+        row_pk: &str,
         file_id: Option<&str>,
         change_id: &str,
         value: &str,
         created_at: &str,
         updated_at: &str,
     ) -> MaterializedTrackedStateRow {
-        let mut row = row_with_value(entity_pk, file_id, change_id, value);
+        let mut row = row_with_value(row_pk, file_id, change_id, value);
         row.created_at = created_at.to_string();
         row.updated_at = updated_at.to_string();
         row
     }
 
     fn row_with_schema_and_value(
-        entity_pk: &str,
+        row_pk: &str,
         file_id: Option<&str>,
         schema_key: &str,
         change_id: &str,
         value: &str,
     ) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),

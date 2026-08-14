@@ -613,7 +613,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     };
     let sources = sources.to_value();
     assert_eq!(
-        sources[0]["entity_pk"],
+        sources[0]["row_pk"],
         json!(["863f406b-3ce8-724d-8548-6dc1e41d451d"])
     );
 
@@ -710,7 +710,7 @@ simulation_test!(
         let rename_sources = rename_sources.to_value();
         assert_eq!(rename_sources.as_array().map(Vec::len), Some(1));
         assert_eq!(
-            rename_sources[0]["entity_pk"],
+            rename_sources[0]["row_pk"],
             json!(["7813628c-6493-7241-80fe-c63337c5d3f9"])
         );
 
@@ -860,7 +860,7 @@ simulation_test!(
             .as_array()
             .expect("grouped file sources should be an array")
             .iter()
-            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .map(|source| source["row_pk"][0].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             source_ids,
@@ -1072,7 +1072,7 @@ simulation_test!(
             .expect("delete sources should be an array")
             .iter()
             .filter(|source| source["schema_key"] == json!("lix_directory_descriptor"))
-            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .map(|source| source["row_pk"][0].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             deleted_directory_ids,
@@ -1145,7 +1145,7 @@ simulation_test!(
             .expect("restore sources should be an array")
             .iter()
             .filter(|source| source["schema_key"] == json!("lix_directory_descriptor"))
-            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .map(|source| source["row_pk"][0].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             restored_directory_ids,
@@ -1906,11 +1906,11 @@ simulation_test!(
                     .collect::<Vec<_>>(),
                 vec![
                     "created_at",
-                    "entity_pk",
                     "file_id",
                     "id",
                     "metadata",
                     "origin_key",
+                    "row_pk",
                     "schema_key",
                     "snapshot_content",
                 ],

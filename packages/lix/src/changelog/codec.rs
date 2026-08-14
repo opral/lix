@@ -23,7 +23,7 @@ pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, Lix
         format_version: record.format_version,
         account_id: &record.account_id,
         schema_key: &record.schema_key,
-        entity_pk: &record.entity_pk,
+        row_pk: &record.row_pk,
         file_id: record.file_id.as_deref(),
         snapshot: record.snapshot.as_ref_slot(),
         metadata: record.metadata.as_ref_slot(),
@@ -42,7 +42,7 @@ pub(crate) fn append_change_record(
             format_version: record.format_version,
             account_id: &record.account_id,
             schema_key: &record.schema_key,
-            entity_pk: &record.entity_pk,
+            row_pk: &record.row_pk,
             file_id: record.file_id.as_deref(),
             snapshot: record.snapshot.as_ref_slot(),
             metadata: record.metadata.as_ref_slot(),
@@ -60,7 +60,7 @@ pub(crate) fn encode_transaction_change_record(
         format_version: record.format_version,
         account_id: record.account_id,
         schema_key: record.schema_key,
-        entity_pk: record.entity_pk,
+        row_pk: record.row_pk,
         file_id: record.file_id,
         snapshot: record.snapshot,
         metadata: record.metadata,
@@ -79,7 +79,7 @@ pub(crate) fn append_transaction_change_record(
             format_version: record.format_version,
             account_id: record.account_id,
             schema_key: record.schema_key,
-            entity_pk: record.entity_pk,
+            row_pk: record.row_pk,
             file_id: record.file_id,
             snapshot: record.snapshot,
             metadata: record.metadata,
@@ -113,7 +113,7 @@ pub(crate) fn decode_change_record(
         change_id,
         account_id: view.account_id.to_string(),
         schema_key: view.schema_key.to_string(),
-        entity_pk: view.entity_pk,
+        row_pk: view.row_pk,
         file_id: view.file_id,
         snapshot: view.snapshot,
         metadata: view.metadata,
@@ -128,7 +128,7 @@ mod tests {
     use crate::changelog::ChangeId;
     use crate::changelog::CommitId;
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::json_store::{JsonRef, JsonSlot};
 
     #[test]
@@ -162,8 +162,8 @@ mod tests {
             change_id: ChangeId::for_test_label("roundtrip-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             schema_key: "schema-\u{00e9}\u{4e2d}".to_string(),
-            entity_pk: EntityPk::from_parts(vec!["part-a".to_string(), "part-b".to_string()])
-                .expect("entity pk should build"),
+            row_pk: RowPk::from_parts(vec!["part-a".to_string(), "part-b".to_string()])
+                .expect("row pk should build"),
             file_id: Some("file-1".to_string()),
             snapshot: JsonSlot::Ref(JsonRef::for_content(b"snapshot")),
             metadata: JsonSlot::Ref(JsonRef::for_content(b"metadata")),
@@ -230,13 +230,13 @@ mod tests {
     fn change_record_packs_canonical_uuid_ids_and_round_trips() {
         let uuid = "019eb805-60d0-71c0-ade3-b0f0efab9d9a";
         let record = ChangeRecord {
-            entity_pk: EntityPk::from_components(smallvec::smallvec![
-                crate::entity_pk::EntityPkComponent::Uuid(
+            row_pk: RowPk::from_components(smallvec::smallvec![
+                crate::row_pk::RowPkComponent::Uuid(
                     storage_codec::id_string::uuid_bytes_from_canonical(uuid)
                         .expect("canonical UUID"),
                 ),
             ])
-            .expect("entity pk should build"),
+            .expect("row pk should build"),
             file_id: Some("019eb805-5e65-7270-861d-cb341bc904c8".to_string()),
             ..full_record()
         };
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(decoded, record);
         assert_eq!(
             decoded
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
                 .expect("one UUID"),
             uuid
@@ -258,11 +258,11 @@ mod tests {
         // Uppercase hex re-hyphenates differently, so it must stay text to
         // round-trip byte-identically; same for arbitrary plugin keys.
         let record = ChangeRecord {
-            entity_pk: EntityPk::from_parts(vec![
+            row_pk: RowPk::from_parts(vec![
                 "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A".to_string(),
                 "row 5 of sheet 2".to_string(),
             ])
-            .expect("entity pk should build"),
+            .expect("row pk should build"),
             file_id: Some("not-a-uuid".to_string()),
             ..full_record()
         };

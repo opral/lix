@@ -23,7 +23,7 @@ use crate::commit_graph::{
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
 };
 use crate::common::ExactBatch;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
     StorageProjectedValue, exact_get_many,
@@ -65,7 +65,7 @@ impl CommitGraphContext {
     }
 }
 
-/// Commit-graph reader that resolves changelog entities at a commit head.
+/// Commit-graph reader that resolves changelog rows at a commit head.
 pub(crate) struct CommitGraphStoreReader<S>
 where
     S: StorageAdapterRead,
@@ -686,14 +686,14 @@ impl HistoryShaping {
 #[derive(Default)]
 struct HistoryCollection {
     entries: Vec<CommitGraphChangeHistoryEntry>,
-    seen_changes: BTreeSet<(ChangeId, String, Option<String>, EntityPk)>,
+    seen_changes: BTreeSet<(ChangeId, String, Option<String>, RowPk)>,
 }
 
 fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphChange {
     CommitGraphChange {
         id: change.change_id,
         account_id: change.account_id,
-        entity_pk: change.entity_pk,
+        row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot: change.snapshot,
@@ -920,7 +920,7 @@ fn change_matches_history_request(
     request: &CommitGraphChangeHistoryRequest,
 ) -> bool {
     (request.include_tombstones || change.snapshot.is_some())
-        && (request.entity_pks.is_empty() || request.entity_pks.contains(&change.entity_pk))
+        && (request.row_pks.is_empty() || request.row_pks.contains(&change.row_pk))
         && (request.schema_keys.is_empty() || request.schema_keys.contains(&change.schema_key))
         && (request.file_ids.is_empty()
             || change
@@ -931,12 +931,12 @@ fn change_matches_history_request(
 
 fn history_change_identity(
     change: &CommitGraphChange,
-) -> (ChangeId, String, Option<String>, EntityPk) {
+) -> (ChangeId, String, Option<String>, RowPk) {
     (
         change.id,
         change.schema_key.clone(),
         change.file_id.clone(),
-        change.entity_pk.clone(),
+        change.row_pk.clone(),
     )
 }
 
@@ -946,7 +946,7 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
     CommitGraphChange {
         id: node.change_id,
         account_id: node.account_id.clone(),
-        entity_pk: EntityPk::uuid_from_canonical(&node.commit_id.to_string())
+        row_pk: RowPk::uuid_from_canonical(&node.commit_id.to_string())
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
@@ -1064,8 +1064,8 @@ mod tests {
         append_changes(
             &storage,
             &[
-                entity_change("change-1", "entity-1", "example", "{}"),
-                entity_change("change-2", "entity-2", "example", "{}"),
+                row_change("change-1", "row-1", "example", "{}"),
+                row_change("change-2", "row-2", "example", "{}"),
                 commit_change(
                     "commit-1-change",
                     "commit-1",
@@ -1207,7 +1207,7 @@ mod tests {
             &storage,
             &[
                 commit_change("commit-b-change", "commit-b", &[], &[]),
-                entity_change("change-1", "entity-1", "example", "{}"),
+                row_change("change-1", "row-1", "example", "{}"),
                 commit_change("commit-a-change", "commit-a", &[], &[]),
             ],
         )
@@ -1265,8 +1265,8 @@ mod tests {
         append_changes(
             &storage,
             &[
-                entity_change("change-root", "entity-root", "test_schema", "{}"),
-                entity_change("change-head", "entity-head", "test_schema", "{}"),
+                row_change("change-root", "row-root", "test_schema", "{}"),
+                row_change("change-head", "row-head", "test_schema", "{}"),
                 commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
                 commit_change(
                     "commit-head-change",
@@ -1331,9 +1331,9 @@ mod tests {
         append_changes(
             &storage,
             &[
-                entity_change("change-root", "entity-root", "test_schema", "{}"),
-                entity_change("change-middle", "entity-middle", "test_schema", "{}"),
-                entity_change("change-head", "entity-head", "test_schema", "{}"),
+                row_change("change-root", "row-root", "test_schema", "{}"),
+                row_change("change-middle", "row-middle", "test_schema", "{}"),
+                row_change("change-head", "row-head", "test_schema", "{}"),
                 commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
                 commit_change(
                     "commit-middle-change",
@@ -1487,8 +1487,8 @@ mod tests {
         append_changes(
             &storage,
             &[
-                entity_change("change-root", "entity-root", "test_schema", "{}"),
-                entity_change("change-head", "entity-head", "test_schema", "{}"),
+                row_change("change-root", "row-root", "test_schema", "{}"),
+                row_change("change-head", "row-head", "test_schema", "{}"),
                 commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
                 commit_change(
                     "commit-head-change",
@@ -1549,9 +1549,9 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = commit_id("selected-tombstone-cache");
         let shared_change_id = change_id("shared-selected-tombstone");
-        let alpha_pk = crate::entity_pk::EntityPk::single("alpha-entity");
-        let alpha_second_pk = crate::entity_pk::EntityPk::single("alpha-second-entity");
-        let beta_pk = crate::entity_pk::EntityPk::single("beta-entity");
+        let alpha_pk = crate::row_pk::RowPk::single("alpha-row");
+        let alpha_second_pk = crate::row_pk::RowPk::single("alpha-second-row");
+        let beta_pk = crate::row_pk::RowPk::single("beta-row");
         let created_at = ts("2026-01-02T00:00:00Z");
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -1581,7 +1581,7 @@ mod tests {
                 delta: TrackedStateDeltaRef {
                     schema_key: "alpha",
                     file_id: None,
-                    entity_pk: &alpha_pk,
+                    row_pk: &alpha_pk,
                     change_id: shared_change_id,
                     commit_id,
                     deleted: true,
@@ -1598,7 +1598,7 @@ mod tests {
                 delta: TrackedStateDeltaRef {
                     schema_key: "beta",
                     file_id: None,
-                    entity_pk: &beta_pk,
+                    row_pk: &beta_pk,
                     change_id: shared_change_id,
                     commit_id,
                     deleted: true,
@@ -1615,7 +1615,7 @@ mod tests {
                 delta: TrackedStateDeltaRef {
                     schema_key: "alpha",
                     file_id: None,
-                    entity_pk: &alpha_second_pk,
+                    row_pk: &alpha_second_pk,
                     change_id: shared_change_id,
                     commit_id,
                     deleted: true,
@@ -1687,36 +1687,36 @@ mod tests {
             alpha_first
                 .entries
                 .iter()
-                .any(|entry| entry.change.entity_pk == alpha_pk)
+                .any(|entry| entry.change.row_pk == alpha_pk)
         );
         assert!(
             alpha_first
                 .entries
                 .iter()
-                .any(|entry| entry.change.entity_pk == alpha_second_pk)
+                .any(|entry| entry.change.row_pk == alpha_second_pk)
         );
         assert_eq!(beta.entries.len(), 1);
         assert_eq!(beta.entries[0].change.schema_key, "beta");
-        assert_eq!(beta.entries[0].change.entity_pk, beta_pk);
+        assert_eq!(beta.entries[0].change.row_pk, beta_pk);
         assert_eq!(alpha_second.entries, alpha_first.entries);
         assert!(Arc::ptr_eq(
             &alpha_first.reachable_nodes,
             &alpha_second.reachable_nodes
         ));
-        let entity_history = reader
+        let row_history = reader
             .change_history_from_commit(
                 &commit_id,
                 &CommitGraphChangeHistoryRequest {
                     schema_keys: vec!["alpha".to_string()],
-                    entity_pks: vec![alpha_second_pk.clone()],
+                    row_pks: vec![alpha_second_pk.clone()],
                     include_tombstones: true,
                     ..CommitGraphChangeHistoryRequest::default()
                 },
             )
             .await
             .expect("identity-filtered selected tombstone should load");
-        assert_eq!(entity_history.entries.len(), 1);
-        assert_eq!(entity_history.entries[0].change.entity_pk, alpha_second_pk);
+        assert_eq!(row_history.entries.len(), 1);
+        assert_eq!(row_history.entries[0].change.row_pk, alpha_second_pk);
     }
 
     #[tokio::test]
@@ -1726,8 +1726,8 @@ mod tests {
         append_changes(
             &storage,
             &[
-                entity_change("change-root", "entity-root", "test_schema", "{}"),
-                entity_change("change-head", "entity-head", "test_schema", "{}"),
+                row_change("change-root", "row-root", "test_schema", "{}"),
+                row_change("change-head", "row-head", "test_schema", "{}"),
                 commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
                 commit_change(
                     "commit-head-change",
@@ -1820,22 +1820,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_history_from_commit_filters_depth_entity_file_and_tombstones() {
+    async fn change_history_from_commit_filters_depth_row_file_and_tombstones() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
-                entity_change_with_file(
+                row_change_with_file(
                     "change-01920000-0000-7000-8000-0000000000a2",
-                    "entity-1",
+                    "row-1",
                     "test_schema",
                     Some("01920000-0000-7000-8000-0000000000a2"),
                     "{}",
                 ),
-                entity_tombstone("change-tombstone", "entity-1", "test_schema"),
-                entity_change_with_file(
+                row_tombstone("change-tombstone", "row-1", "test_schema"),
+                row_change_with_file(
                     "change-01920000-0000-7000-8000-0000000000b2",
-                    "entity-2",
+                    "row-2",
                     "test_schema",
                     Some("01920000-0000-7000-8000-0000000000b2"),
                     "{}",
@@ -1870,7 +1870,7 @@ mod tests {
             .change_history_from_commit(
                 &commit_head,
                 &CommitGraphChangeHistoryRequest {
-                    entity_pks: vec![crate::entity_pk::EntityPk::single("entity-1")],
+                    row_pks: vec![crate::row_pk::RowPk::single("row-1")],
                     file_ids: vec!["01920000-0000-7000-8000-0000000000a2".to_string()],
                     min_depth: Some(1),
                     max_depth: Some(1),
@@ -1895,7 +1895,7 @@ mod tests {
         append_changes(
             &storage,
             &[
-                entity_tombstone("change-deleted", "entity-1", "test_schema"),
+                row_tombstone("change-deleted", "row-1", "test_schema"),
                 commit_change(
                     "commit-head-change",
                     "commit-head",
@@ -1958,7 +1958,7 @@ mod tests {
                 change: CommitGraphChange {
                     id: ChangeId::for_test_label(change_id),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single(commit_id),
+                    row_pk: crate::row_pk::RowPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::None,
@@ -1977,9 +1977,9 @@ mod tests {
             }
         }
 
-        fn entity(
+        fn row(
             change_id: &str,
-            entity_pk: &str,
+            row_pk: &str,
             schema_key: &str,
             file_id: Option<&str>,
             snapshot_content: Option<&str>,
@@ -1989,7 +1989,7 @@ mod tests {
                 change: CommitGraphChange {
                     id: ChangeId::for_test_label(change_id),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+                    row_pk: crate::row_pk::RowPk::single(row_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
                     snapshot: snapshot_content
@@ -2032,9 +2032,9 @@ mod tests {
                 CommitId::for_test_label(
                     change
                         .change
-                        .entity_pk
+                        .row_pk
                         .as_single_string()
-                        .expect("commit fixture should use single entity pk"),
+                        .expect("commit fixture should use single row pk"),
                 )
             })
             .collect::<BTreeSet<_>>();
@@ -2048,9 +2048,9 @@ mod tests {
         for change in changes.iter().filter(|change| change.is_commit()) {
             let commit_label = change
                 .change
-                .entity_pk
+                .row_pk
                 .as_single_string()
-                .expect("commit fixture should use single entity pk")
+                .expect("commit fixture should use single row pk")
                 .to_string();
             let commit_id = CommitId::for_test_label(&commit_label);
             for parent_commit_id in &change.parent_commit_ids {
@@ -2130,7 +2130,7 @@ mod tests {
                     delta: TrackedStateDeltaRef {
                         schema_key: &change.schema_key,
                         file_id: change.file_id.as_deref(),
-                        entity_pk: &change.entity_pk,
+                        row_pk: &change.row_pk,
                         change_id: change.change_id,
                         commit_id: *commit_id,
                         deleted: change.snapshot.is_none(),
@@ -2205,7 +2205,7 @@ mod tests {
             format_version: 1,
             change_id: change.change.id,
             account_id: change.change.account_id.clone(),
-            entity_pk: change.change.entity_pk.clone(),
+            row_pk: change.change.row_pk.clone(),
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
             snapshot: change.change.snapshot.clone(),
@@ -2246,31 +2246,31 @@ mod tests {
         }
     }
 
-    fn entity_change(
+    fn row_change(
         change_id: &str,
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         snapshot_content: &str,
     ) -> TestChange {
-        entity_change_at(
+        row_change_at(
             change_id,
-            entity_pk,
+            row_pk,
             schema_key,
             snapshot_content,
             "2026-01-01T00:00:00Z",
         )
     }
 
-    fn entity_change_at(
+    fn row_change_at(
         change_id: &str,
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         snapshot_content: &str,
         created_at: &str,
     ) -> TestChange {
-        TestChange::entity(
+        TestChange::row(
             change_id,
-            entity_pk,
+            row_pk,
             schema_key,
             None,
             Some(snapshot_content),
@@ -2278,16 +2278,16 @@ mod tests {
         )
     }
 
-    fn entity_change_with_file(
+    fn row_change_with_file(
         change_id: &str,
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         file_id: Option<&str>,
         snapshot_content: &str,
     ) -> TestChange {
-        TestChange::entity(
+        TestChange::row(
             change_id,
-            entity_pk,
+            row_pk,
             schema_key,
             file_id,
             Some(snapshot_content),
@@ -2295,10 +2295,10 @@ mod tests {
         )
     }
 
-    fn entity_tombstone(change_id: &str, entity_pk: &str, schema_key: &str) -> TestChange {
-        TestChange::entity(
+    fn row_tombstone(change_id: &str, row_pk: &str, schema_key: &str) -> TestChange {
+        TestChange::row(
             change_id,
-            entity_pk,
+            row_pk,
             schema_key,
             None,
             None,

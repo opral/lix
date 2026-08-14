@@ -2,7 +2,7 @@ use lix::Value;
 use lix::storage::Memory;
 use lix::{engine::Engine, session::SessionContext};
 
-const MULTI_ENTITY_SQL: &str = "SELECT b.id AS bundle_id, m.id AS message_id, \
+const MULTI_ROW_SQL: &str = "SELECT b.id AS bundle_id, m.id AS message_id, \
     v.id AS variant_id FROM bundle b \
     LEFT JOIN message m ON m.\"bundle_id\" = b.id \
     LEFT JOIN variant v ON v.\"message_id\" = m.id WHERE b.id = $1";
@@ -18,7 +18,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
         .expect("initialized storage should open");
     let session = engine.open_session().await.expect("session should open");
 
-    for schema in multi_entity_schemas() {
+    for schema in multi_row_schemas() {
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
@@ -44,7 +44,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     let bundle_1 = [Value::Text("bundle-1".to_string())];
     for _ in 0..2 {
         let rows = session
-            .execute(MULTI_ENTITY_SQL, &bundle_1)
+            .execute(MULTI_ROW_SQL, &bundle_1)
             .await
             .expect("warm cached query should execute");
         assert_eq!(rows.len(), 1);
@@ -59,7 +59,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     // fresh provider and expose the new row.
     insert_message_variant(&session, "bundle-1-de", "bundle-1").await;
     let rows = session
-        .execute(MULTI_ENTITY_SQL, &bundle_1)
+        .execute(MULTI_ROW_SQL, &bundle_1)
         .await
         .expect("cached query should rebind the current snapshot");
     assert_eq!(rows.len(), 2);
@@ -69,7 +69,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     // cached bundle-1 predicate or rows.
     let bundle_2 = [Value::Text("bundle-2".to_string())];
     let rows = session
-        .execute(MULTI_ENTITY_SQL, &bundle_2)
+        .execute(MULTI_ROW_SQL, &bundle_2)
         .await
         .expect("different exact parameter should execute");
     assert_eq!(rows.len(), 1);
@@ -158,7 +158,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     let reopened = engine.open_session().await.expect("session should reopen");
     assert_eq!(
         reopened
-            .execute(MULTI_ENTITY_SQL, &bundle_1)
+            .execute(MULTI_ROW_SQL, &bundle_1)
             .await
             .expect("cached query should rebind after reopen")
             .len(),
@@ -193,7 +193,7 @@ async fn insert_message_variant(session: &SessionContext, message_id: &str, bund
         .expect("variant should insert");
 }
 
-fn multi_entity_schemas() -> [serde_json::Value; 3] {
+fn multi_row_schemas() -> [serde_json::Value; 3] {
     [
         serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",

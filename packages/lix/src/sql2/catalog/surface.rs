@@ -24,9 +24,9 @@ impl PublicSurfaceContract {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicSurfaceKind {
-    EntityBase { schema_key: String },
-    EntityByBranch { schema_key: String },
-    EntityHistory { schema_key: String },
+    SchemaBase { schema_key: String },
+    SchemaByBranch { schema_key: String },
+    SchemaHistory { schema_key: String },
     File,
     FileByBranch,
     FileHistory,

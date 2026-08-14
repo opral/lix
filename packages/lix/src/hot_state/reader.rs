@@ -46,7 +46,7 @@ pub(crate) trait HotStateReader: Send + Sync {
     }
 
     /// Reads one explicit authenticated serving domain.  Ordinary visibility
-    /// callers use `Combined`; internal historical/entity validation and
+    /// callers use `Combined`; internal historical/row validation and
     /// current-only durable callers select their domain explicitly.
     async fn scan_domain_batch(
         &self,

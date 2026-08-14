@@ -34,7 +34,7 @@ use serde::Deserialize;
 use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
     FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
@@ -3179,7 +3179,7 @@ async fn load_exact_existing_materializations(
                 HotStateExactRowRequest {
                     branch_id: entry.key.branch_id().to_string(),
                     schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: file_id_entity_pk(entry.id())?,
+                    row_pk: file_id_row_pk(entry.id())?,
                     file_id: Some(entry.id().to_string()),
                 },
             ))
@@ -3293,8 +3293,8 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     // without a path-index revision.
     let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
     blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
-    blob_request.filter.entity_pks = vec![file_id_entity_pk(&file_id)?];
-    // Pin the file id too. The hot index key is file-first, so an entity PK on
+    blob_request.filter.row_pks = vec![file_id_row_pk(&file_id)?];
+    // Pin the file id too. The hot index key is file-first, so a row PK on
     // its own cannot form a point key: `hot_scan_entries` refuses the MultiGet
     // route for any schema with file-backed members -- a null-file point key
     // would miss the real row -- and `hot_file_scan_prefixes` requires a file
@@ -3303,10 +3303,10 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     // O(files) *per statement* and cost ~0.20 us per file in the branch.
     //
     // The pin cannot reject the row it is looking for, because for this schema
-    // the file id and the entity PK are the same value by construction: both
+    // the file id and the row PK are the same value by construction: both
     // producers in `filesystem::planner` (`BlobRefRowInput::append_to` and
     // `append_blob_ref_tombstone_row`, tombstones included) set the row's
-    // entity PK and its `file_id` from one variable, and `lix_binary_blob_ref`
+    // row PK and its `file_id` from one variable, and `lix_binary_blob_ref`
     // is a read-only public surface, so no caller can supply a divergent pair.
     // The exact-batch route below already pairs them the same way.
     blob_request.filter.file_ids = vec![crate::NullableKeyFilter::Value(file_id.clone())];
@@ -4078,7 +4078,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_entity_pk")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_row_pk")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
@@ -4653,7 +4653,7 @@ fn prepare_indexed_lix_file_rows(
         );
         if let Some(blob_ref) = entry.blob_ref_live_row() {
             let row_index = indexed_builder.push_materialized_ref(
-                &blob_ref.entity_pk,
+                &blob_ref.row_pk,
                 &blob_ref.schema_key,
                 blob_ref.file_id.as_deref(),
                 blob_ref.snapshot_content.clone(),
@@ -4744,11 +4744,11 @@ fn lix_file_record_batch_from_path_selection(
             "content" => Arc::new(LargeBinaryArray::from(
                 entries.iter().map(|_| Some(&[][..])).collect::<Vec<_>>(),
             )),
-            "lixcol_entity_pk" => Arc::new(StringArray::from(
+            "lixcol_row_pk" => Arc::new(StringArray::from(
                 entries
                     .iter()
                     .map(|entry| {
-                        file_id_entity_pk(entry.id())?
+                        file_id_row_pk(entry.id())?
                             .as_json_array_text()
                             .map(Some)
                     })
@@ -4838,7 +4838,7 @@ struct LixFileRecordBatchRow {
     directory_id: Option<String>,
     name: String,
     data: Option<Vec<u8>>,
-    entity_pk: String,
+    row_pk: String,
     file_id: Option<String>,
     global: bool,
     change_id: Option<String>,
@@ -4857,7 +4857,7 @@ struct LixFileRecordBatchColumns {
     directory_ids: Vec<Option<String>>,
     names: Vec<Option<String>>,
     data_values: Vec<Option<Vec<u8>>>,
-    entity_pks: Vec<Option<String>>,
+    row_pks: Vec<Option<String>>,
     schema_keys: Vec<Option<String>>,
     file_ids: Vec<Option<String>>,
     globals: Vec<Option<bool>>,
@@ -4877,7 +4877,7 @@ impl LixFileRecordBatchColumns {
         self.directory_ids.push(row.directory_id);
         self.names.push(Some(row.name));
         self.data_values.push(row.data);
-        self.entity_pks.push(Some(row.entity_pk));
+        self.row_pks.push(Some(row.row_pk));
         self.schema_keys
             .push(Some(FILE_DESCRIPTOR_SCHEMA_KEY.to_string()));
         self.file_ids.push(row.file_id);
@@ -4899,7 +4899,7 @@ impl LixFileRecordBatchColumns {
             directory_ids,
             names,
             data_values,
-            entity_pks,
+            row_pks,
             schema_keys,
             file_ids,
             globals,
@@ -4921,7 +4921,7 @@ impl LixFileRecordBatchColumns {
                 .map(|value| value.as_deref())
                 .collect::<Vec<_>>(),
         ));
-        let entity_pks: ArrayRef = Arc::new(StringArray::from(entity_pks));
+        let row_pks: ArrayRef = Arc::new(StringArray::from(row_pks));
         let schema_keys: ArrayRef = Arc::new(StringArray::from(schema_keys));
         let file_ids: ArrayRef = Arc::new(StringArray::from(file_ids));
         let globals: ArrayRef = Arc::new(BooleanArray::from(globals));
@@ -4941,7 +4941,7 @@ impl LixFileRecordBatchColumns {
                 "directory_id" => Arc::clone(&directory_ids),
                 "name" => Arc::clone(&names),
                 "content" => Arc::clone(&data_values),
-                "lixcol_entity_pk" => Arc::clone(&entity_pks),
+                "lixcol_row_pk" => Arc::clone(&row_pks),
                 "lixcol_schema_key" => Arc::clone(&schema_keys),
                 "lixcol_file_id" => Arc::clone(&file_ids),
                 "lixcol_global" => Arc::clone(&globals),
@@ -5057,7 +5057,7 @@ async fn lix_file_record_batch_from_prepared(
             directory_id,
             name,
             data,
-            entity_pk: live.entity_pk().as_json_array_text()?,
+            row_pk: live.row_pk().as_json_array_text()?,
             file_id: live.file_id().map(str::to_owned),
             global: live.global(),
             change_id: projected_change_id.map(|id| id.to_string()),
@@ -5560,7 +5560,7 @@ async fn load_plugin_render_branches(
                         .scan_tracked_batch(&HotStateScanRequest {
                             filter: HotStateFilter {
                                 schema_keys: vec!["lix_key_value".to_string()],
-                                entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                                row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
                                 branch_ids: vec![branch_id.clone()],
                                 file_ids: vec![crate::NullableKeyFilter::Null],
                                 untracked: Some(false),
@@ -5572,7 +5572,7 @@ async fn load_plugin_render_branches(
                         .await?;
                     let row = rows.iter().find(|row| {
                         row.schema_key() == "lix_key_value"
-                            && row.entity_pk().as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
+                            && row.row_pk().as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
                             && row.file_id().is_none()
                             && row.branch_id() == branch_id.as_str()
                             && !row.global()
@@ -5648,7 +5648,7 @@ async fn plugin_render_context_with_branches(
                     .scan_tracked_batch(&HotStateScanRequest {
                         filter: HotStateFilter {
                             schema_keys: vec!["lix_key_value".to_string()],
-                            entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
+                            row_pks: vec![RowPk::single(PLUGIN_OWNER_KEY)],
                             branch_ids: vec![branch_id.clone()],
                             file_ids: file_ids
                                 .iter()
@@ -5674,7 +5674,7 @@ async fn plugin_render_context_with_branches(
                 continue;
             };
             if row.schema_key() != "lix_key_value"
-                || row.entity_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+                || row.row_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
                 || row.branch_id() != branch_id.as_str()
                 || row.global()
                 || row.untracked()
@@ -5685,7 +5685,7 @@ async fn plugin_render_context_with_branches(
             let owned_row = row.to_owned();
             // KNOWN LANE GAP: this render context resolves owners through
             // `scan_tracked_batch`, a tracked-only reader, so untracked
-            // plugin-owned files are not rendered from entities here. They do
+            // plugin-owned files are not rendered from rows here. They do
             // not need to be - an untracked file's bytes round-trip through its
             // stored content blob, which is asserted by the lane-parity tests.
             // Extending this to both lanes means changing the reader and
@@ -5914,11 +5914,11 @@ async fn scan_lix_file_live_batch(
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         BLOB_REF_SCHEMA_KEY.to_string(),
     ];
-    // Bound this read on the file id, not the entity PK.
+    // Bound this read on the file id, not the row PK.
     //
     // The hot index key is file-first -- `scope(branch, generation) ++
-    // schema_key ++ file_id ++ entity_pk` -- so an entity PK on its own names
-    // neither a point key nor a prefix. With `entity_pks` set and `file_ids`
+    // schema_key ++ file_id ++ row_pk` -- so a row PK on its own names
+    // neither a point key nor a prefix. With `row_pks` set and `file_ids`
     // empty, `hot_exact_identity_batches` returns a batch but
     // `may_use_null_point_batch` refuses it (both schema keys here have
     // file-backed members, and a null-file point key would miss the real row),
@@ -5927,40 +5927,40 @@ async fn scan_lix_file_live_batch(
     // every `lix_binary_blob_ref` row in the branch, filtered in memory. That
     // is O(files in branch) per statement.
     //
-    // Pinning `file_ids` *instead of* `entity_pks` -- not in addition to --
+    // Pinning `file_ids` *instead of* `row_pks` -- not in addition to --
     // routes to `hot_file_scan_prefixes`, one tight `(branch, generation,
     // schema_key, file_id)` prefix seek per target file. Adding the pin while
-    // keeping `entity_pks` would be much worse than the walk it replaces:
+    // keeping `row_pks` would be much worse than the walk it replaces:
     // `FiniteHotIdentityBatchRef::new` builds the *cross product*
-    // `entity_pks.len() * file_ids.len()`, so N target files would encode N^2
+    // `row_pks.len() * file_ids.len()`, so N target files would encode N^2
     // point keys per schema key.
     //
-    // Dropping `entity_pks` cannot widen the answer, because `file_id ==
-    // entity_pk` holds by construction for both of these schema keys:
+    // Dropping `row_pks` cannot widen the answer, because `file_id ==
+    // row_pk` holds by construction for both of these schema keys:
     // `transaction::normalization::canonicalize_descriptor_file_id` *derives*
-    // the descriptor row's `file_id` from its entity PK on every normalized
+    // the descriptor row's `file_id` from its row PK on every normalized
     // write, and both `lix_binary_blob_ref` producers in `filesystem::planner`
     // (`BlobRefRowInput::append_to` and `append_blob_ref_tombstone_row`,
     // tombstones included) set the pair from one variable. Both surfaces are
     // read-only, so no caller can supply a divergent pair.
     // `scan_exact_file_blob_batch` below already pairs them the same way.
-    file_request.filter.entity_pks.clear();
+    file_request.filter.row_pks.clear();
     file_request.filter.file_ids = target_file_ids
         .iter()
         .map(|file_id| crate::NullableKeyFilter::Value(file_id.clone()))
         .collect();
-    // Preserve the canonical-UUID validation the entity-PK projection used to
+    // Preserve the canonical-UUID validation the row-PK projection used to
     // perform, so a malformed file id stays an error instead of becoming a
     // silently empty answer.
     for file_id in target_file_ids {
-        file_id_entity_pk(file_id)?;
+        file_id_row_pk(file_id)?;
     }
 
     let file_rows = hot_state.scan_batch(&file_request).await?;
 
     let mut directory_request = request.clone();
     directory_request.filter.schema_keys = vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()];
-    directory_request.filter.entity_pks.clear();
+    directory_request.filter.row_pks.clear();
     directory_request.limit = None;
     let directory_rows = hot_state.scan_batch(&directory_request).await?;
     Ok(concatenate_hot_state_batches([file_rows, directory_rows]))
@@ -5994,7 +5994,7 @@ fn scan_indexed_file_batch(
         .filter_map(FilesystemPathEntry::blob_ref_live_row)
     {
         builder.push_materialized_ref(
-            &row.entity_pk,
+            &row.row_pk,
             &row.schema_key,
             row.file_id.as_deref(),
             row.snapshot_content.clone(),
@@ -6036,7 +6036,7 @@ async fn scan_exact_file_blob_batch(
                 Ok(HotStateExactRowRequest {
                     branch_id: branch_id.clone(),
                     schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: file_id_entity_pk(file_id)?,
+                    row_pk: file_id_row_pk(file_id)?,
                     file_id: Some(file_id.clone()),
                 })
             })
@@ -6974,7 +6974,7 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("content", DataType::LargeBinary, false),
-        json_field("lixcol_entity_pk", false),
+        json_field("lixcol_row_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -7001,8 +7001,8 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
 }
 
-fn file_id_entity_pk(file_id: &str) -> Result<EntityPk, LixError> {
-    EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+fn file_id_row_pk(file_id: &str) -> Result<RowPk, LixError> {
+    RowPk::uuid_from_canonical(file_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("validated file ID is not a canonical UUID: {error}"),
@@ -7080,8 +7080,8 @@ mod tests {
         move || ids.next().expect("test id should exist").to_string()
     }
 
-    fn uuid_pk(value: &str) -> crate::entity_pk::EntityPk {
-        crate::entity_pk::EntityPk::uuid_from_canonical(value)
+    fn uuid_pk(value: &str) -> crate::row_pk::RowPk {
+        crate::row_pk::RowPk::uuid_from_canonical(value)
             .expect("fixture ID should be a canonical UUID")
     }
 
@@ -7643,7 +7643,7 @@ mod tests {
             "path",
             "directory_id",
             "name",
-            "lixcol_entity_pk",
+            "lixcol_row_pk",
             "lixcol_schema_key",
             "lixcol_commit_id",
             "lixcol_metadata",
@@ -7683,7 +7683,7 @@ mod tests {
         );
         assert_eq!(string_value("name"), "readme.md");
         assert_eq!(
-            string_value("lixcol_entity_pk"),
+            string_value("lixcol_row_pk"),
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(
@@ -8301,7 +8301,7 @@ mod tests {
         );
         untracked_blob.untracked = true;
         untracked_blob.change_id = Some(ChangeId::for_test_label("untracked-blob"));
-        // A malformed `(entity=01920000-0000-7000-8000-000000000122, file=different-file-id)` row must
+        // A malformed `(row=01920000-0000-7000-8000-000000000122, file=different-file-id)` row must
         // never be fetched for the exact descriptor identity.
         let mut misplaced_blob = live_blob_ref_row(
             "01920000-0000-7000-8000-000000000122",
@@ -8719,7 +8719,7 @@ mod tests {
                     .map(|requested| {
                         let matches = |row: &&MaterializedHotStateRow| {
                             row.schema_key == requested.schema_key
-                                && row.entity_pk == requested.entity_pk
+                                && row.row_pk == requested.row_pk
                                 && row.file_id == requested.file_id
                                 && request
                                     .untracked
@@ -8842,7 +8842,7 @@ mod tests {
                             .iter()
                             .find(|row| {
                                 row.schema_key == requested.schema_key
-                                    && row.entity_pk == requested.entity_pk
+                                    && row.row_pk == requested.row_pk
                                     && row.file_id == requested.file_id
                                     && row.branch_id.as_ref() == requested.branch_id.as_str()
                             })
@@ -8948,10 +8948,10 @@ mod tests {
                         .iter()
                         .map(|row| row.schema_key.clone())
                         .collect(),
-                    entity_pks: request
+                    row_pks: request
                         .rows
                         .iter()
-                        .map(|row| row.entity_pk.clone())
+                        .map(|row| row.row_pk.clone())
                         .collect(),
                     file_ids: request
                         .rows
@@ -8972,8 +8972,8 @@ mod tests {
             recorded.filter.branch_ids.dedup();
             recorded.filter.schema_keys.sort();
             recorded.filter.schema_keys.dedup();
-            recorded.filter.entity_pks.sort();
-            recorded.filter.entity_pks.dedup();
+            recorded.filter.row_pks.sort();
+            recorded.filter.row_pks.dedup();
             recorded
                 .filter
                 .file_ids
@@ -8991,7 +8991,7 @@ mod tests {
                     .map(|requested| {
                         let exact_match = |row: &&MaterializedHotStateRow| {
                             row.schema_key == requested.schema_key
-                                && row.entity_pk == requested.entity_pk
+                                && row.row_pk == requested.row_pk
                                 && row.file_id == requested.file_id
                                 && request
                                     .untracked
@@ -9095,12 +9095,12 @@ mod tests {
     }
 
     fn live_directory_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture directory ID should be a UUID"),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
@@ -9108,8 +9108,8 @@ mod tests {
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -9118,26 +9118,26 @@ mod tests {
     }
 
     fn live_file_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedHotStateRow {
-        let typed_entity_pk = if matches!(entity_pk, PLUGIN_REGISTRY_KEY | PLUGIN_OWNER_KEY) {
-            crate::entity_pk::EntityPk::single(entity_pk)
+        let typed_row_pk = if matches!(row_pk, PLUGIN_REGISTRY_KEY | PLUGIN_OWNER_KEY) {
+            crate::row_pk::RowPk::single(row_pk)
         } else {
-            crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+            crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture file ID should be a UUID")
         };
         MaterializedHotStateRow {
-            entity_pk: typed_entity_pk,
+            row_pk: typed_row_pk,
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            file_id: Some(entity_pk.to_string()),
+            file_id: Some(row_pk.to_string()),
             snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -9146,14 +9146,14 @@ mod tests {
     }
 
     fn live_blob_ref_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         file_id: &str,
         blob_hash: &str,
         size_bytes: usize,
     ) -> MaterializedHotStateRow {
         let mut row = live_file_row(
-            entity_pk,
+            row_pk,
             branch_id,
             &format!(r#"{{"id":"{file_id}","blob_hash":"{blob_hash}","size_bytes":{size_bytes}}}"#),
         );
@@ -9645,9 +9645,9 @@ mod tests {
 
         for index in 0..FILE_COUNT {
             let file_id = format!("01920000-0000-7000-8000-{index:012x}");
-            let entity_pk = uuid_pk(&file_id);
+            let row_pk = uuid_pk(&file_id);
             builder.push_materialized_ref(
-                &entity_pk,
+                &row_pk,
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
                 None,
                 Some(
@@ -9667,7 +9667,7 @@ mod tests {
                 branch_id,
             );
             builder.push_materialized_ref(
-                &entity_pk,
+                &row_pk,
                 super::BLOB_REF_SCHEMA_KEY,
                 Some(&file_id),
                 Some(
@@ -9687,7 +9687,7 @@ mod tests {
         }
 
         let batch = builder.finish();
-        let entity_column = batch.entity_column_ptr();
+        let row_column = batch.row_column_ptr();
         let prepared = super::prepare_lix_file_rows(batch, &super::FilePathPredicate::All)
             .expect("bulk descriptor/blob batch should prepare");
 
@@ -9695,8 +9695,8 @@ mod tests {
         assert_eq!(prepared.blob_rows.len(), FILE_COUNT);
         assert_eq!(prepared.live_rows.batches.len(), 1);
         assert_eq!(
-            prepared.live_rows.batch(0).entity_column_ptr(),
-            entity_column,
+            prepared.live_rows.batch(0).row_column_ptr(),
+            row_column,
             "preparation should retain the source batch instead of rebuilding row DTOs"
         );
         assert!(
@@ -10086,8 +10086,8 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].filter.schema_keys, vec!["lix_key_value"]);
         assert_eq!(
-            requests[0].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
+            requests[0].filter.row_pks,
+            vec![crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY)]
         );
         assert_eq!(
             requests[0].filter.branch_ids,
@@ -10097,8 +10097,8 @@ mod tests {
         assert_eq!(requests[0].filter.untracked, Some(false));
         assert_eq!(requests[0].limit, Some(1));
         assert_eq!(
-            requests[1].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
+            requests[1].filter.row_pks,
+            vec![crate::row_pk::RowPk::single(PLUGIN_OWNER_KEY)]
         );
         assert_eq!(
             requests[1].filter.file_ids,
@@ -10152,12 +10152,12 @@ mod tests {
         let requests = requests.lock().expect("scan request mutex");
         assert_eq!(requests.len(), 2, "registry and exact owner rows are read");
         assert_eq!(
-            requests[0].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
+            requests[0].filter.row_pks,
+            vec![crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY)]
         );
         assert_eq!(
-            requests[1].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
+            requests[1].filter.row_pks,
+            vec![crate::row_pk::RowPk::single(PLUGIN_OWNER_KEY)]
         );
     }
 
@@ -10438,7 +10438,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk.as_ref(),
+            rows[0].row_pk.as_ref(),
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
@@ -10835,7 +10835,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_directory_descriptor")
             .expect("missing /docs/ directory should be staged");
         assert_eq!(
-            directory.entity_pk,
+            directory.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-000000000353"))
         );
 
@@ -11098,7 +11098,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("data insert should stage blob ref row");
         assert_eq!(
-            blob_ref_row.entity_pk,
+            blob_ref_row.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -11154,7 +11154,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be staged");
         assert_eq!(
-            descriptor.entity_pk,
+            descriptor.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -11169,7 +11169,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be staged");
         assert_eq!(
-            blob_ref.entity_pk,
+            blob_ref.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -11190,7 +11190,7 @@ mod tests {
         let row = staged.state_rows.row(0);
         assert_eq!(row.schema_key, "lix_file_descriptor");
         assert_eq!(
-            row.entity_pk,
+            row.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(row.snapshot, None);
@@ -11331,7 +11331,7 @@ mod tests {
                 assert_eq!(*mode, TransactionWriteMode::Insert);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
-                    rows.row(0).entity_pk,
+                    rows.row(0).row_pk,
                     Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
                 );
                 assert_eq!(rows.row(0).schema_key, "lix_file_descriptor");
@@ -11414,8 +11414,8 @@ mod tests {
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(
-            write_context.exact_load_requests[0].rows[0].entity_pk,
-            crate::entity_pk::EntityPk::uuid_from_canonical(
+            write_context.exact_load_requests[0].rows[0].row_pk,
+            crate::row_pk::RowPk::uuid_from_canonical(
                 "01920000-0000-7000-8000-0000000000d2",
             )
             .expect("fixture file ID")
@@ -11674,7 +11674,7 @@ mod tests {
                 vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
             );
             assert_eq!(
-                requests[0].filter.entity_pks,
+                requests[0].filter.row_pks,
                 vec![uuid_pk("01920000-0000-7000-8000-0000000000d2")]
             );
         }

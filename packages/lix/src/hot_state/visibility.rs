@@ -8,7 +8,7 @@ use crate::hot_state::{
     MaterializedHotStateExactBatch, MaterializedHotStateRowRef,
 };
 
-// Scanned-vs-returned accounting for the single-entity `lix_binary_blob_ref`
+// Scanned-vs-returned accounting for the single-row `lix_binary_blob_ref`
 // probe that every `lix_file` content update issues. `calls` exists so a zero
 // scanned count is readable as "the pushdown works" rather than as "this
 // counter never ran" -- the two are otherwise indistinguishable.
@@ -27,11 +27,11 @@ pub(crate) fn reset_blob_ref_probe_stats() {
     BLOB_REF_PROBE_ROWS_RETURNED.with(|rows| rows.set(0));
 }
 
-/// `(calls, rows_scanned, rows_returned)` for single-entity blob-ref probes.
+/// `(calls, rows_scanned, rows_returned)` for single-row blob-ref probes.
 ///
 /// `rows_scanned` counts what the underlying hot-state scan handed back before
 /// visibility resolution -- i.e. what the storage layer actually read. If
-/// `entity_pks` is pushed down to a seek this tracks `rows_returned`; if it is
+/// `row_pks` is pushed down to a seek this tracks `rows_returned`; if it is
 /// applied as an in-memory filter it tracks the branch's blob-ref count.
 #[cfg(test)]
 pub(crate) fn blob_ref_probe_stats() -> (usize, usize, usize) {
@@ -43,8 +43,8 @@ pub(crate) fn blob_ref_probe_stats() -> (usize, usize, usize) {
 }
 
 #[cfg(test)]
-fn is_single_entity_blob_ref_probe(request: &HotStateScanRequest) -> bool {
-    request.filter.schema_keys == ["lix_binary_blob_ref"] && request.filter.entity_pks.len() == 1
+fn is_single_row_blob_ref_probe(request: &HotStateScanRequest) -> bool {
+    request.filter.schema_keys == ["lix_binary_blob_ref"] && request.filter.row_pks.len() == 1
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,7 +153,7 @@ fn materialized_row_identity(row: MaterializedHotStateRowRef<'_>) -> HotStateRow
     HotStateRowIdentityRef {
         branch_id: row.branch_id(),
         schema_key: row.schema_key(),
-        entity_pk: row.entity_pk(),
+        row_pk: row.row_pk(),
         file_id: row.file_id(),
     }
 }
@@ -201,7 +201,7 @@ where
         },
     );
     #[cfg(test)]
-    if is_single_entity_blob_ref_probe(request) {
+    if is_single_row_blob_ref_probe(request) {
         BLOB_REF_PROBE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
         BLOB_REF_PROBE_ROWS_SCANNED.with(|rows| rows.set(rows.get().saturating_add(scanned)));
         BLOB_REF_PROBE_ROWS_RETURNED
@@ -273,7 +273,7 @@ where
         staged_requests.push(HotStateExactRowRequest {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.clone(),
         });
         let branch_index = if row.branch_id == GLOBAL_BRANCH_ID {
@@ -535,7 +535,7 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
 
     use async_trait::async_trait;
 
@@ -563,7 +563,7 @@ mod tests {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
         let rows = (0..10_000)
             .map(|index| MaterializedHotStateRow {
-                entity_pk: EntityPk::uuid_from_canonical(&format!(
+                row_pk: RowPk::uuid_from_canonical(&format!(
                     "01920000-0000-7000-8000-{index:012x}"
                 ))
                 .expect("canonical test UUID"),
@@ -582,7 +582,7 @@ mod tests {
             })
             .collect();
         let source = MaterializedHotStateBatch::from_rows(rows);
-        let source_entity_column = source.entity_column_ptr();
+        let source_row_column = source.row_column_ptr();
         let batch = resolve_visible_batch(
             source,
             MaterializedHotStateBatch::default(),
@@ -596,7 +596,7 @@ mod tests {
         );
 
         assert_eq!(batch.len(), 10_000);
-        assert_eq!(batch.entity_column_ptr(), source_entity_column);
+        assert_eq!(batch.row_column_ptr(), source_row_column);
         assert_eq!(batch.dictionary_entry_count(), 3);
         assert_eq!(batch.row(0).schema_key(), batch.row(9_999).schema_key());
         assert_eq!(
@@ -610,7 +610,7 @@ mod tests {
         let rows = resolve_hot_state_batch(
             &MaterializedHotStateBatch::from_rows(vec![row_at(
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
-                "entity",
+                "row",
                 "global-value",
                 true,
                 Some("change-global"),
@@ -640,14 +640,14 @@ mod tests {
             &MaterializedHotStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
-                    "entity",
+                    "row",
                     "global-value",
                     true,
                     Some("change-global"),
                 ),
                 row_at(
                     "01920000-0000-7000-8000-0000000000a1",
-                    "entity",
+                    "row",
                     "branch-value",
                     false,
                     Some("change-branch"),
@@ -676,7 +676,7 @@ mod tests {
     fn empty_branch_filter_uses_last_base_row_for_duplicate_identity() {
         let mut tracked = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "tracked",
             false,
             Some("change-tracked"),
@@ -684,7 +684,7 @@ mod tests {
         tracked.untracked = false;
         let mut untracked = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "untracked",
             false,
             Some("change-untracked"),
@@ -713,14 +713,14 @@ mod tests {
     fn empty_branch_filter_dedupes_duplicate_base_and_staged_overlay_identity() {
         let base = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "base",
             false,
             Some("change-base"),
         );
         let staged = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "staged",
             false,
             Some("change-staged"),
@@ -748,14 +748,14 @@ mod tests {
             &MaterializedHotStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
-                    "entity",
+                    "row",
                     "global-value",
                     true,
                     Some("change-global"),
                 ),
                 tombstone_at(
                     "01920000-0000-7000-8000-0000000000a1",
-                    "entity",
+                    "row",
                     false,
                     Some("change-tombstone"),
                 ),
@@ -774,7 +774,7 @@ mod tests {
     fn staged_duplicate_identity_uses_last_mutation_without_tracking_lane_preference() {
         let mut tracked = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "tracked",
             false,
             Some("change-tracked"),
@@ -782,7 +782,7 @@ mod tests {
         tracked.untracked = false;
         let mut untracked = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "untracked",
             false,
             Some("change-untracked"),
@@ -827,7 +827,7 @@ mod tests {
     fn staged_row_replaces_base_row_for_same_visible_identity() {
         let mut base = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "base-untracked",
             false,
             Some("change-base-untracked"),
@@ -836,7 +836,7 @@ mod tests {
         base.commit_id = None;
         let mut staged = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "staged-tracked",
             false,
             Some("change-staged"),
@@ -864,7 +864,7 @@ mod tests {
     fn staged_global_tombstone_hides_projected_base_global_row() {
         let mut base = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "base",
             true,
             Some("change-base"),
@@ -875,7 +875,7 @@ mod tests {
             &MaterializedHotStateBatch::from_rows(vec![base]),
             &MaterializedHotStateBatch::from_rows(vec![tombstone_at(
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
-                "entity",
+                "row",
                 true,
                 Some("change-staged"),
             )]),
@@ -892,13 +892,13 @@ mod tests {
     fn base_branch_tombstone_hides_staged_global_row() {
         let base = tombstone_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             false,
             Some("change-base"),
         );
         let staged = row_at(
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            "entity",
+            "row",
             "staged",
             true,
             Some("change-staged"),
@@ -920,13 +920,13 @@ mod tests {
     fn base_branch_tombstone_hides_staged_global_row_regardless_of_tracking_state() {
         let base = tombstone_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             false,
             Some("change-base"),
         );
         let mut staged = row_at(
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            "entity",
+            "row",
             "staged",
             true,
             Some("change-staged"),
@@ -950,13 +950,13 @@ mod tests {
     fn staged_branch_row_overrides_base_branch_tombstone() {
         let base = tombstone_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             false,
             Some("change-base"),
         );
         let staged = row_at(
             "01920000-0000-7000-8000-0000000000a1",
-            "entity",
+            "row",
             "staged",
             false,
             Some("change-staged"),
@@ -981,14 +981,14 @@ mod tests {
             &MaterializedHotStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
-                    "entity",
+                    "row",
                     "global-value",
                     true,
                     Some("change-global"),
                 ),
                 tombstone_at(
                     "01920000-0000-7000-8000-0000000000a1",
-                    "entity",
+                    "row",
                     false,
                     Some("change-tombstone"),
                 ),
@@ -1047,7 +1047,7 @@ mod tests {
         let base = ExistingGlobalOnlyReader {
             rows: vec![row_at(
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
-                "entity",
+                "row",
                 "global-value",
                 true,
                 Some("change-global"),
@@ -1124,7 +1124,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].branch_id.as_ref(), unaffected_branch);
-        assert_eq!(rows[0].entity_pk, EntityPk::single("unaffected"));
+        assert_eq!(rows[0].row_pk, RowPk::single("unaffected"));
     }
 
     #[tokio::test]
@@ -1225,10 +1225,10 @@ mod tests {
                 ),
             ],
         };
-        let exact = |entity: &str| HotStateExactRowRequest {
+        let exact = |row: &str| HotStateExactRowRequest {
             schema_key: "schema".to_string(),
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
-            entity_pk: EntityPk::single(entity),
+            row_pk: RowPk::single(row),
             file_id: None,
         };
         let request = HotStateExactBatchRequest {
@@ -1285,13 +1285,13 @@ mod tests {
 
     fn row_at(
         branch_id: &str,
-        entity_pk: &str,
+        row_pk: &str,
         value: &str,
         global: bool,
         change_id: Option<&str>,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
             schema_key: "schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
@@ -1309,14 +1309,14 @@ mod tests {
 
     fn tombstone_at(
         branch_id: &str,
-        entity_pk: &str,
+        row_pk: &str,
         global: bool,
         change_id: Option<&str>,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
             snapshot_content: None,
             deleted: true,
-            ..row_at(branch_id, entity_pk, "ignored", global, change_id)
+            ..row_at(branch_id, row_pk, "ignored", global, change_id)
         }
     }
 
@@ -1329,8 +1329,8 @@ mod tests {
                 .any(|branch_id| branch_id == row.branch_id.as_ref());
         let schema_matches =
             filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.schema_key);
-        let entity_matches =
-            filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.entity_pk);
+        let row_matches =
+            filter.row_pks.is_empty() || filter.row_pks.contains(&row.row_pk);
         let file_matches = filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|file_id| match file_id {
                 NullableKeyFilter::Any => true,
@@ -1338,7 +1338,7 @@ mod tests {
                 NullableKeyFilter::Null => row.file_id.is_none(),
             });
         let tombstone_matches = filter.include_tombstones || !row.deleted;
-        branch_matches && schema_matches && entity_matches && file_matches && tombstone_matches
+        branch_matches && schema_matches && row_matches && file_matches && tombstone_matches
     }
 
     struct EmptyStagedRows;

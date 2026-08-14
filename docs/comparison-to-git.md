@@ -4,7 +4,7 @@ description: Lix is not a Git replacement. Keep code in Git; use Lix to version,
 
 # How Lix compares to Git
 
-Lix is not a Git replacement. Git versions source code as line-diffed text. Lix is an SDK you embed in an app to version files and data, with entity-level diffs and SQL over content and history.
+Lix is not a Git replacement. Git versions source code as line-diffed text. Lix is an SDK you embed in an app to version files and data, with row-level diffs and SQL over content and history.
 
 Keep your code in Git. Use Lix for the documents and app data your product needs to diff, merge, and roll back.
 
@@ -24,7 +24,7 @@ Keep your code in Git. Use Lix for the documents and app data your product needs
 | Runs embedded in your app                 | CLI-first; libraries exist   | SDK-first                               |
 | Pluggable storage (memory, disk, S3)      | Assumes a POSIX filesystem   | Yes                                     |
 
-An agent updates one field in an orders CSV. Git shows a changed text line or a binary blob. Lix shows the entity that changed:
+An agent updates one field in an orders CSV. Git shows a changed text line or a binary blob. Lix shows the row that changed:
 
 ```diff
 order_id 1002 status:
@@ -36,7 +36,7 @@ order_id 1002 status:
 And the history is queryable:
 
 ```sql
-SELECT created_at, schema_key, entity_pk, snapshot_content
+SELECT created_at, schema_key, row_pk, snapshot_content
 FROM lix_change
 ORDER BY created_at DESC
 LIMIT 20;
@@ -50,6 +50,6 @@ LIMIT 20;
 
 ## Deeper reading
 
-- [Semantic Changes](./semantic-changes.md): how plugins split files into entities.
+- [Semantic Changes](./semantic-changes.md): how plugins split files into rows.
 - [Change History](./history.md): query what changed with SQL.
 - [Persistence and Storage](./persistence.md): storage adapters from memory to S3.

@@ -17,21 +17,20 @@ use tracing::Instrument as _;
 
 use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
 use crate::common::{RequestBlobSpliceProvenance, SharedStr};
-use crate::entity_pk::EntityPk;
 use crate::hot_state::MaterializedHotStateBatch;
 use crate::plugin::runtime::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
-    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
+    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedRowBatch,
     WasmChangeDrainValidator, WasmChangePage, WasmComponentActor, WasmConflictResolution,
     WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
-    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
-    WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
-    WasmEntityConflictSource, WasmEntityKey, WasmEntityPage, WasmEntitySource,
-    WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
-    WasmHostConflictResolution, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
-    WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
+    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmFileTransition, WasmGuestBytes,
+    WasmHostBytes, WasmHostConflictResolution, WasmHostRow, WasmHostRowChanges, WasmInputBytes,
+    WasmInputSplice, WasmOutputRange, WasmRow, WasmRowChange, WasmRowChangeSource, WasmRowChanges,
+    WasmRowConflict, WasmRowConflictPage, WasmRowConflictSource, WasmRowKey, WasmRowPage,
+    WasmRowSource, WasmRowTransition, WasmSourceRange, WasmTransitionCounters,
     WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
 };
+use crate::row_pk::RowPk;
 use crate::{Blob, LixError};
 
 /// Exact SHA-256 identity for one actor-owned byte version.
@@ -137,44 +136,44 @@ impl WasmByteSource for ArcByteSource {
     }
 }
 
-/// Builds one host entity while keeping an indivisible oversized snapshot out
+/// Builds one host row while keeping an indivisible oversized snapshot out
 /// of the packet's inline record arena.
 ///
-/// Packet-v1 records cannot cross pages. The entity key, blob tag/length, and
+/// Packet-v1 records cannot cross pages. The row key, blob tag/length, and
 /// four-byte record frame all consume the record/page limits, so deciding from
 /// the snapshot length alone has an off-by-overhead failure at the boundary.
 /// A lazy source keeps the record bounded while retaining immutable ownership
 /// of the complete Snapshot JSON for the guest to read on demand.
-pub(crate) fn host_entity_with_lazy_snapshot(
-    key: WasmEntityKey,
+pub(crate) fn host_row_with_lazy_snapshot(
+    key: WasmRowKey,
     snapshot: Bytes,
     limits: WasmTransitionLimits,
-) -> Result<WasmHostEntity, LixError> {
+) -> Result<WasmHostRow, LixError> {
     let limits = limits.validate()?;
-    let mut entity = WasmEntity {
+    let mut row = WasmRow {
         key,
         snapshot_content: WasmHostBytes::Inline(snapshot),
     };
-    if host_entity_record_fits(&entity, limits) {
-        return Ok(entity);
+    if host_row_record_fits(&row, limits) {
+        return Ok(row);
     }
 
-    entity.snapshot_content = lazy_source_from_inline(entity.snapshot_content);
-    validate_host_entity(&entity)?;
-    require_framed_record_fits(encoded_entity_record_bytes(&entity)?, limits, "entity")?;
-    Ok(entity)
+    row.snapshot_content = lazy_source_from_inline(row.snapshot_content);
+    validate_host_row(&row)?;
+    require_framed_record_fits(encoded_row_record_bytes(&row)?, limits, "row")?;
+    Ok(row)
 }
 
-/// Change-record counterpart of [`host_entity_with_lazy_snapshot`].
-pub(crate) fn host_entity_change_with_lazy_snapshot(
-    key: WasmEntityKey,
+/// Change-record counterpart of [`host_row_with_lazy_snapshot`].
+pub(crate) fn host_row_change_with_lazy_snapshot(
+    key: WasmRowKey,
     snapshot: Bytes,
     effect: crate::plugin::runtime::WasmChangeEffect,
     limits: WasmTransitionLimits,
-) -> Result<WasmEntityChange<WasmHostBytes>, LixError> {
+) -> Result<WasmRowChange<WasmHostBytes>, LixError> {
     let limits = limits.validate()?;
-    let mut change = WasmEntityChange::Upsert {
-        entity: WasmEntity {
+    let mut change = WasmRowChange::Upsert {
+        row: WasmRow {
             key,
             snapshot_content: WasmHostBytes::Inline(snapshot),
         },
@@ -184,19 +183,19 @@ pub(crate) fn host_entity_change_with_lazy_snapshot(
         return Ok(change);
     }
 
-    let WasmEntityChange::Upsert { entity, .. } = &mut change else {
+    let WasmRowChange::Upsert { row, .. } = &mut change else {
         unreachable!("the helper constructs an upsert")
     };
     let snapshot = std::mem::replace(
-        &mut entity.snapshot_content,
+        &mut row.snapshot_content,
         WasmHostBytes::Inline(Bytes::new()),
     );
-    entity.snapshot_content = lazy_source_from_inline(snapshot);
-    validate_host_entity(entity)?;
+    row.snapshot_content = lazy_source_from_inline(snapshot);
+    validate_host_row(row)?;
     require_framed_record_fits(
-        encoded_entity_change_record_bytes(&change)?,
+        encoded_row_change_record_bytes(&change)?,
         limits,
-        "entity change",
+        "row change",
     )?;
     Ok(change)
 }
@@ -212,17 +211,17 @@ fn lazy_source_from_inline(bytes: WasmHostBytes) -> WasmHostBytes {
     })
 }
 
-fn host_entity_record_fits(entity: &WasmHostEntity, limits: WasmTransitionLimits) -> bool {
-    encoded_entity_record_bytes(entity)
+fn host_row_record_fits(row: &WasmHostRow, limits: WasmTransitionLimits) -> bool {
+    encoded_row_record_bytes(row)
         .ok()
         .is_some_and(|bytes| framed_record_fits(bytes, limits))
 }
 
 fn host_change_record_fits(
-    change: &WasmEntityChange<WasmHostBytes>,
+    change: &WasmRowChange<WasmHostBytes>,
     limits: WasmTransitionLimits,
 ) -> bool {
-    encoded_entity_change_record_bytes(change)
+    encoded_row_change_record_bytes(change)
         .ok()
         .is_some_and(|bytes| framed_record_fits(bytes, limits))
 }
@@ -742,7 +741,7 @@ pub(crate) fn canonicalize_snapshot(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
     let value = parse_number_free_snapshot(bytes)?;
     if !value.is_object() {
         return Err(invalid_guest(
-            "component entity snapshots must be JSON objects",
+            "component row snapshots must be JSON objects",
         ));
     }
     let mut canonical = Vec::new();
@@ -755,7 +754,7 @@ struct CanonicalJsonBatchBuilder {
     row_kinds: Vec<CanonicalJsonBatchRowKind>,
     decoded_values: Vec<serde_json::Value>,
     certified_normalized: Vec<SharedStr>,
-    certified_entity_pks: Vec<EntityPk>,
+    certified_row_pks: Vec<RowPk>,
     schema_fingerprints: Vec<Arc<SchemaPlanFingerprint>>,
     schema_fingerprint_indices: Vec<u32>,
     normalized_ends: Vec<u32>,
@@ -778,7 +777,7 @@ impl CanonicalJsonBatchBuilder {
             row_kinds: Vec::with_capacity(row_count),
             decoded_values: Vec::new(),
             certified_normalized: Vec::new(),
-            certified_entity_pks: Vec::new(),
+            certified_row_pks: Vec::new(),
             schema_fingerprints: Vec::new(),
             schema_fingerprint_indices: Vec::new(),
             normalized_ends: Vec::with_capacity(row_count),
@@ -798,7 +797,7 @@ impl CanonicalJsonBatchBuilder {
     fn reserve_certified_columns(&mut self) {
         if self.certified_normalized.capacity() == 0 {
             self.certified_normalized.reserve_exact(self.row_capacity);
-            self.certified_entity_pks.reserve_exact(self.row_capacity);
+            self.certified_row_pks.reserve_exact(self.row_capacity);
             self.schema_fingerprint_indices
                 .reserve_exact(self.row_capacity);
         }
@@ -827,7 +826,7 @@ impl CanonicalJsonBatchBuilder {
         let value = parse_number_free_snapshot(bytes)?;
         if !value.is_object() {
             return Err(invalid_guest(
-                "component entity snapshots must be JSON objects",
+                "component row snapshots must be JSON objects",
             ));
         }
 
@@ -848,7 +847,7 @@ impl CanonicalJsonBatchBuilder {
     fn push_plugin(
         &mut self,
         bytes: Bytes,
-        key: &WasmEntityKey,
+        key: &WasmRowKey,
         schemas: &SchemaAllowlist,
     ) -> Result<usize, LixError> {
         self.parse_count = self.parse_count.saturating_add(1);
@@ -881,7 +880,7 @@ impl CanonicalJsonBatchBuilder {
                 SharedStr::from_utf8(normalized)
                     .map_err(|_| invalid_guest("certified canonical JSON row is not UTF-8"))?,
             );
-            self.certified_entity_pks.push(certified.entity_pk);
+            self.certified_row_pks.push(certified.row_pk);
             self.schema_fingerprint_indices
                 .push(schema_fingerprint_index);
             self.row_kinds.push(CanonicalJsonBatchRowKind::Certified);
@@ -894,7 +893,7 @@ impl CanonicalJsonBatchBuilder {
         let value = parse_number_free_snapshot(&bytes)?;
         if !value.is_object() {
             return Err(invalid_guest(
-                "component entity snapshots must be JSON objects",
+                "component row snapshots must be JSON objects",
             ));
         }
         if let Some(plan) = plan {
@@ -907,18 +906,16 @@ impl CanonicalJsonBatchBuilder {
                 invalid_guest("component snapshot schema has no primary-key definition")
             })?;
             let emitted = json_pointer_components(&value, primary_key)?;
-            if emitted.as_slice() != key.entity_pk.as_slice() {
+            if emitted.as_slice() != key.row_pk.as_slice() {
                 return Err(invalid_guest(
-                    "component snapshot primary key does not match its entity key",
+                    "component snapshot primary key does not match its row key",
                 ));
             }
             let component_types = plan.primary_key_component_types.as_deref().ok_or_else(|| {
                 invalid_guest("component snapshot schema has no typed primary key")
             })?;
-            let entity_pk =
-                EntityPk::from_external_parts(emitted, component_types).map_err(|error| {
-                    invalid_guest(format!("component entity key is invalid: {error}"))
-                })?;
+            let row_pk = RowPk::from_external_parts(emitted, component_types)
+                .map_err(|error| invalid_guest(format!("component row key is invalid: {error}")))?;
             let encoded_len = canonical_json_encoded_len(&value)?;
             let mut normalized = Vec::with_capacity(encoded_len as usize);
             encode_number_free_json(&value, &mut normalized)?;
@@ -936,7 +933,7 @@ impl CanonicalJsonBatchBuilder {
                 SharedStr::from_utf8(Bytes::from(normalized))
                     .map_err(|_| invalid_guest("certified canonical JSON row is not UTF-8"))?,
             );
-            self.certified_entity_pks.push(entity_pk);
+            self.certified_row_pks.push(row_pk);
             self.schema_fingerprint_indices
                 .push(schema_fingerprint_index);
             self.row_kinds.push(CanonicalJsonBatchRowKind::Certified);
@@ -976,7 +973,7 @@ impl CanonicalJsonBatchBuilder {
             );
             return WasmCanonicalJson::from_certified_batch_parts(
                 self.certified_normalized,
-                self.certified_entity_pks,
+                self.certified_row_pks,
                 self.schema_fingerprints,
                 self.schema_fingerprint_indices,
                 self.parse_count,
@@ -989,7 +986,7 @@ impl CanonicalJsonBatchBuilder {
         let mut offsets = Vec::with_capacity(self.row_kinds.len());
         let mut decoded_values = self.decoded_values.into_iter();
         let mut certified_normalized = self.certified_normalized.into_iter();
-        let mut certified_entity_pks = self.certified_entity_pks.into_iter();
+        let mut certified_row_pks = self.certified_row_pks.into_iter();
         let mut schema_fingerprint_indices = self.schema_fingerprint_indices.into_iter();
         let mut serialize_count = self.serialize_count;
         let mut start = 0_u32;
@@ -1009,9 +1006,9 @@ impl CanonicalJsonBatchBuilder {
                     let canonical = certified_normalized
                         .next()
                         .expect("certified canonical JSON row has bytes");
-                    let entity_pk = certified_entity_pks
+                    let row_pk = certified_row_pks
                         .next()
-                        .expect("certified canonical JSON row has an entity identity");
+                        .expect("certified canonical JSON row has a row identity");
                     let schema_fingerprint_index = schema_fingerprint_indices
                         .next()
                         .expect("certified canonical JSON row has a schema index");
@@ -1023,7 +1020,7 @@ impl CanonicalJsonBatchBuilder {
                     normalized.extend_from_slice(canonical.as_bytes());
                     values.push(None);
                     certificates.push(Some(WasmCanonicalJsonCertificate::new(
-                        entity_pk,
+                        row_pk,
                         schema_fingerprint,
                     )));
                 }
@@ -1036,7 +1033,7 @@ impl CanonicalJsonBatchBuilder {
         {
             assert!(decoded_values.next().is_none());
             assert!(certified_normalized.next().is_none());
-            assert!(certified_entity_pks.next().is_none());
+            assert!(certified_row_pks.next().is_none());
             assert!(schema_fingerprint_indices.next().is_none());
         }
         debug_assert_eq!(normalized.len(), normalized.capacity());
@@ -1196,93 +1193,89 @@ fn encode_json_string(value: &str, output: &mut Vec<u8>) {
     output.push(b'"');
 }
 
-/// Vec-backed complete-entity packet source for cold rendering. Construction
+/// Vec-backed complete-row packet source for cold rendering. Construction
 /// enforces packet-v1's global key order.
 #[derive(Debug)]
-pub(crate) struct VecEntitySource {
-    entities: VecDeque<WasmHostEntity>,
+pub(crate) struct VecRowSource {
+    rows: VecDeque<WasmHostRow>,
     state: VecSourceState,
 }
 
-impl VecEntitySource {
+impl VecRowSource {
     pub(crate) fn new(
-        entities: Vec<WasmHostEntity>,
+        rows: Vec<WasmHostRow>,
         limits: WasmTransitionLimits,
     ) -> Result<Self, LixError> {
-        validate_entity_order(&entities)?;
-        for entity in &entities {
-            validate_host_entity(entity)?;
+        validate_row_order(&rows)?;
+        for row in &rows {
+            validate_host_row(row)?;
         }
         Ok(Self {
-            entities: entities.into(),
+            rows: rows.into(),
             state: VecSourceState::new(limits)?,
         })
     }
 }
 
-impl WasmEntitySource for VecEntitySource {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
+impl WasmRowSource for VecRowSource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError> {
         if self.state.reached_eof {
             return Ok(None);
         }
         let page_limit = self.state.page_limit(max_bytes)?;
-        if self.entities.is_empty() {
+        if self.rows.is_empty() {
             self.state.reached_eof = true;
             return Ok(None);
         }
 
         let mut page_bytes = 0u64;
         let mut page_refs = 0u32;
-        let mut entities = Vec::new();
-        while let Some(entity) = self.entities.front() {
-            let record_bytes = encoded_entity_record_bytes(entity)?;
+        let mut rows = Vec::new();
+        while let Some(row) = self.rows.front() {
+            let record_bytes = encoded_row_record_bytes(row)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
                 return Err(invalid_input(
-                    "component entity record exceeds max_record_bytes",
+                    "component row record exceeds max_record_bytes",
                 ));
             }
             let framed_bytes = record_bytes
                 .checked_add(4)
-                .ok_or_else(|| invalid_input("component entity frame length overflowed"))?;
+                .ok_or_else(|| invalid_input("component row frame length overflowed"))?;
             if page_bytes
                 .checked_add(framed_bytes)
                 .is_none_or(|size| size > page_limit)
             {
-                if entities.is_empty() {
+                if rows.is_empty() {
                     return Err(invalid_input(
-                        "component entity record does not fit the requested page",
+                        "component row record does not fit the requested page",
                     ));
                 }
                 break;
             }
             page_bytes += framed_bytes;
             page_refs = page_refs
-                .checked_add(host_bytes_attachment_refs(&entity.snapshot_content))
-                .ok_or_else(|| invalid_input("component entity attachment count overflowed"))?;
-            entities.push(
-                self.entities
-                    .pop_front()
-                    .expect("front entity was just inspected"),
-            );
+                .checked_add(host_bytes_attachment_refs(&row.snapshot_content))
+                .ok_or_else(|| invalid_input("component row attachment count overflowed"))?;
+            rows.push(self.rows.pop_front().expect("front row was just inspected"));
         }
         self.state.accept_page(page_bytes, page_refs)?;
-        Ok(Some(WasmEntityPage { entities }))
+        Ok(Some(WasmRowPage { rows }))
     }
 }
 
-/// Page-lazy complete-entity source backed by the engine's columnar live-state
+/// Page-lazy complete-row source backed by the engine's columnar live-state
 /// batch. This keeps shared snapshot buffers in their storage-native owner and
-/// constructs generic Wasm entities only for the page currently crossing the
+/// constructs generic Wasm rows only for the page currently crossing the
 /// component boundary.
 #[derive(Debug)]
-pub(crate) struct LiveBatchEntitySource {
+pub(crate) struct LiveBatchRowSource {
     rows: MaterializedHotStateBatch,
     ordinals: VecDeque<u32>,
-    pending: Option<WasmHostEntity>,
+    pending: Option<WasmHostRow>,
     state: VecSourceState,
 }
 
-impl LiveBatchEntitySource {
+impl LiveBatchRowSource {
     pub(crate) fn new(
         rows: MaterializedHotStateBatch,
         ordinals: Vec<u32>,
@@ -1291,10 +1284,10 @@ impl LiveBatchEntitySource {
         for pair in ordinals.windows(2) {
             let left = rows.row(pair[0] as usize);
             let right = rows.row(pair[1] as usize);
-            if left.schema_key() == right.schema_key() && left.entity_pk() == right.entity_pk() {
+            if left.schema_key() == right.schema_key() && left.row_pk() == right.row_pk() {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "durable component entity hydration returned duplicate keys",
+                    "durable component row hydration returned duplicate keys",
                 ));
             }
         }
@@ -1306,9 +1299,9 @@ impl LiveBatchEntitySource {
         })
     }
 
-    fn next_entity(&mut self) -> Result<Option<WasmHostEntity>, LixError> {
-        if let Some(entity) = self.pending.take() {
-            return Ok(Some(entity));
+    fn next_row(&mut self) -> Result<Option<WasmHostRow>, LixError> {
+        if let Some(row) = self.pending.take() {
+            return Ok(Some(row));
         }
         let Some(ordinal) = self.ordinals.pop_front() else {
             return Ok(None);
@@ -1325,10 +1318,10 @@ impl LiveBatchEntitySource {
                 "plugin state selection references a tombstoned row",
             )
         })?;
-        host_entity_with_lazy_snapshot(
-            WasmEntityKey::from_owned_parts(
+        host_row_with_lazy_snapshot(
+            WasmRowKey::from_owned_parts(
                 row.schema_key().to_owned(),
-                row.entity_pk().clone().into_parts(),
+                row.row_pk().clone().into_parts(),
             ),
             snapshot.clone().into_bytes(),
             self.state.limits,
@@ -1337,81 +1330,81 @@ impl LiveBatchEntitySource {
     }
 }
 
-impl WasmEntitySource for LiveBatchEntitySource {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
+impl WasmRowSource for LiveBatchRowSource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError> {
         if self.state.reached_eof {
             return Ok(None);
         }
         let page_limit = self.state.page_limit(max_bytes)?;
         let mut page_bytes = 0_u64;
         let mut page_refs = 0_u32;
-        let mut entities = Vec::new();
-        while let Some(entity) = self.next_entity()? {
-            let record_bytes = encoded_entity_record_bytes(&entity)?;
+        let mut rows = Vec::new();
+        while let Some(row) = self.next_row()? {
+            let record_bytes = encoded_row_record_bytes(&row)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
                 return Err(invalid_input(
-                    "component entity record exceeds max_record_bytes",
+                    "component row record exceeds max_record_bytes",
                 ));
             }
             let framed_bytes = record_bytes
                 .checked_add(4)
-                .ok_or_else(|| invalid_input("component entity frame length overflowed"))?;
+                .ok_or_else(|| invalid_input("component row frame length overflowed"))?;
             if page_bytes
                 .checked_add(framed_bytes)
                 .is_none_or(|size| size > page_limit)
             {
-                if entities.is_empty() {
+                if rows.is_empty() {
                     return Err(invalid_input(
-                        "component entity record does not fit the requested page",
+                        "component row record does not fit the requested page",
                     ));
                 }
-                self.pending = Some(entity);
+                self.pending = Some(row);
                 break;
             }
             page_bytes += framed_bytes;
             page_refs = page_refs
-                .checked_add(host_bytes_attachment_refs(&entity.snapshot_content))
-                .ok_or_else(|| invalid_input("component entity attachment count overflowed"))?;
-            entities.push(entity);
+                .checked_add(host_bytes_attachment_refs(&row.snapshot_content))
+                .ok_or_else(|| invalid_input("component row attachment count overflowed"))?;
+            rows.push(row);
         }
-        if entities.is_empty() {
+        if rows.is_empty() {
             self.state.reached_eof = true;
             return Ok(None);
         }
         self.state.accept_page(page_bytes, page_refs)?;
-        Ok(Some(WasmEntityPage { entities }))
+        Ok(Some(WasmRowPage { rows }))
     }
 }
 
 /// Vec-backed source for the final resolved semantic changes supplied to
-/// `entities_changed`.
+/// `rows_changed`.
 #[derive(Debug)]
-pub(crate) struct VecEntityChangeSource {
-    changes: VecDeque<WasmEntityChange<WasmHostBytes>>,
+pub(crate) struct VecRowChangeSource {
+    changes: VecDeque<WasmRowChange<WasmHostBytes>>,
     state: VecSourceState,
 }
 
-impl VecEntityChangeSource {
+impl VecRowChangeSource {
     pub(crate) fn new(
-        changes: WasmHostEntityChanges,
+        changes: WasmHostRowChanges,
         limits: WasmTransitionLimits,
     ) -> Result<Self, LixError> {
         changes.validate()?;
         validate_change_order(&changes.changes)?;
         for change in &changes.changes {
             match change {
-                WasmEntityChange::Create { .. } => {
+                WasmRowChange::Create { .. } => {
                     return Err(invalid_input(
-                        "host-to-guest entity changes cannot contain keyless creates",
+                        "host-to-guest row changes cannot contain keyless creates",
                     ));
                 }
-                WasmEntityChange::Upsert { entity, .. } => validate_host_entity(entity)?,
-                WasmEntityChange::Delete(key) if key.entity_pk.is_empty() => {
+                WasmRowChange::Upsert { row, .. } => validate_host_row(row)?,
+                WasmRowChange::Delete(key) if key.row_pk.is_empty() => {
                     return Err(invalid_input(
-                        "component entity primary keys must not be empty",
+                        "component row primary keys must not be empty",
                     ));
                 }
-                WasmEntityChange::Delete(_) => {}
+                WasmRowChange::Delete(_) => {}
             }
         }
         Ok(Self {
@@ -1421,8 +1414,8 @@ impl VecEntityChangeSource {
     }
 }
 
-impl WasmEntityChangeSource for VecEntityChangeSource {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmHostEntityChanges>, LixError> {
+impl WasmRowChangeSource for VecRowChangeSource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmHostRowChanges>, LixError> {
         if self.state.reached_eof {
             return Ok(None);
         }
@@ -1436,7 +1429,7 @@ impl WasmEntityChangeSource for VecEntityChangeSource {
         let mut page_refs = 0u32;
         let mut changes = Vec::new();
         while let Some(change) = self.changes.front() {
-            let record_bytes = encoded_entity_change_record_bytes(change)?;
+            let record_bytes = encoded_row_change_record_bytes(change)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
                 return Err(invalid_input(
                     "component change record exceeds max_record_bytes",
@@ -1467,23 +1460,23 @@ impl WasmEntityChangeSource for VecEntityChangeSource {
             );
         }
         self.state.accept_page(page_bytes, page_refs)?;
-        Ok(Some(WasmEntityChanges { changes }))
+        Ok(Some(WasmRowChanges { changes }))
     }
 }
 
 /// Vec-backed lazy source for same-identity three-way conflict triples. The
-/// source is deliberately separate from `VecEntityChangeSource`: a conflict
-/// exposes three immutable versions, while an entity update exposes only the
+/// source is deliberately separate from `VecRowChangeSource`: a conflict
+/// exposes three immutable versions, while a row update exposes only the
 /// already resolved final state.
 #[derive(Debug)]
-pub(crate) struct VecEntityConflictSource {
-    conflicts: VecDeque<WasmEntityConflict<WasmHostBytes>>,
+pub(crate) struct VecRowConflictSource {
+    conflicts: VecDeque<WasmRowConflict<WasmHostBytes>>,
     state: VecSourceState,
 }
 
-impl VecEntityConflictSource {
+impl VecRowConflictSource {
     pub(crate) fn new(
-        conflicts: Vec<WasmEntityConflict<WasmHostBytes>>,
+        conflicts: Vec<WasmRowConflict<WasmHostBytes>>,
         limits: WasmTransitionLimits,
     ) -> Result<Self, LixError> {
         validate_conflict_order(&conflicts)?;
@@ -1501,7 +1494,7 @@ impl VecEntityConflictSource {
                 .into_iter()
                 .flatten()
             {
-                validate_host_entity(&WasmEntity {
+                validate_host_row(&WasmRow {
                     key: conflict.key.clone(),
                     snapshot_content: snapshot.clone(),
                 })?;
@@ -1514,8 +1507,8 @@ impl VecEntityConflictSource {
     }
 }
 
-impl WasmEntityConflictSource for VecEntityConflictSource {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityConflictPage>, LixError> {
+impl WasmRowConflictSource for VecRowConflictSource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowConflictPage>, LixError> {
         if self.state.reached_eof {
             return Ok(None);
         }
@@ -1529,7 +1522,7 @@ impl WasmEntityConflictSource for VecEntityConflictSource {
         let mut page_refs = 0u32;
         let mut conflicts = Vec::new();
         while let Some(conflict) = self.conflicts.front() {
-            let record_bytes = encoded_entity_conflict_record_bytes(conflict)?;
+            let record_bytes = encoded_row_conflict_record_bytes(conflict)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
                 return Err(invalid_input(
                     "component conflict record exceeds max_record_bytes",
@@ -1567,7 +1560,7 @@ impl WasmEntityConflictSource for VecEntityConflictSource {
             );
         }
         self.state.accept_page(page_bytes, page_refs)?;
-        Ok(Some(WasmEntityConflictPage { conflicts }))
+        Ok(Some(WasmRowConflictPage { conflicts }))
     }
 }
 
@@ -1633,41 +1626,39 @@ impl VecSourceState {
     }
 }
 
-fn validate_entity_order(entities: &[WasmHostEntity]) -> Result<(), LixError> {
-    for pair in entities.windows(2) {
+fn validate_row_order(rows: &[WasmHostRow]) -> Result<(), LixError> {
+    for pair in rows.windows(2) {
         if pair[0].key >= pair[1].key {
             return Err(invalid_input(
-                "component complete entity sources must be strictly key-sorted and unique",
+                "component complete row sources must be strictly key-sorted and unique",
             ));
         }
     }
     Ok(())
 }
 
-fn validate_change_order<B>(changes: &[WasmEntityChange<B>]) -> Result<(), LixError> {
+fn validate_change_order<B>(changes: &[WasmRowChange<B>]) -> Result<(), LixError> {
     if changes
         .iter()
-        .any(|change| matches!(change, WasmEntityChange::Create { .. }))
+        .any(|change| matches!(change, WasmRowChange::Create { .. }))
     {
         return Ok(());
     }
     for pair in changes.windows(2) {
-        if pair[0].entity_key() >= pair[1].entity_key() {
+        if pair[0].row_key() >= pair[1].row_key() {
             return Err(invalid_input(
-                "component entity changes must be strictly key-sorted and unique",
+                "component row changes must be strictly key-sorted and unique",
             ));
         }
     }
     Ok(())
 }
 
-fn validate_conflict_order(
-    conflicts: &[WasmEntityConflict<WasmHostBytes>],
-) -> Result<(), LixError> {
+fn validate_conflict_order(conflicts: &[WasmRowConflict<WasmHostBytes>]) -> Result<(), LixError> {
     for conflict in conflicts {
-        if conflict.key.entity_pk.is_empty() {
+        if conflict.key.row_pk.is_empty() {
             return Err(invalid_input(
-                "component conflict entity primary keys must not be empty",
+                "component conflict row primary keys must not be empty",
             ));
         }
     }
@@ -1681,38 +1672,32 @@ fn validate_conflict_order(
     Ok(())
 }
 
-fn validate_host_entity(entity: &WasmHostEntity) -> Result<(), LixError> {
-    if entity.key.entity_pk.is_empty() {
+fn validate_host_row(row: &WasmHostRow) -> Result<(), LixError> {
+    if row.key.row_pk.is_empty() {
         return Err(invalid_input(
-            "component entity primary keys must not be empty",
+            "component row primary keys must not be empty",
         ));
     }
-    if let WasmHostBytes::Source(slice) = &entity.snapshot_content {
+    if let WasmHostBytes::Source(slice) = &row.snapshot_content {
         slice.validate()?;
     }
     Ok(())
 }
 
-fn encoded_entity_record_bytes(entity: &WasmHostEntity) -> Result<u64, LixError> {
-    entity
-        .key
-        .entity_pk
+fn encoded_row_record_bytes(row: &WasmHostRow) -> Result<u64, LixError> {
+    row.key
+        .row_pk
         .iter()
-        .try_fold(
-            entity.key.schema_key.len() as u64 + 32,
-            |size, component| {
-                size.checked_add(component.len() as u64)
-                    .ok_or_else(|| invalid_input("component entity record size overflowed"))
-            },
-        )?
-        .checked_add(encoded_host_bytes_ref_bytes(&entity.snapshot_content)?)
-        .ok_or_else(|| invalid_input("component entity record size overflowed"))
+        .try_fold(row.key.schema_key.len() as u64 + 32, |size, component| {
+            size.checked_add(component.len() as u64)
+                .ok_or_else(|| invalid_input("component row record size overflowed"))
+        })?
+        .checked_add(encoded_host_bytes_ref_bytes(&row.snapshot_content)?)
+        .ok_or_else(|| invalid_input("component row record size overflowed"))
 }
 
-fn encoded_entity_change_record_bytes(
-    change: &WasmEntityChange<WasmHostBytes>,
-) -> Result<u64, LixError> {
-    if let WasmEntityChange::Create {
+fn encoded_row_change_record_bytes(change: &WasmRowChange<WasmHostBytes>) -> Result<u64, LixError> {
+    if let WasmRowChange::Create {
         schema_key,
         snapshot_content,
         ..
@@ -1724,28 +1709,26 @@ fn encoded_entity_change_record_bytes(
             .and_then(|size| size.checked_add(snapshot_bytes))
             .ok_or_else(|| invalid_input("component create record size overflowed"));
     }
-    let key = change
-        .entity_key()
-        .expect("non-create change has an entity key");
+    let key = change.row_key().expect("non-create change has a row key");
     let mut size =
-        key.entity_pk
+        key.row_pk
             .iter()
             .try_fold(key.schema_key.len() as u64 + 32, |size, component| {
                 size.checked_add(component.len() as u64)
                     .ok_or_else(|| invalid_input("component change record size overflowed"))
             })?;
-    if let WasmEntityChange::Upsert { entity, .. } = change {
+    if let WasmRowChange::Upsert { row, .. } = change {
         size = size
-            .checked_add(encoded_host_bytes_ref_bytes(&entity.snapshot_content)?)
+            .checked_add(encoded_host_bytes_ref_bytes(&row.snapshot_content)?)
             .ok_or_else(|| invalid_input("component change record size overflowed"))?;
     }
     Ok(size)
 }
 
-fn encoded_entity_conflict_record_bytes(
-    conflict: &WasmEntityConflict<WasmHostBytes>,
+fn encoded_row_conflict_record_bytes(
+    conflict: &WasmRowConflict<WasmHostBytes>,
 ) -> Result<u64, LixError> {
-    let mut size = encoded_entity_key_bytes(&conflict.key)?
+    let mut size = encoded_row_key_bytes(&conflict.key)?
         .checked_add(4)
         .ok_or_else(|| invalid_input("component conflict record size overflowed"))?;
     for snapshot in [&conflict.base, &conflict.a, &conflict.b] {
@@ -1763,21 +1746,21 @@ fn encoded_entity_conflict_record_bytes(
     Ok(size)
 }
 
-fn encoded_entity_key_bytes(key: &WasmEntityKey) -> Result<u64, LixError> {
-    if key.entity_pk.is_empty() {
+fn encoded_row_key_bytes(key: &WasmRowKey) -> Result<u64, LixError> {
+    if key.row_pk.is_empty() {
         return Err(invalid_input(
-            "component entity primary keys must not be empty",
+            "component row primary keys must not be empty",
         ));
     }
-    let _ = u32::try_from(key.entity_pk.len())
-        .map_err(|_| invalid_input("component entity primary key has too many components"))?;
+    let _ = u32::try_from(key.row_pk.len())
+        .map_err(|_| invalid_input("component row primary key has too many components"))?;
     let mut size = encoded_text_bytes(&key.schema_key)?
         .checked_add(4)
-        .ok_or_else(|| invalid_input("component entity key size overflowed"))?;
-    for component in &key.entity_pk {
+        .ok_or_else(|| invalid_input("component row key size overflowed"))?;
+    for component in &key.row_pk {
         size = size
             .checked_add(encoded_text_bytes(component)?)
-            .ok_or_else(|| invalid_input("component entity key size overflowed"))?;
+            .ok_or_else(|| invalid_input("component row key size overflowed"))?;
     }
     Ok(size)
 }
@@ -1811,28 +1794,26 @@ fn host_bytes_attachment_refs(value: &WasmHostBytes) -> u32 {
     u32::from(matches!(value, WasmHostBytes::Source(_)))
 }
 
-fn change_attachment_refs(change: &WasmEntityChange<WasmHostBytes>) -> u32 {
+fn change_attachment_refs(change: &WasmRowChange<WasmHostBytes>) -> u32 {
     match change {
-        WasmEntityChange::Create {
+        WasmRowChange::Create {
             snapshot_content, ..
         } => u32::from(matches!(snapshot_content, WasmHostBytes::Source(_))),
-        WasmEntityChange::Upsert { entity, .. } => {
-            host_bytes_attachment_refs(&entity.snapshot_content)
-        }
-        WasmEntityChange::Delete(_) => 0,
+        WasmRowChange::Upsert { row, .. } => host_bytes_attachment_refs(&row.snapshot_content),
+        WasmRowChange::Delete(_) => 0,
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedFileTransition {
     pub(crate) document: WasmDocumentHandle,
-    pub(crate) changes: WasmHostEntityChanges,
-    pub(crate) certified_batches: Vec<WasmCertifiedEntityBatch>,
+    pub(crate) changes: WasmHostRowChanges,
+    pub(crate) certified_batches: Vec<WasmCertifiedRowBatch>,
     pub(crate) counters: WasmTransitionCounters,
 }
 
 /// Fully drained static conflict-resolution output. Results remain aligned to
-/// the caller's conflict list; the merge planner owns the entity keys and
+/// the caller's conflict list; the merge planner owns the row keys and
 /// historical rows used by a `Take` result.
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedConflictTransition {
@@ -1861,7 +1842,7 @@ pub(crate) struct ValidatedSameLengthOutputSplice {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ValidatedEntityTransition {
+pub(crate) struct ValidatedRowTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) bytes: Blob,
     pub(crate) bytes_sha256: Option<FileBytesSha256>,
@@ -1874,8 +1855,8 @@ pub(crate) struct ValidatedEntityTransition {
     pub(crate) counters: WasmTransitionCounters,
 }
 
-fn validate_certified_entity_batches(
-    batches: &mut [WasmCertifiedEntityBatch],
+fn validate_certified_row_batches(
+    batches: &mut [WasmCertifiedRowBatch],
     schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     for batch in batches {
@@ -1886,7 +1867,7 @@ fn validate_certified_entity_batches(
             2 => validate_certified_snapshot_packets(batch, schemas)?,
             format => {
                 return Err(invalid_guest(format!(
-                    "unknown certified entity batch format {format}"
+                    "unknown certified row batch format {format}"
                 )));
             }
         }
@@ -1913,7 +1894,7 @@ pub(crate) fn certify_dense_fresh_file(
         return Ok(());
     }
     let Some(schema_key) = transition.changes.changes.first().and_then(|change| {
-        let WasmEntityChange::Create { schema_key, .. } = change else {
+        let WasmRowChange::Create { schema_key, .. } = change else {
             return None;
         };
         Some(schema_key.as_str())
@@ -1923,7 +1904,7 @@ pub(crate) fn certify_dense_fresh_file(
     if !transition.changes.changes.iter().all(|change| {
         matches!(
             change,
-            WasmEntityChange::Create {
+            WasmRowChange::Create {
                 schema_key: candidate_schema_key,
                 resolved_key: None,
                 snapshot_content: WasmHostBytes::CanonicalJson(_),
@@ -1952,7 +1933,7 @@ pub(crate) fn certify_dense_fresh_file(
         .changes
         .iter()
         .filter_map(|change| match change {
-            WasmEntityChange::Create {
+            WasmRowChange::Create {
                 snapshot_content: WasmHostBytes::CanonicalJson(snapshot),
                 ..
             } => Some(snapshot.normalized().len()),
@@ -1966,7 +1947,7 @@ pub(crate) fn certify_dense_fresh_file(
     let mut page_first_local_ref = None;
     let mut page_last_local_ref = None;
     for change in &transition.changes.changes {
-        let WasmEntityChange::Create {
+        let WasmRowChange::Create {
             schema_key,
             local_ref,
             snapshot_content: WasmHostBytes::CanonicalJson(snapshot),
@@ -2050,7 +2031,7 @@ pub(crate) fn certify_dense_fresh_file(
             compressed_pages,
         )?);
     }
-    let batch = WasmCertifiedEntityBatch {
+    let batch = WasmCertifiedRowBatch {
         // Formats 3 and 4 are host-only equivalents of the format-2 packet
         // codec. Guest batches are validated before this synthesis point and
         // the guest-facing validator intentionally rejects both formats.
@@ -2098,7 +2079,7 @@ fn finish_host_certified_packet_page(
 }
 
 fn validate_certified_snapshot_packets(
-    batch: &mut WasmCertifiedEntityBatch,
+    batch: &mut WasmCertifiedRowBatch,
     schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     let mut rows = 0_u64;
@@ -2115,7 +2096,7 @@ fn validate_certified_snapshot_packets(
                 })?;
                 Ok::<_, LixError>(found || !plan.foreign_keys.is_empty())
             })?;
-    let mut entity_keys = BTreeSet::new();
+    let mut row_keys = BTreeSet::new();
     let mut foreign_keys = Vec::new();
     for page in &batch.pages {
         let mut page = CertifiedPacketReader::new(page);
@@ -2155,7 +2136,7 @@ fn validate_certified_snapshot_packets(
                         snapshot,
                         batch.complete_file_state,
                         validate_relationships,
-                        &mut entity_keys,
+                        &mut row_keys,
                         &mut foreign_keys,
                     )?
                 }
@@ -2181,7 +2162,7 @@ fn validate_certified_snapshot_packets(
                         snapshot,
                         batch.complete_file_state,
                         validate_relationships,
-                        &mut entity_keys,
+                        &mut row_keys,
                         &mut foreign_keys,
                     )?;
                     normalized
@@ -2219,8 +2200,7 @@ fn validate_certified_snapshot_packets(
             "certified batch schema header does not match its records",
         ));
     }
-    if let Some((schema_key, components)) =
-        foreign_keys.iter().find(|key| !entity_keys.contains(*key))
+    if let Some((schema_key, components)) = foreign_keys.iter().find(|key| !row_keys.contains(*key))
     {
         return Err(invalid_guest(format!(
             "certified foreign key '{}:{components:?}' is absent from the complete batch",
@@ -2230,7 +2210,7 @@ fn validate_certified_snapshot_packets(
     Ok(())
 }
 
-type CertifiedEntityKey = (String, Vec<String>);
+type CertifiedRowKey = (String, Vec<String>);
 
 fn validate_certified_record(
     plan: &SchemaPlan,
@@ -2239,14 +2219,14 @@ fn validate_certified_record(
     snapshot: &[u8],
     complete_file_state: bool,
     validate_relationships: bool,
-    entity_keys: &mut BTreeSet<CertifiedEntityKey>,
-    foreign_keys: &mut Vec<CertifiedEntityKey>,
+    row_keys: &mut BTreeSet<CertifiedRowKey>,
+    foreign_keys: &mut Vec<CertifiedRowKey>,
 ) -> Result<Option<Vec<u8>>, LixError> {
     if let Some(normalized) =
         plan.certify_or_normalize_plugin_row_parts(snapshot, schema_key, components)?
     {
         if validate_relationships {
-            entity_keys.insert((
+            row_keys.insert((
                 schema_key.to_owned(),
                 components.iter().map(|value| (*value).to_owned()).collect(),
             ));
@@ -2276,11 +2256,11 @@ fn validate_certified_record(
         .ne(components.iter().copied())
     {
         return Err(invalid_guest(
-            "certified snapshot primary key does not match its entity key",
+            "certified snapshot primary key does not match its row key",
         ));
     }
     if validate_relationships {
-        entity_keys.insert((schema_key.to_owned(), emitted));
+        row_keys.insert((schema_key.to_owned(), emitted));
         for foreign_key in &plan.foreign_keys {
             let values = json_pointer_components_optional(&value, &foreign_key.local_properties)?;
             if let Some(values) = values {
@@ -2462,7 +2442,7 @@ async fn drain_file_transition_changes_inner(
             .changes
             .changes
             .iter()
-            .filter(|change| !matches!(change, WasmEntityChange::Delete(_)))
+            .filter(|change| !matches!(change, WasmRowChange::Delete(_)))
             .count();
         let page_start = changes.len();
         changes.reserve(page_row_count);
@@ -2472,7 +2452,7 @@ async fn drain_file_transition_changes_inner(
             let mut page_snapshot_ordinal = 0usize;
             for change in page.changes.changes {
                 let resolved = match change {
-                    WasmEntityChange::Create {
+                    WasmRowChange::Create {
                         schema_key,
                         local_ref,
                         mut resolved_key,
@@ -2499,7 +2479,7 @@ async fn drain_file_transition_changes_inner(
                                     plan.primary_key.as_deref().unwrap_or_default()
                                 else {
                                     return Err(invalid_guest(
-                                        "created entities require exactly one generated primary-key field",
+                                        "created rows require exactly one generated primary-key field",
                                     ));
                                 };
                                 let id = creates.component(local_ref)?;
@@ -2510,10 +2490,10 @@ async fn drain_file_transition_changes_inner(
                                 )
                                 .map_err(|error| {
                                     invalid_guest(format!(
-                                        "created entity identity is invalid: {error}"
+                                        "created row identity is invalid: {error}"
                                     ))
                                 })?;
-                                let key = WasmEntityKey::from_owned_parts(
+                                let key = WasmRowKey::from_owned_parts(
                                     schema_key.clone(),
                                     vec![id],
                                 );
@@ -2524,7 +2504,7 @@ async fn drain_file_transition_changes_inner(
                         };
                         debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
                         page_snapshot_ordinal += 1;
-                        WasmEntityChange::Create {
+                        WasmRowChange::Create {
                             schema_key,
                             local_ref,
                             resolved_key,
@@ -2533,23 +2513,23 @@ async fn drain_file_transition_changes_inner(
                             snapshot_content: WasmHostBytes::Inline(Bytes::new()),
                         }
                     }
-                    WasmEntityChange::Delete(key) => WasmEntityChange::Delete(key),
-                    WasmEntityChange::Upsert { entity, effect } => {
+                    WasmRowChange::Delete(key) => WasmRowChange::Delete(key),
+                    WasmRowChange::Upsert { row, effect } => {
                         let snapshot = resolve_guest_bytes(
                             actor,
                             transition.transition,
                             outputs,
-                            entity.snapshot_content,
+                            row.snapshot_content,
                             &mut budget,
                             &mut local_counters,
                         )
                         .await?;
-                        let snapshot_row = snapshots.push_plugin(snapshot, &entity.key, schemas)?;
+                        let snapshot_row = snapshots.push_plugin(snapshot, &row.key, schemas)?;
                         debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
                         page_snapshot_ordinal += 1;
-                        WasmEntityChange::Upsert {
-                            entity: WasmEntity {
-                                key: entity.key,
+                        WasmRowChange::Upsert {
+                            row: WasmRow {
+                                key: row.key,
                                 // The canonical page does not exist until every
                                 // snapshot has validated. Patch this sentinel in
                                 // place after `finish`, retaining source order
@@ -2575,11 +2555,11 @@ async fn drain_file_transition_changes_inner(
         debug_assert_eq!(changes.len() - page_start, page_row_count);
         for change in &mut changes[page_start..] {
             let snapshot_content = match change {
-                WasmEntityChange::Create {
+                WasmRowChange::Create {
                     snapshot_content, ..
                 } => Some(snapshot_content),
-                WasmEntityChange::Upsert { entity, .. } => Some(&mut entity.snapshot_content),
-                WasmEntityChange::Delete(_) => None,
+                WasmRowChange::Upsert { row, .. } => Some(&mut row.snapshot_content),
+                WasmRowChange::Delete(_) => None,
             };
             if let Some(snapshot_content) = snapshot_content {
                 debug_assert!(matches!(
@@ -2602,8 +2582,8 @@ async fn drain_file_transition_changes_inner(
             error.message
         ))
     })?;
-    let mut certified_batches = actor.take_certified_entity_batches(transition.transition);
-    validate_certified_entity_batches(&mut certified_batches, schemas)?;
+    let mut certified_batches = actor.take_certified_row_batches(transition.transition);
+    validate_certified_row_batches(&mut certified_batches, schemas)?;
     let runtime_counters = actor
         .finish_transition(transition.transition)
         .instrument(tracing::debug_span!(
@@ -2613,7 +2593,7 @@ async fn drain_file_transition_changes_inner(
         .await?;
     Ok(ValidatedFileTransition {
         document: transition.document,
-        changes: WasmEntityChanges { changes },
+        changes: WasmRowChanges { changes },
         certified_batches,
         counters: merge_counter_snapshots(local_counters, runtime_counters),
     })
@@ -2777,16 +2757,16 @@ async fn drain_conflict_transition_resolutions_inner(
 /// Drains renderer edit pages, resolves lazy output ranges, applies the edits
 /// against one immutable base, and optionally proves byte equality with an
 /// independently reconstructed expected result.
-pub(crate) async fn drain_entity_transition_edits(
+pub(crate) async fn drain_row_transition_edits(
     actor: &mut dyn WasmComponentActor,
-    transition: WasmEntityTransition,
+    transition: WasmRowTransition,
     base: &[u8],
     expected: Option<Blob>,
     expected_delta: Option<&[WasmInputSplice]>,
     limits: WasmTransitionLimits,
-) -> Result<ValidatedEntityTransition, LixError> {
+) -> Result<ValidatedRowTransition, LixError> {
     let transition_handle = transition.transition;
-    match drain_entity_transition_edits_inner(
+    match drain_row_transition_edits_inner(
         actor,
         transition,
         base,
@@ -2801,14 +2781,14 @@ pub(crate) async fn drain_entity_transition_edits(
     }
 }
 
-async fn drain_entity_transition_edits_inner(
+async fn drain_row_transition_edits_inner(
     actor: &mut dyn WasmComponentActor,
-    transition: WasmEntityTransition,
+    transition: WasmRowTransition,
     base: &[u8],
     expected: Option<Blob>,
     expected_delta: Option<&[WasmInputSplice]>,
     limits: WasmTransitionLimits,
-) -> Result<ValidatedEntityTransition, LixError> {
+) -> Result<ValidatedRowTransition, LixError> {
     let mut validator = WasmEditDrainValidator::new(base.len() as u64, limits)?;
     let mut budget = OutputDrainBudget::new(limits)?;
     let mut local_counters = WasmTransitionCounters::default();
@@ -2881,7 +2861,7 @@ async fn drain_entity_transition_edits_inner(
     // until a later request actually presents transport splice provenance.
     let bytes_sha256 = expected.as_ref().map(|_| FileBytesSha256::compute(&bytes));
     let runtime_counters = actor.finish_transition(transition.transition).await?;
-    Ok(ValidatedEntityTransition {
+    Ok(ValidatedRowTransition {
         document: transition.document,
         bytes,
         bytes_sha256,
@@ -3046,19 +3026,19 @@ fn prevalidate_change_page(
     let mut references = 0u32;
     for change in &page.changes.changes {
         schemas.validate(change.schema_key())?;
-        if let Some(key) = change.entity_key()
-            && key.entity_pk.is_empty()
+        if let Some(key) = change.row_key()
+            && key.row_pk.is_empty()
         {
             return Err(invalid_guest(
-                "component entity primary keys must not be empty",
+                "component row primary keys must not be empty",
             ));
         }
         let snapshot = match change {
-            WasmEntityChange::Create {
+            WasmRowChange::Create {
                 snapshot_content, ..
             } => Some(snapshot_content),
-            WasmEntityChange::Upsert { entity, .. } => Some(&entity.snapshot_content),
-            WasmEntityChange::Delete(_) => None,
+            WasmRowChange::Upsert { row, .. } => Some(&row.snapshot_content),
+            WasmRowChange::Delete(_) => None,
         };
         if let Some(snapshot) = snapshot {
             match snapshot {
@@ -3435,34 +3415,30 @@ fn merge_counter_snapshots(
             .max(runtime.state_value_bytes_read),
         packet_pages: local.packet_pages.max(runtime.packet_pages),
         packet_records: local.packet_records.max(runtime.packet_records),
-        entity_input_pages: local.entity_input_pages.max(runtime.entity_input_pages),
-        entity_input_records: local.entity_input_records.max(runtime.entity_input_records),
-        entity_input_wire_bytes: local
-            .entity_input_wire_bytes
-            .max(runtime.entity_input_wire_bytes),
-        entity_output_pages: local.entity_output_pages.max(runtime.entity_output_pages),
-        entity_output_records: local
-            .entity_output_records
-            .max(runtime.entity_output_records),
-        entity_output_wire_bytes: local
-            .entity_output_wire_bytes
-            .max(runtime.entity_output_wire_bytes),
+        row_input_pages: local.row_input_pages.max(runtime.row_input_pages),
+        row_input_records: local.row_input_records.max(runtime.row_input_records),
+        row_input_wire_bytes: local.row_input_wire_bytes.max(runtime.row_input_wire_bytes),
+        row_output_pages: local.row_output_pages.max(runtime.row_output_pages),
+        row_output_records: local.row_output_records.max(runtime.row_output_records),
+        row_output_wire_bytes: local
+            .row_output_wire_bytes
+            .max(runtime.row_output_wire_bytes),
         attachment_reads: local.attachment_reads.max(runtime.attachment_reads),
         attachment_bytes_read: local
             .attachment_bytes_read
             .max(runtime.attachment_bytes_read),
-        entity_input_attachment_reads: local
-            .entity_input_attachment_reads
-            .max(runtime.entity_input_attachment_reads),
-        entity_input_attachment_bytes: local
-            .entity_input_attachment_bytes
-            .max(runtime.entity_input_attachment_bytes),
-        entity_output_attachment_writes: local
-            .entity_output_attachment_writes
-            .max(runtime.entity_output_attachment_writes),
-        entity_output_attachment_bytes: local
-            .entity_output_attachment_bytes
-            .max(runtime.entity_output_attachment_bytes),
+        row_input_attachment_reads: local
+            .row_input_attachment_reads
+            .max(runtime.row_input_attachment_reads),
+        row_input_attachment_bytes: local
+            .row_input_attachment_bytes
+            .max(runtime.row_input_attachment_bytes),
+        row_output_attachment_writes: local
+            .row_output_attachment_writes
+            .max(runtime.row_output_attachment_writes),
+        row_output_attachment_bytes: local
+            .row_output_attachment_bytes
+            .max(runtime.row_output_attachment_bytes),
         component_import_calls: local
             .component_import_calls
             .max(runtime.component_import_calls),
@@ -3538,7 +3514,7 @@ mod tests {
     use super::*;
     use crate::plugin::runtime::{
         WasmChangeCursorHandle, WasmChangeEffect, WasmCreateContext, WasmEditCursorHandle,
-        WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputSplice,
+        WasmOpenFileInput, WasmOpenRowsInput, WasmOutputSplice,
     };
 
     const UUID_A: &str = "019a0000-0000-7000-8000-000000000001";
@@ -3552,12 +3528,12 @@ mod tests {
         }
     }
 
-    fn key(id: &str) -> WasmEntityKey {
-        WasmEntityKey::from_owned_parts("csv_row", vec![id.to_owned()])
+    fn key(id: &str) -> WasmRowKey {
+        WasmRowKey::from_owned_parts("csv_row", vec![id.to_owned()])
     }
 
-    fn host_entity(id: &str) -> WasmHostEntity {
-        WasmEntity {
+    fn host_row(id: &str) -> WasmHostRow {
+        WasmRow {
             key: key(id),
             snapshot_content: WasmHostBytes::Inline(
                 format!(r#"{{"cells":[],"id":"{id}","order_key":"a"}}"#)
@@ -3921,9 +3897,7 @@ mod tests {
         assert!(
             batch.certified_normalized.capacity() * size_of::<SharedStr>() < LARGE_ALLOCATION_BYTES
         );
-        assert!(
-            batch.certified_entity_pks.capacity() * size_of::<EntityPk>() < LARGE_ALLOCATION_BYTES
-        );
+        assert!(batch.certified_row_pks.capacity() * size_of::<RowPk>() < LARGE_ALLOCATION_BYTES);
         assert!(
             batch.schema_fingerprint_indices.capacity() * size_of::<u32>() < LARGE_ALLOCATION_BYTES
         );
@@ -3963,14 +3937,14 @@ mod tests {
         batch
             .push_plugin(
                 first,
-                &WasmEntityKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]),
+                &WasmRowKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]),
                 &schemas,
             )
             .expect("first canonical row");
         batch
             .push_plugin(
                 second,
-                &WasmEntityKey::from_owned_parts("csv_row", vec![UUID_B.to_owned()]),
+                &WasmRowKey::from_owned_parts("csv_row", vec![UUID_B.to_owned()]),
                 &schemas,
             )
             .expect("second canonical row");
@@ -3988,18 +3962,12 @@ mod tests {
         assert_eq!(rows[0].batch_certified_schema_count(), 1);
         assert!(rows.iter().all(|row| row.certificate().is_some()));
         assert_eq!(
-            rows[0]
-                .certificate()
-                .expect("first certificate")
-                .entity_pk(),
-            &EntityPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
+            rows[0].certificate().expect("first certificate").row_pk(),
+            &RowPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
         );
         assert_eq!(
-            rows[1]
-                .certificate()
-                .expect("second certificate")
-                .entity_pk(),
-            &EntityPk::uuid_from_canonical(UUID_B).expect("canonical UUID")
+            rows[1].certificate().expect("second certificate").row_pk(),
+            &RowPk::uuid_from_canonical(UUID_B).expect("canonical UUID")
         );
         assert_eq!(
             rows[0].normalized(),
@@ -4034,7 +4002,7 @@ mod tests {
                 Bytes::from_static(
                     br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 ),
-                &WasmEntityKey::from_owned_parts(
+                &WasmRowKey::from_owned_parts(
                     "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
@@ -4046,7 +4014,7 @@ mod tests {
                 Bytes::from_static(
                     br#"{"id":"019a0000-0000-7000-8000-000000000002","order_key":"03","cells":["b"]}"#,
                 ),
-                &WasmEntityKey::from_owned_parts(
+                &WasmRowKey::from_owned_parts(
                     "csv_row",
                     vec![UUID_B.to_owned()],
                 ),
@@ -4093,7 +4061,7 @@ mod tests {
                 Bytes::from_static(
                     br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 ),
-                &WasmEntityKey::from_owned_parts(
+                &WasmRowKey::from_owned_parts(
                     "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
@@ -4110,7 +4078,7 @@ mod tests {
                 Bytes::from_static(
                     br#" { "id":"019a0000-0000-7000-8000-000000000002", "order_key":"03", "cells":["b"] } "#,
                 ),
-                &WasmEntityKey::from_owned_parts(
+                &WasmRowKey::from_owned_parts(
                     "csv_row",
                     vec![UUID_B.to_owned()],
                 ),
@@ -4132,7 +4100,7 @@ mod tests {
                 Bytes::from_static(
                     br#"{"cells":[1],"id":"019a0000-0000-7000-8000-000000000003","order_key":"05"}"#,
                 ),
-                &WasmEntityKey::from_owned_parts(
+                &WasmRowKey::from_owned_parts(
                     "csv_row",
                     vec![UUID_C.to_owned()],
                 ),
@@ -4177,7 +4145,7 @@ mod tests {
         let valid = [
             (
                 br#" { "id":"019a0000-0000-7000-8000-000000000001", "order_key":"01", "cells":[ "a", "b" ] } "#.as_slice(),
-                WasmEntityKey::from_owned_parts(
+                WasmRowKey::from_owned_parts(
                     "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
@@ -4185,7 +4153,7 @@ mod tests {
             (
                 br#"{"cells":["\uD83D\uDE00","line\u000Abreak"],"\u0069d":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
                     .as_slice(),
-                WasmEntityKey::from_owned_parts(
+                WasmRowKey::from_owned_parts(
                     "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
@@ -4193,7 +4161,7 @@ mod tests {
             (
                 br#" { "id":"root", "dialect": { "terminator":"\u000A", "quote":"\u0022", "\u0064elimiter":"," } } "#
                     .as_slice(),
-                WasmEntityKey::from_owned_parts(
+                WasmRowKey::from_owned_parts(
                     "csv_table",
                     vec!["root".to_owned()],
                 ),
@@ -4214,12 +4182,12 @@ mod tests {
                 rows[0]
                     .certificate()
                     .expect("streaming row certificate")
-                    .entity_pk()
+                    .row_pk()
                     .clone(),
                 if key.schema_key == "csv_row" {
-                    EntityPk::uuid_from_canonical(&key.entity_pk[0]).expect("canonical UUID")
+                    RowPk::uuid_from_canonical(&key.row_pk[0]).expect("canonical UUID")
                 } else {
-                    EntityPk::single(key.entity_pk[0].as_str())
+                    RowPk::single(key.row_pk[0].as_str())
                 }
             );
         }
@@ -4236,7 +4204,7 @@ mod tests {
             let streaming_error = batch
                 .push_plugin(
                     Bytes::copy_from_slice(input),
-                    &WasmEntityKey::from_owned_parts(
+                    &WasmRowKey::from_owned_parts(
                         "csv_row",
                         vec![UUID_A.to_owned()],
                     ),
@@ -4251,31 +4219,28 @@ mod tests {
     }
 
     #[test]
-    fn vec_entity_sources_page_without_splitting_records() {
-        let first = host_entity("a");
-        let first_page_bytes = encoded_entity_record_bytes(&first).unwrap() + 4;
-        let mut source = VecEntitySource::new(
-            vec![first, host_entity("b")],
-            WasmTransitionLimits::default(),
-        )
-        .unwrap();
+    fn vec_row_sources_page_without_splitting_records() {
+        let first = host_row("a");
+        let first_page_bytes = encoded_row_record_bytes(&first).unwrap() + 4;
+        let mut source =
+            VecRowSource::new(vec![first, host_row("b")], WasmTransitionLimits::default()).unwrap();
         let first_page = source
             .next_page(u32::try_from(first_page_bytes).expect("test page size fits u32"))
             .unwrap()
             .unwrap();
-        assert_eq!(first_page.entities.len(), 1);
-        assert_eq!(first_page.entities[0].key.entity_pk[0], "a");
+        assert_eq!(first_page.rows.len(), 1);
+        assert_eq!(first_page.rows[0].key.row_pk[0], "a");
         let second_page = source
             .next_page(WasmTransitionLimits::default().max_page_bytes)
             .unwrap()
             .unwrap();
-        assert_eq!(second_page.entities[0].key.entity_pk[0], "b");
+        assert_eq!(second_page.rows[0].key.row_pk[0], "b");
         assert!(source.next_page(1).unwrap().is_none());
         assert!(source.next_page(1).unwrap().is_none());
 
         assert!(
-            VecEntitySource::new(
-                vec![host_entity("b"), host_entity("a")],
+            VecRowSource::new(
+                vec![host_row("b"), host_row("a")],
                 WasmTransitionLimits::default()
             )
             .is_err()
@@ -4283,35 +4248,34 @@ mod tests {
     }
 
     #[test]
-    fn vec_entity_source_clamps_a_larger_consumer_page_hint() {
+    fn vec_row_source_clamps_a_larger_consumer_page_hint() {
         let limits = WasmTransitionLimits::default();
-        let mut source = VecEntitySource::new(vec![host_entity("a")], limits).unwrap();
+        let mut source = VecRowSource::new(vec![host_row("a")], limits).unwrap();
 
         let page = source
             .next_page(limits.max_page_bytes.saturating_mul(4))
             .expect("larger consumer hint should be clamped")
-            .expect("one entity page");
+            .expect("one row page");
 
-        assert_eq!(page.entities.len(), 1);
+        assert_eq!(page.rows.len(), 1);
     }
 
     #[test]
     fn vec_change_source_rejects_unsorted_changes_and_pages_records() {
-        let unsorted = WasmEntityChanges {
+        let unsorted = WasmRowChanges {
             changes: vec![
-                WasmEntityChange::Delete(key("b")),
-                WasmEntityChange::Delete(key("a")),
+                WasmRowChange::Delete(key("b")),
+                WasmRowChange::Delete(key("a")),
             ],
         };
-        assert!(VecEntityChangeSource::new(unsorted, WasmTransitionLimits::default()).is_err());
+        assert!(VecRowChangeSource::new(unsorted, WasmTransitionLimits::default()).is_err());
 
-        let first = WasmEntityChange::Delete(key("a"));
-        let first_page_bytes = encoded_entity_change_record_bytes(&first).unwrap() + 4;
-        let changes = WasmEntityChanges {
-            changes: vec![first, WasmEntityChange::Delete(key("b"))],
+        let first = WasmRowChange::Delete(key("a"));
+        let first_page_bytes = encoded_row_change_record_bytes(&first).unwrap() + 4;
+        let changes = WasmRowChanges {
+            changes: vec![first, WasmRowChange::Delete(key("b"))],
         };
-        let mut source =
-            VecEntityChangeSource::new(changes, WasmTransitionLimits::default()).unwrap();
+        let mut source = VecRowChangeSource::new(changes, WasmTransitionLimits::default()).unwrap();
         assert_eq!(
             source
                 .next_page(u32::try_from(first_page_bytes).expect("test page size fits u32"))
@@ -4386,11 +4350,11 @@ mod tests {
             Err(unused())
         }
 
-        async fn open_entities(
+        async fn open_rows(
             &mut self,
             _limits: WasmTransitionLimits,
-            _input: WasmOpenEntitiesInput,
-        ) -> Result<WasmEntityTransition, LixError> {
+            _input: WasmOpenRowsInput,
+        ) -> Result<WasmRowTransition, LixError> {
             Err(unused())
         }
 
@@ -4403,12 +4367,12 @@ mod tests {
             Err(unused())
         }
 
-        async fn entities_changed(
+        async fn rows_changed(
             &mut self,
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
-            _update: crate::plugin::runtime::WasmEntityUpdate,
-        ) -> Result<WasmEntityTransition, LixError> {
+            _update: crate::plugin::runtime::WasmRowUpdate,
+        ) -> Result<WasmRowTransition, LixError> {
             Err(unused())
         }
 
@@ -4740,10 +4704,10 @@ mod tests {
         let second_snapshot = br#"{"order_key":"b","id":"row2","cells":[]}"#.to_vec();
         let page = WasmChangePage {
             format_version: PACKET_FORMAT_V1,
-            changes: WasmEntityChanges {
+            changes: WasmRowChanges {
                 changes: vec![
-                    WasmEntityChange::Upsert {
-                        entity: WasmEntity {
+                    WasmRowChange::Upsert {
+                        row: WasmRow {
                             key: key("row"),
                             snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
                                 index: 0,
@@ -4753,8 +4717,8 @@ mod tests {
                         },
                         effect: WasmChangeEffect::Content,
                     },
-                    WasmEntityChange::Upsert {
-                        entity: WasmEntity {
+                    WasmRowChange::Upsert {
+                        row: WasmRow {
                             key: key("row2"),
                             snapshot_content: WasmGuestBytes::Inline(second_snapshot.into()),
                         },
@@ -4791,10 +4755,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(drained.document, WasmDocumentHandle(2));
-        let WasmEntityChange::Upsert { entity, .. } = &drained.changes.changes[0] else {
+        let WasmRowChange::Upsert { row, .. } = &drained.changes.changes[0] else {
             panic!("expected upsert")
         };
-        let WasmHostBytes::CanonicalJson(json) = &entity.snapshot_content else {
+        let WasmHostBytes::CanonicalJson(json) = &row.snapshot_content else {
             panic!("resolved snapshots must retain parsed canonical JSON")
         };
         assert_eq!(
@@ -4802,10 +4766,10 @@ mod tests {
             r#"{"cells":[],"id":"row","order_key":"a"}"#
         );
         assert_eq!(json.value()["id"], "row");
-        let WasmEntityChange::Upsert { entity, .. } = &drained.changes.changes[1] else {
+        let WasmRowChange::Upsert { row, .. } = &drained.changes.changes[1] else {
             panic!("expected second upsert")
         };
-        let WasmHostBytes::CanonicalJson(second_json) = &entity.snapshot_content else {
+        let WasmHostBytes::CanonicalJson(second_json) = &row.snapshot_content else {
             panic!("resolved snapshots must retain parsed canonical JSON")
         };
         assert!(json.shares_batch_with(second_json));
@@ -4820,9 +4784,9 @@ mod tests {
     async fn change_drain_bounds_canonical_arenas_to_cursor_pages() {
         let page = |id: &str| WasmChangePage {
             format_version: PACKET_FORMAT_V1,
-            changes: WasmEntityChanges {
-                changes: vec![WasmEntityChange::Upsert {
-                    entity: WasmEntity {
+            changes: WasmRowChanges {
+                changes: vec![WasmRowChange::Upsert {
+                    row: WasmRow {
                         key: key(id),
                         snapshot_content: WasmGuestBytes::Inline(
                             format!(r#"{{"id":"{id}"}}"#).into_bytes().into(),
@@ -4858,9 +4822,9 @@ mod tests {
             .changes
             .iter()
             .map(|change| match change {
-                WasmEntityChange::Upsert {
-                    entity:
-                        WasmEntity {
+                WasmRowChange::Upsert {
+                    row:
+                        WasmRow {
                             snapshot_content: WasmHostBytes::CanonicalJson(json),
                             ..
                         },
@@ -4881,8 +4845,8 @@ mod tests {
 
     #[tokio::test]
     async fn change_drain_patches_only_appended_page_ranges_in_source_order() {
-        let upsert = |id: &str| WasmEntityChange::Upsert {
-            entity: WasmEntity {
+        let upsert = |id: &str| WasmRowChange::Upsert {
+            row: WasmRow {
                 key: key(id),
                 snapshot_content: WasmGuestBytes::Inline(
                     format!(r#"{{"id":"{id}"}}"#).into_bytes().into(),
@@ -4892,17 +4856,17 @@ mod tests {
         };
         let page = |changes| WasmChangePage {
             format_version: PACKET_FORMAT_V1,
-            changes: WasmEntityChanges { changes },
+            changes: WasmRowChanges { changes },
             outputs: None,
         };
         let mut actor = FakeActor {
             change_pages: [
                 page(vec![
                     upsert("a"),
-                    WasmEntityChange::Delete(key("gone-a")),
+                    WasmRowChange::Delete(key("gone-a")),
                     upsert("b"),
                 ]),
-                page(vec![WasmEntityChange::Delete(key("gone-b")), upsert("c")]),
+                page(vec![WasmRowChange::Delete(key("gone-b")), upsert("c")]),
             ]
             .into(),
             ..FakeActor::default()
@@ -4925,34 +4889,19 @@ mod tests {
         .expect("interleaved rows should retain exact source order");
         let changes = &drained.changes.changes;
         assert_eq!(changes.len(), 5);
-        assert_eq!(
-            changes[0].entity_key().expect("entity key").entity_pk[0],
-            "a"
-        );
-        assert_eq!(
-            changes[1].entity_key().expect("entity key").entity_pk[0],
-            "gone-a"
-        );
-        assert_eq!(
-            changes[2].entity_key().expect("entity key").entity_pk[0],
-            "b"
-        );
-        assert_eq!(
-            changes[3].entity_key().expect("entity key").entity_pk[0],
-            "gone-b"
-        );
-        assert_eq!(
-            changes[4].entity_key().expect("entity key").entity_pk[0],
-            "c"
-        );
-        assert!(matches!(changes[1], WasmEntityChange::Delete(_)));
-        assert!(matches!(changes[3], WasmEntityChange::Delete(_)));
+        assert_eq!(changes[0].row_key().expect("row key").row_pk[0], "a");
+        assert_eq!(changes[1].row_key().expect("row key").row_pk[0], "gone-a");
+        assert_eq!(changes[2].row_key().expect("row key").row_pk[0], "b");
+        assert_eq!(changes[3].row_key().expect("row key").row_pk[0], "gone-b");
+        assert_eq!(changes[4].row_key().expect("row key").row_pk[0], "c");
+        assert!(matches!(changes[1], WasmRowChange::Delete(_)));
+        assert!(matches!(changes[3], WasmRowChange::Delete(_)));
 
-        fn canonical(change: &WasmEntityChange<WasmHostBytes>) -> &WasmCanonicalJson {
+        fn canonical(change: &WasmRowChange<WasmHostBytes>) -> &WasmCanonicalJson {
             match change {
-                WasmEntityChange::Upsert {
-                    entity:
-                        WasmEntity {
+                WasmRowChange::Upsert {
+                    row:
+                        WasmRow {
                             snapshot_content: WasmHostBytes::CanonicalJson(json),
                             ..
                         },
@@ -4975,8 +4924,8 @@ mod tests {
     async fn change_drain_rejects_duplicate_keys_across_pages() {
         let duplicate = WasmChangePage {
             format_version: PACKET_FORMAT_V1,
-            changes: WasmEntityChanges {
-                changes: vec![WasmEntityChange::Delete(key("row"))],
+            changes: WasmRowChanges {
+                changes: vec![WasmRowChange::Delete(key("row"))],
             },
             outputs: None,
         };
@@ -5003,7 +4952,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert_eq!(
             error.message,
-            "invalid component change cursor page: a component entity key may occur only once across a change cursor"
+            "invalid component change cursor page: a component row key may occur only once across a change cursor"
         );
         assert_eq!(actor.discarded_transitions, vec![transition.transition]);
         assert!(!actor.finished);
@@ -5014,10 +4963,10 @@ mod tests {
         let outputs = WasmByteOutputsHandle(7);
         let page = WasmChangePage {
             format_version: PACKET_FORMAT_V1,
-            changes: WasmEntityChanges {
-                changes: vec![WasmEntityChange::Upsert {
-                    entity: WasmEntity {
-                        key: WasmEntityKey::from_owned_parts("not_allowed", vec!["row".to_owned()]),
+            changes: WasmRowChanges {
+                changes: vec![WasmRowChange::Upsert {
+                    row: WasmRow {
+                        key: WasmRowKey::from_owned_parts("not_allowed", vec!["row".to_owned()]),
                         snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
                             index: 0,
                             offset: 0,
@@ -5055,8 +5004,8 @@ mod tests {
 
         actor.change_pages.push_back(WasmChangePage {
             format_version: PACKET_FORMAT_V1,
-            changes: WasmEntityChanges {
-                changes: vec![WasmEntityChange::Delete(key("row"))],
+            changes: WasmRowChanges {
+                changes: vec![WasmRowChange::Delete(key("row"))],
             },
             outputs: None,
         });
@@ -5074,7 +5023,7 @@ mod tests {
         .await
         .expect("a deterministic host rejection must leave the actor reusable");
         assert_eq!(retried.document, WasmDocumentHandle(5));
-        assert_eq!(retried.changes.entity_change_count(), 1);
+        assert_eq!(retried.changes.row_change_count(), 1);
         assert!(actor.finished);
         assert!(!actor.retired);
     }
@@ -5084,8 +5033,8 @@ mod tests {
         let mut actor = FakeActor {
             change_pages: [WasmChangePage {
                 format_version: PACKET_FORMAT_V1,
-                changes: WasmEntityChanges {
-                    changes: vec![WasmEntityChange::Delete(WasmEntityKey::from_owned_parts(
+                changes: WasmRowChanges {
+                    changes: vec![WasmRowChange::Delete(WasmRowKey::from_owned_parts(
                         "not_allowed",
                         vec!["row".to_owned()],
                     ))],
@@ -5147,9 +5096,9 @@ mod tests {
             ..FakeActor::default()
         };
         actor.outputs.insert((outputs, 0), b"Z".to_vec());
-        let drained = drain_entity_transition_edits(
+        let drained = drain_row_transition_edits(
             &mut actor,
-            WasmEntityTransition {
+            WasmRowTransition {
                 transition: WasmTransitionHandle(1),
                 document: WasmDocumentHandle(2),
                 edits: WasmEditCursorHandle(3),
@@ -5181,9 +5130,9 @@ mod tests {
             .into(),
             ..FakeActor::default()
         };
-        let drained = drain_entity_transition_edits(
+        let drained = drain_row_transition_edits(
             &mut actor,
-            WasmEntityTransition {
+            WasmRowTransition {
                 transition: WasmTransitionHandle(1),
                 document: WasmDocumentHandle(2),
                 edits: WasmEditCursorHandle(3),
@@ -5292,9 +5241,9 @@ mod tests {
             delete_len: 2,
             insert: WasmInputBytes::Inline(b"XY".to_vec()),
         }];
-        let drained = drain_entity_transition_edits(
+        let drained = drain_row_transition_edits(
             &mut actor,
-            WasmEntityTransition {
+            WasmRowTransition {
                 transition: WasmTransitionHandle(1),
                 document: WasmDocumentHandle(2),
                 edits: WasmEditCursorHandle(3),

@@ -1,6 +1,6 @@
-//! Projection-aware decoding for entity snapshot JSON.
+//! Projection-aware decoding for row snapshot JSON.
 //!
-//! Entity SQL reads need only their selected fields. This module is the
+//! Row SQL reads need only their selected fields. This module is the
 //! private boundary from raw snapshot bytes to Arrow arrays. The current
 //! caller adapts materialized rows; a later tracked-head reader can hand its
 //! v5 JSON bytes to the same boundary directly.
@@ -19,22 +19,22 @@ use serde_json::Value as JsonValue;
 use serde_json::value::RawValue;
 
 use crate::LixError;
-use crate::sql2::catalog::{EntityColumnType, EntitySurfaceSpec};
+use crate::sql2::catalog::{SchemaColumnType, SchemaSurfaceSpec};
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 
-/// A projection decoder for the general entity provider.
-pub(crate) struct EntityProjectionDecoder {
+/// A projection decoder for the general row provider.
+pub(crate) struct RowProjectionDecoder {
     schema_key: String,
-    fields: Vec<EntityProjectionField>,
+    fields: Vec<RowProjectionField>,
     slots_by_name: HashMap<String, Vec<usize>>,
 }
 
 /// Keep malformed snapshots and provider-shape failures on the same
-/// DataFusion `Execution` error path as the established entity projection.
+/// DataFusion `Execution` error path as the established row projection.
 /// Typed value failures already carry a Lix error code and retain that SQL
 /// error contract.
-pub(crate) fn entity_projection_error_to_datafusion_error(error: LixError) -> DataFusionError {
+pub(crate) fn row_projection_error_to_datafusion_error(error: LixError) -> DataFusionError {
     if error.code == LixError::CODE_INTERNAL_ERROR {
         DataFusionError::Execution(error.message)
     } else {
@@ -43,15 +43,15 @@ pub(crate) fn entity_projection_error_to_datafusion_error(error: LixError) -> Da
 }
 
 #[derive(Clone)]
-struct EntityProjectionField {
+struct RowProjectionField {
     name: String,
-    column_type: EntityColumnType,
+    column_type: SchemaColumnType,
 }
 
-impl EntityProjectionDecoder {
-    /// Builds a decoder for visible entity columns in output order.
+impl RowProjectionDecoder {
+    /// Builds a decoder for visible row columns in output order.
     pub(crate) fn new<'a>(
-        spec: &EntitySurfaceSpec,
+        spec: &SchemaSurfaceSpec,
         columns: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, LixError> {
         let mut fields = Vec::new();
@@ -61,13 +61,13 @@ impl EntityProjectionDecoder {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "sql2 entity provider '{}' does not expose column '{}'",
+                        "sql2 row provider '{}' does not expose column '{}'",
                         spec.schema_key, column_name
                     ),
                 )
             })?;
             let index = fields.len();
-            fields.push(EntityProjectionField {
+            fields.push(RowProjectionField {
                 name: column.name.clone(),
                 column_type: column.column_type,
             });
@@ -94,7 +94,7 @@ impl EntityProjectionDecoder {
             columns: self
                 .fields
                 .iter()
-                .map(|field| EntityProjectionColumn::new(field.column_type, capacity))
+                .map(|field| RowProjectionColumn::new(field.column_type, capacity))
                 .collect(),
         };
         for snapshot in snapshots {
@@ -103,13 +103,13 @@ impl EntityProjectionDecoder {
         Ok(sink
             .columns
             .into_iter()
-            .map(EntityProjectionColumn::into_array)
+            .map(RowProjectionColumn::into_array)
             .collect())
     }
 
     fn decode_into<S>(&self, snapshot: Option<&[u8]>, sink: &mut S) -> Result<(), LixError>
     where
-        S: EntityProjectionSink,
+        S: RowProjectionSink,
     {
         let Some(snapshot) = snapshot else {
             sink.begin_row(self.fields.len());
@@ -127,12 +127,12 @@ impl EntityProjectionDecoder {
     }
 }
 
-trait EntityProjectionSink {
+trait RowProjectionSink {
     fn begin_row(&mut self, field_count: usize);
 
     fn project_raw(
         &mut self,
-        decoder: &EntityProjectionDecoder,
+        decoder: &RowProjectionDecoder,
         indices: &[usize],
         raw: &RawValue,
     ) -> Result<(), LixError>;
@@ -143,13 +143,13 @@ trait EntityProjectionSink {
 /// normal tracked Arrow scan has neither a snapshot JSON DOM nor per-field
 /// raw-value boxes.
 struct RawProjectionSeed<'decoder, 'sink, S> {
-    decoder: &'decoder EntityProjectionDecoder,
+    decoder: &'decoder RowProjectionDecoder,
     sink: &'sink mut S,
 }
 
 impl<'de, S> DeserializeSeed<'de> for RawProjectionSeed<'_, '_, S>
 where
-    S: EntityProjectionSink,
+    S: RowProjectionSink,
 {
     type Value = Option<LixError>;
 
@@ -165,18 +165,18 @@ where
 }
 
 struct RawProjectionVisitor<'decoder, 'sink, S> {
-    decoder: &'decoder EntityProjectionDecoder,
+    decoder: &'decoder RowProjectionDecoder,
     sink: &'sink mut S,
 }
 
 impl<'de, S> Visitor<'de> for RawProjectionVisitor<'_, '_, S>
 where
-    S: EntityProjectionSink,
+    S: RowProjectionSink,
 {
     type Value = Option<LixError>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON entity snapshot")
+        formatter.write_str("a JSON row snapshot")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -276,10 +276,10 @@ where
 }
 
 struct ArrowProjectionSink {
-    columns: Vec<EntityProjectionColumn>,
+    columns: Vec<RowProjectionColumn>,
 }
 
-impl EntityProjectionSink for ArrowProjectionSink {
+impl RowProjectionSink for ArrowProjectionSink {
     fn begin_row(&mut self, _field_count: usize) {
         for column in &mut self.columns {
             column.push_null();
@@ -288,7 +288,7 @@ impl EntityProjectionSink for ArrowProjectionSink {
 
     fn project_raw(
         &mut self,
-        decoder: &EntityProjectionDecoder,
+        decoder: &RowProjectionDecoder,
         indices: &[usize],
         raw: &RawValue,
     ) -> Result<(), LixError> {
@@ -308,7 +308,7 @@ fn parse_json_value(raw: &RawValue) -> Result<JsonValue, LixError> {
 }
 
 fn raw_string_text(raw: &RawValue) -> Result<Option<String>, LixError> {
-    // String-valued entity fields dominate broad public reads. Deserializing
+    // String-valued row fields dominate broad public reads. Deserializing
     // through `serde_json::Value` first allocates the string and then clones
     // it again in `json_value_to_string`. Decode the JSON string directly;
     // all non-string coercions retain the established general path below.
@@ -339,11 +339,11 @@ fn raw_json_text(raw: &RawValue) -> Option<String> {
 fn snapshot_decode_error(error: serde_json::Error) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("sql2 entity provider expected valid snapshot_content JSON: {error}"),
+        format!("sql2 row provider expected valid snapshot_content JSON: {error}"),
     )
 }
 
-enum EntityProjectionColumn {
+enum RowProjectionColumn {
     String(Vec<Option<String>>),
     Json(Vec<Option<String>>),
     Integer(Vec<Option<i64>>),
@@ -352,15 +352,15 @@ enum EntityProjectionColumn {
     Timestamptz(Vec<Option<i64>>),
 }
 
-impl EntityProjectionColumn {
-    fn new(column_type: EntityColumnType, capacity: usize) -> Self {
+impl RowProjectionColumn {
+    fn new(column_type: SchemaColumnType, capacity: usize) -> Self {
         match column_type {
-            EntityColumnType::String => Self::String(Vec::with_capacity(capacity)),
-            EntityColumnType::Json => Self::Json(Vec::with_capacity(capacity)),
-            EntityColumnType::Integer => Self::Integer(Vec::with_capacity(capacity)),
-            EntityColumnType::Number => Self::Number(Vec::with_capacity(capacity)),
-            EntityColumnType::Boolean => Self::Boolean(Vec::with_capacity(capacity)),
-            EntityColumnType::Timestamptz => Self::Timestamptz(Vec::with_capacity(capacity)),
+            SchemaColumnType::String => Self::String(Vec::with_capacity(capacity)),
+            SchemaColumnType::Json => Self::Json(Vec::with_capacity(capacity)),
+            SchemaColumnType::Integer => Self::Integer(Vec::with_capacity(capacity)),
+            SchemaColumnType::Number => Self::Number(Vec::with_capacity(capacity)),
+            SchemaColumnType::Boolean => Self::Boolean(Vec::with_capacity(capacity)),
+            SchemaColumnType::Timestamptz => Self::Timestamptz(Vec::with_capacity(capacity)),
         }
     }
 
@@ -377,40 +377,40 @@ impl EntityProjectionColumn {
     fn replace_last_from_raw(
         &mut self,
         raw: &RawValue,
-        field: &EntityProjectionField,
+        field: &RowProjectionField,
         schema_key: &str,
     ) -> Result<(), LixError> {
         match self {
-            Self::String(values) if field.column_type == EntityColumnType::String => {
+            Self::String(values) if field.column_type == SchemaColumnType::String => {
                 *values
                     .last_mut()
                     .expect("projection sink must start the row first") = raw_string_text(raw)?;
             }
-            Self::Json(values) if field.column_type == EntityColumnType::Json => {
+            Self::Json(values) if field.column_type == SchemaColumnType::Json => {
                 *values
                     .last_mut()
                     .expect("projection sink must start the row first") = raw_json_text(raw);
             }
-            Self::Integer(values) if field.column_type == EntityColumnType::Integer => {
+            Self::Integer(values) if field.column_type == SchemaColumnType::Integer => {
                 let value = parse_json_value(raw)?;
                 *values
                     .last_mut()
                     .expect("projection sink must start the row first") =
                     json_bigint_value(Some(&value), schema_key, &field.name)?;
             }
-            Self::Number(values) if field.column_type == EntityColumnType::Number => {
+            Self::Number(values) if field.column_type == SchemaColumnType::Number => {
                 let value = parse_json_value(raw)?;
                 *values
                     .last_mut()
                     .expect("projection sink must start the row first") =
                     json_double_value(Some(&value), schema_key, &field.name)?;
             }
-            Self::Boolean(values) if field.column_type == EntityColumnType::Boolean => {
+            Self::Boolean(values) if field.column_type == SchemaColumnType::Boolean => {
                 *values
                     .last_mut()
                     .expect("projection sink must start the row first") = raw_bool(raw);
             }
-            Self::Timestamptz(values) if field.column_type == EntityColumnType::Timestamptz => {
+            Self::Timestamptz(values) if field.column_type == SchemaColumnType::Timestamptz => {
                 let value = raw_string_text(raw)?;
                 *values
                     .last_mut()
@@ -433,7 +433,7 @@ impl EntityProjectionColumn {
             _ => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "entity snapshot projection produced a value with the wrong SQL type",
+                    "row snapshot projection produced a value with the wrong SQL type",
                 ));
             }
         }
@@ -462,8 +462,8 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use serde_json::json;
 
-    use super::EntityProjectionDecoder;
-    use crate::sql2::catalog::derive_entity_surface_spec_from_schema;
+    use super::RowProjectionDecoder;
+    use crate::sql2::catalog::derive_schema_surface_spec_from_schema;
     use crate::sql2::exec::datafusion::query_result_from_batches;
     use crate::sql2::result_metadata::mark_json_field;
     use crate::transaction_types::TransactionJson;
@@ -473,8 +473,8 @@ mod tests {
         Json::from_canonical_text(canonical)
     }
 
-    fn spec() -> crate::sql2::catalog::EntitySurfaceSpec {
-        derive_entity_surface_spec_from_schema(&json!({
+    fn spec() -> crate::sql2::catalog::SchemaSurfaceSpec {
+        derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "projection_test",
             "columns": [
@@ -497,7 +497,7 @@ mod tests {
     #[expect(clippy::float_cmp)]
     fn decodes_selected_fields_from_canonical_tracked_arrow_projection() {
         let spec = spec();
-        let decoder = EntityProjectionDecoder::new(
+        let decoder = RowProjectionDecoder::new(
             &spec,
             [
                 "text",
@@ -573,7 +573,7 @@ mod tests {
     #[test]
     fn arrow_projection_preserves_public_result_contract() {
         let spec = spec();
-        let decoder = EntityProjectionDecoder::new(
+        let decoder = RowProjectionDecoder::new(
             &spec,
             [
                 "text",
@@ -626,7 +626,7 @@ mod tests {
         ];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), arrays)
             .expect("decoded arrays should form a batch");
-        let arrow_rows = query_result_from_batches(&fields, &[batch])
+        let arrows = query_result_from_batches(&fields, &[batch])
             .expect("Arrow result values should decode")
             .rows;
 
@@ -635,7 +635,7 @@ mod tests {
         // boundary, so this hand-built raw snapshot keeps its source order
         // rather than being re-sorted by a decode-side DOM round trip.
         assert_eq!(
-            arrow_rows[0],
+            arrows[0],
             vec![
                 Value::Text("line\nquote: \"".to_string()),
                 Value::Json(canonical_json(r#"{"z":[true,null],"a":"value"}"#)),
@@ -649,14 +649,14 @@ mod tests {
                 Value::Text("line\nquote: \"".to_string()),
             ]
         );
-        assert_eq!(arrow_rows[1], vec![Value::Null; 10]);
-        assert_eq!(arrow_rows[2], vec![Value::Null; 10]);
+        assert_eq!(arrows[1], vec![Value::Null; 10]);
+        assert_eq!(arrows[2], vec![Value::Null; 10]);
     }
 
     #[test]
     fn reports_the_existing_typed_number_contract_error() {
         let spec = spec();
-        let decoder = EntityProjectionDecoder::new(&spec, ["integer", "number"])
+        let decoder = RowProjectionDecoder::new(&spec, ["integer", "number"])
             .expect("decoder should build");
         let snapshot = TransactionJson::from_value(
             json!({"integer": "7", "number": 4.5}),

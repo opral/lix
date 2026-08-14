@@ -145,9 +145,9 @@ pub(crate) fn append_path_value_replacement_snapshot_text(
 
 #[cfg(test)]
 pub(crate) use bound_public_write::{
-    take_certified_entity_insert_batch_executions,
-    take_certified_entity_insert_parameter_batch_executions,
+    take_certified_row_insert_batch_executions,
+    take_certified_row_insert_parameter_batch_executions,
     take_certified_generation_identity_replacements,
     take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_entity_update_parameter_batch_executions,
+    take_certified_single_path_value_replacements, take_row_update_parameter_batch_executions,
 };

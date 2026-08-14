@@ -7,7 +7,7 @@ use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphContext;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
@@ -35,10 +35,10 @@ use super::derived::{
 };
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
-const ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
-const ENTITY_POINT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
-const ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
-const ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES: usize = 16;
+const ROW_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const ROW_POINT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
+const ROW_COLUMNAR_LAYOUT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const ROW_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES: usize = 16;
 const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
 type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 
@@ -114,28 +114,28 @@ impl GlobalKeyValueRowCache {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct EntityPointSnapshotCacheKey {
+struct RowPointSnapshotCacheKey {
     branch_id: String,
     generation: CommitId,
     current_state_revision: u64,
     schema_key: String,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
 }
 
 #[derive(Debug)]
-struct EntityPointSnapshotCacheEntry {
-    key: EntityPointSnapshotCacheKey,
+struct RowPointSnapshotCacheEntry {
+    key: RowPointSnapshotCacheKey,
     snapshots: Vec<Option<Bytes>>,
     bytes: usize,
 }
 
 #[derive(Debug, Default)]
-struct EntityPointSnapshotCache {
-    entries: std::sync::Mutex<Vec<EntityPointSnapshotCacheEntry>>,
+struct RowPointSnapshotCache {
+    entries: std::sync::Mutex<Vec<RowPointSnapshotCacheEntry>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct EntityColumnarLayoutCacheKey {
+struct RowColumnarLayoutCacheKey {
     branch_id: String,
     generation: CommitId,
     current_state_revision: u64,
@@ -143,34 +143,34 @@ struct EntityColumnarLayoutCacheKey {
 }
 
 #[derive(Debug)]
-struct CachedEntityColumnarLayout {
-    key: EntityColumnarLayoutCacheKey,
+struct CachedRowColumnarLayout {
+    key: RowColumnarLayoutCacheKey,
     id: crate::columnar_row_group::RowGroupSetId,
     manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
     manifest_digest: [u8; 32],
-    overlay: std::sync::Arc<Vec<crate::hot_state::EntityColumnarOverlayRow>>,
+    overlay: std::sync::Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
     head_commit_id: CommitId,
     live_count: u64,
     bytes: usize,
 }
 
 #[derive(Debug, Default)]
-struct EntityColumnarLayoutCache {
+struct RowColumnarLayoutCache {
     // Oldest entry first. Columnar planning is infrequent relative to batch
     // execution, so a tiny vector keeps the synchronization and bookkeeping
     // cost below that of a second index.
-    entries: StdMutex<Vec<std::sync::Arc<CachedEntityColumnarLayout>>>,
+    entries: StdMutex<Vec<std::sync::Arc<CachedRowColumnarLayout>>>,
 }
 
-impl EntityColumnarLayoutCache {
+impl RowColumnarLayoutCache {
     fn get(
         &self,
-        key: &EntityColumnarLayoutCacheKey,
-    ) -> Option<std::sync::Arc<CachedEntityColumnarLayout>> {
+        key: &RowColumnarLayoutCacheKey,
+    ) -> Option<std::sync::Arc<CachedRowColumnarLayout>> {
         let mut entries = self
             .entries
             .lock()
-            .expect("entity columnar layout cache lock poisoned");
+            .expect("row columnar layout cache lock poisoned");
         let position = entries.iter().position(|entry| entry.key == *key)?;
         let entry = entries.remove(position);
         entries.push(std::sync::Arc::clone(&entry));
@@ -179,14 +179,14 @@ impl EntityColumnarLayoutCache {
 
     fn insert(
         &self,
-        key: EntityColumnarLayoutCacheKey,
+        key: RowColumnarLayoutCacheKey,
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
-        overlay: Vec<crate::hot_state::EntityColumnarOverlayRow>,
+        overlay: Vec<crate::hot_state::RowColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
-    ) -> std::sync::Arc<CachedEntityColumnarLayout> {
+    ) -> std::sync::Arc<CachedRowColumnarLayout> {
         self.insert_with_max_bytes(
             key,
             id,
@@ -195,31 +195,31 @@ impl EntityColumnarLayoutCache {
             overlay,
             head_commit_id,
             live_count,
-            ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_BYTES,
+            ROW_COLUMNAR_LAYOUT_CACHE_MAX_BYTES,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn insert_with_max_bytes(
         &self,
-        key: EntityColumnarLayoutCacheKey,
+        key: RowColumnarLayoutCacheKey,
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
-        overlay: Vec<crate::hot_state::EntityColumnarOverlayRow>,
+        overlay: Vec<crate::hot_state::RowColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
         max_bytes: usize,
-    ) -> std::sync::Arc<CachedEntityColumnarLayout> {
+    ) -> std::sync::Arc<CachedRowColumnarLayout> {
         let overlay = std::sync::Arc::new(overlay);
         // Capacity accounting covers every owned buffer. A 2x admission
         // margin conservatively absorbs allocator and HashMap control-byte
         // overhead that Rust's collections do not expose.
         let bytes =
-            estimated_entity_columnar_layout_bytes(&key, &manifest, &overlay, overlay.capacity())
+            estimated_row_columnar_layout_bytes(&key, &manifest, &overlay, overlay.capacity())
                 .saturating_mul(2);
         let manifest = std::sync::Arc::new(manifest);
-        let entry = std::sync::Arc::new(CachedEntityColumnarLayout {
+        let entry = std::sync::Arc::new(CachedRowColumnarLayout {
             key,
             id,
             manifest,
@@ -236,7 +236,7 @@ impl EntityColumnarLayoutCache {
         let mut entries = self
             .entries
             .lock()
-            .expect("entity columnar layout cache lock poisoned");
+            .expect("row columnar layout cache lock poisoned");
         // A newer state revision for one collection makes the older layout
         // useless to subsequent live readers. The exact revision key already
         // prevents stale hits; eager removal also bounds revision churn.
@@ -246,7 +246,7 @@ impl EntityColumnarLayoutCache {
         });
         entries.push(std::sync::Arc::clone(&entry));
         let mut resident_bytes = entries.iter().map(|entry| entry.bytes).sum::<usize>();
-        while resident_bytes > max_bytes || entries.len() > ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES
+        while resident_bytes > max_bytes || entries.len() > ROW_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES
         {
             resident_bytes = resident_bytes.saturating_sub(entries.remove(0).bytes);
         }
@@ -254,27 +254,27 @@ impl EntityColumnarLayoutCache {
     }
 }
 
-fn estimated_entity_columnar_layout_bytes(
-    key: &EntityColumnarLayoutCacheKey,
+fn estimated_row_columnar_layout_bytes(
+    key: &RowColumnarLayoutCacheKey,
     manifest: &crate::columnar_row_group::RowGroupManifest,
-    overlay: &[crate::hot_state::EntityColumnarOverlayRow],
+    overlay: &[crate::hot_state::RowColumnarOverlayRow],
     overlay_capacity: usize,
 ) -> usize {
     let manifest_bytes = size_of::<crate::columnar_row_group::RowGroupManifest>()
         .saturating_add(manifest.estimated_heap_bytes());
-    size_of::<CachedEntityColumnarLayout>()
+    size_of::<CachedRowColumnarLayout>()
         .saturating_add(key.branch_id.capacity())
         .saturating_add(key.schema_key.capacity())
         .saturating_add(manifest_bytes)
         .saturating_add(
             overlay_capacity
-                .saturating_mul(size_of::<crate::hot_state::EntityColumnarOverlayRow>()),
+                .saturating_mul(size_of::<crate::hot_state::RowColumnarOverlayRow>()),
         )
         .saturating_add(
             overlay
                 .iter()
                 .map(|row| {
-                    row.entity_pk
+                    row.row_pk
                         .estimated_heap_bytes()
                         .saturating_add(row.snapshot_content.as_ref().map_or(0, Bytes::len))
                 })
@@ -282,15 +282,15 @@ fn estimated_entity_columnar_layout_bytes(
         )
 }
 
-impl EntityPointSnapshotCache {
-    fn get(&self, key: &EntityPointSnapshotCacheKey) -> Option<Vec<Option<Bytes>>> {
-        if entity_point_snapshot_cache_disabled_for_profile() {
+impl RowPointSnapshotCache {
+    fn get(&self, key: &RowPointSnapshotCacheKey) -> Option<Vec<Option<Bytes>>> {
+        if row_point_snapshot_cache_disabled_for_profile() {
             return None;
         }
         let mut entries = self
             .entries
             .lock()
-            .expect("entity point snapshot cache lock poisoned");
+            .expect("row point snapshot cache lock poisoned");
         let position = entries.iter().position(|entry| entry.key == *key)?;
         let entry = entries.remove(position);
         let result = entry.snapshots.clone();
@@ -300,38 +300,38 @@ impl EntityPointSnapshotCache {
 
     fn insert(
         &self,
-        key: EntityPointSnapshotCacheKey,
+        key: RowPointSnapshotCacheKey,
         snapshots: Vec<Option<Bytes>>,
     ) -> Vec<Option<Bytes>> {
-        if entity_point_snapshot_cache_disabled_for_profile() {
+        if row_point_snapshot_cache_disabled_for_profile() {
             return snapshots;
         }
-        let bytes = size_of::<EntityPointSnapshotCacheEntry>()
+        let bytes = size_of::<RowPointSnapshotCacheEntry>()
             + key.branch_id.capacity()
             + key.schema_key.capacity()
             + snapshots.capacity() * size_of::<Option<Bytes>>()
             + snapshots.iter().flatten().map(Bytes::len).sum::<usize>();
         let result = snapshots.clone();
-        if bytes > ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES {
+        if bytes > ROW_POINT_SNAPSHOT_CACHE_MAX_BYTES {
             return result;
         }
         let mut entries = self
             .entries
             .lock()
-            .expect("entity point snapshot cache lock poisoned");
+            .expect("row point snapshot cache lock poisoned");
         entries.retain(|entry| {
             entry.key.branch_id != key.branch_id
                 || entry.key.schema_key != key.schema_key
-                || entry.key.entity_pk != key.entity_pk
+                || entry.key.row_pk != key.row_pk
         });
-        entries.push(EntityPointSnapshotCacheEntry {
+        entries.push(RowPointSnapshotCacheEntry {
             key,
             snapshots,
             bytes,
         });
         let mut resident_bytes = entries.iter().map(|entry| entry.bytes).sum::<usize>();
-        while resident_bytes > ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES
-            || entries.len() > ENTITY_POINT_SNAPSHOT_CACHE_MAX_ENTRIES
+        while resident_bytes > ROW_POINT_SNAPSHOT_CACHE_MAX_BYTES
+            || entries.len() > ROW_POINT_SNAPSHOT_CACHE_MAX_ENTRIES
         {
             resident_bytes = resident_bytes.saturating_sub(entries.remove(0).bytes);
         }
@@ -340,14 +340,14 @@ impl EntityPointSnapshotCache {
 }
 
 #[cfg(feature = "storage-benches")]
-fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
+fn row_point_snapshot_cache_disabled_for_profile() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED
         .get_or_init(|| std::env::var_os("LIX_TRACKED_STATE_CRUD_DISABLE_POINT_CACHE").is_some())
 }
 
 #[cfg(not(feature = "storage-benches"))]
-const fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
+const fn row_point_snapshot_cache_disabled_for_profile() -> bool {
     false
 }
 
@@ -360,11 +360,11 @@ pub(crate) struct HotStateContext {
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
-    entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
-    entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
-    entity_columnar_scan_cache:
-        std::sync::Arc<std::sync::Mutex<crate::hot_state::EntityColumnarShadowMaskCache>>,
-    entity_decoded_column_cache: crate::hot_state::EntityDecodedColumnCache,
+    row_point_snapshot_cache: std::sync::Arc<RowPointSnapshotCache>,
+    row_columnar_layout_cache: std::sync::Arc<RowColumnarLayoutCache>,
+    row_columnar_scan_cache:
+        std::sync::Arc<std::sync::Mutex<crate::hot_state::RowColumnarShadowMaskCache>>,
+    row_decoded_column_cache: crate::hot_state::RowDecodedColumnCache,
     global_key_value_rows: std::sync::Arc<GlobalKeyValueRowCache>,
     root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
 }
@@ -380,36 +380,36 @@ impl HotStateContext {
         _tracked_state: TrackedStateContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
-        let entity_columnar_array_budget =
-            std::sync::Arc::new(crate::hot_state::EntityColumnarArrayBudget::default());
+        let row_columnar_array_budget =
+            std::sync::Arc::new(crate::hot_state::RowColumnarArrayBudget::default());
         Self {
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
-            entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
-            entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
-            entity_columnar_scan_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(
-                    std::sync::Arc::clone(&entity_columnar_array_budget),
+            row_point_snapshot_cache: std::sync::Arc::new(RowPointSnapshotCache::default()),
+            row_columnar_layout_cache: std::sync::Arc::new(RowColumnarLayoutCache::default()),
+            row_columnar_scan_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::hot_state::RowColumnarShadowMaskCache::with_array_budget(
+                    std::sync::Arc::clone(&row_columnar_array_budget),
                 ),
             )),
-            entity_decoded_column_cache:
-                crate::hot_state::EntityDecodedColumnCache::with_array_budget(
-                    entity_columnar_array_budget,
+            row_decoded_column_cache:
+                crate::hot_state::RowDecodedColumnCache::with_array_budget(
+                    row_columnar_array_budget,
                 ),
             global_key_value_rows: std::sync::Arc::new(GlobalKeyValueRowCache::default()),
             root_base_cache: std::sync::Arc::default(),
         }
     }
 
-    pub(crate) fn entity_columnar_scan_cache(
+    pub(crate) fn row_columnar_scan_cache(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<crate::hot_state::EntityColumnarShadowMaskCache>> {
-        std::sync::Arc::clone(&self.entity_columnar_scan_cache)
+    ) -> std::sync::Arc<std::sync::Mutex<crate::hot_state::RowColumnarShadowMaskCache>> {
+        std::sync::Arc::clone(&self.row_columnar_scan_cache)
     }
 
-    pub(crate) fn entity_decoded_column_cache(&self) -> crate::hot_state::EntityDecodedColumnCache {
-        self.entity_decoded_column_cache.clone()
+    pub(crate) fn row_decoded_column_cache(&self) -> crate::hot_state::RowDecodedColumnCache {
+        self.row_decoded_column_cache.clone()
     }
 
     /// Creates a visible live-state reader over a caller-provided KV store.
@@ -422,8 +422,8 @@ impl HotStateContext {
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
-            entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
+            row_point_snapshot_cache: std::sync::Arc::clone(&self.row_point_snapshot_cache),
+            row_columnar_layout_cache: std::sync::Arc::clone(&self.row_columnar_layout_cache),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
@@ -444,14 +444,14 @@ impl HotStateContext {
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
-            entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
+            row_point_snapshot_cache: std::sync::Arc::clone(&self.row_point_snapshot_cache),
+            row_columnar_layout_cache: std::sync::Arc::clone(&self.row_columnar_layout_cache),
             branch_head_control_cache: Some(branch_head_control_cache),
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
     }
 
-    /// Creates a reader whose entity-level derived indexes are private to one
+    /// Creates a reader whose row-level derived indexes are private to one
     /// retained storage snapshot. Those caches are not revision-tagged, so they
     /// cannot serve an older explicit transaction and stay per-snapshot.
     ///
@@ -476,8 +476,8 @@ impl HotStateContext {
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
-            entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
+            row_point_snapshot_cache: std::sync::Arc::new(RowPointSnapshotCache::default()),
+            row_columnar_layout_cache: std::sync::Arc::new(RowColumnarLayoutCache::default()),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
@@ -500,8 +500,8 @@ pub(crate) struct HotStateContextReader<S> {
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
-    entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
-    entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
+    row_point_snapshot_cache: std::sync::Arc<RowPointSnapshotCache>,
+    row_columnar_layout_cache: std::sync::Arc<RowColumnarLayoutCache>,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
     root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
 }
@@ -530,88 +530,88 @@ where
             .await
     }
 
-    /// Returns raw current-state snapshot bytes for one current SQL entity scan.
+    /// Returns raw current-state snapshot bytes for one current SQL row scan.
     ///
     /// `None` means the normal materialized visibility path remains
     /// authoritative: a global branch projection, multiple result branch
     /// scopes, or commit-derived state all require its full visibility
     /// semantics.
-    pub(crate) async fn scan_direct_entity_snapshots(
+    pub(crate) async fn scan_direct_row_snapshots(
         &self,
         request: &HotStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
         let Some((requested_branch_id, requested_control, schema_key)) =
-            self.direct_entity_snapshot_scope(request).await?
+            self.direct_row_snapshot_scope(request).await?
         else {
             return Ok(None);
         };
-        let point_key = match (request.filter.entity_pks.as_slice(), request.limit) {
-            ([entity_pk], None | Some(1..)) => Some(EntityPointSnapshotCacheKey {
+        let point_key = match (request.filter.row_pks.as_slice(), request.limit) {
+            ([row_pk], None | Some(1..)) => Some(RowPointSnapshotCacheKey {
                 branch_id: requested_branch_id.clone(),
                 generation: requested_control.tracked_generation,
                 current_state_revision: requested_control.current_state_revision,
                 schema_key: schema_key.clone(),
-                entity_pk: entity_pk.clone(),
+                row_pk: row_pk.clone(),
             }),
             _ => None,
         };
         if let Some(key) = point_key.as_ref()
-            && let Some(snapshots) = self.entity_point_snapshot_cache.get(key)
+            && let Some(snapshots) = self.row_point_snapshot_cache.get(key)
         {
             #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_entity_point_snapshot_cache_hit();
+            crate::storage_bench::record_row_point_snapshot_cache_hit();
             return Ok(Some(snapshots));
         }
         if point_key.is_some() {
             #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_entity_point_snapshot_cache_miss();
+            crate::storage_bench::record_row_point_snapshot_cache_miss();
         }
         let snapshots = self
             .tracked_head
             .reader(&self.store)
             .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
-            .scan_entity_snapshots(
+            .scan_row_snapshots(
                 &requested_branch_id,
                 requested_control,
                 &schema_key,
-                &request.filter.entity_pks,
+                &request.filter.row_pks,
                 request.limit,
             )
             .await?;
         Ok(Some(match point_key {
-            Some(key) => self.entity_point_snapshot_cache.insert(key, snapshots),
+            Some(key) => self.row_point_snapshot_cache.insert(key, snapshots),
             None => snapshots,
         }))
     }
 
-    /// Returns committed entity identities under the same narrow visibility
-    /// proof as [`Self::scan_direct_entity_snapshots`].  The packed reader
+    /// Returns committed row identities under the same narrow visibility
+    /// proof as [`Self::scan_direct_row_snapshots`].  The packed reader
     /// still resolves the authoritative current rows; callers may avoid JSON
     /// decoding only when their projected SQL fields are exact key components.
-    pub(crate) async fn scan_direct_entity_primary_keys(
+    pub(crate) async fn scan_direct_row_primary_keys(
         &self,
         request: &HotStateScanRequest,
-    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+    ) -> Result<Option<Vec<RowPk>>, LixError> {
         let Some((branch_id, control, schema_key)) =
-            self.direct_entity_snapshot_scope(request).await?
+            self.direct_row_snapshot_scope(request).await?
         else {
             return Ok(None);
         };
         self.tracked_head
             .reader(&self.store)
             .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
-            .scan_entity_primary_keys(
+            .scan_row_primary_keys(
                 &branch_id,
                 control,
                 &schema_key,
-                &request.filter.entity_pks,
+                &request.filter.row_pks,
                 request.limit,
             )
             .await
             .map(Some)
     }
 
-    pub(crate) async fn plan_direct_entity_columnar_scan(
+    pub(crate) async fn plan_direct_row_columnar_scan(
         &self,
         request: &HotStateScanRequest,
     ) -> Result<
@@ -619,7 +619,7 @@ where
             crate::columnar_row_group::RowGroupSetId,
             std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
             [u8; 32],
-            std::sync::Arc<Vec<crate::hot_state::EntityColumnarOverlayRow>>,
+            std::sync::Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
             String,
             CommitId,
             u64,
@@ -627,7 +627,7 @@ where
         )>,
         LixError,
     > {
-        if !request.filter.entity_pks.is_empty()
+        if !request.filter.row_pks.is_empty()
             || request.limit.is_some()
             || !matches!(request.filter.rows, HotStateRowFilter::All)
             || request.filter.include_tombstones
@@ -638,17 +638,17 @@ where
             return Ok(None);
         }
         let Some((branch_id, control, schema_key)) =
-            self.direct_entity_snapshot_scope(request).await?
+            self.direct_row_snapshot_scope(request).await?
         else {
             return Ok(None);
         };
-        let key = EntityColumnarLayoutCacheKey {
+        let key = RowColumnarLayoutCacheKey {
             branch_id: branch_id.clone(),
             generation: control.tracked_generation,
             current_state_revision: control.current_state_revision,
             schema_key: schema_key.clone(),
         };
-        if let Some(layout) = self.entity_columnar_layout_cache.get(&key) {
+        if let Some(layout) = self.row_columnar_layout_cache.get(&key) {
             return Ok(Some((
                 layout.id,
                 std::sync::Arc::clone(&layout.manifest),
@@ -663,13 +663,13 @@ where
         let layout = self
             .tracked_head
             .reader(&self.store)
-            .entity_columnar_layout(&branch_id, control, &schema_key)
+            .row_columnar_layout(&branch_id, control, &schema_key)
             .await?;
         let Some((id, manifest, overlay, live_count)) = layout else {
             return Ok(None);
         };
         let manifest_digest = manifest.content_digest()?;
-        let layout = self.entity_columnar_layout_cache.insert(
+        let layout = self.row_columnar_layout_cache.insert(
             key,
             id,
             manifest,
@@ -691,7 +691,7 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) async fn entity_columnar_overlay_len_for_test(
+    pub(crate) async fn row_columnar_overlay_len_for_test(
         &self,
         branch_id: &str,
         schema_key: &str,
@@ -706,12 +706,12 @@ where
         Ok(self
             .tracked_head
             .reader(&self.store)
-            .entity_columnar_layout(branch_id, control, schema_key)
+            .row_columnar_layout(branch_id, control, schema_key)
             .await?
             .map(|(_, _, overlay, _)| overlay.len()))
     }
 
-    async fn direct_entity_snapshot_scope(
+    async fn direct_row_snapshot_scope(
         &self,
         request: &HotStateScanRequest,
     ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
@@ -784,7 +784,7 @@ where
             return Ok(MaterializedHotStateBatch::default());
         }
         // Resolve a declared-column equality through the index plane before any
-        // route is chosen, so every route below sees an ordinary entity-pk
+        // route is chosen, so every route below sees an ordinary row-pk
         // request. Candidates are not answers: the caller keeps its own
         // predicate and rejects stale ones.
         let resolved;
@@ -795,7 +795,7 @@ where
             }
             None => request,
         };
-        if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
+        if let Some(rows) = self.scan_direct_row_pk_batch(request, &scope).await? {
             return Ok(rows);
         }
         let derived_rows = MaterializedHotStateBatch::from_rows(
@@ -856,7 +856,7 @@ where
         ))
     }
 
-    /// Rewrites a declared-column equality into an entity-pk request.
+    /// Rewrites a declared-column equality into a row-pk request.
     ///
     /// Returns `None` when the predicate cannot be served — no predicate, more
     /// than one branch in scope, or no completeness witness for the collection
@@ -864,7 +864,7 @@ where
     /// produces correct rows, only slower.
     ///
     /// An empty candidate set becomes `HotStateRowFilter::None`, never an
-    /// empty `entity_pks` list: an empty list means "no identity filter" and
+    /// empty `row_pks` list: an empty list means "no identity filter" and
     /// would silently widen the scan to the whole collection.
     async fn resolve_declared_column_eq(
         &self,
@@ -880,7 +880,7 @@ where
         rewritten.filter.declared_column_eq = None;
         rewritten.filter.declared_column_range = None;
         // An identity filter already names its rows, so no index can narrow it.
-        if !request.filter.entity_pks.is_empty() {
+        if !request.filter.row_pks.is_empty() {
             return Ok(Some(rewritten));
         }
         // Every branch in scope must be witnessed. A branch whose index is
@@ -958,27 +958,27 @@ where
         if unique.is_empty() {
             rewritten.filter.rows = HotStateRowFilter::None;
         } else {
-            rewritten.filter.entity_pks = unique.into_iter().collect();
+            rewritten.filter.row_pks = unique.into_iter().collect();
         }
         Ok(Some(rewritten))
     }
 
-    /// Serves finite entity-PK scans from the hot current-state index. Every
+    /// Serves finite row-PK scans from the hot current-state index. Every
     /// row already has its retention tag, so an unrelated untracked row
     /// cannot route selected tracked identities through a separate scan.
     #[cfg(test)]
-    async fn scan_direct_entity_pk_rows(
+    async fn scan_direct_row_pk_rows(
         &self,
         request: &HotStateScanRequest,
         scope: &HotStateScanScope,
     ) -> Result<Option<Vec<MaterializedHotStateRow>>, LixError> {
         Ok(self
-            .scan_direct_entity_pk_batch(request, scope)
+            .scan_direct_row_pk_batch(request, scope)
             .await?
             .map(MaterializedHotStateBatch::into_rows))
     }
 
-    async fn scan_direct_entity_pk_batch(
+    async fn scan_direct_row_pk_batch(
         &self,
         request: &HotStateScanRequest,
         scope: &HotStateScanScope,
@@ -986,7 +986,7 @@ where
         if !matches!(request.filter.rows, HotStateRowFilter::All)
             || request.filter.branch_ids.is_empty()
             || request.filter.schema_keys.is_empty()
-            || request.filter.entity_pks.is_empty()
+            || request.filter.row_pks.is_empty()
             || !request.filter.file_ids.is_empty()
             || !request.filter.constraints.is_empty()
             || request_may_include_derived(request)
@@ -1068,7 +1068,7 @@ where
             .scan_batch(&HotStateScanRequest {
                 filter: crate::hot_state::HotStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
-                    entity_pks: vec![request.entity_pk.clone()],
+                    row_pks: vec![request.row_pk.clone()],
                     branch_ids: vec![request.branch_id.clone()],
                     file_ids: vec![request.file_id.clone()],
                     include_tombstones: false,
@@ -1156,14 +1156,14 @@ where
             storage_identities.push(crate::hot_state::HotStateRowIdentityRef {
                 branch_id: row.branch_id.as_str(),
                 schema_key: row.schema_key.as_str(),
-                entity_pk: &row.entity_pk,
+                row_pk: &row.row_pk,
                 file_id: row.file_id.as_deref(),
             });
             if row.branch_id != GLOBAL_BRANCH_ID {
                 storage_identities.push(crate::hot_state::HotStateRowIdentityRef {
                     branch_id: GLOBAL_BRANCH_ID,
                     schema_key: row.schema_key.as_str(),
-                    entity_pk: &row.entity_pk,
+                    row_pk: &row.row_pk,
                     file_id: row.file_id.as_deref(),
                 });
             }
@@ -1197,7 +1197,7 @@ where
                         .iter()
                         .map(|identity| crate::tracked_state::TrackedStateKeyRef {
                             schema_key: identity.schema_key,
-                            entity_pk: identity.entity_pk,
+                            row_pk: identity.row_pk,
                             file_id: identity.file_id,
                         })
                         .collect::<Vec<_>>();
@@ -1252,7 +1252,7 @@ where
             let branch_identity = crate::hot_state::HotStateRowIdentityRef {
                 branch_id: requested.branch_id.as_str(),
                 schema_key: requested.schema_key.as_str(),
-                entity_pk: &requested.entity_pk,
+                row_pk: &requested.row_pk,
                 file_id: requested.file_id.as_deref(),
             };
             let global_identity = crate::hot_state::HotStateRowIdentityRef {
@@ -1396,7 +1396,7 @@ where
     ) -> Result<Vec<HotBranchRows>, LixError> {
         // `HotStateRowFilter::None` means "no identity can match", which is
         // exactly what an index probe with no candidates produces. The tracked
-        // request below carries only `entity_pks`, where an empty list means
+        // request below carries only `row_pks`, where an empty list means
         // "no identity filter" — the opposite — so the empty case has to be
         // answered before the request is lowered.
         if matches!(request.filter.rows, HotStateRowFilter::None) {
@@ -1543,7 +1543,7 @@ fn tracked_scan_request_from_live(request: &HotStateScanRequest) -> TrackedState
     TrackedStateScanRequest {
         filter: TrackedStateFilter {
             schema_keys: request.filter.schema_keys.clone(),
-            entity_pks: request.filter.entity_pks.clone(),
+            row_pks: request.filter.row_pks.clone(),
             file_ids: request.filter.file_ids.clone(),
             // Scan tombstones internally so branch-local tombstones can hide
             // global fallback rows before the serving facade filters them.
@@ -1854,7 +1854,7 @@ mod tests {
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, CommitId,
         CommitLoadRequest,
     };
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::hot_state::{
         CurrentStateDeltaRef, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
         HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
@@ -1869,8 +1869,8 @@ mod tests {
     };
     use serde_json::json;
 
-    fn columnar_cache_key(revision: u64) -> EntityColumnarLayoutCacheKey {
-        EntityColumnarLayoutCacheKey {
+    fn columnar_cache_key(revision: u64) -> RowColumnarLayoutCacheKey {
+        RowColumnarLayoutCacheKey {
             branch_id: "branch".to_owned(),
             generation: CommitId::for_test_label("columnar-cache-generation"),
             current_state_revision: revision,
@@ -1889,8 +1889,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_columnar_layout_cache_reuses_arc_overlay() {
-        let cache = EntityColumnarLayoutCache::default();
+    fn row_columnar_layout_cache_reuses_arc_overlay() {
+        let cache = RowColumnarLayoutCache::default();
         let key = columnar_cache_key(7);
         let inserted = cache.insert(
             key,
@@ -1909,8 +1909,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_columnar_layout_cache_revision_change_invalidates_prior_layout() {
-        let cache = EntityColumnarLayoutCache::default();
+    fn row_columnar_layout_cache_revision_change_invalidates_prior_layout() {
+        let cache = RowColumnarLayoutCache::default();
         let first = columnar_cache_key(7);
         cache.insert(
             first,
@@ -1936,8 +1936,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_columnar_layout_cache_does_not_admit_oversize_layout() {
-        let cache = EntityColumnarLayoutCache::default();
+    fn row_columnar_layout_cache_does_not_admit_oversize_layout() {
+        let cache = RowColumnarLayoutCache::default();
         let key = columnar_cache_key(7);
         let returned = cache.insert_with_max_bytes(
             key,
@@ -1956,7 +1956,7 @@ mod tests {
 
     #[derive(Clone)]
     struct MaterializedUntrackedStateRow {
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         schema_key: String,
         file_id: Option<String>,
         snapshot_content: Option<String>,
@@ -1979,12 +1979,12 @@ mod tests {
         HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
     }
 
-    async fn stage_direct_entity_head(
+    async fn stage_direct_row_head(
         storage: &StorageAdapter,
         branch_id: &str,
         head: CommitId,
         schema_key: &str,
-        entity_pk: &EntityPk,
+        row_pk: &RowPk,
         snapshot: &str,
     ) {
         let read = storage
@@ -2002,7 +2002,7 @@ mod tests {
                 &[TrackedHeadDeltaRef {
                     schema_key,
                     file_id: None,
-                    entity_pk,
+                    row_pk,
                     change_id: ChangeId::for_test_label(&format!("{branch_id}-change")),
                     commit_id: head,
                     deleted: false,
@@ -2015,18 +2015,18 @@ mod tests {
                 None,
             )
             .await
-            .expect("stage direct entity head");
+            .expect("stage direct row head");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("commit direct entity head");
+            .expect("commit direct row head");
     }
 
     #[derive(Clone, Copy)]
     struct DirectTrackedHeadRow<'a> {
         schema_key: &'a str,
-        entity_pk: &'a EntityPk,
+        row_pk: &'a RowPk,
         file_id: Option<&'a str>,
         snapshot: Option<&'a str>,
         deleted: bool,
@@ -2050,7 +2050,7 @@ mod tests {
             .map(|(index, row)| TrackedHeadDeltaRef {
                 schema_key: row.schema_key,
                 file_id: row.file_id,
-                entity_pk: row.entity_pk,
+                row_pk: row.row_pk,
                 change_id: ChangeId::for_test_label(&format!("{branch_id}-change-{index}")),
                 commit_id: head,
                 deleted: row.deleted,
@@ -2085,12 +2085,12 @@ mod tests {
     fn finite_pk_scan_request(
         branch_id: &str,
         schema_key: &str,
-        entity_pks: Vec<EntityPk>,
+        row_pks: Vec<RowPk>,
     ) -> HotStateScanRequest {
         HotStateScanRequest {
             filter: HotStateFilter {
                 schema_keys: vec![schema_key.to_string()],
-                entity_pks,
+                row_pks,
                 branch_ids: vec![branch_id.to_string()],
                 ..HotStateFilter::default()
             },
@@ -2098,7 +2098,7 @@ mod tests {
         }
     }
 
-    async fn scan_direct_entity_pk_rows_for_test(
+    async fn scan_direct_row_pk_rows_for_test(
         hot_state: &HotStateContext,
         storage: &StorageAdapter,
         request: &HotStateScanRequest,
@@ -2110,7 +2110,7 @@ mod tests {
         let scope = scan_scope(&read, request, true, None).await?;
         hot_state
             .reader(read)
-            .scan_direct_entity_pk_rows(request, &scope)
+            .scan_direct_row_pk_rows(request, &scope)
             .await
     }
 
@@ -2118,13 +2118,13 @@ mod tests {
     async fn transaction_branch_head_control_cache_pins_loaded_generation() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "ffffffff-ffff-7fff-bfff-ffffffffffff";
-        let entity_pk = EntityPk::single("cached-control-row");
-        stage_direct_entity_head(
+        let row_pk = RowPk::single("cached-control-row");
+        stage_direct_row_head(
             &storage,
             branch_id,
             CommitId::for_test_label("cached-control-head"),
             "schema",
-            &entity_pk,
+            &row_pk,
             r#"{"value":"one"}"#,
         )
         .await;
@@ -2217,24 +2217,24 @@ mod tests {
             .map(MaterializedHotStateBatch::into_rows)
     }
 
-    async fn scan_direct_entity_snapshots_for_test(
+    async fn scan_direct_row_snapshots_for_test(
         hot_state: &HotStateContext,
         storage: &StorageAdapter,
         branch_id: &str,
         schema_key: &str,
-        entity_pks: &[EntityPk],
+        row_pks: &[RowPk],
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
         hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
-                    .expect("open direct entity read"),
+                    .expect("open direct row read"),
             )
-            .scan_direct_entity_snapshots(&HotStateScanRequest {
+            .scan_direct_row_snapshots(&HotStateScanRequest {
                 filter: HotStateFilter {
                     schema_keys: vec![schema_key.to_string()],
-                    entity_pks: entity_pks.to_vec(),
+                    row_pks: row_pks.to_vec(),
                     branch_ids: vec![branch_id.to_string()],
                     ..HotStateFilter::default()
                 },
@@ -2301,32 +2301,32 @@ mod tests {
             tracked_row_at_with_commit("branch", "first", None, "first"),
             tracked_row_at_with_commit("branch", "second", None, "second"),
         ]);
-        let entity_column = batch.entity_column_ptr();
+        let row_column = batch.row_column_ptr();
         let batch = filter_current_row_retention(batch, Some(false));
-        assert_eq!(batch.entity_column_ptr(), entity_column);
+        assert_eq!(batch.row_column_ptr(), row_column);
 
-        let entity_column = batch.entity_column_ptr();
+        let row_column = batch.row_column_ptr();
         let batch = finalize_ordered_unique_batch(batch, false, None);
-        assert_eq!(batch.entity_column_ptr(), entity_column);
+        assert_eq!(batch.row_column_ptr(), row_column);
 
-        let entity_column = batch.entity_column_ptr();
+        let row_column = batch.row_column_ptr();
         let batch = concat_hot_state_batches([
             MaterializedHotStateBatch::default(),
             batch,
             MaterializedHotStateBatch::default(),
         ]);
-        assert_eq!(batch.entity_column_ptr(), entity_column);
+        assert_eq!(batch.row_column_ptr(), row_column);
         assert_eq!(batch.len(), 2);
     }
 
     #[tokio::test]
-    async fn direct_entity_snapshots_fall_back_when_global_tracks_the_schema() {
+    async fn direct_row_snapshots_fall_back_when_global_tracks_the_schema() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
         let branch_id = "branch";
         let schema_key = "schema";
-        let local_pk = EntityPk::single("local-row");
-        stage_direct_entity_head(
+        let local_pk = RowPk::single("local-row");
+        stage_direct_row_head(
             &storage,
             branch_id,
             CommitId::for_test_label("branch-head"),
@@ -2335,18 +2335,18 @@ mod tests {
             r#"{"value":"local"}"#,
         )
         .await;
-        stage_direct_entity_head(
+        stage_direct_row_head(
             &storage,
             GLOBAL_BRANCH_ID,
             CommitId::for_test_label("global-head"),
             schema_key,
-            &EntityPk::single("global-row"),
+            &RowPk::single("global-row"),
             r#"{"value":"ffffffff-ffff-7fff-bfff-ffffffffffff"}"#,
         )
         .await;
 
         assert!(
-            scan_direct_entity_snapshots_for_test(
+            scan_direct_row_snapshots_for_test(
                 &hot_state,
                 &storage,
                 branch_id,
@@ -2354,14 +2354,14 @@ mod tests {
                 std::slice::from_ref(&local_pk),
             )
             .await
-            .expect("global entity scan should execute")
+            .expect("global row scan should execute")
             .is_none(),
             "a global tracked row requires the established branch/global resolver"
         );
     }
 
     #[tokio::test]
-    async fn direct_entity_snapshots_fall_back_for_retention_scoped_reads() {
+    async fn direct_row_snapshots_fall_back_for_retention_scoped_reads() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
         for untracked in [false, true] {
@@ -2370,12 +2370,12 @@ mod tests {
                     storage
                         .begin_read(StorageReadOptions::default())
                         .await
-                        .expect("open retention-scoped entity read"),
+                        .expect("open retention-scoped row read"),
                 )
-                .scan_direct_entity_snapshots(&HotStateScanRequest {
+                .scan_direct_row_snapshots(&HotStateScanRequest {
                     filter: HotStateFilter {
                         schema_keys: vec!["schema".to_string()],
-                        entity_pks: vec![EntityPk::single("row")],
+                        row_pks: vec![RowPk::single("row")],
                         branch_ids: vec!["branch".to_string()],
                         untracked: Some(untracked),
                         ..HotStateFilter::default()
@@ -2383,7 +2383,7 @@ mod tests {
                     ..HotStateScanRequest::default()
                 })
                 .await
-                .expect("retention-scoped entity read should execute");
+                .expect("retention-scoped row read should execute");
             assert!(
                 snapshots.is_none(),
                 "raw snapshot serving must not bypass retention filtering"
@@ -2392,24 +2392,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_entity_snapshots_read_sorted_exact_primary_keys() {
+    async fn direct_row_snapshots_read_sorted_exact_primary_keys() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
         let branch_id = "branch";
         let schema_key = "schema";
-        let first = EntityPk::single("first");
-        let second = EntityPk::single("second");
+        let first = RowPk::single("first");
+        let second = RowPk::single("second");
         let rows = [
             DirectTrackedHeadRow {
                 schema_key,
-                entity_pk: &second,
+                row_pk: &second,
                 file_id: None,
                 snapshot: Some(r#"{"id":"second","value":"two"}"#),
                 deleted: false,
             },
             DirectTrackedHeadRow {
                 schema_key,
-                entity_pk: &first,
+                row_pk: &first,
                 file_id: None,
                 snapshot: Some(r#"{"id":"first","value":"one"}"#),
                 deleted: false,
@@ -2423,21 +2423,21 @@ mod tests {
         )
         .await;
 
-        let snapshots = scan_direct_entity_snapshots_for_test(
+        let snapshots = scan_direct_row_snapshots_for_test(
             &hot_state,
             &storage,
             branch_id,
             schema_key,
             &[
                 second.clone(),
-                EntityPk::single("missing"),
+                RowPk::single("missing"),
                 first.clone(),
                 second,
             ],
         )
         .await
-        .expect("exact tracked entity scan should execute")
-        .expect("tracked-only exact entity scan should use direct snapshots");
+        .expect("exact tracked row scan should execute")
+        .expect("tracked-only exact row scan should use direct snapshots");
         assert_eq!(
             snapshots
                 .iter()
@@ -2456,18 +2456,18 @@ mod tests {
     async fn finite_pk_hot_scan_returns_all_file_id_siblings() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
-        let entity_pk = EntityPk::single("shared-entity");
+        let row_pk = RowPk::single("shared-row");
         let rows = [
             DirectTrackedHeadRow {
                 schema_key: "schema",
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                 snapshot: Some(r#"{"value":"a"}"#),
                 deleted: false,
             },
             DirectTrackedHeadRow {
                 schema_key: "schema",
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 file_id: Some("01920000-0000-7000-8000-0000000000b2"),
                 snapshot: Some(r#"{"value":"b"}"#),
                 deleted: false,
@@ -2481,8 +2481,8 @@ mod tests {
         )
         .await;
 
-        let request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
-        let direct = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
+        let request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![row_pk]);
+        let direct = scan_direct_row_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("direct hot-state scan should execute")
             .expect("finite tracked primary-key scan should use the hot route");
@@ -2514,14 +2514,14 @@ mod tests {
     async fn finite_pk_hot_scan_resolves_branch_override_and_tombstone_against_global() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
-        let entity_pk = EntityPk::single("shared-entity");
+        let row_pk = RowPk::single("shared-row");
         stage_direct_tracked_head_rows(
             &storage,
             GLOBAL_BRANCH_ID,
             CommitId::for_test_label("global-head"),
             &[DirectTrackedHeadRow {
                 schema_key: "schema",
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 file_id: None,
                 snapshot: Some(r#"{"value":"ffffffff-ffff-7fff-bfff-ffffffffffff"}"#),
                 deleted: false,
@@ -2534,7 +2534,7 @@ mod tests {
             CommitId::for_test_label("branch-head"),
             &[DirectTrackedHeadRow {
                 schema_key: "schema",
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 file_id: None,
                 snapshot: Some(r#"{"value":"branch"}"#),
                 deleted: false,
@@ -2545,9 +2545,9 @@ mod tests {
         let request = finite_pk_scan_request(
             "01920000-0000-7000-8000-0000000000a1",
             "schema",
-            vec![entity_pk.clone()],
+            vec![row_pk.clone()],
         );
-        let direct = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
+        let direct = scan_direct_row_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("direct hot-state scan should execute")
             .expect("current branch and global controls should use the hot route");
@@ -2574,7 +2574,7 @@ mod tests {
             CommitId::for_test_label("branch-tombstone"),
             &[DirectTrackedHeadRow {
                 schema_key: "schema",
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 file_id: None,
                 snapshot: None,
                 deleted: true,
@@ -2582,7 +2582,7 @@ mod tests {
         )
         .await;
 
-        let hidden = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
+        let hidden = scan_direct_row_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("direct hot-state tombstone scan should execute")
             .expect("current controls should retain the hot route");
@@ -2597,7 +2597,7 @@ mod tests {
         let mut including_tombstones = request.clone();
         including_tombstones.filter.include_tombstones = true;
         let tombstones =
-            scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &including_tombstones)
+            scan_direct_row_pk_rows_for_test(&hot_state, &storage, &including_tombstones)
                 .await
                 .expect("direct hot-state tombstone scan should execute")
                 .expect("current controls should retain the hot route");
@@ -2614,15 +2614,15 @@ mod tests {
     async fn finite_pk_hot_scan_serves_mixed_current_state() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
-        let tracked_pk = EntityPk::single("tracked-entity");
-        let untracked_pk = EntityPk::single("untracked-entity");
+        let tracked_pk = RowPk::single("tracked-row");
+        let untracked_pk = RowPk::single("untracked-row");
         stage_direct_tracked_head_rows(
             &storage,
             GLOBAL_BRANCH_ID,
             CommitId::for_test_label("tracked-head"),
             &[DirectTrackedHeadRow {
                 schema_key: "schema",
-                entity_pk: &tracked_pk,
+                row_pk: &tracked_pk,
                 file_id: None,
                 snapshot: Some(r#"{"value":"tracked"}"#),
                 deleted: false,
@@ -2636,7 +2636,7 @@ mod tests {
             vec![tracked_pk.clone(), untracked_pk.clone()],
         );
         assert!(
-            scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
+            scan_direct_row_pk_rows_for_test(&hot_state, &storage, &request)
                 .await
                 .expect("initial direct hot-state scan should execute")
                 .is_some(),
@@ -2651,7 +2651,7 @@ mod tests {
             &storage,
             &read,
             &[MaterializedUntrackedStateRow {
-                entity_pk: untracked_pk.clone(),
+                row_pk: untracked_pk.clone(),
                 schema_key: "schema".to_string(),
                 file_id: None,
                 snapshot_content: Some(r#"{"value":"untracked"}"#.to_string()),
@@ -2664,7 +2664,7 @@ mod tests {
         )
         .await;
 
-        let direct = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
+        let direct = scan_direct_row_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("mixed hot-state scan should execute")
             .expect("one hot index serves both retention modes");
@@ -2676,7 +2676,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let tracked = rows
             .iter()
-            .find(|row| row.entity_pk == tracked_pk)
+            .find(|row| row.row_pk == tracked_pk)
             .expect("tracked row should remain visible");
         assert!(!tracked.untracked);
         assert_eq!(
@@ -2685,7 +2685,7 @@ mod tests {
         );
         let untracked = rows
             .iter()
-            .find(|row| row.entity_pk == untracked_pk)
+            .find(|row| row.row_pk == untracked_pk)
             .expect("untracked row should be merged into normal query results");
         assert!(untracked.untracked);
         assert_eq!(
@@ -2698,7 +2698,7 @@ mod tests {
     async fn explicit_file_id_predicate_retains_member_read_path() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
-        let entity_pk = EntityPk::single("shared-entity");
+        let row_pk = RowPk::single("shared-row");
         stage_direct_tracked_head_rows(
             &storage,
             GLOBAL_BRANCH_ID,
@@ -2706,14 +2706,14 @@ mod tests {
             &[
                 DirectTrackedHeadRow {
                     schema_key: "schema",
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                     snapshot: Some(r#"{"value":"a"}"#),
                     deleted: false,
                 },
                 DirectTrackedHeadRow {
                     schema_key: "schema",
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     file_id: Some("01920000-0000-7000-8000-0000000000b2"),
                     snapshot: Some(r#"{"value":"b"}"#),
                     deleted: false,
@@ -2722,12 +2722,12 @@ mod tests {
         )
         .await;
 
-        let mut request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
+        let mut request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![row_pk]);
         request.filter.file_ids = vec![NullableKeyFilter::Value(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
         )];
         assert!(
-            scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
+            scan_direct_row_pk_rows_for_test(&hot_state, &storage, &request)
                 .await
                 .expect("file-filtered direct hot-state scan should execute")
                 .is_none(),
@@ -2767,7 +2767,7 @@ mod tests {
                     continue;
                 }
                 let branch_id = row
-                    .entity_pk
+                    .row_pk
                     .as_single_string_owned()
                     .expect("test branch ref must have one branch id key");
                 let snapshot = row
@@ -2879,7 +2879,7 @@ mod tests {
                 .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
+                    row_pk: &row.row_pk,
                     change_id: Some(ChangeId::for_test_label("live-state-untracked-store")),
                     commit_id: None,
                     untracked: true,
@@ -2962,7 +2962,7 @@ mod tests {
                 .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
+                    row_pk: &row.row_pk,
                     change_id: Some(ChangeId::for_test_label("live-state-untracked-store-alt")),
                     commit_id: None,
                     untracked: true,
@@ -3098,9 +3098,9 @@ mod tests {
             "test-branch",
             COMMIT_SCHEMA_KEY,
             vec![
-                EntityPk::uuid_from_bytes(*existing.as_uuid().as_bytes()),
-                EntityPk::uuid_from_bytes(*existing.as_uuid().as_bytes()),
-                EntityPk::uuid_from_bytes(*missing.as_uuid().as_bytes()),
+                RowPk::uuid_from_bytes(*existing.as_uuid().as_bytes()),
+                RowPk::uuid_from_bytes(*existing.as_uuid().as_bytes()),
+                RowPk::uuid_from_bytes(*missing.as_uuid().as_bytes()),
             ],
         );
         let rows = scan_derived_rows(
@@ -3114,13 +3114,13 @@ mod tests {
         .await
         .expect("typed point scan should succeed");
         assert_eq!(rows.len(), 1, "duplicates and missing keys must flatten");
-        assert_eq!(rows[0].entity_pk, typed_request.filter.entity_pks[0]);
+        assert_eq!(rows[0].row_pk, typed_request.filter.row_pks[0]);
         assert_eq!(rows[0].commit_id, Some(existing));
 
         let string_request = finite_pk_scan_request(
             "test-branch",
             COMMIT_SCHEMA_KEY,
-            vec![EntityPk::single(existing.to_string())],
+            vec![RowPk::single(existing.to_string())],
         );
         let rows = scan_derived_rows(
             &read,
@@ -3203,7 +3203,7 @@ mod tests {
         let typed_request = finite_pk_scan_request(
             branch_id,
             BRANCH_REF_SCHEMA_KEY,
-            vec![EntityPk::uuid_from_canonical(branch_id).expect("valid branch UUID")],
+            vec![RowPk::uuid_from_canonical(branch_id).expect("valid branch UUID")],
         );
         let rows = scan_derived_rows(
             &read,
@@ -3216,12 +3216,12 @@ mod tests {
         .await
         .expect("typed branch-ref point scan should succeed");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, typed_request.filter.entity_pks[0]);
+        assert_eq!(rows[0].row_pk, typed_request.filter.row_pks[0]);
 
         let string_request = finite_pk_scan_request(
             branch_id,
             BRANCH_REF_SCHEMA_KEY,
-            vec![EntityPk::single(branch_id)],
+            vec![RowPk::single(branch_id)],
         );
         let rows = scan_derived_rows(
             &read,
@@ -3305,16 +3305,16 @@ mod tests {
             projection_branch_ids: vec![branch_id.to_string()],
             branch_heads: BranchHeads::default(),
         };
-        let edge_pk = EntityPk::from_components(smallvec::smallvec![
-            crate::entity_pk::EntityPkComponent::Uuid(*child.as_uuid().as_bytes()),
-            crate::entity_pk::EntityPkComponent::Integer(0),
+        let edge_pk = RowPk::from_components(smallvec::smallvec![
+            crate::row_pk::RowPkComponent::Uuid(*child.as_uuid().as_bytes()),
+            crate::row_pk::RowPkComponent::Integer(0),
         ])
         .expect("valid edge identity");
         let request = HotStateScanRequest {
             filter: HotStateFilter {
                 schema_keys: vec!["lix_commit".to_string(), "lix_commit_edge".to_string()],
-                entity_pks: vec![
-                    EntityPk::uuid_from_bytes(*child.as_uuid().as_bytes()),
+                row_pks: vec![
+                    RowPk::uuid_from_bytes(*child.as_uuid().as_bytes()),
                     edge_pk.clone(),
                 ],
                 branch_ids: vec![branch_id.to_string()],
@@ -3340,7 +3340,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.schema_key == "lix_commit"));
         assert!(
             rows.iter()
-                .any(|row| row.schema_key == "lix_commit_edge" && row.entity_pk == edge_pk)
+                .any(|row| row.schema_key == "lix_commit_edge" && row.row_pk == edge_pk)
         );
     }
 
@@ -3457,7 +3457,7 @@ mod tests {
                 .map(|(change, created_at, updated_at)| TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),
-                    entity_pk: &change.entity_pk,
+                    row_pk: &change.row_pk,
                     change_id: change.change_id,
                     commit_id: typed_commit_id,
                     deleted: change.snapshot.is_none(),
@@ -3571,7 +3571,7 @@ mod tests {
         // under test: a single identity cannot change retention class.
         let mut tracked_row =
             tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
-        tracked_row.entity_pk = identity("tracked-tab");
+        tracked_row.row_pk = identity("tracked-tab");
         stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
             .await
             .expect("tracked row should stage");
@@ -3618,7 +3618,7 @@ mod tests {
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                entity_pk: EntityPk::single("selected-tab"),
+                row_pk: RowPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -3649,7 +3649,7 @@ mod tests {
         // identity so the selected untracked row is not a retention conflict.
         let mut tracked_row =
             tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
-        tracked_row.entity_pk = identity("tracked-tab");
+        tracked_row.row_pk = identity("tracked-tab");
         stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
             .await
             .expect("tracked row should stage");
@@ -3670,7 +3670,7 @@ mod tests {
         let selected = HotStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-            entity_pk: identity("selected-tab"),
+            row_pk: identity("selected-tab"),
             file_id: None,
         };
         let rows = hot_state
@@ -3687,7 +3687,7 @@ mod tests {
                     HotStateExactRowRequest {
                         schema_key: "lix_key_value".to_string(),
                         branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                        entity_pk: identity("missing"),
+                        row_pk: identity("missing"),
                         file_id: None,
                     },
                 ],
@@ -4305,12 +4305,12 @@ mod tests {
 
         let mut global_fallback =
             tracked_row_with_commit("global-fallback", Some("change-fallback"), "commit-global");
-        global_fallback.entity_pk = identity("fallback");
+        global_fallback.row_pk = identity("fallback");
         global_fallback.file_id = Some("fallback".to_string());
         global_fallback.metadata = Some("{\"source\":\"global\"}".into());
         let mut global_overridden =
             tracked_row_with_commit("global-old", Some("change-global-old"), "commit-global");
-        global_overridden.entity_pk = identity("overridden");
+        global_overridden.row_pk = identity("overridden");
         global_overridden.file_id = Some("overridden".to_string());
         let mut branch_override = tracked_row_at_with_commit(
             "01920000-0000-7000-8000-0000000000a1",
@@ -4318,22 +4318,22 @@ mod tests {
             Some("change-branch-new"),
             "commit-branch",
         );
-        branch_override.entity_pk = identity("overridden");
+        branch_override.row_pk = identity("overridden");
         branch_override.file_id = Some("overridden".to_string());
         let mut global_hidden =
             tracked_row_with_commit("global-hidden", Some("change-hidden"), "commit-global");
-        global_hidden.entity_pk = identity("hidden");
+        global_hidden.row_pk = identity("hidden");
         global_hidden.file_id = Some("hidden".to_string());
         let mut branch_tombstone = tombstone_tracked_row_at_with_commit(
             "01920000-0000-7000-8000-0000000000a1",
             Some("change-tombstone"),
             "commit-branch",
         );
-        branch_tombstone.entity_pk = identity("hidden");
+        branch_tombstone.row_pk = identity("hidden");
         branch_tombstone.file_id = Some("hidden".to_string());
         let mut malformed_cross_pair =
             tracked_row_with_commit("cross-pair", Some("change-cross"), "commit-global");
-        malformed_cross_pair.entity_pk = identity("entity-a");
+        malformed_cross_pair.row_pk = identity("row-a");
         malformed_cross_pair.file_id = Some("01920000-0000-7000-8000-0000000000b2".to_string());
 
         let rows = [
@@ -4363,10 +4363,10 @@ mod tests {
         )
         .await;
 
-        let exact = |entity: &str, file_id: &str| HotStateExactRowRequest {
+        let exact = |row: &str, file_id: &str| HotStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
-            entity_pk: identity(entity),
+            row_pk: identity(row),
             file_id: Some(file_id.to_string()),
         };
         let reader = hot_state.reader(
@@ -4381,9 +4381,9 @@ mod tests {
                     exact("fallback", "fallback"),
                     exact("overridden", "overridden"),
                     exact("hidden", "hidden"),
-                    exact("entity-a", "01920000-0000-7000-8000-0000000000a2"),
-                    exact("entity-b", "01920000-0000-7000-8000-0000000000b2"),
-                    exact("entity-a", "01920000-0000-7000-8000-0000000000b2"),
+                    exact("row-a", "01920000-0000-7000-8000-0000000000a2"),
+                    exact("row-b", "01920000-0000-7000-8000-0000000000b2"),
+                    exact("row-a", "01920000-0000-7000-8000-0000000000b2"),
                     exact("missing", "missing"),
                 ],
                 projection: HotStateProjection {
@@ -4413,8 +4413,8 @@ mod tests {
             Some("{\"value\":\"branch-new\"}")
         );
         assert_eq!(loaded[2], None, "branch tombstone must hide global row");
-        assert_eq!(loaded[3], None, "entity A/file A must not cross-match");
-        assert_eq!(loaded[4], None, "entity B/file B must not cross-match");
+        assert_eq!(loaded[3], None, "row A/file A must not cross-match");
+        assert_eq!(loaded[4], None, "row B/file B must not cross-match");
         assert_eq!(
             loaded[5]
                 .as_ref()
@@ -4612,7 +4612,7 @@ mod tests {
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                entity_pk: EntityPk::single("selected-tab"),
+                row_pk: RowPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -4633,7 +4633,7 @@ mod tests {
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: branch_id.to_string(),
-                entity_pk: EntityPk::single("selected-tab"),
+                row_pk: RowPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -4655,7 +4655,7 @@ mod tests {
             .scan_batch(&HotStateScanRequest {
                 filter: HotStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_pks: vec![EntityPk::single("selected-tab")],
+                    row_pks: vec![RowPk::single("selected-tab")],
                     branch_ids: vec![branch_id.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones,
@@ -4715,7 +4715,7 @@ mod tests {
     ) -> MaterializedHotStateRow {
         let commit_id = CommitId::for_test_label(commit_id);
         MaterializedHotStateRow {
-            entity_pk: identity("selected-tab"),
+            row_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
@@ -4749,7 +4749,7 @@ mod tests {
 
     fn untracked_row_at(branch_id: &str, value: &str) -> MaterializedUntrackedStateRow {
         MaterializedUntrackedStateRow {
-            entity_pk: identity("selected-tab"),
+            row_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
@@ -4764,7 +4764,7 @@ mod tests {
     fn branch_ref_row(branch_id: &str, commit_id: &str) -> MaterializedUntrackedStateRow {
         let commit_id = CommitId::for_test_label(commit_id).to_string();
         MaterializedUntrackedStateRow {
-            entity_pk: identity(branch_id),
+            row_pk: identity(branch_id),
             schema_key: "lix_branch_ref".to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -4816,7 +4816,7 @@ mod tests {
         let commit_id = CommitId::for_test_label(commit_id);
         let commit_id_text = commit_id.to_string();
         MaterializedHotStateRow {
-            entity_pk: identity(&commit_id_text),
+            row_pk: identity(&commit_id_text),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -4836,7 +4836,7 @@ mod tests {
         }
     }
 
-    fn identity(entity_pk: &str) -> EntityPk {
-        EntityPk::single(entity_pk)
+    fn identity(row_pk: &str) -> RowPk {
+        RowPk::single(row_pk)
     }
 }

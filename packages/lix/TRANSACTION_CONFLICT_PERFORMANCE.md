@@ -48,8 +48,8 @@ Conflict resolution was already invoked once per file, but its resolved and
 retained rows were replayed through one plugin transition at a time. The hard
 cut groups those rows by file and sends one semantic batch through the existing
 plugin boundary. JSON now accepts multiple independent existing-scalar edits;
-CSV, Markdown, and text already accepted multi-entity updates. Every reference
-plugin is covered by a multi-entity same-base convergence test that asserts one
+CSV, Markdown, and text already accepted multi-row updates. Every reference
+plugin is covered by a multi-row same-base convergence test that asserts one
 resolver call and one render transition.
 
 | Conflicts in one JSON file | Before p50 | After p50 | Before guest exports | After guest exports | Speedup |

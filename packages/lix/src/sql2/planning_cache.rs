@@ -897,7 +897,7 @@ fn decode_update_string_literals_for_shape<'a>(
         return None;
     }
 
-    // The entity UPDATE lane has exactly two string parameters. Once its
+    // The row UPDATE lane has exactly two string parameters. Once its
     // normalized shape is certified, compare the three static SQL spans and
     // scan only the two quoted values. The generic state machine below is
     // retained for wider mutation programs, but rerunning it over every byte

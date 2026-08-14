@@ -21,7 +21,7 @@ const BOUND_OLAP_UPDATE_SCORE_SQL: &str = "UPDATE olap_row SET score = $1 WHERE 
 const BOUND_OLAP_UPDATE_ACTIVE_SQL: &str = "UPDATE olap_row SET active = $1 WHERE id = $2";
 const OLAP_ROWS_PER_STATEMENT: usize = 4_096;
 const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
-// These deliberately miss the native entity-read recognizer so profile mode
+// These deliberately miss the native row-read recognizer so profile mode
 // can measure the general DataFusion execution path rather than a specialized
 // public CRUD fast path.
 const GENERAL_FILTER_SORT_SQL: &str =

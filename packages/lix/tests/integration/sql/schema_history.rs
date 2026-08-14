@@ -4,7 +4,7 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
-    entity_history_reads_typed_rows_from_commit_graph,
+    row_history_reads_typed_rows_from_commit_graph,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -31,12 +31,12 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_history_schema \
-                 (lixcol_entity_pk, id, count, active, meta, lixcol_untracked) \
-                 VALUES (CAST('[\"history-entity\"]' AS JSONB), 'history-entity', 1, true, CAST('{\"source\":\"insert\"}' AS JSONB), false)",
+                 (lixcol_row_pk, id, count, active, meta, lixcol_untracked) \
+                 VALUES (CAST('[\"history-row\"]' AS JSONB), 'history-row', 1, true, CAST('{\"source\":\"insert\"}' AS JSONB), false)",
                 &[],
             )
             .await
-            .expect("entity insert should succeed");
+            .expect("row insert should succeed");
         let first_commit_id = engine
             .load_branch_head_commit_id(sim.main_branch_id())
             .await
@@ -47,11 +47,11 @@ simulation_test!(
             .execute(
                 "UPDATE engine_history_schema \
                  SET count = 2, active = false, meta = CAST('{\"source\":\"update\"}' AS JSONB) \
-                 WHERE lixcol_entity_pk = CAST('[\"history-entity\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"history-row\"]' AS JSONB)",
                 &[],
             )
             .await
-            .expect("entity update should succeed");
+            .expect("row update should succeed");
         let second_commit_id = engine
             .load_branch_head_commit_id(sim.main_branch_id())
             .await
@@ -62,35 +62,35 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, count, active, meta, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_is_deleted, lixcol_depth \
+                    "SELECT id, count, active, meta, lixcol_row_pk, lixcol_observed_commit_id, lixcol_is_deleted, lixcol_depth \
                      FROM engine_history_schema_history('{second_commit_id}') \
-                     WHERE lixcol_entity_pk = CAST('[\"history-entity\"]' AS JSONB) \
+                     WHERE lixcol_row_pk = CAST('[\"history-row\"]' AS JSONB) \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
             )
             .await
-            .expect("entity history read should succeed");
+            .expect("row history read should succeed");
 
         assert_rows_eq(
             result,
             vec![
                 vec![
-                    Value::Text("history-entity".to_string()),
+                    Value::Text("history-row".to_string()),
                     Value::Integer(2),
                     Value::Boolean(false),
                     Value::Json(json!({"source": "update"}).into()),
-                    Value::Json(json!(["history-entity"]).into()),
+                    Value::Json(json!(["history-row"]).into()),
                     Value::Text(second_commit_id.clone()),
                     Value::Boolean(false),
                     Value::Integer(0),
                 ],
                 vec![
-                    Value::Text("history-entity".to_string()),
+                    Value::Text("history-row".to_string()),
                     Value::Integer(1),
                     Value::Boolean(true),
                     Value::Json(json!({"source": "insert"}).into()),
-                    Value::Json(json!(["history-entity"]).into()),
+                    Value::Json(json!(["history-row"]).into()),
                     Value::Text(first_commit_id),
                     Value::Boolean(false),
                     Value::Integer(1),
@@ -100,7 +100,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
+simulation_test!(row_history_defaults_to_active_head, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -126,12 +126,12 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
     session
         .execute(
             "INSERT INTO engine_history_error_schema \
-                 (lixcol_entity_pk, id, lixcol_untracked) \
+                 (lixcol_row_pk, id, lixcol_untracked) \
                  VALUES (CAST('[\"history-default\"]' AS JSONB), 'history-default', false)",
             &[],
         )
         .await
-        .expect("entity insert should succeed");
+        .expect("row insert should succeed");
     let result = session
         .execute(
             "SELECT id, lixcol_depth \
@@ -152,7 +152,7 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
 });
 
 simulation_test!(
-    entity_history_rejects_retired_anchor_names,
+    row_history_rejects_retired_anchor_names,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(

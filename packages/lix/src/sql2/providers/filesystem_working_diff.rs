@@ -15,7 +15,7 @@ use crate::branch::BranchRefReader;
 use crate::checkpoint::checkpoint_commit_id_at_head;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{compose_directory_path, compose_file_path};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -255,12 +255,12 @@ where
         }
         match entry.identity.schema_key() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(entry.identity.entity_pk()) {
+                if let Some(id) = single_row_pk_value(entry.identity.row_pk()) {
                     file_ids.insert(id);
                 }
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(entry.identity.entity_pk()) {
+                if let Some(id) = single_row_pk_value(entry.identity.row_pk()) {
                     directory_ids.insert(id);
                 }
             }
@@ -316,8 +316,8 @@ where
     Ok(rows)
 }
 
-fn single_entity_pk_value(entity_pk: &EntityPk) -> Option<String> {
-    serde_json::from_str::<Vec<String>>(&entity_pk.as_json_array_text().ok()?)
+fn single_row_pk_value(row_pk: &RowPk) -> Option<String> {
+    serde_json::from_str::<Vec<String>>(&row_pk.as_json_array_text().ok()?)
         .ok()?
         .into_iter()
         .next()
@@ -332,12 +332,12 @@ async fn load_logical_snapshot<S>(
 where
     S: StorageAdapterRead,
 {
-    let file_entity_pks = if load_all_files {
+    let file_row_pks = if load_all_files {
         Vec::new()
     } else {
         selected_file_ids
             .iter()
-            .map(|file_id| filesystem_descriptor_entity_pk(file_id, "file"))
+            .map(|file_id| filesystem_descriptor_row_pk(file_id, "file"))
             .collect::<Result<Vec<_>, _>>()?
     };
     let files = if !load_all_files && selected_file_ids.is_empty() {
@@ -347,7 +347,7 @@ where
             tracked,
             commit_id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            file_entity_pks,
+            file_row_pks,
         )
         .await?
     };
@@ -421,7 +421,7 @@ where
             commit_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             ids.iter()
-                .map(|directory_id| filesystem_descriptor_entity_pk(directory_id, "directory"))
+                .map(|directory_id| filesystem_descriptor_row_pk(directory_id, "directory"))
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
@@ -436,8 +436,8 @@ where
     Ok(directories)
 }
 
-fn filesystem_descriptor_entity_pk(id: &str, kind: &str) -> Result<EntityPk, LixError> {
-    EntityPk::uuid_from_canonical(id).map_err(|error| {
+fn filesystem_descriptor_row_pk(id: &str, kind: &str) -> Result<RowPk, LixError> {
+    RowPk::uuid_from_canonical(id).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("validated {kind} ID is not a canonical UUID: {error}"),
@@ -449,7 +449,7 @@ async fn scan_descriptors<S, T>(
     tracked: &mut TrackedStateStoreReader<S>,
     commit_id: &str,
     schema_key: &str,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
 ) -> Result<Vec<T>, LixError>
 where
     S: StorageAdapterRead,
@@ -461,7 +461,7 @@ where
             &TrackedStateScanRequest {
                 filter: TrackedStateFilter {
                     schema_keys: vec![schema_key.to_string()],
-                    entity_pks,
+                    row_pks,
                     include_tombstones: false,
                     ..TrackedStateFilter::default()
                 },

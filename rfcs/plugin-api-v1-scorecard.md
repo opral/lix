@@ -16,7 +16,7 @@ These use the production Wasmtime Component runtime and real format plugins.
 | workload | input | transition | elapsed | guest high water | boundary |
 | --- | ---: | --- | ---: | ---: | ---: |
 | CSV, 220,000 rows | 10,680,000 B | initial import | 1.62 s test total | 53,018,624 B | paged full import |
-| CSV, 220,000 rows | 10,680,000 B | cold restore | 0.86 s combined test | 61,997,056 B | paged entities/render |
+| CSV, 220,000 rows | 10,680,000 B | cold restore | 0.86 s combined test | 61,997,056 B | paged rows/render |
 | CSV, 220,000 rows | 10,680,000 B | one-row warm edit after restore | included above | 61,997,056 B | one row |
 | JSON, 39,870 properties | 10,485,760 B | initial import | 1,688.546 ms | 26,673,152 B | full source |
 | JSON, one scalar | 10,485,760 B | verified warm edit | 5.500 ms engine | 26,673,152 B | 418 B |
@@ -55,7 +55,7 @@ cargo test -p lix_e2e --test e2e \
 
 ## v3 arena ownership model
 
-The deterministic scorecard applies one one-byte edit, one complete entity
+The deterministic scorecard applies one one-byte edit, one complete row
 replacement, and one opaque state-page replacement to unique-content fixtures.
 The v2 retained estimate counts only two exact accepted byte owners plus the
 changed values; it deliberately excludes allocator and parsed-index overhead.
@@ -104,7 +104,7 @@ Every row is an independent pass/fail gate. “Pending” is not a pass.
 | CSV | 10.68 MiB warm row edit | pending isolated p95 | pending | ≥72,677,056 B | ≤24,225,685 B |
 | Excalidraw | large element/file edit | pending baseline | pending | pending baseline | pending |
 
-The final scorecard also requires cold import, warm entity edit, eviction
+The final scorecard also requires cold import, warm row edit, eviction
 restore, and merge lanes for all four formats. It measures process peak delta
 and separately reports host unique arena bytes and guest high water so a lower
 Wasm heap cannot hide host duplication.
@@ -112,7 +112,7 @@ Wasm heap cannot hide host duplication.
 ## Decision
 
 Accepted as the production hard cut after the Wasmtime binding, fused push
-sinks, universal entity pages, certified storage batches, and sparse arena state were
+sinks, universal row pages, certified storage batches, and sparse arena state were
 connected end to end. The measured matched lanes were:
 
 | format | v2 p50 | v3 p50 | speedup | memory result |

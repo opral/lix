@@ -98,7 +98,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
+simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -124,35 +124,35 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
     session
             .execute(
                 "INSERT INTO engine_history_conformance \
-                 (lixcol_entity_pk, id, value, lixcol_untracked) \
-                 VALUES (CAST('[\"history-conformance-entity\"]' AS JSONB), 'history-conformance-entity', 'one', false)",
+                 (lixcol_row_pk, id, value, lixcol_untracked) \
+                 VALUES (CAST('[\"history-conformance-row\"]' AS JSONB), 'history-conformance-row', 'one', false)",
                 &[],
             )
             .await
-            .expect("entity insert should succeed");
+            .expect("row insert should succeed");
     session
         .execute(
             "UPDATE engine_history_conformance \
                  SET value = 'two' \
-                 WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"history-conformance-row\"]' AS JSONB)",
             &[],
         )
         .await
-        .expect("entity update should succeed");
+        .expect("row update should succeed");
     session
         .execute(
             "DELETE FROM engine_history_conformance \
-                 WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"history-conformance-row\"]' AS JSONB)",
             &[],
         )
         .await
-        .expect("entity delete should succeed");
+        .expect("row delete should succeed");
 
     let typed_rows = select_rows(
         &session,
-        "SELECT id, value, lixcol_entity_pk, lixcol_depth \
+        "SELECT id, value, lixcol_row_pk, lixcol_depth \
              FROM engine_history_conformance_history() \
-               WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB) \
+               WHERE lixcol_row_pk = CAST('[\"history-conformance-row\"]' AS JSONB) \
              ORDER BY lixcol_depth",
     )
     .await;
@@ -160,16 +160,16 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
     assert_eq!(
         typed_rows[0],
         vec![
-            Value::Text("history-conformance-entity".to_string()),
+            Value::Text("history-conformance-row".to_string()),
             Value::Null,
-            Value::Json(serde_json::json!(["history-conformance-entity"]).into()),
+            Value::Json(serde_json::json!(["history-conformance-row"]).into()),
             Value::Integer(0),
         ]
     );
 });
 
 simulation_test!(
-    typed_entity_history_backfills_primary_key_columns_on_tombstones,
+    typed_row_history_backfills_primary_key_columns_on_tombstones,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -198,7 +198,7 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT key, value, lixcol_entity_pk, lixcol_depth \
+            "SELECT key, value, lixcol_row_pk, lixcol_depth \
              FROM lix_key_value_history() \
                WHERE key = 'history-pk-backfill' \
              ORDER BY lixcol_depth",
@@ -226,7 +226,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_history_backfills_composite_primary_key_columns_on_tombstones,
+    typed_row_history_backfills_composite_primary_key_columns_on_tombstones,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -258,7 +258,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("composite entity insert should succeed");
+            .expect("composite row insert should succeed");
         session
             .execute(
                 "DELETE FROM engine_history_composite_pk \
@@ -266,7 +266,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("composite entity delete should succeed");
+            .expect("composite row delete should succeed");
 
         let rows = select_rows(
             &session,
@@ -299,7 +299,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_history_reconstructs_flat_primary_key_columns_on_tombstones,
+    typed_row_history_reconstructs_flat_primary_key_columns_on_tombstones,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -331,15 +331,15 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("nested-key entity insert should succeed");
+            .expect("nested-key row insert should succeed");
         session
             .execute(
                 "DELETE FROM engine_history_nested_pk \
-                 WHERE lixcol_entity_pk = CAST('[\"acme\",\"7\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"acme\",\"7\"]' AS JSONB)",
                 &[],
             )
             .await
-            .expect("nested-key entity delete should succeed");
+            .expect("nested-key row delete should succeed");
 
         let rows = select_rows(
             &session,
@@ -417,7 +417,7 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, content, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
+            "SELECT id, path, name, content, lixcol_row_pk, lixcol_is_deleted, lixcol_depth \
              FROM lix_file_history() \
                WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
@@ -476,7 +476,7 @@ simulation_test!(
 
         let directory_rows = select_rows(
             &session,
-            "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
+            "SELECT id, path, parent_id, name, lixcol_row_pk, lixcol_is_deleted, lixcol_depth \
              FROM lix_directory_history() \
                WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",

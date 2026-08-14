@@ -70,7 +70,7 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
     // Discard everything the seed and the checkpoint decoded.
     let _ = take_hot_scan_refcount_census();
 
-    // A predicate on a non-key column, so the entity provider parses each
+    // A predicate on a non-key column, so the row provider parses each
     // row's snapshot and filters it — the shape that used to rebuild the whole
     // materialized batch row by row.
     let result = lix
@@ -124,7 +124,7 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
 
     // The ceiling that actually regresses, and the reason this file exists.
     // Before materialized batches were compacted in place, each surviving row
-    // was cloned into a second columnar owner twice over — once by the entity
+    // was cloned into a second columnar owner twice over — once by the row
     // provider's filter rebuild and once by the materialization path — and
     // this lane measured **5.015 batch-rebuild handle clones per decoded
     // row**. It now measures 0.043, from the handful of point-shaped reads the

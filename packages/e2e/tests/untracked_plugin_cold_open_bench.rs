@@ -1,9 +1,9 @@
 //! Cold-open cost of a plugin file, per lane.
 //!
 //! The measured operation is the first file write after a cold reopen. That is
-//! the durable checkpoint's only consumer: the entity-write path opens its
+//! the durable checkpoint's only consumer: the row-write path opens its
 //! actor through `cold_open_semantic_actor`, which always rebuilds from live
-//! entity rows, whereas a file write takes the cold-successor path that either
+//! rows, whereas a file write takes the cold-successor path that either
 //! restores the durable document or re-parses the whole file.
 //!
 //! The `tracked` lane has always published a checkpoint and is unaffected by

@@ -2628,20 +2628,20 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
-            if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
+            if matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk")
     )
 }
 
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::Base {
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base {
             schema_key,
         }) if bound_predicate_contains_like(&plan.bound.predicate)
             || bound_update_contains_binary(plan) =>
         {
             Ok(schema_key.clone())
         }
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::ByBranch {
             schema_key,
         }) if bound_predicate_contains_like(&plan.bound.predicate)
             || bound_update_contains_binary(plan) =>
@@ -2664,9 +2664,9 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
             Ok("lix_create_checkpoint".to_string())
         }
-        BoundWriteTarget::Entity(_) => Err(LixError::new(
+        BoundWriteTarget::Row(_) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "sql2 DataFusion reference writer does not support this entity write",
+            "sql2 DataFusion reference writer does not support this row write",
         )),
     }
 }
@@ -2978,7 +2978,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "DDL statements are not supported by Lix SQL",
             )
             .with_hint(
-                "Use Lix entity surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
+                "Use Lix SQL surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
             ));
         }
         LogicalPlan::Statement(_) => {
@@ -3391,7 +3391,7 @@ mod tests {
     use crate::hot_state::{HotStateReader, HotStateScanRequest, MaterializedHotStateRow};
     use crate::json_store::JsonStoreContext;
     use crate::sql2::{
-        ChangelogQuerySource, EntitySnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
+        ChangelogQuerySource, RowSnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
         SqlHistoryQuerySource,
     };
     use crate::sql2::{
@@ -3626,7 +3626,7 @@ mod tests {
         );
         assert_eq!(cursor.next_values().await.unwrap(), None);
     }
-    struct RecordingEntitySnapshotReader {
+    struct RecordingRowSnapshotReader {
         snapshots: Vec<Option<Bytes>>,
         requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
     }
@@ -3758,7 +3758,7 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     struct CapturedStageRow {
-        entity_pk: String,
+        row_pk: String,
         schema_key: String,
         branch_id: String,
         file_id: Option<String>,
@@ -3772,11 +3772,11 @@ mod tests {
     impl From<TransactionWriteRow> for CapturedStageRow {
         fn from(row: TransactionWriteRow) -> Self {
             Self {
-                entity_pk: row
-                    .entity_pk
-                    .expect("captured staged row should carry entity_pk")
+                row_pk: row
+                    .row_pk
+                    .expect("captured staged row should carry row_pk")
                     .as_json_array_text()
-                    .expect("captured staged row should project entity_pk"),
+                    .expect("captured staged row should project row_pk"),
                 schema_key: row.schema_key.into(),
                 branch_id: row.branch_id.into(),
                 file_id: row.file_id.map(Into::into),
@@ -3793,7 +3793,7 @@ mod tests {
         active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
         hot_state: Arc<dyn HotStateReader>,
-        entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
+        row_snapshot_reader: Option<Arc<dyn RowSnapshotReader>>,
         schema_definitions: Vec<JsonValue>,
     }
 
@@ -3809,8 +3809,8 @@ mod tests {
             Arc::clone(&self.hot_state)
         }
 
-        fn entity_snapshot_reader(&self) -> Option<Arc<dyn EntitySnapshotReader>> {
-            self.entity_snapshot_reader.clone()
+        fn row_snapshot_reader(&self) -> Option<Arc<dyn RowSnapshotReader>> {
+            self.row_snapshot_reader.clone()
         }
 
         fn filesystem_path_index(&self) -> Arc<dyn crate::filesystem::FilesystemPathIndexReader> {
@@ -4363,8 +4363,8 @@ mod tests {
             .filter(|row| {
                 (request.filter.schema_keys.is_empty()
                     || request.filter.schema_keys.contains(&row.schema_key))
-                    && (request.filter.entity_pks.is_empty()
-                        || request.filter.entity_pks.contains(&row.entity_pk))
+                    && (request.filter.row_pks.is_empty()
+                        || request.filter.row_pks.contains(&row.row_pk))
                     && (request.filter.branch_ids.is_empty()
                         || request
                             .filter
@@ -4450,8 +4450,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl EntitySnapshotReader for RecordingEntitySnapshotReader {
-        async fn scan_entity_snapshots(
+    impl RowSnapshotReader for RecordingRowSnapshotReader {
+        async fn scan_row_snapshots(
             &self,
             request: HotStateScanRequest,
         ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
@@ -4491,19 +4491,19 @@ mod tests {
         }
     }
 
-    fn live_entity_row(entity_pk: &str, branch_id: &str, value: &str) -> MaterializedHotStateRow {
+    fn live_row(row_pk: &str, branch_id: &str, value: &str) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            row_pk: crate::row_pk::RowPk::single(row_pk),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
             snapshot_content: Some(
-                format!("{{\"id\":\"{entity_pk}\",\"value\":\"{value}\"}}").into(),
+                format!("{{\"id\":\"{row_pk}\",\"value\":\"{value}\"}}").into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -4512,14 +4512,14 @@ mod tests {
     }
 
     fn live_test_state_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         value: &str,
         untracked: bool,
     ) -> MaterializedHotStateRow {
-        let mut row = live_entity_row(entity_pk, branch_id, value);
+        let mut row = live_row(row_pk, branch_id, value);
         row.snapshot_content = Some(
-            json!({ "id": entity_pk, "value": value })
+            json!({ "id": row_pk, "value": value })
                 .to_string()
                 .into(),
         );
@@ -4528,30 +4528,30 @@ mod tests {
     }
 
     fn live_directory_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         parent_id: Option<&str>,
         name: &str,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture directory ID should be a UUID"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "parent_id": parent_id,
                     "name": name
                 })
                 .to_string()
                 .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -4560,30 +4560,30 @@ mod tests {
     }
 
     fn live_file_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         directory_id: Option<&str>,
         name: &str,
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture file ID should be a UUID"),
             schema_key: "lix_file_descriptor".to_string(),
-            file_id: Some(entity_pk.to_string()),
+            file_id: Some(row_pk.to_string()),
             snapshot_content: Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "directory_id": directory_id,
                     "name": name
                 })
                 .to_string()
                 .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -4592,32 +4592,32 @@ mod tests {
     }
 
     fn live_blob_ref_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         bytes: &[u8],
     ) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture blob-ref ID should be a UUID"),
             schema_key: "lix_binary_blob_ref".to_string(),
-            file_id: Some(entity_pk.to_string()),
+            file_id: Some(row_pk.to_string()),
             snapshot_content: Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "blob_hash": crate::binary_cas::BlobId::from_content(bytes).to_hex(),
                     "size_bytes": bytes.len()
                 })
                 .to_string()
                 .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!(
-                "change-{entity_pk}-blob"
+                "change-{row_pk}-blob"
             ))),
             commit_id: Some(CommitId::for_test_label(&format!(
-                "commit-{entity_pk}-blob"
+                "commit-{row_pk}-blob"
             ))),
             global: false,
             untracked: false,
@@ -4724,7 +4724,7 @@ mod tests {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::clone(&blob_reader),
             hot_state: Arc::clone(&hot_state) as Arc<dyn HotStateReader>,
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -4746,7 +4746,7 @@ mod tests {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
             hot_state,
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -4759,14 +4759,14 @@ mod tests {
     #[tokio::test]
     async fn integer_primary_key_read_pushes_exact_identity_to_hot_state() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
-        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
-        let entity_pk = crate::entity_pk::EntityPk::from_external_parts(
+        let component_types = [crate::row_pk::RowPkComponentType::Integer];
+        let row_pk = crate::row_pk::RowPk::from_external_parts(
             vec!["42".to_string()],
             &component_types,
         )
         .expect("integer fixture identity should encode");
-        let mut row = live_entity_row("42", branch_id, "answer");
-        row.entity_pk = entity_pk.clone();
+        let mut row = live_row("42", branch_id, "answer");
+        row.row_pk = row_pk.clone();
         row.schema_key = "integer_state_schema".to_string();
         row.snapshot_content = Some(json!({ "id": 42, "value": "answer" }).to_string().into());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -4777,7 +4777,7 @@ mod tests {
                 rows: vec![row],
                 requests: Arc::clone(&requests),
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![json!({
                 "$schema": "https://lix.dev/schema-v1.json",
                 "key": "integer_state_schema",
@@ -4802,33 +4802,33 @@ mod tests {
         let [request] = requests.as_slice() else {
             panic!("integer point read should issue one live-state scan");
         };
-        assert_eq!(request.filter.entity_pks, vec![entity_pk]);
+        assert_eq!(request.filter.row_pks, vec![row_pk]);
     }
 
     #[tokio::test]
-    async fn datafusion_entity_primary_key_read_materializes_public_result() {
+    async fn datafusion_row_primary_key_read_materializes_public_result() {
         let sql = "SELECT id, value FROM test_state_schema \
-                   WHERE id IN ('entity-b', 'entity-a') ORDER BY id";
+                   WHERE id IN ('row-b', 'row-a') ORDER BY id";
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
             hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
                     live_test_state_row(
-                        "entity-b",
+                        "row-b",
                         "01920000-0000-7000-8000-0000000000a1",
                         "B",
                         false,
                     ),
                     live_test_state_row(
-                        "entity-a",
+                        "row-a",
                         "01920000-0000-7000-8000-0000000000a1",
                         "A",
                         false,
                     ),
                 ],
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![json!({
                 "$schema": "https://lix.dev/schema-v1.json",
                 "key": "test_state_schema",
@@ -4848,11 +4848,11 @@ mod tests {
             result.rows,
             vec![
                 vec![
-                    Value::Text("entity-a".to_string()),
+                    Value::Text("row-a".to_string()),
                     Value::Text("A".to_string())
                 ],
                 vec![
-                    Value::Text("entity-b".to_string()),
+                    Value::Text("row-b".to_string()),
                     Value::Text("B".to_string())
                 ],
             ]
@@ -4860,14 +4860,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datafusion_entity_primary_key_read_uses_registered_provider() {
+    async fn datafusion_row_primary_key_read_uses_registered_provider() {
         let sql = "SELECT id, value FROM test_state_schema \
-                   WHERE id IN ('entity-b', 'entity-a', 'entity-b') ORDER BY id";
+                   WHERE id IN ('row-b', 'row-a', 'row-b') ORDER BY id";
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let snapshot_reader = Arc::new(RecordingEntitySnapshotReader {
+        let snapshot_reader = Arc::new(RecordingRowSnapshotReader {
             snapshots: vec![
-                Some(Bytes::from_static(br#"{"id":"entity-a","value":"A"}"#)),
-                Some(Bytes::from_static(br#"{"id":"entity-b","value":"B"}"#)),
+                Some(Bytes::from_static(br#"{"id":"row-a","value":"A"}"#)),
+                Some(Bytes::from_static(br#"{"id":"row-b","value":"B"}"#)),
             ],
             requests: Arc::clone(&requests),
         });
@@ -4878,13 +4878,13 @@ mod tests {
             hot_state: Arc::new(CountingRowsHotStateReader {
                 rows: vec![
                     live_test_state_row(
-                        "entity-b",
+                        "row-b",
                         "01920000-0000-7000-8000-0000000000a1",
                         "B",
                         false,
                     ),
                     live_test_state_row(
-                        "entity-a",
+                        "row-a",
                         "01920000-0000-7000-8000-0000000000a1",
                         "A",
                         false,
@@ -4892,7 +4892,7 @@ mod tests {
                 ],
                 scans: Arc::clone(&scans),
             }),
-            entity_snapshot_reader: Some(snapshot_reader),
+            row_snapshot_reader: Some(snapshot_reader),
             schema_definitions: vec![json!({
                 "$schema": "https://lix.dev/schema-v1.json",
                 "key": "test_state_schema",
@@ -4911,26 +4911,26 @@ mod tests {
             result.rows,
             vec![
                 vec![
-                    Value::Text("entity-a".to_string()),
+                    Value::Text("row-a".to_string()),
                     Value::Text("A".to_string())
                 ],
                 vec![
-                    Value::Text("entity-b".to_string()),
+                    Value::Text("row-b".to_string()),
                     Value::Text("B".to_string())
                 ],
             ]
         );
-        // A `WHERE` clause that resolves to a complete entity identity set is
-        // applied in full by the `entity_pks` access path, so this read must
+        // A `WHERE` clause that resolves to a complete row identity set is
+        // applied in full by the `row_pks` access path, so this read must
         // take the direct point-snapshot route rather than the generic
         // visibility scan.
         //
         // This assertion pair previously read `scans == 1` and
         // `requests.is_empty()` — the exact opposite — and its message called
         // the snapshot reader "the deleted native snapshot route". That wording
-        // predates the current `EntitySnapshotReader`, which is a live route
-        // registered from `SqlExecutionContext::entity_snapshot_reader` and
-        // backed by the entity point-snapshot cache. The old expectation froze
+        // predates the current `RowSnapshotReader`, which is a live route
+        // registered from `SqlExecutionContext::row_snapshot_reader` and
+        // backed by the row point-snapshot cache. The old expectation froze
         // a mis-gate in `plan_scan_parts`: it re-derived a residual row filter
         // for a predicate the access path already applied, and a non-empty
         // `row_filters` disqualifies every direct route.
@@ -4943,7 +4943,7 @@ mod tests {
         assert_eq!(
             requests.len(),
             1,
-            "an exact identity point read must consult the entity point-snapshot route exactly once"
+            "an exact identity point read must consult the row point-snapshot route exactly once"
         );
         assert_eq!(
             requests[0].filter.schema_keys,
@@ -4951,18 +4951,18 @@ mod tests {
             "the point-snapshot request must be scoped to the queried schema"
         );
         assert_eq!(
-            requests[0].filter.entity_pks,
+            requests[0].filter.row_pks,
             vec![
-                crate::entity_pk::EntityPk::single("entity-a"),
-                crate::entity_pk::EntityPk::single("entity-b"),
+                crate::row_pk::RowPk::single("row-a"),
+                crate::row_pk::RowPk::single("row-b"),
             ],
-            "the repeated 'entity-b' in the IN list must collapse into a deduplicated, \
+            "the repeated 'row-b' in the IN list must collapse into a deduplicated, \
              ordered identity set rather than being pushed down three times"
         );
     }
 
     #[tokio::test]
-    async fn datafusion_entity_left_join_preserves_matches_and_null_extension() {
+    async fn datafusion_row_left_join_preserves_matches_and_null_extension() {
         let sql = r#"SELECT "bundle"."id" AS "bundle_id",
                          "message"."id" AS "message_id",
                          "variant"."id" AS "variantId",
@@ -4971,8 +4971,8 @@ mod tests {
                     LEFT JOIN "message" ON "message"."bundle_id" = "bundle"."id"
                     LEFT JOIN "variant" ON "variant"."message_id" = "message"."id"
                    WHERE "bundle"."id" = $1"#;
-        let row = |schema_key: &str, entity_pk: &str, snapshot: &str| {
-            let mut row = live_entity_row(entity_pk, "01920000-0000-7000-8000-0000000000a1", "");
+        let row = |schema_key: &str, row_pk: &str, snapshot: &str| {
+            let mut row = live_row(row_pk, "01920000-0000-7000-8000-0000000000a1", "");
             row.schema_key = schema_key.to_string();
             row.snapshot_content = Some(snapshot.to_string().into());
             row
@@ -4994,7 +4994,7 @@ mod tests {
                     ),
                 ],
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![
                 json!({
                     "$schema": "https://lix.dev/schema-v1.json",
@@ -5027,7 +5027,7 @@ mod tests {
         };
         let result = execute_sql(&ctx, sql, &[Value::Text("b1".to_string())])
             .await
-            .expect("DataFusion entity join should execute");
+            .expect("DataFusion row join should execute");
 
         assert_eq!(
             result.columns,
@@ -5060,7 +5060,7 @@ mod tests {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
             hot_state,
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -5122,7 +5122,7 @@ mod tests {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
             hot_state,
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -5158,7 +5158,7 @@ mod tests {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
             hot_state,
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -5207,8 +5207,8 @@ mod tests {
         session
             .execute(
                 "INSERT INTO test_state_schema \
-             (lixcol_entity_pk, id, value, count, lixcol_metadata, lixcol_untracked) \
-             VALUES (CAST('[\"entity-history\"]' AS JSONB), 'entity-history', 'A', 7, '{\"source\":\"history\"}', false)",
+             (lixcol_row_pk, id, value, count, lixcol_metadata, lixcol_untracked) \
+             VALUES (CAST('[\"row-history\"]' AS JSONB), 'row-history', 'A', 7, '{\"source\":\"history\"}', false)",
                 &[],
             )
             .await?;
@@ -5241,7 +5241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_entity_collection_delete_uses_one_generation_fact_and_allows_recreation() {
+    async fn whole_row_collection_delete_uses_one_generation_fact_and_allows_recreation() {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone())
             .await
@@ -5333,7 +5333,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("entity tombstone changelog should query")
+            .expect("row tombstone changelog should query")
             .rows()[0]
             .get::<i64>("changes")
             .expect("tombstone count should be numeric");
@@ -5427,7 +5427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_entity_collection_delete_is_visible_inside_explicit_transaction() {
+    async fn whole_row_collection_delete_is_visible_inside_explicit_transaction() {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone())
             .await
@@ -5559,7 +5559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_entity_collection_delete_falls_back_for_global_members() {
+    async fn whole_row_collection_delete_falls_back_for_global_members() {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone())
             .await
@@ -5676,7 +5676,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("merged entity tombstones should query")
+            .expect("merged row tombstones should query")
             .rows()[0]
             .get::<i64>("changes")
             .expect("tombstone count should be numeric");
@@ -5801,31 +5801,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_reads_entity_history_view_from_history_context() {
+    async fn execute_sql_reads_row_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
             .await
             .expect("history fixture should initialize");
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, count, lixcol_entity_pk, lixcol_depth \
+                    "SELECT value, count, lixcol_row_pk, lixcol_depth \
 	             FROM test_state_schema_history('{head_commit_id}') \
-	             WHERE lixcol_entity_pk = CAST('[\"entity-history\"]' AS JSONB)"
+	             WHERE lixcol_row_pk = CAST('[\"row-history\"]' AS JSONB)"
                 ),
                 &[],
             )
             .await
-            .expect("sql2 execute should read entity history through real engine context");
+            .expect("sql2 execute should read row history through real engine context");
         let (columns, rows) = rows_from_execute_result(result);
 
         assert_eq!(
             columns,
-            vec!["value", "count", "lixcol_entity_pk", "lixcol_depth",]
+            vec!["value", "count", "lixcol_row_pk", "lixcol_depth",]
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
-        assert_eq!(rows[0][2], Value::Json(json!(["entity-history"]).into()));
+        assert_eq!(rows[0][2], Value::Json(json!(["row-history"]).into()));
         assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
@@ -6694,14 +6694,14 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000312\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_entity_by_branch_stages_write() {
+    async fn execute_sql_insert_into_row_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -6724,12 +6724,12 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
-	     lixcol_entity_pk, lixcol_branch_id, id, value\
-	     ) VALUES (CAST('[\"entity-c\"]' AS JSONB), '01920000-0000-7000-8000-0000000000b1', 'entity-c', 'C')",
+	     lixcol_row_pk, lixcol_branch_id, id, value\
+	     ) VALUES (CAST('[\"row-c\"]' AS JSONB), '01920000-0000-7000-8000-0000000000b1', 'row-c', 'C')",
             &[],
         )
         .await
-        .expect("INSERT INTO entity by-branch surface should stage write");
+        .expect("INSERT INTO row by-branch surface should stage write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -6741,18 +6741,18 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"id\":\"entity-c\",\"value\":\"C\"}")
+            Some("{\"id\":\"row-c\",\"value\":\"C\"}")
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_entity_by_branch_accepts_parameterized_branch_id() {
+    async fn execute_sql_insert_into_row_by_branch_accepts_parameterized_branch_id() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -6775,14 +6775,14 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
-             lixcol_entity_pk, lixcol_branch_id, id, value\
-             ) VALUES (CAST('[\"entity-c\"]' AS JSONB), $1, 'entity-c', 'C')",
+             lixcol_row_pk, lixcol_branch_id, id, value\
+             ) VALUES (CAST('[\"row-c\"]' AS JSONB), $1, 'row-c', 'C')",
             &[Value::Text(
                 "01920000-0000-7000-8000-0000000000b1".to_string(),
             )],
         )
         .await
-        .expect("parameterized by-branch entity insert should stage write");
+        .expect("parameterized by-branch row insert should stage write");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
@@ -6792,12 +6792,12 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_entity_defaults_active_branch() {
+    async fn execute_sql_insert_into_active_row_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -6819,12 +6819,12 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_pk, id, value) \
-	     VALUES (CAST('[\"entity-c\"]' AS JSONB), 'entity-c', 'C')",
+            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
+	     VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
             &[],
         )
         .await
-        .expect("INSERT INTO active entity surface should stage write");
+        .expect("INSERT INTO active schema surface should stage write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -6836,18 +6836,18 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"id\":\"entity-c\",\"value\":\"C\"}")
+            Some("{\"id\":\"row-c\",\"value\":\"C\"}")
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_default_values_uses_the_native_entity_writer() {
+    async fn execute_sql_insert_default_values_uses_the_native_row_writer() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -6888,7 +6888,7 @@ mod tests {
             rows[0]
                 .snapshot_content
                 .as_deref()
-                .expect("inserted entity should have a snapshot"),
+                .expect("inserted row should have a snapshot"),
         )
         .expect("defaulted snapshot should be JSON");
         let id = snapshot["id"]
@@ -6904,7 +6904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_entity_does_not_probe_active_head_during_lowering() {
+    async fn execute_sql_insert_into_active_row_does_not_probe_active_head_during_lowering() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -6926,8 +6926,8 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_pk, id, value) \
-             VALUES (CAST('[\"entity-c\"]' AS JSONB), 'entity-c', 'C')",
+            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
+             VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
             &[],
         )
         .await
@@ -6946,7 +6946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_noop_active_entity_write_does_not_probe_active_head() {
+    async fn execute_sql_noop_active_row_write_does_not_probe_active_head() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -6987,7 +6987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_entity_upsert_conflict_scan_is_narrowed_to_inserted_identity() {
+    async fn execute_sql_row_upsert_conflict_scan_is_narrowed_to_inserted_identity() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(CapturingRowsHotStateReader {
@@ -7034,7 +7034,7 @@ mod tests {
             WriteExecutorMode::Auto,
         )
         .await
-        .expect("entity upsert should update the matching row");
+        .expect("row upsert should update the matching row");
 
         assert_eq!(path, WriteExecutorPath::Fast);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -7043,8 +7043,8 @@ mod tests {
         let filter = &requests[0].filter;
         assert_eq!(filter.schema_keys, vec!["test_state_schema"]);
         assert_eq!(
-            filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single("target")]
+            filter.row_pks,
+            vec![crate::row_pk::RowPk::single("target")]
         );
         assert_eq!(
             filter.branch_ids,
@@ -7064,7 +7064,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"target\"]");
+        assert_eq!(rows[0].row_pk, "[\"target\"]");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"id\":\"target\",\"value\":\"new\"}")
@@ -7074,8 +7074,8 @@ mod tests {
     #[tokio::test]
     async fn integer_primary_key_update_and_delete_narrow_candidate_scans() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
-        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
-        let entity_pk = crate::entity_pk::EntityPk::from_external_parts(
+        let component_types = [crate::row_pk::RowPkComponentType::Integer];
+        let row_pk = crate::row_pk::RowPk::from_external_parts(
             vec!["42".to_string()],
             &component_types,
         )
@@ -7091,8 +7091,8 @@ mod tests {
                 vec![Value::Integer(42)],
             ),
         ] {
-            let mut row = live_entity_row("42", branch_id, "before");
-            row.entity_pk = entity_pk.clone();
+            let mut row = live_row("42", branch_id, "before");
+            row.row_pk = row_pk.clone();
             row.schema_key = "integer_state_schema".to_string();
             row.snapshot_content = Some(json!({ "id": 42, "value": "before" }).to_string().into());
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -7126,7 +7126,7 @@ mod tests {
             let [request] = requests.as_slice() else {
                 panic!("integer point write should issue one candidate scan: {sql}");
             };
-            assert_eq!(request.filter.entity_pks, vec![entity_pk.clone()], "{sql}");
+            assert_eq!(request.filter.row_pks, vec![row_pk.clone()], "{sql}");
         }
     }
 
@@ -7213,7 +7213,7 @@ mod tests {
             .iter()
             .filter(|request| {
                 request.filter.schema_keys == vec!["lix_directory_descriptor".to_string()]
-                    && request.filter.entity_pks.is_empty()
+                    && request.filter.row_pks.is_empty()
             })
             .count();
         assert_eq!(
@@ -7231,9 +7231,9 @@ mod tests {
         );
         for request in blob_requests {
             assert_eq!(
-                request.filter.entity_pks,
+                request.filter.row_pks,
                 vec![
-                    crate::entity_pk::EntityPk::uuid_from_canonical(
+                    crate::row_pk::RowPk::uuid_from_canonical(
                         "01920000-0000-7000-8000-000000000562",
                     )
                     .expect("fixture file ID"),
@@ -7256,7 +7256,7 @@ mod tests {
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(descriptor_rows.len(), 1);
         assert_eq!(
-            descriptor_rows[0].entity_pk,
+            descriptor_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000562\"]"
         );
         let descriptor: JsonValue = serde_json::from_str(
@@ -7276,7 +7276,7 @@ mod tests {
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(
-            blob_ref_rows[0].entity_pk,
+            blob_ref_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000562\"]"
         );
         let blob_ref: JsonValue = serde_json::from_str(
@@ -7327,7 +7327,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -7374,7 +7374,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -7431,7 +7431,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -7486,7 +7486,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -7546,7 +7546,7 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000313\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -7588,7 +7588,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -7638,7 +7638,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -7687,13 +7687,13 @@ mod tests {
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(descriptor_rows.len(), 1);
         assert_eq!(
-            descriptor_rows[0].entity_pk,
+            descriptor_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(
-            blob_ref_rows[0].entity_pk,
+            blob_ref_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(
@@ -8048,7 +8048,7 @@ mod tests {
         assert!(
             blob_ref_rows
                 .iter()
-                .any(|row| row.entity_pk == "[\"01920000-0000-7000-8000-000000000322\"]")
+                .any(|row| row.row_pk == "[\"01920000-0000-7000-8000-000000000322\"]")
         );
     }
 
@@ -8088,7 +8088,7 @@ mod tests {
             .filter(|row| row.schema_key == "lix_file_descriptor")
             .collect::<Vec<_>>();
         assert!(descriptor_rows.iter().any(|row| {
-            row.entity_pk == "[\"01920000-0000-7000-8000-000000000322\"]"
+            row.row_pk == "[\"01920000-0000-7000-8000-000000000322\"]"
                 && row
                     .snapshot_content
                     .as_deref()
@@ -8333,7 +8333,7 @@ mod tests {
         let mut ids = overlay
             .visible_semantic_rows(false, "lix_file_descriptor")
             .into_iter()
-            .map(|row| row.entity_pk)
+            .map(|row| row.row_pk)
             .collect::<Vec<_>>();
         ids.sort();
         assert_eq!(
@@ -8370,7 +8370,7 @@ mod tests {
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(descriptor_rows.len(), 1);
         assert_eq!(
-            descriptor_rows[0].entity_pk,
+            descriptor_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000a2\"]"
         );
         assert_eq!(
@@ -8434,7 +8434,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -9024,7 +9024,7 @@ mod tests {
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(
-            blob_ref_rows[0].entity_pk,
+            blob_ref_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         let snapshot: JsonValue =
@@ -9150,7 +9150,7 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000332\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -9159,12 +9159,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
+    async fn execute_sql_update_schema_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
-                live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-                live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000a1", "B"),
+                live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+                live_row("row-b", "01920000-0000-7000-8000-0000000000a1", "B"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -9187,12 +9187,12 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "UPDATE test_state_schema \
-             SET value = 'updated', lixcol_metadata = '{\"source\":\"entity-update\"}' \
+             SET value = 'updated', lixcol_metadata = '{\"source\":\"row-update\"}' \
              WHERE value = 'A'",
             &[],
         )
         .await
-        .expect("UPDATE entity surface should stage rewritten row");
+        .expect("UPDATE schema surface should stage rewritten row");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -9204,25 +9204,25 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-a\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-a\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"id\":\"entity-a\",\"value\":\"updated\"}")
+            Some("{\"id\":\"row-a\",\"value\":\"updated\"}")
         );
         assert_eq!(
             rows[0].metadata.as_deref(),
-            Some("{\"source\":\"entity-update\"}")
+            Some("{\"source\":\"row-update\"}")
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_entity_by_branch_stages_tombstone() {
+    async fn execute_sql_delete_row_by_branch_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
-                live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-                live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "B"),
+                live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+                live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "B"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -9251,7 +9251,7 @@ mod tests {
             )],
         )
         .await
-        .expect("parameterized DELETE entity by-branch surface should stage tombstone");
+        .expect("parameterized DELETE row by-branch surface should stage tombstone");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -9263,18 +9263,18 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-b\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_entity_by_branch_like_uses_datafusion_and_stages_tombstone() {
+    async fn execute_sql_delete_row_by_branch_like_uses_datafusion_and_stages_tombstone() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![
-            live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-            live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "Before"),
-            live_entity_row("entity-c", "01920000-0000-7000-8000-0000000000b1", "After"),
+            live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+            live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "Before"),
+            live_row("row-c", "01920000-0000-7000-8000-0000000000b1", "After"),
         ]);
         ctx.schema_definitions = vec![json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -9297,7 +9297,7 @@ mod tests {
             WriteExecutorMode::Auto,
         )
         .await
-        .expect("DELETE LIKE on an entity surface should stage a tombstone");
+        .expect("DELETE LIKE on a schema surface should stage a tombstone");
 
         assert_eq!(path, WriteExecutorPath::DataFusion);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -9309,13 +9309,13 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-b\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(rows[0].tombstone);
     }
 
     #[tokio::test]
-    async fn bound_public_write_supports_only_supported_entity_shapes() {
+    async fn bound_public_write_supports_only_supported_row_shapes() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(RowsHotStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -9340,7 +9340,7 @@ mod tests {
             "UPDATE test_state_schema SET value = 'updated' WHERE value = 'A'",
         )
         .await
-        .expect("supported entity update should plan");
+        .expect("supported row update should plan");
         let crate::sql2::exec::SqlLogicalPlan::Write(supported_plan) = supported_plan else {
             panic!("expected write plan");
         };
@@ -9383,7 +9383,7 @@ mod tests {
             "DELETE FROM test_state_schema WHERE value = 'A' AND value = 'B'",
         )
         .await
-        .expect("registered entity write should bind before reference writer selection");
+        .expect("registered row write should bind before reference writer selection");
         let error = crate::sql2::execute_write_logical_plan_with_mode(
             &mut ctx,
             plan,
@@ -9394,7 +9394,7 @@ mod tests {
         .expect_err("unsupported reference writer target should not become a fast no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("does not support this entity write"));
+        assert!(error.message.contains("does not support this row write"));
     }
 
     #[tokio::test]
@@ -9420,7 +9420,7 @@ mod tests {
 
         let plan = create_write_logical_plan(&mut ctx, "DELETE FROM test_state_schema WHERE false")
             .await
-            .expect("registered entity write should bind before reference writer selection");
+            .expect("registered row write should bind before reference writer selection");
         let error = crate::sql2::execute_write_logical_plan_with_mode(
             &mut ctx,
             plan,
@@ -9431,7 +9431,7 @@ mod tests {
         .expect_err("unsupported target with empty scope should not become a no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("does not support this entity write"));
+        assert!(error.message.contains("does not support this row write"));
     }
 
     async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, LixError> {
@@ -9451,8 +9451,8 @@ mod tests {
             }),
             hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
-                    live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-                    live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "B"),
+                    live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+                    live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "B"),
                     live_directory_row(
                         "01920000-0000-7000-8000-0000000000d3",
                         "01920000-0000-7000-8000-0000000000a1",
@@ -9472,7 +9472,7 @@ mod tests {
                     ),
                 ],
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![schema_definition],
         })
     }
@@ -9496,7 +9496,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_sql_reads_entity_view_from_active_branch() {
+    fn execute_sql_reads_row_view_from_active_branch() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -9505,23 +9505,23 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT value, lixcol_entity_pk \
+                    "SELECT value, lixcol_row_pk \
                      FROM test_state_schema",
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read entity view");
+                .expect("sql2 execute should read row view");
 
-                assert_eq!(result.columns, vec!["value", "lixcol_entity_pk"]);
+                assert_eq!(result.columns, vec!["value", "lixcol_row_pk"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-                assert_eq!(result.rows[0][1], Value::Json(json!(["entity-a"]).into()));
+                assert_eq!(result.rows[0][1], Value::Json(json!(["row-a"]).into()));
             })
         });
     }
 
     #[test]
-    fn execute_sql_reads_entity_by_branch_view() {
+    fn execute_sql_reads_row_by_branch_view() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -9536,7 +9536,7 @@ mod tests {
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read entity by-branch view");
+                .expect("sql2 execute should read row by-branch view");
 
                 assert_eq!(result.columns, vec!["value", "lixcol_branch_id"]);
                 assert_eq!(result.rows.len(), 1);

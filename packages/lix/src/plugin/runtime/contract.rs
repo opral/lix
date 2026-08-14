@@ -15,8 +15,7 @@ use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
 
 use crate::{
-    LixError, catalog::SchemaPlanFingerprint, common::SharedStr, entity_pk::EntityPk,
-    wasm::WasmLimits,
+    LixError, catalog::SchemaPlanFingerprint, common::SharedStr, row_pk::RowPk, wasm::WasmLimits,
 };
 
 pub const PACKET_FORMAT_V1: u16 = 1;
@@ -57,7 +56,7 @@ impl Default for WasmTransitionLimits {
             max_page_bytes: TRANSITION_PAGE_BYTES,
             max_pages: 1_024,
             // A 10 MiB recursive JSON import can legitimately carry roughly
-            // one compact entity per leaf plus packet keys. Keep the
+            // one compact row per leaf plus packet keys. Keep the
             // transition bounded, but do not confuse aggregate paging traffic
             // with the component's independent linear-memory ceiling.
             max_total_bytes: 128 * MIB,
@@ -99,7 +98,7 @@ impl WasmTransitionLimits {
     }
 
     fn scale_page_for_file_bytes(&mut self, file_bytes: u64) {
-        // Text entities encode their byte-exact content as unpadded base64.
+        // Text rows encode their byte-exact content as unpadded base64.
         // A generated/source-map file may legitimately be one long line, so
         // its single semantic record can be larger than the normal 2 MiB
         // scheduling page. Retain a hard 16 MiB page bound; small files and
@@ -164,20 +163,20 @@ pub struct WasmTransitionCounters {
     pub state_value_bytes_read: u64,
     pub packet_pages: u64,
     pub packet_records: u64,
-    /// Universal entity pages sent from host to guest.
-    pub entity_input_pages: u64,
-    pub entity_input_records: u64,
-    pub entity_input_wire_bytes: u64,
-    /// Universal entity pages sent from guest to host.
-    pub entity_output_pages: u64,
-    pub entity_output_records: u64,
-    pub entity_output_wire_bytes: u64,
+    /// Universal row pages sent from host to guest.
+    pub row_input_pages: u64,
+    pub row_input_records: u64,
+    pub row_input_wire_bytes: u64,
+    /// Universal row pages sent from guest to host.
+    pub row_output_pages: u64,
+    pub row_output_records: u64,
+    pub row_output_wire_bytes: u64,
     pub attachment_reads: u64,
     pub attachment_bytes_read: u64,
-    pub entity_input_attachment_reads: u64,
-    pub entity_input_attachment_bytes: u64,
-    pub entity_output_attachment_writes: u64,
-    pub entity_output_attachment_bytes: u64,
+    pub row_input_attachment_reads: u64,
+    pub row_input_attachment_bytes: u64,
+    pub row_output_attachment_writes: u64,
+    pub row_output_attachment_bytes: u64,
     pub component_import_calls: u64,
     /// Exported guest entries. Prototype A requires exactly one for an initial
     /// file transition, independent of page and source-read counts.
@@ -207,7 +206,7 @@ pub struct WasmTransitionCounters {
     pub full_renderer_invocations: u64,
     pub filesystem_sync_full_renders: u64,
     /// Static conflict-resolution guest calls. A merge batches all colliding
-    /// entities for one file/plugin generation into one call, so this should
+    /// rows for one file/plugin generation into one call, so this should
     /// remain O(files), not O(conflicts).
     pub conflict_resolution_calls: u64,
     /// Conflict triples delivered to a plugin resolver.
@@ -238,40 +237,36 @@ impl WasmTransitionCounters {
             .saturating_add(other.state_value_bytes_read);
         self.packet_pages = self.packet_pages.saturating_add(other.packet_pages);
         self.packet_records = self.packet_records.saturating_add(other.packet_records);
-        self.entity_input_pages = self
-            .entity_input_pages
-            .saturating_add(other.entity_input_pages);
-        self.entity_input_records = self
-            .entity_input_records
-            .saturating_add(other.entity_input_records);
-        self.entity_input_wire_bytes = self
-            .entity_input_wire_bytes
-            .saturating_add(other.entity_input_wire_bytes);
-        self.entity_output_pages = self
-            .entity_output_pages
-            .saturating_add(other.entity_output_pages);
-        self.entity_output_records = self
-            .entity_output_records
-            .saturating_add(other.entity_output_records);
-        self.entity_output_wire_bytes = self
-            .entity_output_wire_bytes
-            .saturating_add(other.entity_output_wire_bytes);
+        self.row_input_pages = self.row_input_pages.saturating_add(other.row_input_pages);
+        self.row_input_records = self
+            .row_input_records
+            .saturating_add(other.row_input_records);
+        self.row_input_wire_bytes = self
+            .row_input_wire_bytes
+            .saturating_add(other.row_input_wire_bytes);
+        self.row_output_pages = self.row_output_pages.saturating_add(other.row_output_pages);
+        self.row_output_records = self
+            .row_output_records
+            .saturating_add(other.row_output_records);
+        self.row_output_wire_bytes = self
+            .row_output_wire_bytes
+            .saturating_add(other.row_output_wire_bytes);
         self.attachment_reads = self.attachment_reads.saturating_add(other.attachment_reads);
         self.attachment_bytes_read = self
             .attachment_bytes_read
             .saturating_add(other.attachment_bytes_read);
-        self.entity_input_attachment_reads = self
-            .entity_input_attachment_reads
-            .saturating_add(other.entity_input_attachment_reads);
-        self.entity_input_attachment_bytes = self
-            .entity_input_attachment_bytes
-            .saturating_add(other.entity_input_attachment_bytes);
-        self.entity_output_attachment_writes = self
-            .entity_output_attachment_writes
-            .saturating_add(other.entity_output_attachment_writes);
-        self.entity_output_attachment_bytes = self
-            .entity_output_attachment_bytes
-            .saturating_add(other.entity_output_attachment_bytes);
+        self.row_input_attachment_reads = self
+            .row_input_attachment_reads
+            .saturating_add(other.row_input_attachment_reads);
+        self.row_input_attachment_bytes = self
+            .row_input_attachment_bytes
+            .saturating_add(other.row_input_attachment_bytes);
+        self.row_output_attachment_writes = self
+            .row_output_attachment_writes
+            .saturating_add(other.row_output_attachment_writes);
+        self.row_output_attachment_bytes = self
+            .row_output_attachment_bytes
+            .saturating_add(other.row_output_attachment_bytes);
         self.component_import_calls = self
             .component_import_calls
             .saturating_add(other.component_import_calls);
@@ -446,7 +441,7 @@ enum WasmCanonicalJsonStorage {
     },
     CertifiedRows {
         decoded_values: OnceLock<Box<[OnceLock<JsonValue>]>>,
-        entity_pks: Box<[EntityPk]>,
+        row_pks: Box<[RowPk]>,
         schema_fingerprints: Box<[Arc<SchemaPlanFingerprint>]>,
         schema_fingerprint_indices: Box<[u32]>,
         normalized: Box<[SharedStr]>,
@@ -455,38 +450,38 @@ enum WasmCanonicalJsonStorage {
 }
 
 /// Schema and identity facts proven while streaming one exact canonical guest
-/// snapshot. The entity key remains the protocol's owner of schema metadata;
+/// snapshot. The row key remains the protocol's owner of schema metadata;
 /// this certificate retains the typed identity plus one shared fingerprint of
 /// the exact schema plan against which the proof was issued.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WasmCanonicalJsonCertificate {
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_fingerprint: Arc<SchemaPlanFingerprint>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WasmCanonicalJsonCertificateRef<'a> {
-    entity_pk: &'a EntityPk,
+    row_pk: &'a RowPk,
     schema_fingerprint: &'a Arc<SchemaPlanFingerprint>,
 }
 
 #[cfg(test)]
 impl WasmCanonicalJsonCertificateRef<'_> {
-    pub(crate) fn entity_pk(&self) -> &EntityPk {
-        self.entity_pk
+    pub(crate) fn row_pk(&self) -> &RowPk {
+        self.row_pk
     }
 }
 
 impl WasmCanonicalJsonCertificate {
-    pub(crate) fn new(entity_pk: EntityPk, schema_fingerprint: Arc<SchemaPlanFingerprint>) -> Self {
+    pub(crate) fn new(row_pk: RowPk, schema_fingerprint: Arc<SchemaPlanFingerprint>) -> Self {
         Self {
-            entity_pk,
+            row_pk,
             schema_fingerprint,
         }
     }
 
-    pub(crate) fn entity_pk(&self) -> &EntityPk {
-        &self.entity_pk
+    pub(crate) fn row_pk(&self) -> &RowPk {
+        &self.row_pk
     }
 
     pub(crate) fn schema_fingerprint(&self) -> &SchemaPlanFingerprint {
@@ -495,7 +490,7 @@ impl WasmCanonicalJsonCertificate {
 
     fn borrowed(&self) -> WasmCanonicalJsonCertificateRef<'_> {
         WasmCanonicalJsonCertificateRef {
-            entity_pk: &self.entity_pk,
+            row_pk: &self.row_pk,
             schema_fingerprint: &self.schema_fingerprint,
         }
     }
@@ -504,7 +499,7 @@ impl WasmCanonicalJsonCertificate {
 impl WasmCanonicalJsonCertificateRef<'_> {
     pub(crate) fn into_owned(self) -> WasmCanonicalJsonCertificate {
         WasmCanonicalJsonCertificate {
-            entity_pk: self.entity_pk.clone(),
+            row_pk: self.row_pk.clone(),
             schema_fingerprint: self.schema_fingerprint.clone(),
         }
     }
@@ -612,13 +607,12 @@ impl WasmCanonicalJson {
 
     pub(crate) fn from_certified_batch_parts(
         normalized: Vec<SharedStr>,
-        entity_pks: Vec<EntityPk>,
+        row_pks: Vec<RowPk>,
         schema_fingerprints: Vec<Arc<SchemaPlanFingerprint>>,
         schema_fingerprint_indices: Vec<u32>,
         parse_count: usize,
     ) -> Result<Vec<Self>, LixError> {
-        if normalized.len() != entity_pks.len()
-            || normalized.len() != schema_fingerprint_indices.len()
+        if normalized.len() != row_pks.len() || normalized.len() != schema_fingerprint_indices.len()
         {
             return Err(invalid_param(
                 "certified canonical JSON batch row and metadata counts differ",
@@ -644,7 +638,7 @@ impl WasmCanonicalJson {
         Self::from_validated_batch(WasmCanonicalJsonBatch {
             storage: WasmCanonicalJsonStorage::CertifiedRows {
                 decoded_values: OnceLock::new(),
-                entity_pks: entity_pks.into_boxed_slice(),
+                row_pks: row_pks.into_boxed_slice(),
                 schema_fingerprints: schema_fingerprints.into_boxed_slice(),
                 schema_fingerprint_indices: schema_fingerprint_indices.into_boxed_slice(),
                 normalized: normalized.into_boxed_slice(),
@@ -694,12 +688,12 @@ impl WasmCanonicalJson {
                 .as_ref()
                 .map(WasmCanonicalJsonCertificate::borrowed),
             WasmCanonicalJsonStorage::CertifiedRows {
-                entity_pks,
+                row_pks,
                 schema_fingerprints,
                 schema_fingerprint_indices,
                 ..
             } => Some(WasmCanonicalJsonCertificateRef {
-                entity_pk: &entity_pks[self.row_index()],
+                row_pk: &row_pks[self.row_index()],
                 schema_fingerprint: &schema_fingerprints
                     [schema_fingerprint_indices[self.row_index()] as usize],
             }),
@@ -842,41 +836,41 @@ pub struct WasmInputSplice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WasmEntityKey {
+pub struct WasmRowKey {
     pub schema_key: SharedStr,
-    pub entity_pk: SmallVec<[SharedStr; 2]>,
+    pub row_pk: SmallVec<[SharedStr; 2]>,
 }
 
-impl WasmEntityKey {
-    pub fn from_owned_parts(schema_key: impl Into<SharedStr>, entity_pk: Vec<String>) -> Self {
+impl WasmRowKey {
+    pub fn from_owned_parts(schema_key: impl Into<SharedStr>, row_pk: Vec<String>) -> Self {
         Self {
             schema_key: schema_key.into(),
-            entity_pk: entity_pk.into_iter().map(SharedStr::from).collect(),
+            row_pk: row_pk.into_iter().map(SharedStr::from).collect(),
         }
     }
 
     pub fn from_shared_parts(
         schema_key: SharedStr,
-        entity_pk: impl IntoIterator<Item = SharedStr>,
+        row_pk: impl IntoIterator<Item = SharedStr>,
     ) -> Self {
         Self {
             schema_key,
-            entity_pk: entity_pk.into_iter().collect(),
+            row_pk: row_pk.into_iter().collect(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct WasmEntity<B> {
-    pub key: WasmEntityKey,
+pub struct WasmRow<B> {
+    pub key: WasmRowKey,
     /// Complete Snapshot JSON for this schema. Production component is currently
     /// restricted to Lix's durable JSON subset; the packet-v1
     /// arbitrary-precision extension remains gated on a durable codec.
     pub snapshot_content: B,
 }
 
-pub type WasmHostEntity = WasmEntity<WasmHostBytes>;
-pub type WasmGuestEntity = WasmEntity<WasmGuestBytes>;
+pub type WasmHostRow = WasmRow<WasmHostBytes>;
+pub type WasmGuestRow = WasmRow<WasmGuestBytes>;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum WasmChangeEffect {
@@ -886,28 +880,28 @@ pub enum WasmChangeEffect {
 }
 
 #[derive(Debug, Clone)]
-pub enum WasmEntityChange<B> {
+pub enum WasmRowChange<B> {
     Create {
         schema_key: String,
         local_ref: u64,
         /// v3 may resolve the host-namespaced primary key before canonical
         /// validation. component leaves this absent and retains keyless semantics
         /// until create-context materialization.
-        resolved_key: Option<WasmEntityKey>,
+        resolved_key: Option<WasmRowKey>,
         snapshot_content: B,
     },
     Upsert {
-        entity: WasmEntity<B>,
+        row: WasmRow<B>,
         effect: WasmChangeEffect,
     },
-    Delete(WasmEntityKey),
+    Delete(WasmRowKey),
 }
 
-impl<B> WasmEntityChange<B> {
-    pub fn entity_key(&self) -> Option<&WasmEntityKey> {
+impl<B> WasmRowChange<B> {
+    pub fn row_key(&self) -> Option<&WasmRowKey> {
         match self {
             Self::Create { resolved_key, .. } => resolved_key.as_ref(),
-            Self::Upsert { entity, .. } => Some(&entity.key),
+            Self::Upsert { row, .. } => Some(&row.key),
             Self::Delete(key) => Some(key),
         }
     }
@@ -915,7 +909,7 @@ impl<B> WasmEntityChange<B> {
     pub fn schema_key(&self) -> &str {
         match self {
             Self::Create { schema_key, .. } => schema_key,
-            Self::Upsert { entity, .. } => &entity.key.schema_key,
+            Self::Upsert { row, .. } => &row.key.schema_key,
             Self::Delete(key) => &key.schema_key,
         }
     }
@@ -929,11 +923,11 @@ impl<B> WasmEntityChange<B> {
 }
 
 #[derive(Debug, Clone)]
-pub struct WasmEntityChanges<B> {
-    pub changes: Vec<WasmEntityChange<B>>,
+pub struct WasmRowChanges<B> {
+    pub changes: Vec<WasmRowChange<B>>,
 }
 
-impl<B> Default for WasmEntityChanges<B> {
+impl<B> Default for WasmRowChanges<B> {
     fn default() -> Self {
         Self {
             changes: Vec::new(),
@@ -941,11 +935,11 @@ impl<B> Default for WasmEntityChanges<B> {
     }
 }
 
-impl<B> WasmEntityChanges<B> {
+impl<B> WasmRowChanges<B> {
     pub fn validate(&self) -> Result<(), LixError> {
         if change_keys_have_duplicates(&self.changes) {
             return Err(invalid_param(
-                "a component entity key may occur only once in one transition",
+                "a component row key may occur only once in one transition",
             ));
         }
         if create_refs_have_duplicates(&self.changes) {
@@ -956,7 +950,7 @@ impl<B> WasmEntityChanges<B> {
         Ok(())
     }
 
-    pub fn entity_change_count(&self) -> usize {
+    pub fn row_change_count(&self) -> usize {
         self.changes.len()
     }
 }
@@ -964,34 +958,34 @@ impl<B> WasmEntityChanges<B> {
 /// Builds the sole transition-wide duplicate-check index as borrowed key
 /// references. Sorting never moves or clones a key owner, and the exact
 /// capacity prevents geometric growth for a large cursor.
-fn sorted_change_key_refs<B>(changes: &[WasmEntityChange<B>]) -> Vec<&WasmEntityKey> {
+fn sorted_change_key_refs<B>(changes: &[WasmRowChange<B>]) -> Vec<&WasmRowKey> {
     let mut keys = Vec::with_capacity(changes.len());
-    keys.extend(changes.iter().filter_map(WasmEntityChange::entity_key));
+    keys.extend(changes.iter().filter_map(WasmRowChange::row_key));
     keys.sort_unstable();
     keys
 }
 
-fn sorted_create_refs<B>(changes: &[WasmEntityChange<B>]) -> Vec<(&str, u64)> {
+fn sorted_create_refs<B>(changes: &[WasmRowChange<B>]) -> Vec<(&str, u64)> {
     let mut creates = Vec::with_capacity(changes.len());
     creates.extend(changes.iter().filter_map(|change| match change {
-        WasmEntityChange::Create {
+        WasmRowChange::Create {
             schema_key,
             local_ref,
             ..
         } => Some((schema_key.as_str(), *local_ref)),
-        WasmEntityChange::Upsert { .. } | WasmEntityChange::Delete(_) => None,
+        WasmRowChange::Upsert { .. } | WasmRowChange::Delete(_) => None,
     }));
     creates.sort_unstable();
     creates
 }
 
-fn change_keys_have_duplicates<B>(changes: &[WasmEntityChange<B>]) -> bool {
+fn change_keys_have_duplicates<B>(changes: &[WasmRowChange<B>]) -> bool {
     sorted_change_key_refs(changes)
         .windows(2)
         .any(|pair| pair[0] == pair[1])
 }
 
-fn create_refs_have_duplicates<B>(changes: &[WasmEntityChange<B>]) -> bool {
+fn create_refs_have_duplicates<B>(changes: &[WasmRowChange<B>]) -> bool {
     sorted_create_refs(changes)
         .windows(2)
         .any(|pair| pair[0] == pair[1])
@@ -1004,11 +998,11 @@ fn create_refs_have_duplicates<B>(changes: &[WasmEntityChange<B>]) -> bool {
 /// untrusted key into a transition-lived owning tree while preserving
 /// arbitrary guest output order and the established rejection text.
 pub(crate) fn validate_change_cursor_key_uniqueness<B>(
-    changes: &[WasmEntityChange<B>],
+    changes: &[WasmRowChange<B>],
 ) -> Result<(), LixError> {
     if change_keys_have_duplicates(changes) {
         return Err(invalid_param(
-            "a component entity key may occur only once across a change cursor",
+            "a component row key may occur only once across a change cursor",
         ));
     }
     if create_refs_have_duplicates(changes) {
@@ -1019,54 +1013,54 @@ pub(crate) fn validate_change_cursor_key_uniqueness<B>(
     Ok(())
 }
 
-pub type WasmHostEntityChanges = WasmEntityChanges<WasmHostBytes>;
-pub type WasmGuestEntityChanges = WasmEntityChanges<WasmGuestBytes>;
+pub type WasmHostRowChanges = WasmRowChanges<WasmHostBytes>;
+pub type WasmGuestRowChanges = WasmRowChanges<WasmGuestBytes>;
 
 #[derive(Debug, Clone)]
-pub struct WasmEntityPage {
-    pub entities: Vec<WasmHostEntity>,
+pub struct WasmRowPage {
+    pub rows: Vec<WasmHostRow>,
 }
 
-/// Bounded, complete host entities. `None` is permanent EOF and every
+/// Bounded, complete host rows. `None` is permanent EOF and every
 /// successful page must be non-empty and no larger than `max_bytes` once
 /// packet-v1 encoded.
-pub trait WasmEntitySource: Send {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError>;
+pub trait WasmRowSource: Send {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError>;
 }
 
-/// Bounded, merge-resolved host changes supplied to `entities_changed`.
-pub trait WasmEntityChangeSource: Send {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmHostEntityChanges>, LixError>;
+/// Bounded, merge-resolved host changes supplied to `rows_changed`.
+pub trait WasmRowChangeSource: Send {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmHostRowChanges>, LixError>;
 }
 
 /// One same-identity three-way semantic conflict. `a` and `b` are
 /// canonically ordered by the durable `(updated_at, change_id)` tuple rather
 /// than by the branch into which a merge happens. A missing value represents a
-/// pre-creation or tombstoned entity.
+/// pre-creation or tombstoned row.
 #[derive(Debug, Clone)]
-pub struct WasmEntityConflict<B> {
+pub struct WasmRowConflict<B> {
     /// Host-assigned zero-based position in this resolver invocation. The
     /// guest must echo it in its resolution record, allowing the host to
     /// prove that an untrusted cursor neither reordered nor duplicated picks.
     pub ordinal: u32,
-    pub key: WasmEntityKey,
+    pub key: WasmRowKey,
     pub base: Option<B>,
     pub a: Option<B>,
     pub b: Option<B>,
 }
 
-pub type WasmHostEntityConflict = WasmEntityConflict<WasmHostBytes>;
-pub type WasmGuestEntityConflict = WasmEntityConflict<WasmGuestBytes>;
+pub type WasmHostRowConflict = WasmRowConflict<WasmHostBytes>;
+pub type WasmGuestRowConflict = WasmRowConflict<WasmGuestBytes>;
 
 #[derive(Debug, Clone)]
-pub struct WasmEntityConflictPage {
-    pub conflicts: Vec<WasmHostEntityConflict>,
+pub struct WasmRowConflictPage {
+    pub conflicts: Vec<WasmHostRowConflict>,
 }
 
 /// Bounded host conflict triples supplied to the static `resolve-conflicts`
 /// hook. Each complete snapshot stays lazy through `WasmHostBytes::Source`.
-pub trait WasmEntityConflictSource: Send {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityConflictPage>, LixError>;
+pub trait WasmRowConflictSource: Send {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowConflictPage>, LixError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1077,7 +1071,7 @@ pub enum WasmConflictTake {
 }
 
 /// A conflict result is aligned with its input record; it cannot alter the
-/// schema key or entity primary key. `Take` reuses the selected historical
+/// schema key or row primary key. `Take` reuses the selected historical
 /// row, avoiding a large round trip through guest linear memory.
 #[derive(Debug, Clone)]
 pub enum WasmConflictResolution<B> {
@@ -1110,7 +1104,7 @@ pub struct WasmCreateContext {
 }
 
 impl WasmCreateContext {
-    pub fn entity_pk(self, local_ref: u64) -> Result<Vec<String>, LixError> {
+    pub fn row_pk(self, local_ref: u64) -> Result<Vec<String>, LixError> {
         Ok(vec![self.component(local_ref)?])
     }
 
@@ -1136,14 +1130,14 @@ pub struct WasmOpenFileInput {
     pub descriptor: WasmFileDescriptor,
     pub file: Arc<dyn WasmByteSource>,
     pub creates: WasmCreateContext,
-    /// Whether this file may represent a complete parse as a certified entity
-    /// packet instead of ordinary per-entity changes.
+    /// Whether this file may represent a complete parse as a certified row
+    /// packet instead of ordinary per-row changes.
     ///
     /// A certified packet is materialized by expanding it from the file's
     /// published commit root, so the caller must set this to `false` for any
     /// file that publishes no commit. The same rows are then produced through
     /// the ordinary change path instead. This is a representation choice made
-    /// by the host; the guest emits the same entities either way.
+    /// by the host; the guest emits the same rows either way.
     pub certified_packets_available: bool,
 }
 
@@ -1162,16 +1156,16 @@ impl fmt::Debug for WasmOpenFileInput {
     }
 }
 
-pub struct WasmOpenEntitiesInput {
+pub struct WasmOpenRowsInput {
     pub descriptor: WasmFileDescriptor,
-    pub entities: Box<dyn WasmEntitySource>,
+    pub rows: Box<dyn WasmRowSource>,
     pub accepted: Option<Arc<dyn WasmByteSource>>,
 }
 
-impl fmt::Debug for WasmOpenEntitiesInput {
+impl fmt::Debug for WasmOpenRowsInput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("WasmOpenEntitiesInput")
+            .debug_struct("WasmOpenRowsInput")
             .field("descriptor", &self.descriptor)
             .field(
                 "accepted_len",
@@ -1197,7 +1191,7 @@ pub struct WasmColdFileUpdate {
     pub edits: Vec<WasmInputSplice>,
     pub after: Arc<dyn WasmByteSource>,
     pub creates: WasmCreateContext,
-    pub entities: Box<dyn WasmEntitySource>,
+    pub rows: Box<dyn WasmRowSource>,
 }
 
 impl fmt::Debug for WasmColdFileUpdate {
@@ -1333,19 +1327,19 @@ impl WasmFileUpdate {
     }
 }
 
-pub struct WasmEntityUpdate {
+pub struct WasmRowUpdate {
     pub before_descriptor: WasmFileDescriptor,
     pub after_descriptor: WasmFileDescriptor,
     pub before: Arc<dyn WasmByteSource>,
-    pub changes: Box<dyn WasmEntityChangeSource>,
+    pub changes: Box<dyn WasmRowChangeSource>,
 }
 
 /// Input for one stateless, file-scoped conflict-resolution call. It has no
 /// document handle on purpose: a one-row/one-paragraph merge must not force a
-/// cold open of all semantic entities in the file.
+/// cold open of all semantic rows in the file.
 pub struct WasmConflictUpdate {
     pub descriptor: WasmFileDescriptor,
-    pub conflicts: Box<dyn WasmEntityConflictSource>,
+    pub conflicts: Box<dyn WasmRowConflictSource>,
 }
 
 impl fmt::Debug for WasmConflictUpdate {
@@ -1357,10 +1351,10 @@ impl fmt::Debug for WasmConflictUpdate {
     }
 }
 
-impl fmt::Debug for WasmEntityUpdate {
+impl fmt::Debug for WasmRowUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("WasmEntityUpdate")
+            .debug_struct("WasmRowUpdate")
             .field("before_descriptor", &self.before_descriptor)
             .field("after_descriptor", &self.after_descriptor)
             .field("before_len", &self.before.len())
@@ -1381,7 +1375,7 @@ handle_type!(WasmDocumentHandle);
 ///
 /// The engine treats the payload as opaque. A compatible component runtime
 /// may restore it into a fresh Store after actor eviction, avoiding durable
-/// entity hydration while preserving the same semantic authority checks.
+/// row hydration while preserving the same semantic authority checks.
 #[derive(Debug, Clone)]
 pub struct WasmDurableDocumentCheckpoint {
     bytes: crate::Blob,
@@ -1541,7 +1535,7 @@ pub enum WasmGuestBytes {
 #[derive(Debug, Clone)]
 pub struct WasmChangePage {
     pub format_version: u16,
-    pub changes: WasmGuestEntityChanges,
+    pub changes: WasmGuestRowChanges,
     /// Exactly one page-local table supplies all `Output` values in `changes`.
     pub outputs: Option<WasmByteOutputsHandle>,
 }
@@ -1610,17 +1604,17 @@ impl WasmChangeDrainValidator {
         let mut page_refs = 0u32;
         for change in &page.changes.changes {
             let output = match change {
-                WasmEntityChange::Create {
+                WasmRowChange::Create {
                     snapshot_content, ..
                 } => match snapshot_content {
                     WasmGuestBytes::Output(range) => Some(range),
                     WasmGuestBytes::Inline(_) => None,
                 },
-                WasmEntityChange::Upsert { entity, .. } => match &entity.snapshot_content {
+                WasmRowChange::Upsert { row, .. } => match &row.snapshot_content {
                     WasmGuestBytes::Output(range) => Some(range),
                     WasmGuestBytes::Inline(_) => None,
                 },
-                WasmEntityChange::Delete(_) => None,
+                WasmRowChange::Delete(_) => None,
             };
             if let Some(range) = output {
                 range
@@ -1882,7 +1876,7 @@ pub struct WasmCertifiedCreateRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmCertifiedEntityBatch {
+pub struct WasmCertifiedRowBatch {
     pub format: u16,
     pub schema_keys: Vec<String>,
     pub row_count: u64,
@@ -1904,7 +1898,7 @@ pub(crate) const HOST_CERTIFIED_PACKET_FORMAT: u16 = 3;
 pub(crate) const HOST_CERTIFIED_ZSTD_PACKET_FORMAT: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WasmEntityTransition {
+pub struct WasmRowTransition {
     pub transition: WasmTransitionHandle,
     pub document: WasmDocumentHandle,
     pub edits: WasmEditCursorHandle,
@@ -1931,7 +1925,7 @@ pub trait WasmComponentFactory: Send + Sync {
 /// cancellation, or uncertain completion.
 #[async_trait]
 pub trait WasmComponentActor: Send {
-    /// True when `open_entities` retains accepted bytes only and returns them
+    /// True when `open_rows` retains accepted bytes only and returns them
     /// unchanged without invoking a semantic renderer.
     fn cold_open_hydrates_without_render(&self) -> bool {
         false
@@ -1939,7 +1933,7 @@ pub trait WasmComponentActor: Send {
 
     /// False when a cold actor reconstructs its transition state from the
     /// accepted file bytes and does not consume durable semantic rows.
-    fn cold_open_requires_entities(&self) -> bool {
+    fn cold_open_requires_rows(&self) -> bool {
         true
     }
 
@@ -1987,11 +1981,11 @@ pub trait WasmComponentActor: Send {
         input: WasmOpenFileInput,
     ) -> Result<WasmFileTransition, LixError>;
 
-    async fn open_entities(
+    async fn open_rows(
         &mut self,
         limits: WasmTransitionLimits,
-        input: WasmOpenEntitiesInput,
-    ) -> Result<WasmEntityTransition, LixError>;
+        input: WasmOpenRowsInput,
+    ) -> Result<WasmRowTransition, LixError>;
 
     async fn file_changed(
         &mut self,
@@ -2011,12 +2005,12 @@ pub trait WasmComponentActor: Send {
         ))
     }
 
-    async fn entities_changed(
+    async fn rows_changed(
         &mut self,
         document: WasmDocumentHandle,
         limits: WasmTransitionLimits,
-        update: WasmEntityUpdate,
-    ) -> Result<WasmEntityTransition, LixError>;
+        update: WasmRowUpdate,
+    ) -> Result<WasmRowTransition, LixError>;
 
     async fn resolve_conflicts(
         &mut self,
@@ -2040,10 +2034,10 @@ pub trait WasmComponentActor: Send {
     ///
     /// Ordinary component actors never produce these. A v3 adapter may return a
     /// batch only after every bounded page has passed its format validator.
-    fn take_certified_entity_batches(
+    fn take_certified_row_batches(
         &mut self,
         _transition: WasmTransitionHandle,
-    ) -> Vec<WasmCertifiedEntityBatch> {
+    ) -> Vec<WasmCertifiedRowBatch> {
         Vec::new()
     }
 
@@ -2174,16 +2168,16 @@ mod tests {
             state_read_calls: 3,
             state_key_bytes: 13,
             state_value_bytes_read: 17,
-            entity_input_pages: 5,
-            entity_input_records: 19,
-            entity_input_wire_bytes: 23,
-            entity_output_pages: 7,
-            entity_output_records: 29,
-            entity_output_wire_bytes: 31,
-            entity_input_attachment_reads: 37,
-            entity_input_attachment_bytes: 41,
-            entity_output_attachment_writes: 43,
-            entity_output_attachment_bytes: 47,
+            row_input_pages: 5,
+            row_input_records: 19,
+            row_input_wire_bytes: 23,
+            row_output_pages: 7,
+            row_output_records: 29,
+            row_output_wire_bytes: 31,
+            row_input_attachment_reads: 37,
+            row_input_attachment_bytes: 41,
+            row_output_attachment_writes: 43,
+            row_output_attachment_bytes: 47,
             ..WasmTransitionCounters::default()
         });
 
@@ -2192,16 +2186,16 @@ mod tests {
         assert_eq!(total.state_read_calls, 3);
         assert_eq!(total.state_key_bytes, 13);
         assert_eq!(total.state_value_bytes_read, 17);
-        assert_eq!(total.entity_input_pages, 5);
-        assert_eq!(total.entity_input_records, 19);
-        assert_eq!(total.entity_input_wire_bytes, 23);
-        assert_eq!(total.entity_output_pages, 7);
-        assert_eq!(total.entity_output_records, 29);
-        assert_eq!(total.entity_output_wire_bytes, 31);
-        assert_eq!(total.entity_input_attachment_reads, 37);
-        assert_eq!(total.entity_input_attachment_bytes, 41);
-        assert_eq!(total.entity_output_attachment_writes, 43);
-        assert_eq!(total.entity_output_attachment_bytes, 47);
+        assert_eq!(total.row_input_pages, 5);
+        assert_eq!(total.row_input_records, 19);
+        assert_eq!(total.row_input_wire_bytes, 23);
+        assert_eq!(total.row_output_pages, 7);
+        assert_eq!(total.row_output_records, 29);
+        assert_eq!(total.row_output_wire_bytes, 31);
+        assert_eq!(total.row_input_attachment_reads, 37);
+        assert_eq!(total.row_input_attachment_bytes, 41);
+        assert_eq!(total.row_output_attachment_writes, 43);
+        assert_eq!(total.row_output_attachment_bytes, 47);
     }
 
     #[test]
@@ -2312,40 +2306,39 @@ mod tests {
     fn large_common_keys_stay_inline_and_duplicate_sort_borrows_original_owners() {
         let schema = SharedStr::from_static("csv_row");
         let namespace = SharedStr::from_static("namespace");
-        let entity = SharedStr::from_static("entity");
+        let row = SharedStr::from_static("row");
         let changes = (0..10_000)
             .map(|ordinal| {
-                let entity_pk = if ordinal % 2 == 0 {
+                let row_pk = if ordinal % 2 == 0 {
                     [namespace.clone()].into_iter().collect()
                 } else {
-                    [namespace.clone(), entity.clone()].into_iter().collect()
+                    [namespace.clone(), row.clone()].into_iter().collect()
                 };
-                WasmEntityChange::<WasmGuestBytes>::Delete(WasmEntityKey {
+                WasmRowChange::<WasmGuestBytes>::Delete(WasmRowKey {
                     schema_key: schema.clone(),
-                    entity_pk,
+                    row_pk,
                 })
             })
             .collect::<Vec<_>>();
 
         for (ordinal, change) in changes.iter().enumerate() {
-            let key = change.entity_key().expect("delete carries an entity key");
-            assert_eq!(key.entity_pk.len(), 1 + (ordinal % 2));
+            let key = change.row_key().expect("delete carries a row key");
+            assert_eq!(key.row_pk.len(), 1 + (ordinal % 2));
             assert!(
-                !key.entity_pk.spilled(),
+                !key.row_pk.spilled(),
                 "one- and two-component protocol keys must stay inline"
             );
             assert!(key.schema_key.shares_buffer_with(&schema));
-            assert!(key.entity_pk[0].shares_buffer_with(&namespace));
+            assert!(key.row_pk[0].shares_buffer_with(&namespace));
             if ordinal % 2 == 1 {
-                assert!(key.entity_pk[1].shares_buffer_with(&entity));
+                assert!(key.row_pk[1].shares_buffer_with(&row));
             }
         }
 
         let mut original_owner_addresses = changes
             .iter()
             .map(|change| {
-                let key: *const WasmEntityKey =
-                    change.entity_key().expect("delete carries an entity key");
+                let key: *const WasmRowKey = change.row_key().expect("delete carries a row key");
                 key as usize
             })
             .collect::<Vec<_>>();
@@ -2353,7 +2346,7 @@ mod tests {
         let mut sorted_owner_addresses = sorted
             .iter()
             .map(|key| {
-                let key: *const WasmEntityKey = *key;
+                let key: *const WasmRowKey = *key;
                 key as usize
             })
             .collect::<Vec<_>>();
@@ -2370,18 +2363,18 @@ mod tests {
             validate_change_cursor_key_uniqueness(&changes)
                 .expect_err("the repeated structural keys are duplicates")
                 .message,
-            "a component entity key may occur only once across a change cursor"
+            "a component row key may occur only once across a change cursor"
         );
     }
 
     #[test]
     fn cursor_key_uniqueness_accepts_arbitrary_unique_order() {
         let changes = vec![
-            WasmEntityChange::<WasmGuestBytes>::Delete(WasmEntityKey::from_shared_parts(
+            WasmRowChange::<WasmGuestBytes>::Delete(WasmRowKey::from_shared_parts(
                 SharedStr::from_static("schema-z"),
                 [SharedStr::from_static("row-z")],
             )),
-            WasmEntityChange::<WasmGuestBytes>::Delete(WasmEntityKey::from_shared_parts(
+            WasmRowChange::<WasmGuestBytes>::Delete(WasmRowKey::from_shared_parts(
                 SharedStr::from_static("schema-a"),
                 [SharedStr::from_static("row-a")],
             )),
@@ -2401,7 +2394,7 @@ mod tests {
             creates.component(42).unwrap(),
             "01920000-0000-7000-8000-00000000002a"
         );
-        assert_eq!(creates.entity_pk(7).unwrap().len(), 1);
+        assert_eq!(creates.row_pk(7).unwrap().len(), 1);
         assert!(creates.component(u64::from(u32::MAX) + 1).is_err());
     }
 
@@ -2436,17 +2429,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_entity_keys() {
-        let key = WasmEntityKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
-        let duplicate = WasmEntityChanges::<WasmGuestBytes> {
+    fn rejects_duplicate_row_keys() {
+        let key = WasmRowKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
+        let duplicate = WasmRowChanges::<WasmGuestBytes> {
             changes: vec![
-                WasmEntityChange::Delete(key.clone()),
-                WasmEntityChange::Delete(key),
+                WasmRowChange::Delete(key.clone()),
+                WasmRowChange::Delete(key),
             ],
         };
         assert!(duplicate.validate().is_err());
         assert!(
-            WasmEntityChanges::<WasmGuestBytes>::default()
+            WasmRowChanges::<WasmGuestBytes>::default()
                 .validate()
                 .is_ok()
         );
@@ -2522,11 +2515,11 @@ mod tests {
 
     #[test]
     fn change_drain_validator_owns_framing_but_not_key_copies() {
-        let key = WasmEntityKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
+        let key = WasmRowKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
         let page = WasmChangePage {
             format_version: PACKET_FORMAT_V1,
-            changes: WasmEntityChanges {
-                changes: vec![WasmEntityChange::Delete(key)],
+            changes: WasmRowChanges {
+                changes: vec![WasmRowChange::Delete(key)],
             },
             outputs: None,
         };
@@ -2639,7 +2632,7 @@ mod tests {
         assert!(wit.starts_with("package lix:plugin@1.0.0;"));
         assert!(wit.contains("resource transition"));
         assert!(wit.contains("apply:"));
-        assert!(wit.contains("entities-changed("));
+        assert!(wit.contains("rows-changed("));
         assert!(!wit.contains("resolution-effect"));
         assert!(!wit.contains("record restore-request {\n    path:"));
         assert!(wit.contains("resolve-conflicts:"));

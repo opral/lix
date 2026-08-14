@@ -1,4 +1,4 @@
-//! Immutable, projection-addressable Arrow row groups.
+//! Immutable, projection-addressable Arrow groups.
 //!
 //! This module owns a generic physical format. It deliberately knows nothing
 //! about SQL plans, current-state visibility, or commit publication. Callers
@@ -39,12 +39,12 @@ pub(crate) struct RowGroupRowLocation {
 }
 pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0029),
-    "entity.columnar_row_group_manifest.v1",
+    "row.columnar_row_group_manifest.v1",
     ValueSemantics::Immutable,
 );
 pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_002a),
-    "entity.columnar_row_group_column.v1",
+    "row.columnar_row_group_column.v1",
     ValueSemantics::Immutable,
 );
 

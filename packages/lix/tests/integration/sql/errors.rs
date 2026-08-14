@@ -322,7 +322,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    sql_blob_insert_into_json_entity_has_targeted_error,
+    sql_blob_insert_into_json_row_has_targeted_error,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -339,7 +339,7 @@ simulation_test!(
                 &[Value::Blob(vec![1, 2, 3, 255, 0, 128].into())],
             )
             .await
-            .expect_err("blob entity insert should fail cleanly");
+            .expect_err("blob row insert should fail cleanly");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(

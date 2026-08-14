@@ -12,7 +12,7 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
 };
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::hot_state::{
     CurrentStateDeltaRef, HotStateContext, HotStateFilter, HotStateProjection, HotStateRowRequest,
     HotStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
@@ -35,7 +35,7 @@ const BENCH_BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000a1";
 pub struct BenchTransactionRow {
     pub schema_key: String,
     pub file_id: Option<String>,
-    pub entity_pk: String,
+    pub row_pk: String,
     pub value: Arc<JsonValue>,
     pub updated_value: Arc<JsonValue>,
 }
@@ -255,12 +255,12 @@ where
         let mut contents = rows
             .iter()
             .map(|row| {
-                let entity_pk = row
-                    .entity_pk()
+                let row_pk = row
+                    .row_pk()
                     .as_json_array_text()
-                    .expect("bench entity pk should render");
+                    .expect("bench row pk should render");
                 (
-                    entity_pk,
+                    row_pk,
                     row.snapshot_content()
                         .map(ToString::to_string)
                         .unwrap_or_default(),
@@ -284,7 +284,7 @@ where
             .load_row(&HotStateRowRequest {
                 schema_key: "json_pointer".to_string(),
                 branch_id: BENCH_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(row.entity_pk.clone()),
+                row_pk: RowPk::single(row.row_pk.clone()),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -364,7 +364,7 @@ where
     }))
     .expect("deterministic mode snapshot should serialize");
     let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
-    let entity_pk = EntityPk::single(crate::functions::DETERMINISTIC_MODE_KEY);
+    let row_pk = RowPk::single(crate::functions::DETERMINISTIC_MODE_KEY);
     let read = SharedStorageAdapterRead::new(
         storage
             .begin_read(StorageReadOptions::default())
@@ -389,7 +389,7 @@ where
             &[CurrentStateDeltaRef {
                 schema_key: "lix_key_value",
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 change_id: None,
                 commit_id: None,
                 untracked: true,
@@ -428,7 +428,7 @@ fn write_accounting(logical_rows: usize, stats: StorageWriteSetStats) -> BenchWr
 
 fn transaction_row(row: &BenchTransactionRow, value: &Arc<JsonValue>) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(row.entity_pk.clone())),
+        row_pk: Some(RowPk::single(row.row_pk.clone())),
         schema_key: row.schema_key.as_str().into(),
         file_id: row.file_id.as_deref().map(Into::into),
         snapshot: Some(TransactionJson::from_shared_value_unchecked(Arc::clone(
@@ -475,7 +475,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
             })
             .to_string();
             crate::tracked_state::MaterializedTrackedStateRow {
-                entity_pk: crate::schema::registered_schema_entity_pk(&key.schema_key)
+                row_pk: crate::schema::registered_schema_row_pk(&key.schema_key)
                     .expect("registered schema identity should derive"),
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,
@@ -523,11 +523,11 @@ async fn seed_visible_schema_rows<StorageImpl>(
     let timestamp = LixTimestamp::expect_parse("timestamp", TIMESTAMP);
     let commit_id = CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID);
     let branch_refs = [GLOBAL_BRANCH_ID, BENCH_BRANCH_ID].map(|branch_id| {
-        let entity_pk =
-            EntityPk::uuid_from_canonical(branch_id).expect("benchmark branch ID is canonical");
+        let row_pk =
+            RowPk::uuid_from_canonical(branch_id).expect("benchmark branch ID is canonical");
         let snapshot = json!({"id": branch_id, "commit_id": commit_id}).to_string();
         let change_id = ChangeId::for_test_label(&format!("bench-branch-ref-{branch_id}"));
-        (branch_id, entity_pk, snapshot, change_id)
+        (branch_id, row_pk, snapshot, change_id)
     });
     let mut writes = StorageWriteSet::new();
     ChangelogContext::new()
@@ -535,11 +535,11 @@ async fn seed_visible_schema_rows<StorageImpl>(
         .stage_append(ChangelogAppend {
             changes: branch_refs
                 .iter()
-                .map(|(_, entity_pk, snapshot, change_id)| ChangeRecord {
+                .map(|(_, row_pk, snapshot, change_id)| ChangeRecord {
                     format_version: 2,
                     change_id: *change_id,
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                    entity_pk: entity_pk.clone(),
+                    row_pk: row_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::from_json(snapshot),
@@ -644,7 +644,7 @@ mod tests {
             .map(|index| BenchTransactionRow {
                 schema_key: "json_pointer".to_owned(),
                 file_id: None,
-                entity_pk: format!("/bulk/{index:04}"),
+                row_pk: format!("/bulk/{index:04}"),
                 value: Arc::new(json!({
                     "path": format!("/bulk/{index:04}"),
                     "value": format!("before-{index:04}"),

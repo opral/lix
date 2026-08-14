@@ -28,7 +28,7 @@ use super::table::{
 use super::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundParamMap,
     BoundReturning, BoundReturningItem, BoundWrite, BoundWriteInput, BoundWriteOp,
-    BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface, FileWriteSurface,
+    BoundWriteTarget, DirectoryWriteSurface, RowWriteSurface, FileWriteSurface,
 };
 use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
 
@@ -96,7 +96,7 @@ pub(super) fn bind_insert_bound(
     // by the schema's default machinery. Keep it distinct from `INSERT INTO
     // table VALUES (...)`, whose implicit public column list is deliberately
     // unsupported.
-    let default_values = matches!(table.surface.kind, PublicSurfaceKind::EntityBase { .. })
+    let default_values = matches!(table.surface.kind, PublicSurfaceKind::SchemaBase { .. })
         && insert.columns.is_empty()
         && insert.source.is_none();
     if insert.columns.is_empty() && !default_values {
@@ -136,8 +136,8 @@ pub(super) fn bind_insert_bound(
     if conflict.is_some() {
         if !matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityBase { .. }
-                | PublicSurfaceKind::EntityByBranch { .. }
+            PublicSurfaceKind::SchemaBase { .. }
+                | PublicSurfaceKind::SchemaByBranch { .. }
                 | PublicSurfaceKind::Branch
                 | PublicSurfaceKind::File
                 | PublicSurfaceKind::FileByBranch
@@ -611,10 +611,10 @@ fn bind_insert_input(
     let SetExpr::Values(values) = source.body.as_ref() else {
         if matches!(
             surface_kind,
-            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
+            PublicSurfaceKind::SchemaBase { .. } | PublicSurfaceKind::SchemaByBranch { .. }
         ) {
             return Err(super::error::unsupported(
-                "INSERT ... SELECT is not supported for entity SQL surfaces yet",
+                "INSERT ... SELECT is not supported for schema SQL surfaces yet",
             ));
         }
         if columns
@@ -1333,14 +1333,14 @@ fn require_write_capability(
         );
         if matches!(
             surface.kind,
-            PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaHistory { .. }
                 | PublicSurfaceKind::FileHistory
                 | PublicSurfaceKind::DirectoryHistory
         ) {
             error = error.with_hint("History views are query-only.");
-        } else if let PublicSurfaceKind::EntityBase { schema_key }
-        | PublicSurfaceKind::EntityByBranch { schema_key } = &surface.kind
-            && let Some(hint) = crate::sql2::read_only::read_only_entity_surface_hint(schema_key)
+        } else if let PublicSurfaceKind::SchemaBase { schema_key }
+        | PublicSurfaceKind::SchemaByBranch { schema_key } = &surface.kind
+            && let Some(hint) = crate::sql2::read_only::read_only_schema_surface_hint(schema_key)
         {
             error = error.with_hint(hint);
         }
@@ -1350,13 +1350,13 @@ fn require_write_capability(
 
 fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
     match kind {
-        PublicSurfaceKind::EntityBase { schema_key } => {
-            BoundWriteTarget::Entity(EntityWriteSurface::Base {
+        PublicSurfaceKind::SchemaBase { schema_key } => {
+            BoundWriteTarget::Row(RowWriteSurface::Base {
                 schema_key: schema_key.clone(),
             })
         }
-        PublicSurfaceKind::EntityByBranch { schema_key } => {
-            BoundWriteTarget::Entity(EntityWriteSurface::ByBranch {
+        PublicSurfaceKind::SchemaByBranch { schema_key } => {
+            BoundWriteTarget::Row(RowWriteSurface::ByBranch {
                 schema_key: schema_key.clone(),
             })
         }
@@ -1374,7 +1374,7 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         PublicSurfaceKind::CreateCheckpoint => {
             BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint)
         }
-        PublicSurfaceKind::EntityHistory { .. }
+        PublicSurfaceKind::SchemaHistory { .. }
         | PublicSurfaceKind::FileHistory
         | PublicSurfaceKind::DirectoryHistory
         | PublicSurfaceKind::Change
@@ -1482,7 +1482,7 @@ fn bind_base_write_branch_scope(
 
 fn by_branch_column_name(kind: &PublicSurfaceKind) -> Option<&'static str> {
     match kind {
-        PublicSurfaceKind::EntityByBranch { .. }
+        PublicSurfaceKind::SchemaByBranch { .. }
         | PublicSurfaceKind::FileByBranch
         | PublicSurfaceKind::DirectoryByBranch => Some("lixcol_branch_id"),
         _ => None,
@@ -1761,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_default_values_for_non_entity_tables() {
+    fn bind_statement_rejects_default_values_for_non_row_tables() {
         let statement = parse_statement("INSERT INTO lix_file DEFAULT VALUES");
         let error = bind_statement(&statement, &[], "branch1")
             .expect_err("DEFAULT VALUES should remain unsupported outside registered schemas");
@@ -1794,7 +1794,7 @@ mod tests {
 
         assert!(matches!(
             bound.target,
-            BoundWriteTarget::Entity(EntityWriteSurface::Base { .. })
+            BoundWriteTarget::Row(RowWriteSurface::Base { .. })
         ));
         assert!(matches!(
             bound.branch_scope,
@@ -1808,9 +1808,9 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_entity_insert_select() {
+    fn bind_statement_rejects_row_insert_select() {
         let statement = parse_statement(
-            "INSERT INTO test_state_schema (lixcol_entity_pk, value) SELECT '[\"a\"]'::jsonb, 'A'",
+            "INSERT INTO test_state_schema (lixcol_row_pk, value) SELECT '[\"a\"]'::jsonb, 'A'",
         );
         let error = bind_statement(
             &statement,
@@ -1824,13 +1824,13 @@ mod tests {
             })],
             "branch1",
         )
-        .expect_err("entity INSERT SELECT should fail closed at binding");
+        .expect_err("row INSERT SELECT should fail closed at binding");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(
             error
                 .message
-                .contains("INSERT ... SELECT is not supported for entity SQL surfaces yet")
+                .contains("INSERT ... SELECT is not supported for schema SQL surfaces yet")
         );
     }
 
@@ -1890,7 +1890,7 @@ mod tests {
         let write = bound;
         assert!(matches!(
             write.target,
-            BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
+            BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
         ));
         assert_eq!(write.op, BoundWriteOp::Update);
         assert_eq!(write.assignments.len(), 1);
@@ -2136,7 +2136,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_dynamic_entity_primary_key_updates() {
+    fn bind_statement_rejects_dynamic_row_primary_key_updates() {
         let statement = parse_statement("UPDATE project_message SET id = 'm2' WHERE id = 'm1'");
         let error = bind_statement(
             &statement,
@@ -2151,7 +2151,7 @@ mod tests {
             })],
             "branch1",
         )
-        .expect_err("entity primary key columns should be insert-only");
+        .expect_err("row primary key columns should be insert-only");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error.message.contains("is not writable"));
@@ -2325,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_binds_returning_for_registered_entity_writes() {
+    fn bind_statement_binds_returning_for_registered_row_writes() {
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "project_task",
@@ -2343,7 +2343,7 @@ mod tests {
             std::slice::from_ref(&schema),
             "branch1",
         )
-        .expect("registered entity INSERT RETURNING should bind");
+        .expect("registered row INSERT RETURNING should bind");
         assert_eq!(
             inserted
                 .returning
@@ -2367,7 +2367,7 @@ mod tests {
             std::slice::from_ref(&schema),
             "branch1",
         )
-        .expect("registered entity UPDATE RETURNING should bind");
+        .expect("registered row UPDATE RETURNING should bind");
         assert_eq!(
             updated
                 .returning

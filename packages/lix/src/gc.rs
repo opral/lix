@@ -886,7 +886,7 @@ async fn load_authenticated_serving_dependency_closure<S>(
     // These retain **both** planes. It is tempting to retain only the semantic
     // projection here and let the physical delta segments go, on the grounds
     // that compaction is supposed to free them — that is what this code did,
-    // and it silently truncated entity history. An entity `_history()` row is
+    // and it silently truncated row history. A row `_history()` row is
     // served out of the per-commit delta, not out of the projection:
     // `CommitGraphContext::change_history_from_commit` walks the graph and then
     // calls `load_member_changes`, which reads
@@ -959,7 +959,7 @@ where
         tracing::warn!(
             history_manifests_missing,
             "repository contains commits whose history delta was reclaimed by a garbage \
-             collection sweep predating the history-retention fix; their entity history is \
+             collection sweep predating the history-retention fix; their row history is \
              permanently truncated and cannot be recovered"
         );
     }
@@ -1189,7 +1189,7 @@ where
 /// This is the reachability the public history surfaces actually read: a
 /// `_history()` query walks the commit graph, so a commit on that chain is
 /// load-bearing no matter how far below the serving checkpoint it sits — and
-/// load-bearing in **both** planes, because an entity history row is served out
+/// load-bearing in **both** planes, because a row history row is served out
 /// of the commit delta while only the commit metadata comes from the
 /// projection. Retaining the projection alone leaves the walk finding the
 /// commit and reading zero members from it, which is silent truncation. The
@@ -2226,7 +2226,7 @@ where
                 crate::columnar_row_group::stage_delete_row_group_set(
                     store,
                     writes,
-                    crate::hot_state::entity_row_group_set_id(*commit_id, schema_key),
+                    crate::hot_state::row_group_set_id(*commit_id, schema_key),
                 )
                 .await?;
             }
@@ -2416,7 +2416,7 @@ mod tests {
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
     };
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::json_store::{
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
@@ -2617,7 +2617,7 @@ mod tests {
     }
 
     /// The fix: a commit reachable from the head through parent links keeps its
-    /// physical delta, because that delta is what an entity `_history()` row is
+    /// physical delta, because that delta is what a row `_history()` row is
     /// served out of.
     #[tokio::test]
     async fn ordinary_gc_retains_the_delta_of_a_graph_reachable_commit() {
@@ -2664,7 +2664,7 @@ mod tests {
         // a raw parent chain no real checkpoint ever produces. That kept
         // `old_root` reachable from the live head forever, and a commit reachable
         // from the head now keeps its delta because that delta is what an
-        // entity `_history()` row is served out of. The release under test here
+        // row `_history()` row is served out of. The release under test here
         // is a rootless tracked serving generation, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("rootless-serving-base", 0, None, timestamp);
@@ -2736,7 +2736,7 @@ mod tests {
         // the whole chain.
         assert!(
             !plan.sweep.tracked_commit_roots.contains(&base.commit_id),
-            "a commit reachable from the live head owns entity history and must not be retired"
+            "a commit reachable from the live head owns row history and must not be retired"
         );
     }
 
@@ -3159,7 +3159,7 @@ mod tests {
         // a raw parent chain no real checkpoint ever produces. That kept
         // `owner` reachable from the live head forever, and a commit reachable
         // from the head now keeps its delta because that delta is what an
-        // entity `_history()` row is served out of. The release under test here
+        // row `_history()` row is served out of. The release under test here
         // is the finite selected-source owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("selected-owner-base", 0, None, timestamp);
@@ -3307,7 +3307,7 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&base.commit_id),
-            "the interval base stays on the head's first-parent chain and owns entity history"
+            "the interval base stays on the head's first-parent chain and owns row history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3356,7 +3356,7 @@ mod tests {
         // a raw parent chain no real checkpoint ever produces. That kept
         // `owner` reachable from the live head forever, and a commit reachable
         // from the head now keeps its delta because that delta is what an
-        // entity `_history()` row is served out of. The release under test here
+        // row `_history()` row is served out of. The release under test here
         // is the scoped-descriptor owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("scoped-part-base", 0, None, timestamp);
@@ -3377,12 +3377,12 @@ mod tests {
             schema_key: "scoped_part_owner".to_owned(),
             file_id: None,
         };
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let encoded_key =
             crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
                 schema_key: &scope.schema_key,
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
 
         let mut writes = storage.new_write_set();
@@ -3501,7 +3501,7 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&base.commit_id),
-            "the interval base stays on the head's first-parent chain and owns entity history"
+            "the interval base stays on the head's first-parent chain and owns row history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3529,7 +3529,7 @@ mod tests {
         // a raw parent chain no real checkpoint ever produces. That kept
         // `owner` reachable from the live head forever, and a commit reachable
         // from the head now keeps its delta because that delta is what an
-        // entity `_history()` row is served out of. The release under test here
+        // row `_history()` row is served out of. The release under test here
         // is the native-row owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("native-row-base", 0, None, timestamp);
@@ -3609,7 +3609,7 @@ mod tests {
             [(marker, vec![part])],
         )
         .expect("native row scoped tree should stage");
-        let snapshot_entity_pk = EntityPk::single("native-row");
+        let snapshot_row_pk = RowPk::single("native-row");
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3623,7 +3623,7 @@ mod tests {
                 [TrackedStateDeltaRef {
                     schema_key: &scope.schema_key,
                     file_id: None,
-                    entity_pk: &snapshot_entity_pk,
+                    row_pk: &snapshot_row_pk,
                     change_id: row.value.change_id,
                     commit_id: row.value.commit_id,
                     deleted: false,
@@ -3807,7 +3807,7 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&base.commit_id),
-            "the interval base stays on the head's first-parent chain and owns entity history"
+            "the interval base stays on the head's first-parent chain and owns row history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4200,7 +4200,7 @@ mod tests {
     /// Registers one of several **identically shaped** payload tables.
     ///
     /// A row's out-of-band payload is its whole snapshot, and the snapshot
-    /// carries the entity's primary key — so two rows can only share a payload
+    /// carries the row's primary key — so two rows can only share a payload
     /// when their snapshots are byte-identical, which means the same key with
     /// the same value under a *different* schema. The schema key lives in the
     /// storage key, not in the snapshot, so these tables are exactly the
@@ -4273,7 +4273,7 @@ mod tests {
     /// underneath them is doing real work.
     /// # This test is about undo, not history
     ///
-    /// **Undo survives reclaim; entity history does not.** These are different
+    /// **Undo survives reclaim; row history does not.** These are different
     /// properties over different planes, and this test asserts only the first.
     /// Do not read its name as "reclaim is safe for history".
     ///
@@ -5175,7 +5175,7 @@ mod tests {
             .expect("repository branch control should exist");
         let timestamp =
             LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
-        let entity_pk = EntityPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);
+        let row_pk = RowPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);
         let mut writes = storage.new_write_set();
         let mut coverage = WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()
@@ -5187,7 +5187,7 @@ mod tests {
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: Some(ChangeId::for_test_label("corrupt-plugin-registry")),
                     commit_id: Some(control.head_commit_id),
                     untracked: false,
@@ -5944,7 +5944,7 @@ mod tests {
         for commit_id in [live_parent, dead_commit] {
             crate::columnar_row_group::stage_row_group_set(
                 &mut writes,
-                crate::hot_state::entity_row_group_set_id(commit_id, "authority_gc"),
+                crate::hot_state::row_group_set_id(commit_id, "authority_gc"),
                 &sidecar,
             )
             .expect("stage GC sidecar");
@@ -6076,7 +6076,7 @@ mod tests {
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
-                crate::hot_state::entity_row_group_set_id(live_parent, "authority_gc"),
+                crate::hot_state::row_group_set_id(live_parent, "authority_gc"),
             )
             .await
             .expect("load live sidecar")
@@ -6086,7 +6086,7 @@ mod tests {
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
-                crate::hot_state::entity_row_group_set_id(dead_commit, "authority_gc"),
+                crate::hot_state::row_group_set_id(dead_commit, "authority_gc"),
             )
             .await
             .expect("load retained authority sidecar")
@@ -6134,12 +6134,12 @@ mod tests {
         json_ref
     }
 
-    fn packed_change(change_label: &str, entity_label: &str, snapshot: JsonSlot) -> ChangeRecord {
+    fn packed_change(change_label: &str, row_label: &str, snapshot: JsonSlot) -> ChangeRecord {
         ChangeRecord {
             format_version: 2,
             change_id: ChangeId::for_test_label(change_label),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            entity_pk: EntityPk::single(entity_label),
+            row_pk: RowPk::single(row_label),
             schema_key: "authority_gc".to_string(),
             file_id: None,
             snapshot,
@@ -6235,7 +6235,7 @@ mod tests {
             std::iter::once(Ok(TrackedStateSingleStringReplacementRef {
                 schema_key,
                 file_id: None,
-                entity_pk: "row",
+                row_pk: "row",
                 commit_id,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -6537,7 +6537,7 @@ mod tests {
                 delta: TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),
-                    entity_pk: &change.entity_pk,
+                    row_pk: &change.row_pk,
                     change_id: change.change_id,
                     commit_id,
                     deleted: change.snapshot.is_none(),

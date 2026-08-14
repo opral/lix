@@ -166,7 +166,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_commit_is_plain_global_entity_not_active_reachability_view,
+    lix_commit_is_plain_global_row_not_active_reachability_view,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -251,7 +251,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_commit_derived_by_branch_surfaces_match_commit_entity_projection,
+    lix_commit_derived_by_branch_surfaces_match_commit_row_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(

@@ -3,13 +3,13 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{ExactValue, LixTimestamp};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChange {
     pub(crate) id: ChangeId,
     pub(crate) account_id: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: crate::json_store::JsonSlot,
@@ -21,7 +21,7 @@ pub(crate) struct CommitGraphChange {
 /// One topology-first commit fact.
 ///
 /// Nodes contain exactly the manifest fields needed by graph algorithms and
-/// derived commit surfaces. Entity/change payloads are loaded separately only
+/// derived commit surfaces. Row/change payloads are loaded separately only
 /// by history APIs that explicitly request them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphNode {
@@ -56,7 +56,7 @@ pub(crate) struct ReachableCommitGraphNode {
     pub(crate) depth: u32,
 }
 
-/// Derived parent/child edge between two commit entities.
+/// Derived parent/child edge between two commit rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphEdge {
     pub(crate) parent_commit_id: CommitId,
@@ -89,7 +89,7 @@ pub(crate) fn commit_edges(commits: &[CommitGraphNode]) -> Vec<CommitGraphEdge> 
 /// graph.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
-    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) row_pks: Vec<RowPk>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<u32>,

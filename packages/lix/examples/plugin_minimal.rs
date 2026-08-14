@@ -1,7 +1,7 @@
 //! Minimal compiling Lix Component plugin.
 
 use lix::plugin::{
-    ColdUpdate, EntityUpdate, FileUpdate, OpenFile, Output, Plugin, RestoreFile, Result,
+    ColdUpdate, FileUpdate, OpenFile, Output, Plugin, RestoreFile, Result, RowUpdate,
 };
 
 struct MinimalPlugin;
@@ -15,7 +15,7 @@ impl Plugin for MinimalPlugin {
         Ok(())
     }
 
-    fn entities_changed(_update: &mut EntityUpdate<'_>, _output: &mut Output<'_>) -> Result<()> {
+    fn rows_changed(_update: &mut RowUpdate<'_>, _output: &mut Output<'_>) -> Result<()> {
         Ok(())
     }
 

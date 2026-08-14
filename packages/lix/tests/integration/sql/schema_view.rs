@@ -5,7 +5,7 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
-    entity_filter_pushdown_plan_smoke_for_payload_equality,
+    row_filter_pushdown_plan_smoke_for_payload_equality,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -39,7 +39,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_filter_pushdown_keeps_filter_only_payload_available,
+    row_filter_pushdown_keeps_filter_only_payload_available,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -55,7 +55,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT lixcol_entity_pk FROM pushdown_note WHERE kind = 'todo'",
+                "SELECT lixcol_row_pk FROM pushdown_note WHERE kind = 'todo'",
                 &[],
             )
             .await
@@ -66,7 +66,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_filter_pushdown_applies_limit_after_payload_filter,
+    row_filter_pushdown_applies_limit_after_payload_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -94,7 +94,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_filter_pushdown_preserves_sql_null_equality_semantics,
+    row_filter_pushdown_preserves_sql_null_equality_semantics,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -123,7 +123,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_filter_pushdown_preserves_number_equality_semantics,
+    row_filter_pushdown_preserves_number_equality_semantics,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -147,7 +147,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_filter_pushdown_leaves_unsupported_range_as_residual_filter,
+    row_filter_pushdown_leaves_unsupported_range_as_residual_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -181,7 +181,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_point_read_order_by_pk_elides_physical_sort,
+    row_point_read_order_by_pk_elides_physical_sort,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -229,7 +229,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_multi_key_and_unpinned_order_by_keep_physical_sort,
+    row_multi_key_and_unpinned_order_by_keep_physical_sort,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -307,7 +307,7 @@ simulation_test!(
 // integer key encoding is `value ^ (1 << 63)`, and a naive encoder that skips
 // the sign flip orders every negative above every positive.
 simulation_test!(
-    entity_range_pushdown_matches_full_scan_at_every_bound,
+    row_range_pushdown_matches_full_scan_at_every_bound,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -357,7 +357,7 @@ simulation_test!(
 // requested rows — an error that a one-sided test with the column always on
 // the left cannot see.
 simulation_test!(
-    entity_range_pushdown_matches_full_scan_for_each_operator,
+    row_range_pushdown_matches_full_scan_for_each_operator,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -426,7 +426,7 @@ simulation_test!(
 // bound distinction is enforced by the residual — so the predicate must appear
 // as a *partial* filter, meaning pushed down **and** still re-checked above.
 simulation_test!(
-    entity_range_pushdown_reaches_the_table_scan_inexactly,
+    row_range_pushdown_reaches_the_table_scan_inexactly,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -468,7 +468,7 @@ simulation_test!(
 // is a wrong answer rather than a slow one, which is why this is asserted
 // rather than left to the residual.
 simulation_test!(
-    entity_range_pushdown_refuses_columns_without_a_total_order,
+    row_range_pushdown_refuses_columns_without_a_total_order,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(

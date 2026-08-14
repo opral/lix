@@ -121,11 +121,11 @@ simulation_test!(
                 .collect::<Vec<_>>(),
             vec![
                 "created_at",
-                "entity_pk",
                 "file_id",
                 "id",
                 "metadata",
                 "origin_key",
+                "row_pk",
                 "schema_key",
                 "snapshot_content",
             ]
@@ -329,9 +329,9 @@ simulation_test!(
                 &format!(
 					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_depth \
 	                 FROM lix_directory_history('{delete_commit_id}') \
-	                   WHERE lixcol_entity_pk IN (CAST('[\"01940000-0000-7000-8000-000000000001\"]' AS JSONB), CAST('[\"01940000-0000-7000-8000-000000000002\"]' AS JSONB)) \
+	                   WHERE lixcol_row_pk IN (CAST('[\"01940000-0000-7000-8000-000000000001\"]' AS JSONB), CAST('[\"01940000-0000-7000-8000-000000000002\"]' AS JSONB)) \
 	                   AND lixcol_depth = 0 \
-	                 ORDER BY lixcol_entity_pk"
+	                 ORDER BY lixcol_row_pk"
 				),
                 &[],
             )
@@ -372,7 +372,7 @@ simulation_test!(
                 .map(|source| {
                     assert_eq!(source["schema_key"], json!("lix_directory_descriptor"));
                     assert_eq!(source["snapshot_content"], serde_json::Value::Null);
-                    source["entity_pk"][0]
+                    source["row_pk"][0]
                         .as_str()
                         .expect("directory source identity should be text")
                 })

@@ -5,8 +5,8 @@ mod core;
 mod order_key;
 
 use core::{
-    ArenaElementSpan, ChangeEffect, Document, EntityChange, EntityImportBuilder, EntityRecord,
-    FileEdit, IdNamespace,
+    ArenaElementSpan, ChangeEffect, Document, FileEdit, IdNamespace, RowChange, RowImportBuilder,
+    RowRecord,
 };
 use lix::plugin as sdk;
 
@@ -27,13 +27,13 @@ impl sdk::Plugin for ExcalidrawPlugin {
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let accepted = update.before.read_all()?;
-        let mut builder = EntityImportBuilder::new();
-        while let Some(entity) = update.entities.next()? {
+        let mut builder = RowImportBuilder::new();
+        while let Some(row) = update.rows.next()? {
             builder
-                .push(EntityRecord {
-                    schema_key: entity.schema_key,
-                    entity_pk: entity.entity_pk,
-                    snapshot: entity.snapshot,
+                .push(RowRecord {
+                    schema_key: row.schema_key,
+                    row_pk: row.row_pk,
+                    snapshot: row.snapshot,
                 })
                 .map_err(sdk::Error::invalid_input)?;
         }
@@ -77,16 +77,16 @@ impl sdk::Plugin for ExcalidrawPlugin {
         emit_changes(changes.into_iter().map(Ok), sink)
     }
 
-    fn entities_changed(
-        update: &mut sdk::EntityUpdate<'_>,
+    fn rows_changed(
+        update: &mut sdk::RowUpdate<'_>,
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.changes.next()? {
-            changes.push(EntityChange {
+            changes.push(RowChange {
                 schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
+                row_pk: change.row_pk,
                 snapshot: change.snapshot,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
@@ -101,7 +101,7 @@ impl sdk::Plugin for ExcalidrawPlugin {
             Document::open_file(before.clone(), Some(update.before_path.as_str()), namespace)
                 .map_err(sdk::Error::invalid_input)?;
         let (_, edits) = document
-            .entities_changed(&changes)
+            .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
         delete_element_index_from_sink(&update.before, sink)?;
@@ -111,14 +111,14 @@ impl sdk::Plugin for ExcalidrawPlugin {
 
     fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(entity) = input.entities.next()? {
-            records.push(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = input.rows.next()? {
+            records.push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             });
         }
-        let (document, _) = Document::open_entities(records).map_err(sdk::Error::invalid_input)?;
+        let (document, _) = Document::open_rows(records).map_err(sdk::Error::invalid_input)?;
         store_element_index(
             sink,
             &encode_element_index(&document.arena_element_spans())?,
@@ -208,10 +208,10 @@ fn read_namespace(root: &sdk::Snapshot<'_>) -> sdk::Result<Option<IdNamespace>> 
     )))
 }
 
-fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
+fn namespace_from_changes(changes: &[RowChange]) -> Option<IdNamespace> {
     changes
         .iter()
-        .flat_map(|change| &change.entity_pk)
+        .flat_map(|change| &change.row_pk)
         .find_map(|component| uuid::Uuid::parse_str(component).ok())
         .map(|id| {
             let bytes = id.into_bytes();
@@ -248,7 +248,7 @@ fn sparse_element_change(
     update: &sdk::FileUpdate<'_>,
     edit: &sdk::FileEdit,
     insert: &[u8],
-) -> sdk::Result<Option<(EntityChange, Vec<u8>)>> {
+) -> sdk::Result<Option<(RowChange, Vec<u8>)>> {
     match update.before.state_len(ELEMENT_INDEX_KEY)? {
         Some(_) => {}
         None => return Ok(None),
@@ -635,23 +635,23 @@ fn state_text(bytes: &[u8]) -> sdk::Result<String> {
 
 fn emit_changes<I>(changes: I, sink: &mut sdk::Output<'_>) -> sdk::Result<()>
 where
-    I: IntoIterator<Item = Result<EntityChange, String>>,
+    I: IntoIterator<Item = Result<RowChange, String>>,
 {
     for change in changes {
         let change = change.map_err(sdk::Error::invalid_input)?;
         match change.snapshot {
-            Some(snapshot) => sink.entity(sdk::EntityMutation::Upsert {
+            Some(snapshot) => sink.row(sdk::RowMutation::Upsert {
                 schema_key: &change.schema_key,
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 snapshot: &snapshot,
                 effect: match change.effect {
                     ChangeEffect::Content => sdk::ChangeEffect::Content,
                     ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
                 },
             })?,
-            None => sink.entity(sdk::EntityMutation::Delete {
+            None => sink.row(sdk::RowMutation::Delete {
                 schema_key: &change.schema_key,
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
             })?,
         }
     }
