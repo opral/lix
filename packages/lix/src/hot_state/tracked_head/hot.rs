@@ -56,7 +56,7 @@ pub(crate) const DIFF_SPACE: StorageSpace = StorageSpace::declare(
     DIFF_NAMESPACE,
     ValueSemantics::Mutable,
 );
-/// Declared-column access path over the hot rows: `value -> row_pk`.
+/// Declared-column access path over the hot rows: `value -> row identity`.
 ///
 /// A predicate on a non-primary-key column has no access path in the hot row
 /// key, whose only searchable dimensions are `(branch, generation, schema,
@@ -71,7 +71,15 @@ pub(crate) const DIFF_SPACE: StorageSpace = StorageSpace::declare(
 /// the only authority for content, and dropping the plane costs nothing but
 /// speed.
 ///
-/// **Maintenance is put-only, and the invariant is "never a false negative".**
+/// Candidate maintenance is put-only, and the invariant is "never a false
+/// negative". A separate generation-local row marker is overwritten for every
+/// indexed-row mutation. It carries a rebuildable covered row plus the row's
+/// current indexed values, allowing a query to reject stale candidates without
+/// loading the canonical row. The canonical HOT row remains semantic authority;
+/// the marker is selected only under a completeness witness and is discarded
+/// with the generation.
+///
+/// **Candidate maintenance is put-only.**
 /// An entry is written when a row's indexed value is written and is never
 /// deleted when that value is superseded, exactly as [`FILE_SPACE`]
 /// markers behave. A superseded or deleted row therefore leaves a stale entry
@@ -5479,14 +5487,7 @@ where
                     let StorageProjectedValue::FullValue(value) = &entry.value else {
                         continue;
                     };
-                    let text = std::str::from_utf8(value).map_err(|error| {
-                        head_value_error(format!("hot index entry is not utf-8: {error}"))
-                    })?;
-                    candidates.push(RowPk::from_json_array_text(text).map_err(|error| {
-                        head_value_error(format!(
-                            "hot index entry has an invalid row pk: {error}"
-                        ))
-                    })?);
+                    candidates.push(decode_hot_index_row_identity(value)?.0);
                 }
                 if candidates.len() > budget {
                     return Ok(None);
@@ -5497,6 +5498,123 @@ where
             }
         }
         Ok(Some(candidates))
+    }
+
+    /// Returns current covered rows for one declared-column equality.
+    ///
+    /// The candidate plane remains a stale superset. Each candidate is joined
+    /// to its generation-local current-row marker and the marker's indexed
+    /// values are rechecked before the covered row is returned. A missing or
+    /// malformed marker under a covering witness is corruption, never a reason
+    /// to fall through to canonical rows.
+    pub(crate) async fn scan_hot_index_covered_candidates(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        schema_key: &str,
+        ordinal: u16,
+        values: &[HotIndexValue],
+    ) -> Result<Option<Vec<MaterializedHotStateRow>>, LixError> {
+        if values.is_empty() || values.len() > HOT_INDEX_PROBE_VALUE_LIMIT {
+            return Ok(None);
+        }
+        let witness = StorageKey(Bytes::from(encode_hot_index_cover_witness_key(
+            branch_id, generation, schema_key, ordinal,
+        )));
+        let present = PointReadPlan::new(INDEX_SPACE, &[witness])
+            .materialize(&self.store, StorageGetOptions::default())
+            .await?;
+        let Some(StorageProjectedValue::FullValue(witness_value)) =
+            present.value.into_iter().next().flatten()
+        else {
+            return Ok(None);
+        };
+        let Some(entries_published) = decode_hot_index_cover_witness(&witness_value) else {
+            return Err(head_value_error(
+                "hot index covering witness is malformed",
+            ));
+        };
+        let budget = hot_index_candidate_budget(entries_published);
+        let mut identities = BTreeSet::new();
+        for value in values {
+            let range = StoragePrefix {
+                bytes: Bytes::from(hot_index_value_prefix(
+                    branch_id, generation, schema_key, ordinal, value,
+                )),
+            }
+            .to_range()?;
+            let mut cursor = self
+                .store
+                .begin_scan(INDEX_SPACE, range, StorageBeginScanOptions::default())
+                .await?;
+            loop {
+                let want = (budget + 1 - identities.len()).min(HOT_INDEX_CANDIDATE_PAGE);
+                let (page, page_has_more) = cursor.next_page(want).await?.into_parts();
+                for entry in &page {
+                    let StorageProjectedValue::FullValue(value) = &entry.value else {
+                        return Err(head_value_error(
+                            "hot index candidate is missing its row identity",
+                        ));
+                    };
+                    identities.insert(decode_hot_index_row_identity(value)?);
+                }
+                if identities.len() > budget {
+                    return Ok(None);
+                }
+                if !page_has_more {
+                    break;
+                }
+            }
+        }
+        if identities.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let marker_keys = identities
+            .iter()
+            .map(|(row_pk, file_id)| {
+                StorageKey(Bytes::from(encode_hot_index_cover_row_key(
+                    branch_id,
+                    generation,
+                    schema_key,
+                    row_pk,
+                    file_id.as_deref(),
+                )))
+            })
+            .collect::<Vec<_>>();
+        let markers = PointReadPlan::new(INDEX_SPACE, &marker_keys)
+            .materialize(&self.store, StorageGetOptions::default())
+            .await?
+            .value;
+        let mut rows = Vec::with_capacity(markers.len());
+        for (((row_pk, file_id), marker_key), marker) in identities
+            .into_iter()
+            .zip(marker_keys)
+            .zip(markers)
+        {
+            let Some(StorageProjectedValue::FullValue(marker)) = marker else {
+                return Err(head_value_error(
+                    "hot index covering witness selected a missing current-row marker",
+                ));
+            };
+            let (row, columns) = decode_hot_index_covered_row(
+                marker_key.0.as_ref(),
+                &marker,
+                branch_id,
+                schema_key,
+                row_pk,
+                file_id,
+            )?;
+            if !columns.iter().any(|(candidate, _)| *candidate == ordinal) {
+                return Err(head_value_error(
+                    "hot index covered row omits the witnessed column",
+                ));
+            }
+            // Return the current row even when its indexed value changed (or
+            // it is now a tombstone). The provider re-applies the predicate,
+            // while visibility needs this row to mask a matching global row.
+            rows.push(row);
+        }
+        Ok(Some(rows))
     }
 
     /// Candidate row primary keys whose indexed column falls in a range.
@@ -5604,12 +5722,7 @@ where
                 let StorageProjectedValue::FullValue(value) = &entry.value else {
                     continue;
                 };
-                let text = std::str::from_utf8(value).map_err(|error| {
-                    head_value_error(format!("hot index entry is not utf-8: {error}"))
-                })?;
-                candidates.push(RowPk::from_json_array_text(text).map_err(|error| {
-                    head_value_error(format!("hot index entry has an invalid row pk: {error}"))
-                })?);
+                candidates.push(decode_hot_index_row_identity(value)?.0);
             }
             if candidates.len() > budget {
                 #[cfg(feature = "storage-benches")]
@@ -13010,6 +13123,10 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
 /// a given schema, so a witness probe is a point read and never scans entries.
 const HOT_INDEX_WITNESS_TAG: u8 = 0x00;
 const HOT_INDEX_ENTRY_TAG: u8 = 0x01;
+const HOT_INDEX_COVER_WITNESS_TAG: u8 = 0x02;
+const HOT_INDEX_COVER_ROW_TAG: u8 = 0x03;
+const HOT_INDEX_COVER_MAGIC: &[u8; 8] = b"LIXHICV1";
+const HOT_INDEX_COVER_WITNESS_MAGIC: &[u8; 8] = b"LIXHICW1";
 const HOT_INDEX_CANDIDATE_PAGE: usize = 256;
 /// Distinct values one indexed-column probe may resolve.
 ///
@@ -13026,6 +13143,14 @@ pub(crate) struct HotIndexEntry {
     pub(crate) ordinal: u16,
     pub(crate) value: HotIndexValue,
     pub(crate) row_pk: RowPk,
+    pub(crate) file_id: Option<String>,
+}
+
+/// One current row in the derived covering plane.
+#[derive(Debug, Clone)]
+pub(crate) struct HotIndexCoveredEntry {
+    pub(crate) row: MaterializedHotStateRow,
+    pub(crate) columns: Vec<(u16, Option<HotIndexValue>)>,
 }
 
 /// Stages index entries and, optionally, the collection witnesses that make
@@ -13041,6 +13166,7 @@ pub(crate) async fn stage_hot_index_entries(
     branch_id: &str,
     generation: CommitId,
     entries: &[HotIndexEntry],
+    covered_rows: &[HotIndexCoveredEntry],
     witnessed_collections: &BTreeSet<(String, u16)>,
 ) -> Result<(), LixError> {
     let mut staged = BTreeSet::new();
@@ -13053,23 +13179,50 @@ pub(crate) async fn stage_hot_index_entries(
             entry.ordinal,
             &entry.value,
             &entry.row_pk,
+            entry.file_id.as_deref(),
         );
         if !staged.insert(key.clone()) {
             continue;
         }
-        let identity = entry.row_pk.as_json_array_text().map_err(|error| {
-            head_value_error(format!("hot index row pk is not encodable: {error}"))
-        })?;
+        let identity = encode_hot_index_row_identity(&entry.row_pk, entry.file_id.as_deref());
         writes.put(
             INDEX_SPACE,
             StorageKey(Bytes::from(key)),
             StorageValue {
-                bytes: Bytes::from(identity.into_bytes()),
+                bytes: Bytes::from(identity),
             },
         );
         *published_by_collection
             .entry((entry.schema_key.clone(), entry.ordinal))
             .or_default() += 1;
+    }
+    for covered in covered_rows {
+        let key = encode_hot_index_cover_row_key(
+            branch_id,
+            generation,
+            &covered.row.schema_key,
+            &covered.row.row_pk,
+            covered.row.file_id.as_deref(),
+        );
+        if !staged.insert(key.clone()) {
+            continue;
+        }
+        writes.put(
+            INDEX_SPACE,
+            StorageKey(Bytes::from(key)),
+            StorageValue {
+                bytes: Bytes::from(encode_hot_index_covered_row(
+                    &encode_hot_index_cover_row_key(
+                        branch_id,
+                        generation,
+                        &covered.row.schema_key,
+                        &covered.row.row_pk,
+                        covered.row.file_id.as_deref(),
+                    ),
+                    covered,
+                )?),
+            },
+        );
     }
     for collection in witnessed_collections {
         published_by_collection
@@ -13123,6 +13276,19 @@ pub(crate) async fn stage_hot_index_entries(
                 bytes: Bytes::from(encode_hot_index_witness(total).to_vec()),
             },
         );
+        let cover_key = StorageKey(Bytes::from(encode_hot_index_cover_witness_key(
+            branch_id,
+            generation,
+            &collection.0,
+            collection.1,
+        )));
+        writes.put(
+            INDEX_SPACE,
+            cover_key,
+            StorageValue {
+                bytes: Bytes::from(encode_hot_index_cover_witness(total).to_vec()),
+            },
+        );
     }
     Ok(())
 }
@@ -13140,6 +13306,255 @@ fn encode_hot_index_witness(entries_published: u64) -> [u8; 8] {
 
 fn decode_hot_index_witness(value: &[u8]) -> Option<u64> {
     value.try_into().ok().map(u64::from_be_bytes)
+}
+
+fn encode_hot_index_cover_witness(entries_published: u64) -> [u8; 16] {
+    let mut value = [0; 16];
+    value[..8].copy_from_slice(HOT_INDEX_COVER_WITNESS_MAGIC);
+    value[8..].copy_from_slice(&entries_published.to_be_bytes());
+    value
+}
+
+fn decode_hot_index_cover_witness(value: &[u8]) -> Option<u64> {
+    if value.get(..8)? != HOT_INDEX_COVER_WITNESS_MAGIC {
+        return None;
+    }
+    Some(u64::from_be_bytes(value.get(8..)?.try_into().ok()?))
+}
+
+fn encode_hot_index_covered_row(
+    owner_key: &[u8],
+    covered: &HotIndexCoveredEntry,
+) -> Result<Vec<u8>, LixError> {
+    let mut columns = covered.columns.clone();
+    columns.sort_by_key(|(ordinal, _)| *ordinal);
+    if columns.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(head_value_error(
+            "hot index covered row has duplicate column ordinals",
+        ));
+    }
+    let row = &covered.row;
+    let mut flags = 0_u8;
+    flags |= u8::from(row.deleted);
+    flags |= u8::from(row.global) << 1;
+    flags |= u8::from(row.untracked) << 2;
+    flags |= u8::from(row.snapshot_content.is_some()) << 3;
+    flags |= u8::from(row.metadata.is_some()) << 4;
+    flags |= u8::from(row.change_id.is_some()) << 5;
+    flags |= u8::from(row.commit_id.is_some()) << 6;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(HOT_INDEX_COVER_MAGIC);
+    write_hot_index_bytes(&mut out, owner_key)?;
+    out.push(flags);
+    out.extend_from_slice(&row.created_at.packed().to_be_bytes());
+    out.extend_from_slice(&row.updated_at.packed().to_be_bytes());
+    if let Some(change_id) = row.change_id {
+        out.extend_from_slice(change_id.as_uuid().as_bytes());
+    }
+    if let Some(commit_id) = row.commit_id {
+        out.extend_from_slice(commit_id.as_uuid().as_bytes());
+    }
+    if let Some(snapshot) = &row.snapshot_content {
+        write_hot_index_bytes(&mut out, snapshot.as_bytes())?;
+    }
+    if let Some(metadata) = &row.metadata {
+        write_hot_index_bytes(&mut out, metadata.as_bytes())?;
+    }
+    out.extend_from_slice(
+        &u16::try_from(columns.len())
+            .map_err(|_| head_value_error("hot index covered row has too many columns"))?
+            .to_be_bytes(),
+    );
+    for (ordinal, value) in columns {
+        out.extend_from_slice(&ordinal.to_be_bytes());
+        match value {
+            None => out.push(0),
+            Some(HotIndexValue::String(value)) => {
+                out.push(1);
+                write_hot_index_bytes(&mut out, value.as_bytes())?;
+            }
+            Some(HotIndexValue::Integer(value)) => {
+                out.push(2);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn write_hot_index_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| head_value_error("hot index covered value exceeds u32 bytes"))?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn decode_hot_index_covered_row(
+    owner_key: &[u8],
+    value: &Bytes,
+    branch_id: &str,
+    schema_key: &str,
+    row_pk: RowPk,
+    file_id: Option<String>,
+) -> Result<(MaterializedHotStateRow, Vec<(u16, Option<HotIndexValue>)>), LixError> {
+    let mut offset = 0_usize;
+    let magic = take_hot_index_bytes(value, &mut offset, HOT_INDEX_COVER_MAGIC.len())?;
+    if magic != HOT_INDEX_COVER_MAGIC {
+        return Err(head_value_error(
+            "hot index covered row has an invalid format tag",
+        ));
+    }
+    let encoded_owner = read_hot_index_bytes(value, &mut offset)?;
+    if encoded_owner != owner_key {
+        return Err(head_value_error(
+            "hot index covered row does not bind its storage owner",
+        ));
+    }
+    let flags = take_hot_index_bytes(value, &mut offset, 1)?[0];
+    if flags & 0x80 != 0 {
+        return Err(head_value_error(
+            "hot index covered row has unknown flags",
+        ));
+    }
+    let created_at = LixTimestamp::from_packed(read_hot_index_u64(value, &mut offset)?)
+        .map_err(|error| head_value_error(format!("hot index created_at is invalid: {error}")))?;
+    let updated_at = LixTimestamp::from_packed(read_hot_index_u64(value, &mut offset)?)
+        .map_err(|error| head_value_error(format!("hot index updated_at is invalid: {error}")))?;
+    let change_id = if flags & (1 << 5) != 0 {
+        Some(ChangeId::new(uuid::Uuid::from_bytes(read_hot_index_uuid(value, &mut offset)?)))
+    } else {
+        None
+    };
+    let commit_id = if flags & (1 << 6) != 0 {
+        Some(CommitId::new(uuid::Uuid::from_bytes(read_hot_index_uuid(value, &mut offset)?)))
+    } else {
+        None
+    };
+    let snapshot_content = if flags & (1 << 3) != 0 {
+        Some(SharedStr::from(
+            std::str::from_utf8(read_hot_index_bytes(value, &mut offset)?).map_err(|error| {
+                head_value_error(format!("hot index snapshot is not utf-8: {error}"))
+            })?,
+        ))
+    } else {
+        None
+    };
+    let metadata = if flags & (1 << 4) != 0 {
+        Some(SharedStr::from(
+            std::str::from_utf8(read_hot_index_bytes(value, &mut offset)?).map_err(|error| {
+                head_value_error(format!("hot index metadata is not utf-8: {error}"))
+            })?,
+        ))
+    } else {
+        None
+    };
+    let count = read_hot_index_u16(value, &mut offset)? as usize;
+    let mut columns = Vec::with_capacity(count);
+    let mut previous = None;
+    for _ in 0..count {
+        let ordinal = read_hot_index_u16(value, &mut offset)?;
+        if previous.is_some_and(|previous| previous >= ordinal) {
+            return Err(head_value_error(
+                "hot index covered columns are not strictly ordered",
+            ));
+        }
+        previous = Some(ordinal);
+        let tag = take_hot_index_bytes(value, &mut offset, 1)?[0];
+        let column = match tag {
+            0 => None,
+            1 => Some(HotIndexValue::String(
+                std::str::from_utf8(read_hot_index_bytes(value, &mut offset)?)
+                    .map_err(|error| {
+                        head_value_error(format!("hot index string is not utf-8: {error}"))
+                    })?
+                    .to_owned(),
+            )),
+            2 => Some(HotIndexValue::Integer(i64::from_be_bytes(
+                take_hot_index_bytes(value, &mut offset, 8)?
+                    .try_into()
+                    .expect("eight-byte slice"),
+            ))),
+            _ => return Err(head_value_error("hot index covered column has an invalid tag")),
+        };
+        columns.push((ordinal, column));
+    }
+    if offset != value.len() {
+        return Err(head_value_error(
+            "hot index covered row has trailing bytes",
+        ));
+    }
+    let deleted = flags & 1 != 0;
+    if deleted == snapshot_content.is_some() {
+        return Err(head_value_error(
+            "hot index covered row snapshot/deletion flags disagree",
+        ));
+    }
+    Ok((
+        MaterializedHotStateRow {
+            row_pk,
+            schema_key: schema_key.to_owned(),
+            file_id,
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            global: flags & (1 << 1) != 0,
+            change_id,
+            commit_id,
+            untracked: flags & (1 << 2) != 0,
+            branch_id: Arc::from(branch_id),
+        },
+        columns,
+    ))
+}
+
+fn take_hot_index_bytes<'a>(
+    value: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], LixError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| head_value_error("hot index covered value offset overflowed"))?;
+    let bytes = value
+        .get(*offset..end)
+        .ok_or_else(|| head_value_error("hot index covered value is truncated"))?;
+    *offset = end;
+    Ok(bytes)
+}
+
+fn read_hot_index_bytes<'a>(value: &'a [u8], offset: &mut usize) -> Result<&'a [u8], LixError> {
+    let len = u32::from_be_bytes(
+        take_hot_index_bytes(value, offset, 4)?
+            .try_into()
+            .expect("four-byte slice"),
+    ) as usize;
+    take_hot_index_bytes(value, offset, len)
+}
+
+fn read_hot_index_u16(value: &[u8], offset: &mut usize) -> Result<u16, LixError> {
+    Ok(u16::from_be_bytes(
+        take_hot_index_bytes(value, offset, 2)?
+            .try_into()
+            .expect("two-byte slice"),
+    ))
+}
+
+fn read_hot_index_u64(value: &[u8], offset: &mut usize) -> Result<u64, LixError> {
+    Ok(u64::from_be_bytes(
+        take_hot_index_bytes(value, offset, 8)?
+            .try_into()
+            .expect("eight-byte slice"),
+    ))
+}
+
+fn read_hot_index_uuid(value: &[u8], offset: &mut usize) -> Result<[u8; 16], LixError> {
+    Ok(take_hot_index_bytes(value, offset, 16)?
+        .try_into()
+        .expect("sixteen-byte slice"))
 }
 
 /// How many candidates one value lookup may collect before the collection scan
@@ -13214,9 +13629,45 @@ pub(crate) fn encode_hot_index_entry_key(
     ordinal: u16,
     value: &HotIndexValue,
     row_pk: &RowPk,
+    file_id: Option<&str>,
 ) -> Vec<u8> {
     let mut key = hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value);
     write_row_pk(&mut key, row_pk);
+    write_file_id(&mut key, file_id);
+    key
+}
+
+fn encode_hot_index_row_identity(row_pk: &RowPk, file_id: Option<&str>) -> Vec<u8> {
+    let mut identity = Vec::new();
+    write_row_pk(&mut identity, row_pk);
+    write_file_id(&mut identity, file_id);
+    identity
+}
+
+fn decode_hot_index_row_identity(bytes: &Bytes) -> Result<(RowPk, Option<String>), LixError> {
+    let mut offset = 0;
+    let row_pk = read_hot_scan_row_pk(bytes, &mut offset)?;
+    let file_id = read_hot_scan_file_id(bytes, &mut offset)?
+        .map(|value| value.as_str(bytes).to_owned());
+    if offset != bytes.len() {
+        return Err(head_value_error(
+            "hot index row identity has trailing bytes",
+        ));
+    }
+    Ok((row_pk, file_id))
+}
+
+fn encode_hot_index_cover_row_key(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    row_pk: &RowPk,
+    file_id: Option<&str>,
+) -> Vec<u8> {
+    let mut key = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key.push(HOT_INDEX_COVER_ROW_TAG);
+    key.extend_from_slice(&encode_hot_index_row_identity(row_pk, file_id));
     key
 }
 
@@ -13294,6 +13745,19 @@ pub(crate) fn encode_hot_index_witness_key(
     let mut key = hot_scope_prefix(branch_id, generation);
     write_key_string(&mut key, schema_key, KEY_PART_FINAL);
     key.push(HOT_INDEX_WITNESS_TAG);
+    key.extend_from_slice(&ordinal.to_be_bytes());
+    key
+}
+
+fn encode_hot_index_cover_witness_key(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    ordinal: u16,
+) -> Vec<u8> {
+    let mut key = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key.push(HOT_INDEX_COVER_WITNESS_TAG);
     key.extend_from_slice(&ordinal.to_be_bytes());
     key
 }

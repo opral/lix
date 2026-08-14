@@ -1983,15 +1983,26 @@ fn hot_index_writes_for_commit(
     parent_control: Option<&BranchHeadControl>,
 ) -> (
     Vec<crate::hot_state::HotIndexEntry>,
+    Vec<crate::hot_state::HotIndexCoveredEntry>,
     BTreeSet<(String, u16)>,
 ) {
     let staged = state_rows.staged_index_values();
     let mut entries = Vec::new();
+    let mut covered_rows = Vec::new();
     let mut witnesses = staged.registered_collections.clone();
+    let mut columns_by_identity = BTreeMap::new();
     for row in &staged.rows {
         if row.branch_id.as_str() != branch_id {
             continue;
         }
+        columns_by_identity.insert(
+            (
+                row.schema_key.as_str().to_owned(),
+                row.row_pk.clone(),
+                row.file_id.as_ref().map(|value| value.as_str().to_owned()),
+            ),
+            row.columns.clone(),
+        );
         // A schema the parent generation proves absent has an empty
         // collection in this branch, so indexing it from this commit forward
         // is complete and the witness is free. The bloom filter has no false
@@ -2011,10 +2022,42 @@ fn hot_index_writes_for_commit(
                 ordinal: *ordinal,
                 value: value.clone(),
                 row_pk: row.row_pk.clone(),
+                file_id: row.file_id.as_ref().map(|value| value.as_str().to_owned()),
             });
         }
     }
-    (entries, witnesses)
+    for row in state_rows.iter() {
+        if row.branch_id.as_str() != branch_id {
+            continue;
+        }
+        let identity = (
+            row.schema_key.as_str().to_owned(),
+            row.row_pk.clone(),
+            row.file_id.map(|value| value.as_str().to_owned()),
+        );
+        let Some(columns) = columns_by_identity.remove(&identity) else {
+            continue;
+        };
+        covered_rows.push(crate::hot_state::HotIndexCoveredEntry {
+            row: MaterializedHotStateRow {
+                row_pk: row.row_pk.clone(),
+                schema_key: row.schema_key.as_str().to_owned(),
+                file_id: row.file_id.map(|value| value.as_str().to_owned()),
+                snapshot_content: row.snapshot.map(|value| value.materialize_shared()),
+                metadata: row.metadata.map(|value| value.materialize_shared()),
+                deleted: row.snapshot.is_none(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                global: row.global,
+                change_id: row.change_id,
+                commit_id: row.commit_id,
+                untracked: row.untracked,
+                branch_id: Arc::from(row.branch_id.as_str()),
+            },
+            columns,
+        });
+    }
+    (entries, covered_rows, witnesses)
 }
 
 fn current_state_delta_from_state_row(
@@ -4542,15 +4585,19 @@ async fn stage_tracked_head(
         // The index plane is staged from this commit's own rows, so it is
         // correct whichever physical route above published them, and it lands
         // in the same write set as the rows themselves.
-        let (index_entries, index_witnesses) =
+        let (index_entries, index_covered_rows, index_witnesses) =
             hot_index_writes_for_commit(state_rows, &root.branch_id, parent_control.as_ref());
-        if !index_entries.is_empty() || !index_witnesses.is_empty() {
+        if !index_entries.is_empty()
+            || !index_covered_rows.is_empty()
+            || !index_witnesses.is_empty()
+        {
             crate::hot_state::stage_hot_index_entries(
                 read,
                 writes,
                 &root.branch_id,
                 generation,
                 &index_entries,
+                &index_covered_rows,
                 &index_witnesses,
             )
             .await?;

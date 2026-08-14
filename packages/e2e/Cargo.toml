@@ -103,6 +103,11 @@ path = "examples/e1_json_leak.rs"
 required-features = ["storage-benches"]
 
 [[example]]
+name = "exp_main_covering_ceiling"
+path = "examples/exp_main_covering_ceiling.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
 name = "e24_cas_read_probe"
 path = "examples/e24_cas_read_probe.rs"
 required-features = ["rocksdb"]

@@ -463,6 +463,7 @@ pub(crate) async fn validate_prepared_writes(
             index_extractor.observe(row, snapshot);
             staged_snapshots.push((row, schema_plan, snapshot));
         } else {
+            index_extractor.observe_tombstone(row);
             pending_constraints.remember_tombstone(row);
         }
     }
@@ -577,10 +578,45 @@ impl<'a> StagedIndexExtractor<'a> {
             branch_id: state_row.branch_id.clone(),
             schema_key: state_row.schema_key.clone(),
             row_pk: state_row.row_pk.clone(),
+            file_id: state_row.file_id.cloned(),
             columns: spec
                 .indexed_columns
                 .iter()
                 .map(|column| (column.ordinal, hot_index_value(snapshot, column)))
+                .collect(),
+        });
+    }
+
+    fn observe_tombstone(&mut self, row: PreparedValidationRow<'_>) {
+        let schema_catalog = self.schema_catalog;
+        let spec = self
+            .specs
+            .entry(row.schema_key().to_owned())
+            .or_insert_with(|| {
+                schema_catalog
+                    .schema(row.schema_key())
+                    .and_then(|schema| {
+                        crate::sql2::derive_schema_surface_spec_from_schema(schema).ok()
+                    })
+                    .map(std::sync::Arc::new)
+            })
+            .clone();
+        let Some(spec) = spec else {
+            return;
+        };
+        if spec.indexed_columns.is_empty() {
+            return;
+        }
+        let PreparedValidationRow::State(state_row) = row;
+        self.values.rows.push(StagedIndexRow {
+            branch_id: state_row.branch_id.clone(),
+            schema_key: state_row.schema_key.clone(),
+            row_pk: state_row.row_pk.clone(),
+            file_id: state_row.file_id.cloned(),
+            columns: spec
+                .indexed_columns
+                .iter()
+                .map(|column| (column.ordinal, None))
                 .collect(),
         });
     }
@@ -608,6 +644,7 @@ fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<
         && staged_rows.iter().all(|row| {
             row.row_content_validated()
                 && !row.requires_transaction_validation()
+                && !row.is_tombstone()
                 && row.file_id().is_none()
                 && !matches!(
                     row.schema_key(),
@@ -643,6 +680,7 @@ pub(crate) fn prepared_tracked_rows_have_row_local_certificates(rows: &PreparedS
         && rows.iter().all(|row| {
             row.facts.row_content_validated
                 && !row.facts.requires_transaction_validation
+                && row.snapshot.is_some()
                 && !row.untracked
                 && row.file_id.is_none()
                 && !matches!(

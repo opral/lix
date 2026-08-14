@@ -2428,8 +2428,8 @@ mod tests {
 
         assert_eq!(
             hot_index_record_counts(&storage).await,
-            (1, 3),
-            "expected one witness for the one declared column and one entry per child row"
+            (2, 6),
+            "expected candidate+cover witnesses and one candidate+cover row per child"
         );
     }
 
@@ -2485,7 +2485,9 @@ mod tests {
         let witnesses = entries
             .iter()
             .filter(|entry| match &entry.value {
-                crate::storage::ProjectedValue::FullValue(bytes) => !bytes.starts_with(b"["),
+                crate::storage::ProjectedValue::FullValue(bytes) => {
+                    bytes.len() == 8 || bytes.starts_with(b"LIXHICW1")
+                }
                 crate::storage::ProjectedValue::KeyOnly => true,
             })
             .count();
@@ -2507,7 +2509,7 @@ mod tests {
             let crate::storage::ProjectedValue::FullValue(bytes) = &entry.value else {
                 continue;
             };
-            if bytes.starts_with(b"[") {
+            if bytes.len() != 8 {
                 continue;
             }
             let count: [u8; 8] = bytes.as_ref().try_into().expect("witness carries a u64");
@@ -2734,6 +2736,134 @@ mod tests {
             1,
             "a deleted row leaves its entry behind and must not resurface"
         );
+    }
+
+    #[tokio::test]
+    async fn covering_index_reopens_with_current_update_and_tombstone_markers() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("reopen_parent", "reopen_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        for parent in ["parent-0", "parent-1"] {
+            session
+                .execute(
+                    "INSERT INTO reopen_parent (id) VALUES ($1)",
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("parent should insert");
+        }
+        for index in 0..3 {
+            session
+                .execute(
+                    r#"INSERT INTO reopen_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+        session
+            .execute(
+                r#"UPDATE reopen_child SET "parent_id" = 'parent-1' WHERE id = 'child-1'"#,
+                &[],
+            )
+            .await
+            .expect("child should move");
+        session
+            .execute("DELETE FROM reopen_child WHERE id = 'child-0'", &[])
+            .await
+            .expect("child should delete");
+        drop(session);
+
+        let reopened = Engine::new(storage)
+            .await
+            .expect("engine should reopen")
+            .open_session()
+            .await
+            .expect("session should reopen");
+        let rows = reopened
+            .execute(
+                r#"SELECT id FROM reopen_child WHERE "parent_id" = 'parent-0' ORDER BY id"#,
+                &[],
+            )
+            .await
+            .expect("covered query should survive reopen");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.rows()[0].values()[0], crate::Value::Text("child-2".into()));
+    }
+
+    #[tokio::test]
+    async fn covering_index_rejects_wrong_owner_substitution_before_output() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("corrupt_parent", "corrupt_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        session
+            .execute("INSERT INTO corrupt_parent (id) VALUES ('parent-0')", &[])
+            .await
+            .expect("parent should insert");
+        for index in 0..2 {
+            session
+                .execute(
+                    r#"INSERT INTO corrupt_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read covering plane");
+        let mut markers = scan_test_space(&read, crate::hot_state::INDEX_SPACE)
+            .await
+            .into_iter()
+            .filter_map(|entry| match entry.value {
+                crate::storage::ProjectedValue::FullValue(bytes)
+                    if bytes.starts_with(b"LIXHICV1") =>
+                {
+                    Some((entry.key, bytes))
+                }
+                crate::storage::ProjectedValue::FullValue(_)
+                | crate::storage::ProjectedValue::KeyOnly => None,
+            })
+            .collect::<Vec<_>>();
+        markers.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(markers.len(), 2, "fixture should publish two covered rows");
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::hot_state::INDEX_SPACE,
+            markers[0].0.clone(),
+            markers[1].1.to_vec(),
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("seed wrong-owner marker bytes");
+
+        let error = session
+            .execute(
+                r#"SELECT id FROM corrupt_child WHERE "parent_id" = 'parent-0' ORDER BY id"#,
+                &[],
+            )
+            .await
+            .expect_err("wrong-owner covered bytes must fail closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("does not bind its storage owner"));
     }
 
     /// A checkpoint publication reuses its branch's serving generation, so the

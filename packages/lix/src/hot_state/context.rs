@@ -783,6 +783,12 @@ where
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedHotStateBatch::default());
         }
+        if let Some(rows) = self
+            .scan_declared_column_eq_covered(request, &scope)
+            .await?
+        {
+            return Ok(rows);
+        }
         // Resolve a declared-column equality through the index plane before any
         // route is chosen, so every route below sees an ordinary row-pk
         // request. Candidates are not answers: the caller keeps its own
@@ -854,6 +860,62 @@ where
                 limit: request.limit,
             },
         ))
+    }
+
+    async fn scan_declared_column_eq_covered(
+        &self,
+        request: &HotStateScanRequest,
+        scope: &HotStateScanScope,
+    ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
+        let Some(predicate) = request.filter.declared_column_eq.as_ref() else {
+            return Ok(None);
+        };
+        if !matches!(request.filter.rows, HotStateRowFilter::All)
+            || !request.filter.row_pks.is_empty()
+            || !request.filter.file_ids.is_empty()
+            || !request.filter.constraints.is_empty()
+            || request_may_include_derived(request)
+        {
+            return Ok(None);
+        }
+        let reader = self.tracked_head.reader(&self.store);
+        let mut rows = Vec::new();
+        for branch_id in &scope.storage_branch_ids {
+            let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                return Ok(None);
+            };
+            if !control.may_have_schema(&predicate.schema_key) {
+                continue;
+            }
+            let Some(mut covered) = reader
+                .scan_hot_index_covered_candidates(
+                    branch_id,
+                    control.tracked_generation,
+                    &predicate.schema_key,
+                    predicate.ordinal,
+                    &predicate.values,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            rows.append(&mut covered);
+        }
+        let rows = filter_current_row_retention(
+            MaterializedHotStateBatch::from_rows(rows),
+            request.filter.untracked,
+        );
+        Ok(Some(resolve_visible_batch(
+            rows,
+            MaterializedHotStateBatch::default(),
+            &VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: scope.projection_branch_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            },
+        )))
     }
 
     /// Rewrites a declared-column equality into a row-pk request.
