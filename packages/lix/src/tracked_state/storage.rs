@@ -8963,12 +8963,9 @@ async fn hydrate_selected_members(
     let selected = members
         .iter()
         .enumerate()
-        // Typed history tombstones carry authenticated schema identity and an
-        // explicit deleted marker in their source columnar row. They are
-        // payload-free only in the selecting commit's compact delta, so the
-        // history member scan must resolve them through the same canonical
-        // source change authority as live selected members.
-        .filter(|(_, member)| !member.authored)
+        // Selected tombstones are deliberately payload-free: their compact
+        // member already authenticates identity, revision, and deletion.
+        .filter(|(_, member)| !member.authored && !member.selected_tombstone)
         .map(|(index, member)| (index, member.value.change_id))
         .collect::<Vec<_>>();
     let change_ids = selected

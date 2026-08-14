@@ -589,7 +589,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         });
     }
 
-    let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
+    let selected_change_records = load_selected_change_records(
+        read,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &commit_rows,
+    )
+    .await?;
     let mut replacement_generations = certify_complete_replacement_generations(
         read,
         &state_rows,
@@ -2204,23 +2210,33 @@ fn current_state_delta_from_engine_row(
 /// first-parent history.
 async fn load_selected_change_records(
     read: &(impl StorageAdapterRead + ?Sized),
+    state_rows: &PreparedStateBatch,
+    tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
 ) -> Result<HashMap<SelectedChangeKey, ChangeRecord>, LixError> {
     let mut by_source_commit = BTreeMap::<CommitId, Vec<StagedCommitChangeRef<'_>>>::new();
-    for change_ref in commit_rows
-        .iter()
-        .flat_map(|commit| selected_changes(&commit.selected_change_batches))
-    {
-        // Identity and timestamps fully describe a selected tombstone.
-        // Historical rows may be absent or retain metadata, while checkpoint
-        // HOT tombstones must carry no payload.
-        if change_ref.deleted {
-            continue;
+    for commit in commit_rows {
+        let state_row_indices = tracked_row_indices_by_commit
+            .get(&commit.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for change_ref in selected_changes_after_authored_shadow(
+            commit.commit_id,
+            state_rows,
+            state_row_indices,
+            &commit.selected_change_batches,
+        ) {
+            // Identity and timestamps fully describe a selected tombstone.
+            // Historical rows may be absent or retain metadata, while checkpoint
+            // HOT tombstones must carry no payload.
+            if change_ref.deleted {
+                continue;
+            }
+            by_source_commit
+                .entry(change_ref.source_commit_id)
+                .or_default()
+                .push(change_ref);
         }
-        by_source_commit
-            .entry(change_ref.source_commit_id)
-            .or_default()
-            .push(change_ref);
     }
 
     let mut records = HashMap::new();
