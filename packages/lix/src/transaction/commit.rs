@@ -6209,20 +6209,13 @@ where
                     row_pk: delta.delta.row_pk,
                 })
             });
-            let serving_root_missing = staged_parent
-                .map(|parent| parent.current_state_scoped_ranges.is_none())
-                .or_else(|| {
-                    external_parent
-                        .map(|parent| parent.current_state_scoped_ranges().is_none())
-                })
-                .unwrap_or(true);
             let certified_body = crate::tracked_state::certify_authored_current_state_body(
                 read,
                 writes,
                 record.commit_id,
                 &record.account_id,
                 &mutations,
-                serving_root_missing,
+                false,
                 deltas,
             )
             .await?;

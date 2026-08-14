@@ -3945,6 +3945,7 @@ pub(crate) fn staged_commit_delta_segment_bytes(
     inventory: &CommitStateMutationInventory,
 ) -> Result<Vec<Option<Bytes>>, LixError> {
     let manifest = commit_delta_manifest_from_inventory(inventory);
+    let staged = writes.staged_values_in_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE);
     manifest
         .segments
         .iter()
@@ -3952,7 +3953,16 @@ pub(crate) fn staged_commit_delta_segment_bytes(
         .map(|(segment_index, bounds)| {
             let physical_key =
                 commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?;
-            Ok(writes.staged_value(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &physical_key))
+            let mut matches = staged
+                .iter()
+                .filter(|(key, _)| key.as_ref() == physical_key.as_slice());
+            let value = matches.next().map(|(_, value)| value.clone());
+            if matches.next().is_some() {
+                return Err(replacement_payload_error(
+                    "staged member closure contains a post-seal duplicate segment mutation",
+                ));
+            }
+            Ok(value)
         })
         .collect()
 }
@@ -19010,6 +19020,20 @@ mod tests {
         .expect("reordered caller members must fail before certification");
         assert!(error.message.contains("canonical member order"));
 
+        let error = super::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            staged.mutation_inventory(),
+            true,
+            canonical.iter().take(1).copied(),
+        )
+        .await
+        .err()
+        .expect("omitted caller members must fail before certification");
+        assert!(error.message.contains("omitted an authored member"));
+
         let duplicate = [canonical[0], canonical[0]];
         let error = super::certify_authored_current_state_body(
             &read,
@@ -19024,6 +19048,61 @@ mod tests {
         .err()
         .expect("duplicate caller members must fail before certification");
         assert!(error.message.contains("without duplicates"));
+    }
+
+    #[tokio::test]
+    async fn authored_body_certificate_rejects_post_seal_segment_mutation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("authored-certification-post-seal");
+        let fixtures = (0..129)
+            .map(|index| CommitDeltaFixture {
+                schema_key: "schema".to_owned(),
+                file_id: None,
+                row_pk: RowPk::single(format!("row-{index:03}")),
+                change_id: ChangeId::for_test_label(&format!("post-seal-{index:03}")),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(index),
+            })
+            .collect::<Vec<_>>();
+        let canonical = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_commit_deltas_for_commit_state(&mut writes, &canonical)
+            .expect("multi-segment members should stage");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certification read should open");
+        let certificate = super::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            staged.mutation_inventory(),
+            true,
+            canonical,
+        )
+        .await
+        .expect("canonical closure should certify")
+        .expect("authored closure should produce a certificate");
+
+        let (segment_key, segment_bytes) = writes
+            .staged_values_in_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE)
+            .into_iter()
+            .next()
+            .expect("129 rows should stage an external segment");
+        let mut substituted = segment_bytes.to_vec();
+        substituted.push(0);
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            key(segment_key.to_vec()),
+            value(substituted),
+        );
+        let error = certificate
+            .into_publication_parts(&writes, commit_id, staged.mutation_inventory())
+            .err()
+            .expect("post-seal segment mutation must invalidate the certificate");
+        assert!(error.message.contains("post-seal duplicate segment mutation"));
     }
 
     #[test]
