@@ -116,51 +116,51 @@ pub(crate) fn encode(
 }
 
 pub(crate) fn semantic_digest(value: &JsonValue) -> [u8; 32] {
-    fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
-        hash.update(&(bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-    }
-
-    fn visit(hash: &mut blake3::Hasher, value: &JsonValue) {
-        match value {
-            JsonValue::Null => {
-                hash.update(&[0]);
-            }
-            JsonValue::Bool(value) => {
-                hash.update(&[1, u8::from(*value)]);
-            }
-            JsonValue::Number(value) => {
-                hash.update(&[2]);
-                field(hash, value.to_string().as_bytes());
-            }
-            JsonValue::String(value) => {
-                hash.update(&[3]);
-                field(hash, value.as_bytes());
-            }
-            JsonValue::Array(values) => {
-                hash.update(&[4]);
-                hash.update(&(values.len() as u64).to_be_bytes());
-                for value in values {
-                    visit(hash, value);
-                }
-            }
-            JsonValue::Object(values) => {
-                hash.update(&[5]);
-                hash.update(&(values.len() as u64).to_be_bytes());
-                let mut entries = values.iter().collect::<Vec<_>>();
-                entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-                for (key, value) in entries {
-                    field(hash, key.as_bytes());
-                    visit(hash, value);
-                }
-            }
-        };
-    }
-
     let mut hash = blake3::Hasher::new();
     hash.update(b"lix.forktree.schema-v1.logical-row.v2\0");
-    visit(&mut hash, value);
+    semantic_digest_visit(&mut hash, value);
     *hash.finalize().as_bytes()
+}
+
+fn semantic_digest_field(hash: &mut blake3::Hasher, bytes: &[u8]) {
+    hash.update(&(bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+}
+
+fn semantic_digest_visit(hash: &mut blake3::Hasher, value: &JsonValue) {
+    match value {
+        JsonValue::Null => {
+            hash.update(&[0]);
+        }
+        JsonValue::Bool(value) => {
+            hash.update(&[1, u8::from(*value)]);
+        }
+        JsonValue::Number(value) => {
+            hash.update(&[2]);
+            semantic_digest_field(hash, value.to_string().as_bytes());
+        }
+        JsonValue::String(value) => {
+            hash.update(&[3]);
+            semantic_digest_field(hash, value.as_bytes());
+        }
+        JsonValue::Array(values) => {
+            hash.update(&[4]);
+            hash.update(&(values.len() as u64).to_be_bytes());
+            for value in values {
+                semantic_digest_visit(hash, value);
+            }
+        }
+        JsonValue::Object(values) => {
+            hash.update(&[5]);
+            hash.update(&(values.len() as u64).to_be_bytes());
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            for (key, value) in entries {
+                semantic_digest_field(hash, key.as_bytes());
+                semantic_digest_visit(hash, value);
+            }
+        }
+    };
 }
 
 pub(crate) fn semantic_digest_text(value: &str) -> Result<[u8; 32], LixError> {
@@ -208,11 +208,113 @@ pub(crate) fn decode(
             ),
         ));
     }
-    lix_schema::value_layout::decode_body(
+    let body = lix_schema::value_layout::decode_body(
         &body_plan(schema),
         &native.body,
     )
-    .map_err(|error| storage_error(schema, &format!("is malformed: {error}")))
+    .map_err(|error| storage_error(schema, &format!("is malformed: {error}")))?;
+    if semantic_digest_from_body(schema, entity_pk, &body)? != native.semantic_digest {
+        return Err(storage_error(
+            schema,
+            "body differs from its authenticated semantic digest",
+        ));
+    }
+    Ok(body)
+}
+
+enum SemanticRowCell<'a> {
+    PrimaryKey(&'a crate::entity_pk::EntityPkComponent),
+    Body(&'a lix_schema::value_layout::BodyValue),
+}
+
+fn semantic_digest_from_body(
+    schema: &lix_schema::Schema,
+    entity_pk: &EntityPk,
+    body: &[lix_schema::value_layout::BodyValue],
+) -> Result<[u8; 32], LixError> {
+    use crate::entity_pk::EntityPkComponent;
+    use lix_schema::value_layout::BodyValue;
+
+    if entity_pk.components.len() != schema.primary_key.len() {
+        return Err(storage_error(schema, "primary key arity is invalid"));
+    }
+    let value_columns = schema
+        .columns
+        .iter()
+        .filter(|column| !schema.primary_key.contains(&column.name))
+        .collect::<Vec<_>>();
+    if body.len() != value_columns.len() {
+        return Err(storage_error(schema, "body arity is invalid"));
+    }
+
+    let mut entries = Vec::with_capacity(schema.columns.len());
+    entries.extend(
+        schema
+            .primary_key
+            .iter()
+            .zip(&entity_pk.components)
+            .map(|(name, value)| (name.as_str(), SemanticRowCell::PrimaryKey(value))),
+    );
+    entries.extend(
+        value_columns
+            .into_iter()
+            .zip(body)
+            .map(|(column, value)| (column.name.as_str(), SemanticRowCell::Body(value))),
+    );
+    entries.sort_unstable_by_key(|(name, _)| *name);
+
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"lix.forktree.schema-v1.logical-row.v2\0");
+    hash.update(&[5]);
+    hash.update(&(entries.len() as u64).to_be_bytes());
+    for (name, value) in entries {
+        semantic_digest_field(&mut hash, name.as_bytes());
+        match value {
+            SemanticRowCell::PrimaryKey(EntityPkComponent::Integer(value)) => {
+                hash.update(&[2]);
+                semantic_digest_field(&mut hash, value.to_string().as_bytes());
+            }
+            SemanticRowCell::PrimaryKey(value) => {
+                hash.update(&[3]);
+                semantic_digest_field(&mut hash, value.external_string().as_bytes());
+            }
+            SemanticRowCell::Body(BodyValue::Null) => {
+                hash.update(&[0]);
+            }
+            SemanticRowCell::Body(BodyValue::Text(value)) => {
+                hash.update(&[3]);
+                semantic_digest_field(&mut hash, value.as_bytes());
+            }
+            SemanticRowCell::Body(BodyValue::Uuid(value)) => {
+                hash.update(&[3]);
+                semantic_digest_field(&mut hash, value.to_string().as_bytes());
+            }
+            SemanticRowCell::Body(BodyValue::Int8(value)) => {
+                hash.update(&[2]);
+                semantic_digest_field(&mut hash, value.to_string().as_bytes());
+            }
+            SemanticRowCell::Body(BodyValue::Float8(value)) => {
+                let value = serde_json::Number::from_f64(*value)
+                    .ok_or_else(|| storage_error(schema, "contains non-finite float8"))?;
+                hash.update(&[2]);
+                semantic_digest_field(&mut hash, value.to_string().as_bytes());
+            }
+            SemanticRowCell::Body(BodyValue::Boolean(value)) => {
+                hash.update(&[1, u8::from(*value)]);
+            }
+            SemanticRowCell::Body(BodyValue::Jsonb(value)) => {
+                semantic_digest_visit(&mut hash, value);
+            }
+            SemanticRowCell::Body(BodyValue::Timestamptz(value)) => {
+                let value = chrono::DateTime::from_timestamp_micros(*value)
+                    .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+                    .ok_or_else(|| storage_error(schema, "contains invalid timestamptz"))?;
+                hash.update(&[3]);
+                semantic_digest_field(&mut hash, value.as_bytes());
+            }
+        }
+    }
+    Ok(*hash.finalize().as_bytes())
 }
 
 fn body_plan(schema: &lix_schema::Schema) -> Vec<lix_schema::value_layout::BodyColumn> {
@@ -275,14 +377,7 @@ pub(crate) fn logical_value(
     native: &NativeRowCell,
 ) -> Result<JsonValue, LixError> {
     let body = decode(schema, entity_pk, global, file_id, native)?;
-    let value = logical_value_from_body(schema, entity_pk, body)?;
-    if semantic_digest(&value) != native.semantic_digest {
-        return Err(storage_error(
-            schema,
-            "body differs from its authenticated semantic digest",
-        ));
-    }
-    Ok(value)
+    logical_value_from_body(schema, entity_pk, body)
 }
 
 fn logical_value_from_body(
@@ -474,6 +569,19 @@ mod tests {
             &encoded
         )
         .is_err());
+        let mut stale_semantics = encoded.clone();
+        stale_semantics.semantic_digest[0] ^= 0x01;
+        assert!(
+            decode(
+                &schema(Some("first"), false),
+                &key,
+                false,
+                None,
+                &stale_semantics,
+            )
+            .is_err(),
+            "typed projection decode must reject a stale semantic digest"
+        );
         assert_ne!(encoded.semantic_digest, semantic_digest(&json!({
             "id":"pk-must-not-appear-in-body",
             "payload":"substituted"
