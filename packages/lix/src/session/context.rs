@@ -1,5 +1,6 @@
 #![allow(clippy::match_wild_err_arm, clippy::option_if_let_else)]
 
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -472,6 +473,15 @@ where
             Ok(branch_id) => Ok(branch_id),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn active_branch_id_owned(
+        self: Arc<Self>,
+    ) -> impl Future<Output = Result<String, LixError>> + Send + 'static {
+        // SAFETY: the future owns its Arc session. Storage read handles are
+        // Send by the Storage contract; the compiler obstruction is the
+        // higher-ranked shared reference carried by a borrowing adapter.
+        unsafe { super::AssumeSendFuture::new(async move { self.active_branch_id().await }) }
     }
 
     #[doc(hidden)]

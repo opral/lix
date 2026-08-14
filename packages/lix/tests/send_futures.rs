@@ -20,6 +20,7 @@ async fn public_execution_and_observation_futures_are_send() {
     let lix = open_lix().await.expect("open Lix");
     assert_send_sync::<Lix>();
 
+    assert_send(lix.active_branch_id());
     assert_send(lix.open_another_session());
     assert_send(lix.execute("SELECT 1", &[]));
     assert_send(lix.execute_batch(&[ExecuteBatchStatement {

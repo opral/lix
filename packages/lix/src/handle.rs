@@ -565,11 +565,15 @@ where
     /// Executes read statements against one coherent storage snapshot and
     /// returns the snapshot metadata required by official storage adapters.
     #[doc(hidden)]
-    pub async fn execute_coherent_read_batch(
+    pub fn execute_coherent_read_batch(
         &self,
         statements: &[(&str, &[Value])],
-    ) -> Result<CoherentReadBatch, LixError> {
-        self.session.execute_coherent_read_batch(statements).await
+    ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
+        let statements = statements
+            .iter()
+            .map(|(sql, params)| ((*sql).to_owned(), (*params).to_vec()))
+            .collect();
+        Arc::clone(&self.session).execute_coherent_read_batch_owned(statements)
     }
 
     /// Executes one prepared DML statement shape for a rectangular parameter
@@ -636,8 +640,10 @@ where
         })
     }
 
-    pub async fn active_branch_id(&self) -> Result<String, LixError> {
-        self.session.active_branch_id().await
+    pub fn active_branch_id(
+        &self,
+    ) -> impl Future<Output = Result<String, LixError>> + Send + 'static {
+        Arc::clone(&self.session).active_branch_id_owned()
     }
 
     pub fn active_account_id(&self) -> &str {
