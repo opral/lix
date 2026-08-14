@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -11,6 +11,7 @@ import {
 	updateCargoToml,
 	updateChangelog,
 	updatePackageVersion,
+	validateCargoLockstepVersions,
 } from "./release.mjs";
 
 test("bumpVersion applies semver changes", () => {
@@ -137,13 +138,18 @@ test("updateCargoToml bumps every lockstep Rust package and exact dependency pin
 	mkdirSync(join(root, "packages", "lix"), { recursive: true });
 	mkdirSync(join(root, "packages", "storage-rocksdb"), { recursive: true });
 	mkdirSync(join(root, "packages", "storage-slatedb"), { recursive: true });
+	mkdirSync(join(root, "packages", "lix-plugin-bindings-column-merger"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
 		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/storage-rocksdb", version = "=0.6.2" }\nlix_storage_slatedb = { path = "packages/storage-slatedb", version = "=0.6.2" }\nlix = { path = "packages/lix", version = "=0.6.2" }\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "lix", "Cargo.toml"),
-		`[package]\nname = "lix"\nversion.workspace = true\n`,
+		`[package]\nname = "lix"\nversion.workspace = true\n\n[dependencies]\nlix-plugin-bindings-column-merger = { path = "../lix-plugin-bindings-column-merger", version = "=0.6.2" }\n`,
+	);
+	writeFileSync(
+		join(root, "packages", "lix-plugin-bindings-column-merger", "Cargo.toml"),
+		`[package]\nname = "lix-plugin-bindings-column-merger"\nversion.workspace = true\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "js-sdk", "Cargo.toml"),
@@ -165,9 +171,77 @@ test("updateCargoToml bumps every lockstep Rust package and exact dependency pin
 	assert.match(rootCargoToml, /lix_storage_rocksdb = \{ path = "packages\/storage-rocksdb", version = "=0\.7\.0"/);
 	assert.match(rootCargoToml, /lix_storage_slatedb = \{ path = "packages\/storage-slatedb", version = "=0\.7\.0"/);
 	assert.match(rootCargoToml, /lix = \{ path = "packages\/lix", version = "=0\.7\.0"/);
-	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.6\.2"/);
+	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.7\.0"/);
 	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /version\.workspace = true/);
-	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.6\.2"/);
+	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.7\.0"/);
+	assert.match(
+		readFileSync(join(root, "packages", "lix", "Cargo.toml"), "utf8"),
+		/lix-plugin-bindings-column-merger = \{ path = "\.\.\/lix-plugin-bindings-column-merger", version = "=0\.7\.0"/,
+	);
+	assert.doesNotThrow(() => validateCargoLockstepVersions(root, "0.7.0"));
+});
+
+test("lockstep preflight reports every partial Cargo version bump", () => {
+	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
+	for (const packageName of ["app", "binding-a", "binding-b"]) {
+		mkdirSync(join(root, "packages", packageName), { recursive: true });
+	}
+	writeFileSync(
+		join(root, "Cargo.toml"),
+		`[workspace.package]\nversion = "0.12.0"\n`,
+	);
+	writeFileSync(
+		join(root, "packages", "app", "Cargo.toml"),
+		`[package]\nname = "app"\nversion.workspace = true\n\n[dependencies]\nbinding-a = {\n\tpath = "../binding-a",\n\tversion = "=0.11.0",\n}\n\n[dependencies.binding-b]\npath = "../binding-b"\nversion = "=0.10.0"\n`,
+	);
+	for (const packageName of ["binding-a", "binding-b"]) {
+		writeFileSync(
+			join(root, "packages", packageName, "Cargo.toml"),
+			`[package]\nname = "${packageName}"\nversion.workspace = true\n`,
+		);
+	}
+
+	assert.throws(
+		() => validateCargoLockstepVersions(root),
+		(error) => {
+			assert.match(error.message, /binding-a requires =0\.11\.0, expected =0\.12\.0/);
+			assert.match(error.message, /binding-b requires =0\.10\.0, expected =0\.12\.0/);
+			return true;
+		},
+	);
+
+	updateCargoToml(root, "0.12.0");
+	assert.doesNotThrow(() => validateCargoLockstepVersions(root));
+});
+
+test("updateCargoToml restores every manifest after a commit failure", () => {
+	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
+	for (const packageName of ["app", "binding"]) {
+		mkdirSync(join(root, "packages", packageName), { recursive: true });
+	}
+	const rootManifest = `[workspace.package]\nversion = "0.11.0"\n`;
+	const appManifest = `[package]\nname = "app"\nversion.workspace = true\n\n[dependencies]\nbinding = { path = "../binding", version = "=0.11.0" }\n`;
+	writeFileSync(join(root, "Cargo.toml"), rootManifest);
+	writeFileSync(join(root, "packages", "app", "Cargo.toml"), appManifest);
+	writeFileSync(
+		join(root, "packages", "binding", "Cargo.toml"),
+		`[package]\nname = "binding"\nversion.workspace = true\n`,
+	);
+
+	let commits = 0;
+	assert.throws(
+		() =>
+			updateCargoToml(root, "0.12.0", {
+				renameManifest(source, destination) {
+					commits += 1;
+					if (commits === 2) throw new Error("injected commit failure");
+					renameSync(source, destination);
+				},
+			}),
+		/injected commit failure/,
+	);
+	assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), rootManifest);
+	assert.equal(readFileSync(join(root, "packages", "app", "Cargo.toml"), "utf8"), appManifest);
 });
 
 test("updatePackageVersion pins native optional dependencies", () => {
