@@ -346,6 +346,16 @@ where
         self.session.execute_batch(statements).await
     }
 
+    /// Executes read statements against one retained ForkTree view and returns
+    /// the selector metadata observed by that same operation.
+    #[doc(hidden)]
+    pub async fn execute_coherent_read_batch(
+        &self,
+        statements: &[(&str, &[Value])],
+    ) -> Result<crate::session::CoherentReadBatch, LixError> {
+        self.session.execute_coherent_read_batch(statements).await
+    }
+
     /// Executes one prepared DML statement shape for a rectangular parameter
     /// page in one atomic transaction. The SQL is planned once and each
     /// parameter row produces one result in input order. This is the public
