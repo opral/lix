@@ -87,6 +87,8 @@ pub struct ExecuteResult {
     /// empty case inline avoids one Arc clone/drop pair for every scalar write.
     backing: Option<Arc<ExecuteResultBacking>>,
     rows_affected: u64,
+    #[cfg(feature = "storage-benches")]
+    profile_provider_rows_examined: u64,
 }
 
 #[derive(Debug)]
@@ -224,6 +226,8 @@ impl ExecuteResult {
             statement_label: None,
             backing: None,
             rows_affected,
+            #[cfg(feature = "storage-benches")]
+            profile_provider_rows_examined: 0,
         }
     }
 
@@ -265,6 +269,8 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected,
+            #[cfg(feature = "storage-benches")]
+            profile_provider_rows_examined: 0,
         }
     }
 
@@ -289,6 +295,8 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected: 0,
+            #[cfg(feature = "storage-benches")]
+            profile_provider_rows_examined: 0,
         }
     }
 
@@ -816,7 +824,15 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
-        let (result, profile) = crate::sql_profile::scope(self.execute(sql, params)).await;
+        let (result, mut profile) = crate::sql_profile::scope(self.execute(sql, params)).await;
+        if let Ok(result) = &result {
+            if result.profile_provider_rows_examined != 0 {
+                profile.scan_rows = profile.scan_rows.saturating_add(result.len() as u64);
+            }
+            profile.provider_rows_examined = profile
+                .provider_rows_examined
+                .saturating_add(result.profile_provider_rows_examined);
+        }
         result.map(|result| (result, profile))
     }
 
@@ -1359,12 +1375,13 @@ where
                 .await
             },
         );
-        let (mut read_result, file_view_mutations) = match read_result.await {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(normalize_sql_surface_error(error, sql));
-            }
-        };
+        let (mut read_result, file_view_mutations, _provider_rows_examined) =
+            match read_result.await {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(normalize_sql_surface_error(error, sql));
+                }
+            };
         let runtime_storage_stats = match read_result.runtime_functions.take() {
             Some(runtime_functions) => {
                 self.persist_runtime_functions_if_needed(
@@ -1381,6 +1398,12 @@ where
         }
         let result = ExecuteResult::from_session_read_result(read_result)
             .with_file_view_mutations(file_view_mutations);
+        #[cfg(feature = "storage-benches")]
+        let result = {
+            let mut result = result;
+            result.profile_provider_rows_examined = _provider_rows_examined as u64;
+            result
+        };
         if !defer_file_view_acknowledgement {
             self.file_views
                 .apply_mutations(result.file_view_mutations().iter().cloned());
@@ -2310,6 +2333,7 @@ where
         (
             sql2::SessionReadSqlResult,
             Vec<sql2::SessionFileViewMutation>,
+            usize,
         ),
         LixError,
     > {
@@ -2418,6 +2442,7 @@ where
                     query: sql2::SessionReadResult::Rows(query),
                 },
                 file_view_mutations,
+                0,
             ));
         }
         if let Some(exact) = exact_schema_point_read {
@@ -2460,6 +2485,7 @@ where
                             query: sql2::SessionReadResult::Rows(query),
                         },
                         Vec::new(),
+                        1,
                     ));
                 }
             }
@@ -2542,6 +2568,7 @@ where
                 query: query.query,
             },
             file_view_mutations,
+            0,
         ))
     }
 }
