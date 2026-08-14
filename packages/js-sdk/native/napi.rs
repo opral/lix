@@ -1822,26 +1822,26 @@ impl TryFrom<LixValue> for Value {
                         LixError::new(LixError::CODE_INVALID_PARAM, "text value must be a string")
                     })?,
             )),
-            "json" => Ok(Self::Json(
+            "jsonb" => Ok(Self::Jsonb(
                 value.value.unwrap_or(serde_json::Value::Null).into(),
             )),
-            "timestamp" => {
+            "timestamptz" => {
                 let raw = value
                     .value
                     .and_then(|value| value.as_str().map(str::to_owned))
                     .ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_INVALID_PARAM,
-                            "timestamp value must be an RFC 3339 string",
+                            "timestamptz value must be an RFC 3339 string",
                         )
                     })?;
                 let parsed = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
-                        format!("timestamp value is invalid: {error}"),
+                        format!("timestamptz value is invalid: {error}"),
                     )
                 })?;
-                Ok(Self::Timestamp(parsed.timestamp_micros()))
+                Ok(Self::Timestamptz(parsed.timestamp_micros()))
             }
             "blob" => {
                 let bytes = value.blob.ok_or_else(|| {
@@ -1898,17 +1898,17 @@ impl TryFrom<&Value> for LixValue {
                 value: Some(serde_json::json!(value)),
                 blob: None,
             }),
-            Value::Json(value) => Ok(Self {
-                kind: "json".to_string(),
+            Value::Jsonb(value) => Ok(Self {
+                kind: "jsonb".to_string(),
                 value: Some(value.to_value()),
                 blob: None,
             }),
-            Value::Timestamp(value) => {
+            Value::Timestamptz(value) => {
                 let value = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_JS_SDK_NATIVE", "timestamp is out of range")
+                    LixError::new("LIX_ERROR_JS_SDK_NATIVE", "timestamptz is out of range")
                 })?;
                 Ok(Self {
-                    kind: "timestamp".to_string(),
+                    kind: "timestamptz".to_string(),
                     value: Some(serde_json::Value::String(
                         value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                     )),

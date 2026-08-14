@@ -10,8 +10,8 @@ pub enum WireValue {
     Int { value: i64 },
     Float { value: f64 },
     Text { value: String },
-    Json { value: Json },
-    Timestamp { value: String },
+    Jsonb { value: Json },
+    Timestamptz { value: String },
     Blob { base64: String },
 }
 
@@ -44,11 +44,11 @@ impl WireValue {
             Value::Text(value) => Ok(Self::Text {
                 value: value.clone(),
             }),
-            Value::Json(value) => Ok(Self::Json {
+            Value::Jsonb(value) => Ok(Self::Jsonb {
                 value: value.clone(),
             }),
-            Value::Timestamp(value) => Ok(Self::Timestamp {
-                value: format_timestamp(*value)?,
+            Value::Timestamptz(value) => Ok(Self::Timestamptz {
+                value: format_timestamptz(*value)?,
             }),
             Value::Blob(value) => Ok(Self::Blob {
                 base64: base64::engine::general_purpose::STANDARD.encode(value),
@@ -74,8 +74,8 @@ impl WireValue {
                 Ok(Value::Real(value))
             }
             Self::Text { value } => Ok(Value::Text(value)),
-            Self::Json { value } => Ok(Value::Json(value)),
-            Self::Timestamp { value } => parse_timestamp(&value).map(Value::Timestamp),
+            Self::Jsonb { value } => Ok(Value::Jsonb(value)),
+            Self::Timestamptz { value } => parse_timestamptz(&value).map(Value::Timestamptz),
             Self::Blob { base64 } => {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(base64.as_bytes())
@@ -91,23 +91,23 @@ impl WireValue {
     }
 }
 
-fn format_timestamp(value: i64) -> Result<String, LixError> {
+fn format_timestamptz(value: i64) -> Result<String, LixError> {
     chrono::DateTime::from_timestamp_micros(value)
         .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-        .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "timestamp is out of range"))
+        .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "timestamptz is out of range"))
 }
 
-fn parse_timestamp(value: &str) -> Result<i64, LixError> {
+fn parse_timestamptz(value: &str) -> Result<i64, LixError> {
     chrono::DateTime::parse_from_rfc3339(value)
         .map_err(|error| {
             LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                format!("timestamp wire value is invalid: {error}"),
+                format!("timestamptz wire value is invalid: {error}"),
             )
         })?
         .timestamp_micros()
         .try_into()
-        .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "timestamp is out of range"))
+        .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "timestamptz is out of range"))
 }
 
 impl WireQueryResult {
@@ -158,7 +158,8 @@ mod tests {
             Value::Integer(42),
             Value::Real(1.5),
             Value::Text("hello".to_string()),
-            Value::Json(json!({"hello": "world"}).into()),
+            Value::Jsonb(json!({"hello": "world"}).into()),
+            Value::Timestamptz(1_700_000_000_000_000),
             Value::Blob(vec![1, 2, 3].into()),
         ];
 
@@ -208,8 +209,11 @@ mod tests {
                 WireValue::Text {
                     value: "hello".to_string(),
                 },
-                WireValue::Json {
+                WireValue::Jsonb {
                     value: json!({"hello": "world"}).into(),
+                },
+                WireValue::Timestamptz {
+                    value: "2023-11-14T22:13:20.000000Z".to_string(),
                 },
                 WireValue::Blob {
                     base64: "AQI=".to_string(),
@@ -226,7 +230,8 @@ mod tests {
         assert!(serialized.contains("\"kind\":\"int\""));
         assert!(serialized.contains("\"kind\":\"float\""));
         assert!(serialized.contains("\"kind\":\"text\""));
-        assert!(serialized.contains("\"kind\":\"json\""));
+        assert!(serialized.contains("\"kind\":\"jsonb\""));
+        assert!(serialized.contains("\"kind\":\"timestamptz\""));
         assert!(serialized.contains("\"kind\":\"blob\""));
         assert!(!serialized.contains("\"kind\":\"Null\""));
         assert!(!serialized.contains("\"kind\":\"Bool\""));
@@ -234,7 +239,23 @@ mod tests {
         assert!(!serialized.contains("\"kind\":\"Real\""));
         assert!(!serialized.contains("\"kind\":\"Text\""));
         assert!(!serialized.contains("\"kind\":\"Json\""));
+        assert!(!serialized.contains("\"kind\":\"timestamp\""));
         assert!(!serialized.contains("\"kind\":\"Blob\""));
+    }
+
+    #[test]
+    fn legacy_json_and_timestamp_wire_kinds_are_rejected() {
+        for legacy in [
+            json!({ "kind": "json", "value": { "ok": true } }),
+            json!({ "kind": "timestamp", "value": "2023-11-14T22:13:20Z" }),
+        ] {
+            let error = serde_json::from_value::<WireValue>(legacy)
+                .expect_err("legacy wire value kind must not decode");
+            assert!(
+                error.to_string().contains("unknown variant"),
+                "unexpected serde rejection: {error}"
+            );
+        }
     }
 
     #[test]

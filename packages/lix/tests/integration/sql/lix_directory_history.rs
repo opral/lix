@@ -95,7 +95,7 @@ simulation_test!(
         let source_changes = source_changes_result.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .expect("source_changes should be present");
-        let Value::Json(source_changes) = source_changes else {
+        let Value::Jsonb(source_changes) = source_changes else {
             panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
         let source_changes = source_changes.to_value();
@@ -352,7 +352,7 @@ simulation_test!(
                     Value::Boolean(true),
                 ]
             );
-            let Value::Json(source_changes) = &row.values()[4] else {
+            let Value::Jsonb(source_changes) = &row.values()[4] else {
                 panic!("delete source changes should be JSON");
             };
             let source_changes = source_changes.to_value();

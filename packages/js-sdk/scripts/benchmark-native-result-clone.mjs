@@ -19,10 +19,10 @@ const payload = {
 
 const columns = ["declarations", "selectors", "matches", "pattern"];
 const rows = Array.from({ length: rowCount }, () => [
-	{ kind: "json", value: payload.declarations },
-	{ kind: "json", value: payload.selectors },
-	{ kind: "json", value: payload.matches },
-	{ kind: "json", value: payload.pattern },
+	{ kind: "jsonb", value: payload.declarations },
+	{ kind: "jsonb", value: payload.selectors },
+	{ kind: "jsonb", value: payload.matches },
+	{ kind: "jsonb", value: payload.pattern },
 ]);
 
 function cloneJsonValue(value) {
@@ -39,8 +39,8 @@ function nativeRows() {
 	if (mode !== "legacy") return rows;
 	return rows.map((row) =>
 		row.map((value) =>
-			value.kind === "json"
-				? { kind: "json", value: cloneJsonValue(value.value) }
+			value.kind === "jsonb"
+				? { kind: "jsonb", value: cloneJsonValue(value.value) }
 				: value
 		)
 	);

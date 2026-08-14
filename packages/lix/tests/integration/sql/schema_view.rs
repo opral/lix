@@ -61,7 +61,7 @@ simulation_test!(
             .await
             .expect("filter-only payload query should succeed");
 
-        assert_rows_eq(result, vec![vec![Value::Json(json!(["n1"]).into())]]);
+        assert_rows_eq(result, vec![vec![Value::Jsonb(json!(["n1"]).into())]]);
     }
 );
 
@@ -463,7 +463,7 @@ simulation_test!(
 
 // The rejection cases, asserted as hard as the acceptance cases.
 //
-// A `Number` column has no total order (NaN), and `Boolean`/`Json` have no
+// A `Number` column has no total order (NaN), and `Boolean`/`Jsonb` have no
 // useful range, so none of them may become a pushed range. Over-claiming here
 // is a wrong answer rather than a slow one, which is why this is asserted
 // rather than left to the residual.

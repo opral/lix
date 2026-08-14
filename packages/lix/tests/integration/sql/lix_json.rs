@@ -40,8 +40,8 @@ simulation_test!(schema_v1_seven_types_have_a_runnable_schema_surface, |sim| asy
     assert_eq!(values[2], Value::Integer(42));
     assert_eq!(values[3], Value::Real(1.5));
     assert_eq!(values[4], Value::Boolean(true));
-    assert_eq!(values[5], Value::Json(json!({"answer": 42}).into()));
-    assert!(matches!(values[6], Value::Timestamp(_)));
+    assert_eq!(values[5], Value::Jsonb(json!({"answer": 42}).into()));
+    assert!(matches!(values[6], Value::Timestamptz(_)));
 });
 
 simulation_test!(timestamptz_is_native_and_current_timestamp_is_stable, |sim| async move {
@@ -77,8 +77,8 @@ simulation_test!(timestamptz_is_native_and_current_timestamp_is_stable, |sim| as
         )
         .await
         .unwrap();
-    assert!(matches!(row.rows()[0].values()[0], Value::Timestamp(_)));
-    assert!(matches!(row.rows()[0].values()[1], Value::Timestamp(_)));
+    assert!(matches!(row.rows()[0].values()[0], Value::Timestamptz(_)));
+    assert!(matches!(row.rows()[0].values()[1], Value::Timestamptz(_)));
     assert_eq!(row.rows()[0].values()[1], row.rows()[0].values()[2]);
 });
 
@@ -159,9 +159,9 @@ simulation_test!(
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Json(json!({"name": "Ada", "tags": ["db"]}).into()),
+                Value::Jsonb(json!({"name": "Ada", "tags": ["db"]}).into()),
                 Value::Null,
-                Value::Json(json!(["db"]).into()),
+                Value::Jsonb(json!(["db"]).into()),
                 Value::Null,
             ]],
         );

@@ -66,8 +66,8 @@ enum ParameterType {
     Integer,
     Real,
     Text,
-    Json,
-    Timestamp,
+    Jsonb,
+    Timestamptz,
     Blob,
 }
 
@@ -644,7 +644,7 @@ impl<CatalogKey> PhysicalReadPlanCacheKey<CatalogKey> {
                 Value::Integer(value) => (3, value.to_le_bytes().to_vec()),
                 Value::Real(value) => (4, value.to_bits().to_le_bytes().to_vec()),
                 Value::Text(value) => (5, value.as_bytes().to_vec()),
-                Value::Json(value) => {
+                Value::Jsonb(value) => {
                     parameters.push(6);
                     let bytes = serde_json::to_vec(value).ok()?;
                     parameters.extend_from_slice(&bytes.len().to_le_bytes());
@@ -652,7 +652,7 @@ impl<CatalogKey> PhysicalReadPlanCacheKey<CatalogKey> {
                     continue;
                 }
                 Value::Blob(value) => (7, value.to_vec()),
-                Value::Timestamp(value) => (8, value.to_le_bytes().to_vec()),
+                Value::Timestamptz(value) => (8, value.to_le_bytes().to_vec()),
             };
             parameters.push(tag);
             parameters.extend_from_slice(&bytes.len().to_le_bytes());
@@ -675,9 +675,9 @@ impl From<&Value> for ParameterType {
             Value::Integer(_) => Self::Integer,
             Value::Real(_) => Self::Real,
             Value::Text(_) => Self::Text,
-            Value::Json(_) => Self::Json,
+            Value::Jsonb(_) => Self::Jsonb,
             Value::Blob(_) => Self::Blob,
-            Value::Timestamp(_) => Self::Timestamp,
+            Value::Timestamptz(_) => Self::Timestamptz,
         }
     }
 }

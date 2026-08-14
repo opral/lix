@@ -24,7 +24,7 @@ fn fixture(runtime: &tokio::runtime::Runtime) -> Lix<Memory> {
 }
 
 fn schema_v1() -> Value {
-    Value::Json(
+    Value::Jsonb(
         json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "bench_registration",

@@ -223,7 +223,7 @@ mod tests {
                          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                         &[
                             Value::Text(format!("gc-estimate-k{write}")),
-                            Value::Json(json!({ "round": round, "write": write }).into()),
+                            Value::Jsonb(json!({ "round": round, "write": write }).into()),
                         ],
                     )
                     .await
@@ -393,7 +393,7 @@ mod tests {
                          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                         &[
                             Value::Text(format!("gc-legacy-k{write}")),
-                            Value::Json(json!({ "round": round, "write": write }).into()),
+                            Value::Jsonb(json!({ "round": round, "write": write }).into()),
                         ],
                     )
                     .await

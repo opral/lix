@@ -38,7 +38,7 @@ fn fixture(runtime: &tokio::runtime::Runtime) -> Lix<Memory> {
         let registered = session
             .execute(
                 "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)",
-                &[Value::Json(schema.into())],
+                &[Value::Jsonb(schema.into())],
             )
             .await
             .expect("register benchmark schema");

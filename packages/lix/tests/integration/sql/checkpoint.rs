@@ -59,7 +59,7 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Json(json!(["checkpoint-key"]).into()),
+                Value::Jsonb(json!(["checkpoint-key"]).into()),
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
@@ -74,7 +74,7 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Json(json!(["checkpoint-key"]).into()),
+                Value::Jsonb(json!(["checkpoint-key"]).into()),
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
@@ -136,7 +136,7 @@ simulation_test!(
             .await,
             vec![vec![
                 Value::Text("lix_checkpoint".to_string()),
-                Value::Json(json!([receipt.commit_id.clone()]).into()),
+                Value::Jsonb(json!([receipt.commit_id.clone()]).into()),
             ]],
             "checkpoint publication must be a normal logical change"
         );
@@ -190,7 +190,7 @@ simulation_test!(
                 "SELECT value FROM lix_key_value WHERE key = 'checkpoint-key'",
             )
             .await,
-            vec![vec![Value::Json(json!("two").into())]]
+            vec![vec![Value::Jsonb(json!("two").into())]]
         );
 
         let timestamps_before_rebuild = select_rows(
@@ -315,11 +315,11 @@ simulation_test!(
             .await,
             vec![
                 vec![
-                    Value::Json(json!(["working-added"]).into()),
+                    Value::Jsonb(json!(["working-added"]).into()),
                     Value::Text("added".to_string()),
                 ],
                 vec![
-                    Value::Json(json!(["working-removed"]).into()),
+                    Value::Jsonb(json!(["working-removed"]).into()),
                     Value::Text("removed".to_string()),
                 ],
             ],

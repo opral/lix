@@ -1825,7 +1825,7 @@ fn row_update_json_value(
     };
     match column_type {
         SchemaColumnType::String => scalar_utf8(value, column_name, spec).map(JsonValue::String),
-        SchemaColumnType::Json => {
+        SchemaColumnType::Jsonb => {
             let raw = scalar_utf8(value, column_name, spec)?;
             serde_json::from_str(&raw).map_err(|error| {
                 DataFusionError::Execution(format!(
@@ -2751,7 +2751,7 @@ impl<'a> RowFilterAnalyzer<'a> {
     /// order, and — not coincidentally — the two the hot index can encode
     /// order-preservingly, so this is the same admissible set a later index
     /// range seek needs. `Number` is refused because NaN makes the order
-    /// partial; `Boolean` and `Json` have no useful range.
+    /// partial; `Boolean` and `Jsonb` have no useful range.
     fn analyze_column_literal_range(
         &self,
         column_expr: &Expr,
@@ -2851,7 +2851,7 @@ impl<'a> RowFilterAnalyzer<'a> {
                 record_filterable_column(&self.spec.schema_key, column_name, true);
                 Some(column.name.as_str())
             }
-            SchemaColumnType::Json | SchemaColumnType::Timestamptz => {
+            SchemaColumnType::Jsonb | SchemaColumnType::Timestamptz => {
                 #[cfg(any(test, feature = "storage-benches"))]
                 record_filterable_column(&self.spec.schema_key, column_name, false);
                 None
@@ -3260,7 +3260,7 @@ fn row_snapshot_value(
             row_f64_value(Some(value), schema_key, column)?.map(RowFilterValue::Number)
         }
         SchemaColumnType::Boolean => value.as_bool().map(RowFilterValue::Boolean),
-        SchemaColumnType::Json => None,
+        SchemaColumnType::Jsonb => None,
         SchemaColumnType::Timestamptz => value
             .as_str()
             .map(|value| RowFilterValue::String(value.to_owned())),
@@ -3904,7 +3904,7 @@ fn row_column_array(
         .map(|snapshot| snapshot.as_ref().and_then(|value| value.get(column_name)))
         .collect::<Vec<_>>();
     Ok(match column_type {
-        SchemaColumnType::String | SchemaColumnType::Json => Arc::new(StringArray::from(
+        SchemaColumnType::String | SchemaColumnType::Jsonb => Arc::new(StringArray::from(
             values
                 .iter()
                 .map(|value| row_json_text_value(*value, column_type))
@@ -4206,7 +4206,7 @@ pub(super) fn row_json_text_value(
         }),
         (SchemaColumnType::String, Some(JsonValue::String(value))) => Some(value.clone()),
         (SchemaColumnType::String, Some(other)) => Some(json_to_string(other)?),
-        (SchemaColumnType::Json, Some(other)) => Some(json_to_string(other)?),
+        (SchemaColumnType::Jsonb, Some(other)) => Some(json_to_string(other)?),
         _ => None,
     })
 }
@@ -4931,7 +4931,7 @@ mod tests {
         );
         assert_eq!(
             spec.visible_column("meta").map(|column| column.column_type),
-            Some(SchemaColumnType::Json)
+            Some(SchemaColumnType::Jsonb)
         );
         assert!(spec.visible_column("lixcol_row_pk").is_none());
     }
@@ -4950,7 +4950,7 @@ mod tests {
         .expect("jsonb is a supported projection type");
         assert_eq!(
             spec.visible_column("kind").map(|column| column.column_type),
-            Some(SchemaColumnType::Json)
+            Some(SchemaColumnType::Jsonb)
         );
     }
 
@@ -6286,7 +6286,7 @@ mod tests {
         );
         assert!(
             super::row_columnar_projection(&drifted, &payload_schema, &spec).is_none(),
-            "a String/Json-compatible Arrow type must not bypass schema binding"
+            "a String/Jsonb-compatible Arrow type must not bypass schema binding"
         );
     }
 

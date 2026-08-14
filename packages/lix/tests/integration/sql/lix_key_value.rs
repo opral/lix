@@ -396,6 +396,6 @@ fn assert_single_text(result: ExecuteResult, expected: &str) {
         .expect("expected value should be valid JSON");
     assert_eq!(
         row_set.rows()[0].values(),
-        &[Value::Json(expected_json.into())]
+        &[Value::Jsonb(expected_json.into())]
     );
 }

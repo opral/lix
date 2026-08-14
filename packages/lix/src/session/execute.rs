@@ -527,8 +527,8 @@ impl TryFromValue for f64 {
 impl TryFromValue for serde_json::Value {
     fn try_from_value(value: &Value) -> Result<Self, LixError> {
         match value {
-            Value::Json(value) => Ok(value.to_value()),
-            other => Err(value_type_error("json", other)),
+            Value::Jsonb(value) => Ok(value.to_value()),
+            other => Err(value_type_error("jsonb", other)),
         }
     }
 }
@@ -2944,13 +2944,13 @@ fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixEr
                 profile_checksum_bytes(checksum, &value.to_bits().to_le_bytes())
             }
             Value::Text(value) => profile_checksum_sized_bytes(checksum, 4, value.as_bytes()),
-            Value::Json(value) => {
+            Value::Jsonb(value) => {
                 profile_checksum_sized_bytes(checksum, 5, value.to_string().as_bytes())
             }
             Value::Blob(value) => {
                 profile_checksum_sized_bytes(checksum, 6, value.as_bytes().as_ref())
             }
-            Value::Timestamp(value) => {
+            Value::Timestamptz(value) => {
                 let checksum = profile_checksum_bytes(checksum, &[7]);
                 profile_checksum_bytes(checksum, &value.to_le_bytes())
             }
@@ -5559,7 +5559,7 @@ mod tests {
         assert_eq!(exact.rows()[0].value("note").expect("note column"), &Value::Null);
         assert_eq!(
             exact.rows()[1].value("payload").expect("payload column"),
-            &Value::Json(serde_json::json!({"rank": 2}).into())
+            &Value::Jsonb(serde_json::json!({"rank": 2}).into())
         );
 
         #[cfg(feature = "storage-benches")]
@@ -5641,7 +5641,7 @@ mod tests {
         );
         assert_eq!(
             exact.rows()[1].value("lixcol_metadata").unwrap(),
-            &Value::Json(serde_json::json!({"rank": 2}).into())
+            &Value::Jsonb(serde_json::json!({"rank": 2}).into())
         );
 
         let exact_directories = session
@@ -7513,7 +7513,7 @@ mod tests {
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
                  WHERE lixcol_row_pk = CAST('[\"amended_parameter_insert_probe\"]' AS JSONB)",
-                &[Value::Json(amended_schema.into())],
+                &[Value::Jsonb(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
@@ -7610,7 +7610,7 @@ mod tests {
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
                  WHERE lixcol_row_pk = CAST('[\"amended_parameter_update_probe\"]' AS JSONB)",
-                &[Value::Json(amended_schema.into())],
+                &[Value::Jsonb(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
@@ -7985,7 +7985,7 @@ mod tests {
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
-                        Value::Json(serde_json::json!({"not": "text"}).into()),
+                        Value::Jsonb(serde_json::json!({"not": "text"}).into()),
                     ],
                 },
                 ExecuteBatchStatement {
@@ -7993,7 +7993,7 @@ mod tests {
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
-                        Value::Json(serde_json::json!({"also": "not text"}).into()),
+                        Value::Jsonb(serde_json::json!({"also": "not text"}).into()),
                     ],
                 },
             ])
@@ -8755,7 +8755,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows.rows()[0].value("value").unwrap(),
-            &Value::Json(serde_json::json!(true).into())
+            &Value::Jsonb(serde_json::json!(true).into())
         );
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
@@ -9984,11 +9984,11 @@ mod tests {
                     Value::Text(b.to_string()),
                     Value::Text("/b.txt".to_string()),
                     Value::Blob(b"bravo".to_vec().into()),
-                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"b"}).into()),
+                    Value::Jsonb(serde_json::json!({"git_mode":"100644","git_oid":"b"}).into()),
                     Value::Text(a.to_string()),
                     Value::Text("/a.txt".to_string()),
                     Value::Blob(b"alpha".to_vec().into()),
-                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into()),
+                    Value::Jsonb(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into()),
                 ],
             )
             .await
@@ -10015,7 +10015,7 @@ mod tests {
         );
         assert_eq!(
             result.rows()[0].value("lixcol_metadata").unwrap(),
-            &Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into())
+            &Value::Jsonb(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into())
         );
         assert_eq!(result.rows()[1].get::<String>("id").unwrap(), b);
         assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");

@@ -13,8 +13,8 @@ export type WireValue =
 	| { kind: "int"; value: number }
 	| { kind: "float"; value: number }
 	| { kind: "text"; value: string }
-	| { kind: "json"; value: unknown }
-	| { kind: "timestamp"; value: string }
+	| { kind: "jsonb"; value: unknown }
+	| { kind: "timestamptz"; value: string }
 	| { kind: "blob"; base64: string };
 
 export type WireRequestBlobSplice = {
@@ -179,10 +179,10 @@ export function encodeWireValue(value: NativeLixValue): WireValue {
 			return { kind: "float", value: value.value };
 		case "text":
 			return { kind: "text", value: value.value };
-		case "json":
-			return { kind: "json", value: value.value };
-		case "timestamp":
-			return { kind: "timestamp", value: value.value };
+		case "jsonb":
+			return { kind: "jsonb", value: value.value };
+		case "timestamptz":
+			return { kind: "timestamptz", value: value.value };
 		case "blob":
 			return { kind: "blob", base64: bytesToBase64(value.blob) };
 	}
@@ -581,14 +581,14 @@ function decodeWireValue(value: unknown): NativeLixValue {
 				throw protocolError("text wire value is invalid");
 			}
 			return { kind: "text", value: wire.value };
-		case "json":
-			assertJsonValue(wire.value, "json wire value");
-			return { kind: "json", value: wire.value };
-		case "timestamp":
+		case "jsonb":
+			assertJsonValue(wire.value, "jsonb wire value");
+			return { kind: "jsonb", value: wire.value };
+		case "timestamptz":
 			if (typeof wire.value !== "string") {
-				throw protocolError("timestamp wire value is invalid");
+				throw protocolError("timestamptz wire value is invalid");
 			}
-			return { kind: "timestamp", value: wire.value };
+			return { kind: "timestamptz", value: wire.value };
 		case "blob":
 			if (typeof wire.base64 !== "string") {
 				throw protocolError("blob wire value is invalid");

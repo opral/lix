@@ -121,8 +121,8 @@ enum StoredValue {
     Integer(i64),
     Real(f64),
     Text(String),
-    Json(crate::Json),
-    Timestamp(i64),
+    Jsonb(crate::Json),
+    Timestamptz(i64),
     Blob(String),
 }
 
@@ -142,8 +142,8 @@ impl StoredValue {
                 Self::Real(*value)
             }
             Value::Text(value) => Self::Text(value.clone()),
-            Value::Json(value) => Self::Json(value.clone()),
-            Value::Timestamp(value) => Self::Timestamp(*value),
+            Value::Jsonb(value) => Self::Jsonb(value.clone()),
+            Value::Timestamptz(value) => Self::Timestamptz(*value),
             Value::Blob(value) => Self::Blob(BASE64.encode(value.as_ref())),
         })
     }
@@ -155,8 +155,8 @@ impl StoredValue {
             Self::Integer(value) => Value::Integer(value),
             Self::Real(value) => Value::Real(value),
             Self::Text(value) => Value::Text(value),
-            Self::Json(value) => Value::Json(value),
-            Self::Timestamp(value) => Value::Timestamp(value),
+            Self::Jsonb(value) => Value::Jsonb(value),
+            Self::Timestamptz(value) => Value::Timestamptz(value),
             Self::Blob(value) => Value::Blob(
                 BASE64
                     .decode(value.as_bytes())
@@ -390,6 +390,8 @@ mod tests {
             Value::Integer(-42),
             Value::Real(1.5),
             Value::Text("text".to_owned()),
+            Value::Jsonb(serde_json::json!({"nested": [true, 42]}).into()),
+            Value::Timestamptz(1_700_000_000_123_456),
             Value::Blob(Blob::from(vec![0u8, 255, 1, 128, 7])),
         ];
         assert_eq!(roundtrip(values.clone()), values);

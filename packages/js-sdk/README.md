@@ -203,7 +203,7 @@ try {
   instead. Worker-scoped headers keep those permissions out of the page.
 
 - SQL parameters use normal JavaScript values: `string`, finite `number`, `boolean`, `Uint8Array`, `null`, JSON-compatible arrays, and JSON-compatible plain objects.
-- Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.json(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
+- Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.jsonb(...)`, `Value.timestamptz(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
 
 ## Browser development
 

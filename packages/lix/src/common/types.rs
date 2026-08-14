@@ -479,10 +479,10 @@ pub enum Value {
     Integer(i64),
     Real(f64),
     Text(String),
-    Json(Json),
+    Jsonb(Json),
     /// PostgreSQL `timestamptz`, represented losslessly as signed UTC
     /// microseconds since the Unix epoch.
-    Timestamp(i64),
+    Timestamptz(i64),
     Blob(Blob),
 }
 
@@ -552,10 +552,10 @@ mod tests {
     #[test]
     fn json_values_serialize_their_retained_bytes_verbatim() {
         let canonical = r#"{"a":1,"b":[true,null],"c":"x"}"#;
-        let value = Value::Json(Json::from_canonical_text(canonical));
+        let value = Value::Jsonb(Json::from_canonical_text(canonical));
 
         let encoded = serde_json::to_string(&value).expect("value serializes");
-        assert_eq!(encoded, format!(r#"{{"Json":{canonical}}}"#));
+        assert_eq!(encoded, format!(r#"{{"Jsonb":{canonical}}}"#));
     }
 
     #[test]

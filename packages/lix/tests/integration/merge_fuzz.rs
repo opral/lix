@@ -58,7 +58,7 @@ simulation_test!(
                     "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
                     &[
                         Value::Text(fast_forward_key.clone()),
-                        Value::Json(fast_forward_value.clone().into()),
+                        Value::Jsonb(fast_forward_value.clone().into()),
                     ],
                 )
                 .await
@@ -193,7 +193,7 @@ async fn mutate_lane(
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                &[Value::Text(key.clone()), Value::Json(value.clone().into())],
+                &[Value::Text(key.clone()), Value::Jsonb(value.clone().into())],
             )
             .await
             .unwrap_or_else(|error| panic!("{label}: upsert failed: {error:?}"));
@@ -221,7 +221,7 @@ async fn assert_state(
         .collect::<Vec<_>>();
     let expected = expected
         .iter()
-        .map(|(key, value)| vec![Value::Text(key.clone()), Value::Json(value.clone().into())])
+        .map(|(key, value)| vec![Value::Text(key.clone()), Value::Jsonb(value.clone().into())])
         .collect::<Vec<_>>();
     assert_eq!(actual, expected, "{label}: branch state diverged");
 }

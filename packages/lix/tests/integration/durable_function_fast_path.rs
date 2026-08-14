@@ -183,7 +183,7 @@ async fn pure_reads_do_not_advance_and_durable_reads_still_persist_deterministic
         .value("value")
         .expect("timestamp should be present")
         .clone();
-    assert_eq!(first_timestamp, Value::Timestamp(1_000));
+    assert_eq!(first_timestamp, Value::Timestamptz(1_000));
 
     let next_uuid = session
         .execute("SELECT uuidv7() AS value", &[])

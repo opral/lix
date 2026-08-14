@@ -63,7 +63,7 @@ fn assert_key_value_row(event: &ObserveEvent, key: &str, value: &str) {
         event.rows.rows()[0].values(),
         &[
             Value::Text(key.to_string()),
-            Value::Json(json!(value).into()),
+            Value::Jsonb(json!(value).into()),
         ]
     );
 }
@@ -1186,7 +1186,7 @@ simulation_test!(
             update.rows.rows()[0].values(),
             &[
                 Value::Text("lix_deterministic_sequence_number".to_string()),
-                Value::Json(json!(0).into()),
+                Value::Jsonb(json!(0).into()),
             ]
         );
     }

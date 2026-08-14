@@ -465,6 +465,7 @@ Constructors:
 | `Value.boolean(value)` | Create a boolean value.                                                      |
 | `Value.real(value)`    | Create a real number value.                                                  |
 | `Value.text(value)`    | Create a text value.                                                         |
-| `Value.json(value)`    | Create a JSON value.                                                         |
+| `Value.jsonb(value)`   | Create a JSONB value.                                                        |
+| `Value.timestamptz(value)` | Create a timestamptz value from an RFC 3339 string.                    |
 | `Value.blob(value)`    | Create a blob value from `Uint8Array`.                                       |
 | `Value.from(raw)`      | Convert a JSON-compatible JS value, `Uint8Array`, or `Value` into a `Value`. |

@@ -29,8 +29,8 @@ enum PreparedDmlValueKind {
     Integer,
     Real,
     Text,
-    Json,
-    Timestamp,
+    Jsonb,
+    Timestamptz,
     Blob,
 }
 
@@ -51,8 +51,8 @@ pub(crate) enum PreparedDmlValueRef<'a> {
     Integer(i64),
     Real(f64),
     Text(&'a str),
-    Json(&'a [u8]),
-    Timestamp(i64),
+    Jsonb(&'a [u8]),
+    Timestamptz(i64),
     Blob(&'a [u8]),
 }
 
@@ -146,9 +146,9 @@ impl PreparedDmlParameterBatch {
                     )
                 })?)
             }
-            PreparedDmlValueKind::Json => PreparedDmlValueRef::Json(self.slice(cell)),
-            PreparedDmlValueKind::Timestamp => {
-                PreparedDmlValueRef::Timestamp(i64::from_le_bytes(cell.scalar))
+            PreparedDmlValueKind::Jsonb => PreparedDmlValueRef::Jsonb(self.slice(cell)),
+            PreparedDmlValueKind::Timestamptz => {
+                PreparedDmlValueRef::Timestamptz(i64::from_le_bytes(cell.scalar))
             }
             PreparedDmlValueKind::Blob => PreparedDmlValueRef::Blob(self.slice(cell)),
         };
@@ -174,9 +174,9 @@ impl PreparedDmlParameterBatch {
                     std::str::from_utf8_unchecked(self.slice(cell))
                 })
             }
-            PreparedDmlValueKind::Json => PreparedDmlValueRef::Json(self.slice(cell)),
-            PreparedDmlValueKind::Timestamp => {
-                PreparedDmlValueRef::Timestamp(i64::from_le_bytes(cell.scalar))
+            PreparedDmlValueKind::Jsonb => PreparedDmlValueRef::Jsonb(self.slice(cell)),
+            PreparedDmlValueKind::Timestamptz => {
+                PreparedDmlValueRef::Timestamptz(i64::from_le_bytes(cell.scalar))
             }
             PreparedDmlValueKind::Blob => PreparedDmlValueRef::Blob(self.slice(cell)),
         }
@@ -199,15 +199,15 @@ impl PreparedDmlParameterBatch {
                 PreparedDmlValueRef::Integer(value) => Ok(Value::Integer(value)),
                 PreparedDmlValueRef::Real(value) => Ok(Value::Real(value)),
                 PreparedDmlValueRef::Text(value) => Ok(Value::Text(value.to_owned())),
-                PreparedDmlValueRef::Json(value) => serde_json::from_slice(value)
-                    .map(Value::Json)
+                PreparedDmlValueRef::Jsonb(value) => serde_json::from_slice(value)
+                    .map(Value::Jsonb)
                     .map_err(|error| {
                         LixError::new(
                             LixError::CODE_INVALID_PARAM,
                             format!("prepared DML JSON parameter is invalid: {error}"),
                         )
                     }),
-                PreparedDmlValueRef::Timestamp(value) => Ok(Value::Timestamp(value)),
+                PreparedDmlValueRef::Timestamptz(value) => Ok(Value::Timestamptz(value)),
                 PreparedDmlValueRef::Blob(value) => Ok(Value::Blob(Blob::from(value.to_vec()))),
             })
             .collect()
@@ -238,8 +238,8 @@ impl PreparedDmlParameterBatch {
                 cell.kind = PreparedDmlValueKind::Text;
                 Self::set_bytes(&mut cell, bytes, value.as_bytes())?;
             }
-            Value::Json(value) => {
-                cell.kind = PreparedDmlValueKind::Json;
+            Value::Jsonb(value) => {
+                cell.kind = PreparedDmlValueKind::Jsonb;
                 let encoded = serde_json::to_vec(&value).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
@@ -248,8 +248,8 @@ impl PreparedDmlParameterBatch {
                 })?;
                 Self::set_bytes(&mut cell, bytes, &encoded)?;
             }
-            Value::Timestamp(value) => {
-                cell.kind = PreparedDmlValueKind::Timestamp;
+            Value::Timestamptz(value) => {
+                cell.kind = PreparedDmlValueKind::Timestamptz;
                 cell.scalar = value.to_le_bytes();
             }
             Value::Blob(value) => {
@@ -301,7 +301,7 @@ mod tests {
             Value::Integer(7),
             Value::Real(1.5),
             Value::Text("text".to_string()),
-            Value::Json(serde_json::json!({"ok": true}).into()),
+            Value::Jsonb(serde_json::json!({"ok": true}).into()),
             Value::Blob(Blob::from(vec![1_u8, 2, 3])),
         ]])
         .expect("rectangular parameter batch");
@@ -321,7 +321,7 @@ mod tests {
             batch.get(0, 4),
             Ok(PreparedDmlValueRef::Text("text"))
         ));
-        assert!(matches!(batch.get(0, 5), Ok(PreparedDmlValueRef::Json(_))));
+        assert!(matches!(batch.get(0, 5), Ok(PreparedDmlValueRef::Jsonb(_))));
         assert!(
             matches!(batch.get(0, 6), Ok(PreparedDmlValueRef::Blob(bytes)) if bytes == [1, 2, 3])
         );

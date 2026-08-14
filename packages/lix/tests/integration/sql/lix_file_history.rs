@@ -605,7 +605,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
         result.rows()[0].get::<Value>("path").unwrap(),
         Value::Text("/renamed/child/target.txt".to_string())
     );
-    let Value::Json(sources) = result.rows()[0]
+    let Value::Jsonb(sources) = result.rows()[0]
         .get::<Value>("lixcol_source_changes")
         .unwrap()
     else {
@@ -701,7 +701,7 @@ simulation_test!(
             renamed_file.rows()[0].get::<Value>("path").unwrap(),
             Value::Text("/archive/docs/guides/readme.md".to_string())
         );
-        let Value::Json(rename_sources) = renamed_file.rows()[0]
+        let Value::Jsonb(rename_sources) = renamed_file.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
@@ -849,7 +849,7 @@ simulation_test!(
             file_row.rows()[0].get::<Value>("path").unwrap(),
             Value::Text("/renamed-root/renamed-child/renamed.txt".to_string())
         );
-        let Value::Json(file_sources) = file_row.rows()[0]
+        let Value::Jsonb(file_sources) = file_row.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
@@ -884,7 +884,7 @@ simulation_test!(
             .await
             .expect("grouped directory history should load");
         assert_eq!(directory_row.len(), 1);
-        let Value::Json(directory_sources) = directory_row.rows()[0]
+        let Value::Jsonb(directory_sources) = directory_row.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
@@ -1060,7 +1060,7 @@ simulation_test!(
             .expect("deleted descendant file history should load");
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted.rows()[0].get::<Value>("path").unwrap(), Value::Null);
-        let Value::Json(delete_sources) = deleted.rows()[0]
+        let Value::Jsonb(delete_sources) = deleted.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
@@ -1133,7 +1133,7 @@ simulation_test!(
             restored.rows()[0].get::<Value>("content").unwrap(),
             Value::Blob(b"y".to_vec().into())
         );
-        let Value::Json(restore_sources) = restored.rows()[0]
+        let Value::Jsonb(restore_sources) = restored.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
@@ -1274,7 +1274,7 @@ simulation_test!(
         let source_changes = source_changes_result.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .expect("source_changes should be present");
-        let Value::Json(source_changes) = source_changes else {
+        let Value::Jsonb(source_changes) = source_changes else {
             panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
         let source_changes = source_changes.to_value();
@@ -1453,7 +1453,7 @@ simulation_test!(
                 let source_changes = row
                     .get::<Value>("lixcol_source_changes")
                     .expect("source changes should exist");
-                let Value::Json(source_changes) = source_changes else {
+                let Value::Jsonb(source_changes) = source_changes else {
                     panic!("source changes should be JSON, got {source_changes:?}");
                 };
                 let source_changes = source_changes.to_value();
@@ -1858,7 +1858,7 @@ simulation_test!(
                 Value::Blob(b"blob2".to_vec().into()),
             ]
         );
-        let Value::Json(latest_sources) = &latest[3] else {
+        let Value::Jsonb(latest_sources) = &latest[3] else {
             panic!("latest source changes should be JSON, got {:?}", latest[3]);
         };
         let latest_sources = latest_sources.to_value();
@@ -1868,7 +1868,7 @@ simulation_test!(
             json!("lix_binary_blob_ref")
         );
 
-        let Value::Json(initial_sources) = &result.rows()[1].values()[3] else {
+        let Value::Jsonb(initial_sources) = &result.rows()[1].values()[3] else {
             panic!(
                 "initial source changes should be JSON, got {:?}",
                 result.rows()[1].values()[3]

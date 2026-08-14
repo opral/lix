@@ -117,7 +117,7 @@ simulation_test!(
             direct,
             vec![vec![
                 Value::Text("returning-direct".to_string()),
-                Value::Json(json!("before").into()),
+                Value::Jsonb(json!("before").into()),
             ]],
         );
 
@@ -157,11 +157,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("returning-like-a".to_string()),
-                    Value::Json(json!("A").into()),
+                    Value::Jsonb(json!("A").into()),
                 ],
                 vec![
                     Value::Text("returning-like-b".to_string()),
-                    Value::Json(json!("B").into()),
+                    Value::Jsonb(json!("B").into()),
                 ],
             ]
         );

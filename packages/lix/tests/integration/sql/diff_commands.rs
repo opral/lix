@@ -78,7 +78,7 @@ simulation_test!(
             .await,
             vec![vec![
                 Value::Text("b".to_string()),
-                Value::Json(json!("two").into()),
+                Value::Jsonb(json!("two").into()),
             ]]
         );
 
@@ -180,7 +180,7 @@ simulation_test!(
              WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
             )
             .await,
-            vec![vec![Value::Json(json!(["b"]).into())]]
+            vec![vec![Value::Jsonb(json!(["b"]).into())]]
         );
         assert_eq!(
             select_rows(
@@ -191,11 +191,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("a".to_string()),
-                    Value::Json(json!("one").into())
+                    Value::Jsonb(json!("one").into())
                 ],
                 vec![
                     Value::Text("b".to_string()),
-                    Value::Json(json!("two").into())
+                    Value::Jsonb(json!("two").into())
                 ],
             ]
         );

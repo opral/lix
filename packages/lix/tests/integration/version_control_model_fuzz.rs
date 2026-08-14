@@ -627,7 +627,7 @@ async fn upsert(session: &SimSession, key: &str, value: &JsonValue, label: &str)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             &[
                 Value::Text(key.to_string()),
-                Value::Json(value.clone().into()),
+                Value::Jsonb(value.clone().into()),
             ],
         )
         .await
@@ -664,7 +664,7 @@ async fn assert_state(
         .collect::<Vec<_>>();
     let expected = expected
         .iter()
-        .map(|(key, value)| vec![Value::Text(key.clone()), Value::Json(value.clone().into())])
+        .map(|(key, value)| vec![Value::Text(key.clone()), Value::Jsonb(value.clone().into())])
         .collect::<Vec<_>>();
     assert_eq!(actual, expected, "{label}: state diverged from the model");
 }

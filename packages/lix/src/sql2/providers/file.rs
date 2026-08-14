@@ -760,7 +760,7 @@ pub(crate) async fn execute_exact_lix_file_root_listing(
                 Value::Text(entry.id().to_string()),
                 Value::Text(entry.path.clone()),
                 Value::Text(entry.name.clone()),
-                metadata.map_or(Value::Null, |metadata| Value::Json(metadata.into())),
+                metadata.map_or(Value::Null, |metadata| Value::Jsonb(metadata.into())),
                 Value::Text(entry.updated_at().to_string()),
             ])
         })

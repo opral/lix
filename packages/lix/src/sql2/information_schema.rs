@@ -19,7 +19,7 @@ use super::catalog::PublicSurfaceKind;
 use super::catalog::{PublicCatalog, PublicColumnInsertPolicy};
 use super::result_metadata::field_is_json;
 
-const LIX_VALUE_KIND_JSON: &str = "JSON";
+const LIX_VALUE_KIND_JSONB: &str = "JSONB";
 const TABLE_FUNCTIONS: &str = "table_functions";
 
 /// Installs Lix's SQL-level column contract while retaining DataFusion's other
@@ -204,7 +204,7 @@ impl LixInformationSchemaProvider {
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if column.read_nullable { "YES" } else { "NO" }.to_string());
                 data_type.push(public_sql_type(field.data_type()));
-                lix_value_kind.push(field_is_json(field).then(|| LIX_VALUE_KIND_JSON.to_string()));
+                lix_value_kind.push(field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()));
             }
         }
 
@@ -379,7 +379,7 @@ impl ColumnsRows {
             self.datetime_precision.push(None);
             self.interval_type.push(None);
             self.lix_value_kind
-                .push(field_is_json(field).then(|| LIX_VALUE_KIND_JSON.to_string()));
+                .push(field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()));
             self.lix_insert_policy
                 .push(insert_policy.as_str().to_string());
         }

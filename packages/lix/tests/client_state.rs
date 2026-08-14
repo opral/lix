@@ -114,7 +114,7 @@ async fn client_state_delete_is_idempotent_and_builtin_keys_are_excluded() {
     assert_eq!(builtin.len(), 1, "the built-in lix_id row remains intact");
     assert!(matches!(
         builtin.rows()[0].value("value"),
-        Ok(Value::Json(_))
+        Ok(Value::Jsonb(_))
     ));
 
     client_state

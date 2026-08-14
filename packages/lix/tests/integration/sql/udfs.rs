@@ -119,7 +119,7 @@ simulation_test!(
             .expect("stored branch should read");
         assert_eq!(
             stored.rows()[0].value("value").unwrap(),
-            &Value::Json(json!("01930000-0000-7000-8000-000000000016").into())
+            &Value::Jsonb(json!("01930000-0000-7000-8000-000000000016").into())
         );
     }
 );
@@ -167,7 +167,7 @@ simulation_test!(
             .expect("stored active head should read");
         assert_eq!(
             stored.rows()[0].value("value").unwrap(),
-            &Value::Json(json!(expected.clone()).into())
+            &Value::Jsonb(json!(expected.clone()).into())
         );
     }
 );

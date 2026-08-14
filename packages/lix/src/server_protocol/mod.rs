@@ -7626,15 +7626,15 @@ mod tests {
         assert_eq!(body[0]["rowsAffected"], 1);
         assert_eq!(
             body[0]["rows"][0][1],
-            json!({ "kind": "json", "value": "one" })
+            json!({ "kind": "jsonb", "value": "one" })
         );
         assert_eq!(
             body[1]["rows"][0][1],
-            json!({ "kind": "json", "value": "two" })
+            json!({ "kind": "jsonb", "value": "two" })
         );
         assert_eq!(
             body[2]["rows"][0][0],
-            json!({ "kind": "json", "value": "two" })
+            json!({ "kind": "jsonb", "value": "two" })
         );
 
         let failed = request(
@@ -8354,8 +8354,8 @@ mod tests {
         let first_value = response_json(visible_from_first).await["rows"][0][0].clone();
         assert_eq!(first_value, second_value);
         assert!([
-            json!({ "kind": "json", "value": "first" }),
-            json!({ "kind": "json", "value": "second" }),
+            json!({ "kind": "jsonb", "value": "first" }),
+            json!({ "kind": "jsonb", "value": "second" }),
         ]
         .contains(&first_value));
     }

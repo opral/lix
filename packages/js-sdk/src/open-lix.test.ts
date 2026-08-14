@@ -1639,7 +1639,7 @@ test("execute round-trips Uint8Array blob parameters", async () => {
 
 test("Value and Row return copies for structured values", async () => {
 	const source = { nested: { ok: true } };
-	const value = Value.json(source);
+	const value = Value.jsonb(source);
 	source.nested.ok = false;
 
 	const first = value.toJS() as { nested: { ok: boolean } };
@@ -1700,10 +1700,10 @@ test("information_schema.columns SELECT * exposes the Lix column contract", asyn
 test("execute rejects invalid explicit Value parameters", async () => {
 	const lix = await openLix();
 
-	expect(() => Value.json({ nested: undefined } as never)).toThrow(
+	expect(() => Value.jsonb({ nested: undefined } as never)).toThrow(
 		/undefined is not a valid SQL parameter/,
 	);
-	expect(() => Value.json(new Map() as never)).toThrow(
+	expect(() => Value.jsonb(new Map() as never)).toThrow(
 		/plain objects or arrays/,
 	);
 	expect(() => Value.integer(1.5)).toThrow(

@@ -343,10 +343,10 @@ mod tests {
         params
             .iter()
             .map(|param| match param {
-                DifferentialParam::Json(value) => {
+                DifferentialParam::Jsonb(value) => {
                     let value =
                         serde_json::from_str(value).expect("differential JSON param should parse");
-                    Value::Json(value)
+                    Value::Jsonb(value)
                 }
                 DifferentialParam::Text(value) => Value::Text((*value).to_string()),
                 DifferentialParam::Blob(value) => Value::Blob((*value).to_vec().into()),

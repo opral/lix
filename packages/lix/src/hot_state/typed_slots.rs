@@ -32,10 +32,10 @@
 //! # Scalar columns only, by design
 //!
 //! `String`, `Integer`, `Number` and `Boolean` columns get typed payloads.
-//! `Json`-declared columns keep their JSON text verbatim in a `Json` slot:
+//! `Jsonb`-declared columns keep their JSON text verbatim in a `Jsonb` slot:
 //! `lix_key_value.value` and `json_pointer.value` are arbitrary JSON by design
-//! — a `::json` column, not a value of unknown type — and this format
-//! deliberately does not introduce a tagged any-slot to cover them. A `Json`
+//! — a `::jsonb` column, not a value of unknown type — and this format
+//! deliberately does not introduce a tagged any-slot to cover them. A `Jsonb`
 //! slot is a byte range a reader can hand back or re-parse exactly as it does
 //! today; nothing about it gets worse, and nothing about it pretends to be
 //! typed.
@@ -81,13 +81,13 @@ const TAG_I64: u8 = 4;
 const TAG_U64: u8 = 5;
 const TAG_F64: u8 = 6;
 const TAG_STR: u8 = 7;
-const TAG_JSON: u8 = 8;
+const TAG_JSONB: u8 = 8;
 
 
 // Counted at every point on the decode path that hands bytes to a JSON
 // tokenizer, so a test can assert that reading columns out of a typed record
 // tokenized nothing rather than inspecting the code and believing it. Only a
-// `Json`-declared slot can move this counter; a scalar slot decodes to a value
+// `Jsonb`-declared slot can move this counter; a scalar slot decodes to a value
 // without a parser ever seeing its bytes.
 #[cfg(test)]
 thread_local! {
@@ -125,12 +125,12 @@ pub(crate) enum DeclaredType {
     Number,
     Boolean,
     /// Arbitrary JSON by design. Stored as verbatim JSON text.
-    Json,
+    Jsonb,
 }
 
 impl DeclaredType {
     pub(crate) fn is_scalar(self) -> bool {
-        !matches!(self, Self::Json)
+        !matches!(self, Self::Jsonb)
     }
 }
 
@@ -248,8 +248,8 @@ pub(crate) enum TypedSlot<'a> {
     U64(u64),
     F64(f64),
     Str(&'a str),
-    /// Verbatim JSON text for a `Json`-declared column.
-    Json(&'a str),
+    /// Verbatim JSON text for a `Jsonb`-declared column.
+    Jsonb(&'a str),
 }
 
 impl TypedSlot<'_> {
@@ -331,17 +331,17 @@ pub(crate) fn encode_typed_slots(
                     ))
                 })?;
                 bytes.extend_from_slice(rendered.as_bytes());
-                TAG_JSON
+                TAG_JSONB
             }
         };
-        // A `Json`-declared column holding a scalar still stores JSON text, so
+        // A `Jsonb`-declared column holding a scalar still stores JSON text, so
         // reconstruction reproduces the value without consulting the layout.
         let tag = if declared.is_scalar() {
             tag
         } else {
             match tag {
                 TAG_ABSENT | TAG_NULL => tag,
-                TAG_JSON => TAG_JSON,
+                TAG_JSONB => TAG_JSONB,
                 _ => {
                     // Rewind the scalar payload just written and re-emit it as
                     // JSON text.
@@ -355,7 +355,7 @@ pub(crate) fn encode_typed_slots(
                         ))
                     })?;
                     bytes.extend_from_slice(rendered.as_bytes());
-                    TAG_JSON
+                    TAG_JSONB
                 }
             }
         };
@@ -492,7 +492,7 @@ impl<'a> TypedSlotsRef<'a> {
             TAG_U64 => TypedSlot::U64(u64::from_be_bytes(fixed_eight(payload, index)?)),
             TAG_F64 => TypedSlot::F64(f64::from_be_bytes(fixed_eight(payload, index)?)),
             TAG_STR => TypedSlot::Str(utf8(payload, index)?),
-            TAG_JSON => TypedSlot::Json(utf8(payload, index)?),
+            TAG_JSONB => TypedSlot::Jsonb(utf8(payload, index)?),
             other => {
                 return Err(TypedSlotError::new(format!(
                     "typed slot {index} carries unknown tag {other}"
@@ -541,7 +541,7 @@ impl<'a> TypedSlotsRef<'a> {
                         ))
                     })?,
                 TypedSlot::Str(value) => JsonValue::String(value.to_string()),
-                TypedSlot::Json(value) => {
+                TypedSlot::Jsonb(value) => {
                     record_typed_slots_json_parse();
                     serde_json::from_str(value).map_err(|error| {
                         TypedSlotError::new(format!(
@@ -595,7 +595,7 @@ impl<'a> TypedSlotsRef<'a> {
                         ))
                     })?,
                 TypedSlot::Str(value) => JsonValue::String(value.to_string()),
-                TypedSlot::Json(value) => {
+                TypedSlot::Jsonb(value) => {
                     record_typed_slots_json_parse();
                     serde_json::from_str(value).map_err(|error| {
                         TypedSlotError::new(format!(
@@ -650,7 +650,7 @@ mod tests {
             ("ratio".to_string(), DeclaredType::Number),
             ("enabled".to_string(), DeclaredType::Boolean),
             ("label".to_string(), DeclaredType::String),
-            ("payload".to_string(), DeclaredType::Json),
+            ("payload".to_string(), DeclaredType::Jsonb),
         ])
         .expect("layout")
     }
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(full["count"], projected["count"]);
     }
 
-    /// A `Json`-declared column is the one slot that still reaches a parser, and
+    /// A `Jsonb`-declared column is the one slot that still reaches a parser, and
     /// only when the predicate actually names it. This pins that the exemption
     /// is scoped to the column rather than to the record.
     #[test]
@@ -802,7 +802,7 @@ mod tests {
             record
                 .slot(layout.index_of("payload").expect("payload"))
                 .expect("payload"),
-            TypedSlot::Json(r#"{"nested":[1,2]}"#)
+            TypedSlot::Jsonb(r#"{"nested":[1,2]}"#)
         );
     }
 

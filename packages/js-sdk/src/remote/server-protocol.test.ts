@@ -30,18 +30,34 @@ test("remote executeBatch requires positional metadata and preserves labels", ()
 
 test("remote timestamps preserve their RFC 3339 representation", () => {
 	const value = "2026-08-13T18:42:01.123456Z";
-	expect(encodeWireValue({ kind: "timestamp", value })).toEqual({
-		kind: "timestamp",
+	expect(encodeWireValue({ kind: "timestamptz", value })).toEqual({
+		kind: "timestamptz",
 		value,
 	});
 	expect(
 		decodeExecuteResult({
 			columns: ["created_at"],
-			rows: [[{ kind: "timestamp", value }]],
+			rows: [[{ kind: "timestamptz", value }]],
 			rowsAffected: 0,
 			notices: [],
 		}).rows[0]?.[0],
-	).toEqual({ kind: "timestamp", value });
+	).toEqual({ kind: "timestamptz", value });
+});
+
+test("remote decoding rejects legacy json and timestamp wire kinds", () => {
+	for (const value of [
+		{ kind: "json", value: { ok: true } },
+		{ kind: "timestamp", value: "2026-08-13T18:42:01Z" },
+	]) {
+		expect(() =>
+			decodeExecuteResult({
+				columns: ["value"],
+				rows: [[value]],
+				rowsAffected: 0,
+				notices: [],
+			}),
+		).toThrow(`unknown wire value kind: ${value.kind}`);
+	}
 });
 
 test("remote blobs use native typed-array base64 when available", () => {
