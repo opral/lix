@@ -1223,36 +1223,12 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
     sweep::<RocksDB>(Workload::from_env());
 }
 
-/// The same sweep, the same invariants and the same null control against the
-/// other shipping adapter.
+/// The durable SlateDB crash-consistency qualification.
 ///
-/// Scope note, stated rather than implied: this runs SlateDB over a
-/// **local-filesystem** object store (`SlateDB::open`, which is
-/// `LocalFileSystem` under the hood — `slatedb.rs:2366-2402`). For *performance*
-/// that configuration is misleading and the round's rules forbid quoting it as
-/// "the SlateDB result". For *crash consistency* it is the legitimate
-/// configuration and the only one this qualification can express: the kill has
-/// to interrupt a real writer process with real bytes crossing a real process
-/// boundary, and the object-store simulation used by the benches
-/// (`ThrottledStore` over `InMemory`) keeps every byte inside the dying
-/// process's heap, so "killed mid-upload" is not even representable there.
-#[cfg(feature = "slatedb")]
-#[test]
-fn slatedb_publication_window_survives_sigkill_at_every_storage_event() {
-    sweep::<SlateDB>(Workload::from_env());
-}
-
-/// The durable half of the SlateDB arm, and the reason the sweep above reports
-/// lost acknowledgements instead of failing on them.
-///
-/// Identical backend, identical workload, identical kill schedule; the only
-/// difference is that every write transaction sets
-/// `WriteOptions::await_durable`. The sweep above measures what a SQL commit
-/// gets today (acknowledged off an in-process queue, so SIGKILL takes it back);
-/// this one measures what the flag buys (acknowledged only after the WAL SST is
-/// in the object store, so SIGKILL cannot). Keeping both in the default run
-/// means the durable contract is a standing assertion rather than a one-off
-/// measurement in a PR body.
+/// Every write transaction sets `WriteOptions::await_durable`, so it is
+/// acknowledged only after the WAL SST is in the object store and SIGKILL
+/// cannot take it back. Keeping this in the default run makes the durable
+/// contract a standing assertion rather than a one-off measurement.
 #[cfg(feature = "slatedb")]
 #[test]
 fn slatedb_durable_acknowledgement_survives_sigkill() {
