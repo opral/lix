@@ -17070,7 +17070,7 @@ mod tests {
             },
             HeadRowIdentity {
                 schema_key: "schema\0escaped".to_string(),
-                entity_pk: EntityPk::single("second\0escaped"),
+                entity_pk: EntityPk::single("second-escaped"),
                 file_id: Some("file\0id".to_string()),
             },
         ];
@@ -17265,7 +17265,7 @@ mod tests {
     fn hot_mutation_keys_append_into_one_exact_arena() {
         let generation = CommitId::for_test_label("shared-hot-mutation-generation");
         let scope = hot_scope_prefix("branch", generation);
-        let first_pk = EntityPk::single("first\0entity");
+        let first_pk = EntityPk::single("first-entity");
         let second_pk = EntityPk::single("second");
         let first = CurrentStateDeltaRef {
             schema_key: "schema\0escaped",

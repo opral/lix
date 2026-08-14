@@ -1818,18 +1818,15 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 
 async function registerCrmTaskSchema(lix: Lix): Promise<void> {
 	const schema = {
-		$schema: "https://json-schema.org/draft/2020-12/schema",
-		"x-lix-key": "crm_task",
-		"x-lix-primary-key": ["/id"],
-		type: "object",
-		required: ["id", "title", "done"],
-		properties: {
-			id: { type: "string", "x-lix-default": "uuidv7()" },
-			title: { type: "string" },
-			done: { type: "boolean" },
-			meta: { type: "object" },
-		},
-		additionalProperties: false,
+		$schema: "https://lix.dev/schema-v1.json",
+		key: "crm_task",
+		columns: [
+			{ name: "id", type: "uuid", nullable: false, default_expression: "uuidv7()" },
+			{ name: "title", type: "text", nullable: false },
+			{ name: "done", type: "boolean", nullable: false },
+			{ name: "meta", type: "jsonb", nullable: true },
+		],
+		primary_key: ["id"],
 	} as const;
 
 	await lix.execute(

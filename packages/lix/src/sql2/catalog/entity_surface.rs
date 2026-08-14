@@ -412,32 +412,21 @@ mod tests {
         EntitySurfaceShape, derive_entity_surface_spec_from_schema, entity_surface_schema,
     };
 
-    fn path_value_schema(value_schema: serde_json::Value) -> serde_json::Value {
+    fn path_value_schema(value_type: &str) -> serde_json::Value {
         json!({
-            "x-lix-key": "arbitrary_name",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": value_schema
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "arbitrary_name",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": value_type, "nullable": false }
+            ],
+            "primary_key": ["path"]
         })
     }
 
     #[test]
     fn certifies_complete_path_value_rows_when_value_accepts_all_json() {
-        let spec = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "anyOf": [
-                { "type": "object" },
-                { "type": "array" },
-                { "type": "string" },
-                { "type": "number" },
-                { "type": "boolean" },
-                { "type": "null" }
-            ]
-        })))
+        let spec = derive_entity_surface_spec_from_schema(&path_value_schema("jsonb"))
         .expect("schema should derive");
 
         assert!(spec.certifies_path_value_replacement);
@@ -445,21 +434,19 @@ mod tests {
 
     #[test]
     fn columnar_snapshot_certificate_requires_exact_reversible_columns() {
-        let strings = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "type": "string"
-        })))
+        let strings = derive_entity_surface_spec_from_schema(&path_value_schema("text"))
         .expect("string schema should derive");
         assert!(strings.columnar_snapshot_bijective);
 
-        let numbers = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "type": "number"
-        })))
+        let numbers = derive_entity_surface_spec_from_schema(&path_value_schema("float8"))
         .expect("number schema should derive");
         assert!(!numbers.columnar_snapshot_bijective);
 
-        let mut reserved = path_value_schema(json!({ "type": "string" }));
-        reserved["properties"]["lixcol_user_value"] = json!({ "type": "string" });
-        reserved["required"] = json!(["path", "value", "lixcol_user_value"]);
+        let mut reserved = path_value_schema("text");
+        reserved["columns"]
+            .as_array_mut()
+            .expect("columns")
+            .push(json!({ "name": "lixcol_user_value", "type": "text", "nullable": true }));
         let reserved = derive_entity_surface_spec_from_schema(&reserved)
             .expect("reserved-name schema should still derive");
         assert!(!reserved.columnar_snapshot_bijective);
@@ -467,57 +454,31 @@ mod tests {
 
     #[test]
     fn does_not_certify_path_value_rows_with_value_constraints() {
-        let spec = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "type": "object"
-        })))
-        .expect("schema should derive");
-        assert!(!spec.certifies_path_value_replacement);
-
-        let mut schema = path_value_schema(json!({
-            "anyOf": [
-                { "type": "object" },
-                { "type": "array" },
-                { "type": "string" },
-                { "type": "number" },
-                { "type": "boolean" },
-                { "type": "null" }
-            ]
-        }));
-        schema
-            .as_object_mut()
-            .expect("object schema")
-            .insert("minProperties".to_string(), json!(3));
+        let schema = path_value_schema("text");
         let spec = derive_entity_surface_spec_from_schema(&schema).expect("schema should derive");
         assert!(!spec.certifies_path_value_replacement);
     }
 
     #[test]
-    fn history_identity_roots_are_non_null_even_for_nested_keys() {
+    fn history_primary_key_columns_are_non_null() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "localized_document",
-            "x-lix-primary-key": ["/identity/tenant", "/identity/id", "/locale"],
-            "type": "object",
-            "properties": {
-                "identity": {
-                    "type": "object",
-                    "properties": {
-                        "tenant": { "type": "string" },
-                        "id": { "type": "string" }
-                    },
-                    "required": ["tenant", "id"]
-                },
-                "locale": { "type": "string" },
-                "body": { "type": "string" }
-            },
-            "required": ["identity", "locale", "body"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "localized_document",
+            "columns": [
+                { "name": "tenant", "type": "text", "nullable": false },
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["tenant", "id", "locale"],
         }))
         .expect("schema should derive");
 
         let history = entity_surface_schema(&spec, EntitySurfaceShape::History);
         assert!(
             !history
-                .field_with_name("identity")
-                .expect("nested identity root")
+                .field_with_name("tenant")
+                .expect("first identity column")
                 .is_nullable()
         );
         assert!(
@@ -536,7 +497,7 @@ mod tests {
         let active = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         assert!(
             !active
-                .field_with_name("identity")
+                .field_with_name("tenant")
                 .expect("active identity input")
                 .is_nullable(),
             "read nullability is independent from omission/default input semantics"
@@ -546,15 +507,23 @@ mod tests {
     #[test]
     fn columnar_layout_fingerprint_distinguishes_string_from_json_utf8() {
         let string_spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "payload",
-            "type": "object",
-            "properties": { "value": { "type": "string" } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "payload",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("string spec");
         let json_spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "payload",
-            "type": "object",
-            "properties": { "value": { "type": ["string", "object"] } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "payload",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("json spec");
 
@@ -582,38 +551,47 @@ mod tests {
     fn indexed_columns_imply_inter_row_constraints() {
         let cases = [
             json!({
-                "x-lix-key": "bypass_pk_only",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_pk_only",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "payload", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": "bypass_unique",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-unique": [["/slug"]],
-                "type": "object",
-                "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_unique",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "slug", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
+                "unique": [["slug"]],
             }),
             json!({
-                "x-lix-key": "bypass_fk",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parentId"],
-                    "references": { "schemaKey": "bypass_pk_only", "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_fk",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": "bypass_pk_only", "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": { "id": { "type": "string" }, "parentId": { "type": "string" } }
             }),
             json!({
-                "x-lix-key": "bypass_composite_unique",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-unique": [["/a", "/b"]],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "a": { "type": "string" },
-                    "b": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_composite_unique",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "a", "type": "text", "nullable": true },
+                    { "name": "b", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
+                "unique": [["a", "b"]],
             }),
         ];
         for schema in cases {
@@ -626,11 +604,14 @@ mod tests {
         }
 
         let unique = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "bypass_unique",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"]],
-            "type": "object",
-            "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bypass_unique",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"]],
         }))
         .expect("spec");
         assert_eq!(

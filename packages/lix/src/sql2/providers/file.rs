@@ -9294,15 +9294,13 @@ mod tests {
         );
         let schema_json = format!(
             r#"{{
-                "x-lix-key": "{schema_key}",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {{
-                    "id": {{ "type": "string" }},
-                    "value": {{ "type": "string" }}
-                }},
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "{schema_key}",
+                "columns": [
+                    {{ "name": "id", "type": "text", "nullable": false }},
+                    {{ "name": "value", "type": "text", "nullable": false }}
+                ],
+                "primary_key": ["id"]
             }}"#
         );
 

@@ -184,16 +184,14 @@ simulation_test!(
                 .expect_err("JSON null typed entity metadata should be rejected on INSERT"),
         );
 
-        assert_invalid_metadata_error(
-            session
-                .execute(
+        session
+            .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
                      VALUES ('metadata-entity-lix-json-sql-null-insert', 'value', CAST(NULL AS JSONB))",
                     &[],
                 )
                 .await
-                .expect_err("CAST(NULL AS JSONB) metadata should be rejected as JSON null on INSERT"),
-        );
+                .expect("CAST(NULL AS JSONB) is SQL NULL metadata");
 
         session
             .execute(
@@ -304,7 +302,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_key_value \
-                 SET lixcol_metadata = lix_json_get(CAST('{}' AS JSONB), 'missing') \
+                 SET lixcol_metadata = CAST('{}' AS JSONB) -> 'missing' \
                  WHERE key = 'metadata-entity-update'",
                 &[],
             )
@@ -327,7 +325,7 @@ simulation_test!(
             session
                 .execute(
                     "UPDATE lix_key_value \
-                     SET lixcol_metadata = lix_json_get(CAST('{\"m\":null}' AS JSONB), 'm') \
+                     SET lixcol_metadata = CAST('{\"m\":null}' AS JSONB) -> 'm' \
                      WHERE key = 'metadata-entity-update'",
                     &[],
                 )
@@ -338,7 +336,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_key_value \
-                 SET lixcol_metadata = lix_json_get_text(CAST('{\"m\":null}' AS JSONB), 'm') \
+                 SET lixcol_metadata = CAST('{\"m\":null}' AS JSONB) ->> 'm' \
                  WHERE key = 'metadata-entity-update'",
                 &[],
             )
@@ -373,7 +371,7 @@ simulation_test!(
             session
                 .execute(
                     "UPDATE lix_key_value \
-                     SET lixcol_metadata = lix_json_get(CAST('{\"m\":\"{\\\"source\\\":\\\"json-string\\\"}\"}' AS JSONB), 'm') \
+                     SET lixcol_metadata = CAST('{\"m\":\"{\\\"source\\\":\\\"json-string\\\"}\"}' AS JSONB) -> 'm' \
                      WHERE key = 'metadata-entity-update'",
                     &[],
                 )
@@ -415,7 +413,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_key_value \
-                 SET lixcol_metadata = lix_json_get(CAST('\"{\\\"m\\\":{\\\"source\\\":\\\"json-string-root\\\"}}\"' AS JSONB), 'm') \
+                 SET lixcol_metadata = CAST('\"{\\\"m\\\":{\\\"source\\\":\\\"json-string-root\\\"}}\"' AS JSONB) -> 'm' \
                  WHERE key = 'metadata-entity-update'",
                 &[],
             )
@@ -458,17 +456,15 @@ simulation_test!(
                 .expect_err("JSON null typed entity metadata should be rejected on UPDATE"),
         );
 
-        assert_invalid_metadata_error(
-            session
-                .execute(
+        session
+            .execute(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = CAST(NULL AS JSONB) \
                      WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
-                .expect_err("CAST(NULL AS JSONB) metadata should be rejected as JSON null on UPDATE"),
-        );
+                .expect("CAST(NULL AS JSONB) is SQL NULL metadata on UPDATE");
 
         session
             .execute(

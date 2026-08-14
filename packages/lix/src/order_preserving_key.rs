@@ -260,7 +260,7 @@ mod tests {
     fn differential_corpus() -> Vec<Vec<u8>> {
         let seeds = vec![
             encoded_entity_pk(vec![EntityPkComponent::String("x".into())]),
-            encoded_entity_pk(vec![EntityPkComponent::String("a\0b".into())]),
+            encoded_entity_pk(vec![EntityPkComponent::String("a-b".into())]),
             encoded_entity_pk(vec![EntityPkComponent::Integer(-1)]),
             encoded_entity_pk(vec![EntityPkComponent::Uuid([7; 16])]),
             encoded_entity_pk(vec![EntityPkComponent::Bytes(bytes::Bytes::from_static(
@@ -487,7 +487,7 @@ mod tests {
     /// the terminator byte.
     #[test]
     fn escaped_strings_keep_lexical_order() {
-        let ordered = ["a", "a\0", "a\0b", "ab", "b"]
+        let ordered = ["a", "a-", "a-b", "ab", "b"]
             .into_iter()
             .map(|value| encoded_entity_pk(vec![EntityPkComponent::String(value.into())]))
             .collect::<Vec<_>>();

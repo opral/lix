@@ -35,16 +35,14 @@ async fn open_session() -> SessionContext<Memory> {
 
 async fn register(session: &SessionContext<Memory>, key: &str) {
     let schema = json!({
-        "x-lix-key": key,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "k": { "type": "string" },
-            "v": { "type": "object" }
-        },
-        "required": ["id", "k", "v"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": key,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "k", "type": "text", "nullable": false },
+            { "name": "v", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     session
         .execute(

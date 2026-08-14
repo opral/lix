@@ -384,17 +384,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "fixed_live",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "fixed_live",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(

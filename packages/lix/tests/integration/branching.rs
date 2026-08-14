@@ -1356,7 +1356,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"merge_task_item\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB)\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"merge_task_item\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB)\
                  )",
                 &[],
             )

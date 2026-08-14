@@ -4,7 +4,7 @@
 //! The shape is the inlang `selectBundleNested(...).where("bundle.id","=",id)`
 //! query from issue #1337: `bundle -> message -> variant`, two rows out. The
 //! first join's equality reaches `message` by ordinary constant propagation,
-//! but `variant."messageId"` can only be known once the message rows exist, so
+//! but `variant."message_id"` can only be known once the message rows exist, so
 //! before the probe-key access path the `variant` scan was unfiltered and the
 //! query read `2N+3` rows at N bundles.
 //!
@@ -24,7 +24,7 @@ use crate::{Memory, Value};
 /// overflows libtest's 2 MiB worker stack in the `test` profile.
 const POINT_JOIN_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
-const NESTED_BUNDLE_SQL: &str = r#"SELECT bundle.id AS "bundleId", bundle.declarations AS "bundleDeclarations", message.id AS "messageId", message.locale AS "messageLocale", variant.id AS "variantId", variant.pattern AS "variantPattern" FROM bundle LEFT JOIN message ON message."bundleId" = bundle.id LEFT JOIN variant ON variant."messageId" = message.id WHERE bundle.id = $1"#;
+const NESTED_BUNDLE_SQL: &str = r#"SELECT bundle.id AS "bundle_id", bundle.declarations AS "bundleDeclarations", message.id AS "message_id", message.locale AS "messageLocale", variant.id AS "variantId", variant.pattern AS "variantPattern" FROM bundle LEFT JOIN message ON message."bundle_id" = bundle.id LEFT JOIN variant ON variant."message_id" = message.id WHERE bundle.id = $1"#;
 
 /// Rows the three scans must examine for a bundle with two messages and one
 /// variant each: one bundle row, two message rows, two variant rows.
@@ -113,7 +113,7 @@ fn nested_bundle_point_lookup_preserves_left_join_null_extension() {
             .expect("insert variantless bundle");
         session
             .execute(
-                r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ('message-variantless', 'bundle-variantless', 'en', CAST('[]' AS JSONB))"#,
+                r#"INSERT INTO message (id, "bundle_id", locale, selectors) VALUES ('message-variantless', 'bundle-variantless', 'en', CAST('[]' AS JSONB))"#,
                 &[],
             )
             .await
@@ -175,9 +175,9 @@ async fn select_ids(session: &SessionContext<Memory>, bundle_id: &str) -> Vec<Ne
         .iter()
         .map(|row| {
             (
-                text(row.value("bundleId").expect("bundleId column"))
+                text(row.value("bundle_id").expect("bundle_id column"))
                     .expect("bundle id is never null"),
-                text(row.value("messageId").expect("messageId column")),
+                text(row.value("message_id").expect("message_id column")),
                 text(row.value("variantId").expect("variantId column")),
             )
         })
@@ -223,7 +223,7 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
             let message = format!("message-{index}-{locale}");
             session
                 .execute(
-                    r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ($1, $2, $3, CAST('[]' AS JSONB))"#,
+                    r#"INSERT INTO message (id, "bundle_id", locale, selectors) VALUES ($1, $2, $3, CAST('[]' AS JSONB))"#,
                     &[
                         Value::Text(message.clone()),
                         Value::Text(bundle.clone()),
@@ -234,7 +234,7 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
                 .expect("insert message");
             session
                 .execute(
-                    r#"INSERT INTO variant (id, "messageId", matches, pattern) VALUES ($1, $2, CAST('[]' AS JSONB), CAST('[{"type":"text","value":"fixture"}]' AS JSONB))"#,
+                    r#"INSERT INTO variant (id, "message_id", matches, pattern) VALUES ($1, $2, CAST('[]' AS JSONB), CAST('[{"type":"text","value":"fixture"}]' AS JSONB))"#,
                     &[
                         Value::Text(format!("variant-{index}-{locale}")),
                         Value::Text(message),
@@ -250,49 +250,43 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
 fn schemas() -> [serde_json::Value; 3] {
     [
         serde_json::json!({
-            "x-lix-key": "bundle",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "declarations": { "type": "array", "items": { "type": "object" }, "default": [] }
-            },
-            "required": ["id", "declarations"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bundle",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "declarations", "type": "jsonb", "nullable": false, "default_value": [] },
+            ],
+            "primary_key": ["id"],
         }),
         serde_json::json!({
-            "x-lix-key": "message",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/bundleId"],
-                "references": { "schemaKey": "bundle", "properties": ["/id"] }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "message",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "bundle_id", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+                { "name": "selectors", "type": "jsonb", "nullable": false, "default_value": [] },
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["bundle_id"],
+                "references": { "schema_key": "bundle", "columns": ["id"] }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "bundleId": { "type": "string" },
-                "locale": { "type": "string" },
-                "selectors": { "type": "array", "items": { "type": "object" }, "default": [] }
-            },
-            "required": ["id", "bundleId", "locale", "selectors"],
-            "additionalProperties": false
         }),
         serde_json::json!({
-            "x-lix-key": "variant",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/messageId"],
-                "references": { "schemaKey": "message", "properties": ["/id"] }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "variant",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "message_id", "type": "text", "nullable": false },
+                { "name": "matches", "type": "jsonb", "nullable": false, "default_value": [] },
+                { "name": "pattern", "type": "jsonb", "nullable": false, "default_value": [] },
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["message_id"],
+                "references": { "schema_key": "message", "columns": ["id"] }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "messageId": { "type": "string" },
-                "matches": { "type": "array", "items": { "type": "object" }, "default": [] },
-                "pattern": { "type": "array", "items": { "type": "object" }, "default": [] }
-            },
-            "required": ["id", "messageId", "matches", "pattern"],
-            "additionalProperties": false
         }),
     ]
 }

@@ -248,17 +248,14 @@ simulation_test!(
 
 async fn register_poison_task_schema(session: &SessionContext) {
     let schema = json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "x-lix-key": "poison_task",
-                "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "title", "meta"],
-        "properties": {
-            "id": { "type": "string" },
-            "title": { "type": "string" },
-            "meta": { "type": "object" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "poison_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
 
     session

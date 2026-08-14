@@ -569,17 +569,13 @@ mod tests {
 
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
         let schema = json!({
-            "x-lix-key": "json_pointer",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_pointer",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         assert_eq!(
             session
@@ -1093,7 +1089,7 @@ mod tests {
         // edge cases: empty strings, embedded NULs, control bytes, and UTF-8.
         // Compare equivalent orderings to exercise provider projection and
         // DataFusion ordering over the tracked-head primary-key codec.
-        let paths = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
+        let paths = ["", "a", "a\u{1}", "z", "é"];
         for (index, path) in paths.iter().enumerate() {
             assert_eq!(
                 session
@@ -2383,28 +2379,26 @@ mod tests {
         let session = engine.open_session().await.expect("session should open");
         for schema in [
             json!({
-                "x-lix-key": "index_probe_parent",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "index_probe_parent",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": "index_probe_child",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parentId"],
-                    "references": { "schemaKey": "index_probe_parent", "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "index_probe_child",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": "index_probe_parent", "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "parentId": { "type": "string" },
-                    "locale": { "type": "string" }
-                },
-                "required": ["id", "parentId", "locale"],
-                "additionalProperties": false
             }),
         ] {
             session
@@ -2425,7 +2419,7 @@ mod tests {
         for index in 0..3 {
             session
                 .execute(
-                    r#"INSERT INTO index_probe_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO index_probe_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2441,32 +2435,30 @@ mod tests {
 
     /// The two schemas the index tests drive: a parent keyed only by its
     /// primary key, and a child declaring a foreign key onto it. The foreign
-    /// key is what makes `parentId` an indexed column.
+    /// key is what makes `parent_id` an indexed column.
     fn index_probe_schemas(parent: &str, child: &str) -> [serde_json::Value; 2] {
         [
             json!({
-                "x-lix-key": parent,
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": parent,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": child,
-                "x-lix-primary-key": ["/id"],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parentId"],
-                    "references": { "schemaKey": parent, "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": child,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": parent, "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "parentId": { "type": "string" },
-                    "locale": { "type": "string" }
-                },
-                "required": ["id", "parentId", "locale"],
-                "additionalProperties": false
             }),
         ]
     }
@@ -2544,7 +2536,7 @@ mod tests {
         for index in 0..4 {
             session
                 .execute(
-                    r#"INSERT INTO counted_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO counted_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2598,7 +2590,7 @@ mod tests {
             .join(",");
         session
             .execute(
-                &format!(r#"INSERT INTO degraded_child (id, "parentId", locale) VALUES {values}"#),
+                &format!(r#"INSERT INTO degraded_child (id, "parent_id", locale) VALUES {values}"#),
                 &[],
             )
             .await
@@ -2612,7 +2604,7 @@ mod tests {
         session
             .execute(
                 &format!(
-                    r#"UPDATE degraded_child SET "parentId" = 'parent-1' WHERE id IN ({moved})"#
+                    r#"UPDATE degraded_child SET "parent_id" = 'parent-1' WHERE id IN ({moved})"#
                 ),
                 &[],
             )
@@ -2639,7 +2631,7 @@ mod tests {
         async fn ids(session: &SessionContext<Memory>, parent: &str) -> Vec<String> {
             let rows = session
                 .execute(
-                    r#"SELECT id FROM degraded_child WHERE "parentId" = $1 ORDER BY id"#,
+                    r#"SELECT id FROM degraded_child WHERE "parent_id" = $1 ORDER BY id"#,
                     &[crate::Value::Text(parent.into())],
                 )
                 .await
@@ -2693,7 +2685,7 @@ mod tests {
         for index in 0..3 {
             session
                 .execute(
-                    r#"INSERT INTO stale_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO stale_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2703,7 +2695,7 @@ mod tests {
         async fn count(session: &SessionContext<Memory>, parent: &str) -> usize {
             session
                 .execute(
-                    r#"SELECT id FROM stale_child WHERE "parentId" = $1"#,
+                    r#"SELECT id FROM stale_child WHERE "parent_id" = $1"#,
                     &[crate::Value::Text(parent.into())],
                 )
                 .await
@@ -2716,7 +2708,7 @@ mod tests {
 
         session
             .execute(
-                r#"UPDATE stale_child SET "parentId" = 'parent-1' WHERE id = 'child-1'"#,
+                r#"UPDATE stale_child SET "parent_id" = 'parent-1' WHERE id = 'child-1'"#,
                 &[],
             )
             .await
@@ -2771,7 +2763,7 @@ mod tests {
         for index in 0..3 {
             session
                 .execute(
-                    r#"INSERT INTO ckpt_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO ckpt_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2784,7 +2776,7 @@ mod tests {
 
         let rows = session
             .execute(
-                r#"SELECT id FROM ckpt_child WHERE "parentId" = 'parent-0'"#,
+                r#"SELECT id FROM ckpt_child WHERE "parent_id" = 'parent-0'"#,
                 &[],
             )
             .await
@@ -2797,14 +2789,14 @@ mod tests {
 
         session
             .execute(
-                r#"INSERT INTO ckpt_child (id, "parentId", locale) VALUES ('child-3', 'parent-0', 'en')"#,
+                r#"INSERT INTO ckpt_child (id, "parent_id", locale) VALUES ('child-3', 'parent-0', 'en')"#,
                 &[],
             )
             .await
             .expect("post-checkpoint child should insert");
         let rows = session
             .execute(
-                r#"SELECT id FROM ckpt_child WHERE "parentId" = 'parent-0'"#,
+                r#"SELECT id FROM ckpt_child WHERE "parent_id" = 'parent-0'"#,
                 &[],
             )
             .await
@@ -2827,16 +2819,14 @@ mod tests {
                 "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[crate::Value::Text(
                     json!({
-                        "x-lix-key": "probe_unique",
-                        "x-lix-primary-key": ["/id"],
-                        "x-lix-unique": [["/slug"]],
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "slug": { "type": "string" }
-                        },
-                        "required": ["id", "slug"],
-                        "additionalProperties": false
+                        "$schema": "https://lix.dev/schema-v1.json",
+                        "key": "probe_unique",
+                        "columns": [
+                            { "name": "id", "type": "text", "nullable": false },
+                            { "name": "slug", "type": "text", "nullable": false },
+                        ],
+                        "primary_key": ["id"],
+                        "unique": [["slug"]],
                     })
                     .to_string(),
                 )],

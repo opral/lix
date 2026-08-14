@@ -1242,12 +1242,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = json!({
-        "x-lix-key": "branch_bench_row",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "value"],
-        "properties": { "id": {"type": "string"}, "value": {"type": "string"} },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "branch_bench_row",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "value", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     let result = lix.execute(
         "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",

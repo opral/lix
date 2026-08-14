@@ -712,21 +712,23 @@ mod tests {
     fn catalog_rejects_legacy_runtime_schema_in_reserved_lix_namespace() {
         for legacy_schema in [
             json!({
-                "x-lix-key": "lix_plugin_note",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false,
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "lix_plugin_note",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": "lix_registry_only_legacy",
-                "type": "object",
-                "properties": { "payload": {} },
-                "additionalProperties": false,
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "lix_registry_only_legacy",
+                "columns": [
+                    { "name": "payload", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["payload"],
             }),
         ] {
-            let schema_key = legacy_schema["x-lix-key"]
+            let schema_key = legacy_schema["key"]
                 .as_str()
                 .expect("test schema key")
                 .to_string();

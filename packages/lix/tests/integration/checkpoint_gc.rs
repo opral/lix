@@ -432,18 +432,16 @@ simulation_test!(
 
 async fn register_replay_gc_schema(session: &support::simulation_test::engine::SimSession) {
     let schema = json!({
-        "x-lix-key": REPLAY_GC_SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "x-lix-unique": [["/indexed_value"]],
-        "type": "object",
-        "required": ["id", "indexed_value", "note", "generation"],
-        "properties": {
-            "id": { "type": "string" },
-            "indexed_value": { "type": "string" },
-            "note": { "type": "string" },
-            "generation": { "type": "integer" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": REPLAY_GC_SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "indexed_value", "type": "text", "nullable": false },
+            { "name": "note", "type": "text", "nullable": false },
+            { "name": "generation", "type": "int8", "nullable": false },
+        ],
+        "primary_key": ["id"],
+        "unique": [["indexed_value"]],
     });
     session
         .execute(

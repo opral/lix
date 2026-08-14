@@ -5414,6 +5414,7 @@ fn append_entity_insert_row(
         }
     }
 
+    populate_registered_schema_key(&layout.schema_key, &mut snapshot)?;
     let functions = ctx.functions();
     spec.defaults.apply(
         &mut snapshot,
@@ -5471,6 +5472,30 @@ fn append_entity_insert_row(
         untracked.unwrap_or(false),
         branch_id.into(),
     );
+    Ok(())
+}
+
+fn populate_registered_schema_key(
+    target_schema_key: &str,
+    snapshot: &mut serde_json::Map<String, JsonValue>,
+) -> Result<(), LixError> {
+    if target_schema_key != "lix_registered_schema" || snapshot.contains_key("schema_key") {
+        return Ok(());
+    }
+    let Some(value) = snapshot.get("value") else {
+        return Ok(());
+    };
+    let key = value
+        .get("key")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                "lix_registered_schema value is missing string key",
+            )
+        })?;
+    snapshot.insert("schema_key".into(), JsonValue::String(key));
     Ok(())
 }
 
@@ -7220,8 +7245,9 @@ mod primary_key_route_tests {
         ] {
             let mut actual = Vec::new();
             append_canonical_json_parameter(&mut actual, raw).unwrap();
-            let expected =
-                serde_json::to_vec(&serde_json::from_str::<JsonValue>(raw).unwrap()).unwrap();
+            let expected = crate::sql2::udfs::common::canonical_jsonb_text(raw)
+                .unwrap()
+                .into_bytes();
             assert_eq!(actual, expected);
         }
     }
@@ -7230,17 +7256,13 @@ mod primary_key_route_tests {
     fn compiles_single_text_primary_key_parameter_once() {
         let spec = crate::sql2::catalog::derive_entity_surface_spec_from_schema(
             &serde_json::json!({
-                "x-lix-key": "entity",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "required": ["id", "value"],
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": {
-                        "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                    }
-                },
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "entity",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "jsonb", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
         )
         .expect("entity surface schema should compile");
@@ -7445,30 +7467,28 @@ mod primary_key_route_tests {
     fn only_constraint_source_assignments_require_commit_validation() {
         let catalog = crate::catalog::CatalogSnapshot::from_visible_schemas(&[
             serde_json::json!({
-                "x-lix-key": "parent",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "parent",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             serde_json::json!({
-                "x-lix-key": "child",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-unique": [["/slug"]],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parent_id"],
-                    "references": { "schemaKey": "parent", "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "child",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "slug", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "unique": [["slug"]],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": "parent", "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "parent_id": { "type": "string" },
-                    "slug": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "parent_id", "slug", "value"],
-                "additionalProperties": false
             }),
         ])
         .expect("constraint schemas should compile");
@@ -7631,22 +7651,20 @@ mod constraints_unchanged_tests {
 
     fn schema() -> JsonValue {
         json!({
-            "x-lix-key": "constraint_probe",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"]],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parentId"],
-                "references": { "schemaKey": "constraint_probe_parent", "properties": ["/id"] }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "constraint_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false },
+                { "name": "payload", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"]],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
+                "references": { "schema_key": "constraint_probe_parent", "columns": ["id"] }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "slug": { "type": "string" },
-                "parentId": { "type": "string" },
-                "payload": { "type": "string" }
-            },
-            "required": ["id", "slug", "parentId", "payload"],
-            "additionalProperties": false
         })
     }
 
@@ -7669,16 +7687,16 @@ mod constraints_unchanged_tests {
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["parentId", "slug"],
+            vec!["parent_id", "slug"],
             "the probe schema must actually declare indexed columns"
         );
         let parent = json!({
-            "x-lix-key": "constraint_probe_parent",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "constraint_probe_parent",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let parent_key = SchemaCatalogKey {
             schema_key: "constraint_probe_parent".to_owned(),

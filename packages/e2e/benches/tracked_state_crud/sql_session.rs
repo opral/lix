@@ -105,6 +105,7 @@ fn fold_value(accumulator: u64, value: &Value) -> u64 {
         Value::Text(value) => fold_bytes(accumulator, 4, value.as_bytes()),
         Value::Json(value) => fold_bytes(accumulator, 5, value.as_bytes()),
         Value::Blob(value) => fold_bytes(accumulator, 6, value.as_bytes()),
+        Value::Timestamp(value) => fold_bytes(accumulator, 7, &value.to_le_bytes()),
     }
 }
 
@@ -1812,17 +1813,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "json_pointer",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "json_pointer",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     let affected = session
         .execute(
@@ -1840,15 +1837,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "tracked_crud_insert",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "tracked_crud_insert",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     let affected = session
         .execute(
@@ -1866,18 +1861,16 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "olap_row",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "ordinal", "lane", "score", "active"],
-        "properties": {
-            "id": { "type": "string" },
-            "ordinal": { "type": "integer" },
-            "lane": { "type": "string" },
-            "score": { "type": "number" },
-            "active": { "type": "boolean" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "olap_row",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "ordinal", "type": "int8", "nullable": false },
+            { "name": "lane", "type": "text", "nullable": false },
+            { "name": "score", "type": "float8", "nullable": false },
+            { "name": "active", "type": "boolean", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     let affected = session
         .execute(

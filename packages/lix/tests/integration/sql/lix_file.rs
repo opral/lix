@@ -1356,15 +1356,6 @@ simulation_test!(
                 "INSERT INTO lix_file (id, path, content) \
                  VALUES ('626f6f6c-2d64-8174-812d-66696c650000', '/bool.bin', true)",
             ),
-            (
-                "74657874-2d66-856e-8374-696f6e2d6400",
-                "INSERT INTO lix_file (id, path, content) \
-                 VALUES (\
-                   '74657874-2d66-856e-8374-696f6e2d6400',\
-                   '/text-function.bin',\
-                   lix_json_get_text(CAST('{\"value\":\"hello\"}' AS JSONB), 'value')\
-                 )",
-            ),
         ] {
             let error = session
                 .execute(sql, &[])
@@ -1384,7 +1375,6 @@ simulation_test!(
                 "SELECT id FROM lix_file \
                  WHERE id IN (\
                    '74657874-2d64-8174-812d-66696c650000',\
-                   '74657874-2d66-856e-8374-696f6e2d6400',\
                    '696e742d-6461-8461-8d66-696c65000000',\
                    '666c6f61-742d-8461-8461-2d66696c6500',\
                    '626f6f6c-2d64-8174-812d-66696c650000'\
@@ -2642,10 +2632,6 @@ simulation_test!(
 
         for (id, assignment) in [
             ("75706461-7465-8d74-8578-742d66696c00", "'hello'"),
-            (
-                "75706461-7465-8d74-8578-742d66756e00",
-                "lix_json_get_text(CAST('{\"value\":\"hello\"}' AS JSONB), 'value')",
-            ),
             ("75706461-7465-8d69-8e74-2d66696c6500", "12345"),
             ("75706461-7465-8d66-8c6f-61742d666900", "1.5"),
             ("75706461-7465-8d62-8f6f-6c2d66696c00", "true"),
@@ -2677,7 +2663,6 @@ simulation_test!(
                 "SELECT id, content FROM lix_file \
                  WHERE id IN (\
                    '75706461-7465-8d74-8578-742d66696c00',\
-                   '75706461-7465-8d74-8578-742d66756e00',\
                    '75706461-7465-8d69-8e74-2d66696c6500',\
                    '75706461-7465-8d66-8c6f-61742d666900',\
                    '75706461-7465-8d62-8f6f-6c2d66696c00'\
@@ -2705,10 +2690,6 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("75706461-7465-8d74-8578-742d66696c00".to_string()),
-                    Value::Blob(b"hello".to_vec().into()),
-                ],
-                vec![
-                    Value::Text("75706461-7465-8d74-8578-742d66756e00".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
             ],

@@ -53,6 +53,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
     functions: FunctionProviderHandle,
     default_timestamp: &mut Option<crate::common::LixTimestamp>,
 ) -> Result<NormalizedRowFacts, LixError> {
+    populate_registered_schema_snapshot(rows, row_index)?;
     let row = rows.row(row_index);
     validate_transaction_write_row_schema_identity(row)?;
     ensure_internal_control_schema(row, schema_catalog)?;
@@ -229,6 +230,48 @@ pub(crate) fn normalize_raw_write_row_in_place(
             requires_transaction_validation,
         },
     })
+}
+
+fn populate_registered_schema_snapshot(
+    rows: &mut RawWriteBatch,
+    row_index: usize,
+) -> Result<(), LixError> {
+    let row = rows.row(row_index);
+    if row.schema_key != REGISTERED_SCHEMA_KEY {
+        return Ok(());
+    }
+    let Some(snapshot) = row.snapshot else {
+        return Ok(());
+    };
+    let Some(value) = snapshot.value().get("value") else {
+        return Ok(());
+    };
+    let schema = value.clone();
+    let schema_key = schema
+        .get("key")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                "lix_registered_schema value is missing string key",
+            )
+        })?;
+    let mut converted = snapshot.value().clone();
+    let object = converted
+        .as_object_mut()
+        .ok_or_else(|| LixError::new(LixError::CODE_SCHEMA_DEFINITION, "lix_registered_schema snapshot must be an object"))?;
+    object
+        .entry("schema_key")
+        .or_insert_with(|| JsonValue::String(schema_key.into()));
+    object.insert("value".into(), schema);
+    rows.set_snapshot(
+        row_index,
+        Some(TransactionJson::from_value(
+            converted,
+            "normalized registered schema snapshot",
+        )?),
+    );
+    Ok(())
 }
 
 fn canonicalize_descriptor_file_id(
@@ -640,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_applies_cel_defaults_from_snapshot_context() {
+    fn normalization_applies_schema_v1_literal_defaults() {
         let mut catalog = catalog_with(vec![schema_with_cel_field_default()]);
         let row = TransactionWriteRow {
             entity_pk: None,
@@ -652,11 +695,11 @@ mod tests {
         let row = normalize_test_row(row, &mut catalog, functions()).expect("normalize row");
         let snapshot = normalized_snapshot(&row);
 
-        assert_eq!(snapshot["slug"], "Sample-slug");
+        assert_eq!(snapshot["slug"], "default-slug");
     }
 
     #[test]
-    fn normalization_x_lix_default_overrides_json_default() {
+    fn normalization_applies_schema_v1_default_value() {
         let mut catalog = catalog_with(vec![schema_with_overridden_default()]);
         let row = TransactionWriteRow {
             entity_pk: None,
@@ -668,7 +711,7 @@ mod tests {
         let row = normalize_test_row(row, &mut catalog, functions()).expect("normalize row");
         let snapshot = normalized_snapshot(&row);
 
-        assert_eq!(snapshot["status"], "computed");
+        assert_eq!(snapshot["status"], "literal");
     }
 
     #[test]
@@ -719,7 +762,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("does not match x-lix-primary-key derived entity_pk")
+                .contains("does not match primary_key-derived entity_pk")
         );
     }
 
@@ -835,7 +878,7 @@ mod tests {
             "lix_plugin_note",
         ] {
             let mut schema = dynamic_schema_definition();
-            schema["x-lix-key"] = json!(schema_key);
+            schema["key"] = json!(schema_key);
             let registered = TransactionWriteRow {
                 entity_pk: None,
                 schema_key: REGISTERED_SCHEMA_KEY.into(),
@@ -867,7 +910,7 @@ mod tests {
                 .clone(),
         ]);
         let mut schema = dynamic_schema_definition();
-        schema["x-lix-key"] = json!("acme_plugin_note");
+        schema["key"] = json!("acme_plugin_note");
         let registered = TransactionWriteRow {
             entity_pk: None,
             schema_key: REGISTERED_SCHEMA_KEY.into(),
@@ -967,24 +1010,24 @@ mod tests {
             global: false,
             ..base_stage_row()
         };
-        let error = normalize_test_row(dotdot, &mut catalog, functions())
-            .expect_err("schema validation should reject a parent-directory segment");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        let dotdot = normalize_test_row(dotdot, &mut catalog, functions())
+            .expect("Schema v1 treats descriptor names as plain text");
+        assert_eq!(normalized_snapshot(&dotdot)["name"], "..");
     }
 
     #[test]
-    fn normalization_applies_structural_filesystem_descriptor_schema() {
+    fn normalization_treats_filesystem_descriptor_names_as_text() {
         let mut catalog = catalog_with(vec![
             builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY),
             builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
         ]);
 
-        let error = normalize_test_row(
+        let row = normalize_test_row(
             TransactionWriteRow {
                 entity_pk: None,
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.into(),
                 snapshot: Some(transaction_json(json!({
-                    "id": "file-slash",
+                    "id": "01920000-0000-7000-8000-0000000000c4",
                     "directory_id": null,
                     "name": "nested/name",
                 }))),
@@ -994,13 +1037,16 @@ mod tests {
             &mut catalog,
             functions(),
         )
-        .expect_err("schema validation should reject a path in a descriptor name");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        .expect("Schema v1 does not apply nested path-segment validation");
+        assert_eq!(normalized_snapshot(&row)["name"], "nested/name");
     }
 
     #[test]
     fn normalization_keeps_file_descriptor_name_opaque() {
-        let mut catalog = catalog_with(vec![builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY)]);
+        let mut catalog = catalog_with(vec![
+            builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY),
+            builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+        ]);
 
         let row = normalize_test_row(
             TransactionWriteRow {
@@ -1086,9 +1132,9 @@ mod tests {
     fn catalog_with(schemas: Vec<JsonValue>) -> TransactionCatalog {
         let mut visible_schemas = schemas;
         if visible_schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some(FILE_DESCRIPTOR_SCHEMA_KEY)
+            schema.get("key").and_then(JsonValue::as_str) == Some(FILE_DESCRIPTOR_SCHEMA_KEY)
         }) && !visible_schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str)
+            schema.get("key").and_then(JsonValue::as_str)
                 == Some(DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         }) {
             visible_schemas.push(builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY));
@@ -1133,124 +1179,102 @@ mod tests {
 
     fn schema_with_default_id() -> JsonValue {
         json!({
-            "x-lix-key": "normalization_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "x-lix-default": "uuidv7()" },
-                "value": { "type": "string", "default": "literal-default" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "normalization_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false, "default_value": "literal-default" },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn certificate_test_schema(required_value: Option<&str>) -> JsonValue {
-        let value_schema = required_value.map_or_else(
-            || json!({"type": "string"}),
-            |required| json!({"type": "string", "const": required}),
-        );
+        let value_type = match required_value {
+            None => "jsonb",
+            Some("old-value") => "text",
+            Some(_) => "boolean",
+        };
         json!({
-            "x-lix-key": "certificate_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": value_schema,
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "certificate_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": value_type, "nullable": false },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn schema_with_cel_field_default() -> JsonValue {
         json!({
-            "x-lix-key": "cel_field_default_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "name": { "type": "string" },
-                "slug": { "type": "string", "x-lix-default": "name + '-slug'" }
-            },
-            "required": ["id", "name"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "cel_field_default_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "name", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": false, "default_value": "default-slug" },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn schema_with_overridden_default() -> JsonValue {
         json!({
-            "x-lix-key": "overridden_default_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "status": {
-                    "type": "string",
-                    "default": "literal",
-                    "x-lix-default": "'computed'"
-                }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "overridden_default_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "status", "type": "text", "nullable": false, "default_value": "literal" },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn schema_with_nullable_default() -> JsonValue {
         json!({
-            "x-lix-key": "nullable_default_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "status": {
-                    "anyOf": [{ "type": "string" }, { "type": "null" }],
-                    "x-lix-default": "'computed'"
-                }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "nullable_default_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "status", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn schema_with_timestamp_default() -> JsonValue {
         json!({
-            "x-lix-key": "timestamp_default_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "created_at": { "type": "string", "x-lix-default": "CURRENT_TIMESTAMP" }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "timestamp_default_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "created_at", "type": "timestamptz", "nullable": false, "default_expression": "CURRENT_TIMESTAMP" },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn composite_key_schema() -> JsonValue {
         json!({
-            "x-lix-key": "composite_key_schema",
-            "x-lix-primary-key": ["/namespace", "/key"],
-            "type": "object",
-            "properties": {
-                "namespace": { "type": "string" },
-                "key": { "type": "string" }
-            },
-            "required": ["namespace", "key"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "composite_key_schema",
+            "columns": [
+                { "name": "namespace", "type": "text", "nullable": false },
+                { "name": "key", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["namespace", "key"],
         })
     }
 
     fn dynamic_schema_definition() -> JsonValue {
         json!({
-            "x-lix-key": "dynamic_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "dynamic_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         })
     }
 

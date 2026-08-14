@@ -320,15 +320,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "expu_document",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "doc"],
-        "properties": {
-            "path": { "type": "string" },
-            "doc": { "type": ["object", "array", "string", "number", "boolean", "null"] }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "expu_document",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "doc", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(

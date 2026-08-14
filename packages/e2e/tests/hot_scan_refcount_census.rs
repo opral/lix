@@ -28,16 +28,14 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
     let lix = open_lix().await.expect("open in-memory lix");
 
     let schema = serde_json::json!({
-        "x-lix-key": SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "ordinal": { "type": "number" },
-            "lane": { "type": "string" }
-        },
-        "required": ["id", "ordinal", "lane"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "ordinal", "type": "float8", "nullable": false },
+            { "name": "lane", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     lix.execute(
         "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",

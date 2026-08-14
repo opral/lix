@@ -478,15 +478,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "undo_bench_row",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "value"],
-        "properties": {
-            "id": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "undo_bench_row",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "value", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     let result = session
         .execute(

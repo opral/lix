@@ -4215,17 +4215,13 @@ mod tests {
         S: crate::storage::Storage + Clone + Send + Sync + 'static,
     {
         let schema = serde_json::json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
@@ -4312,15 +4308,13 @@ mod tests {
             .expect("repository should open");
         let session = engine.open_session().await.expect("session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "gc_undo_cadence_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "gc_undo_cadence_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
@@ -6397,15 +6391,13 @@ mod tests {
             .await
             .expect("generation fixture session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "gc_generation_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "gc_generation_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(

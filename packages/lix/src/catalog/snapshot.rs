@@ -46,13 +46,14 @@ impl CatalogSnapshot {
     pub(crate) fn from_visible_schemas(visible_schemas: &[JsonValue]) -> Result<Self, LixError> {
         let mut catalog = Self::default();
         for schema in visible_schemas {
-            let key = crate::schema::schema_key_from_definition(schema)?;
+            let schema = schema.clone();
+            let key = crate::schema::schema_key_from_definition(&schema)?;
             let catalog_key = SchemaCatalogKey::from_schema_key(key);
             let identity = DomainSchemaIdentity::new(
                 Domain::schema_catalog(crate::GLOBAL_BRANCH_ID, true),
                 catalog_key.schema_key.clone(),
             );
-            catalog.remember_schema_identity(identity, catalog_key, schema.clone())?;
+            catalog.remember_schema_identity(identity, catalog_key, schema)?;
         }
         catalog.rebuild_plans()?;
         Ok(catalog)

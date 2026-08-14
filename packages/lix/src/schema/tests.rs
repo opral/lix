@@ -10,7 +10,7 @@ fn schema() -> serde_json::Value {
             { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
             { "name": "title", "type": "text", "nullable": false },
             { "name": "payload", "type": "jsonb", "nullable": false },
-            { "name": "rank", "type": "int8", "nullable": true }
+            { "name": "rank", "type": "int8", "nullable": false }
         ],
         "primary_key": ["id"],
         "unique": [["title"]]
@@ -26,7 +26,8 @@ fn accepts_schema_v1_and_rows() {
         &json!({
             "id": "01920000-0000-7000-8000-000000000001",
             "title": "hello",
-            "payload": { "nested": [1, null, true] }
+            "payload": { "nested": [1, null, true] },
+            "rank": 1
         }),
     )
     .expect("valid row");
@@ -36,6 +37,7 @@ fn accepts_schema_v1_and_rows() {
 fn rejects_json_schema_and_unknown_fields() {
     let legacy = json!({
         "x-lix-key": "acme_note",
+        "x-lix-primary-key": ["/id"],
         "type": "object",
         "properties": { "id": { "type": "string" } }
     });
@@ -54,7 +56,8 @@ fn distinguishes_sql_null_from_jsonb_null() {
         &json!({
             "id": "01920000-0000-7000-8000-000000000001",
             "title": "hello",
-            "payload": null
+            "payload": null,
+            "rank": 1
         }),
     )
     .expect("JSONB null is a non-NULL JSONB value");
@@ -64,7 +67,8 @@ fn distinguishes_sql_null_from_jsonb_null() {
         &json!({
             "id": "01920000-0000-7000-8000-000000000001",
             "title": null,
-            "payload": {}
+            "payload": {},
+            "rank": 1
         }),
     )
     .expect_err("NOT NULL text rejects SQL NULL");

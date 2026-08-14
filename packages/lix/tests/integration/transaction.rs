@@ -25,7 +25,7 @@ where
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (CAST('{"x-lix-key":"untracked_race_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}' AS JSONB), false, false)"#,
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"untracked_race_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, false)"#,
             &[],
         )
         .await
@@ -33,7 +33,7 @@ where
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (CAST('{"x-lix-key":"untracked_race_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"untracked_race_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}' AS JSONB), false, false)"#,
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"untracked_race_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"untracked_race_parent","columns":["id"]}}]}' AS JSONB), false, false)"#,
             &[],
         )
         .await
@@ -322,7 +322,7 @@ simulation_test!(
         session
             .execute(
                 r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-                   VALUES (CAST('{"x-lix-key":"transaction_collection_delete","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}' AS JSONB), false, false)"#,
+                   VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"transaction_collection_delete","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, false)"#,
                 &[],
             )
             .await

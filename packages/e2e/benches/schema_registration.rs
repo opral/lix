@@ -31,7 +31,7 @@ fn schema_v1() -> Value {
             "columns": [
                 { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
                 { "name": "name", "type": "text", "nullable": false },
-                { "name": "metadata", "type": "jsonb", "nullable": true }
+                { "name": "metadata", "type": "jsonb", "nullable": false }
             ],
             "primary_key": ["id"]
         })

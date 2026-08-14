@@ -687,17 +687,13 @@ fn row_path(index: usize) -> String {
 
 async fn register_schema(session: &Lix<SlateDB>) {
     let schema = serde_json::json!({
-        "x-lix-key": "branch_fixture",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "branch_fixture",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(

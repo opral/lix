@@ -12713,8 +12713,10 @@ mod tests {
             replacement: upgrade_test_entry('b'),
         };
         let definition = json!({
-            "x-lix-key": "csv_row",
-            "type": "object",
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "csv_row",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"],
         });
         let current = BTreeMap::from([(
             ("main".to_string(), "csv_row".to_string()),
@@ -12735,9 +12737,12 @@ mod tests {
             &BTreeMap::from([(
                 "csv_row".to_string(),
                 json!({
-                    "x-lix-key": "csv_row",
-                    "type": "object",
-                    "properties": { "extra": { "type": "string" } },
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "csv_row",
+                    "columns": [
+                        { "name": "extra", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["extra"],
                 }),
             )]),
         )
@@ -13939,7 +13944,7 @@ fallback={large_fallback} decoded={large_decoded}"
 
         let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
         invalid_row.snapshot = Some(TransactionJson::from_value_for_test(
-            json!({"key": "invalid-programmatic"}),
+            json!({"key": "invalid-programmatic", "extra": true}),
         ));
         let error = transaction
             .stage_rows(raw_write_rows(vec![invalid_row]))
@@ -14088,7 +14093,7 @@ fallback={large_fallback} decoded={large_decoded}"
     }
 
     #[tokio::test]
-    async fn stage_rows_rejects_snapshot_that_violates_json_schema_without_sql() {
+    async fn stage_rows_rejects_snapshot_with_unknown_schema_v1_column_without_sql() {
         let storage = Memory::new();
         let (hot_state, _binary_cas, branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
@@ -14096,12 +14101,12 @@ fallback={large_fallback} decoded={large_decoded}"
 
         let mut row = key_value_stage_row("schema-mismatch", "value", false);
         row.snapshot = Some(TransactionJson::from_value_for_test(
-            json!({"key": "schema-mismatch"}),
+            json!({"key": "schema-mismatch", "extra": true}),
         ));
         let error = transaction
             .stage_rows(raw_write_rows(vec![row]))
             .await
-            .expect_err("JSON Schema mismatch should fail statement validation");
+            .expect_err("unknown Schema v1 column should fail statement validation");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
@@ -14127,14 +14132,10 @@ fallback={large_fallback} decoded={large_decoded}"
         row.schema_key = "lix_registered_schema".into();
         row.snapshot = Some(TransactionJson::from_value_for_test(json!({
             "value": {
-                "x-lix-key": "malformed_registered_schema",
-                "x-lix-primary-key": ["id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "malformed_registered_schema",
+                "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                "primary_key": ["missing"]
             }
         })));
         row.entity_pk = None;
@@ -14146,7 +14147,7 @@ fallback={large_fallback} decoded={large_decoded}"
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("x-lix-primary-key"),
+            error.message.contains("unknown column 'missing'"),
             "error should explain malformed registered schema: {error:?}"
         );
     }
@@ -14169,7 +14170,7 @@ fallback={large_fallback} decoded={large_decoded}"
         assert!(
             error
                 .message
-                .contains("does not match x-lix-primary-key derived entity_pk"),
+                .contains("does not match primary_key-derived entity_pk"),
             "error should explain entity pk mismatch: {error:?}"
         );
     }
@@ -14404,7 +14405,11 @@ fallback={large_fallback} decoded={large_decoded}"
             .map(|schema| {
                 let key = crate::schema::schema_key_from_definition(schema)
                     .expect("seed schema key should derive");
-                let snapshot_content = json!({ "value": schema }).to_string();
+                let snapshot_content = json!({
+                    "schema_key": key.schema_key.clone(),
+                    "value": schema,
+                })
+                .to_string();
                 crate::tracked_state::MaterializedTrackedStateRow {
                     entity_pk: crate::schema::registered_schema_entity_pk(&key.schema_key)
                         .expect("registered schema identity should derive"),

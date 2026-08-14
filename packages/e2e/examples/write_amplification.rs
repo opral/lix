@@ -159,17 +159,13 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
     let session = lix.open_another_session().await.expect("open session");
 
     let schema = serde_json::json!({
-        "x-lix-key": "json_pointer",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "json_pointer",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(

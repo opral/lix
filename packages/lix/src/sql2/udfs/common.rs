@@ -78,6 +78,9 @@ pub(super) fn json_value_to_serde(array: &dyn Array, row: usize) -> Result<Optio
 }
 
 pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
+    if matches!(array.data_type(), datafusion::arrow::datatypes::DataType::Null) {
+        return Ok(None);
+    }
     if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
         return Ok((!array.is_null(row)).then(|| array.value(row).to_string()));
     }
@@ -258,7 +261,6 @@ fn json_path_segment(
             return Ok(None);
         }
         let value = array.value(row).to_string();
-        validate_json_path_key_segment(fn_name, &value)?;
         return Ok(Some(JsonPathSegment::Key(value)));
     }
     if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
@@ -266,7 +268,6 @@ fn json_path_segment(
             return Ok(None);
         }
         let value = array.value(row).to_string();
-        validate_json_path_key_segment(fn_name, &value)?;
         return Ok(Some(JsonPathSegment::Key(value)));
     }
     macro_rules! index_array {
@@ -297,16 +298,6 @@ fn json_path_segment(
         "{fn_name}() path arguments must be strings or integers, got {:?}",
         array.data_type()
     )))
-}
-
-fn validate_json_path_key_segment(fn_name: &str, value: &str) -> Result<()> {
-    if value == "$" || value.starts_with("$.") || value.starts_with("$[") || value.starts_with('/')
-    {
-        return Err(DataFusionError::Execution(format!(
-            "{fn_name}() uses variadic path segments, not JSONPath or JSON Pointer; got '{value}'"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

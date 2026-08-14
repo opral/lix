@@ -1780,15 +1780,13 @@ mod tests {
         let bound = bind_statement(
             &statement,
             &[serde_json::json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "x-lix-default": "uuidv7()" },
-                    "label": { "type": "string", "default": "untitled" }
-                },
-                "required": ["id", "label"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                    { "name": "label", "type": "text", "nullable": false, "default_value": "untitled" },
+                ],
+                "primary_key": ["id"],
             })],
             "branch1",
         )
@@ -1817,10 +1815,12 @@ mod tests {
         let error = bind_statement(
             &statement,
             &[serde_json::json!({
-                "x-lix-key": "test_state_schema",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["value"],
             })],
             "branch1",
         )
@@ -1875,11 +1875,13 @@ mod tests {
         let bound = bind_statement(
             &statement,
             &[serde_json::json!({
-                "x-lix-key": "test_state_schema",
-                "properties": {
-                    "id": { "type": "string" },
-                    "name": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "name", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
             })],
             "branch1",
         )
@@ -1972,23 +1974,21 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_predecodes_lix_json_literal_values() {
+    fn bind_statement_preserves_private_jsonb_casts() {
         let statement = parse_statement(
             "INSERT INTO app_json (id, payload, metadata) VALUES ('e1', '{\"id\":\"e1\"}'::jsonb, '{\"source\":\"test\"}'::jsonb)",
         );
         let bound = bind_statement(
             &statement,
             &[serde_json::json!({
-                "x-lix-key": "app_json",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "payload": { "type": "object" },
-                    "metadata": { "type": "object" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "app_json",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "payload", "type": "jsonb", "nullable": false },
+                    { "name": "metadata", "type": "jsonb", "nullable": true },
+                ],
+                "primary_key": ["id"],
             })],
             "branch1",
         )
@@ -2002,7 +2002,7 @@ mod tests {
         assert!(
             values.rows[0]
                 .iter()
-                .filter(|value| matches!(value, BoundExpr::Literal(BoundLiteral::Json(_))))
+                .filter(|value| matches!(value, BoundExpr::Function { name, .. } if name == "__lix_jsonb"))
                 .count()
                 >= 2
         );
@@ -2141,15 +2141,13 @@ mod tests {
         let error = bind_statement(
             &statement,
             &[serde_json::json!({
-                "x-lix-key": "project_message",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "body": { "type": "string" }
-                },
-                "required": ["id", "body"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
             "branch1",
         )
@@ -2329,15 +2327,13 @@ mod tests {
     #[test]
     fn bind_statement_binds_returning_for_registered_entity_writes() {
         let schema = serde_json::json!({
-            "x-lix-key": "project_task",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_task",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let inserted = bind_statement(
             &parse_statement(

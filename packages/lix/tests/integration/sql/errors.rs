@@ -225,7 +225,7 @@ simulation_test!(sql_explain_is_read_shaped, |sim| async move {
     assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
 });
 
-simulation_test!(sql_json_function_miss_has_lix_udf_hint, |sim| async move {
+simulation_test!(sql_json_function_miss_has_postgres_jsonb_hint, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -244,13 +244,13 @@ simulation_test!(sql_json_function_miss_has_lix_udf_hint, |sim| async move {
     assert!(
         error
             .hint()
-            .is_some_and(|hint| hint.contains("lix_json_get")),
-        "expected JSON UDF hint: {error}"
+            .is_some_and(|hint| hint.contains("PostgreSQL JSONB operators")),
+        "expected PostgreSQL JSONB hint: {error}"
     );
 });
 
 simulation_test!(
-    sql_json_arrow_operator_has_dialect_error,
+    sql_json_arrow_operator_uses_postgres_semantics,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -261,18 +261,11 @@ simulation_test!(
             &engine,
         );
 
-        let error = session
+        let result = session
             .execute("SELECT CAST('{\"a\":1}' AS JSONB) ->> 'a'", &[])
             .await
-            .expect_err("Postgres JSON arrow operator should fail with a dialect error");
-
-        assert_eq!(error.code, LixError::CODE_DIALECT_UNSUPPORTED);
-        assert!(
-            error
-                .hint()
-                .is_some_and(|hint| hint.contains("lix_json_get_text")),
-            "expected JSON dialect hint: {error}"
-        );
+            .expect("PostgreSQL JSON arrow operator should be supported");
+        assert_eq!(result.rows()[0].values(), &[Value::Text("1".into())]);
     }
 );
 

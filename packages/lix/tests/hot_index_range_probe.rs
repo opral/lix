@@ -147,12 +147,12 @@ async fn seeded_session(schema_key: &str, declare_unique: bool, rows: usize) -> 
         .expect("open lix");
 
     let unique = if declare_unique {
-        r#""x-lix-unique":[["/ordinal"]],"#
+        r#","unique":[["ordinal"]]"#
     } else {
         ""
     };
     let schema = format!(
-        r#"{{"x-lix-key":"{schema_key}","x-lix-primary-key":["/id"],{unique}"type":"object","properties":{{"id":{{"type":"string"}},"ordinal":{{"type":"integer"}}}},"required":["id","ordinal"],"additionalProperties":false}}"#
+        r#"{{"$schema":"https://lix.dev/schema-v1.json","key":"{schema_key}","columns":[{{"name":"id","type":"text","nullable":false}},{{"name":"ordinal","type":"int8","nullable":false}}],"primary_key":["id"]{unique}}}"#
     );
     session
         .execute(

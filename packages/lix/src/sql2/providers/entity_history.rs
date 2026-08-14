@@ -443,15 +443,14 @@ mod tests {
     #[test]
     fn public_composite_key_filters_route_in_schema_order() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "localized_message",
-            "x-lix-primary-key": ["/locale", "/key"],
-            "type": "object",
-            "properties": {
-                "key": { "type": "string" },
-                "locale": { "type": "string" },
-                "body": { "type": "string" }
-            },
-            "required": ["key", "locale", "body"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "localized_message",
+            "columns": [
+                { "name": "key", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["locale", "key"],
         }))
         .expect("schema should derive");
         let filters = vec![
@@ -472,14 +471,13 @@ mod tests {
     #[test]
     fn public_and_opaque_identity_filters_intersect() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "localized_message",
-            "x-lix-primary-key": ["/locale", "/key"],
-            "type": "object",
-            "properties": {
-                "key": { "type": "string" },
-                "locale": { "type": "string" }
-            },
-            "required": ["key", "locale"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "localized_message",
+            "columns": [
+                { "name": "key", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["locale", "key"],
         }))
         .expect("schema should derive");
         let filters = vec![

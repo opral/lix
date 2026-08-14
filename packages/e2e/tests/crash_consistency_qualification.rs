@@ -791,16 +791,14 @@ fn single_generation(rows: &[i64]) -> Result<i64, String> {
 
 async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<S>) {
     let schema = serde_json::json!({
-        "x-lix-key": SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "generation", "payload"],
-        "properties": {
-            "id": { "type": "string" },
-            "generation": { "type": "integer" },
-            "payload": { "type": "string" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "generation", "type": "int8", "nullable": false },
+            { "name": "payload", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     lix.execute(
         "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",

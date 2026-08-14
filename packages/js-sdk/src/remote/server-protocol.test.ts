@@ -28,6 +28,22 @@ test("remote executeBatch requires positional metadata and preserves labels", ()
 	).toThrow("statementIndex must be a non-negative safe integer");
 });
 
+test("remote timestamps preserve their RFC 3339 representation", () => {
+	const value = "2026-08-13T18:42:01.123456Z";
+	expect(encodeWireValue({ kind: "timestamp", value })).toEqual({
+		kind: "timestamp",
+		value,
+	});
+	expect(
+		decodeExecuteResult({
+			columns: ["created_at"],
+			rows: [[{ kind: "timestamp", value }]],
+			rowsAffected: 0,
+			notices: [],
+		}).rows[0]?.[0],
+	).toEqual({ kind: "timestamp", value });
+});
+
 test("remote blobs use native typed-array base64 when available", () => {
 	const prototype = Uint8Array.prototype as Uint8Array & {
 		toBase64?: () => string;

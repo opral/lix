@@ -174,7 +174,7 @@ where
         Lane::ForeignKey => {
             session
                 .execute(
-                    r#"INSERT INTO w_fk_child (id, "parentId") VALUES ($1, $2)"#,
+                    r#"INSERT INTO w_fk_child (id, "parent_id") VALUES ($1, $2)"#,
                     &[
                         Value::Text(format!("row-{index}")),
                         Value::Text("parent-0".into()),
@@ -197,50 +197,44 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
 fn schemas() -> [serde_json::Value; 4] {
     [
         serde_json::json!({
-            "x-lix-key": "w_pk_only",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "payload": { "type": "string" }
-            },
-            "required": ["id", "payload"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "w_pk_only",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "payload", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }),
         serde_json::json!({
-            "x-lix-key": "w_unique",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "slug": { "type": "string" }
-            },
-            "required": ["id", "slug"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "w_unique",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"]],
         }),
         serde_json::json!({
-            "x-lix-key": "w_fk_parent",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "w_fk_parent",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }),
         serde_json::json!({
-            "x-lix-key": "w_fk_child",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parentId"],
-                "references": { "schemaKey": "w_fk_parent", "properties": ["/id"] }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "w_fk_child",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
+                "references": { "schema_key": "w_fk_parent", "columns": ["id"] }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "parentId": { "type": "string" }
-            },
-            "required": ["id", "parentId"],
-            "additionalProperties": false
         }),
     ]
 }

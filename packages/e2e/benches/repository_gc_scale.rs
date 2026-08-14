@@ -234,15 +234,13 @@ where
         .await
         .expect("open repository-GC main session");
     let schema = serde_json::json!({
-        "x-lix-key": "repository_gc_fixture",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "repository_gc_fixture",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     main.execute(
         "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",

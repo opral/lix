@@ -6931,7 +6931,7 @@ where
     lix.execute(
         "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(
-            r#"{"x-lix-key":"write_owner_task","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string","x-lix-default":"uuidv7()"},"title":{"type":"string"}},"required":["id","title"],"additionalProperties":false}"#.to_string(),
+            r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_task","columns":[{"name":"id","type":"uuid","nullable":false,"default_expression":"uuidv7()"},{"name":"title","type":"text","nullable":false}],"primary_key":["id"]}"#.to_string(),
         )],
     )
     .await
@@ -6940,10 +6940,10 @@ where
         "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB)), (CAST($2 AS JSONB))",
         &[
             Value::Text(
-                r#"{"x-lix-key":"write_owner_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.to_string(),
+                r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}"#.to_string(),
             ),
             Value::Text(
-                r#"{"x-lix-key":"write_owner_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"write_owner_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}"#.to_string(),
+                r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"write_owner_parent","columns":["id"]}}]}"#.to_string(),
             ),
         ],
     )
@@ -7354,7 +7354,7 @@ fn plugin_info_from_archive(archive_bytes: Vec<u8>) -> InstalledPluginInfo {
             .read_to_string(&mut schema_json)
             .unwrap();
         let schema: serde_json::Value = serde_json::from_str(&schema_json).unwrap();
-        schema_keys.push(schema["x-lix-key"].as_str().unwrap().to_string());
+        schema_keys.push(schema["key"].as_str().unwrap().to_string());
     }
     InstalledPluginInfo { key, schema_keys }
 }

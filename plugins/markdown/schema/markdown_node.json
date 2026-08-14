@@ -29,7 +29,7 @@
     },
     {
       "name": "parent_id",
-      "type": "text",
+      "type": "uuid",
       "nullable": true
     },
     {

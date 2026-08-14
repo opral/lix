@@ -235,15 +235,13 @@ async fn run_repository_gc(storage: &Memory) {
 
 fn probe_schema(key: &str) -> serde_json::Value {
     json!({
-        "x-lix-key": key,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "locale": { "type": "string" }
-        },
-        "required": ["id", "locale"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": key,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "locale", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     })
 }
 

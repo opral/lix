@@ -1427,14 +1427,13 @@ mod tests {
         let catalog_a = "catalog-a".to_string();
         let catalog_b = "catalog-b".to_string();
         let schema = json!({
-            "x-lix-key": "app_note",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "text": { "type": "string" }
-            },
-            "required": ["id", "text"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "app_note",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "text", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
 
         let first = cache

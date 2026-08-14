@@ -211,16 +211,14 @@ async fn checkpoints_scenario(samples: &[usize], rows_per_commit: usize) {
 async fn entity_commits_scenario(samples: &[usize], rows_per_commit: usize) {
     let fixture = Fixture::open().await;
     let schema = serde_json::json!({
-        "x-lix-key": "expv_entity",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "name", "amount"],
-        "properties": {
-            "id": { "type": "string" },
-            "name": { "type": "string" },
-            "amount": { "type": "integer" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "expv_entity",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "name", "type": "text", "nullable": false },
+            { "name": "amount", "type": "int8", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     fixture
         .session
@@ -456,17 +454,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "space_growth",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "space_growth",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(

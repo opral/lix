@@ -1572,18 +1572,15 @@ async fn wait_for_lix_directory(lix: &Lix<FilesystemStorage>, path: &str, expect
 
 async fn register_crm_task_schema(lix: &Lix) {
     let schema = r#"{
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "x-lix-key": "crm_task",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "title", "done", "meta"],
-        "properties": {
-            "id": { "type": "string" },
-            "title": { "type": "string" },
-            "done": { "type": "boolean" },
-            "meta": { "type": "object" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "crm_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "done", "type": "boolean", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["id"]
     }"#;
 
     lix.execute(
@@ -1627,17 +1624,14 @@ fn assert_crm_task_projection(result: &lix::ExecuteResult) {
 
 async fn register_poison_task_schema(lix: &Lix) {
     let schema = r#"{
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "x-lix-key": "poison_task",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "title", "meta"],
-        "properties": {
-            "id": { "type": "string" },
-            "title": { "type": "string" },
-            "meta": { "type": "object" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "poison_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["id"]
     }"#;
 
     lix.execute(

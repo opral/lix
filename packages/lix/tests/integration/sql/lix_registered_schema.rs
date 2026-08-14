@@ -22,7 +22,7 @@ simulation_test!(
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_dummy_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -48,7 +48,7 @@ simulation_test!(
                 [Value::Json(entity_pk), Value::Json(value)]
                     if value
                         .to_value()
-                        .get("x-lix-key")
+                        .get("key")
                         .and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema") =>
                 {
@@ -56,7 +56,7 @@ simulation_test!(
                 }
                 [Value::Json(entity_pk), Value::Text(value)] => {
                     let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                    (value.get("x-lix-key").and_then(serde_json::Value::as_str)
+                    (value.get("key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema"))
                     .then_some(entity_pk)
                 }
@@ -109,21 +109,13 @@ simulation_test!(
         );
 
         let schema = json!({
-            "x-lix-key": "default_values_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "x-lix-default": "uuidv7()",
-                },
-                "label": {
-                    "type": "string",
-                    "default": "untitled",
-                },
-            },
-            "required": ["id", "label"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "default_values_probe",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                { "name": "label", "type": "text", "nullable": false, "default_value": "untitled" },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
@@ -166,18 +158,13 @@ simulation_test!(
         );
 
         let schema = json!({
-            "x-lix-key": "default_values_missing_required",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "x-lix-default": "uuidv7()",
-                },
-                "label": { "type": "string" },
-            },
-            "required": ["id", "label"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "default_values_missing_required",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                { "name": "label", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
@@ -218,7 +205,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"sql_template_snapshot_note\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"text\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -286,7 +273,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_untracked_only_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_untracked_only_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  true\
                  )",
@@ -330,12 +317,12 @@ simulation_test!(
             "lix_plugin_note",
         ] {
             let schema = json!({
-                "x-lix-key": schema_key,
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false,
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": schema_key,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             });
             let error = session
                 .execute(
@@ -363,12 +350,12 @@ simulation_test!(
         }
 
         let noncolliding_schema = json!({
-            "x-lix-key": "acme_plugin_note",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "acme_plugin_note",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
@@ -396,7 +383,7 @@ simulation_test!(
 
         let registered = session
             .execute(
-                "SELECT lix_json_get_text(value, 'x-lix-key') \
+                "SELECT value ->> 'key' \
                  FROM lix_registered_schema",
                 &[],
             )
@@ -514,7 +501,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_delete_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -538,7 +525,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
             [Value::Json(entity_pk), Value::Json(value)]
                 if value
                     .to_value()
-                    .get("x-lix-key")
+                    .get("key")
                     .and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema") =>
             {
@@ -546,7 +533,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
             }
             [Value::Json(entity_pk), Value::Text(value)] => {
                 let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                (value.get("x-lix-key").and_then(serde_json::Value::as_str)
+                (value.get("key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema"))
                 .then_some(entity_pk.clone())
             }
@@ -574,7 +561,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
     let like_error = session
         .execute(
             "DELETE FROM lix_registered_schema \
-             WHERE lix_json_get_text(value, 'x-lix-key') LIKE 'engine_delete%'",
+             WHERE value ->> 'key' LIKE 'engine_delete%'",
             &[],
         )
         .await
@@ -601,28 +588,24 @@ simulation_test!(
         );
 
         let initial_schema = json!({
-            "x-lix-key": "engine_schema_update_history",
-                        "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "engine_schema_update_history",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let amended_schema = json!({
-            "x-lix-key": "engine_schema_update_history",
-                        "x-lix-primary-key": ["/id"],
-            "type": "object",
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "engine_schema_update_history",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+                { "name": "subtitle", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
             "description": "Compatible tracked schema amendment",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" },
-                "subtitle": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false
         });
 
         session
@@ -689,7 +672,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_primary_key_without_json_pointer_slash,
+    lix_registered_schema_insert_rejects_unknown_primary_key_column,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -704,38 +687,26 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_bad_pointer_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"missing\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
                 &[],
             )
             .await
-            .expect_err("registered schema insert should reject JSON Pointers without leading slash");
+            .expect_err("registered schema insert should reject unknown primary-key columns");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("must begin with '/'"),
+            error.message.contains("unknown column 'missing'"),
             "unexpected message: {}",
             error.message
-        );
-        assert!(
-            error
-                .message
-                .contains("x-lix-primary-key: \"id\" → \"/id\""),
-            "message should show the offending primary key pointer: {}",
-            error.message
-        );
-        let hint = error.hint.as_deref().expect("error should include a hint");
-        assert!(
-            hint.contains("Did you mean [\"/id\"]?"),
-            "hint should suggest the JSON Pointer form: {hint}"
         );
     }
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_unprojectable_entity_property,
+    lix_registered_schema_insert_rejects_unknown_column_type,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -750,24 +721,19 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_empty_property_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"kind\",\"type\":\"object\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  true,\
                  false\
                  )",
                 &[],
             )
             .await
-            .expect_err("registered schema insert should reject properties without a SQL projection type");
+            .expect_err("registered schema insert should reject unknown column types");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("property '/kind'"),
-            "message should identify the unprojectable property: {}",
-            error.message
-        );
-        assert!(
-            error.message.contains("SQL-projectable JSON Schema type"),
-            "message should explain the projection requirement: {}",
+            error.message.contains("unknown variant `object`"),
+            "message should identify the unknown type: {}",
             error.message
         );
     }
@@ -796,7 +762,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_poison_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -846,7 +812,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_divergent_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -856,26 +822,22 @@ simulation_test!(
             .expect("main schema should be registered");
 
         let main_schema = json!({
-            "x-lix-key": "engine_divergent_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "name": { "type": "string" }
-            },
-            "required": ["id", "name"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "engine_divergent_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "name", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let target_schema = json!({
-            "x-lix-key": "engine_divergent_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "engine_divergent_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
 
         let target = sim.wrap_session(
@@ -890,7 +852,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_divergent_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -936,39 +898,33 @@ simulation_test!(
         );
 
         let base_schema = json!({
-            "x-lix-key": "engine_branch_schema_amendment",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "engine_branch_schema_amendment",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let main_schema = json!({
-            "x-lix-key": "engine_branch_schema_amendment",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" },
-                "main_note": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "engine_branch_schema_amendment",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+                { "name": "main_note", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
         });
         let draft_schema = json!({
-            "x-lix-key": "engine_branch_schema_amendment",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" },
-                "draft_note": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "engine_branch_schema_amendment",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+                { "name": "draft_note", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
         });
 
         main.execute(
@@ -1064,7 +1020,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_fk_parent_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -1076,7 +1032,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_fk_child_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"parent_id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"],\"foreign_keys\":[{\"columns\":[\"parent_id\"],\"references\":{\"schema_key\":\"engine_fk_parent_schema\",\"columns\":[\"id\"]}}]}' AS JSONB),\
              false,\
              false\
              )",
@@ -1138,7 +1094,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_default_id_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1193,7 +1149,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_nullable_default_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"status\",\"type\":\"text\",\"nullable\":true,\"default_value\":\"computed\"}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1264,7 +1220,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_overlay_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              true,\
              false\
              )",
@@ -1277,7 +1233,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_overlay_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -1343,7 +1299,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_global_poison_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1386,7 +1342,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_typed_entity_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"float8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1443,7 +1399,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_number_update_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"score\",\"type\":\"float8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1501,7 +1457,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_file_scoped_entity_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1587,7 +1543,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_identity_literal_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1644,7 +1600,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_identity_in_literal_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1700,7 +1656,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_base_branch_filter_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -1776,7 +1732,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_base_insert_branch_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -1834,7 +1790,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_unknown_insert_column_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1878,7 +1834,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_duplicate_insert_column_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1922,7 +1878,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_qualified_insert_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1964,7 +1920,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_base_branch_insert_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -2020,7 +1976,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_delete_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -2116,7 +2072,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_update_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -2213,7 +2169,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_alias_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -2325,7 +2281,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_duplicate_update_assignment_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -2367,7 +2323,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    propertyless_entity_metadata_update_keeps_internal_snapshot_projection,
+    primary_key_only_entity_metadata_update_keeps_internal_snapshot_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2382,20 +2338,21 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"x-lix-key\":\"engine_propertyless_update_schema\",\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}' AS JSONB),\
+                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_propertyless_update_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                    false,\
                    false\
                  )",
                 &[],
             )
             .await
-            .expect("propertyless schema should register");
+            .expect("primary-key-only schema should register");
 
         session
             .execute(
                 "INSERT INTO engine_propertyless_update_schema \
-                 (lixcol_entity_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
+                 (id, lixcol_entity_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
                  VALUES (\
+                   'propertyless-row',\
                    CAST('[\"propertyless-row\"]' AS JSONB),\
                    CAST('{\"phase\":\"before\"}' AS JSONB),\
                    false,\
@@ -2447,7 +2404,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_optional_update_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false},{\"name\":\"rank\",\"type\":\"int8\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -2490,7 +2447,7 @@ simulation_test!(
             vec![vec![Value::Text("after".to_string()), Value::Null]],
         );
 
-        let error = session
+        session
             .execute(
                 "UPDATE engine_optional_update_schema \
                  SET rank = NULL \
@@ -2498,13 +2455,6 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("explicit NULL should still be validated as JSON null");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(
-            error
-                .message
-                .contains("/rank null is not of type \"integer\""),
-            "expected rank validation error, got {error:?}"
-        );
+            .expect("explicit SQL NULL is valid for a nullable int8 column");
     }
 );

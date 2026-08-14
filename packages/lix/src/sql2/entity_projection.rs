@@ -475,20 +475,20 @@ mod tests {
 
     fn spec() -> crate::sql2::catalog::EntitySurfaceSpec {
         derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "projection_test",
-            "x-lix-primary-key": ["/text"],
-            "type": "object",
-            "properties": {
-                "text": { "type": "string" },
-                "json": { "type": "object" },
-                "integer": { "type": "integer" },
-                "number": { "type": "number" },
-                "boolean": { "type": "boolean" },
-                "coerce_bool": { "type": "string" },
-                "coerce_object": { "type": "string" },
-                "null_text": { "type": "string" },
-                "missing": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "projection_test",
+            "columns": [
+                { "name": "text", "type": "text", "nullable": false },
+                { "name": "json", "type": "jsonb", "nullable": true },
+                { "name": "integer", "type": "int8", "nullable": true },
+                { "name": "number", "type": "float8", "nullable": true },
+                { "name": "boolean", "type": "boolean", "nullable": true },
+                { "name": "coerce_bool", "type": "text", "nullable": true },
+                { "name": "coerce_object", "type": "text", "nullable": true },
+                { "name": "null_text", "type": "text", "nullable": true },
+                { "name": "missing", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["text"],
         }))
         .expect("test schema should derive")
     }

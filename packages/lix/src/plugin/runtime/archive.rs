@@ -1468,12 +1468,10 @@ mod benchmark_probe {
             "schemas":["schema/plugin_bench_note.json"]
         }"#;
         let schema = br#"{
-            "x-lix-key":"plugin_bench_note",
-            "x-lix-primary-key":["/id"],
-            "type":"object",
-            "properties":{"id":{"type":"string"}},
-            "required":["id"],
-            "additionalProperties":false
+            "$schema":"https://lix.dev/schema-v1.json",
+            "key":"plugin_bench_note",
+            "columns":[{"name":"id","type":"text","nullable":false}],
+            "primary_key":["id"]
         }"#;
         let mut wasm = vec![0u8; wasm_bytes];
         wasm[..8].copy_from_slice(b"\0asm\x01\0\0\0");

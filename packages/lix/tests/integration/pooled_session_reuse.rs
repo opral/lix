@@ -230,12 +230,12 @@ async fn information_schema_stays_available_across_pooled_statements() {
             "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[Value::Text(
                 serde_json::json!({
-                    "x-lix-key": "pooled_probe",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": { "id": { "type": "string" } },
-                    "required": ["id"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "pooled_probe",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 })
                 .to_string(),
             )],

@@ -311,15 +311,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "value"],
-        "properties": {
-            "id": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "value", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     session
         .execute(

@@ -90,8 +90,8 @@ pub(crate) fn bind_public_cast_type(
     let cast_type = match data_type {
         SqlDataType::Text => Some(BoundCastType::Text),
         SqlDataType::Bytea => Some(BoundCastType::Binary),
-        SqlDataType::Int8(None) => Some(BoundCastType::BigInt),
-        SqlDataType::Float8 => Some(BoundCastType::Double),
+        SqlDataType::Int8(None) | SqlDataType::BigInt(None) => Some(BoundCastType::BigInt),
+        SqlDataType::Float8 | SqlDataType::DoublePrecision => Some(BoundCastType::Double),
         SqlDataType::Boolean => Some(BoundCastType::Boolean),
         SqlDataType::JSONB => Some(BoundCastType::Jsonb),
         _ => None,

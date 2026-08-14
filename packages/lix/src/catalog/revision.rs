@@ -141,7 +141,7 @@ mod tests {
         rolled_back
             .execute(
                 "INSERT INTO lix_registered_schema \
-                 (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'x-lix-key', $1, false, true)",
+                 (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'key', $1, false, true)",
                 &[Value::Json(test_schema("rolled_back_schema", false).into())],
             )
             .await
@@ -423,7 +423,7 @@ mod tests {
     async fn register_schema(session: &SessionContext<Memory>, schema_key: &str, untracked: bool) {
         let sql = format!(
             "INSERT INTO lix_registered_schema \
-             (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'x-lix-key', $1, false, {untracked})"
+             (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'key', $1, false, {untracked})"
         );
         session
             .execute(&sql, &[Value::Json(test_schema(schema_key, false).into())])
@@ -433,16 +433,19 @@ mod tests {
 
     fn test_schema(schema_key: &str, amended: bool) -> JsonValue {
         let mut schema = json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         if amended {
             schema["description"] = json!("compatible additive amendment");
-            schema["properties"]["title"] = json!({ "type": "string" });
+            schema["columns"]
+                .as_array_mut()
+                .expect("columns")
+                .push(json!({ "name": "title", "type": "text", "nullable": true }));
         }
         schema
     }

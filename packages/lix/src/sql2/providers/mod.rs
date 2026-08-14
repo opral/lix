@@ -816,10 +816,12 @@ mod tests {
     #[test]
     fn transaction_registration_partitions_provider_construction_once() {
         let schema = json!({
-            "x-lix-key": "phase8_entity",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "phase8_entity",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let catalog = PublicCatalog::from_visible_schemas(&[schema]).expect("catalog should build");
 
@@ -994,14 +996,14 @@ mod tests {
     #[tokio::test]
     async fn provider_entity_schemas_match_catalog_contract_order() {
         let schema = json!({
-            "x-lix-key": "phase8_entity",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "count": { "type": "integer" },
-                "body": { "type": "object" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "phase8_entity",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "count", "type": "int8", "nullable": true },
+                { "name": "body", "type": "jsonb", "nullable": true },
+            ],
+            "primary_key": ["id"],
         });
         let catalog =
             PublicCatalog::from_visible_schemas(&[schema.clone()]).expect("catalog should build");

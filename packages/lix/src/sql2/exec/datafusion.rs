@@ -4496,7 +4496,9 @@ mod tests {
             entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
+            snapshot_content: Some(
+                format!("{{\"id\":\"{entity_pk}\",\"value\":\"{value}\"}}").into(),
+            ),
             metadata: Some(json!({ "source": entity_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
@@ -4777,15 +4779,13 @@ mod tests {
             }),
             entity_snapshot_reader: None,
             schema_definitions: vec![json!({
-                "x-lix-key": "integer_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "integer_state_schema",
+                "columns": [
+                    { "name": "id", "type": "int8", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -4830,15 +4830,13 @@ mod tests {
             }),
             entity_snapshot_reader: None,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
         let result = execute_sql(&ctx, sql, &[])
@@ -4896,15 +4894,13 @@ mod tests {
             }),
             entity_snapshot_reader: Some(snapshot_reader),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
         let result = execute_sql(&ctx, sql, &[])
@@ -4967,13 +4963,13 @@ mod tests {
 
     #[tokio::test]
     async fn datafusion_entity_left_join_preserves_matches_and_null_extension() {
-        let sql = r#"SELECT "bundle"."id" AS "bundleId",
-                         "message"."id" AS "messageId",
+        let sql = r#"SELECT "bundle"."id" AS "bundle_id",
+                         "message"."id" AS "message_id",
                          "variant"."id" AS "variantId",
                          "variant"."pattern" AS "variantPattern"
                     FROM "bundle"
-                    LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id"
-                    LEFT JOIN "variant" ON "variant"."messageId" = "message"."id"
+                    LEFT JOIN "message" ON "message"."bundle_id" = "bundle"."id"
+                    LEFT JOIN "variant" ON "variant"."message_id" = "message"."id"
                    WHERE "bundle"."id" = $1"#;
         let row = |schema_key: &str, entity_pk: &str, snapshot: &str| {
             let mut row = live_entity_row(entity_pk, "01920000-0000-7000-8000-0000000000a1", "");
@@ -4989,47 +4985,43 @@ mod tests {
                     row("bundle", "b1", r#"{"id":"b1"}"#),
                     // Stored JSON can violate a registered string type. The
                     // provider projection retains the established coercion.
-                    row("message", "true", r#"{"id":true,"bundleId":"b1"}"#),
-                    row("message", "m2", r#"{"id":"m2","bundleId":"b1"}"#),
+                    row("message", "true", r#"{"id":true,"bundle_id":"b1"}"#),
+                    row("message", "m2", r#"{"id":"m2","bundle_id":"b1"}"#),
                     row(
                         "variant",
                         "v1",
-                        r#"{"id":"v1","messageId":true,"pattern":"Hello"}"#,
+                        r#"{"id":"v1","message_id":true,"pattern":"Hello"}"#,
                     ),
                 ],
             }),
             entity_snapshot_reader: None,
             schema_definitions: vec![
                 json!({
-                    "x-lix-key": "bundle",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": { "id": { "type": "string" } },
-                    "required": ["id"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "bundle",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 }),
                 json!({
-                    "x-lix-key": "message",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "bundleId": { "type": "string" }
-                    },
-                    "required": ["id", "bundleId"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "message",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                        { "name": "bundle_id", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 }),
                 json!({
-                    "x-lix-key": "variant",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "messageId": { "type": "string" },
-                        "pattern": { "type": "string" }
-                    },
-                    "required": ["id", "messageId", "pattern"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "variant",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                        { "name": "message_id", "type": "text", "nullable": false },
+                        { "name": "pattern", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 }),
             ],
         };
@@ -5039,7 +5031,7 @@ mod tests {
 
         assert_eq!(
             result.columns,
-            ["bundleId", "messageId", "variantId", "variantPattern"]
+            ["bundle_id", "message_id", "variantId", "variantPattern"]
         );
         assert_eq!(
             result.rows,
@@ -5096,7 +5088,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"aggregate_filter_test\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"integer\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"aggregate_filter_test\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"int8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false, false)",
                 &[],
             )
@@ -5205,7 +5197,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"int8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -5215,8 +5207,8 @@ mod tests {
         session
             .execute(
                 "INSERT INTO test_state_schema \
-	             (lixcol_entity_pk, value, count, lixcol_metadata, lixcol_untracked) \
-	             VALUES (CAST('[\"entity-history\"]' AS JSONB), 'A', 7, '{\"source\":\"history\"}', false)",
+             (lixcol_entity_pk, id, value, count, lixcol_metadata, lixcol_untracked) \
+             VALUES (CAST('[\"entity-history\"]' AS JSONB), 'entity-history', 'A', 7, '{\"source\":\"history\"}', false)",
                 &[],
             )
             .await?;
@@ -5264,7 +5256,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -5449,7 +5441,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -5629,7 +5621,7 @@ mod tests {
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}' AS JSONB),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -6651,15 +6643,13 @@ mod tests {
                 hot_state,
                 staged_writes,
                 schema_definitions: vec![json!({
-                    "x-lix-key": "test_state_schema",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "value": { "type": "string" }
-                    },
-                    "required": ["id", "value"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "test_state_schema",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                        { "name": "value", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 })],
             };
 
@@ -6721,19 +6711,21 @@ mod tests {
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
-	     lixcol_entity_pk, lixcol_branch_id, value\
-	     ) VALUES (CAST('[\"entity-c\"]' AS JSONB), '01920000-0000-7000-8000-0000000000b1', 'C')",
+	     lixcol_entity_pk, lixcol_branch_id, id, value\
+	     ) VALUES (CAST('[\"entity-c\"]' AS JSONB), '01920000-0000-7000-8000-0000000000b1', 'entity-c', 'C')",
             &[],
         )
         .await
@@ -6755,7 +6747,7 @@ mod tests {
         assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"C\"}")
+            Some("{\"id\":\"entity-c\",\"value\":\"C\"}")
         );
     }
 
@@ -6770,19 +6762,21 @@ mod tests {
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
-             lixcol_entity_pk, lixcol_branch_id, value\
-             ) VALUES (CAST('[\"entity-c\"]' AS JSONB), $1, 'C')",
+             lixcol_entity_pk, lixcol_branch_id, id, value\
+             ) VALUES (CAST('[\"entity-c\"]' AS JSONB), $1, 'entity-c', 'C')",
             &[Value::Text(
                 "01920000-0000-7000-8000-0000000000b1".to_string(),
             )],
@@ -6813,18 +6807,20 @@ mod tests {
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
-	     VALUES (CAST('[\"entity-c\"]' AS JSONB), 'C')",
+            "INSERT INTO test_state_schema (lixcol_entity_pk, id, value) \
+	     VALUES (CAST('[\"entity-c\"]' AS JSONB), 'entity-c', 'C')",
             &[],
         )
         .await
@@ -6846,7 +6842,7 @@ mod tests {
         assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"C\"}")
+            Some("{\"id\":\"entity-c\",\"value\":\"C\"}")
         );
     }
 
@@ -6861,18 +6857,13 @@ mod tests {
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "default_values_probe",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "x-lix-default": "uuidv7()"
-                    },
-                    "label": { "type": "string", "default": "untitled" }
-                },
-                "required": ["id", "label"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "default_values_probe",
+                "columns": [
+                    { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                    { "name": "label", "type": "text", "nullable": false, "default_value": "untitled" },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -6923,18 +6914,20 @@ mod tests {
             hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
-             VALUES (CAST('[\"entity-c\"]' AS JSONB), 'C')",
+            "INSERT INTO test_state_schema (lixcol_entity_pk, id, value) \
+             VALUES (CAST('[\"entity-c\"]' AS JSONB), 'entity-c', 'C')",
             &[],
         )
         .await
@@ -6963,11 +6956,13 @@ mod tests {
             hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -7019,15 +7014,13 @@ mod tests {
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -7112,15 +7105,13 @@ mod tests {
                 }),
                 staged_writes: Arc::new(Mutex::new(CapturingStagedWrites::default())),
                 schema_definitions: vec![json!({
-                    "x-lix-key": "integer_state_schema",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "integer" },
-                        "value": { "type": "string" }
-                    },
-                    "required": ["id", "value"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "integer_state_schema",
+                    "columns": [
+                        { "name": "id", "type": "int8", "nullable": false },
+                        { "name": "value", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 })],
             };
 
@@ -9183,11 +9174,13 @@ mod tests {
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -9215,7 +9208,7 @@ mod tests {
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"updated\"}")
+            Some("{\"id\":\"entity-a\",\"value\":\"updated\"}")
         );
         assert_eq!(
             rows[0].metadata.as_deref(),
@@ -9239,11 +9232,13 @@ mod tests {
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -9282,11 +9277,13 @@ mod tests {
             live_entity_row("entity-c", "01920000-0000-7000-8000-0000000000b1", "After"),
         ]);
         ctx.schema_definitions = vec![json!({
-            "x-lix-key": "test_state_schema",
-            "type": "object",
-            "properties": {
-                "value": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
         })];
 
         let (result, path) = execute_write_sql_trace(
@@ -9328,11 +9325,13 @@ mod tests {
             hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -9369,11 +9368,13 @@ mod tests {
             hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -9407,11 +9408,13 @@ mod tests {
             hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -9433,13 +9436,13 @@ mod tests {
 
     async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, LixError> {
         let schema_definition = json!({
-            "x-lix-key": "test_state_schema",
-            "type": "object",
-            "properties": {
-                "value": { "type": "string" }
-            },
-            "required": ["value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "test_state_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         Ok(DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
