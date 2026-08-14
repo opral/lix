@@ -3125,9 +3125,9 @@ where
                 reject_external_plugin_registry_rows(&rows)?;
                 let count = rows.len() as u64;
                 let mut file_content = Vec::new();
-                let mut reconciliation = self
-                    .plugin_write_reconciliation(&mut rows, &mut file_content)
-                    .await?;
+                let mut reconciliation =
+                    Box::pin(self.plugin_write_reconciliation(&mut rows, &mut file_content))
+                        .await?;
                 reconciliation.attach_durable_checkpoints(&mut file_content)?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 for (file_key, version) in &reconciliation.materialization_versions {
@@ -3195,13 +3195,14 @@ where
             } => {
                 let mut rows = rows;
                 reject_external_plugin_registry_rows(&rows)?;
-                let mut reconciliation = self
-                    .plugin_write_reconciliation(&mut rows, &mut file_content)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.plugin_reconciliation"
-                    ))
-                    .await?;
+                let mut reconciliation = Box::pin(
+                    self.plugin_write_reconciliation(&mut rows, &mut file_content)
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.plugin_reconciliation"
+                        )),
+                )
+                .await?;
                 reconciliation.attach_durable_checkpoints(&mut file_content)?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 rows.retain_raw(|row| {

@@ -171,10 +171,9 @@ jobs:
           cargo test --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-run
 
       - name: Run Rust workspace tests
-        # Deliberately no RUST_MIN_STACK here. Tests that need more than
-        # libtest's 2 MiB worker-stack default must size their own thread
-        # (see `run_on_sized_stack` in the CRUD public-result parity test), so
-        # that the command a developer runs by hand behaves like CI's.
+        # Deliberately no stack-size override here. Production operations and
+        # their tests must fit libtest's default worker stack, so the command a
+        # developer runs by hand behaves like CI's.
         #
         # `--no-fail-fast` is required, not cosmetic. Without it cargo stops at
         # the first failing target and never runs the rest, so a single red
