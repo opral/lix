@@ -102,6 +102,21 @@ where
         .open_another_session()
         .await
         .expect("open shared-blob session");
+    let branch = session
+        .create_branch(lix::CreateBranchOptions {
+            id: Some("01990000-0000-7000-8000-00000000000c".to_owned()),
+            name: "shared-blob-disposable".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create shared-blob disposable branch");
+    let branch_id = branch.id;
+    session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: branch_id.clone(),
+        })
+        .await
+        .expect("switch shared-blob session branch");
     for path in ["/shared-a.bin", "/shared-b.bin"] {
         session
             .execute(
@@ -142,6 +157,15 @@ where
         .await
         .expect("collect while second shared owner remains");
     assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+    let old_hash = blake3::hash(OLD).to_hex().to_string();
+    let new_hash = blake3::hash(NEW).to_hex().to_string();
+    assert_eq!(
+        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &old_hash)
+            .await
+            .expect("shared old CAS lookup should succeed")
+            .as_deref(),
+        Some(OLD),
+    );
     drop(session);
     drop(lix);
     drop(storage);
@@ -155,6 +179,12 @@ where
         .open_another_session()
         .await
         .expect("open shared-blob session after reopen");
+    reopened_session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: branch_id.clone(),
+        })
+        .await
+        .expect("switch reopened shared-blob branch");
     assert_eq!(
         read_file_at(&reopened_session, "/shared-b.bin").await,
         Some(OLD.to_vec())
@@ -163,11 +193,41 @@ where
         .execute("DELETE FROM lix_file WHERE path = '/shared-b.bin'", &[])
         .await
         .expect("delete final shared owner");
-    collect_repository_gc_for_bench(&StorageAdapter::new(reopened_storage))
-        .await
-        .expect("collect after both shared owners are deleted");
     assert_eq!(read_file_at(&reopened_session, "/shared-a.bin").await, None);
     assert_eq!(read_file_at(&reopened_session, "/shared-b.bin").await, None);
+    drop(reopened_session);
+
+    let main = reopened
+        .open_another_session()
+        .await
+        .expect("open shared-blob main session");
+    main.execute(
+        "DELETE FROM lix_branch WHERE id = $1",
+        &[Value::Text(branch_id)],
+    )
+    .await
+    .expect("release shared-blob branch history");
+    drop(main);
+
+    let adapter = StorageAdapter::new(reopened_storage);
+    let sweep = collect_repository_gc_for_bench(&adapter)
+        .await
+        .expect("collect after final owner and history release");
+    assert_ne!(sweep.swept_commits, 0, "shared history release must sweep commits");
+    assert!(
+        read_binary_cas_for_bench(&adapter, &old_hash)
+            .await
+            .expect("released old CAS lookup should succeed")
+            .is_none(),
+        "old shared content must reclaim after every current and historical owner is released",
+    );
+    assert!(
+        read_binary_cas_for_bench(&adapter, &new_hash)
+            .await
+            .expect("released replacement CAS lookup should succeed")
+            .is_none(),
+        "replacement content must reclaim after its branch history is released",
+    );
 }
 
 async fn read_file_at<S>(session: &lix::Lix<S>, path: &str) -> Option<Vec<u8>>

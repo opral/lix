@@ -122,6 +122,84 @@ impl TrackedStateTree {
         storage::load_root(store, commit_id).await
     }
 
+    /// Returns the distinct schema identities that are physically present in
+    /// this authenticated root. Each schema run is discovered with one
+    /// lower-bound descent, so callers can plan schema/file-bounded work
+    /// without trusting the public registration catalog or materializing the
+    /// full tree.
+    pub(crate) async fn distinct_schema_keys(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+    ) -> Result<Vec<String>, LixError> {
+        let mut schema_keys = Vec::new();
+        let mut lower = Vec::new();
+        while let Some(encoded_key) = self
+            .first_key_at_or_after(store, root_id, &lower)
+            .await?
+        {
+            let key = decode_key(&encoded_key)?;
+            let schema_key = key.schema_key;
+            let Some(next_lower) =
+                lexicographic_successor(&encode_schema_key_prefix(&schema_key))
+            else {
+                schema_keys.push(schema_key);
+                break;
+            };
+            if next_lower <= lower {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "tracked-state schema inventory did not advance",
+                ));
+            }
+            schema_keys.push(schema_key);
+            lower = next_lower;
+        }
+        Ok(schema_keys)
+    }
+
+    async fn first_key_at_or_after(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        lower: &[u8],
+    ) -> Result<Option<Bytes>, LixError> {
+        let mut current = *root_id.as_bytes();
+        loop {
+            match self.load_node(store, &current).await? {
+                DecodedNode::Leaf(leaf) => {
+                    let mut low = 0usize;
+                    let mut high = leaf.len();
+                    while low < high {
+                        let mid = low + (high - low) / 2;
+                        let key = leaf.key(mid)?.ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "tracked-state leaf key disappeared during lower-bound seek",
+                            )
+                        })?;
+                        if key < lower {
+                            low = mid + 1;
+                        } else {
+                            high = mid;
+                        }
+                    }
+                    return Ok(leaf.entry_owned(low).map(|entry| entry.key));
+                }
+                DecodedNode::Internal(internal) => {
+                    let Some(child) = internal
+                        .children()
+                        .iter()
+                        .find(|child| child.last_key.as_ref() >= lower)
+                    else {
+                        return Ok(None);
+                    };
+                    current = child.child_hash;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn get(
         &self,

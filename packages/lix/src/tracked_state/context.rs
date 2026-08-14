@@ -3796,37 +3796,85 @@ where
         staged_read: &storage::TrackedStateStagedRead<'_, S>,
         base_root: &TrackedStateRootId,
     ) -> Result<Vec<String>, LixError> {
-        // A file-only predicate cannot bound this schema-first tree. Derive
-        // the complete schema inventory from authenticated registered-schema
-        // rows in this same parent root, then issue canonical
-        // `(schema_key, file_id)` ranges. Built-in filesystem schemas are
-        // native controls and therefore included independently of public
-        // registration.
-        let mut schema_keys = crate::filesystem::filesystem_schema_keys()
-            .into_iter()
+        // A file-only predicate cannot bound this schema-first tree. Enumerate
+        // the actual authenticated schema runs in the same parent root, then
+        // issue canonical `(schema_key, file_id)` ranges. This includes
+        // private/unregistered rows without trusting a second catalog.
+        self.tree.distinct_schema_keys(staged_read, base_root).await
+    }
+
+    #[cold]
+    #[inline(never)]
+    async fn file_cascade_mutations<'a>(
+        &self,
+        staged_read: &storage::TrackedStateStagedRead<'_, S>,
+        base_root: &TrackedStateRootId,
+        deltas: &[TrackedStateDeltaRef<'a>],
+    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, LixError> {
+        let mut cascades = BTreeMap::<String, &TrackedStateDeltaRef<'_>>::new();
+        for delta in deltas {
+            if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !delta.deleted {
+                continue;
+            }
+            let file_id = delta.row_pk.as_single_string_owned().map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("file descriptor tombstone has invalid identity: {error}"),
+                )
+            })?;
+            cascades.insert(file_id, delta);
+        }
+        let explicit_keys = deltas
+            .iter()
+            .map(|delta| TrackedStateKey {
+                schema_key: delta.schema_key.to_string(),
+                file_id: delta.file_id.map(str::to_string),
+                row_pk: delta.row_pk.clone(),
+            })
             .collect::<BTreeSet<_>>();
-        let registered_schemas = self
+        let rows = self
             .tree
             .scan(
                 staged_read,
                 base_root,
                 &TrackedStateTreeScanRequest {
-                    schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                    file_ids: vec![NullableKeyFilter::Null],
+                    schema_keys: self
+                        .file_cascade_schema_keys(staged_read, base_root)
+                        .await?,
+                    file_ids: cascades
+                        .keys()
+                        .cloned()
+                        .map(NullableKeyFilter::Value)
+                        .collect(),
                     include_tombstones: false,
                     ..TrackedStateTreeScanRequest::default()
                 },
             )
             .await?;
-        for (key, _) in registered_schemas {
-            schema_keys.insert(key.row_pk.as_single_string_owned().map_err(|error| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!("registered schema cascade identity is invalid: {error}"),
+        let mut mutations = BTreeMap::new();
+        for (key, value) in rows {
+            if explicit_keys.contains(&key) {
+                continue;
+            }
+            let cascade = cascades
+                .get(
+                    key.file_id
+                        .as_deref()
+                        .expect("file-filtered tracked row requires file id"),
                 )
-            })?);
+                .expect("tracked scan only returns requested cascade ids");
+            mutations.insert(
+                encode_key(&key),
+                encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: cascade.change_id,
+                    commit_id: cascade.commit_id,
+                    deleted: true,
+                    created_at: value.created_at(),
+                    updated_at: cascade.updated_at,
+                }),
+            );
         }
-        Ok(schema_keys.into_iter().collect())
+        Ok(mutations)
     }
 
     pub(crate) fn into_transient_rebuild_state(self) -> TrackedStateTransientRebuildState {
@@ -3991,74 +4039,26 @@ where
                 primary_chunk_puts: 0,
             });
         }
-        let explicit_keys = deltas
-            .iter()
-            .map(|delta| TrackedStateKey {
-                schema_key: delta.schema_key.to_string(),
-                file_id: delta.file_id.map(str::to_string),
-                row_pk: delta.row_pk.clone(),
-            })
-            .collect::<BTreeSet<_>>();
         let mut cascade_mutations = BTreeMap::<Vec<u8>, Vec<u8>>::new();
         if let Some(base_root) = base_root.as_ref() {
             let staged_read = storage::TrackedStateStagedRead::new(self.store, &self.chunk_overlay);
-            let mut cascades = BTreeMap::<String, &TrackedStateDeltaRef<'_>>::new();
-            for delta in &deltas {
-                if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !delta.deleted {
-                    continue;
-                }
-                let file_id = delta.row_pk.as_single_string_owned().map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("file descriptor tombstone has invalid identity: {error}"),
-                    )
-                })?;
-                cascades.insert(file_id, delta);
-            }
-            if !cascades.is_empty() {
-                let cascade_schema_keys = self
-                    .file_cascade_schema_keys(&staged_read, base_root)
+            if deltas.iter().any(|delta| {
+                delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && delta.deleted
+            }) {
+                cascade_mutations = self
+                    .file_cascade_mutations(&staged_read, base_root, &deltas)
                     .await?;
-                let rows = self
-                    .tree
-                    .scan(
-                        &staged_read,
-                        base_root,
-                        &TrackedStateTreeScanRequest {
-                            schema_keys: cascade_schema_keys,
-                            file_ids: cascades
-                                .keys()
-                                .cloned()
-                                .map(NullableKeyFilter::Value)
-                                .collect(),
-                            include_tombstones: false,
-                            ..TrackedStateTreeScanRequest::default()
-                        },
-                    )
-                    .await?;
-                for (key, value) in rows {
-                    if explicit_keys.contains(&key) {
-                        continue;
-                    }
-                    let cascade = cascades
-                        .get(
-                            key.file_id
-                                .as_deref()
-                                .expect("file-filtered tracked row requires file id"),
-                        )
-                        .expect("tracked scan only returns requested cascade ids");
-                    cascade_mutations.insert(
-                        encode_key(&key),
-                        encode_value_ref(TrackedStateIndexValueRef {
-                            change_id: cascade.change_id,
-                            commit_id: cascade.commit_id,
-                            deleted: true,
-                            created_at: value.created_at(),
-                            updated_at: cascade.updated_at,
-                        }),
-                    );
-                }
             }
+            let explicit_keys = (!certified_replacement_markers.is_empty()).then(|| {
+                deltas
+                    .iter()
+                    .map(|delta| TrackedStateKey {
+                        schema_key: delta.schema_key.to_string(),
+                        file_id: delta.file_id.map(str::to_string),
+                        row_pk: delta.row_pk.clone(),
+                    })
+                    .collect::<BTreeSet<_>>()
+            });
             for marker in deltas.iter().filter(|delta| {
                 !delta.deleted
                     && delta.schema_key
@@ -4087,7 +4087,11 @@ where
                     )
                     .await?;
                 for (key, value) in rows {
-                    if explicit_keys.contains(&key) {
+                    if explicit_keys
+                        .as_ref()
+                        .expect("certified marker requires explicit-key inventory")
+                        .contains(&key)
+                    {
                         continue;
                     }
                     cascade_mutations.insert(
@@ -6479,7 +6483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_cascade_rejects_malformed_registered_schema_identity() {
+    async fn file_cascade_discovers_unregistered_file_owned_schema_from_root() {
         const FILE_ID: &str = "01920000-0000-7000-8000-0000000000a3.json";
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
@@ -6487,28 +6491,24 @@ mod tests {
         let mut descriptor = row(FILE_ID, "descriptor-parent", "parent");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         descriptor.file_id = Some(FILE_ID.to_string());
-        let mut malformed_registration = row("ignored", "schema-parent", "parent");
-        malformed_registration.schema_key = REGISTERED_SCHEMA_KEY.to_string();
-        malformed_registration.file_id = None;
-        malformed_registration.row_pk = RowPk::from_validated_shared_string_parts([
-            "schema-part-a".into(),
-            "schema-part-b".into(),
-        ]);
+        let mut private_row = row("private-row", "private-parent", "parent");
+        private_row.schema_key = "plugin_private_schema".to_string();
+        private_row.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
             "parent",
             None,
-            &[descriptor.clone(), malformed_registration],
+            &[descriptor.clone(), private_row.clone()],
         )
         .await
-        .expect("malformed catalog fixture root should stage");
+        .expect("unregistered private row root should stage");
 
         descriptor.snapshot_content = None;
         descriptor.deleted = true;
         descriptor.change_id = ChangeId::for_test_label("descriptor-delete");
         descriptor.commit_id = CommitId::for_test_label("child");
-        let error = write_root_for_test(
+        write_root_for_test(
             &storage,
             &tracked_state,
             "child",
@@ -6516,13 +6516,33 @@ mod tests {
             &[descriptor],
         )
         .await
-        .expect_err("malformed authenticated schema inventory must fail closed");
-        assert!(
-            error
-                .message
-                .contains("registered schema cascade identity is invalid"),
-            "unexpected error: {error:?}"
-        );
+        .expect("authenticated root inventory must find the private schema");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("child root should open");
+        let child_root = tracked_state
+            .tree
+            .load_root(&read, "child")
+            .await
+            .expect("child root metadata should load")
+            .expect("child root must exist");
+        let value = TrackedStateTree::new()
+            .get(
+                &read,
+                &child_root,
+                &TrackedStateKey {
+                    schema_key: private_row.schema_key,
+                    file_id: private_row.file_id,
+                    row_pk: private_row.row_pk,
+                },
+            )
+            .await
+            .expect("private row should remain addressable")
+            .expect("private row must be represented by a tombstone");
+        assert!(value.deleted());
+        assert_eq!(value.commit_id, CommitId::for_test_label("child"));
     }
 
     #[tokio::test]
