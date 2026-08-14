@@ -166,6 +166,13 @@ impl CurrentStatePackV1 {
                     "current-state pack row commit differs from its owner",
                 ));
             }
+            if let super::state::StateCell::NativeRow(native) = &row.value.cell
+                && native.global != self.global
+            {
+                return Err(corruption(
+                    "current-state native row domain differs from its pack",
+                ));
+            }
             if row.history_page_object_id == ObjectId::ZERO {
                 return Err(corruption(
                     "current-state pack contains a zero history page id",

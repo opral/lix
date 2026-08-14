@@ -13,14 +13,13 @@ use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::branch::BRANCH_DESCRIPTOR_SCHEMA_KEY;
 use crate::catalog::{CatalogSnapshot, SchemaPlan};
 use crate::common::{SharedStr, json_pointer_get, validate_row_metadata};
 use crate::domain::Domain;
 use crate::entity_pk::{EntityPk, EntityPkComponents};
 use crate::forktree::{
-    StateCell, StateKey, StateKeyRef, decode_state_key, encode_state_entity_prefix,
-    encode_state_key, exclusive_prefix_upper_bound,
+    StateKey, StateKeyRef, decode_state_key, encode_state_entity_prefix, encode_state_key,
+    exclusive_prefix_upper_bound,
 };
 use crate::state::{StateRow, StateRowSource, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
@@ -77,13 +76,16 @@ struct NativeValidationRow {
 impl NativeValidationRow {
     fn from_tracked(row: StateRow, branch_id: &str) -> Result<Self, LixError> {
         let key = decode_state_key(&row.key)?;
-        let branch_id = if key.schema_key == BRANCH_DESCRIPTOR_SCHEMA_KEY {
+        let branch_id = if row.source == StateRowSource::Global {
             GLOBAL_BRANCH_ID.to_owned()
         } else {
             branch_id.to_owned()
         };
         let deleted = row.value.cell.deleted();
-        let snapshot = row.value.cell.seed_logical_text(&key, &branch_id)?;
+        let snapshot = row
+            .value
+            .cell
+            .seed_logical_text(&key, row.source == StateRowSource::Global)?;
         Ok(Self {
             key,
             branch_id,
@@ -1315,6 +1317,51 @@ where
 mod tests {
     use super::*;
 
+    fn tracked_native_row(
+        source: StateRowSource,
+        global: bool,
+        key: &str,
+        value: &str,
+    ) -> StateRow {
+        let schema = crate::native_row::seed_schema("lix_key_value")
+            .expect("built-in key-value schema must compile");
+        let entity_pk = EntityPk::single(key);
+        let snapshot = serde_json::json!({"key": key, "value": value});
+        StateRow {
+            key: encode_state_key(StateKeyRef {
+                schema_key: "lix_key_value",
+                file_id: None,
+                entity_pk: &entity_pk,
+            }),
+            value: crate::forktree::StateValue {
+                change_id: crate::changelog::ChangeId::default(),
+                commit_id: crate::changelog::CommitId::default(),
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+                updated_at: crate::common::LixTimestamp::expect_parse(
+                    "updated_at",
+                    "2026-01-01T00:00:00.001Z",
+                ),
+                cell: crate::forktree::StateCell::NativeRow(
+                    crate::native_row::encode(
+                        &schema,
+                        &entity_pk,
+                        global,
+                        None,
+                        &snapshot,
+                    )
+                    .expect("test row must encode"),
+                ),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source,
+        }
+    }
+
     fn native_row(schema_key: &str, snapshot: &str) -> NativeValidationRow {
         NativeValidationRow {
             key: StateKey {
@@ -1364,6 +1411,64 @@ mod tests {
         );
         let error = descriptor_namespace_parts(&row).expect_err("invalid name must fail");
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+    }
+
+    #[test]
+    fn tracked_native_validation_binds_global_and_branch_rows_to_their_source_owner() {
+        let branch_id = "01950000-0000-7000-8000-000000000001";
+
+        let global = NativeValidationRow::from_tracked(
+            tracked_native_row(
+                StateRowSource::Global,
+                true,
+                "same-key",
+                "global",
+            ),
+            branch_id,
+        )
+        .expect("global row must retain its authenticated global domain");
+        assert_eq!(global.branch_id, GLOBAL_BRANCH_ID);
+        assert!(global.global);
+
+        let local = NativeValidationRow::from_tracked(
+            tracked_native_row(
+                StateRowSource::Branch,
+                false,
+                "same-key",
+                "local",
+            ),
+            branch_id,
+        )
+        .expect("branch row must bind to the selected logical branch");
+        assert_eq!(local.branch_id, branch_id);
+        assert!(!local.global);
+
+        let source_branch = "01950000-0000-7000-8000-000000000002";
+        let inherited = NativeValidationRow::from_tracked(
+            tracked_native_row(
+                StateRowSource::Branch,
+                false,
+                "same-key",
+                "inherited",
+            ),
+            branch_id,
+        )
+        .expect("an inherited local row remains valid in the selected child branch");
+        assert_eq!(inherited.branch_id, branch_id);
+        assert!(!inherited.global);
+
+        let error = NativeValidationRow::from_tracked(
+            tracked_native_row(
+                StateRowSource::Branch,
+                true,
+                "same-key",
+                "substituted",
+            ),
+            branch_id,
+        )
+        .expect_err("wrong-owner substitution must fail closed");
+        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
+        assert!(error.message.contains("owner domain does not match"));
     }
 
     fn validation_index_candidate_count(row_count: usize) -> usize {

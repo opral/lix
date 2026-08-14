@@ -960,7 +960,7 @@ fn commit_projection_row(
             cell: StateCell::NativeRow(crate::native_row::encode(
                 schema,
                 &entity_pk,
-                crate::GLOBAL_BRANCH_ID,
+                true,
                 None,
                 &snapshot,
             )?),
@@ -1023,7 +1023,7 @@ fn branch_ref_state_slot(
                 crate::native_row::encode(
                     &schema,
                     &entity_pk,
-                    crate::GLOBAL_BRANCH_ID,
+                    true,
                     None,
                     &snapshot,
                 )
@@ -3037,20 +3037,19 @@ fn entity_slot_logical_value(
     let key = decode_state_key(&row.key).map_err(lix_error_to_datafusion_error)?;
     match &row.value.cell {
         StateCell::NativeRow(native) => {
-            let owner_branch = if row.source == StateRowSource::Global {
-                GLOBAL_BRANCH_ID
-            } else {
+            let global = row.source == StateRowSource::Global;
+            if !global {
                 historical_branch_id.or(active_branch_id).ok_or_else(|| {
                     DataFusionError::Execution(format!(
                         "entity provider '{}' has no authenticated branch owner",
                         spec.schema_key
                     ))
-                })?
-            };
+                })?;
+            }
             crate::native_row::logical_value(
                 spec.native_schema.as_ref(),
                 &key.entity_pk,
-                owner_branch,
+                global,
                 key.file_id.as_deref(),
                 native,
             )
@@ -3110,9 +3109,10 @@ fn entity_slot_system_column_array(
             Ok(match slot {
                 EntityStateSlot::Tracked(row) => match row.source {
                     StateRowSource::Global => Some(GLOBAL_BRANCH_ID.to_string()),
-                    StateRowSource::Branch | StateRowSource::Staged => {
+                    StateRowSource::Branch | StateRowSource::StagedBranch => {
                         branch_id.map(str::to_string)
                     }
+                    StateRowSource::StagedGlobal => Some(GLOBAL_BRANCH_ID.to_string()),
                 },
                 EntityStateSlot::TrackedAt { branch_id, .. } => Some(branch_id.clone()),
             })
@@ -3191,12 +3191,18 @@ fn entity_slot_system_column_array(
                     // staged post-image. The commit identity remains visible
                     // and the change id becomes durable at publication.
                     EntityStateSlot::Tracked(row)
-                        if matches!(row.source, StateRowSource::Staged) =>
+                        if matches!(
+                            row.source,
+                            StateRowSource::StagedGlobal | StateRowSource::StagedBranch
+                        ) =>
                     {
                         Ok(None)
                     }
                     EntityStateSlot::TrackedAt { row, .. }
-                        if matches!(row.source, StateRowSource::Staged) =>
+                        if matches!(
+                            row.source,
+                            StateRowSource::StagedGlobal | StateRowSource::StagedBranch
+                        ) =>
                     {
                         Ok(None)
                     }
@@ -3367,7 +3373,8 @@ fn entity_state_system_column_array(column_name: &str, rows: &[StateRow]) -> Res
         "branch_id" => Arc::new(StringArray::from_iter(rows.iter().map(
             |row| match row.source {
                 StateRowSource::Global => Some(GLOBAL_BRANCH_ID),
-                StateRowSource::Branch | StateRowSource::Staged => None,
+                StateRowSource::Branch | StateRowSource::StagedBranch => None,
+                StateRowSource::StagedGlobal => Some(GLOBAL_BRANCH_ID),
             },
         ))) as ArrayRef,
         _ => {
@@ -3772,12 +3779,13 @@ mod tests {
             .expect("scan committed native view");
         assert!(committed_rows.is_empty());
 
-        let staged = tracked_row(StateRowSource::Staged, "app.message", "staged");
+        let staged = tracked_row(StateRowSource::StagedBranch, "app.message", "staged");
         let transaction = TransactionStateView::new(
             committed.clone(),
             vec![StagedStateRow::new(
                 staged.key.clone(),
                 staged.value.clone(),
+                false,
             )],
         )
         .expect("construct ordered native transaction overlay");

@@ -7,7 +7,7 @@ use crate::forktree::NativeRowCell;
 pub(crate) fn encode(
     schema: &lix_schema::Schema,
     entity_pk: &EntityPk,
-    branch_id: &str,
+    global: bool,
     file_id: Option<&str>,
     snapshot: &JsonValue,
 ) -> Result<NativeRowCell, LixError> {
@@ -98,34 +98,68 @@ pub(crate) fn encode(
         &mut body,
     )
     .map_err(|error| LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string()))?;
+    let canonical_values = lix_schema::value_layout::decode_body(&body_plan(schema), &body)
+        .map_err(|error| LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string()))?;
+    let semantic_value = logical_value_from_body(schema, entity_pk, canonical_values)?;
     Ok(NativeRowCell {
         layout_id,
-        owner_branch_id: *uuid::Uuid::parse_str(branch_id)
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("native row owner branch is not a UUID: {error}"),
-                )
-            })?
-            .as_bytes(),
-        owner_digest: crate::entity_pk::native_row_owner_digest(
-            branch_id,
+        global,
+        owner_digest: crate::entity_pk::state_identity_digest(
+            global,
             &schema.key,
             entity_pk,
             file_id,
         ),
-        semantic_digest: semantic_digest(snapshot),
+        semantic_digest: semantic_digest(&semantic_value),
         body: bytes::Bytes::from(body),
     })
 }
 
 pub(crate) fn semantic_digest(value: &JsonValue) -> [u8; 32] {
+    fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
+        hash.update(&(bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+
+    fn visit(hash: &mut blake3::Hasher, value: &JsonValue) {
+        match value {
+            JsonValue::Null => {
+                hash.update(&[0]);
+            }
+            JsonValue::Bool(value) => {
+                hash.update(&[1, u8::from(*value)]);
+            }
+            JsonValue::Number(value) => {
+                hash.update(&[2]);
+                field(hash, value.to_string().as_bytes());
+            }
+            JsonValue::String(value) => {
+                hash.update(&[3]);
+                field(hash, value.as_bytes());
+            }
+            JsonValue::Array(values) => {
+                hash.update(&[4]);
+                hash.update(&(values.len() as u64).to_be_bytes());
+                for value in values {
+                    visit(hash, value);
+                }
+            }
+            JsonValue::Object(values) => {
+                hash.update(&[5]);
+                hash.update(&(values.len() as u64).to_be_bytes());
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+                for (key, value) in entries {
+                    field(hash, key.as_bytes());
+                    visit(hash, value);
+                }
+            }
+        };
+    }
+
     let mut hash = blake3::Hasher::new();
-    hash.update(b"lix.forktree.schema-v1.logical-row.v1\0");
-    hash.update(
-        &serde_json::to_vec(value)
-            .expect("serde_json::Value always has a canonical serializable representation"),
-    );
+    hash.update(b"lix.forktree.schema-v1.logical-row.v2\0");
+    visit(&mut hash, value);
     *hash.finalize().as_bytes()
 }
 
@@ -142,7 +176,7 @@ pub(crate) fn semantic_digest_text(value: &str) -> Result<[u8; 32], LixError> {
 pub(crate) fn decode(
     schema: &lix_schema::Schema,
     entity_pk: &EntityPk,
-    branch_id: &str,
+    global: bool,
     file_id: Option<&str>,
     native: &NativeRowCell,
 ) -> Result<Vec<lix_schema::value_layout::BodyValue>, LixError> {
@@ -150,23 +184,17 @@ pub(crate) fn decode(
     if native.layout_id != expected_layout {
         return Err(storage_error(schema, "has a mismatched native layout"));
     }
-    let expected_branch = uuid::Uuid::parse_str(branch_id).map_err(|error| {
-        LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            format!("authenticated native row branch is not a UUID: {error}"),
-        )
-    })?;
-    if native.owner_branch_id != *expected_branch.as_bytes() {
+    if native.global != global {
         return Err(storage_error(
             schema,
             &format!(
-                "branch owner does not match its authenticated source (expected={expected_branch}, actual={})",
-                uuid::Uuid::from_bytes(native.owner_branch_id),
+                "owner domain does not match its authenticated source (expected_global={global}, actual_global={})",
+                native.global,
             ),
         ));
     }
-    let expected_owner = crate::entity_pk::native_row_owner_digest(
-        branch_id,
+    let expected_owner = crate::entity_pk::state_identity_digest(
+        native.global,
         &schema.key,
         entity_pk,
         file_id,
@@ -175,7 +203,7 @@ pub(crate) fn decode(
         return Err(storage_error(
             schema,
             &format!(
-                "owner does not match its authenticated StateKey (branch={branch_id}, file_id={file_id:?}, entity_pk={entity_pk:?}, expected={expected_owner:02x?}, actual={:02x?})",
+                "owner does not match its authenticated StateKey (global={global}, file_id={file_id:?}, entity_pk={entity_pk:?}, expected={expected_owner:02x?}, actual={:02x?})",
                 native.owner_digest,
             ),
         ));
@@ -242,12 +270,27 @@ fn layout_id(schema: &lix_schema::Schema) -> [u8; 32] {
 pub(crate) fn logical_value(
     schema: &lix_schema::Schema,
     entity_pk: &EntityPk,
-    branch_id: &str,
+    global: bool,
     file_id: Option<&str>,
     native: &NativeRowCell,
 ) -> Result<JsonValue, LixError> {
+    let body = decode(schema, entity_pk, global, file_id, native)?;
+    let value = logical_value_from_body(schema, entity_pk, body)?;
+    if semantic_digest(&value) != native.semantic_digest {
+        return Err(storage_error(
+            schema,
+            "body differs from its authenticated semantic digest",
+        ));
+    }
+    Ok(value)
+}
+
+fn logical_value_from_body(
+    schema: &lix_schema::Schema,
+    entity_pk: &EntityPk,
+    body: Vec<lix_schema::value_layout::BodyValue>,
+) -> Result<JsonValue, LixError> {
     use lix_schema::value_layout::BodyValue;
-    let body = decode(schema, entity_pk, branch_id, file_id, native)?;
     let JsonValue::Array(pk) = entity_pk.as_json_array_value()? else {
         unreachable!("typed entity primary key always encodes as an array")
     };
@@ -293,12 +336,12 @@ pub(crate) fn logical_value(
 pub(crate) fn logical_text(
     schema: &lix_schema::Schema,
     entity_pk: &EntityPk,
-    branch_id: &str,
+    global: bool,
     file_id: Option<&str>,
     native: &NativeRowCell,
 ) -> Result<crate::common::SharedStr, LixError> {
     serde_json::to_string(&logical_value(
-        schema, entity_pk, branch_id, file_id, native,
+        schema, entity_pk, global, file_id, native,
     )?)
     .map(crate::common::SharedStr::from)
     .map_err(|error| storage_error(schema, &format!("cannot materialize logical row: {error}")))
@@ -337,13 +380,13 @@ pub(crate) fn seed_schema(schema_key: &str) -> Result<lix_schema::Schema, LixErr
 
 pub(crate) fn logical_text_for_seed(
     key: &crate::forktree::StateKey,
-    branch_id: &str,
+    global: bool,
     native: &NativeRowCell,
 ) -> Result<crate::common::SharedStr, LixError> {
     logical_text(
         &seed_schema(&key.schema_key)?,
         &key.entity_pk,
-        branch_id,
+        global,
         key.file_id.as_deref(),
         native,
     )
@@ -377,22 +420,48 @@ mod tests {
     }
 
     #[test]
+    fn semantic_digest_tracks_canonical_float_and_jsonb_body_bytes() {
+        let schema = lix_schema::from_value(json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "canonical_probe",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "score", "type": "float8", "nullable": false},
+                {"name": "payload", "type": "jsonb", "nullable": false}
+            ],
+            "primary_key": ["id"]
+        }))
+        .expect("canonical probe schema");
+        let key = EntityPk::single("row");
+        let encoded = encode(
+            &schema,
+            &key,
+            false,
+            None,
+            &json!({"id": "row", "score": -0.0, "payload": 1.0}),
+        )
+        .expect("canonical native row encodes");
+        let value = logical_value(&schema, &key, false, None, &encoded)
+            .expect("canonical native row authenticates");
+        assert_eq!(semantic_digest(&value), encoded.semantic_digest);
+    }
+
+    #[test]
     fn tuple_omits_pk_and_authenticates_layout_owner_and_semantics() {
-        let branch = "01920000-0000-7000-8000-000000000001";
         let key = EntityPk::single("pk-must-not-appear-in-body");
         let row = json!({"id":"pk-must-not-appear-in-body","payload":"body-only"});
-        let encoded = encode(&schema(Some("first"), false), &key, branch, None, &row)
+        let encoded = encode(&schema(Some("first"), false), &key, false, None, &row)
             .expect("native tuple encodes");
         assert!(!encoded
             .body
             .windows(b"pk-must-not-appear-in-body".len())
             .any(|window| window == b"pk-must-not-appear-in-body"));
-        decode(&schema(Some("changed metadata"), false), &key, branch, None, &encoded)
+        decode(&schema(Some("changed metadata"), false), &key, false, None, &encoded)
             .expect("layout-neutral description amendment remains readable");
         assert!(decode(
             &schema(Some("first"), true),
             &key,
-            branch,
+            false,
             None,
             &encoded
         )
@@ -400,7 +469,7 @@ mod tests {
         assert!(decode(
             &schema(Some("first"), false),
             &key,
-            "01920000-0000-7000-8000-000000000002",
+            true,
             None,
             &encoded
         )

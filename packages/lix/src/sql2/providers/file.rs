@@ -8809,7 +8809,7 @@ mod tests {
         }
         let staged = selected
             .into_values()
-            .map(|row| crate::state::StagedStateRow::new(row.key, row.value))
+            .map(|row| crate::state::StagedStateRow::new(row.key, row.value, false))
             .collect();
         TransactionStateView::new(committed, staged)
             .expect("native transaction overlay should be valid")

@@ -151,15 +151,15 @@ pub(crate) struct StateDiffEntry {
 impl StateRow {
     pub(crate) fn seed_logical_snapshot(
         &self,
-        active_branch_id: &str,
+        _active_branch_id: &str,
     ) -> Result<Option<crate::common::SharedStr>, LixError> {
         let key = crate::forktree::decode_state_key(&self.key)?;
-        let owner = if self.source == StateRowSource::Global {
-            crate::GLOBAL_BRANCH_ID
-        } else {
-            active_branch_id
+        let global = match self.source {
+            StateRowSource::Global => true,
+            StateRowSource::Branch | StateRowSource::StagedBranch => false,
+            StateRowSource::StagedGlobal => true,
         };
-        self.value.cell.seed_logical_text(&key, owner)
+        self.value.cell.seed_logical_text(&key, global)
     }
 
     fn from_committed(row: VisibleStateRow) -> Self {
@@ -177,7 +177,11 @@ impl StateRow {
         Self {
             key: row.key.clone(),
             value: row.value.clone(),
-            source: StateRowSource::Staged,
+            source: if row.global {
+                StateRowSource::StagedGlobal
+            } else {
+                StateRowSource::StagedBranch
+            },
         }
     }
 }
@@ -187,7 +191,8 @@ impl StateRow {
 pub(crate) enum StateRowSource {
     Global,
     Branch,
-    Staged,
+    StagedGlobal,
+    StagedBranch,
 }
 
 /// One already-authenticated staged state cell. Rows must be supplied in
@@ -196,11 +201,12 @@ pub(crate) enum StateRowSource {
 pub(crate) struct StagedStateRow {
     pub(crate) key: Vec<u8>,
     pub(crate) value: StateValue,
+    pub(crate) global: bool,
 }
 
 impl StagedStateRow {
-    pub(crate) fn new(key: Vec<u8>, value: StateValue) -> Self {
-        Self { key, value }
+    pub(crate) fn new(key: Vec<u8>, value: StateValue, global: bool) -> Self {
+        Self { key, value, global }
     }
 }
 
@@ -825,7 +831,7 @@ where
 
 fn collection_delete_ranges(
     staged: &[StagedStateRow],
-    active_branch_id: &str,
+    _active_branch_id: &str,
 ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, LixError> {
     let mut ranges = Vec::new();
     for row in staged {
@@ -833,7 +839,10 @@ fn collection_delete_ranges(
         if key.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
             continue;
         }
-        let Some(snapshot) = row.value.cell.seed_logical_text(&key, active_branch_id)? else {
+        let Some(snapshot) = row.value.cell.seed_logical_text(
+            &key,
+            row.global,
+        )? else {
             continue;
         };
         let value: serde_json::Value =

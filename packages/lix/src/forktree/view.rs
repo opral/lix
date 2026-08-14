@@ -782,7 +782,10 @@ where
         let snapshot = row
             .value
             .cell
-            .seed_logical_text(&decoded, branch_id)?
+            .seed_logical_text(
+                &decoded,
+                row.source == super::serving::StateSource::Global,
+            )?
             .ok_or_else(|| {
                 crate::LixError::new(
                     crate::LixError::CODE_STORAGE_ERROR,

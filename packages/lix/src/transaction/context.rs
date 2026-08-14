@@ -6380,6 +6380,10 @@ where
         self.sql_schema_snapshot.fingerprint()
     }
 
+    pub(crate) fn sql_schema_snapshot(&self) -> &CatalogSnapshot {
+        &self.sql_schema_snapshot
+    }
+
     pub(crate) fn sql_public_catalog(&self) -> Result<Arc<crate::sql2::PublicCatalog>, LixError> {
         self.sql_planning_cache
             .public_catalog(self.sql_catalog_fingerprint(), || {

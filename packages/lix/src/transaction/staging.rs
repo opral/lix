@@ -1469,7 +1469,7 @@ impl TransactionWriteBuffer {
             tracked.push((
                 encoded_key,
                 is_global,
-                StagedStateRow::new(staged_key, state_value_from_prepared(row)),
+                StagedStateRow::new(staged_key, state_value_from_prepared(row), is_global),
             ));
         }
 
@@ -3553,8 +3553,13 @@ mod staging_semantics_tests {
                 StagedStateRow::new(
                     key_a.clone(),
                     native_state_value(StateCell::Value("a".into()), 1),
+                    false,
                 ),
-                StagedStateRow::new(key_b.clone(), native_state_value(StateCell::Tombstone, 2)),
+                StagedStateRow::new(
+                    key_b.clone(),
+                    native_state_value(StateCell::Tombstone, 2),
+                    false,
+                ),
             ],
         )
         .expect("native rows are ordered");
@@ -3592,12 +3597,21 @@ mod staging_semantics_tests {
         let view = TransactionStateView::new(
             committed,
             vec![
-                StagedStateRow::new(key_a.clone(), native_state_value(StateCell::Tombstone, 1)),
+                StagedStateRow::new(
+                    key_a.clone(),
+                    native_state_value(StateCell::Tombstone, 1),
+                    false,
+                ),
                 StagedStateRow::new(
                     key_b.clone(),
                     native_state_value(StateCell::Value("b".into()), 2),
+                    false,
                 ),
-                StagedStateRow::new(key_c, native_state_value(StateCell::Value("c".into()), 3)),
+                StagedStateRow::new(
+                    key_c,
+                    native_state_value(StateCell::Value("c".into()), 3),
+                    false,
+                ),
             ],
         )
         .expect("native rows are ordered");
@@ -3621,11 +3635,17 @@ mod staging_semantics_tests {
                 StagedStateRow::new(
                     key_a.clone(),
                     native_state_value(StateCell::Value("a".into()), 1),
+                    false,
                 ),
-                StagedStateRow::new(key_b.clone(), native_state_value(StateCell::Tombstone, 2)),
+                StagedStateRow::new(
+                    key_b.clone(),
+                    native_state_value(StateCell::Tombstone, 2),
+                    false,
+                ),
                 StagedStateRow::new(
                     key_c.clone(),
                     native_state_value(StateCell::Value("c".into()), 3),
+                    false,
                 ),
             ],
         )
@@ -3899,8 +3919,16 @@ mod staging_semantics_tests {
         let result = TransactionStateView::new(
             committed,
             vec![
-                StagedStateRow::new(native_key("b"), native_state_value(StateCell::Null, 1)),
-                StagedStateRow::new(native_key("a"), native_state_value(StateCell::Null, 2)),
+                StagedStateRow::new(
+                    native_key("b"),
+                    native_state_value(StateCell::Null, 1),
+                    false,
+                ),
+                StagedStateRow::new(
+                    native_key("a"),
+                    native_state_value(StateCell::Null, 2),
+                    false,
+                ),
             ],
         );
         assert!(
