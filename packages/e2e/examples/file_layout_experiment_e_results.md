@@ -156,3 +156,36 @@ reading plugin schema metadata. Neither result is claimed as E1/E2 public-path
 coverage. Production cutover still requires replacing the current file-row
 content reference with this tagged binary cell as the sole authority, followed
 by public SQL, corruption, GC, and reopen qualification.
+
+## Final exact-main rebind
+
+The approved model was transplanted exactly once, without redesign or conflict,
+onto final PR #1469 commit
+`dc4f42917937150fa20fcb7517c46c21d1840045`, tree
+`6b4b9e14eb95dfa5fb5fc7046cf169c12f4813e1`.
+
+The rebind preserves the same native scalar metadata encoding (UUID-width file
+and directory IDs, canonical UTF-8 text, native `u64` payload length), the same
+canonical descriptor rule (`<=128` bytes inline, `>128` indirect), and the
+same explicit-tag/content-ID validation. The four codec tests pass unchanged.
+
+Fresh representative cells on both RocksDB and SlateDB pass deterministic
+same-key chunk/descriptor substitution rejection, cold reopen, GC, and
+post-GC authenticated reads:
+
+- 1 MiB inline descriptor: SHA-256
+  `4e1a346c6f3e12a41406875f67de71643327df6f8663d9f2ebcf4f696971ca42`.
+  After GC each adapter has three rows, no external descriptor object, no
+  inline payload, two unique chunks, and 3x logical sharing.
+- 16 MiB with 64 additional shared references: SHA-256
+  `3e030513b305baf138d848555845bcc8f26f99607c65f6021cfa83b10380bcdd`.
+  After GC each adapter has 67 rows, one 548-byte external descriptor, no
+  inline payload, 15 unique chunks, and exactly 67x logical sharing.
+- release binary SHA-256
+  `82e747530e3441d461d281695bb080b867554ae5a240a6a5807eb3acad667de3`.
+
+Status remains **MODEL APPROVED / PRODUCTION CUTOVER PENDING**. This rebind
+changes only the benchmark registration, model, and report. It does not make
+the tagged descriptor the durable `lix_file` carrier, so it is not public-path
+integration evidence. Production cutover requires a separately assigned
+cross-lane format composition and sole-authority migration.
