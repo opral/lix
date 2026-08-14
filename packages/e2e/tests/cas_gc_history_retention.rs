@@ -70,6 +70,122 @@ async fn slatedb_current_untracked_blob_survives_sweep_and_cold_reopen() {
         .await;
 }
 
+#[tokio::test]
+async fn rocksdb_shared_blob_survives_replace_rollback_delete_gc_and_reopen() {
+    let temp = tempfile::tempdir().expect("create RocksDB shared-blob fixture");
+    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| {
+        RocksDB::open(path)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn slatedb_shared_blob_survives_replace_rollback_delete_gc_and_reopen() {
+    let temp = tempfile::tempdir().expect("create SlateDB shared-blob fixture");
+    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| SlateDB::open(path))
+        .await;
+}
+
+async fn shared_blob_replacement_lifecycle<S, O>(path: &std::path::Path, open: O)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    O: Fn(&std::path::Path) -> Result<S, lix::storage::StorageError>,
+{
+    const OLD: &[u8] = b"shared-old-content";
+    const NEW: &[u8] = b"replacement-content";
+    let storage = open(path).expect("open shared-blob fixture");
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("initialize shared-blob repository");
+    let session = lix
+        .open_another_session()
+        .await
+        .expect("open shared-blob session");
+    for path in ["/shared-a.bin", "/shared-b.bin"] {
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[Value::Text(path.to_owned()), Value::Blob(OLD.to_vec().into())],
+            )
+            .await
+            .expect("insert shared blob owner");
+    }
+
+    let mut rollback = session
+        .begin_transaction()
+        .await
+        .expect("begin shared replacement rollback");
+    rollback
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'",
+            &[Value::Blob(NEW.to_vec().into())],
+        )
+        .await
+        .expect("stage shared replacement rollback");
+    rollback.rollback().await.expect("rollback shared replacement");
+    assert_eq!(read_file_at(&session, "/shared-a.bin").await, Some(OLD.to_vec()));
+    assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+
+    session
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'",
+            &[Value::Blob(NEW.to_vec().into())],
+        )
+        .await
+        .expect("commit one shared owner replacement");
+    session
+        .execute("DELETE FROM lix_file WHERE path = '/shared-a.bin'", &[])
+        .await
+        .expect("delete replaced shared owner");
+    collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
+        .await
+        .expect("collect while second shared owner remains");
+    assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+    drop(session);
+    drop(lix);
+    drop(storage);
+
+    let reopened_storage = open(path).expect("cold reopen shared-blob fixture");
+    let reopened = open_lix()
+        .with_storage(reopened_storage.clone())
+        .await
+        .expect("open shared-blob repository after reopen");
+    let reopened_session = reopened
+        .open_another_session()
+        .await
+        .expect("open shared-blob session after reopen");
+    assert_eq!(
+        read_file_at(&reopened_session, "/shared-b.bin").await,
+        Some(OLD.to_vec())
+    );
+    reopened_session
+        .execute("DELETE FROM lix_file WHERE path = '/shared-b.bin'", &[])
+        .await
+        .expect("delete final shared owner");
+    collect_repository_gc_for_bench(&StorageAdapter::new(reopened_storage))
+        .await
+        .expect("collect after both shared owners are deleted");
+    assert_eq!(read_file_at(&reopened_session, "/shared-a.bin").await, None);
+    assert_eq!(read_file_at(&reopened_session, "/shared-b.bin").await, None);
+}
+
+async fn read_file_at<S>(session: &lix::Lix<S>, path: &str) -> Option<Vec<u8>>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    session
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_owned())],
+        )
+        .await
+        .expect("read shared blob owner")
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("content").expect("blob content"))
+}
+
 async fn prepare_current_untracked<S>(storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
