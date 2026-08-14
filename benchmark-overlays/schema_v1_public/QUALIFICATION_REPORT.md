@@ -135,9 +135,9 @@ the durable write bytes. This is not a Slate-only effect, although Slate wall
 penalties are larger.
 
 The successful one-shot public file prefix also shows the same direction. On
-Rocks, unified/main wall microseconds are insert 3049/2694, read 1787/948,
-update 3026/2248, delete 1924/852. On Slate they are 2746/1753, 1403/553,
-3166/1870, 2712/925. File digests match through delete. Branch sharing and
+Rocks, unified/main wall microseconds are insert 2865/2556, read 1461/941,
+update 2619/2224, delete 1679/834. On Slate they are 2208/1807, 1102/610,
+2516/1916, 2106/932. File digests match through delete. Branch sharing and
 cold-reopen file qualification remain blocked by branch creation and are not
 claimed.
 
