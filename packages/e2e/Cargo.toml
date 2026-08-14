@@ -357,6 +357,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "schema_history_chunks"
+path = "benches/schema_history_chunks.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "checkpoint_history_scale"
 path = "benches/checkpoint_history_scale.rs"
 harness = false
