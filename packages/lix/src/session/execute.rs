@@ -5562,21 +5562,24 @@ mod tests {
             &Value::Json(serde_json::json!({"rank": 2}).into())
         );
 
-        let (profiled, profile) = session
-            .execute_profiled(
-                "SELECT id, note, payload FROM batch_route_row \
-                 WHERE id IN ($1, $2, $3, $4) \
-                   AND lixcol_file_id IS NULL ORDER BY id",
-                &params,
-            )
-            .await
-            .expect("profiled native batch route should execute");
-        assert_eq!(profiled.rows().len(), 2);
-        assert_eq!(profile.scan_rows, 2, "only returned public rows are scanned");
-        assert_eq!(
-            profile.provider_rows_examined, 3,
-            "present, missing, and duplicate slots examine three unique exact identities"
-        );
+        #[cfg(feature = "storage-benches")]
+        {
+            let (profiled, profile) = session
+                .execute_profiled(
+                    "SELECT id, note, payload FROM batch_route_row \
+                     WHERE id IN ($1, $2, $3, $4) \
+                       AND lixcol_file_id IS NULL ORDER BY id",
+                    &params,
+                )
+                .await
+                .expect("profiled native batch route should execute");
+            assert_eq!(profiled.rows().len(), 2);
+            assert_eq!(profile.scan_rows, 2, "only returned public rows are scanned");
+            assert_eq!(
+                profile.provider_rows_examined, 3,
+                "present, missing, and duplicate slots examine three unique exact identities"
+            );
+        }
     }
 
     #[tokio::test]
