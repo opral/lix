@@ -242,6 +242,7 @@ struct FileReturningKey {
 #[derive(Clone, Copy)]
 struct LixFileDmlSourceOptions {
     needs_data: bool,
+    needs_blob_refs: bool,
     needs_plugin_ownership: bool,
     capture_path_resolver_rows: bool,
 }
@@ -446,21 +447,30 @@ impl LixFileSpec {
                     // index. Blob references are a distinct authenticated row
                     // family: load only those belonging to selected files
                     // instead of hydrating every BlobRef in the repository.
-                    let selected_file_ids = match &target_file_ids {
-                        FileIdConstraint::Ids(file_ids) => file_ids.clone(),
-                        FileIdConstraint::All => indexed_matches
-                            .entries()
-                            .filter(|entry| entry.kind == FilesystemPathKind::File)
-                            .map(|entry| entry.id().to_string())
-                            .collect(),
-                        FileIdConstraint::None => BTreeSet::new(),
+                    let validate_rejected_exact_identity = indexed_matches.is_empty()
+                        && matches!(&target_file_ids, FileIdConstraint::Ids(_));
+                    let rows = if options.needs_blob_refs || validate_rejected_exact_identity {
+                        let selected_file_ids = match &target_file_ids {
+                            FileIdConstraint::Ids(file_ids) => file_ids.clone(),
+                            FileIdConstraint::All => indexed_matches
+                                .entries()
+                                .filter(|entry| entry.kind == FilesystemPathKind::File)
+                                .map(|entry| entry.id().to_string())
+                                .collect(),
+                            FileIdConstraint::None => BTreeSet::new(),
+                        };
+                        scan_exact_file_blob_batch(
+                            hot_state.clone(),
+                            &request,
+                            &selected_file_ids,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                    } else {
+                        MaterializedHotStateBatch::default()
                     };
-                    let rows =
-                        scan_exact_file_blob_batch(hot_state.clone(), &request, &selected_file_ids)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
                     (
-                        prepare_indexed_lix_file_rows(indexed_matches, rows),
+                        prepare_indexed_lix_file_rows(indexed_matches, rows, false),
                         None,
                         options
                             .capture_path_resolver_rows
@@ -598,6 +608,7 @@ impl LixFileSpec {
             None,
             LixFileDmlSourceOptions {
                 needs_data,
+                needs_blob_refs: true,
                 needs_plugin_ownership: false,
                 capture_path_resolver_rows: false,
             },
@@ -689,7 +700,7 @@ pub(crate) async fn execute_exact_lix_file_read(
         ),
     };
     let rows = scan_indexed_file_batch(&matches, true)?;
-    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows, true)?;
     let load_data = column == ExactLixFileReadColumn::Content;
     let acknowledge_plugin_data = load_data && session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
@@ -828,7 +839,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
     let rows = scan_indexed_file_batch(&matches, true)?;
-    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows, true)?;
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
         plugin_render_context_for_lix_file_scan_cached(
@@ -918,7 +929,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
         .await?;
     let matches = indexed_file_id_matches(index, file_ids, &FilePathPredicate::All);
     let rows = scan_indexed_file_batch(&matches, true)?;
-    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows, true)?;
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
         plugin_render_context_for_lix_file_scan(
@@ -1183,7 +1194,7 @@ impl TableSpec for LixFileSpec {
                                     "sql2 indexed lix_file scan failed: {error}"
                                 ))
                             })?;
-                        prepare_indexed_lix_file_rows(indexed_matches, rows)
+                        prepare_indexed_lix_file_rows(indexed_matches, rows, true)
                     } else {
                         let rows = scan_lix_file_live_batch(
                             Arc::clone(&hot_state),
@@ -1441,6 +1452,7 @@ impl TableSpec for LixFileSpec {
             indexed_matches,
             LixFileDmlSourceOptions {
                 needs_data,
+                needs_blob_refs: true,
                 needs_plugin_ownership: false,
                 capture_path_resolver_rows: false,
             },
@@ -1538,6 +1550,7 @@ impl LixFileSpec {
                 (&self.branch_binding, &target_file_ids),
                 (BranchBinding::Active { .. }, FileIdConstraint::All)
             );
+        let predecessor_blob_request = request.clone();
         let captured: SharedLixFileDmlSourceState = Arc::new(Mutex::new(None));
         let source = self.dml_source(
             &write_ctx,
@@ -1546,6 +1559,7 @@ impl LixFileSpec {
             indexed_matches,
             LixFileDmlSourceOptions {
                 needs_data,
+                needs_blob_refs: needs_data,
                 needs_plugin_ownership: update_columns.updates_path() && !update_columns.data,
                 capture_path_resolver_rows,
             },
@@ -1562,6 +1576,7 @@ impl LixFileSpec {
             let captured = Arc::clone(&captured);
             let returning = returning.clone();
             let returning_spec = returning_spec.clone();
+            let predecessor_blob_request = predecessor_blob_request.clone();
             async move {
                 let keys = returning
                     .as_ref()
@@ -1574,7 +1589,7 @@ impl LixFileSpec {
                     })
                     .transpose()?;
                 let LixFileDmlSourceState {
-                    blob_ref_keys,
+                    mut blob_ref_keys,
                     plugin_render,
                     path_resolvers: captured_path_resolvers,
                     path_index,
@@ -1592,6 +1607,32 @@ impl LixFileSpec {
                     } else {
                         BTreeSet::new()
                     };
+                let assigned_empty_content = update_columns.data
+                    && (0..matched_batch.num_rows()).any(|row_index| {
+                        update_required_binary_value(
+                            &matched_batch,
+                            &assignment_values,
+                            row_index,
+                            "content",
+                        )
+                        .is_ok_and(|content| content.is_empty())
+                    });
+                if blob_ref_keys.is_empty()
+                    && (assigned_empty_content || !plugin_rewrite_file_ids.is_empty())
+                {
+                    let selected_file_ids = (0..matched_batch.num_rows())
+                        .map(|row_index| required_string_value(&matched_batch, row_index, "id"))
+                        .collect::<Result<BTreeSet<_>>>()?;
+                    let predecessor_rows = scan_exact_file_blob_batch(
+                        Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
+                        &predecessor_blob_request,
+                        &selected_file_ids,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    blob_ref_keys = blob_ref_keys_from_live_rows(&predecessor_rows)
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
                 let mut path_resolvers = None;
                 if update_columns.requires_path_resolver() {
                     path_resolvers = Some(if let Some(path_index) = path_index {
@@ -1903,7 +1944,7 @@ impl UpsertSupport for LixFileSpec {
                 }
             }
             .map_err(lix_error_to_datafusion_error)?;
-            prepare_indexed_lix_file_rows(indexed_matches, rows)
+            prepare_indexed_lix_file_rows(indexed_matches, rows, true)
         } else {
             let rows = scan_lix_file_live_batch(hot_state.clone(), &request, &target_file_ids)
                 .await
@@ -3317,7 +3358,7 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     blob_request.filter.file_ids = vec![crate::NullableKeyFilter::Value(file_id.clone())];
     let rows = ctx.scan_hot_state_batch(&blob_request).await?;
 
-    let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows, true)?;
 
     let PreparedLixFileRows {
         live_rows,
@@ -4623,6 +4664,7 @@ fn prepare_lix_file_rows(
 fn prepare_indexed_lix_file_rows(
     matches: &FilesystemPathSelection,
     rows: impl Into<MaterializedHotStateBatch>,
+    include_derived_blob_refs: bool,
 ) -> Result<PreparedLixFileRows, LixError> {
     let mut live_rows = HotStateBatchOwners::default();
     let scanned_batch = live_rows.push(rows.into());
@@ -4655,7 +4697,7 @@ fn prepare_indexed_lix_file_rows(
                 live: hot_state_row_handle(indexed_batch, descriptor_row_index),
             },
         );
-        if let Some(blob_ref) = entry.blob_ref_live_row() {
+        if include_derived_blob_refs && let Some(blob_ref) = entry.blob_ref_live_row() {
             let row_index = indexed_builder.push_materialized_ref(
                 &blob_ref.row_pk,
                 &blob_ref.schema_key,
@@ -8071,7 +8113,7 @@ mod tests {
         );
         let rows =
             super::scan_indexed_file_batch(&matches, true).expect("matching blob rows should load");
-        let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
+        let prepared = super::prepare_indexed_lix_file_rows(&matches, rows, true)
             .expect("indexed rows should prepare");
         let blob_reader: Arc<dyn BlobDataReader> =
             Arc::new(StaticBlobReader::from_blobs(Vec::new()));
@@ -8342,7 +8384,7 @@ mod tests {
         );
         let rows =
             super::scan_indexed_file_batch(&matches, true).expect("matching blob rows should load");
-        let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
+        let prepared = super::prepare_indexed_lix_file_rows(&matches, rows, true)
             .expect("indexed rows should prepare");
         let blob_reader: Arc<dyn BlobDataReader> =
             Arc::new(StaticBlobReader::from_blobs(Vec::new()));
@@ -9738,7 +9780,7 @@ mod tests {
             super::indexed_file_matches(Arc::clone(&index), &super::FilePathPredicate::All);
         let scanned =
             super::scan_indexed_file_batch(&matches, true).expect("indexed blob rows should scan");
-        let prepared = super::prepare_indexed_lix_file_rows(&matches, scanned)
+        let prepared = super::prepare_indexed_lix_file_rows(&matches, scanned, true)
             .expect("indexed rows should prepare");
 
         assert_eq!(
@@ -11425,7 +11467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_update_by_exact_path_loads_only_selected_blob_ref() {
+    async fn file_update_by_exact_path_with_non_empty_content_skips_predecessor_blob_ref() {
         let mut rows = file_dml_rows();
         rows.extend([
             live_file_row(
@@ -11451,8 +11493,8 @@ mod tests {
             .plan_update(
                 write_ctx,
                 vec![literal_assignment(
-                    "name",
-                    ScalarValue::Utf8(Some("README.md".to_string())),
+                    "content",
+                    ScalarValue::Binary(Some(b"replacement".to_vec())),
                 )],
                 &[eq_filter("path", "/readme.md")],
             )
@@ -11470,14 +11512,46 @@ mod tests {
             "path selection must not hydrate every repository BlobRef"
         );
         assert_eq!(write_context.scan_count, 0);
+        assert!(write_context.exact_load_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_update_to_empty_defers_and_authenticates_predecessor_blob_ref() {
+        let mut write_context = CapturingWriteContext {
+            rows: file_dml_rows(),
+            ..CapturingWriteContext::default()
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+        let planned = spec
+            .plan_update(
+                write_ctx,
+                vec![literal_assignment(
+                    "content",
+                    ScalarValue::Binary(Some(Vec::new())),
+                )],
+                &[eq_filter("path", "/readme.md")],
+            )
+            .await
+            .expect("plan exact-path empty-content update");
+
+        let source_batch = (planned.source)()
+            .await
+            .expect("load exact-path update candidates");
+        assert!(write_context.exact_load_requests.is_empty());
+        let count = (planned.apply)(source_batch)
+            .await
+            .expect("apply empty-content update");
+
+        assert_eq!(count, 1);
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
-        assert_eq!(
-            write_context.exact_load_requests[0].rows[0]
-                .file_id
-                .as_deref(),
-            Some("01920000-0000-7000-8000-0000000000d2")
-        );
+        let TransactionWrite::RowsWithFileContent { rows, .. } = &write_context.writes[0] else {
+            panic!("empty-content replacement should retain file-content intent");
+        };
+        assert!(rows.iter().any(|row| {
+            row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
+        }));
     }
 
     #[tokio::test]

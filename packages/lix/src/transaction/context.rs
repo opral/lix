@@ -2873,11 +2873,10 @@ where
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        // Exact candidate hydration is part of the transaction operation that
+        // selected those identities. Keep it on the opening read so descriptor
+        // selection and row authentication cannot observe different snapshots.
+        let read = self.opening_read();
         let base = self
             .hot_state
             .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
