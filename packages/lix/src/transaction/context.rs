@@ -2473,9 +2473,12 @@ where
         let Some(file_row) = rows.pop().flatten() else {
             return Ok(None);
         };
-        let StateCell::Value(file_snapshot) = &file_row.value.cell else {
-            return Ok(None);
-        };
+        let file_snapshot = file_row
+            .seed_logical_snapshot(branch_id)?
+            .ok_or_else(|| LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("authenticated file descriptor '{file_id}' is deleted"),
+            ))?;
         let file_snapshot: JsonValue =
             serde_json::from_str(file_snapshot.as_str()).map_err(|error| {
                 LixError::new(
@@ -2530,12 +2533,12 @@ where
                     format!("authenticated directory descriptor '{id}' is missing"),
                 )
             })?;
-            let StateCell::Value(snapshot) = &row.value.cell else {
-                return Err(LixError::new(
+            let snapshot = row.seed_logical_snapshot(&branch_id)?.ok_or_else(|| {
+                LixError::new(
                     LixError::CODE_STORAGE_ERROR,
                     format!("authenticated directory descriptor '{id}' is deleted"),
-                ));
-            };
+                )
+            })?;
             let snapshot: JsonValue = serde_json::from_str(snapshot.as_str()).map_err(|error| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
@@ -2594,7 +2597,9 @@ where
             .await?;
         rows.first()
             .and_then(Option::as_ref)
-            .map(|row| decode_visible_materialization_ref(row, &key.file_id))
+            .map(|row| {
+                decode_visible_materialization_ref(row, &key.file_id, &key.branch_id)
+            })
             .transpose()
     }
 
@@ -2641,7 +2646,11 @@ where
                 ),
             ));
         }
-        let materialization = decode_visible_materialization_ref(blob_row, &actor_key.file_id)?;
+        let materialization = decode_visible_materialization_ref(
+            blob_row,
+            &actor_key.file_id,
+            &actor_key.branch_id,
+        )?;
         if !matches!(
             &materialization.bytes,
             VisibleMaterializationBytes::Blob { .. }
@@ -2719,7 +2728,12 @@ where
                 ),
             )
         })?;
-        let source = StateRowEntitySource::new(rows, entity_ordinals, limits)?;
+        let source = StateRowEntitySource::new(
+            rows,
+            entity_ordinals,
+            limits,
+            actor_key.branch_id.clone(),
+        )?;
         let transition = match actor
             .open_entities(
                 limits,
@@ -2864,7 +2878,12 @@ where
             .map(|(_, key)| key.clone())
             .collect();
         Ok((
-            suppress_format_only_noops_against_batch(changes, &format_only_keys, &current)?,
+            suppress_format_only_noops_against_batch(
+                changes,
+                &format_only_keys,
+                &current,
+                &file_key.branch_id,
+            )?,
             observed_existing,
         ))
     }
@@ -3524,7 +3543,7 @@ where
                     .zip(self.plugin_state_points(&branch_id, &keys, false).await?)
                 {
                     let Some(row) = row else { continue };
-                    let StateCell::Value(snapshot) = row.value.cell else {
+                    let Some(snapshot) = row.seed_logical_snapshot(&branch_id)? else {
                         continue;
                     };
                     existing_schemas.insert(
@@ -5060,6 +5079,7 @@ where
                                     entity_rows,
                                     entity_ordinals,
                                     cold_limits,
+                                    actor_key.branch_id.clone(),
                                 )?;
                                 drop(read);
                                 actor
@@ -6137,13 +6157,9 @@ where
         if certified_preparation.is_some() && !certified_plan_is_current {
             rows.revoke_certified_preparation();
         }
-        if allow_homogeneous
-            && certified_plan_is_current
-            && let Some(certificate) = certified_preparation
-        {
-            let timestamp = self.functions.call_timestamp();
-            return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
-        }
+        // Certified canonical JSON still crosses the current SchemaPlan
+        // boundary. Its certificate avoids semantic revalidation, but cannot
+        // bypass creation of the sole authenticated native current-state row.
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
             let catalog = self
@@ -7971,6 +7987,7 @@ where
 struct PreparedScalarRow {
     schema_plan_id: SchemaPlanId,
     facts: PreparedRowFacts,
+    native_row: Option<crate::forktree::NativeRowCell>,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     change_id: Option<ChangeId>,
@@ -7986,6 +8003,7 @@ struct PreparedScalarRow {
 struct PreparedScalarBatch {
     schema_plan_ids: Vec<SchemaPlanId>,
     facts: Vec<PreparedRowFacts>,
+    native_rows: Vec<Option<crate::forktree::NativeRowCell>>,
     created_at: Vec<LixTimestamp>,
     updated_at: Vec<LixTimestamp>,
     change_ids: Vec<Option<ChangeId>>,
@@ -7998,6 +8016,7 @@ impl PreparedScalarBatch {
         Self {
             schema_plan_ids: Vec::with_capacity(capacity),
             facts: Vec::with_capacity(capacity),
+            native_rows: Vec::with_capacity(capacity),
             created_at: Vec::with_capacity(capacity),
             updated_at: Vec::with_capacity(capacity),
             change_ids: Vec::with_capacity(capacity),
@@ -8009,6 +8028,7 @@ impl PreparedScalarBatch {
     fn push(&mut self, row: PreparedScalarRow) {
         self.schema_plan_ids.push(row.schema_plan_id);
         self.facts.push(row.facts);
+        self.native_rows.push(row.native_row);
         self.created_at.push(row.created_at);
         self.updated_at.push(row.updated_at);
         self.change_ids.push(row.change_id);
@@ -8020,6 +8040,7 @@ impl PreparedScalarBatch {
         PreparedScalarRow {
             schema_plan_id: self.schema_plan_ids[index],
             facts: self.facts[index],
+            native_row: self.native_rows[index].clone(),
             created_at: self.created_at[index],
             updated_at: self.updated_at[index],
             change_id: self.change_ids[index],
@@ -8038,6 +8059,7 @@ fn plan_prepared_row_scalars(
     let NormalizedRowFacts {
         schema_plan_id,
         facts,
+        native_row,
     } = normalized;
     let updated_at = match row.updated_at {
         Some(updated_at) => parse_prepared_timestamp("updated_at", updated_at)?,
@@ -8065,6 +8087,7 @@ fn plan_prepared_row_scalars(
     Ok(PreparedScalarRow {
         schema_plan_id,
         facts,
+        native_row,
         created_at,
         updated_at,
         change_id,
@@ -8242,7 +8265,9 @@ fn push_prepared_state_row_from_planned_parts(
         untracked,
         branch_id,
     );
-    prepared.set_durable_predecessor(prepared.len() - 1, durable_predecessor);
+    let prepared_index = prepared.len() - 1;
+    prepared.set_native_row(prepared_index, scalar.native_row);
+    prepared.set_durable_predecessor(prepared_index, durable_predecessor);
     Ok(())
 }
 
@@ -8861,16 +8886,14 @@ enum VisibleMaterializationBytes {
 fn decode_visible_materialization_ref(
     row: &StateRow,
     file_id: &str,
+    branch_id: &str,
 ) -> Result<VisibleMaterialization, LixError> {
     let key = crate::forktree::decode_state_key(&row.key)?;
-    let snapshot = match &row.value.cell {
-        StateCell::Value(value) => Some(value.as_str()),
-        StateCell::Null | StateCell::Tombstone => None,
-    };
+    let snapshot = row.seed_logical_snapshot(branch_id)?;
     decode_visible_materialization_parts(
         &key.schema_key,
         Some(row.value.change_id),
-        snapshot,
+        snapshot.as_deref(),
         file_id,
     )
 }
@@ -9264,6 +9287,7 @@ fn v2_host_entities_from_live_batch_ordinals(
     rows: &Vec<StateRow>,
     ordinals: &[u32],
     limits: WasmTransitionLimits,
+    branch_id: &str,
 ) -> Result<Vec<WasmHostEntity>, LixError> {
     let mut entities = Vec::with_capacity(ordinals.len());
     for ordinal in ordinals {
@@ -9273,9 +9297,8 @@ fn v2_host_entities_from_live_batch_ordinals(
                 "plugin state selection references a row outside its batch owner",
             )
         })?;
-        let snapshot_content = match &row.value.cell {
-            StateCell::Value(value) => value,
-            StateCell::Null | StateCell::Tombstone => continue,
+        let Some(snapshot_content) = row.seed_logical_snapshot(branch_id)? else {
+            continue;
         };
         let key = decode_state_key(&row.key)?;
         entities.push(host_entity_with_lazy_snapshot(
@@ -9307,7 +9330,7 @@ fn v2_host_entity_ordinals_from_live_batch(
         .filter_map(|(ordinal, row)| {
             let key = decode_state_key(&row.key).ok()?;
             (key.file_id.as_deref() == Some(file_key.file_id.as_str())
-                && matches!(row.value.cell, StateCell::Value(_))
+                && matches!(row.value.cell, StateCell::NativeRow(_))
                 && schema_keys
                     .binary_search_by(|schema_key| schema_key.as_str().cmp(&key.schema_key))
                     .is_ok())
@@ -9348,6 +9371,7 @@ fn suppress_format_only_noops_against_batch(
     changes: WasmHostEntityChanges,
     keys: &[WasmEntityKey],
     accepted: &[Option<StateRow>],
+    branch_id: &str,
 ) -> Result<WasmHostEntityChanges, LixError> {
     if keys.len() != accepted.len() {
         return Err(LixError::new(
@@ -9367,7 +9391,7 @@ fn suppress_format_only_noops_against_batch(
                     effective.push(change);
                     continue;
                 };
-                let StateCell::Value(base_snapshot) = &base.value.cell else {
+                let Some(base_snapshot) = base.seed_logical_snapshot(branch_id)? else {
                     effective.push(change);
                     continue;
                 };
@@ -10539,7 +10563,7 @@ where
                 format!("active plugin schema has an invalid identity: {error}"),
             )
         })?;
-        let StateCell::Value(snapshot) = &row.value.cell else {
+        let Some(snapshot) = row.seed_logical_snapshot(branch_id)? else {
             continue;
         };
         let snapshot: JsonValue = serde_json::from_str(snapshot.as_str()).map_err(|error| {
@@ -10629,7 +10653,7 @@ where
             let Some(file_id) = key.file_id.as_deref() else {
                 continue;
             };
-            if matches!(row.value.cell, StateCell::Value(_))
+            if matches!(row.value.cell, StateCell::NativeRow(_))
                 && upgrade
                     .previous
                     .schema_keys()
@@ -10698,7 +10722,7 @@ where
             let Some(file_id) = key.file_id.as_deref() else {
                 continue;
             };
-            let StateCell::Value(snapshot) = &row.value.cell else {
+            let Some(snapshot) = row.seed_logical_snapshot(&upgrade.branch_id)? else {
                 continue;
             };
             let snapshot: PluginUpgradeBlobRefSnapshot = serde_json::from_str(snapshot.as_str())
@@ -10817,6 +10841,7 @@ where
                 &state_rows,
                 &state_ordinals[range],
                 limits,
+                &upgrade.branch_id,
             )?;
             let store_permit = host
                 .actor_cache()

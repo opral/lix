@@ -593,6 +593,7 @@ pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
         EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
             match &row.value.cell {
                 StateCell::Value(value) => Some(value.as_ref()),
+                StateCell::NativeRow(_) => None,
                 StateCell::Null | StateCell::Tombstone => None,
             }
         }
@@ -603,6 +604,7 @@ pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
 pub(crate) fn row_snapshot(row: &StateRow) -> Option<&str> {
     match &row.value.cell {
         StateCell::Value(value) => Some(value.as_ref()),
+        StateCell::NativeRow(_) => None,
         StateCell::Null | StateCell::Tombstone => None,
     }
 }

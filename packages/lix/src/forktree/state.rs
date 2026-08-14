@@ -123,8 +123,40 @@ pub(crate) enum StateCellRef<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StateCell {
     Value(SharedStr),
+    NativeRow(NativeRowCell),
     Null,
     Tombstone,
+}
+
+impl StateCell {
+    /// Materializes one trusted built-in Schema-v1 row at a semantic/API
+    /// boundary. Durable state remains the native tuple; this never serves as
+    /// a storage fallback and rejects unknown schema ownership.
+    pub(crate) fn seed_logical_text(
+        &self,
+        key: &StateKey,
+        branch_id: &str,
+    ) -> Result<Option<crate::common::SharedStr>, crate::LixError> {
+        match self {
+            Self::NativeRow(native) => {
+                crate::native_row::logical_text_for_seed(key, branch_id, native).map(Some)
+            }
+            Self::Value(_) => Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "Schema-v1 current-state row uses the removed JSON snapshot representation",
+            )),
+            Self::Null | Self::Tombstone => Ok(None),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeRowCell {
+    pub(crate) layout_id: [u8; 32],
+    pub(crate) owner_branch_id: [u8; 16],
+    pub(crate) owner_digest: [u8; 32],
+    pub(crate) semantic_digest: [u8; 32],
+    pub(crate) body: bytes::Bytes,
 }
 
 impl StateCell {
@@ -346,12 +378,25 @@ pub(super) fn encode_current_state_value(value: &StateValue) -> Result<Vec<u8>, 
     output.extend_from_slice(&value.created_at.packed().to_be_bytes());
     output.extend_from_slice(&value.updated_at.packed().to_be_bytes());
     match &value.cell {
-        StateCell::Value(value) => {
-            output.push(0);
-            put_bytes(&mut output, value.as_bytes())?;
+        StateCell::Value(_) => {
+            return Err(state_error(
+                "current state cannot encode the removed JSON row representation",
+            ));
         }
-        StateCell::Null => output.push(1),
+        StateCell::Null => {
+            return Err(state_error(
+                "current state cannot encode the removed whole-row null representation",
+            ));
+        }
         StateCell::Tombstone => output.push(2),
+        StateCell::NativeRow(value) => {
+            output.push(3);
+            output.extend_from_slice(&value.layout_id);
+            output.extend_from_slice(&value.owner_branch_id);
+            output.extend_from_slice(&value.owner_digest);
+            output.extend_from_slice(&value.semantic_digest);
+            put_bytes(&mut output, &value.body)?;
+        }
     }
     put_optional_bytes(&mut output, value.metadata.as_deref().map(str::as_bytes))?;
     put_optional_bytes(&mut output, value.origin_key.as_deref().map(str::as_bytes))?;
@@ -688,15 +733,28 @@ impl<'a> ValueDecoder<'a> {
 
     fn state_cell(&mut self, field: &str) -> Result<StateCell, LixError> {
         match self.take(1, field)?[0] {
-            0 => {
-                let length = self.u32(field)? as usize;
-                std::str::from_utf8(self.take(length, field)?)
-                    .map(SharedStr::from)
-                    .map(StateCell::Value)
-                    .map_err(|_| state_error(format!("{field} value is not UTF-8")))
-            }
-            1 => Ok(StateCell::Null),
+            0 => Err(state_error(format!(
+                "{field} uses the removed JSON current-state representation"
+            ))),
+            1 => Err(state_error(format!(
+                "{field} uses the removed whole-row null current-state representation"
+            ))),
             2 => Ok(StateCell::Tombstone),
+            3 => {
+                let layout_id = self.fixed_32(field)?;
+                let owner_branch_id = self.fixed_16(field)?;
+                let owner_digest = self.fixed_32(field)?;
+                let semantic_digest = self.fixed_32(field)?;
+                let length = self.u32(field)? as usize;
+                let body = bytes::Bytes::copy_from_slice(self.take(length, field)?);
+                Ok(StateCell::NativeRow(NativeRowCell {
+                    layout_id,
+                    owner_branch_id,
+                    owner_digest,
+                    semantic_digest,
+                    body,
+                }))
+            }
             other => Err(state_error(format!("{field} has invalid tag {other}"))),
         }
     }

@@ -853,8 +853,19 @@ where
                     .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                let filtered = apply_entity_state_slot_filters(slots, &row_filters)?;
-                entity_record_batch_from_slots(&provider.spec, schema, &filtered, None)
+                let active_branch_id = provider.branch_binding.active_branch_id();
+                let filtered = apply_entity_state_slot_filters(
+                    &provider.spec,
+                    slots,
+                    &row_filters,
+                    active_branch_id,
+                )?;
+                entity_record_batch_from_slots(
+                    &provider.spec,
+                    schema,
+                    &filtered,
+                    active_branch_id,
+                )
             },
         );
         let spec = Arc::clone(&self.spec);
@@ -1085,8 +1096,19 @@ where
                             .scan_rows(&request)
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
-                        let filtered = apply_entity_state_slot_filters(slots, &row_filters)?;
-                        entity_record_batch_from_slots(&spec, schema, &filtered, None)
+                        let active_branch_id = provider.branch_binding.active_branch_id();
+                        let filtered = apply_entity_state_slot_filters(
+                            &spec,
+                            slots,
+                            &row_filters,
+                            active_branch_id,
+                        )?;
+                        entity_record_batch_from_slots(
+                            &spec,
+                            schema,
+                            &filtered,
+                            active_branch_id,
+                        )
                     }
                 },
             ),
@@ -1131,8 +1153,19 @@ where
                     .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                let filtered = apply_entity_state_slot_filters(slots, &row_filters)?;
-                entity_record_batch_from_slots(&provider.spec, schema, &filtered, None)
+                let active_branch_id = provider.branch_binding.active_branch_id();
+                let filtered = apply_entity_state_slot_filters(
+                    &provider.spec,
+                    slots,
+                    &row_filters,
+                    active_branch_id,
+                )?;
+                entity_record_batch_from_slots(
+                    &provider.spec,
+                    schema,
+                    &filtered,
+                    active_branch_id,
+                )
             },
         );
         let spec = Arc::clone(&self.spec);
@@ -2481,27 +2514,20 @@ fn apply_entity_state_filters(
 }
 
 fn apply_entity_state_slot_filters(
+    spec: &EntitySurfaceSpec,
     slots: Vec<EntityStateSlot>,
     filters: &[EntityRowFilter],
+    branch_id: Option<&str>,
 ) -> Result<Vec<EntityStateSlot>> {
     if filters.is_empty() {
         return Ok(slots);
     }
     let mut filtered = Vec::with_capacity(slots.len());
     for slot in slots {
-        let Some(snapshot_content) = slot_snapshot(&slot) else {
+        let Some(snapshot) = entity_slot_logical_value(spec, &slot, branch_id)? else {
             continue;
         };
         let key = slot_state_key(&slot).map_err(lix_error_to_datafusion_error)?;
-        let snapshot = parse_snapshot_value(snapshot_content).map_err(|error| {
-            DataFusionError::External(Box::new(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "entity scan filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
-                    key.schema_key, key.entity_pk
-                ),
-            )))
-        })?;
         let matches = filters.iter().try_fold(true, |matches, filter| {
             if !matches {
                 return Ok(false);
@@ -2665,12 +2691,9 @@ fn entity_record_batch_from_slots(
         return RecordBatch::try_new_with_options(schema, vec![], &options)
             .map_err(DataFusionError::from);
     }
-    if spec.certifies_path_value_replacement {
-        return path_value_record_batch_from_slots(spec, schema, slots, branch_id);
-    }
     let snapshots = slots
         .iter()
-        .map(|slot| parse_snapshot(slot_snapshot(slot)))
+        .map(|slot| entity_slot_logical_value(spec, slot, branch_id))
         .collect::<Result<Vec<_>>>()?;
     let columns = schema
         .fields()
@@ -2980,6 +3003,49 @@ fn slot_state_key(slot: &EntityStateSlot) -> Result<crate::forktree::StateKey, L
     }
 }
 
+fn entity_slot_logical_value(
+    spec: &EntitySurfaceSpec,
+    slot: &EntityStateSlot,
+    active_branch_id: Option<&str>,
+) -> Result<Option<JsonValue>> {
+    let (row, historical_branch_id) = match slot {
+        EntityStateSlot::Tracked(row) => (row, None),
+        EntityStateSlot::TrackedAt { row, branch_id } => (row, Some(branch_id.as_str())),
+    };
+    let key = decode_state_key(&row.key).map_err(lix_error_to_datafusion_error)?;
+    match &row.value.cell {
+        StateCell::NativeRow(native) => {
+            let owner_branch = if row.source == StateRowSource::Global {
+                GLOBAL_BRANCH_ID
+            } else {
+                historical_branch_id.or(active_branch_id).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "entity provider '{}' has no authenticated branch owner",
+                        spec.schema_key
+                    ))
+                })?
+            };
+            crate::native_row::logical_value(
+                spec.native_schema.as_ref(),
+                &key.entity_pk,
+                owner_branch,
+                key.file_id.as_deref(),
+                native,
+            )
+            .map(Some)
+            .map_err(lix_error_to_datafusion_error)
+        }
+        StateCell::Value(_) => Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!(
+                "Schema-v1 entity '{}' uses the removed JSON current-state representation",
+                spec.schema_key
+            ),
+        ))),
+        StateCell::Null | StateCell::Tombstone => Ok(None),
+    }
+}
+
 fn slot_value(
     slot: &EntityStateSlot,
 ) -> Result<
@@ -3047,7 +3113,22 @@ fn entity_slot_system_column_array(
             keys.iter().map(|key| key.file_id.clone()),
         )),
         "snapshot_content" => Arc::new(StringArray::from_iter(
-            slots.iter().map(|slot| slot_snapshot(slot)),
+            slots
+                .iter()
+                .map(|slot| {
+                    entity_slot_logical_value(spec, slot, branch_id).and_then(|value| {
+                        value
+                            .map(|value| {
+                                serde_json::to_string(&value).map_err(|error| {
+                                    DataFusionError::Execution(format!(
+                                        "failed to materialize native entity snapshot: {error}"
+                                    ))
+                                })
+                            })
+                            .transpose()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         )),
         "metadata" => Arc::new(StringArray::from_iter(
             slots

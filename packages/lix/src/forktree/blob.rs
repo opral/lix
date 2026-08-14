@@ -344,12 +344,24 @@ fn bind_state_blob_ref_parts(
         return Err(corruption("blob-reference key identity is inconsistent").into());
     }
     let value = match cell {
-        StateCell::Value(value) => value,
+        StateCell::NativeRow(native) => crate::native_row::logical_text(
+            &crate::native_row::seed_schema(&key.schema_key)?,
+            &key.entity_pk,
+            &uuid::Uuid::from_bytes(*branch_id.as_bytes()).to_string(),
+            key.file_id.as_deref(),
+            native,
+        )?,
+        StateCell::Value(_) => {
+            return Err(corruption(
+                "blob-reference owner uses the removed JSON current-state representation",
+            )
+            .into());
+        }
         StateCell::Null | StateCell::Tombstone => {
             return Err(corruption("blob-reference owner has no live semantic value").into());
         }
     };
-    let owner: BlobRefOwnerValue = serde_json::from_str(value).map_err(|error| {
+    let owner: BlobRefOwnerValue = serde_json::from_str(&value).map_err(|error| {
         corruption(format!(
             "blob-reference owner semantic value is malformed: {error}"
         ))
@@ -622,6 +634,12 @@ fn bind_historical_state_blob_ref(
     }
     let snapshot = match &value.cell {
         StateCell::Value(snapshot) => snapshot,
+        StateCell::NativeRow(_) => {
+            return Err(corruption(
+                "historical BlobRef native tuple requires an authenticated branch owner",
+            )
+            .into());
+        }
         StateCell::Null | StateCell::Tombstone => {
             return Err(corruption("historical blob-reference owner is not live").into());
         }
