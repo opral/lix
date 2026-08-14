@@ -198,3 +198,77 @@ async fn dynamically_registered_rows_coexist_with_native_file_and_commit_surface
     );
     lix.close().await.expect("memory Lix closes");
 }
+
+#[tokio::test]
+async fn native_projection_preserves_null_json_filter_order_and_limit_semantics() {
+    let lix = open_lix().await.expect("memory Lix opens");
+    let schema = json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "native_projection_probe",
+        "columns": [
+            {"name": "id", "type": "uuid", "nullable": false},
+            {"name": "note", "type": "text", "nullable": true},
+            {"name": "enabled", "type": "boolean", "nullable": false},
+            {"name": "payload", "type": "jsonb", "nullable": true}
+        ],
+        "primary_key": ["id"]
+    });
+    lix.execute(
+        "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+        &[
+            Value::Text("native_projection_probe".into()),
+            Value::Text(schema.to_string()),
+        ],
+    )
+    .await
+    .expect("projection schema registers");
+    lix.execute(
+        "INSERT INTO native_projection_probe (id, note, enabled, payload) VALUES \
+         ('01920000-0000-7000-8000-000000000001', NULL, true, CAST('null' AS JSONB)), \
+         ('01920000-0000-7000-8000-000000000002', 'keep', true, CAST('{\"z\":2,\"a\":1,\"z\":3}' AS JSONB)), \
+         ('01920000-0000-7000-8000-000000000003', 'drop', false, CAST('[1,2]' AS JSONB))",
+        &[],
+    )
+    .await
+    .expect("native projection rows write");
+
+    let rows = lix
+        .execute(
+            "SELECT id, note, payload FROM native_projection_probe \
+             WHERE enabled = true ORDER BY id LIMIT 2",
+            &[],
+        )
+        .await
+        .expect("native residual filter and projection execute");
+    assert_eq!(rows.rows().len(), 2);
+    assert_eq!(rows.rows()[0].values()[1], Value::Null);
+    // The Arrow jsonb cell contains the canonical text `null`; the public
+    // result contract represents that JSON scalar as Value::Null.
+    assert_eq!(rows.rows()[0].values()[2], Value::Null);
+    assert_eq!(rows.rows()[1].values()[1], Value::Text("keep".into()));
+    assert_eq!(
+        rows.rows()[1].values()[2],
+        Value::Json(json!({"a": 1, "z": 3}).into())
+    );
+
+    lix.execute(
+        "DELETE FROM native_projection_probe WHERE id = \
+         '01920000-0000-7000-8000-000000000001'",
+        &[],
+    )
+    .await
+    .expect("native row tombstones");
+    let remaining = lix
+        .execute(
+            "SELECT id FROM native_projection_probe WHERE enabled = true ORDER BY id LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("limit applies after tombstone visibility");
+    assert_eq!(remaining.rows().len(), 1);
+    assert_eq!(
+        remaining.rows()[0].values()[0],
+        Value::Text("01920000-0000-7000-8000-000000000002".into())
+    );
+    lix.close().await.expect("memory Lix closes");
+}
