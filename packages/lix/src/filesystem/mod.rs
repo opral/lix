@@ -150,6 +150,29 @@ impl From<Vec<FilesystemStateRow>> for FilesystemStateRows {
 }
 
 impl FilesystemStateRow {
+    pub(crate) fn from_state_row_identity(
+        row: StateRow,
+        branch_id: &str,
+        untracked: bool,
+    ) -> Result<Self, LixError> {
+        let key = crate::forktree::decode_state_key(&row.key)?;
+        Ok(Self {
+            entity_pk: key.entity_pk,
+            schema_key: key.schema_key,
+            file_id: key.file_id,
+            snapshot_content: None,
+            metadata: row.value.metadata,
+            deleted: row.value.cell.deleted(),
+            created_at: row.value.created_at,
+            updated_at: row.value.updated_at,
+            global: row.source == StateRowSource::Global,
+            change_id: Some(row.value.change_id),
+            commit_id: Some(row.value.commit_id),
+            untracked,
+            branch_id: branch_id.to_owned(),
+        })
+    }
+
     pub(crate) fn from_state_row(
         row: StateRow,
         branch_id: &str,
@@ -254,5 +277,35 @@ pub(crate) fn filesystem_schema_keys() -> Vec<String> {
         keys::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         keys::BLOB_REF_SCHEMA_KEY.to_string(),
     ]
+}
+
+pub(crate) async fn filesystem_state_rows_for_branch<R>(
+    state: &crate::state::ForkTreeStateView<R>,
+    branch_id: &str,
+    include_tombstones: bool,
+) -> Result<Vec<StateRow>, LixError>
+where
+    R: crate::storage_adapter::StorageAdapterRead,
+{
+    let empty_pk = EntityPk {
+        components: crate::entity_pk::EntityPkComponents::Empty,
+    };
+    let mut rows = Vec::new();
+    for schema_key in filesystem_schema_keys() {
+        let lower = crate::forktree::encode_state_entity_prefix(&schema_key, &empty_pk);
+        let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
+        rows.extend(
+            state
+                .branch_range(
+                    branch_id,
+                    Some(&lower),
+                    upper.as_deref(),
+                    None,
+                    include_tombstones,
+                )
+                .await?,
+        );
+    }
+    Ok(rows)
 }
 pub(crate) use self::visibility::VisibleFilesystem;

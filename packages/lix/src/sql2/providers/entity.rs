@@ -549,7 +549,7 @@ where
                         LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())
                     })?;
                 let row = commit_projection_row(
-                    &self.spec.schema_key,
+                    &self.spec.native_schema,
                     entity_pk,
                     commit_snapshot,
                     record,
@@ -580,7 +580,7 @@ where
                 )
                 .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
                 let row = commit_projection_row(
-                    &self.spec.schema_key,
+                    &self.spec.native_schema,
                     entity_pk,
                     serde_json::to_string(&snapshot).map_err(|error| {
                         LixError::new(
@@ -934,13 +934,19 @@ struct EntityReturningKey {
 }
 
 fn commit_projection_row(
-    schema_key: &str,
+    schema: &lix_schema::Schema,
     entity_pk: EntityPk,
     snapshot: String,
     record: &CommitRecord,
 ) -> Result<StateRow, LixError> {
+    let snapshot = serde_json::from_str::<serde_json::Value>(&snapshot).map_err(|error| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("derived '{}' row is malformed: {error}", schema.key),
+        )
+    })?;
     let key = encode_state_key(StateKeyRef {
-        schema_key,
+        schema_key: &schema.key,
         file_id: None,
         entity_pk: &entity_pk,
     });
@@ -951,7 +957,13 @@ fn commit_projection_row(
             commit_id: record.commit_id,
             created_at: record.created_at,
             updated_at: record.created_at,
-            cell: StateCell::Value(crate::common::SharedStr::from(snapshot)),
+            cell: StateCell::NativeRow(crate::native_row::encode(
+                schema,
+                &entity_pk,
+                crate::GLOBAL_BRANCH_ID,
+                None,
+                &snapshot,
+            )?),
             metadata: None,
             origin_key: None,
             blob_manifest_object_ids: Vec::new(),
@@ -994,8 +1006,9 @@ fn branch_ref_state_slot(
     let snapshot = serde_json::json!({
         "id": branch_id,
         "commit_id": commit_id.to_string(),
-    })
-    .to_string();
+    });
+    let schema = crate::native_row::seed_schema(BRANCH_REF_SCHEMA_KEY)
+        .expect("built-in branch-ref native schema");
     EntityStateSlot::Tracked(StateRow {
         key,
         value: StateValue {
@@ -1006,7 +1019,16 @@ fn branch_ref_state_slot(
             // canonical zero timestamp while retaining authenticated updates.
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
             updated_at: metadata.updated_at,
-            cell: StateCell::Value(crate::common::SharedStr::from(snapshot)),
+            cell: StateCell::NativeRow(
+                crate::native_row::encode(
+                    &schema,
+                    &entity_pk,
+                    crate::GLOBAL_BRANCH_ID,
+                    None,
+                    &snapshot,
+                )
+                .expect("derived branch-ref row matches its built-in schema"),
+            ),
             metadata: None,
             origin_key: None,
             blob_manifest_object_ids: Vec::new(),

@@ -1525,9 +1525,8 @@ where
             "filesystem path resolution requires a branch-bound state view",
         )
     })?;
-    let tracked_rows = state
-        .branch_range(branch_id, None, None, None, true)
-        .await?;
+    let tracked_rows =
+        crate::filesystem::filesystem_state_rows_for_branch(state, branch_id, true).await?;
     let rows = FilesystemStateRows::from_view_rows(tracked_rows, branch_id, false)?;
     let merged_rows = crate::filesystem::merge_filesystem_state_rows(rows, false);
     let mut resolvers = directory_path_resolvers_from_state_batch(&merged_rows)?;
