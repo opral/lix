@@ -127,6 +127,10 @@ impl CommittedHotStateRows {
         batch: MaterializedHotStateBatch,
         mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
     ) -> Result<Self, LixError> {
+        #[cfg(feature = "storage-benches")]
+        let select_started = std::time::Instant::now();
+        #[cfg(feature = "storage-benches")]
+        let input_rows = batch.len();
         u32::try_from(batch.len()).map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -158,6 +162,11 @@ impl CommittedHotStateRows {
                 selected = Some(ordinals);
             }
         }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_constraint_materialized_select(
+            input_rows,
+            select_started.elapsed().as_nanos() as u64,
+        );
         Ok(Self { batch, selected })
     }
 
@@ -240,6 +249,8 @@ async fn scan_committed_constraint_rows(
         },
         ..Default::default()
     };
+    #[cfg(feature = "storage-benches")]
+    let scan_started = std::time::Instant::now();
     let batch = hot_state
         .scan_domain_batch(
             &request,
@@ -250,6 +261,11 @@ async fn scan_committed_constraint_rows(
             },
         )
         .await?;
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_constraint_committed_scan(
+        batch.len(),
+        scan_started.elapsed().as_nanos() as u64,
+    );
     CommittedHotStateRows::select(batch, |row| {
         domain.contains_ref(row)
             && (schema_keys.is_empty() || schema_keys.iter().any(|key| key == row.schema_key()))
@@ -281,6 +297,8 @@ async fn scan_committed_constraint_rows_by_declared_column(
         },
         ..Default::default()
     };
+    #[cfg(feature = "storage-benches")]
+    let scan_started = std::time::Instant::now();
     let batch = hot_state
         .scan_domain_batch(
             &request,
@@ -291,6 +309,11 @@ async fn scan_committed_constraint_rows_by_declared_column(
             },
         )
         .await?;
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_constraint_committed_scan(
+        batch.len(),
+        scan_started.elapsed().as_nanos() as u64,
+    );
     CommittedHotStateRows::select(batch, |row| {
         domain.contains_ref(row) && row.schema_key() == schema_key
     })
@@ -2812,7 +2835,9 @@ fn parse_committed_snapshot(
     row: MaterializedHotStateRowRef<'_>,
     snapshot_content: &str,
 ) -> Result<JsonValue, LixError> {
-    serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+    #[cfg(feature = "storage-benches")]
+    let parse_started = std::time::Instant::now();
+    let parsed = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
@@ -2820,7 +2845,13 @@ fn parse_committed_snapshot(
                 row.schema_key()
             ),
         )
-    })
+    });
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_constraint_json_parse(
+        snapshot_content.len(),
+        parse_started.elapsed().as_nanos() as u64,
+    );
+    parsed
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

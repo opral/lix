@@ -44,6 +44,14 @@ static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_COMMITTED_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_COMMITTED_SCAN_ROWS: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_COMMITTED_SCAN_NS: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_MATERIALIZED_SELECT_ROWS: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_MATERIALIZED_SELECT_NS: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_JSON_PARSE_CALLS: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_JSON_PARSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static CONSTRAINT_JSON_PARSE_NS: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
@@ -2581,6 +2589,48 @@ pub(crate) fn record_transaction_schema_catalog_load() {
 
 pub(crate) fn record_transaction_schema_catalog_compile() {
     TRANSACTION_SCHEMA_CATALOG_COMPILES.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConstraintValidationAccounting {
+    pub committed_scan_calls: u64,
+    pub committed_scan_rows: u64,
+    pub committed_scan_ns: u64,
+    pub materialized_select_rows: u64,
+    pub materialized_select_ns: u64,
+    pub json_parse_calls: u64,
+    pub json_parse_bytes: u64,
+    pub json_parse_ns: u64,
+}
+
+pub(crate) fn record_constraint_committed_scan(rows: usize, elapsed_ns: u64) {
+    CONSTRAINT_COMMITTED_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+    CONSTRAINT_COMMITTED_SCAN_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+    CONSTRAINT_COMMITTED_SCAN_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_constraint_materialized_select(rows: usize, elapsed_ns: u64) {
+    CONSTRAINT_MATERIALIZED_SELECT_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+    CONSTRAINT_MATERIALIZED_SELECT_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_constraint_json_parse(bytes: usize, elapsed_ns: u64) {
+    CONSTRAINT_JSON_PARSE_CALLS.fetch_add(1, Ordering::Relaxed);
+    CONSTRAINT_JSON_PARSE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    CONSTRAINT_JSON_PARSE_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
+pub fn take_constraint_validation_accounting() -> ConstraintValidationAccounting {
+    ConstraintValidationAccounting {
+        committed_scan_calls: CONSTRAINT_COMMITTED_SCAN_CALLS.swap(0, Ordering::Relaxed),
+        committed_scan_rows: CONSTRAINT_COMMITTED_SCAN_ROWS.swap(0, Ordering::Relaxed),
+        committed_scan_ns: CONSTRAINT_COMMITTED_SCAN_NS.swap(0, Ordering::Relaxed),
+        materialized_select_rows: CONSTRAINT_MATERIALIZED_SELECT_ROWS.swap(0, Ordering::Relaxed),
+        materialized_select_ns: CONSTRAINT_MATERIALIZED_SELECT_NS.swap(0, Ordering::Relaxed),
+        json_parse_calls: CONSTRAINT_JSON_PARSE_CALLS.swap(0, Ordering::Relaxed),
+        json_parse_bytes: CONSTRAINT_JSON_PARSE_BYTES.swap(0, Ordering::Relaxed),
+        json_parse_ns: CONSTRAINT_JSON_PARSE_NS.swap(0, Ordering::Relaxed),
+    }
 }
 
 pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {

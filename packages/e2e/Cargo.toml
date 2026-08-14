@@ -410,7 +410,7 @@ required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
 [[example]]
 name = "exppq_write_scaling"
 path = "examples/exppq_write_scaling.rs"
-required-features = ["storage-benches"]
+required-features = ["storage-benches", "slatedb"]
 
 [[example]]
 name = "write_amplification"

@@ -29,6 +29,7 @@ use lix::Value;
 use lix::storage::Storage;
 use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Lane {
@@ -81,7 +82,12 @@ async fn main() {
                 "memory" => {
                     run_lane(lix::Memory::default(), lane, size, measured).await;
                 }
-                other => panic!("unknown backend '{other}', expected rocksdb or memory"),
+                "slatedb" => {
+                    let directory = tempfile::tempdir().expect("create SlateDB directory");
+                    let storage = SlateDB::open(directory.path()).expect("open SlateDB");
+                    run_lane(storage, lane, size, measured).await;
+                }
+                other => panic!("unknown backend '{other}', expected rocksdb, slatedb or memory"),
             }
         }
     }
@@ -108,16 +114,20 @@ where
             .expect("register schema");
     }
 
-    // The foreign-key lane needs exactly one parent to point at. Its cost must
-    // not depend on how many parents exist, only on the child collection size.
+    // A declared non-PK scalar forces the committed constraint-value bridge.
     if lane == Lane::ForeignKey {
-        session
-            .execute(
-                "INSERT INTO w_fk_parent (id) VALUES ($1)",
-                &[Value::Text("parent-0".into())],
-            )
-            .await
-            .expect("insert parent");
+        for index in 0..2 {
+            session
+                .execute(
+                    "INSERT INTO w_fk_parent (id, code) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!("parent-id-{index}")),
+                        Value::Text(format!("parent-{index}")),
+                    ],
+                )
+                .await
+                .expect("insert parent");
+        }
     }
 
     for index in 0..seeded {
@@ -125,6 +135,7 @@ where
     }
 
     let mut samples = Vec::with_capacity(measured);
+    let _ = lix::storage_bench::take_constraint_validation_accounting();
     for step in 0..measured {
         let index = seeded + step;
         let started = Instant::now();
@@ -133,13 +144,69 @@ where
     }
     samples.sort_by(|left, right| left.partial_cmp(right).expect("no NaN timings"));
 
+    let accounting = lix::storage_bench::take_constraint_validation_accounting();
     println!(
-        "lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1}",
+        "op=insert lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1}",
         lane.label(),
         percentile(&samples, 0.50),
         percentile(&samples, 0.95),
         samples[0],
+        accounting.committed_scan_calls,
+        accounting.committed_scan_rows,
+        accounting.committed_scan_ns as f64 / 1_000.0,
+        accounting.materialized_select_rows,
+        accounting.materialized_select_ns as f64 / 1_000.0,
+        accounting.json_parse_calls,
+        accounting.json_parse_bytes,
+        accounting.json_parse_ns as f64 / 1_000.0,
     );
+
+    if lane == Lane::ForeignKey {
+        let _ = lix::storage_bench::take_constraint_validation_accounting();
+        let mut updates = Vec::with_capacity(measured);
+        for step in 0..measured {
+            let started = Instant::now();
+            session
+                .execute(
+                    "UPDATE w_fk_child SET parent_code = $1 WHERE id = $2",
+                    &[
+                        Value::Text("parent-1".into()),
+                        Value::Text(format!("row-{}", seeded + step)),
+                    ],
+                )
+                .await
+                .expect("update fk row");
+            updates.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        updates.sort_by(|left, right| left.partial_cmp(right).expect("no NaN timings"));
+        let accounting = lix::storage_bench::take_constraint_validation_accounting();
+        println!(
+            "op=update lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1}",
+            lane.label(),
+            percentile(&updates, 0.50),
+            percentile(&updates, 0.95),
+            updates[0],
+            accounting.committed_scan_calls,
+            accounting.committed_scan_rows,
+            accounting.committed_scan_ns as f64 / 1_000.0,
+            accounting.materialized_select_rows,
+            accounting.materialized_select_ns as f64 / 1_000.0,
+            accounting.json_parse_calls,
+            accounting.json_parse_bytes,
+            accounting.json_parse_ns as f64 / 1_000.0,
+        );
+        let error = session
+            .execute(
+                "INSERT INTO w_fk_child (id, parent_code) VALUES ($1, $2)",
+                &[
+                    Value::Text("invalid-child".into()),
+                    Value::Text("missing-parent".into()),
+                ],
+            )
+            .await
+            .expect_err("missing FK target must fail");
+        assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+    }
 }
 
 async fn insert_row<S>(session: &Lix<S>, lane: Lane, index: usize)
@@ -174,7 +241,7 @@ where
         Lane::ForeignKey => {
             session
                 .execute(
-                    r#"INSERT INTO w_fk_child (id, "parent_id") VALUES ($1, $2)"#,
+                    "INSERT INTO w_fk_child (id, parent_code) VALUES ($1, $2)",
                     &[
                         Value::Text(format!("row-{index}")),
                         Value::Text("parent-0".into()),
@@ -220,20 +287,22 @@ fn schemas() -> [serde_json::Value; 4] {
             "key": "w_fk_parent",
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
+                { "name": "code", "type": "text", "nullable": false },
             ],
             "primary_key": ["id"],
+            "unique": [["code"]],
         }),
         serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "w_fk_child",
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
-                { "name": "parent_id", "type": "text", "nullable": false },
+                { "name": "parent_code", "type": "text", "nullable": false },
             ],
             "primary_key": ["id"],
             "foreign_keys": [{
-                "columns": ["parent_id"],
-                "references": { "schema_key": "w_fk_parent", "columns": ["id"] }
+                "columns": ["parent_code"],
+                "references": { "schema_key": "w_fk_parent", "columns": ["code"] }
             }],
         }),
     ]
