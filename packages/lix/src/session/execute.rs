@@ -6972,7 +6972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn certified_empty_batch_rechecks_concurrent_insert_at_commit_snapshot() {
+    async fn certified_batch_reconciles_concurrent_insert_at_commit_snapshot() {
         let storage = Memory::default();
         Engine::initialize(storage.clone())
             .await
@@ -7062,12 +7062,10 @@ mod tests {
             .await
             .expect("concurrent batch should commit first");
 
-        let error = first_transaction
+        first_transaction
             .commit()
             .await
-            .expect_err("commit snapshot must observe the concurrent identity");
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+            .expect("same-identity concurrent inserts use row-existence LWW");
         let rows = second
             .execute(
                 "SELECT value FROM concurrent_parameter_insert_probe WHERE id = 'shared'",
@@ -7075,7 +7073,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "second");
+        assert!(matches!(
+            rows.rows()[0].get::<String>("value").unwrap().as_str(),
+            "first" | "second"
+        ));
     }
 
     #[tokio::test]

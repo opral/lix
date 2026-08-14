@@ -1,34 +1,32 @@
-//! Minimal compiling Lix Component plugin.
+//! Minimal compiling row-only Lix Component plugin.
 
-use lix::plugin::{
-    ColdUpdate, FileUpdate, OpenFile, Output, Plugin, RestoreFile, Result, RowUpdate,
-};
+use lix::plugin::{ColumnMerge, ColumnMergeResult, ColumnMerger, OwnedColumnValue, Result};
 
-struct MinimalPlugin;
+#[allow(dead_code)]
+struct ConversationMerger;
 
-impl Plugin for MinimalPlugin {
-    fn open(_input: &OpenFile<'_>, _output: &mut Output<'_>) -> Result<()> {
-        Ok(())
-    }
+impl ColumnMerger for ConversationMerger {
+    fn merge(input: ColumnMerge<'_>) -> Result<ColumnMergeResult> {
+        if input.row.schema_key != "conversation" || input.column != "body" {
+            return Ok(ColumnMergeResult::UseLww);
+        }
+        let (Some(base), Some(a), Some(b)) = (input.base.text()?, input.a.text()?, input.b.text()?)
+        else {
+            return Ok(ColumnMergeResult::UseLww);
+        };
 
-    fn file_changed(_update: &FileUpdate<'_>, _output: &mut Output<'_>) -> Result<()> {
-        Ok(())
-    }
-
-    fn rows_changed(_update: &mut RowUpdate<'_>, _output: &mut Output<'_>) -> Result<()> {
-        Ok(())
-    }
-
-    fn restore(_input: &mut RestoreFile<'_>, _output: &mut Output<'_>) -> Result<()> {
-        Ok(())
-    }
-
-    fn cold_file_changed(_update: &mut ColdUpdate<'_>, _output: &mut Output<'_>) -> Result<()> {
-        Ok(())
+        // This example's domain rule merges two append-only transcript writes.
+        // Any edit to existing prose deliberately keeps the host's LWW value.
+        let (Some(a_append), Some(b_append)) = (a.strip_prefix(&base), b.strip_prefix(&base))
+        else {
+            return Ok(ColumnMergeResult::UseLww);
+        };
+        let merged = format!("{base}{a_append}{b_append}");
+        Ok(ColumnMergeResult::Replace(OwnedColumnValue::text(merged)))
     }
 }
 
-lix::plugin::export!(MinimalPlugin);
+lix::plugin::export_capabilities! { column_merger: ConversationMerger }
 
 // Cargo builds examples as binaries during `cargo test --all-targets`. The
 // packaged-plugin qualification copies this source into a downstream

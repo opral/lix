@@ -1,4 +1,4 @@
-//! Excalidraw support for the fused Component API v1.
+//! Excalidraw support for the row-first Component API v1.
 #![allow(dead_code)]
 
 mod core;
@@ -21,69 +21,73 @@ const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
 const ELEMENT_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_ELEMENT_SHIFT_RECORDS: usize = 4096;
 
-impl sdk::Plugin for ExcalidrawPlugin {
-    fn cold_file_changed(
-        update: &mut sdk::ColdUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
-    ) -> sdk::Result<()> {
-        let accepted = update.before.read_all()?;
-        let mut builder = RowImportBuilder::new();
-        while let Some(row) = update.rows.next()? {
-            builder
-                .push(RowRecord {
-                    schema_key: row.schema_key,
-                    row_pk: row.row_pk,
-                    snapshot: row.snapshot,
-                })
-                .map_err(sdk::Error::invalid_input)?;
-        }
-        let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
-        let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
-        let rendered = document.bytes();
-        if rendered != accepted {
-            let reconcile = [FileEdit {
-                offset: 0,
-                delete_len: rendered.len() as u64,
-                insert: &accepted,
-            }];
-            document = document
-                .file_changed(&reconcile, namespace)
-                .map_err(sdk::Error::invalid_input)?
-                .0;
-        }
-        let inserts = update
-            .edits
-            .iter()
-            .map(|edit| edit.insert.clone())
-            .collect::<Vec<_>>();
-        let splices = update
-            .edits
-            .iter()
-            .zip(&inserts)
-            .map(|(edit, insert)| FileEdit {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert,
+fn cold_parse_changes(
+    update: &mut sdk::ParseChangesInput<'_>,
+    sink: &mut sdk::RowChangeOutput<'_, '_>,
+) -> sdk::Result<()> {
+    let accepted = update.before.read_all()?;
+    let mut builder = RowImportBuilder::new();
+    let rows = update
+        .rows
+        .as_mut()
+        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+    while let Some(row) = rows.next()? {
+        builder
+            .push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             })
-            .collect::<Vec<_>>();
-        let (successor, changes) = document
-            .file_changed(&splices, namespace)
             .map_err(sdk::Error::invalid_input)?;
-        sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
-        store_element_index(
-            sink,
-            &encode_element_index(&successor.arena_element_spans())?,
-        )?;
-        emit_changes(changes.into_iter().map(Ok), sink)
     }
+    let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
+    let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
+    let rendered = document.bytes();
+    if rendered != accepted {
+        let reconcile = [FileEdit {
+            offset: 0,
+            delete_len: rendered.len() as u64,
+            insert: &accepted,
+        }];
+        document = document
+            .file_changed(&reconcile, namespace)
+            .map_err(sdk::Error::invalid_input)?
+            .0;
+    }
+    let inserts = update
+        .file_edits
+        .iter()
+        .map(|edit| edit.insert.clone())
+        .collect::<Vec<_>>();
+    let splices = update
+        .file_edits
+        .iter()
+        .zip(&inserts)
+        .map(|(edit, insert)| FileEdit {
+            offset: edit.offset,
+            delete_len: edit.delete_len,
+            insert,
+        })
+        .collect::<Vec<_>>();
+    let (successor, changes) = document
+        .file_changed(&splices, namespace)
+        .map_err(sdk::Error::invalid_input)?;
+    sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+    store_element_index(
+        sink,
+        &encode_element_index(&successor.arena_element_spans())?,
+    )?;
+    emit_changes(changes.into_iter().map(Ok), sink)
+}
 
-    fn rows_changed(
-        update: &mut sdk::RowUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
+impl sdk::FileProjection for ExcalidrawPlugin {
+    fn serialize_changes(
+        mut update: sdk::SerializeChangesInput<'_>,
+        sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
-        while let Some(change) = update.changes.next()? {
+        while let Some(change) = update.row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
                 row_pk: change.row_pk,
@@ -97,19 +101,26 @@ impl sdk::Plugin for ExcalidrawPlugin {
         let namespace = read_namespace(&update.before)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let (document, _) =
-            Document::open_file(before.clone(), Some(update.before_path.as_str()), namespace)
-                .map_err(sdk::Error::invalid_input)?;
-        let (_, edits) = document
+        let (document, _) = Document::open_file(before.clone(), Some(update.path), namespace)
+            .map_err(sdk::Error::invalid_input)?;
+        let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
-        sink.replace_file(&apply_edits(before, &edits)?)?;
-        delete_element_index_from_sink(&update.before, sink)?;
+        for edit in edits {
+            sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
+        }
+        store_element_index(
+            sink,
+            &encode_element_index(&successor.arena_element_spans())?,
+        )?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
         Ok(())
     }
 
-    fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn serialize(
+        mut input: sdk::SerializeInput<'_>,
+        sink: &mut sdk::FileOutput<'_, '_>,
+    ) -> sdk::Result<()> {
         let mut records = Vec::new();
         while let Some(row) = input.rows.next()? {
             records.push(RowRecord {
@@ -123,20 +134,14 @@ impl sdk::Plugin for ExcalidrawPlugin {
             sink,
             &encode_element_index(&document.arena_element_spans())?,
         )?;
-        if input.accepted.is_none() {
-            sink.replace_file(&document.bytes())?;
-        }
-        Ok(())
+        sink.write(&document.bytes())
     }
 
-    fn open(input: &sdk::OpenFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn parse(input: sdk::ParseInput<'_>, sink: &mut sdk::RowOutput<'_, '_>) -> sdk::Result<()> {
         let namespace = IdNamespace::from_namespace_bytes(input.creates.namespace_bytes());
-        let (document, changes) = Document::open_file(
-            input.accepted.read_all()?,
-            Some(input.path.as_str()),
-            namespace,
-        )
-        .map_err(sdk::Error::invalid_input)?;
+        let (document, changes) =
+            Document::open_file(input.file.read_all()?, Some(input.path), namespace)
+                .map_err(sdk::Error::invalid_input)?;
         sink.put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         store_element_index(
             sink,
@@ -146,15 +151,21 @@ impl sdk::Plugin for ExcalidrawPlugin {
         Ok(())
     }
 
-    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn parse_changes(
+        mut update: sdk::ParseChangesInput<'_>,
+        sink: &mut sdk::RowChangeOutput<'_, '_>,
+    ) -> sdk::Result<()> {
+        if update.before.state_len(ELEMENT_INDEX_KEY)?.is_none() {
+            return cold_parse_changes(&mut update, sink);
+        }
         let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
         let inserts = update
-            .edits
+            .file_edits
             .iter()
             .map(|edit| edit.insert.clone())
             .collect::<Vec<_>>();
         let splices = update
-            .edits
+            .file_edits
             .iter()
             .zip(&inserts)
             .map(|(edit, insert)| FileEdit {
@@ -164,9 +175,10 @@ impl sdk::Plugin for ExcalidrawPlugin {
             })
             .collect::<Vec<_>>();
         if update.before_path == update.after_path
-            && let [edit] = update.edits.as_slice()
+            && update.file_edits.iter().len() == 1
+            && let Some(edit) = update.file_edits.iter().next()
             && let Some((change, successor_shifts)) =
-                sparse_element_change(update, edit, &inserts[0])?
+                sparse_element_change(&update, edit, &inserts[0])?
         {
             sink.put_state(ELEMENT_SHIFTS_KEY, &successor_shifts)?;
             emit_changes([Ok(change)], sink)?;
@@ -175,7 +187,7 @@ impl sdk::Plugin for ExcalidrawPlugin {
 
         let (document, _) = Document::open_file(
             update.before.read_all()?,
-            Some(update.before_path.as_str()),
+            Some(update.before_path),
             namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
@@ -245,7 +257,7 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
 }
 
 fn sparse_element_change(
-    update: &sdk::FileUpdate<'_>,
+    update: &sdk::ParseChangesInput<'_>,
     edit: &sdk::FileEdit,
     insert: &[u8],
 ) -> sdk::Result<Option<(RowChange, Vec<u8>)>> {
@@ -415,7 +427,7 @@ fn encode_element_index(spans: &[ArenaElementSpan]) -> sdk::Result<EncodedElemen
 }
 
 fn store_element_index(
-    successor: &sdk::Output<'_>,
+    successor: &mut impl StateOutput,
     encoded: &EncodedElementIndex,
 ) -> sdk::Result<()> {
     let page_count = u32::try_from(encoded.payload.len().div_ceil(ELEMENT_INDEX_PAGE_BYTES))
@@ -438,7 +450,7 @@ fn store_element_index(
 
 fn replace_element_index(
     before: &sdk::Snapshot<'_>,
-    successor: &sdk::Output<'_>,
+    successor: &mut impl StateOutput,
     encoded: &EncodedElementIndex,
 ) -> sdk::Result<()> {
     let old_page_count = element_index_page_count(before)?;
@@ -453,7 +465,7 @@ fn replace_element_index(
 
 fn delete_element_index_from_sink(
     before: &sdk::Snapshot<'_>,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl StateOutput,
 ) -> sdk::Result<()> {
     let page_count = element_index_page_count(before)?;
     sink.delete_state(ELEMENT_INDEX_KEY)?;
@@ -522,7 +534,7 @@ struct IndexEntry {
     leading_json_len: u32,
 }
 
-fn read_index_entry(update: &sdk::FileUpdate<'_>, ordinal: u32) -> sdk::Result<IndexEntry> {
+fn read_index_entry(update: &sdk::ParseChangesInput<'_>, ordinal: u32) -> sdk::Result<IndexEntry> {
     let offset = u64::from(ordinal)
         .checked_mul(u64::from(ELEMENT_INDEX_ENTRY_BYTES))
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw index offset overflowed"))?;
@@ -633,33 +645,80 @@ fn state_text(bytes: &[u8]) -> sdk::Result<String> {
         .map_err(|error| sdk::Error::invalid_input(format!("invalid Excalidraw state: {error}")))
 }
 
-fn emit_changes<I>(changes: I, sink: &mut sdk::Output<'_>) -> sdk::Result<()>
+fn emit_changes<I>(changes: I, sink: &mut impl MutationOutput) -> sdk::Result<()>
 where
     I: IntoIterator<Item = Result<RowChange, String>>,
 {
     for change in changes {
         let change = change.map_err(sdk::Error::invalid_input)?;
         match change.snapshot {
-            Some(snapshot) => sink.row(sdk::RowMutation::Upsert {
-                schema_key: &change.schema_key,
-                row_pk: &change.row_pk,
-                snapshot: &snapshot,
-                effect: match change.effect {
+            Some(snapshot) => sink.upsert(
+                &change.schema_key,
+                &change.row_pk,
+                &snapshot,
+                match change.effect {
                     ChangeEffect::Content => sdk::ChangeEffect::Content,
                     ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
                 },
-            })?,
-            None => sink.row(sdk::RowMutation::Delete {
-                schema_key: &change.schema_key,
-                row_pk: &change.row_pk,
-            })?,
+            )?,
+            None => sink.delete(&change.schema_key, &change.row_pk)?,
         }
     }
     Ok(())
 }
 
+trait StateOutput {
+    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
+    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
+}
+macro_rules! impl_state_output {
+    ($type:ty) => {
+        impl StateOutput for $type {
+            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
+                <$type>::put_state(self, key, value)
+            }
+            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
+                <$type>::delete_state(self, key)
+            }
+        }
+    };
+}
+impl_state_output!(sdk::RowOutput<'_, '_>);
+impl_state_output!(sdk::RowChangeOutput<'_, '_>);
+impl_state_output!(sdk::FileOutput<'_, '_>);
+impl_state_output!(sdk::FileEditOutput<'_, '_>);
+
+trait MutationOutput {
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[String],
+        snapshot: &[u8],
+        effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+}
+impl MutationOutput for sdk::RowOutput<'_, '_> {
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], _: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v)
+    }
+    fn delete(&mut self, _: &str, _: &[String]) -> sdk::Result<()> {
+        Err(sdk::Error::invalid_input(
+            "initial Excalidraw parse produced a deletion",
+        ))
+    }
+}
+impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], e: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v, e)
+    }
+    fn delete(&mut self, s: &str, k: &[String]) -> sdk::Result<()> {
+        self.delete(s, k)
+    }
+}
+
 #[cfg(target_family = "wasm")]
-lix::plugin::export!(ExcalidrawPlugin);
+lix::plugin::export_capabilities! { file_projection: ExcalidrawPlugin }
 
 #[cfg(test)]
 mod tests {

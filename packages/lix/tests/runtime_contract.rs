@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lix::plugin::runtime::{
-    WasmByteOutputsHandle, WasmChangeCursorHandle, WasmChangePage, WasmComponentActor,
-    WasmComponentFactory, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage,
-    WasmFileTransition, WasmFileUpdate, WasmOpenFileInput, WasmOpenRowsInput, WasmRowTransition,
-    WasmRowUpdate, WasmRuntime, WasmTransitionHandle, WasmTransitionLimits,
+    PluginCapabilities, WasmByteOutputsHandle, WasmChangeCursorHandle, WasmChangePage,
+    WasmComponentActor, WasmComponentFactory, WasmDocumentHandle, WasmEditCursorHandle,
+    WasmEditPage, WasmFileTransition, WasmFileUpdate, WasmOpenFileInput, WasmOpenRowsInput,
+    WasmRowTransition, WasmRowUpdate, WasmRuntime, WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix::wasm::WasmLimits;
 use lix::{LixError, open_lix};
@@ -19,6 +19,7 @@ impl WasmRuntime for EmbeddingRuntime {
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
+        _capabilities: PluginCapabilities,
     ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
         Ok(Arc::new(EmbeddingFactory))
     }

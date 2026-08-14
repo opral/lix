@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::{LixError, wasm::WasmLimits};
 
-use super::contract::WasmComponentFactory;
+use super::{PluginCapabilities, contract::WasmComponentFactory};
 
 /// Host-owned immutable arena primitives for Component plugins.
 ///
@@ -27,6 +27,7 @@ pub trait WasmRuntime: Send + Sync {
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
+        capabilities: PluginCapabilities,
     ) -> Result<Arc<dyn WasmComponentFactory>, LixError>;
 }
 
@@ -39,6 +40,7 @@ impl WasmRuntime for UnsupportedWasmRuntime {
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
+        _capabilities: PluginCapabilities,
     ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
         Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,

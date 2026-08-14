@@ -541,16 +541,20 @@ mod tests {
             key: "plugin_csv".to_string(),
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
-            path_glob: "*.csv".to_string(),
+            capabilities: crate::plugin::runtime::PluginCapabilities {
+                column_merger: true,
+                file_projection: true,
+            },
+            path_glob: Some("*.csv".to_string()),
             content: None,
-            entry: "plugin.wasm".to_string(),
+            entry: Some("plugin.wasm".to_string()),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"entry":"plugin.wasm","key":"plugin_csv","match":{"path_glob":"*.csv"},"schemas":["schema/csv_row.json"]}"#.to_string(),
+            manifest_json: r#"{"entry":"plugin.wasm","file_match":{"path_glob":"*.csv"},"key":"plugin_csv","schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: crate::plugin::runtime::plugin_storage_archive_file_id("plugin_csv"),
             archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
             archive_blob_hash: "a".repeat(64),
-            wasm_blob_hash: "b".repeat(64),
+            wasm_blob_hash: Some("b".repeat(64)),
         })
         .expect("plugin")
     }

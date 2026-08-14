@@ -1,6 +1,6 @@
 {
   "key": "plugin_json",
-  "match": {
+  "file_match": {
     "path_glob": "*.json",
     "content": "text"
   },

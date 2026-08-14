@@ -104,6 +104,134 @@ async fn stale_transaction_composes_disjoint_semantic_writes() {
     assert_eq!(result.rows()[1].get::<String>("key").unwrap(), "winner-key");
 }
 
+#[tokio::test]
+async fn stale_transaction_composes_different_columns_of_one_ordinary_row() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
+        .await
+        .expect("initialized storage should create an engine");
+    let setup = engine.open_session().await.expect("setup session should open");
+    setup
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value)
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"row_merge_note","columns":[{"name":"id","type":"text","nullable":false},{"name":"title","type":"text","nullable":false},{"name":"body","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB))"#,
+            &[],
+        )
+        .await
+        .expect("note schema should register");
+    setup
+        .execute(
+            "INSERT INTO row_merge_note (id, title, body) VALUES ('note-1', 'old title', 'old body')",
+            &[],
+        )
+        .await
+        .expect("note should seed");
+
+    let stale_session = engine.open_session().await.expect("stale session should open");
+    let winner_session = engine.open_session().await.expect("winner session should open");
+    let mut stale = stale_session
+        .begin_transaction()
+        .await
+        .expect("stale transaction should begin");
+    stale
+        .execute(
+            "UPDATE row_merge_note SET title = 'alice title' WHERE id = 'note-1'",
+            &[],
+        )
+        .await
+        .expect("stale title edit should stage");
+    winner_session
+        .execute(
+            "UPDATE row_merge_note SET body = 'bob body' WHERE id = 'note-1'",
+            &[],
+        )
+        .await
+        .expect("winner body edit should commit");
+    stale
+        .commit()
+        .await
+        .expect("different columns should compose without a conflict API");
+
+    let result = winner_session
+        .execute(
+            "SELECT title, body FROM row_merge_note WHERE id = 'note-1'",
+            &[],
+        )
+        .await
+        .expect("merged note should read");
+    assert_eq!(result.rows()[0].get::<String>("title").unwrap(), "alice title");
+    assert_eq!(result.rows()[0].get::<String>("body").unwrap(), "bob body");
+}
+
+#[tokio::test]
+async fn commit_cohort_composes_different_columns_of_one_ordinary_row() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
+        .await
+        .expect("initialized storage should create an engine");
+    let setup = engine.open_session().await.expect("setup session should open");
+    setup
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value)
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"cohort_row_merge_note","columns":[{"name":"id","type":"text","nullable":false},{"name":"title","type":"text","nullable":false},{"name":"body","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB))"#,
+            &[],
+        )
+        .await
+        .expect("note schema should register");
+    setup
+        .execute(
+            "INSERT INTO cohort_row_merge_note (id, title, body) VALUES ('note-1', 'old title', 'old body')",
+            &[],
+        )
+        .await
+        .expect("note should seed");
+
+    let alice_session = engine.open_session().await.expect("alice session should open");
+    let bob_session = engine.open_session().await.expect("bob session should open");
+    let mut alice = alice_session
+        .begin_transaction()
+        .await
+        .expect("alice transaction should begin");
+    let mut bob = bob_session
+        .begin_transaction()
+        .await
+        .expect("bob transaction should begin");
+    alice
+        .execute(
+            "UPDATE cohort_row_merge_note SET title = 'alice title' WHERE id = 'note-1'",
+            &[],
+        )
+        .await
+        .expect("alice title edit should stage");
+    bob.execute(
+        "UPDATE cohort_row_merge_note SET body = 'bob body' WHERE id = 'note-1'",
+        &[],
+    )
+    .await
+    .expect("bob body edit should stage");
+
+    let (alice_result, bob_result) = tokio::join!(alice.commit(), bob.commit());
+    alice_result.expect("alice cohort member should commit");
+    bob_result.expect("bob cohort member should commit");
+
+    let result = setup
+        .execute(
+            "SELECT title, body FROM cohort_row_merge_note WHERE id = 'note-1'",
+            &[],
+        )
+        .await
+        .expect("cohort-merged note should read");
+    assert_eq!(result.rows().len(), 1, "cohort must retain one row identity");
+    assert_eq!(result.rows()[0].get::<String>("title").unwrap(), "alice title");
+    assert_eq!(result.rows()[0].get::<String>("body").unwrap(), "bob body");
+}
+
 /// Media ingest and an unrelated project-file save are independent writers:
 /// they touch disjoint files, disjoint payload rows, and disjoint branch state.
 /// Neither may be rejected because the other committed first.
@@ -187,7 +315,7 @@ async fn committed_media_ingest_part_does_not_invalidate_a_concurrent_project_sa
 }
 
 #[tokio::test]
-async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
+async fn stale_transaction_uses_row_existence_lww_for_overlapping_ordinary_insert() {
     let storage = Memory::new();
     Engine::initialize(storage.clone())
         .await
@@ -223,11 +351,10 @@ async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
         .await
         .expect("winner transaction should commit");
 
-    let error = stale
+    stale
         .commit()
         .await
-        .expect_err("overlapping ordinary rows must remain conservative");
-    assert_eq!(error.code, "LIX_ERROR_UNIQUE");
+        .expect("overlapping ordinary row creations use row-existence LWW");
     let result = winner_session
         .execute(
             "SELECT value FROM lix_key_value WHERE key = 'same-key'",
@@ -236,10 +363,10 @@ async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
         .await
         .expect("winner state should remain readable");
     assert_eq!(result.rows().len(), 1);
-    assert_eq!(
+    assert!(matches!(
         result.rows()[0].get::<serde_json::Value>("value").unwrap(),
-        serde_json::json!("winner")
-    );
+        serde_json::Value::String(value) if value == "stale" || value == "winner"
+    ));
 }
 
 #[tokio::test]

@@ -34,7 +34,6 @@ use serde::Deserialize;
 use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
-use crate::row_pk::RowPk;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
     FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
@@ -54,6 +53,7 @@ use crate::plugin::runtime::{
     plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
     plugin_storage_archive_file_id,
 };
+use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
     resolve_write_branch_scope,
@@ -4144,8 +4144,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let directory_id = optional_string_value(batch, row_index, "directory_id")?;
         let name = required_string_value(batch, row_index, "name")?;
-        crate::common::validate_lix_path_segment(&name)
-            .map_err(lix_error_to_datafusion_error)?;
+        crate::common::validate_lix_path_segment(&name).map_err(lix_error_to_datafusion_error)?;
         let mut data_path = None;
 
         let id = if data.is_some() {
@@ -4747,11 +4746,7 @@ fn lix_file_record_batch_from_path_selection(
             "lixcol_row_pk" => Arc::new(StringArray::from(
                 entries
                     .iter()
-                    .map(|entry| {
-                        file_id_row_pk(entry.id())?
-                            .as_json_array_text()
-                            .map(Some)
-                    })
+                    .map(|entry| file_id_row_pk(entry.id())?.as_json_array_text().map(Some))
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             "lixcol_schema_key" => {
@@ -7038,6 +7033,7 @@ mod tests {
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::Literal;
     use serde_json::Value as JsonValue;
+    use wasm_encoder::{ComponentBuilder, ComponentExportKind};
 
     use crate::binary_cas::{
         BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobWriteReceipt, ChunkHash,
@@ -7054,6 +7050,7 @@ mod tests {
         HotStateExactBatchRequest, HotStateFilter, HotStateReader, HotStateScanRequest,
         MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
     };
+    use crate::plugin::runtime::UnsupportedWasmRuntime;
     use crate::plugin::runtime::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
         PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
@@ -7065,7 +7062,6 @@ mod tests {
     use crate::transaction_types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::plugin::runtime::UnsupportedWasmRuntime;
     use crate::{LixError, NullableKeyFilter};
 
     use super::{
@@ -8948,11 +8944,7 @@ mod tests {
                         .iter()
                         .map(|row| row.schema_key.clone())
                         .collect(),
-                    row_pks: request
-                        .rows
-                        .iter()
-                        .map(|row| row.row_pk.clone())
-                        .collect(),
+                    row_pks: request.rows.iter().map(|row| row.row_pk.clone()).collect(),
                     file_ids: request
                         .rows
                         .iter()
@@ -9217,11 +9209,11 @@ mod tests {
         let mut manifest = serde_json::json!({
             "entry": "plugin.wasm",
             "key": key,
-            "match": { "path_glob": path_glob },
+            "file_match": { "path_glob": path_glob },
             "schemas": ["schema/plugin.json"],
         });
         if let Some(content) = content {
-            manifest["match"]["content"] =
+            manifest["file_match"]["content"] =
                 serde_json::to_value(content).expect("plugin content type should serialize");
         }
         let manifest_json = manifest.to_string();
@@ -9229,16 +9221,20 @@ mod tests {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
-            path_glob: path_glob.to_string(),
+            capabilities: crate::plugin::runtime::PluginCapabilities {
+                column_merger: false,
+                file_projection: true,
+            },
+            path_glob: Some(path_glob.to_string()),
             content,
-            entry: "plugin.wasm".to_string(),
+            entry: Some("plugin.wasm".to_string()),
             schema_keys: vec![schema_key.to_string()],
             create_schema_keys: Vec::new(),
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
             archive_blob_hash: BlobId::from_content(format!("archive-{key}").as_bytes()).to_hex(),
-            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
+            wasm_blob_hash: Some(BlobId::from_content(wasm).to_hex()),
         })
         .expect("test plugin registry entry should be valid")
     }
@@ -9283,11 +9279,11 @@ mod tests {
     }
 
     fn plugin_archive(path_glob: &str, schema_key: &str) -> Vec<u8> {
-        const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
+        let wasm = file_projection_component();
         let manifest_json = format!(
             r#"{{
                 "key": "plugin_sentinel",
-                "match": {{ "path_glob": "{path_glob}" }},
+                "file_match": {{ "path_glob": "{path_glob}" }},
                 "entry": "plugin.wasm",
                 "schemas": ["schema/plugin_note.json"]
             }}"#
@@ -9310,12 +9306,29 @@ mod tests {
         for (path, bytes) in [
             ("manifest.json", manifest_json.as_bytes()),
             ("schema/plugin_note.json", schema_json.as_bytes()),
-            ("plugin.wasm", WASM_HEADER),
+            ("plugin.wasm", wasm.as_slice()),
         ] {
             writer.start_file(path, options).unwrap();
             writer.write_all(bytes).unwrap();
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    fn file_projection_component() -> Vec<u8> {
+        let mut component = ComponentBuilder::default();
+        let empty = component.component(Some("capability"), ComponentBuilder::default());
+        let instance = component.instantiate(
+            Some("file-projection"),
+            empty,
+            std::iter::empty::<(&str, ComponentExportKind, u32)>(),
+        );
+        component.export(
+            "lix:plugin/file-projection@1.0.0",
+            ComponentExportKind::Instance,
+            instance,
+            None,
+        );
+        component.finish()
     }
 
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
@@ -9953,7 +9966,7 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_registry_catalogs_remain_branch_scoped() {
-        let wasm = b"test wasm";
+        let wasm = file_projection_component();
         let rows = vec![
             live_plugin_registry_row(
                 "01920000-0000-7000-8000-0000000000a1",
@@ -9961,7 +9974,7 @@ mod tests {
                     "plugin_sentinel",
                     "*.01920000-0000-7000-8000-0000000000a1",
                     "plugin_note_a",
-                    wasm,
+                    &wasm,
                 )],
             ),
             live_plugin_owner_row(
@@ -9976,7 +9989,7 @@ mod tests {
                     "plugin_sentinel",
                     "*.01920000-0000-7000-8000-0000000000b1",
                     "plugin_note_b",
-                    wasm,
+                    &wasm,
                 )],
             ),
             live_plugin_owner_row(
@@ -10110,7 +10123,7 @@ mod tests {
 
     #[tokio::test]
     async fn installed_nonmatching_plugin_checks_blobless_file_ownership() {
-        let wasm = b"test wasm";
+        let wasm = file_projection_component();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
@@ -10129,7 +10142,7 @@ mod tests {
                         "plugin_sentinel",
                         "*.sentinel",
                         "plugin_note",
-                        wasm,
+                        &wasm,
                     )],
                 )],
                 scan_requests: Arc::clone(&requests),
@@ -10216,7 +10229,7 @@ mod tests {
 
     #[tokio::test]
     async fn path_update_uses_stale_owner_and_current_catalog() {
-        let wasm = b"test wasm";
+        let wasm = file_projection_component();
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -10235,7 +10248,7 @@ mod tests {
                             "plugin_active",
                             "*.active",
                             "plugin_active_state",
-                            wasm,
+                            &wasm,
                         )],
                     ),
                     live_plugin_owner_row(
@@ -10299,7 +10312,7 @@ mod tests {
 
     #[tokio::test]
     async fn path_update_restages_same_owner_v2_for_descriptor_transition() {
-        let wasm = b"test v2 wasm";
+        let wasm = file_projection_component();
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -10318,7 +10331,7 @@ mod tests {
                             "plugin_csv",
                             "*.csv",
                             "csv_row",
-                            wasm,
+                            &wasm,
                         )],
                     ),
                     live_plugin_owner_row(
@@ -10367,7 +10380,7 @@ mod tests {
 
     #[tokio::test]
     async fn path_update_uses_materialized_data_for_content_matching() {
-        let wasm = b"test wasm";
+        let wasm = file_projection_component();
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -10386,7 +10399,7 @@ mod tests {
                         "*.active",
                         Some(PluginContentMatcher::Text),
                         "plugin_text_state",
-                        wasm,
+                        &wasm,
                     )],
                 )],
             }) as Arc<dyn HotStateReader>,
@@ -11415,10 +11428,8 @@ mod tests {
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(
             write_context.exact_load_requests[0].rows[0].row_pk,
-            crate::row_pk::RowPk::uuid_from_canonical(
-                "01920000-0000-7000-8000-0000000000d2",
-            )
-            .expect("fixture file ID")
+            crate::row_pk::RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000d2",)
+                .expect("fixture file ID")
         );
         assert_eq!(
             write_context.exact_load_requests[0].rows[0]

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
+use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use tracing::Instrument as _;
@@ -8,11 +8,12 @@ use tracing::Instrument as _;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
-use crate::row_pk::RowPk;
 use crate::plugin::runtime::{
-    ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
-    load_plugin_registry_at_commit,
+    ColumnMergeResult as HostColumnMergeResult, ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner,
+    PluginRegistry, PluginRegistryEntry, RowVersionRef, WasmColumnMergeResult, WasmHostColumnMerge,
+    load_plugin_registry_at_commit, reconcile_row,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::Storage;
 #[cfg(test)]
 use crate::tracked_state::MaterializedTrackedStateRow;
@@ -32,14 +33,10 @@ use super::conflicts::{
 };
 use super::stats::MergeStats;
 use crate::common::{SharedStr, compose_directory_path, compose_file_path};
+use crate::plugin::runtime::{WasmHostBytes, WasmRowKey};
 use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
 use crate::transaction::StagedCommitChangeBatchBuilder;
-use crate::plugin::runtime::{
-    WasmByteSource, WasmChangeEffect, WasmConflictResolution, WasmConflictTake, WasmRowConflict,
-    WasmRowKey, WasmFileDescriptor, WasmHostBytes, WasmPluginSelection, WasmSourceRange,
-    WasmSourceSlice,
-};
 
 /// Options for merging another branch into this session's active branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,26 +191,12 @@ where
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_derived_blob_detection"))
                 .await?;
 
-                let resolvable_plugin_conflicts =
-                    resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
-
                 let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted {
-                    let plugin_conflict_groups = async {
-                        let mut reader = transaction.tracked_state_reader().await;
-                        plugin_merge_conflict_groups(
-                            &mut reader,
-                            &analysis,
-                            &derived_blob_files,
-                            &resolvable_plugin_conflicts,
-                        )
-                        .await
-                    }
-                    .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_conflict_inputs"))
-                    .await?;
                     let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
-                    let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
+                    let resolved_plugin_rows = resolve_row_merge_conflicts(
                         transaction,
-                        plugin_conflict_groups,
+                        &analysis,
+                        &derived_blob_files,
                         &semantic_branch_id,
                     )
                     .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_conflict_resolve"))
@@ -233,7 +216,6 @@ where
                     &source_branch_id,
                     &analysis,
                     &derived_blob_files,
-                    &resolvable_plugin_conflicts,
                     &plugin_resolution_stats,
                 )
         })
@@ -357,57 +339,11 @@ where
                 .merge_plan()
                 .expect("merge analysis should include a plan for mergeCommitted");
 
-            // Do the no-Wasm compatibility preflight and reject ordinary
-            // conflicts before constructing a Component Store. A merge
-            // with an unrelated unresolved row must not pay for (or be
-            // masked by) a plugin resolver invocation.
-            let resolvable_plugin_conflicts =
-                resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
-            let effective_conflicts = if resolvable_plugin_conflicts
-                .covers_all_with_derived_blobs(merge_plan.conflicts.len(), &derived_blob_files)
-            {
-                Vec::new()
-            } else {
-                analysis
-                    .conflict_batch()
-                    .expect("mergeCommitted analysis should include a conflict batch")
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, conflict)| {
-                        !is_derived_blob_conflict(conflict.tracked(), &derived_blob_files)
-                            && !resolvable_plugin_conflicts.contains_index(*index)
-                    })
-                    .map(|(_, conflict)| conflict)
-                    .collect::<Vec<_>>()
-            };
-            if !effective_conflicts.is_empty() {
-                return Err(merge_conflict_error(
-                    &effective_conflicts
-                        .into_iter()
-                        .map(merge_conflict_from_analysis)
-                        .collect::<Result<Vec<_>, _>>()?,
-                )?);
-            }
-
-            let plugin_conflict_groups = async {
-                let mut reader = transaction.tracked_state_reader().await;
-                plugin_merge_conflict_groups(
-                    &mut reader,
-                    &analysis,
-                    &derived_blob_files,
-                    &resolvable_plugin_conflicts,
-                )
-                .await
-            }
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_plugin_conflict_inputs"
-            ))
-            .await?;
             let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
-            let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
+            let resolved_plugin_rows = resolve_row_merge_conflicts(
                 transaction,
-                plugin_conflict_groups,
+                &analysis,
+                &derived_blob_files,
                 &semantic_branch_id,
             )
             .instrument(tracing::debug_span!(
@@ -415,7 +351,6 @@ where
                 "lix.perf.merge_plugin_conflict_resolve"
             ))
             .await?;
-
             let plugin_resolution_stats = async {
                 let mut reader = transaction.tracked_state_reader().await;
                 plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
@@ -508,38 +443,19 @@ const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-#[derive(Debug, Clone)]
-struct DerivedPluginFileConflict {
-    plugin: PluginRegistryEntry,
-    descriptor: WasmFileDescriptor,
-    conflict_indices: Vec<usize>,
-    derived_blob_conflict_count: usize,
-}
-
 #[derive(Debug, Clone, Default)]
 struct DerivedPluginConflictIndex {
     owners: BTreeMap<String, PluginFileOwner>,
-    files: BTreeMap<String, DerivedPluginFileConflict>,
+    files: BTreeSet<String>,
 }
 
 impl DerivedPluginConflictIndex {
-    fn context(&self, file_id: &str) -> Option<&DerivedPluginFileConflict> {
-        self.files.get(file_id)
-    }
-
     fn owner(&self, file_id: &str) -> Option<&PluginFileOwner> {
         self.owners.get(file_id)
     }
 
     fn contains_file(&self, file_id: &str) -> bool {
-        self.owners.contains_key(file_id)
-    }
-
-    fn derived_blob_conflict_count(&self) -> usize {
-        self.files
-            .values()
-            .map(|context| context.derived_blob_conflict_count)
-            .sum()
+        self.files.contains(file_id)
     }
 }
 
@@ -647,52 +563,21 @@ where
         load_plugin_registry_at_commit(reader, &analysis.commits.source_commit_id.to_string())
             .await?;
 
-    let mut derived = BTreeMap::new();
+    let mut derived = BTreeSet::new();
     let mut derived_owners = BTreeMap::new();
     for (file_id, owner) in common_owners {
         let Some(path @ Some(_)) = common_descriptors.get(&file_id).cloned() else {
             continue;
         };
-        let Ok(plugin) = pinned_conflict_plugin_entry(
+        let _plugin = pinned_conflict_plugin_entry(
             &owner,
             &base_registry,
             &target_registry,
             &source_registry,
             &file_id,
-        ) else {
-            continue;
-        };
-        let descriptor = WasmFileDescriptor {
-            path,
-            plugin: WasmPluginSelection {
-                plugin_key: plugin.key().to_owned(),
-                generation: plugin.archive_blob_hash().to_owned(),
-            },
-        };
-        let conflict_indices = conflict_indices_by_file
-            .remove(&file_id)
-            .unwrap_or_default();
-        let merge_plan = analysis
-            .merge_plan()
-            .expect("derived plugin conflicts require a merge plan");
-        let derived_blob_conflict_count = conflict_indices
-            .iter()
-            .filter(|&&index| {
-                matches!(
-                    merge_plan.conflicts[index].identity.schema_key(),
-                    BLOB_REF_SCHEMA_KEY
-                )
-            })
-            .count();
-        derived.insert(
-            file_id.clone(),
-            DerivedPluginFileConflict {
-                plugin,
-                descriptor,
-                conflict_indices,
-                derived_blob_conflict_count,
-            },
-        );
+        )?;
+        let _ = path;
+        derived.insert(file_id.clone());
         derived_owners.insert(file_id, owner);
     }
     Ok(DerivedPluginConflictIndex {
@@ -799,132 +684,55 @@ fn pick_is_derived_plugin_state(
             .any(|schema_key| schema_key == pick.selected_row.schema_key())
 }
 
-/// One historical triple for a plugin-owned semantic row. The row identity
-/// remains host-owned; a Component can only choose or replace the aligned
-/// value and cannot invent a different key during a merge.
-#[derive(Debug, Clone)]
-struct PluginMergeConflictRow {
-    identity: TrackedStateDiffIdentity,
-    base: Option<PluginMergeConflictPayload>,
-    a: Option<PluginMergeConflictPayload>,
-    b: Option<PluginMergeConflictPayload>,
-}
-
-/// Payload-only conflict side. Identity lives once in the aligned batch row;
-/// immutable JSON retains the shared read buffers loaded from the JSON store.
 #[derive(Debug, Clone)]
 struct PluginMergeConflictPayload {
     snapshot: SharedStr,
     metadata: Option<SharedStr>,
 }
-
-#[derive(Debug, Clone, Default)]
-struct PluginMergeConflictBatch {
-    rows: Vec<PluginMergeConflictRow>,
+#[derive(Debug)]
+struct RowMergeInput {
+    identity: TrackedStateDiffIdentity,
+    base: Option<PluginMergeConflictPayload>,
+    a: Option<PluginMergeConflictPayload>,
+    b: Option<PluginMergeConflictPayload>,
+    merger: Option<PluginRegistryEntry>,
+    primary_key_columns: BTreeSet<String>,
 }
 
-impl PluginMergeConflictBatch {
-    fn push(&mut self, row: PluginMergeConflictRow) {
-        self.rows.push(row);
-    }
-
-    fn sort_by_identity(&mut self) {
-        self.rows
-            .sort_by(|left, right| left.identity.cmp(&right.identity));
-    }
-
-    fn iter(&self) -> std::slice::Iter<'_, PluginMergeConflictRow> {
-        self.rows.iter()
-    }
-
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PluginMergeConflictGroup {
+#[derive(Debug)]
+struct ColumnMergeGroup {
     plugin: PluginRegistryEntry,
-    descriptor: WasmFileDescriptor,
-    conflicts: PluginMergeConflictBatch,
+    merges: Vec<WasmHostColumnMerge>,
+    destinations: Vec<(usize, String)>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ResolvablePluginConflicts {
-    indices: Vec<usize>,
-}
-
-impl ResolvablePluginConflicts {
-    fn contains_index(&self, index: usize) -> bool {
-        self.indices.binary_search(&index).is_ok()
-    }
-
-    fn covers_all_with_derived_blobs(
-        &self,
-        conflict_count: usize,
-        derived: &DerivedPluginConflictIndex,
-    ) -> bool {
-        self.indices
-            .len()
-            .checked_add(derived.derived_blob_conflict_count())
-            == Some(conflict_count)
-    }
-}
-
-/// Returns exactly the semantic conflict identities that can be handed to a
-/// static resolver. This deliberately does not execute Wasm: callers use it
-/// both to make merge preview honest and to reject ordinary conflicts before
-/// allocating a Component Store.
-fn resolvable_plugin_conflict_keys(
+/// Resolves every same-row conflict through the universal row pipeline.
+/// Host-native column LWW is always present. A schema-owning component is
+/// called only for columns that both successors changed differently, and its
+/// output is applied back to that exact column before file-backed rows proceed
+/// through the ordinary projection staging path.
+async fn resolve_row_merge_conflicts<StorageImpl>(
+    transaction: &mut crate::transaction::Transaction<StorageImpl>,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &DerivedPluginConflictIndex,
-) -> ResolvablePluginConflicts {
-    let Some(merge_plan) = analysis.merge_plan() else {
-        return ResolvablePluginConflicts::default();
-    };
-    let mut eligible = ResolvablePluginConflicts::default();
-    for (file_id, context) in &derived_blob_files.files {
-        let owner = derived_blob_files
-            .owner(file_id)
-            .expect("derived plugin context has an owner");
-        for &index in &context.conflict_indices {
-            let conflict = &merge_plan.conflicts[index];
-            if !matches!(conflict.identity.schema_key(), BLOB_REF_SCHEMA_KEY)
-                && owner
-                    .schema_keys()
-                    .iter()
-                    .any(|schema_key| schema_key == conflict.identity.schema_key())
-            {
-                eligible.indices.push(index);
-            }
-        }
-    }
-    eligible.indices.sort_unstable();
-    eligible
-}
-
-async fn plugin_merge_conflict_groups<S>(
-    reader: &mut TrackedStateStoreReader<S>,
-    analysis: &super::analysis::MergeAnalysis,
-    derived_blob_files: &DerivedPluginConflictIndex,
-    resolvable_plugin_conflicts: &ResolvablePluginConflicts,
-) -> Result<Vec<PluginMergeConflictGroup>, LixError>
+    target_branch_id: &SharedStr,
+) -> Result<RawWriteBatch, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let merge_plan = analysis
         .merge_plan()
-        .expect("plugin conflict resolution requires a merge plan");
-    let semantic_conflicts = resolvable_plugin_conflicts
-        .indices
+        .expect("row reconciliation requires a merge plan");
+    let conflicts = merge_plan
+        .conflicts
         .iter()
-        .map(|&index| &merge_plan.conflicts[index])
+        .filter(|conflict| !is_derived_blob_conflict(conflict, derived_blob_files))
         .collect::<Vec<_>>();
-    if semantic_conflicts.is_empty() {
-        return Ok(Vec::new());
+    if conflicts.is_empty() {
+        return Ok(RawWriteBatch::new());
     }
 
-    let keys = semantic_conflicts
+    let keys = conflicts
         .iter()
         .map(|conflict| TrackedStateKey {
             schema_key: conflict.identity.schema_key().to_owned(),
@@ -932,103 +740,357 @@ where
             row_pk: conflict.identity.row_pk().clone(),
         })
         .collect::<Vec<_>>();
-    let base_rows = reader
-        .load_projected_batch_at_commit(
-            &analysis.commits.base_commit_id.to_string(),
-            &keys,
-            &ChangeRecordProjection::full(),
-        )
-        .await?;
-    let target_rows = reader
-        .load_projected_batch_at_commit(
-            &analysis.commits.target_commit_id.to_string(),
-            &keys,
-            &ChangeRecordProjection::full(),
-        )
-        .await?;
-    let source_rows = reader
-        .load_projected_batch_at_commit(
-            &analysis.commits.source_commit_id.to_string(),
-            &keys,
-            &ChangeRecordProjection::full(),
-        )
-        .await?;
-    let missing_base_keys = keys
+    let primary_keys_by_schema = conflicts
         .iter()
-        .enumerate()
-        .filter(|(index, _)| base_rows.row(*index).is_none())
-        .map(|(_, key)| key.clone())
-        .collect::<Vec<_>>();
-    let certified_base_rows = crate::hot_state::load_certified_rows_at_commit(
-        reader.store(),
-        &analysis.commits.base_commit_id.to_string(),
-        &missing_base_keys,
-    )
-    .await?;
+        .map(|conflict| conflict.identity.schema_key())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|schema_key| {
+            transaction
+                .merge_primary_key_columns(schema_key)
+                .map(|columns| (schema_key.to_owned(), columns))
+        })
+        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
 
-    let mut groups = BTreeMap::<String, PluginMergeConflictGroup>::new();
-    for (index, conflict) in semantic_conflicts.into_iter().enumerate() {
-        let base = base_rows.row(index);
-        let target = target_rows.row(index);
-        let source = source_rows.row(index);
-        let file_id = conflict
-            .identity
-            .file_id()
-            .expect("semantic plugin conflicts have a file id")
-            .to_owned();
-        let context = derived_blob_files
-            .context(&file_id)
-            .expect("semantic plugin conflicts have a derived owner");
-        let plugin = context.plugin.clone();
-        verify_historical_conflict_row_ref(base, conflict.target.before.as_ref(), "base")?;
-        verify_historical_conflict_row_ref(target, conflict.target.after.as_ref(), "target")?;
-        verify_historical_conflict_row_ref(source, conflict.source.after.as_ref(), "source")?;
+    // Historical reads finish before any Component is instantiated. All
+    // merge input below owns or shares immutable buffers.
+    let inputs = {
+        let mut reader = transaction.tracked_state_reader().await;
+        let base_rows = reader
+            .load_projected_batch_at_commit(
+                &analysis.commits.base_commit_id.to_string(),
+                &keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let target_rows = reader
+            .load_projected_batch_at_commit(
+                &analysis.commits.target_commit_id.to_string(),
+                &keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let source_rows = reader
+            .load_projected_batch_at_commit(
+                &analysis.commits.source_commit_id.to_string(),
+                &keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let missing_base_keys = keys
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| base_rows.row(*index).is_none())
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        let certified_base_rows = crate::hot_state::load_certified_rows_at_commit(
+            reader.store(),
+            &analysis.commits.base_commit_id.to_string(),
+            &missing_base_keys,
+        )
+        .await?;
+        let base_registry = load_plugin_registry_at_commit(
+            &mut reader,
+            &analysis.commits.base_commit_id.to_string(),
+        )
+        .await?;
+        let target_registry = load_plugin_registry_at_commit(
+            &mut reader,
+            &analysis.commits.target_commit_id.to_string(),
+        )
+        .await?;
+        let source_registry = load_plugin_registry_at_commit(
+            &mut reader,
+            &analysis.commits.source_commit_id.to_string(),
+        )
+        .await?;
 
-        let (a, b) = canonical_conflict_variants_ref(conflict, target, source)?;
-        let base = historical_live_payload_ref(base)?.or_else(|| {
-            certified_base_rows
-                .get(&keys[index])
-                .and_then(certified_live_payload)
-        });
-        let row = PluginMergeConflictRow {
-            identity: conflict.identity.clone(),
-            base,
-            a: historical_live_payload_ref(a)?,
-            b: historical_live_payload_ref(b)?,
+        let mut inputs = Vec::with_capacity(conflicts.len());
+        for (index, conflict) in conflicts.iter().enumerate() {
+            let base = base_rows.row(index);
+            let target = target_rows.row(index);
+            let source = source_rows.row(index);
+            verify_historical_conflict_row_ref(base, conflict.target.before.as_ref(), "base")?;
+            verify_historical_conflict_row_ref(target, conflict.target.after.as_ref(), "target")?;
+            verify_historical_conflict_row_ref(source, conflict.source.after.as_ref(), "source")?;
+            let (a, b) = canonical_conflict_variants_ref(conflict, target, source)?;
+            let base = historical_live_payload_ref(base)?.or_else(|| {
+                certified_base_rows
+                    .get(&keys[index])
+                    .and_then(certified_live_payload)
+            });
+            inputs.push(RowMergeInput {
+                identity: conflict.identity.clone(),
+                base,
+                a: historical_live_payload_ref(a)?,
+                b: historical_live_payload_ref(b)?,
+                merger: common_column_merger_for_schema(
+                    conflict.identity.schema_key(),
+                    &base_registry,
+                    &target_registry,
+                    &source_registry,
+                )?,
+                primary_key_columns: primary_keys_by_schema
+                    .get(conflict.identity.schema_key())
+                    .cloned()
+                    .expect("schema primary keys were resolved above"),
+            });
+        }
+        inputs
+    };
+
+    let decoded = inputs
+        .iter()
+        .map(|input| {
+            Ok((
+                DecodedMergePayload::parse(input.base.as_ref())?,
+                DecodedMergePayload::parse(input.a.as_ref())?,
+                DecodedMergePayload::parse(input.b.as_ref())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let mut groups = BTreeMap::<(String, String), ColumnMergeGroup>::new();
+    for (row_index, (input, (base, a, b))) in inputs.iter().zip(&decoded).enumerate() {
+        let Some(plugin) = input.merger.as_ref() else {
+            continue;
         };
-        let descriptor = context.descriptor.clone();
-        match groups.get_mut(&file_id) {
-            Some(group) => {
-                if group.plugin != plugin || group.descriptor != descriptor {
-                    return Err(LixError::new(
+        let (Some(base), Some(a), Some(b)) = (base.as_ref(), a.as_ref(), b.as_ref()) else {
+            continue;
+        };
+        let base_row = json_bytes(&base.snapshot)?;
+        let a_row = json_bytes(&a.snapshot)?;
+        let b_row = json_bytes(&b.snapshot)?;
+        let group = groups
+            .entry((
+                plugin.key().to_owned(),
+                plugin.archive_blob_hash().to_owned(),
+            ))
+            .or_insert_with(|| ColumnMergeGroup {
+                plugin: plugin.clone(),
+                merges: Vec::new(),
+                destinations: Vec::new(),
+            });
+        reconcile_row(
+            Some(base.borrowed()),
+            Some(a.borrowed()),
+            Some(b.borrowed()),
+            &input.primary_key_columns,
+            |overlap| {
+                let ordinal = u32::try_from(group.merges.len()).map_err(|_| {
+                    LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
-                        format!(
-                            "plugin-owned file '{file_id}' has inconsistent historical resolver generations"
-                        ),
-                    ));
+                        "column merge batch exceeds the u32 ordinal limit",
+                    )
+                })?;
+                group.merges.push(WasmHostColumnMerge {
+                    ordinal,
+                    key: WasmRowKey::from_owned_parts(
+                        input.identity.schema_key().to_owned(),
+                        input.identity.row_pk().clone().into_parts(),
+                    ),
+                    file_id: input.identity.file_id().map(str::to_owned),
+                    column: overlap.column.to_owned(),
+                    base: optional_json_bytes(overlap.base)?,
+                    a: optional_json_bytes(overlap.a)?,
+                    b: optional_json_bytes(overlap.b)?,
+                    base_row: base_row.clone(),
+                    a_row: a_row.clone(),
+                    b_row: b_row.clone(),
+                });
+                group
+                    .destinations
+                    .push((row_index, overlap.column.to_owned()));
+                Ok(Some(HostColumnMergeResult::UseLww))
+            },
+        )?;
+    }
+
+    let mut replacements = BTreeMap::<(usize, String), HostColumnMergeResult>::new();
+    for (_, group) in groups {
+        let resolved = transaction
+            .merge_plugin_columns(&group.plugin, group.merges)
+            .await?;
+        if resolved.results.len() != group.destinations.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "validated column merge output lost input alignment",
+            ));
+        }
+        for (destination, result) in group.destinations.into_iter().zip(resolved.results) {
+            let result = match result {
+                WasmColumnMergeResult::UseLww => HostColumnMergeResult::UseLww,
+                WasmColumnMergeResult::Replace(value) => {
+                    HostColumnMergeResult::Replace(value.map(host_bytes_json).transpose()?)
                 }
-                group.conflicts.push(row);
-            }
-            None => {
-                groups.insert(
-                    file_id,
-                    PluginMergeConflictGroup {
-                        plugin,
-                        descriptor,
-                        conflicts: PluginMergeConflictBatch { rows: vec![row] },
-                    },
-                );
-            }
+            };
+            replacements.insert(destination, result);
         }
     }
-    let mut groups = groups.into_values().collect::<Vec<_>>();
-    // Merge-plan order is currently key-stable, but make the packet invariant
-    // host-owned rather than coupling an untrusted resolver input to that
-    // implementation detail.
-    for group in &mut groups {
-        group.conflicts.sort_by_identity();
+
+    let mut rows = RawWriteBatch::with_capacity(inputs.len());
+    for (row_index, (input, (base, a, b))) in inputs.iter().zip(&decoded).enumerate() {
+        let resolved = reconcile_row(
+            base.as_ref().map(DecodedMergePayload::borrowed),
+            a.as_ref().map(DecodedMergePayload::borrowed),
+            b.as_ref().map(DecodedMergePayload::borrowed),
+            &input.primary_key_columns,
+            |overlap| Ok(replacements.remove(&(row_index, overlap.column.to_owned()))),
+        )?;
+        push_reconciled_transaction_row(&mut rows, input, resolved, target_branch_id)?;
     }
-    Ok(groups)
+    Ok(rows)
+}
+
+fn common_column_merger_for_schema(
+    schema_key: &str,
+    base: &PluginRegistry,
+    target: &PluginRegistry,
+    source: &PluginRegistry,
+) -> Result<Option<PluginRegistryEntry>, LixError> {
+    fn merger<'a>(
+        schema_key: &str,
+        registry: &'a PluginRegistry,
+    ) -> Option<&'a PluginRegistryEntry> {
+        registry.plugins().iter().find(|plugin| {
+            plugin.has_column_merger()
+                && plugin
+                    .schema_keys()
+                    .binary_search_by(|key| key.as_str().cmp(schema_key))
+                    .is_ok()
+        })
+    }
+    match (
+        merger(schema_key, base),
+        merger(schema_key, target),
+        merger(schema_key, source),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(base), Some(target), Some(source)) if base == target && target == source => {
+            Ok(Some(target.clone()))
+        }
+        _ => Err(LixError::new(
+            LixError::CODE_MERGE_CONFLICT,
+            format!("column merger generation for schema '{schema_key}' differs across the merge"),
+        )
+        .with_hint("merge the plugin generation change before merging semantic row edits")),
+    }
+}
+
+fn json_bytes(value: &JsonValue) -> Result<WasmHostBytes, LixError> {
+    serde_json::to_vec(value)
+        .map(|bytes| WasmHostBytes::Inline(Bytes::from(bytes)))
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to encode column merge JSON: {error}"),
+            )
+        })
+}
+
+fn optional_json_bytes(value: Option<&JsonValue>) -> Result<Option<WasmHostBytes>, LixError> {
+    value.map(json_bytes).transpose()
+}
+
+fn host_bytes_json(value: WasmHostBytes) -> Result<JsonValue, LixError> {
+    let bytes = match value {
+        WasmHostBytes::Inline(bytes) => bytes.to_vec(),
+        WasmHostBytes::CanonicalJson(json) => json.normalized().as_bytes().to_vec(),
+        WasmHostBytes::Source(slice) => slice.source.read(
+            slice.range.offset,
+            u32::try_from(slice.range.length).map_err(|_| {
+                LixError::new(LixError::CODE_INVALID_PLUGIN, "column value exceeds u32")
+            })?,
+        )?,
+    };
+    serde_json::from_slice(&bytes).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("column merger returned invalid JSON: {error}"),
+        )
+    })
+}
+
+fn push_reconciled_transaction_row(
+    rows: &mut RawWriteBatch,
+    input: &RowMergeInput,
+    resolved: Option<crate::plugin::runtime::ReconciledRow>,
+    target_branch_id: &SharedStr,
+) -> Result<(), LixError> {
+    match resolved {
+        Some(resolved) => {
+            let snapshot = serde_json::to_string(&resolved.snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("failed to encode reconciled row snapshot: {error}"),
+                )
+            })?;
+            let metadata = resolved
+                .metadata
+                .map(|metadata| serde_json::to_string(&metadata))
+                .transpose()
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("failed to encode reconciled row metadata: {error}"),
+                    )
+                })?;
+            push_plugin_transaction_row(
+                rows,
+                &input.identity,
+                Some(TransactionJson::from_unvalidated_shared_normalized_content(
+                    SharedStr::from(snapshot),
+                )),
+                metadata.map(|metadata| {
+                    TransactionJson::from_unvalidated_shared_normalized_content(SharedStr::from(
+                        metadata,
+                    ))
+                }),
+                target_branch_id,
+            );
+        }
+        None => push_plugin_transaction_row(rows, &input.identity, None, None, target_branch_id),
+    }
+    Ok(())
+}
+
+struct DecodedMergePayload {
+    snapshot: JsonValue,
+    metadata: Option<JsonValue>,
+}
+
+impl DecodedMergePayload {
+    fn parse(payload: Option<&PluginMergeConflictPayload>) -> Result<Option<Self>, LixError> {
+        payload
+            .map(|payload| {
+                let snapshot =
+                    serde_json::from_str(payload.snapshot.as_str()).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!("row merge snapshot is invalid JSON: {error}"),
+                        )
+                    })?;
+                let metadata = payload
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| serde_json::from_str(metadata.as_str()))
+                    .transpose()
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!("row merge metadata is invalid JSON: {error}"),
+                        )
+                    })?;
+                Ok(Self { snapshot, metadata })
+            })
+            .transpose()
+    }
+
+    fn borrowed(&self) -> RowVersionRef<'_> {
+        RowVersionRef {
+            snapshot: &self.snapshot,
+            metadata: self.metadata.as_ref(),
+        }
+    }
 }
 
 fn certified_live_payload(
@@ -1303,7 +1365,7 @@ fn pinned_conflict_plugin_entry(
     if target_entry != base_entry || target_entry != source_entry {
         return Err(LixError::new(
             LixError::CODE_MERGE_CONFLICT,
-            format!("plugin-owned file '{file_id}' changed resolver generation across the merge"),
+            format!("plugin-owned file '{file_id}' changed plugin generation across the merge"),
         )
         .with_hint(
             "merge the plugin generation change before merging semantic edits for this file",
@@ -1397,199 +1459,6 @@ fn canonical_conflict_variants_ref<'a>(
     }
 }
 
-fn conflict_host_snapshot(
-    payload: Option<&PluginMergeConflictPayload>,
-) -> Result<Option<WasmHostBytes>, LixError> {
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-    let snapshot = &payload.snapshot;
-    let length = u64::try_from(snapshot.len()).map_err(|_| {
-        LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            "plugin semantic snapshot length exceeds Wasm source bounds",
-        )
-    })?;
-    // Keep the JSON-store buffer alive behind the source. The common `take(b)`
-    // path moves neither the semantic bytes nor a materialized tracked row.
-    let source = Arc::new(TrackedRowSnapshotSource {
-        snapshot: snapshot.clone(),
-    });
-    Ok(Some(WasmHostBytes::Source(WasmSourceSlice {
-        source,
-        range: WasmSourceRange { offset: 0, length },
-    })))
-}
-
-#[derive(Debug)]
-struct TrackedRowSnapshotSource {
-    snapshot: SharedStr,
-}
-
-impl WasmByteSource for TrackedRowSnapshotSource {
-    fn len(&self) -> u64 {
-        self.snapshot.len() as u64
-    }
-
-    fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
-        if length == 0 {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "v2 byte-source reads must request bytes",
-            ));
-        }
-        let snapshot = self.snapshot.as_str();
-        let start = usize::try_from(offset).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "v2 byte-source offset does not fit this host",
-            )
-        })?;
-        let end = start.checked_add(length as usize).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "v2 byte-source range overflowed",
-            )
-        })?;
-        let bytes = snapshot.as_bytes();
-        if end > bytes.len() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "v2 byte-source range exceeds its snapshot",
-            ));
-        }
-        Ok(bytes[start..end].to_vec())
-    }
-}
-
-async fn resolve_plugin_merge_conflict_groups<StorageImpl>(
-    transaction: &mut crate::transaction::Transaction<StorageImpl>,
-    groups: Vec<PluginMergeConflictGroup>,
-    target_branch_id: &SharedStr,
-) -> Result<RawWriteBatch, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let row_count = groups.iter().try_fold(0usize, |row_count, group| {
-        row_count.checked_add(group.conflicts.len()).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "plugin conflict output row count overflowed this host",
-            )
-        })
-    })?;
-    let mut rows = RawWriteBatch::with_capacity(row_count);
-    for group in groups {
-        let conflicts = group
-            .conflicts
-            .iter()
-            .enumerate()
-            .map(|(ordinal, conflict)| {
-                Ok(WasmRowConflict {
-                    ordinal: u32::try_from(ordinal).map_err(|_| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            "plugin conflict batch exceeds the u32 ordinal limit",
-                        )
-                    })?,
-                    key: WasmRowKey::from_owned_parts(
-                        conflict.identity.schema_key().to_owned(),
-                        conflict.identity.row_pk().clone().into_parts(),
-                    ),
-                    base: conflict_host_snapshot(conflict.base.as_ref())?,
-                    a: conflict_host_snapshot(conflict.a.as_ref())?,
-                    b: conflict_host_snapshot(conflict.b.as_ref())?,
-                })
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        let resolved = transaction
-            .resolve_plugin_conflicts(&group.plugin, group.descriptor, conflicts)
-            .await?;
-        if resolved.resolutions.len() != group.conflicts.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "validated plugin conflict output lost input alignment",
-            ));
-        }
-        for (conflict, resolution) in group.conflicts.iter().zip(resolved.resolutions) {
-            push_transaction_row_from_conflict_resolution(
-                &mut rows,
-                conflict,
-                resolution,
-                target_branch_id,
-            )?;
-        }
-    }
-    Ok(rows)
-}
-
-fn push_transaction_row_from_conflict_resolution(
-    rows: &mut RawWriteBatch,
-    conflict: &PluginMergeConflictRow,
-    resolution: WasmConflictResolution<WasmHostBytes>,
-    target_branch_id: &SharedStr,
-) -> Result<(), LixError> {
-    match resolution {
-        WasmConflictResolution::Take(side) => {
-            let (side_name, selected) = match side {
-                WasmConflictTake::Base => ("base", &conflict.base),
-                WasmConflictTake::A => ("a", &conflict.a),
-                WasmConflictTake::B => ("b", &conflict.b),
-            };
-            let row = selected.as_ref().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!(
-                        "plugin conflict resolver selected absent {side_name} snapshot; use delete for a tombstone"
-                    ),
-                )
-            })?;
-            push_transaction_row_from_conflict_payload(
-                rows,
-                &conflict.identity,
-                row,
-                target_branch_id,
-            );
-            Ok(())
-        }
-        WasmConflictResolution::Delete => {
-            push_plugin_transaction_row(rows, &conflict.identity, None, None, target_branch_id);
-            Ok(())
-        }
-        WasmConflictResolution::Replace {
-            snapshot_content,
-            effect,
-        } => {
-            let WasmHostBytes::CanonicalJson(snapshot) = snapshot_content else {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    "validated conflict replacement is not canonical JSON",
-                ));
-            };
-            // A replacement's effect is part of the v2 durable semantic
-            // contract. Do not inherit the selected B row's metadata: that
-            // could retain a stale format-only marker after a content merge,
-            // or silently turn a declared format-only resolution into content.
-            let metadata = match effect {
-                WasmChangeEffect::Content => None,
-                WasmChangeEffect::FormatOnly => {
-                    Some(TransactionJson::from_unvalidated_shared_normalized_content(
-                        SharedStr::from_static(r#"{"impact":"format"}"#),
-                    ))
-                }
-            };
-            push_plugin_transaction_row(
-                rows,
-                &conflict.identity,
-                Some(TransactionJson::from_canonical_batch(snapshot)),
-                metadata,
-                target_branch_id,
-            );
-            Ok(())
-        }
-    }
-}
-
 fn push_plugin_transaction_row(
     rows: &mut RawWriteBatch,
     identity: &TrackedStateDiffIdentity,
@@ -1611,26 +1480,6 @@ fn push_plugin_transaction_row(
         None,
         false,
         target_branch_id.clone(),
-    );
-}
-
-fn push_transaction_row_from_conflict_payload(
-    rows: &mut RawWriteBatch,
-    identity: &TrackedStateDiffIdentity,
-    payload: &PluginMergeConflictPayload,
-    target_branch_id: &SharedStr,
-) {
-    push_plugin_transaction_row(
-        rows,
-        identity,
-        Some(TransactionJson::from_unvalidated_shared_normalized_content(
-            payload.snapshot.clone(),
-        )),
-        payload
-            .metadata
-            .clone()
-            .map(TransactionJson::from_unvalidated_shared_normalized_content),
-        target_branch_id,
     );
 }
 
@@ -1837,27 +1686,21 @@ fn preview_from_analysis(
     source_branch_id: &str,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &DerivedPluginConflictIndex,
-    resolvable_plugin_conflicts: &ResolvablePluginConflicts,
     plugin_resolution_stats: &MergeChangeStats,
 ) -> Result<MergeBranchPreview, LixError> {
     let conflicts = match analysis.merge_plan() {
-        Some(plan)
-            if resolvable_plugin_conflicts
-                .covers_all_with_derived_blobs(plan.conflicts.len(), derived_blob_files) =>
-        {
-            Vec::new()
-        }
+        // Every same-row conflict has a deterministic host LWW result. An
+        // optional merger improves overlapping columns but is not required
+        // for the preview to be mergeable.
+        Some(_) => Vec::new(),
         _ => analysis
             .conflict_batch()
             .map(|batch| {
                 batch
                     .iter()
-                    .enumerate()
-                    .filter(|(index, conflict)| {
+                    .filter(|conflict| {
                         !is_derived_blob_conflict(conflict.tracked(), derived_blob_files)
-                            && !resolvable_plugin_conflicts.contains_index(*index)
                     })
-                    .map(|(_, conflict)| conflict)
                     .map(merge_conflict_from_analysis)
                     .collect::<Result<Vec<_>, LixError>>()
             })
@@ -1935,51 +1778,10 @@ fn merge_conflict_side_from_analysis(side: AnalysisMergeConflictSide<'_>) -> Mer
     }
 }
 
-#[expect(clippy::unnecessary_wraps)]
-fn merge_conflict_error(conflicts: &[MergeConflict]) -> Result<LixError, LixError> {
-    let conflict_count = conflicts.len();
-    Ok(LixError::new(
-        LixError::CODE_MERGE_CONFLICT,
-        format!("merge_branch found {conflict_count} tracked-state conflict(s)"),
-    )
-    .with_hint("Resolve the conflicting rows in the target branch, then retry the merge.")
-    .with_details(json!({
-        "conflicts": conflicts.iter()
-            .map(merge_conflict_details)
-            .collect::<Vec<_>>(),
-    })))
-}
-
-fn merge_conflict_details(conflict: &MergeConflict) -> serde_json::Value {
-    json!({
-        "kind": match conflict.kind {
-            MergeConflictKind::SameRowChanged => "sameRowChanged",
-        },
-        "schemaKey": conflict.schema_key,
-        "rowPk": conflict.row_pk,
-        "fileId": conflict.file_id,
-        "target": merge_conflict_side_details(&conflict.target),
-        "source": merge_conflict_side_details(&conflict.source),
-    })
-}
-
-fn merge_conflict_side_details(side: &MergeConflictSide) -> serde_json::Value {
-    json!({
-        "kind": match side.kind {
-            MergeConflictChangeKind::Added => "added",
-            MergeConflictChangeKind::Modified => "modified",
-            MergeConflictChangeKind::Removed => "removed",
-        },
-        "beforeChangeId": side.before_change_id,
-        "afterChangeId": side.after_change_id,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKeyRef};
 
     fn descriptor_row(
         file_id: &str,
@@ -2164,189 +1966,6 @@ mod tests {
             )
             .is_none()
         );
-    }
-
-    #[test]
-    fn resolver_take_requires_a_present_snapshot() {
-        let conflict = PluginMergeConflictRow {
-            identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
-                schema_key: "csv_row".to_owned(),
-                file_id: Some("01920000-0000-7000-8000-0000000000a2".to_owned()),
-                row_pk: RowPk::single("row-a"),
-            }),
-            base: None,
-            a: None,
-            b: None,
-        };
-        let target_branch_id = SharedStr::from_static("main");
-        let mut rows = RawWriteBatch::with_capacity(1);
-        let error = push_transaction_row_from_conflict_resolution(
-            &mut rows,
-            &conflict,
-            WasmConflictResolution::Take(WasmConflictTake::A),
-            &target_branch_id,
-        )
-        .expect_err("take(a) cannot silently turn an absent snapshot into deletion");
-        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-        assert!(error.message.contains("absent a snapshot"));
-        assert!(rows.is_empty());
-
-        push_transaction_row_from_conflict_resolution(
-            &mut rows,
-            &conflict,
-            WasmConflictResolution::Delete,
-            &target_branch_id,
-        )
-        .expect("explicit delete remains the only tombstone operation");
-        let deleted = rows.row(0);
-        assert!(deleted.snapshot.is_none());
-    }
-
-    #[test]
-    fn resolver_replace_reuses_validated_canonical_batch_row() {
-        let conflict = PluginMergeConflictRow {
-            identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
-                schema_key: "csv_row".to_owned(),
-                file_id: Some("01920000-0000-7000-8000-0000000000a2".to_owned()),
-                row_pk: RowPk::single("row-a"),
-            }),
-            base: None,
-            a: None,
-            b: None,
-        };
-        let normalized = br#"{"id":"row-a"}"#;
-        let canonical = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
-            vec![json!({"id": "row-a"})],
-            normalized.to_vec(),
-            vec![(0, normalized.len() as u32)],
-            1,
-            1,
-        )
-        .expect("test canonical batch is valid")
-        .pop()
-        .expect("test canonical batch has one row");
-        let expected_owner = canonical.clone();
-
-        let mut rows = RawWriteBatch::with_capacity(1);
-        push_transaction_row_from_conflict_resolution(
-            &mut rows,
-            &conflict,
-            WasmConflictResolution::Replace {
-                snapshot_content: WasmHostBytes::CanonicalJson(canonical),
-                effect: WasmChangeEffect::Content,
-            },
-            &SharedStr::from_static("main"),
-        )
-        .expect("validated replacement should become a transaction row");
-        let snapshot = rows.row(0).snapshot.expect("replacement stays live");
-        let actual_owner = snapshot
-            .canonical_batch_row()
-            .expect("replacement must retain its canonical batch row");
-        assert!(expected_owner.shares_batch_with(actual_owner));
-        assert_eq!(snapshot.normalized(), r#"{"id":"row-a"}"#);
-        assert_eq!(actual_owner.validation_counts(), (1, 1));
-        assert!(rows.row(0).metadata.is_none());
-
-        push_transaction_row_from_conflict_resolution(
-            &mut rows,
-            &conflict,
-            WasmConflictResolution::Replace {
-                snapshot_content: WasmHostBytes::CanonicalJson(expected_owner.clone()),
-                effect: WasmChangeEffect::FormatOnly,
-            },
-            &SharedStr::from_static("main"),
-        )
-        .expect("format-only replacement should become a transaction row");
-        assert_eq!(
-            rows.row(1)
-                .metadata
-                .expect("format-only effect metadata")
-                .normalized(),
-            r#"{"impact":"format"}"#
-        );
-    }
-
-    #[test]
-    fn ten_thousand_conflict_takes_lower_into_one_shared_raw_batch() {
-        const ROW_COUNT: usize = 10_000;
-        let row_pks = (0..ROW_COUNT)
-            .map(|index| RowPk::single(format!("row-{index:05}")))
-            .collect::<Vec<_>>();
-        let identities =
-            TrackedStateDiffIdentity::from_key_refs(row_pks.len(), |index| TrackedStateKeyRef {
-                schema_key: "csv_row",
-                file_id: Some("01920000-0000-7000-8000-0000000000a2"),
-                row_pk: &row_pks[index],
-            })
-            .expect("shared conflict identity batch should seal");
-        let payload = PluginMergeConflictPayload {
-            snapshot: SharedStr::from_static(r#"{"value":"shared"}"#),
-            metadata: Some(SharedStr::from_static(r#"{"impact":"format"}"#)),
-        };
-        let target_branch_id = SharedStr::from_static("main");
-        let mut rows = RawWriteBatch::with_capacity(ROW_COUNT);
-        let owner_pointers = rows.aligned_owner_allocation_ptrs();
-        let owner_capacities = rows.aligned_owner_capacities();
-
-        for identity in identities {
-            let conflict = PluginMergeConflictRow {
-                identity,
-                base: None,
-                a: Some(payload.clone()),
-                b: None,
-            };
-            push_transaction_row_from_conflict_resolution(
-                &mut rows,
-                &conflict,
-                WasmConflictResolution::Take(WasmConflictTake::A),
-                &target_branch_id,
-            )
-            .expect("conflict take should lower");
-        }
-
-        assert_eq!(rows.len(), ROW_COUNT);
-        assert_eq!(rows.aligned_owner_allocation_ptrs(), owner_pointers);
-        assert_eq!(rows.aligned_owner_capacities(), owner_capacities);
-        assert_eq!(
-            rows.shared_string_count(),
-            3,
-            "schema, file, and branch metadata must be stored once"
-        );
-        assert!(
-            !rows.string_dictionary_is_promoted(),
-            "three shared values must stay in the inline dictionary"
-        );
-        let first = rows.row(0);
-        let last = rows.row(ROW_COUNT - 1);
-        assert!(first.schema_key.shares_buffer_with(last.schema_key));
-        assert!(
-            first
-                .file_id
-                .expect("first file id")
-                .shares_buffer_with(last.file_id.expect("last file id"))
-        );
-        assert!(first.branch_id.shares_buffer_with(last.branch_id));
-        assert_eq!(
-            first
-                .row_pk
-                .expect("first identity")
-                .as_single_string()
-                .expect("single first identity"),
-            "row-00000"
-        );
-        assert_eq!(
-            last.row_pk
-                .expect("last identity")
-                .as_single_string()
-                .expect("single last identity"),
-            "row-09999"
-        );
-        let first_snapshot = first.snapshot.expect("first snapshot").normalized();
-        let last_snapshot = last.snapshot.expect("last snapshot").normalized();
-        assert_eq!(first_snapshot.as_ptr(), last_snapshot.as_ptr());
-        let first_metadata = first.metadata.expect("first metadata").normalized();
-        let last_metadata = last.metadata.expect("last metadata").normalized();
-        assert_eq!(first_metadata.as_ptr(), last_metadata.as_ptr());
     }
 
     #[test]

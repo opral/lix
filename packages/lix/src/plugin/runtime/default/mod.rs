@@ -398,8 +398,9 @@ impl WasmRuntime for WasmtimePluginRuntime {
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
+        capabilities: lix::plugin::runtime::PluginCapabilities,
     ) -> Result<Arc<dyn lix::plugin::runtime::WasmComponentFactory>, LixError> {
-        component_runtime::compile_component(self, bytes, limits).await
+        component_runtime::compile_component(self, bytes, limits, capabilities).await
     }
 }
 

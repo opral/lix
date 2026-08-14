@@ -90,6 +90,7 @@ zip = { version = "8", default-features = false }
 # unconditional; they cost build time on a bench-only invocation but cannot
 # change what a bench measures, since nothing loads them without `sdk-tests`.
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_conversation = { path = "../../plugins/conversation", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
@@ -466,6 +467,16 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 name = "plugin_document_scale"
 path = "tests/plugin_document_scale.rs"
 required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "plugin_api_benchmarks"
+path = "tests/plugin_api_benchmarks.rs"
+required-features = ["sdk-tests"]
+
+[[test]]
+name = "plugin_row_only_merge"
+path = "tests/plugin_row_only_merge.rs"
+required-features = ["sdk-tests"]
 
 [[test]]
 name = "realtime_collaboration_capacity"

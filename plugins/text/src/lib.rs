@@ -20,14 +20,48 @@ const LINE_IDENTITIES_STATE: &[u8] = b"text/line-identities";
 const LINE_IDENTITIES_MAGIC: &[u8; 4] = b"LTX1";
 const STATE_PAGE_BYTES: usize = 1024 * 1024;
 
-impl sdk::Plugin for TextPlugin {
-    fn cold_file_changed(
-        update: &mut sdk::ColdUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
+impl sdk::FileProjection for TextPlugin {
+    fn parse(input: sdk::ParseInput<'_>, output: &mut sdk::RowOutput<'_, '_>) -> sdk::Result<()> {
+        let namespace = input.creates;
+        let (document, changes) = Document::open_file(input.file.read_all()?, |ordinal| {
+            namespace.id(local_ref(ordinal))
+        })
+        .map_err(sdk::Error::invalid_input)?;
+        output.put_state(ID_NAMESPACE_STATE, &namespace.namespace_bytes())?;
+        store_identities(output, &document)?;
+        emit_changes(changes, namespace, output)
+    }
+
+    fn parse_changes(
+        mut update: sdk::ParseChangesInput<'_>,
+        output: &mut sdk::RowChangeOutput<'_, '_>,
     ) -> sdk::Result<()> {
+        if update.before.state_len(LINE_IDENTITIES_STATE)?.is_some() {
+            let before = read_document(&update.before)?;
+            let splices = update
+                .file_edits
+                .iter()
+                .map(|edit| FileEdit {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert: edit.insert.clone(),
+                })
+                .collect::<Vec<_>>();
+            let creates = update.creates;
+            let (after, changes) = before
+                .file_changed(&splices, |ordinal| creates.id(local_ref(ordinal)))
+                .map_err(sdk::Error::invalid_input)?;
+            replace_identities(&update.before, output, &after)?;
+            return emit_changes(changes.into_iter().map(Ok), creates, output);
+        }
+
         let accepted = update.before.read_all()?;
         let mut records = Vec::new();
-        while let Some(row) = update.rows.next()? {
+        let rows = update
+            .rows
+            .as_mut()
+            .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+        while let Some(row) = rows.next()? {
             records.push(Ok(RowRecord {
                 schema_key: row.schema_key,
                 row_pk: row.row_pk,
@@ -49,7 +83,7 @@ impl sdk::Plugin for TextPlugin {
                 .0;
         }
         let splices = update
-            .edits
+            .file_edits
             .iter()
             .map(|edit| FileEdit {
                 offset: edit.offset,
@@ -60,49 +94,18 @@ impl sdk::Plugin for TextPlugin {
         let (successor, changes) = document
             .file_changed(&splices, |ordinal| creates.id(local_ref(ordinal)))
             .map_err(sdk::Error::invalid_input)?;
-        sink.put_state(ID_NAMESPACE_STATE, &creates.namespace_bytes())?;
-        store_identities_in_transaction(sink, &successor)?;
-        emit_changes(changes.into_iter().map(Ok), creates, sink)
+        output.put_state(ID_NAMESPACE_STATE, &creates.namespace_bytes())?;
+        store_identities(output, &successor)?;
+        emit_changes(changes.into_iter().map(Ok), creates, output)
     }
 
-    fn open(input: &sdk::OpenFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
-        let namespace = input.creates;
-        let (document, changes) = Document::open_file(input.accepted.read_all()?, |ordinal| {
-            namespace.id(local_ref(ordinal))
-        })
-        .map_err(sdk::Error::invalid_input)?;
-        sink.put_state(ID_NAMESPACE_STATE, &namespace.namespace_bytes())?;
-        store_identities_in_transaction(sink, &document)?;
-        emit_changes(changes, namespace, sink)?;
-        Ok(())
-    }
-
-    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
-        let before = read_document(&update.before)?;
-        let splices = update
-            .edits
-            .iter()
-            .map(|edit| FileEdit {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert: edit.insert.clone(),
-            })
-            .collect::<Vec<_>>();
-        let creates = update.creates;
-        let (after, changes) = before
-            .file_changed(&splices, |ordinal| creates.id(local_ref(ordinal)))
-            .map_err(sdk::Error::invalid_input)?;
-        replace_identities_in_transaction(&update.before, sink, &after)?;
-        emit_changes(changes.into_iter().map(Ok), creates, sink)
-    }
-
-    fn rows_changed(
-        update: &mut sdk::RowUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
+    fn serialize_changes(
+        mut update: sdk::SerializeChangesInput<'_>,
+        output: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let before = read_document(&update.before)?;
         let mut changes = Vec::new();
-        while let Some(change) = update.changes.next()? {
+        while let Some(change) = update.row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
                 row_pk: change.row_pk,
@@ -113,14 +116,19 @@ impl sdk::Plugin for TextPlugin {
                 },
             });
         }
-        let (after, _edits) = before
+        let (after, edits) = before
             .rows_changed(changes)
             .map_err(sdk::Error::invalid_input)?;
-        sink.replace_file(after.bytes())?;
-        replace_identities_from_sink(&update.before, sink, &after)
+        for edit in edits {
+            output.replace(edit.offset, edit.delete_len, &edit.insert)?;
+        }
+        replace_identities(&update.before, output, &after)
     }
 
-    fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn serialize(
+        mut input: sdk::SerializeInput<'_>,
+        output: &mut sdk::FileOutput<'_, '_>,
+    ) -> sdk::Result<()> {
         let mut records = Vec::new();
         while let Some(row) = input.rows.next()? {
             records.push(Ok(RowRecord {
@@ -130,11 +138,8 @@ impl sdk::Plugin for TextPlugin {
             }));
         }
         let document = Document::open_rows_fallible(records).map_err(sdk::Error::invalid_input)?;
-        store_identities_in_transaction(sink, &document)?;
-        if input.accepted.is_none() {
-            sink.replace_file(document.bytes())?;
-        }
-        Ok(())
+        store_identities(output, &document)?;
+        output.write(document.bytes())
     }
 }
 
@@ -154,10 +159,7 @@ fn read_document(root: &sdk::Snapshot<'_>) -> sdk::Result<Document> {
         .map_err(sdk::Error::invalid_input)
 }
 
-fn store_identities_in_transaction(
-    successor: &sdk::Output<'_>,
-    document: &Document,
-) -> sdk::Result<()> {
+fn store_identities(successor: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
     let (manifest, pages) = encode_identities(&document.identities())?;
     successor.put_state(LINE_IDENTITIES_STATE, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
@@ -166,9 +168,9 @@ fn store_identities_in_transaction(
     Ok(())
 }
 
-fn replace_identities_in_transaction(
+fn replace_identities(
     before: &sdk::Snapshot<'_>,
-    successor: &sdk::Output<'_>,
+    successor: &mut impl StateOutput,
     document: &Document,
 ) -> sdk::Result<()> {
     let old_page_count = identity_page_count(before)?;
@@ -179,23 +181,6 @@ fn replace_identities_in_transaction(
     }
     for ordinal in pages.len() as u32..old_page_count {
         successor.delete_state(&line_identity_page_key(ordinal))?;
-    }
-    Ok(())
-}
-
-fn replace_identities_from_sink(
-    before: &sdk::Snapshot<'_>,
-    sink: &mut sdk::Output<'_>,
-    document: &Document,
-) -> sdk::Result<()> {
-    let old_page_count = identity_page_count(before)?;
-    let (manifest, pages) = encode_identities(&document.identities())?;
-    sink.put_state(LINE_IDENTITIES_STATE, &manifest)?;
-    for (ordinal, page) in pages.iter().enumerate() {
-        sink.put_state(&line_identity_page_key(ordinal as u32), page)?;
-    }
-    for ordinal in pages.len() as u32..old_page_count {
-        sink.delete_state(&line_identity_page_key(ordinal))?;
     }
     Ok(())
 }
@@ -360,7 +345,7 @@ fn local_ref(ordinal: u64) -> u32 {
 fn emit_changes<I>(
     changes: I,
     creates: sdk::CreateContext,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl MutationOutput,
 ) -> sdk::Result<()>
 where
     I: IntoIterator<Item = Result<RowChange, String>>,
@@ -370,30 +355,96 @@ where
         match change.snapshot {
             Some(snapshot) => {
                 if let Some(local_ref) = create_local_ref(&change.row_pk, creates) {
-                    sink.row(sdk::RowMutation::Create {
-                        schema_key: &change.schema_key,
-                        local_ref,
-                        snapshot: &snapshot,
-                    })?;
+                    sink.create(&change.schema_key, local_ref, &snapshot)?;
                 } else {
-                    sink.row(sdk::RowMutation::Upsert {
-                        schema_key: &change.schema_key,
-                        row_pk: &change.row_pk,
-                        snapshot: &snapshot,
-                        effect: match change.effect {
+                    sink.upsert(
+                        &change.schema_key,
+                        &change.row_pk,
+                        &snapshot,
+                        match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
                             ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
                         },
-                    })?;
+                    )?;
                 }
             }
-            None => sink.row(sdk::RowMutation::Delete {
-                schema_key: &change.schema_key,
-                row_pk: &change.row_pk,
-            })?,
+            None => sink.delete(&change.schema_key, &change.row_pk)?,
         }
     }
     Ok(())
+}
+
+trait StateOutput {
+    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
+    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
+}
+
+macro_rules! impl_state_output {
+    ($type:ty) => {
+        impl StateOutput for $type {
+            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
+                <$type>::put_state(self, key, value)
+            }
+            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
+                <$type>::delete_state(self, key)
+            }
+        }
+    };
+}
+
+impl_state_output!(sdk::RowOutput<'_, '_>);
+impl_state_output!(sdk::RowChangeOutput<'_, '_>);
+impl_state_output!(sdk::FileOutput<'_, '_>);
+impl_state_output!(sdk::FileEditOutput<'_, '_>);
+
+trait MutationOutput {
+    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()>;
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[String],
+        snapshot: &[u8],
+        effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+}
+
+impl MutationOutput for sdk::RowOutput<'_, '_> {
+    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()> {
+        self.create(schema_key, local_ref, snapshot)
+    }
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[String],
+        snapshot: &[u8],
+        _effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        self.upsert(schema_key, row_pk, snapshot)
+    }
+    fn delete(&mut self, _schema_key: &str, _row_pk: &[String]) -> sdk::Result<()> {
+        Err(sdk::Error::invalid_input(
+            "initial Text parse produced a deletion",
+        ))
+    }
+}
+
+impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
+    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()> {
+        self.create(schema_key, local_ref, snapshot)
+    }
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[String],
+        snapshot: &[u8],
+        effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        self.upsert(schema_key, row_pk, snapshot, effect)
+    }
+    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()> {
+        self.delete(schema_key, row_pk)
+    }
 }
 
 fn create_local_ref(row_pk: &[String], creates: sdk::CreateContext) -> Option<u32> {
@@ -425,4 +476,4 @@ pub const SCHEMAS: [(&str, &str); 1] = [(
 mod tests;
 
 #[cfg(target_family = "wasm")]
-lix::plugin::export!(TextPlugin);
+lix::plugin::export_capabilities! { file_projection: TextPlugin }

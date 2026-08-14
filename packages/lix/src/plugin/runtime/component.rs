@@ -10,7 +10,9 @@ use crate::{
 
 use super::{
     CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES, InstalledPlugin, PluginActorCache,
-    PluginCatalogCache, PluginRegistry,
+    PluginCatalogCache, PluginRegistry, PluginRegistryEntry, ValidatedColumnMergeTransition,
+    VecColumnMergeSource, WasmColumnMergeUpdate, WasmHostColumnMerge, WasmTransitionLimits,
+    drain_column_merge_transition_results,
 };
 
 /// Installed plugins are untrusted repository data. This is the absolute
@@ -207,32 +209,124 @@ impl PluginRuntimeHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = WasmTransitionCounters::default();
     }
 
+    /// Invokes one pinned plugin generation for same-column overlaps. The
+    /// operation is row-first: `file_id` may be absent and no file descriptor,
+    /// path, projection state, or document actor is required.
+    pub(crate) async fn merge_columns(
+        &self,
+        plugin: &PluginRegistryEntry,
+        wasm: Option<Vec<u8>>,
+        merges: Vec<WasmHostColumnMerge>,
+        limits: WasmTransitionLimits,
+    ) -> Result<ValidatedColumnMergeTransition, LixError> {
+        if !plugin.has_column_merger() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("plugin '{}' has no column-merger capability", plugin.key()),
+            ));
+        }
+        if merges.is_empty() {
+            return Ok(ValidatedColumnMergeTransition {
+                results: Vec::new(),
+                counters: WasmTransitionCounters::default(),
+            });
+        }
+        let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("plugin '{}' has no column-merger component", plugin.key()),
+            )
+        })?)?;
+        let factory = match self.cached_plugin_factory(plugin.key(), wasm_hash)? {
+            Some(factory) => factory,
+            None => {
+                let wasm = wasm.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "plugin '{}' component bytes are required on cache miss",
+                            plugin.key()
+                        ),
+                    )
+                })?;
+                let installed = plugin.to_installed_plugin(Some(wasm))?;
+                self.load_or_compile_factory(&installed).await?
+            }
+        };
+        let _store_permit = self.plugin_actor_cache.admit_store()?;
+        let mut actor = factory.instantiate_actor().await?;
+        let expected_count = merges.len();
+        let source = VecColumnMergeSource::new(merges, limits)?;
+        let transition = match actor
+            .merge_columns(
+                limits,
+                WasmColumnMergeUpdate {
+                    merges: Box::new(source),
+                },
+            )
+            .await
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                let _ = actor.retire().await;
+                return Err(error);
+            }
+        };
+        let result = drain_column_merge_transition_results(
+            actor.as_mut(),
+            transition,
+            expected_count,
+            limits,
+        )
+        .await;
+        let retire = actor.retire().await;
+        match (result, retire) {
+            (Ok(validated), Ok(())) => {
+                self.record_transition_counters(validated.counters);
+                Ok(validated)
+            }
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     /// Shares only compiled code. Every file actor created from this factory
     /// receives a distinct Store/instance through `instantiate_actor`.
     pub(crate) async fn load_or_compile_factory(
         &self,
         plugin: &InstalledPlugin,
     ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
-        if let Some(factory) = self.cached_plugin_factory(&plugin.key, plugin.wasm_hash)? {
+        let wasm_hash = plugin.wasm_hash.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("plugin '{}' has no executable component", plugin.key),
+            )
+        })?;
+        let wasm = plugin.wasm.clone().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("plugin '{}' executable bytes are unavailable", plugin.key),
+            )
+        })?;
+        if let Some(factory) = self.cached_plugin_factory(&plugin.key, wasm_hash)? {
             return Ok(factory);
         }
         let compiled = self
             .wasm_runtime
-            .compile_component(plugin.wasm.clone(), self.plugin_wasm_limits)
+            .compile_component(wasm, self.plugin_wasm_limits, plugin.capabilities)
             .await?;
         let mut cache = self
             .plugin_factory_cache
             .lock()
             .map_err(|_| component_cache_lock_error())?;
         if let Some(cached) = cache.get(&plugin.key)
-            && cached.wasm_hash == plugin.wasm_hash
+            && cached.wasm_hash == wasm_hash
         {
             return Ok(Arc::clone(&cached.factory));
         }
         cache.insert(
             plugin.key.clone(),
             CachedPluginFactory {
-                wasm_hash: plugin.wasm_hash,
+                wasm_hash,
                 factory: Arc::clone(&compiled),
             },
         );

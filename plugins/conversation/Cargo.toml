@@ -1,0 +1,23 @@
+[package]
+name = "plugin_conversation"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Row-only conversation text merger for Lix"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lix = { workspace = true, default-features = true }

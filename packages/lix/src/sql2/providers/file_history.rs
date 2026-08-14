@@ -2866,7 +2866,7 @@ mod tests {
         let manifest_json = serde_json::json!({
             "entry": "plugin.wasm",
             "key": plugin_key,
-            "match": { "path_glob": "*.plugin-test" },
+            "file_match": { "path_glob": "*.plugin-test" },
             "schemas": ["schema/plugin.json"],
         })
         .to_string();
@@ -2874,9 +2874,13 @@ mod tests {
             key: plugin_key.to_string(),
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
-            path_glob: "*.plugin-test".to_string(),
+            capabilities: crate::plugin::runtime::PluginCapabilities {
+                column_merger: false,
+                file_projection: true,
+            },
+            path_glob: Some("*.plugin-test".to_string()),
             content: None,
-            entry: "plugin.wasm".to_string(),
+            entry: Some("plugin.wasm".to_string()),
             schema_keys: schema_keys
                 .iter()
                 .map(|schema_key| (*schema_key).to_string())
@@ -2887,7 +2891,7 @@ mod tests {
             archive_path: plugin_storage_archive_path(plugin_key),
             archive_blob_hash: BlobId::from_content(format!("archive-{plugin_key}").as_bytes())
                 .to_hex(),
-            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
+            wasm_blob_hash: Some(BlobId::from_content(wasm).to_hex()),
         })
         .expect("test plugin registry entry should be valid");
         PluginRegistry::new(vec![entry]).expect("test plugin registry should be valid")

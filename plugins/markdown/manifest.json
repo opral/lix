@@ -1,6 +1,6 @@
 {
   "key": "plugin_markdown",
-  "match": {
+  "file_match": {
     "path_glob": "*.{md,markdown}",
     "content": "text"
   },

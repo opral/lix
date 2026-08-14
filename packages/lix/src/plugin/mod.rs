@@ -27,4 +27,4 @@ pub use api::*;
     not(target_arch = "wasm32"),
     all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")
 ))]
-pub use crate::__lix_export_plugin as export;
+pub use crate::__lix_export_capabilities as export_capabilities;

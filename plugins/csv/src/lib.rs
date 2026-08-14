@@ -1,4 +1,4 @@
-//! CSV support for the fused Component API v1.
+//! CSV support for the row-first Component API v1.
 #![allow(dead_code)]
 
 mod core;
@@ -20,80 +20,84 @@ const CSV_INDEX_HEADER_BYTES: u32 = 36;
 const CSV_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 const CSV_STATE_PAGE_BYTES: usize = 1024 * 1024;
 
-impl sdk::Plugin for CsvPlugin {
-    fn cold_file_changed(
-        update: &mut sdk::ColdUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
-    ) -> sdk::Result<()> {
-        let accepted = update.before.read_all()?;
-        let mut builder = core::RowImportBuilder::new();
-        while let Some(row) = update.rows.next()? {
-            builder
-                .push(RowRecord {
-                    schema_key: row.schema_key,
-                    row_pk: row.row_pk,
-                    snapshot: row.snapshot,
-                })
-                .map_err(sdk::Error::invalid_input)?;
-        }
-        let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
-        let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
-        if !document.bytes_equal(&accepted) {
-            let reconcile = [FileEdit {
-                offset: 0,
-                delete_len: document.byte_len() as u64,
-                insert: &accepted,
-            }];
-            document = document
-                .file_changed_with_paths(
-                    &reconcile,
-                    Some(update.before_path.as_str()),
-                    Some(update.before_path.as_str()),
-                    namespace,
-                )
-                .map_err(sdk::Error::invalid_input)?
-                .0;
-        }
-        let splices = update
-            .edits
-            .iter()
-            .map(|edit| FileEdit {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert: &edit.insert,
+fn cold_parse_changes(
+    update: &mut sdk::ParseChangesInput<'_>,
+    sink: &mut sdk::RowChangeOutput<'_, '_>,
+) -> sdk::Result<()> {
+    let accepted = update.before.read_all()?;
+    let mut builder = core::RowImportBuilder::new();
+    let rows = update
+        .rows
+        .as_mut()
+        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+    while let Some(row) = rows.next()? {
+        builder
+            .push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             })
-            .collect::<Vec<_>>();
-        let (successor, changes) = document
+            .map_err(sdk::Error::invalid_input)?;
+    }
+    let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
+    let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
+    if !document.bytes_equal(&accepted) {
+        let reconcile = [FileEdit {
+            offset: 0,
+            delete_len: document.byte_len() as u64,
+            insert: &accepted,
+        }];
+        document = document
             .file_changed_with_paths(
-                &splices,
-                Some(update.before_path.as_str()),
-                Some(update.after_path.as_str()),
+                &reconcile,
+                Some(update.before_path),
+                Some(update.before_path),
                 namespace,
             )
-            .map_err(sdk::Error::invalid_input)?;
-        if let Some((namespace, state)) = successor.canonical_arena_state() {
-            sink.put_state(ID_NAMESPACE_STATE, &namespace)?;
-            store_csv_index(sink, &state)?;
-        } else {
-            sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
-            store_fallback_rows_fresh(
-                sink,
-                &successor.row_records().map_err(sdk::Error::invalid_input)?,
-            )?;
-        }
-        for change in changes {
-            emit_change(change, update.creates, sink)?;
-        }
-        Ok(())
+            .map_err(sdk::Error::invalid_input)?
+            .0;
     }
+    let splices = update
+        .file_edits
+        .iter()
+        .map(|edit| FileEdit {
+            offset: edit.offset,
+            delete_len: edit.delete_len,
+            insert: &edit.insert,
+        })
+        .collect::<Vec<_>>();
+    let (successor, changes) = document
+        .file_changed_with_paths(
+            &splices,
+            Some(update.before_path),
+            Some(update.after_path),
+            namespace,
+        )
+        .map_err(sdk::Error::invalid_input)?;
+    if let Some((namespace, state)) = successor.canonical_arena_state() {
+        sink.put_state(ID_NAMESPACE_STATE, &namespace)?;
+        store_csv_index(sink, &state)?;
+    } else {
+        sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+        store_fallback_rows_fresh(
+            sink,
+            &successor.row_records().map_err(sdk::Error::invalid_input)?,
+        )?;
+    }
+    for change in changes {
+        emit_change(change, update.creates, sink)?;
+    }
+    Ok(())
+}
 
-    fn rows_changed(
-        update: &mut sdk::RowUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
+impl sdk::FileProjection for CsvPlugin {
+    fn serialize_changes(
+        mut update: sdk::SerializeChangesInput<'_>,
+        sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
-        while let Some(change) = update.changes.next()? {
+        while let Some(change) = update.row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
                 row_pk: change.row_pk,
@@ -116,21 +120,26 @@ impl sdk::Plugin for CsvPlugin {
             let namespace = read_namespace(&update.before)?
                 .or_else(|| namespace_from_changes(&changes))
                 .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-            Document::open_file(before.clone(), Some(update.before_path.as_str()), namespace)
+            Document::open_file(before.clone(), Some(update.path), namespace)
                 .map_err(sdk::Error::invalid_input)?
                 .0
         };
         let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
-        sink.replace_file(&apply_edits(before, &edits)?)?;
+        for edit in edits {
+            sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
+        }
         let records = successor.row_records().map_err(sdk::Error::invalid_input)?;
         store_fallback_rows_from_sink(&update.before, sink, &records)?;
         delete_csv_index_from_sink(&update.before, sink)?;
         Ok(())
     }
 
-    fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn serialize(
+        mut input: sdk::SerializeInput<'_>,
+        sink: &mut sdk::FileOutput<'_, '_>,
+    ) -> sdk::Result<()> {
         let mut records = Vec::new();
         while let Some(row) = input.rows.next()? {
             records.push(RowRecord {
@@ -142,41 +151,13 @@ impl sdk::Plugin for CsvPlugin {
         let (document, _) =
             Document::open_rows(records.clone()).map_err(sdk::Error::invalid_input)?;
         store_fallback_rows_fresh(sink, &records)?;
-        if input.accepted.is_none() {
-            sink.replace_file(&document.bytes())?;
-        }
-        Ok(())
+        sink.write(&document.bytes())
     }
 
-    fn resolve_conflict(conflict: sdk::RowConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
-        if conflict.schema_key != ROW_SCHEMA_KEY {
-            return Ok(conflict.take_b_or_delete());
-        }
-        let (Some(base), Some(a), Some(b)) = (&conflict.base, &conflict.a, &conflict.b) else {
-            return Ok(conflict.take_b_or_delete());
-        };
-        if base.len() > 64 * 1024 || a.len() > 64 * 1024 || b.len() > 64 * 1024 {
-            return Ok(sdk::ConflictResolution::TakeB);
-        }
-        let base = base.read()?;
-        let a = a.read()?;
-        let b = b.read()?;
-        Ok(
-            match resolve_row_conflict(Some(&base), Some(&a), Some(&b)) {
-                RowConflictResolution::TakeA => sdk::ConflictResolution::TakeA,
-                RowConflictResolution::TakeB => sdk::ConflictResolution::TakeB,
-                RowConflictResolution::Replace(snapshot) => {
-                    sdk::ConflictResolution::Replace(snapshot)
-                }
-                RowConflictResolution::Delete => sdk::ConflictResolution::Delete,
-            },
-        )
-    }
-
-    fn open(input: &sdk::OpenFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
-        let bytes = input.accepted.read_all()?;
-        let mut import = ColdInitialImport::open(bytes, Some(input.path.as_str()))
-            .map_err(sdk::Error::invalid_input)?;
+    fn parse(input: sdk::ParseInput<'_>, sink: &mut sdk::RowOutput<'_, '_>) -> sdk::Result<()> {
+        let bytes = input.file.read_all()?;
+        let mut import =
+            ColdInitialImport::open(bytes, Some(input.path)).map_err(sdk::Error::invalid_input)?;
         let state = import.arena_state(input.creates.namespace_bytes());
         sink.put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         store_csv_index(sink, &state)?;
@@ -191,11 +172,7 @@ impl sdk::Plugin for CsvPlugin {
                 break;
             };
             debug_assert_eq!(local_ref, next_local_ref);
-            sink.row(sdk::RowMutation::Create {
-                schema_key: ROW_SCHEMA_KEY,
-                local_ref,
-                snapshot: &snapshot,
-            })?;
+            sink.create(ROW_SCHEMA_KEY, local_ref, &snapshot)?;
             next_local_ref = next_local_ref
                 .checked_add(1)
                 .ok_or_else(|| sdk::Error::limit_exceeded("CSV row count exceeds u32"))?;
@@ -203,18 +180,29 @@ impl sdk::Plugin for CsvPlugin {
         Ok(())
     }
 
-    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn parse_changes(
+        mut update: sdk::ParseChangesInput<'_>,
+        sink: &mut sdk::RowChangeOutput<'_, '_>,
+    ) -> sdk::Result<()> {
+        if update.before.state_len(CSV_INDEX_KEY)?.is_none()
+            && update.before.state_len(CSV_FALLBACK_ROWS_KEY)?.is_none()
+        {
+            return cold_parse_changes(&mut update, sink);
+        }
         if update.before.state_len(CSV_FALLBACK_ROWS_KEY)?.is_some()
             || update.before_path != update.after_path
-            || update.edits.len() != 1
-            || u64::try_from(update.edits[0].insert.len()).expect("usize fits u64")
-                != update.edits[0].delete_len
+            || update.file_edits.iter().len() != 1
         {
             return fallback_file_changed(update, sink);
         }
-        let [edit] = update.edits.as_slice() else {
-            unreachable!("the sparse path requires exactly one edit")
-        };
+        let edit = update
+            .file_edits
+            .iter()
+            .next()
+            .expect("the sparse path requires exactly one edit");
+        if u64::try_from(edit.insert.len()).expect("usize fits u64") != edit.delete_len {
+            return fallback_file_changed(update, sink);
+        }
         let insert = &edit.insert;
         let (index, range, discovered_state) = if update.before.state_len(CSV_INDEX_KEY)?.is_some()
         {
@@ -246,11 +234,9 @@ impl sdk::Plugin for CsvPlugin {
                 .map_err(sdk::Error::invalid_input)?;
             (index, range, None)
         } else {
-            let import = ColdInitialImport::open(
-                update.before.read_all()?,
-                Some(update.before_path.as_str()),
-            )
-            .map_err(sdk::Error::invalid_input)?;
+            let import =
+                ColdInitialImport::open(update.before.read_all()?, Some(update.before_path))
+                    .map_err(sdk::Error::invalid_input)?;
             let state = import.arena_state(update.creates.namespace_bytes());
             let index = ArenaRowIndex::decode(&state).map_err(sdk::Error::invalid_input)?;
             let range = index
@@ -283,7 +269,44 @@ impl sdk::Plugin for CsvPlugin {
     }
 }
 
-fn store_csv_index(successor: &sdk::Output<'_>, state: &[u8]) -> sdk::Result<()> {
+impl sdk::ColumnMerger for CsvPlugin {
+    fn merge(input: sdk::ColumnMerge<'_>) -> sdk::Result<sdk::ColumnMergeResult> {
+        if input.row.schema_key != ROW_SCHEMA_KEY || input.column != "cells" {
+            return Ok(sdk::ColumnMergeResult::UseLww);
+        }
+        if [input.base.len(), input.a.len(), input.b.len()]
+            .into_iter()
+            .flatten()
+            .any(|length| length > 64 * 1024)
+        {
+            return Ok(sdk::ColumnMergeResult::UseLww);
+        }
+        let base = input.rows.base.read()?;
+        let a = input.rows.a.read()?;
+        let b = input.rows.b.read()?;
+        let resolved = resolve_row_conflict(Some(&base), Some(&a), Some(&b));
+        let snapshot = match resolved {
+            RowConflictResolution::TakeA => a,
+            RowConflictResolution::Replace(snapshot) => snapshot,
+            RowConflictResolution::TakeB | RowConflictResolution::Delete => {
+                return Ok(sdk::ColumnMergeResult::UseLww);
+            }
+        };
+        let row: serde_json::Value = serde_json::from_slice(&snapshot).map_err(|error| {
+            sdk::Error::invalid_input(format!("invalid merged CSV row: {error}"))
+        })?;
+        let value = row
+            .get("cells")
+            .ok_or_else(|| sdk::Error::invalid_input("merged CSV row has no cells column"))?;
+        let encoded = serde_json::to_vec(value)
+            .map_err(|error| sdk::Error::internal(format!("encode merged CSV cells: {error}")))?;
+        Ok(sdk::ColumnMergeResult::Replace(
+            sdk::OwnedColumnValue::json(encoded),
+        ))
+    }
+}
+
+fn store_csv_index(successor: &mut impl StateOutput, state: &[u8]) -> sdk::Result<()> {
     let (header, pages) = split_csv_index(state)?;
     successor.put_state(CSV_INDEX_KEY, header)?;
     for (ordinal, page) in pages.into_iter().enumerate() {
@@ -321,7 +344,10 @@ fn csv_index_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
         .map_err(|_| sdk::Error::limit_exceeded("too many CSV row index pages"))?)
 }
 
-fn delete_csv_index(before: &sdk::Snapshot<'_>, successor: &sdk::Output<'_>) -> sdk::Result<()> {
+fn delete_csv_index(
+    before: &sdk::Snapshot<'_>,
+    successor: &mut impl StateOutput,
+) -> sdk::Result<()> {
     let page_count = csv_index_page_count(before)?;
     successor.delete_state(CSV_INDEX_KEY)?;
     for ordinal in 0..page_count {
@@ -332,7 +358,7 @@ fn delete_csv_index(before: &sdk::Snapshot<'_>, successor: &sdk::Output<'_>) -> 
 
 fn delete_csv_index_from_sink(
     before: &sdk::Snapshot<'_>,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl StateOutput,
 ) -> sdk::Result<()> {
     let page_count = csv_index_page_count(before)?;
     sink.delete_state(CSV_INDEX_KEY)?;
@@ -349,8 +375,8 @@ fn csv_index_page_key(ordinal: u32) -> Vec<u8> {
 }
 
 fn fallback_file_changed(
-    update: &sdk::FileUpdate<'_>,
-    sink: &mut sdk::Output<'_>,
+    update: sdk::ParseChangesInput<'_>,
+    sink: &mut sdk::RowChangeOutput<'_, '_>,
 ) -> sdk::Result<()> {
     let before_bytes = update.before.read_all()?;
     let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ROWS_KEY)? {
@@ -371,8 +397,8 @@ fn fallback_file_changed(
             document
                 .file_changed_with_paths(
                     &reconcile,
-                    Some(update.before_path.as_str()),
-                    Some(update.before_path.as_str()),
+                    Some(update.before_path),
+                    Some(update.before_path),
                     namespace,
                 )
                 .map_err(sdk::Error::invalid_input)?
@@ -381,12 +407,12 @@ fn fallback_file_changed(
     } else {
         let namespace =
             read_namespace(&update.before)?.unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        Document::open_file(before_bytes, Some(update.before_path.as_str()), namespace)
+        Document::open_file(before_bytes, Some(update.before_path), namespace)
             .map_err(sdk::Error::invalid_input)?
             .0
     };
     let splices = update
-        .edits
+        .file_edits
         .iter()
         .map(|edit| FileEdit {
             offset: edit.offset,
@@ -398,8 +424,8 @@ fn fallback_file_changed(
     let (successor, changes) = document
         .file_changed_with_paths(
             &splices,
-            Some(update.before_path.as_str()),
-            Some(update.after_path.as_str()),
+            Some(update.before_path),
+            Some(update.after_path),
             namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
@@ -414,7 +440,7 @@ fn fallback_file_changed(
 
 fn store_fallback_rows_from_sink(
     before: &sdk::Snapshot<'_>,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl StateOutput,
     records: &[RowRecord],
 ) -> sdk::Result<()> {
     let old_page_count = fallback_row_page_count(before)?;
@@ -431,7 +457,7 @@ fn store_fallback_rows_from_sink(
 
 fn store_fallback_rows_in_transaction(
     before: &sdk::Snapshot<'_>,
-    successor: &sdk::Output<'_>,
+    successor: &mut impl StateOutput,
     records: &[RowRecord],
 ) -> sdk::Result<()> {
     let old_page_count = fallback_row_page_count(before)?;
@@ -447,7 +473,7 @@ fn store_fallback_rows_in_transaction(
 }
 
 fn store_fallback_rows_fresh(
-    successor: &sdk::Output<'_>,
+    successor: &mut impl StateOutput,
     records: &[RowRecord],
 ) -> sdk::Result<()> {
     let (manifest, pages) = encode_row_records(records)?;
@@ -692,7 +718,7 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
 fn emit_change(
     change: RowChange,
     creates: sdk::CreateContext,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl MutationOutput,
 ) -> sdk::Result<()> {
     match change.schema_key.as_str() {
         TABLE_SCHEMA_KEY | ROW_SCHEMA_KEY => {}
@@ -710,29 +736,83 @@ fn emit_change(
                 .first()
                 .and_then(|id| local_ref(creates, id));
             if change.schema_key == ROW_SCHEMA_KEY && local_ref.is_some() {
-                sink.row(sdk::RowMutation::Create {
-                    schema_key: &change.schema_key,
-                    local_ref: local_ref.expect("checked above"),
-                    snapshot: &snapshot,
-                })?;
+                sink.create(
+                    &change.schema_key,
+                    local_ref.expect("checked above"),
+                    &snapshot,
+                )?;
             } else {
-                sink.row(sdk::RowMutation::Upsert {
-                    schema_key: &change.schema_key,
-                    row_pk: &change.row_pk,
-                    snapshot: &snapshot,
-                    effect: match change.effect {
+                sink.upsert(
+                    &change.schema_key,
+                    &change.row_pk,
+                    &snapshot,
+                    match change.effect {
                         ChangeEffect::Content => sdk::ChangeEffect::Content,
                         ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
                     },
-                })?;
+                )?;
             }
         }
-        None => sink.row(sdk::RowMutation::Delete {
-            schema_key: &change.schema_key,
-            row_pk: &change.row_pk,
-        })?,
+        None => sink.delete(&change.schema_key, &change.row_pk)?,
     }
     Ok(())
+}
+
+trait StateOutput {
+    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
+    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
+}
+macro_rules! impl_state_output {
+    ($type:ty) => {
+        impl StateOutput for $type {
+            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
+                <$type>::put_state(self, key, value)
+            }
+            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
+                <$type>::delete_state(self, key)
+            }
+        }
+    };
+}
+impl_state_output!(sdk::RowOutput<'_, '_>);
+impl_state_output!(sdk::RowChangeOutput<'_, '_>);
+impl_state_output!(sdk::FileOutput<'_, '_>);
+impl_state_output!(sdk::FileEditOutput<'_, '_>);
+
+trait MutationOutput {
+    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()>;
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[String],
+        snapshot: &[u8],
+        effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+}
+impl MutationOutput for sdk::RowOutput<'_, '_> {
+    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
+        self.create(s, l, v)
+    }
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], _: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v)
+    }
+    fn delete(&mut self, _: &str, _: &[String]) -> sdk::Result<()> {
+        Err(sdk::Error::invalid_input(
+            "initial CSV parse produced a deletion",
+        ))
+    }
+}
+impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
+    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
+        self.create(s, l, v)
+    }
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], e: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v, e)
+    }
+    fn delete(&mut self, s: &str, k: &[String]) -> sdk::Result<()> {
+        self.delete(s, k)
+    }
 }
 
 fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
@@ -756,7 +836,10 @@ fn push_text(output: &mut Vec<u8>, value: &str) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix::plugin::export!(CsvPlugin);
+lix::plugin::export_capabilities! {
+    column_merger: CsvPlugin,
+    file_projection: CsvPlugin,
+}
 
 #[cfg(test)]
 mod tests {
