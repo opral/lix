@@ -95,7 +95,13 @@ async fn run_case(files: usize) {
     write_probe(&lix, "/docs/main-probe.txt").await;
     let control_ms = control_started.elapsed().as_secs_f64() * 1_000.0;
     let control_after = snapshot(&storage, &db_path).await;
-    report(files, "control_write_on_main", &control_before, &control_after, control_ms);
+    report(
+        files,
+        "control_write_on_main",
+        &control_before,
+        &control_after,
+        control_ms,
+    );
 
     let before = snapshot(&storage, &db_path).await;
     if std::env::var_os("E10_INVENTORY").is_some() {
@@ -157,13 +163,25 @@ async fn run_case(files: usize) {
     write_probe(&lix, "/docs/branch-probe-1.txt").await;
     let write_ms = write_started.elapsed().as_secs_f64() * 1_000.0;
     let after_write = snapshot(&storage, &db_path).await;
-    report(files, "first_write_on_branch", &after_switch, &after_write, write_ms);
+    report(
+        files,
+        "first_write_on_branch",
+        &after_switch,
+        &after_write,
+        write_ms,
+    );
 
     let second_started = Instant::now();
     write_probe(&lix, "/docs/branch-probe-2.txt").await;
     let second_ms = second_started.elapsed().as_secs_f64() * 1_000.0;
     let after_second = snapshot(&storage, &db_path).await;
-    report(files, "second_write_on_branch", &after_write, &after_second, second_ms);
+    report(
+        files,
+        "second_write_on_branch",
+        &after_write,
+        &after_second,
+        second_ms,
+    );
 
     lix.close().await.expect("close branch-file-cost Lix");
 }
@@ -353,7 +371,9 @@ fn build_text_plugin_archive() -> Vec<u8> {
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
-        writer.start_file(path, options).expect("start archive file");
+        writer
+            .start_file(path, options)
+            .expect("start archive file");
         writer.write_all(bytes).expect("write archive file");
     }
     writer.finish().expect("finish archive").into_inner()

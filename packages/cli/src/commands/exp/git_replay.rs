@@ -340,7 +340,7 @@ where
         .map_err(|error| CliError::msg(format!("failed to open replay Lix: {error}")))?;
     db::block_on(lix.execute(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-         VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+         VALUES ('lix_deterministic_mode', '{\"enabled\":true}'::jsonb, true, true)",
         &[],
     ))
     .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;

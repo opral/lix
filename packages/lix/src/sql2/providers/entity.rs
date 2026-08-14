@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 #[cfg(test)]
 use datafusion::arrow::array::Array;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -24,12 +26,12 @@ use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
+use crate::hot_state::MaterializedHotStateBatch;
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
     HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
-use crate::hot_state::MaterializedHotStateBatch;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
@@ -1767,6 +1769,30 @@ fn entity_update_json_value(
                 &other,
             )),
         },
+        EntityColumnType::Timestamptz => match value {
+            ScalarValue::TimestampMicrosecond(Some(value), _) => {
+                chrono::DateTime::from_timestamp_micros(value)
+                    .map(|timestamp| {
+                        JsonValue::String(
+                            timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        entity_update_type_error(
+                            spec,
+                            column_name,
+                            "TIMESTAMPTZ",
+                            &ScalarValue::TimestampMicrosecond(Some(value), Some("UTC".into())),
+                        )
+                    })
+            }
+            other => Err(entity_update_type_error(
+                spec,
+                column_name,
+                "TIMESTAMPTZ",
+                &other,
+            )),
+        },
     }
 }
 
@@ -1945,9 +1971,7 @@ fn hot_index_value_from_filter_value(
         EntityFilterValue::String(value) => {
             Some(crate::hot_state::HotIndexValue::String(value.clone()))
         }
-        EntityFilterValue::Integer(value) => {
-            Some(crate::hot_state::HotIndexValue::Integer(*value))
-        }
+        EntityFilterValue::Integer(value) => Some(crate::hot_state::HotIndexValue::Integer(*value)),
         _ => None,
     }
 }
@@ -2550,7 +2574,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
                 record_filterable_column(&self.spec.schema_key, column_name, true);
                 Some(column.name.as_str())
             }
-            EntityColumnType::Json => {
+            EntityColumnType::Json | EntityColumnType::Timestamptz => {
                 #[cfg(any(test, feature = "storage-benches"))]
                 record_filterable_column(&self.spec.schema_key, column_name, false);
                 None
@@ -2584,7 +2608,11 @@ fn record_filterable_column(schema_key: &str, column_name: &str, accepted: bool)
     };
     let verdict = if accepted { "accept" } else { "refuse_json" };
     let line = format!("{verdict}\t{schema_key}\t{column_name}\n");
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -2708,7 +2736,12 @@ impl EntityRowFilter {
                     .fields
                     .iter()
                     .position(|field| field.name == *column)?;
-                entity_filter_range_in_statistics(*op, value, &group.columns[index], group.row_count)
+                entity_filter_range_in_statistics(
+                    *op,
+                    value,
+                    &group.columns[index],
+                    group.row_count,
+                )
             }
             Self::And(left, right) => match (
                 left.may_match_group(manifest, group),
@@ -2951,6 +2984,9 @@ fn entity_snapshot_value(
         }
         EntityColumnType::Boolean => value.as_bool().map(EntityFilterValue::Boolean),
         EntityColumnType::Json => None,
+        EntityColumnType::Timestamptz => value
+            .as_str()
+            .map(|value| EntityFilterValue::String(value.to_owned())),
     })
 }
 
@@ -3615,7 +3651,39 @@ fn entity_column_array(
                 .map(|value| value.and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
+        EntityColumnType::Timestamptz => Arc::new(
+            TimestampMicrosecondArray::from(
+                values
+                    .iter()
+                    .map(|value| entity_timestamptz_value(*value, &spec.schema_key, column_name))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .with_timezone("UTC"),
+        ) as ArrayRef,
     })
+}
+
+fn entity_timestamptz_value(
+    value: Option<&JsonValue>,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<Option<i64>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "{schema_key}.{column_name} expected timestamptz text"
+        ))
+    })?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|timestamp| Some(timestamp.timestamp_micros()))
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "{schema_key}.{column_name} contains invalid timestamptz: {error}"
+            ))
+        })
 }
 
 /// Materialize `lixcol_*` system columns from borrowed batch rows.
@@ -4140,14 +4208,13 @@ mod tests {
     fn entity_insert_spec_with_primary_key() -> Arc<super::EntitySurfaceSpec> {
         Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "body": { "type": "string" }
-                },
-                "required": ["id", "body"]
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }))
             .expect("schema should derive entity surface spec"),
         )
@@ -4291,9 +4358,12 @@ mod tests {
     fn filtered_entity_scan_never_builds_a_candidate_snapshot_dom() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "type": "object",
-                "properties": { "body": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -4482,9 +4552,12 @@ mod tests {
     fn unfiltered_parsed_projection_parses_each_row_once() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "type": "object",
-                "properties": { "body": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -4503,17 +4576,16 @@ mod tests {
     fn filter_pushdown_spec() -> Arc<super::EntitySurfaceSpec> {
         Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "pushdown_note",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "kind": { "type": "string" },
-                    "score": { "type": "number" },
-                    "count": { "type": "integer" },
-                    "meta": { "type": "object" }
-                },
-                "required": ["id", "kind", "score", "count"]
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "pushdown_note",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "kind", "type": "text", "nullable": false },
+                    { "name": "score", "type": "float8", "nullable": false },
+                    { "name": "count", "type": "int8", "nullable": false },
+                    { "name": "meta", "type": "jsonb", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }))
             .expect("schema should derive entity surface spec"),
         )
@@ -4555,21 +4627,21 @@ mod tests {
     #[test]
     fn derives_entity_surface_spec_from_schema_definition() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "project_message",
-            "type": "object",
-            "properties": {
-                "body": { "type": "string" },
-                "rating": { "type": "number" },
-                "meta": { "type": "object" },
-                "lixcol_entity_pk": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_message",
+            "columns": [
+                { "name": "body", "type": "text", "nullable": false },
+                { "name": "rating", "type": "float8", "nullable": true },
+                { "name": "meta", "type": "jsonb", "nullable": true },
+            ],
+            "primary_key": ["body"],
         }))
         .expect("schema should derive entity surface spec");
 
         assert_eq!(spec.schema_key, "project_message");
         assert_eq!(
             spec.visible_column_names().collect::<Vec<_>>(),
-            vec!["body", "meta", "rating"]
+            vec!["body", "rating", "meta"]
         );
         assert_eq!(
             spec.visible_column("body").map(|column| column.column_type),
@@ -4588,35 +4660,32 @@ mod tests {
     }
 
     #[test]
-    fn entity_surface_spec_rejects_properties_without_projection_type() {
-        let error = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "project_message",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "kind": {}
-            },
-            "required": ["id", "kind"],
-            "additionalProperties": false
+    fn entity_surface_spec_accepts_jsonb_columns() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_message",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "kind", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
-        .expect_err("unprojectable property should be rejected");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error.message.contains("property '/kind'"),
-            "error should identify the property: {error:?}"
+        .expect("jsonb is a supported projection type");
+        assert_eq!(
+            spec.visible_column("kind").map(|column| column.column_type),
+            Some(EntityColumnType::Json)
         );
     }
 
     #[test]
     fn by_branch_schema_includes_branch_system_column() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "project_message",
-            "type": "object",
-            "properties": {
-                "body": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_message",
+            "columns": [
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["body"],
         }))
         .expect("schema should derive entity surface spec");
 
@@ -4629,11 +4698,12 @@ mod tests {
     #[test]
     fn active_schema_excludes_branch_system_column() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "project_message",
-            "type": "object",
-            "properties": {
-                "body": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_message",
+            "columns": [
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["body"],
         }))
         .expect("schema should derive entity surface spec");
 
@@ -4646,13 +4716,13 @@ mod tests {
     #[test]
     fn read_schema_keeps_defaulted_required_identity_non_null() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "project_message",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
-                "body": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_message",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                { "name": "body", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("schema should derive entity surface spec");
 
@@ -4678,15 +4748,16 @@ mod tests {
     fn record_batch_projects_payload_and_system_columns() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "type": "object",
-                "properties": {
-                    "body": { "type": "string" },
-                    "rating": { "type": "number" },
-                    "count": { "type": "integer" },
-                    "enabled": { "type": "boolean" },
-                    "meta": { "type": "object" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                    { "name": "rating", "type": "float8", "nullable": true },
+                    { "name": "count", "type": "int8", "nullable": true },
+                    { "name": "enabled", "type": "boolean", "nullable": true },
+                    { "name": "meta", "type": "jsonb", "nullable": true },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -4757,16 +4828,16 @@ mod tests {
     fn exact_primary_key_batches_keep_the_existing_json_and_scalar_projection_contract() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "x-lix-primary-key": ["/body"],
-                "type": "object",
-                "properties": {
-                    "body": { "type": "string" },
-                    "rating": { "type": "number" },
-                    "count": { "type": "integer" },
-                    "enabled": { "type": "boolean" },
-                    "meta": { "type": "object" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                    { "name": "rating", "type": "float8", "nullable": true },
+                    { "name": "count", "type": "int8", "nullable": true },
+                    { "name": "enabled", "type": "boolean", "nullable": true },
+                    { "name": "meta", "type": "jsonb", "nullable": true },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -4824,12 +4895,13 @@ mod tests {
     fn untracked_broad_batches_keep_duplicate_key_last_wins_scalar_semantics() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "type": "object",
-                "properties": {
-                    "body": { "type": "string" },
-                    "count": { "type": "integer" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                    { "name": "count", "type": "int8", "nullable": true },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -4862,16 +4934,16 @@ mod tests {
     fn canonical_tracked_raw_batch_matches_parsed_batch_for_all_system_columns() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "x-lix-primary-key": ["/body"],
-                "type": "object",
-                "properties": {
-                    "body": { "type": "string" },
-                    "rating": { "type": "number" },
-                    "count": { "type": "integer" },
-                    "enabled": { "type": "boolean" },
-                    "meta": { "type": "object" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                    { "name": "rating", "type": "float8", "nullable": true },
+                    { "name": "count", "type": "int8", "nullable": true },
+                    { "name": "enabled", "type": "boolean", "nullable": true },
+                    { "name": "meta", "type": "jsonb", "nullable": true },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -4968,9 +5040,12 @@ mod tests {
     fn broad_raw_projection_keeps_invalid_snapshot_errors_on_the_execution_path() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "type": "object",
-                "properties": { "body": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -5058,11 +5133,12 @@ mod tests {
     async fn provider_registers_as_table_provider() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "type": "object",
-                "properties": {
-                    "body": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["body"],
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -5107,14 +5183,13 @@ mod tests {
     async fn file_id_filter_pushes_an_exact_file_scope_into_scan() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "file_note",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "body": { "type": "string" }
-                },
-                "required": ["id", "body"]
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "file_note",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }))
             .expect("file-scoped schema should derive"),
         );
@@ -5211,14 +5286,13 @@ mod tests {
     async fn integer_primary_key_filter_pushes_exact_identity_into_scan() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "integer_note",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer" },
-                    "body": { "type": "string" }
-                },
-                "required": ["id", "body"]
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "integer_note",
+                "columns": [
+                    { "name": "id", "type": "int8", "nullable": false },
+                    { "name": "body", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }))
             .expect("integer primary-key schema should derive"),
         );
@@ -5255,15 +5329,14 @@ mod tests {
     #[test]
     fn mixed_composite_primary_key_filters_use_typed_components() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "versioned_note",
-            "x-lix-primary-key": ["/namespace", "/revision"],
-            "type": "object",
-            "properties": {
-                "namespace": { "type": "string" },
-                "revision": { "type": "integer" },
-                "body": { "type": "string" }
-            },
-            "required": ["namespace", "revision", "body"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "versioned_note",
+            "columns": [
+                { "name": "namespace", "type": "text", "nullable": false },
+                { "name": "revision", "type": "int8", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["namespace", "revision"],
         }))
         .expect("mixed primary-key schema should derive");
         let filters = vec![
@@ -5289,11 +5362,12 @@ mod tests {
     #[test]
     fn integer_primary_key_rejects_string_literal_pushdown() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "integer_note",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "integer" } },
-            "required": ["id"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "integer_note",
+            "columns": [
+                { "name": "id", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("integer primary-key schema should derive");
 
@@ -5307,15 +5381,14 @@ mod tests {
     #[test]
     fn split_composite_primary_key_filters_use_declared_path_order() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "localized_message",
-            "x-lix-primary-key": ["/locale", "/key"],
-            "type": "object",
-            "properties": {
-                "key": { "type": "string" },
-                "locale": { "type": "string" },
-                "body": { "type": "string" }
-            },
-            "required": ["key", "locale", "body"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "localized_message",
+            "columns": [
+                { "name": "key", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["locale", "key"],
         }))
         .expect("schema should derive");
         // SQL predicate order is deliberately the reverse of the schema's
@@ -5551,19 +5624,21 @@ mod tests {
     #[test]
     fn columnar_pruning_applies_boolean_conjunct_with_residual_filter() {
         let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
-            "x-lix-key": "fixture",
-            "type": "object",
-            "properties": {
-                "active": { "type": "boolean" },
-                "lane": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "fixture",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "active", "type": "boolean", "nullable": false },
+                { "name": "lane", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("schema");
         let snapshots = [
-            serde_json::json!({"active": true, "lane": "a"}),
-            serde_json::json!({"active": false, "lane": "a"}),
-            serde_json::json!({"active": true, "lane": "b"}),
-            serde_json::json!({"active": false, "lane": "b"}),
+            serde_json::json!({"id": "entity-0", "active": true, "lane": "a"}),
+            serde_json::json!({"id": "entity-1", "active": false, "lane": "a"}),
+            serde_json::json!({"id": "entity-2", "active": true, "lane": "b"}),
+            serde_json::json!({"id": "entity-3", "active": false, "lane": "b"}),
         ];
         let canonical = snapshots
             .iter()
@@ -5629,18 +5704,20 @@ mod tests {
     #[test]
     fn exact_boolean_pruning_excludes_all_null_groups_above_sidecar_threshold() {
         let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
-            "x-lix-key": "nullable_boolean_fixture",
-            "type": "object",
-            "properties": {
-                "active": { "type": ["boolean", "null"] }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "nullable_boolean_fixture",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "active", "type": "boolean", "nullable": true },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("schema");
         let snapshots = (0..1_025)
             .map(|index| match index % 3 {
-                0 => serde_json::json!({"active": true}),
-                1 => serde_json::json!({"active": false}),
-                _ => serde_json::json!({"active": null}),
+                0 => serde_json::json!({"id": format!("entity-{index}"), "active": true}),
+                1 => serde_json::json!({"id": format!("entity-{index}"), "active": false}),
+                _ => serde_json::json!({"id": format!("entity-{index}"), "active": null}),
             })
             .collect::<Vec<_>>();
         let canonical = snapshots
@@ -5694,22 +5771,25 @@ mod tests {
 
     #[test]
     fn boolean_beyond_clustering_budget_retains_datafusion_residual() {
-        let mut properties = serde_json::Map::new();
+        let mut columns = vec![serde_json::json!({
+            "name": "id", "type": "text", "nullable": false
+        })];
         for index in 0..5 {
-            properties.insert(
-                format!("flag_{index}"),
-                serde_json::json!({ "type": "boolean" }),
-            );
+            columns.push(serde_json::json!({
+                "name": format!("flag_{index}"), "type": "boolean", "nullable": false
+            }));
         }
         let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
-            "x-lix-key": "wide_boolean_fixture",
-            "type": "object",
-            "properties": properties
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "wide_boolean_fixture",
+            "columns": columns,
+            "primary_key": ["id"]
         }))
         .expect("schema");
         let snapshots = (0..1_025)
             .map(|row| {
                 let mut snapshot = serde_json::Map::new();
+                snapshot.insert("id".to_string(), serde_json::json!(format!("entity-{row}")));
                 for index in 0..5 {
                     snapshot.insert(
                         format!("flag_{index}"),
@@ -5787,12 +5867,16 @@ mod tests {
     #[test]
     fn columnar_projection_accepts_schema_bound_canonical_json_and_rejects_drift() {
         let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
-            "x-lix-key": "json_payload",
-            "type": "object",
-            "properties": { "payload": { "type": ["string", "object", "null"] } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_payload",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "payload", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("schema");
-        let snapshot = serde_json::json!({"payload": {"z": 2, "a": 1}});
+        let snapshot = serde_json::json!({"id": "entity-1", "payload": {"z": 2, "a": 1}});
         let canonical = snapshot.to_string();
         let identity = TestEntityPk::single("entity-1");
         let encoded = crate::sql2::encode_registered_entity_row_groups(
@@ -5815,7 +5899,7 @@ mod tests {
 
         assert_eq!(
             super::entity_columnar_projection(&encoded.manifest, &payload_schema, &spec),
-            Some(vec![0]),
+            Some(vec![1]),
             "schema-bound canonical JSON text is safe to scan directly"
         );
 
@@ -5833,12 +5917,13 @@ mod tests {
     #[test]
     fn columnar_overlay_shadows_before_predicate_and_omits_tombstones() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "overlay_fixture",
-            "type": "object",
-            "properties": {
-                "active": { "type": "boolean" },
-                "lane": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "overlay_fixture",
+            "columns": [
+                { "name": "active", "type": "boolean", "nullable": false },
+                { "name": "lane", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["lane"],
         }))
         .expect("schema");
         let public_schema = Arc::new(Schema::new(vec![
@@ -5966,14 +6051,13 @@ mod tests {
     #[test]
     fn columnar_coordinate_masks_touch_only_the_affected_physical_groups() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "coordinate_mask_fixture",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "active": { "type": "boolean" }
-            },
-            "required": ["id", "active"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "coordinate_mask_fixture",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "active", "type": "boolean", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("schema");
         let snapshots = [

@@ -573,6 +573,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
     storage: Arc<StorageAdapter<StorageImpl>>,
     functions: FunctionProviderHandle,
+    /// PostgreSQL `CURRENT_TIMESTAMP`, fixed at this implicit transaction's start.
+    current_timestamp: Option<LixTimestamp>,
     /// Tracked-state revision observed by the coherent transaction-open read.
     /// Durable tracked publication must still be based on this revision;
     /// untracked current-state writes do not invalidate the tracked snapshot.
@@ -1657,6 +1659,7 @@ where
                     opening_read,
                     storage,
                     functions,
+                    current_timestamp: None,
                     opening_tracked_mutation_revision,
                     opening_active_branch_head,
                     opening_global_branch_head,
@@ -3482,17 +3485,23 @@ where
                             )
                         })?
                         .to_string();
-                    let definition = row
+                    let snapshot = row
                         .snapshot
                         .as_ref()
-                        .and_then(|snapshot| snapshot.get("value"))
-                        .cloned()
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
-                                "plugin schema row is missing its definition",
+                                "plugin schema row is missing its snapshot",
                             )
                         })?;
+                    let (snapshot_key, definition) =
+                        crate::schema::schema_from_registered_snapshot(snapshot)?;
+                    if snapshot_key.schema_key != schema_key {
+                        return Err(LixError::new(
+                            LixError::CODE_SCHEMA_DEFINITION,
+                            "plugin schema row identity does not match schema_key",
+                        ));
+                    }
                     Ok((schema_key, definition))
                 })
                 .collect::<Result<BTreeMap<_, _>, LixError>>()?;
@@ -6378,8 +6387,13 @@ where
                 .await?;
             let mut scalar_facts = PreparedScalarBatch::with_capacity(rows.len());
             for index in 0..rows.len() {
-                let normalized =
-                    normalize_raw_write_row_in_place(&mut rows, index, catalog, functions.clone())?;
+                let normalized = normalize_raw_write_row_in_place(
+                    &mut rows,
+                    index,
+                    catalog,
+                    functions.clone(),
+                    &mut default_timestamp,
+                )?;
                 scalar_facts.push(plan_prepared_row_scalars(
                     rows.row(index),
                     normalized,
@@ -6469,6 +6483,7 @@ where
                     index,
                     catalog,
                     functions.clone(),
+                    &mut default_timestamp,
                 )?);
             }
             // Preserve the historical domain-by-domain provider/error order:
@@ -9103,6 +9118,12 @@ where
         self.functions.clone()
     }
 
+    fn current_timestamp(&mut self) -> LixTimestamp {
+        *self
+            .current_timestamp
+            .get_or_insert_with(|| self.functions.call_timestamp())
+    }
+
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
         Ok(self.sql_visible_schemas())
     }
@@ -11227,12 +11248,14 @@ async fn preflight_owned_generation_upgrades(
                 format!("active plugin schema snapshot is invalid JSON: {error}"),
             )
         })?;
-        let definition = snapshot.get("value").cloned().ok_or_else(|| {
-            LixError::new(
+        let (snapshot_key, definition) =
+            crate::schema::schema_from_registered_snapshot(&snapshot)?;
+        if snapshot_key.schema_key != schema_key {
+            return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!("active plugin schema '{schema_key}' is missing its definition"),
-            )
-        })?;
+                format!("active plugin schema '{schema_key}' has mismatched snapshot identity"),
+            ));
+        }
         if registered_schema_definitions
             .insert(
                 (row.branch_id().to_string(), schema_key.to_string()),
@@ -12690,8 +12713,10 @@ mod tests {
             replacement: upgrade_test_entry('b'),
         };
         let definition = json!({
-            "x-lix-key": "csv_row",
-            "type": "object",
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "csv_row",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"],
         });
         let current = BTreeMap::from([(
             ("main".to_string(), "csv_row".to_string()),
@@ -12712,9 +12737,12 @@ mod tests {
             &BTreeMap::from([(
                 "csv_row".to_string(),
                 json!({
-                    "x-lix-key": "csv_row",
-                    "type": "object",
-                    "properties": { "extra": { "type": "string" } },
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "csv_row",
+                    "columns": [
+                        { "name": "extra", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["extra"],
                 }),
             )]),
         )
@@ -13916,7 +13944,7 @@ fallback={large_fallback} decoded={large_decoded}"
 
         let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
         invalid_row.snapshot = Some(TransactionJson::from_value_for_test(
-            json!({"key": "invalid-programmatic"}),
+            json!({"key": "invalid-programmatic", "extra": true}),
         ));
         let error = transaction
             .stage_rows(raw_write_rows(vec![invalid_row]))
@@ -14065,7 +14093,7 @@ fallback={large_fallback} decoded={large_decoded}"
     }
 
     #[tokio::test]
-    async fn stage_rows_rejects_snapshot_that_violates_json_schema_without_sql() {
+    async fn stage_rows_rejects_snapshot_with_unknown_schema_v1_column_without_sql() {
         let storage = Memory::new();
         let (hot_state, _binary_cas, branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
@@ -14073,12 +14101,12 @@ fallback={large_fallback} decoded={large_decoded}"
 
         let mut row = key_value_stage_row("schema-mismatch", "value", false);
         row.snapshot = Some(TransactionJson::from_value_for_test(
-            json!({"key": "schema-mismatch"}),
+            json!({"key": "schema-mismatch", "extra": true}),
         ));
         let error = transaction
             .stage_rows(raw_write_rows(vec![row]))
             .await
-            .expect_err("JSON Schema mismatch should fail statement validation");
+            .expect_err("unknown Schema v1 column should fail statement validation");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
@@ -14104,14 +14132,10 @@ fallback={large_fallback} decoded={large_decoded}"
         row.schema_key = "lix_registered_schema".into();
         row.snapshot = Some(TransactionJson::from_value_for_test(json!({
             "value": {
-                "x-lix-key": "malformed_registered_schema",
-                "x-lix-primary-key": ["id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "malformed_registered_schema",
+                "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                "primary_key": ["missing"]
             }
         })));
         row.entity_pk = None;
@@ -14123,7 +14147,7 @@ fallback={large_fallback} decoded={large_decoded}"
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("x-lix-primary-key"),
+            error.message.contains("unknown column 'missing'"),
             "error should explain malformed registered schema: {error:?}"
         );
     }
@@ -14146,7 +14170,7 @@ fallback={large_fallback} decoded={large_decoded}"
         assert!(
             error
                 .message
-                .contains("does not match x-lix-primary-key derived entity_pk"),
+                .contains("does not match primary_key-derived entity_pk"),
             "error should explain entity pk mismatch: {error:?}"
         );
     }
@@ -14381,7 +14405,11 @@ fallback={large_fallback} decoded={large_decoded}"
             .map(|schema| {
                 let key = crate::schema::schema_key_from_definition(schema)
                     .expect("seed schema key should derive");
-                let snapshot_content = json!({ "value": schema }).to_string();
+                let snapshot_content = json!({
+                    "schema_key": key.schema_key.clone(),
+                    "value": schema,
+                })
+                .to_string();
                 crate::tracked_state::MaterializedTrackedStateRow {
                     entity_pk: crate::schema::registered_schema_entity_pk(&key.schema_key)
                         .expect("registered schema identity should derive"),

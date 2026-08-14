@@ -519,7 +519,7 @@ async fn register_range_note_schema(
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"range_note\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-unique\":[[\"/ordinal\"]],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"ordinal\":{\"type\":\"integer\"},\"lane\":{\"type\":\"string\"},\"weight\":{\"type\":\"number\"}},\"required\":[\"id\",\"ordinal\",\"lane\",\"weight\"],\"additionalProperties\":false}'),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"range_note\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"ordinal\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"lane\",\"type\":\"text\",\"nullable\":false},{\"name\":\"weight\",\"type\":\"float8\",\"nullable\":false}],\"primary_key\":[\"id\"],\"unique\":[[\"ordinal\"]]}' AS JSONB),\
              false,\
              false\
              )",
@@ -586,7 +586,7 @@ async fn register_pushdown_note_schema(
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"pushdown_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"},\"optional\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"id\",\"kind\",\"title\",\"score\"],\"additionalProperties\":false}'),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"pushdown_note\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"kind\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false},{\"name\":\"score\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"optional\",\"type\":\"jsonb\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",

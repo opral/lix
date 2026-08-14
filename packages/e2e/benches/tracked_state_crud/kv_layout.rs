@@ -377,7 +377,8 @@ where
         let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan rows").into_parts();
+            .expect("scan rows")
+            .into_parts();
         rows += page.len();
         if !page_has_more {
             break;
@@ -440,7 +441,8 @@ where
         let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan kv layout accounting").into_parts();
+            .expect("scan kv layout accounting")
+            .into_parts();
 
         rows += page.len() as u64;
         key_bytes += page

@@ -140,27 +140,23 @@ async fn ordinal_range_ids(
         .collect()
 }
 
-async fn seeded_session(
-    schema_key: &str,
-    declare_unique: bool,
-    rows: usize,
-) -> Lix<Memory> {
+async fn seeded_session(schema_key: &str, declare_unique: bool, rows: usize) -> Lix<Memory> {
     let session = open_lix()
         .with_storage(Memory::default())
         .await
         .expect("open lix");
 
     let unique = if declare_unique {
-        r#""x-lix-unique":[["/ordinal"]],"#
+        r#","unique":[["ordinal"]]"#
     } else {
         ""
     };
     let schema = format!(
-        r#"{{"x-lix-key":"{schema_key}","x-lix-primary-key":["/id"],{unique}"type":"object","properties":{{"id":{{"type":"string"}},"ordinal":{{"type":"integer"}}}},"required":["id","ordinal"],"additionalProperties":false}}"#
+        r#"{{"$schema":"https://lix.dev/schema-v1.json","key":"{schema_key}","columns":[{{"name":"id","type":"text","nullable":false}},{{"name":"ordinal","type":"int8","nullable":false}}],"primary_key":["id"]{unique}}}"#
     );
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[Value::Text(schema)],
         )
         .await

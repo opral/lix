@@ -92,7 +92,7 @@ describe omission only; `is_nullable` still describes read values.
 
 ## Typed entity surfaces
 
-Registering an application schema with `x-lix-key: "acme_task"` produces:
+Registering a Schema v1 document with `key: "acme_task"` produces:
 
 | Surface                      | Use for                                                   |
 | :--------------------------- | :-------------------------------------------------------- |
@@ -122,9 +122,7 @@ composite-key lookups, and tombstones.
 `lix_registered_schema` is the authoritative schema registry:
 
 ```sql
-SELECT
-  lix_json_get_text(value, 'x-lix-key') AS schema_key,
-  lix_json_get(value, 'x-lix-primary-key') AS primary_key
+SELECT schema_key, value -> 'primary_key' AS primary_key
 FROM lix_registered_schema
 ORDER BY schema_key;
 ```
@@ -135,7 +133,7 @@ relation. The storage-level schemas `lix_file_descriptor`,
 `lix_directory_descriptor`, and `lix_binary_blob_ref` are registered for
 interoperability while their implementation relations are private.
 
-Applications and plugins cannot register the exact `x-lix-key` `lix` or a key
+Applications and plugins cannot register the exact Schema v1 key `lix` or a key
 beginning with `lix_`; their base or generated SQL names occupy the namespace
 reserved for Lix bootstrap schemas. Use an owner-specific prefix such as
 `acme_task`.

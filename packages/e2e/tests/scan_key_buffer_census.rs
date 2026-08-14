@@ -49,18 +49,16 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
         .expect("open census lix");
 
     let schema = serde_json::json!({
-        "x-lix-key": SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "ordinal": { "type": "number" }
-        },
-        "required": ["id", "ordinal"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "ordinal", "type": "float8", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await
@@ -96,7 +94,11 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
         .execute(&format!("SELECT id, ordinal FROM {SCHEMA_KEY}"), &[])
         .await
         .expect("scan census rows");
-    assert_eq!(result.rows().len(), ROWS, "the census must observe a full scan");
+    assert_eq!(
+        result.rows().len(),
+        ROWS,
+        "the census must observe a full scan"
+    );
 
     let (allocations, allocated_bytes) = take_scan_key_buffer_census();
     let (rows_decoded, ..) = take_hot_scan_refcount_census();

@@ -431,11 +431,11 @@ fn builtin_schema_property_names(schema_key: &str) -> BTreeSet<String> {
     let schema = serde_json::from_str::<serde_json::Value>(schema)
         .expect("builtin schema fixture should parse");
     schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-        .expect("builtin schema should define properties")
-        .keys()
-        .cloned()
+        .get("columns")
+        .and_then(serde_json::Value::as_array)
+        .expect("builtin schema should define columns")
+        .iter()
+        .map(|column| column["name"].as_str().expect("column name").to_string())
         .collect::<BTreeSet<_>>()
 }
 

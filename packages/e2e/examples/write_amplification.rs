@@ -71,8 +71,8 @@ impl BenchStorage for RocksDB {
     }
 }
 
-const SEED_SQL: &str = "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
-const UPDATE_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+const SEED_SQL: &str = "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))";
+const UPDATE_SQL: &str = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
 const READ_SQL: &str = "SELECT value FROM json_pointer WHERE path = $1";
 const SEED_COMMIT_ROWS: usize = 1_000;
 const MIN_RUN: usize = 6;
@@ -159,22 +159,18 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
     let session = lix.open_another_session().await.expect("open session");
 
     let schema = serde_json::json!({
-        "x-lix-key": "json_pointer",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "json_pointer",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

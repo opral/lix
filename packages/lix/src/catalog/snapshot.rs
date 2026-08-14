@@ -1,16 +1,15 @@
 use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
-use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use smallvec::SmallVec;
 
 use crate::LixError;
-use crate::common::{format_json_pointer, parse_json_pointer};
+use crate::common::format_json_pointer;
 use crate::domain::{Domain, DomainSchemaIdentity};
 use crate::entity_pk::{EntityPk, canonical_json_text};
 use crate::functions::FunctionProviderHandle;
-use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
 use crate::plugin::runtime::WasmEntityKey;
+use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
 
 #[derive(Default)]
 pub(crate) struct CatalogSnapshot {
@@ -47,13 +46,14 @@ impl CatalogSnapshot {
     pub(crate) fn from_visible_schemas(visible_schemas: &[JsonValue]) -> Result<Self, LixError> {
         let mut catalog = Self::default();
         for schema in visible_schemas {
-            let key = crate::schema::schema_key_from_definition(schema)?;
+            let schema = schema.clone();
+            let key = crate::schema::schema_key_from_definition(&schema)?;
             let catalog_key = SchemaCatalogKey::from_schema_key(key);
             let identity = DomainSchemaIdentity::new(
                 Domain::schema_catalog(crate::GLOBAL_BRANCH_ID, true),
                 catalog_key.schema_key.clone(),
             );
-            catalog.remember_schema_identity(identity, catalog_key, schema.clone())?;
+            catalog.remember_schema_identity(identity, catalog_key, schema)?;
         }
         catalog.rebuild_plans()?;
         Ok(catalog)
@@ -380,7 +380,7 @@ pub(crate) struct SchemaPlan {
     pub(crate) key: SchemaCatalogKey,
     pub(crate) schema: Arc<JsonValue>,
     fingerprint: Arc<SchemaPlanFingerprint>,
-    pub(crate) compiled_schema: JSONSchema,
+    pub(crate) compiled_schema: lix_schema::CompiledSchema,
     fast_object_validation: Option<FastObjectValidationPlan>,
     pub(crate) defaults: DefaultPlan,
     pub(crate) primary_key: Option<PointerGroup>,
@@ -725,7 +725,7 @@ impl SchemaPlan {
             *blake3::hash(canonical_schema.as_bytes()).as_bytes(),
         ));
         let compiled_schema = compile_lix_schema(&schema)?;
-        let fast_object_validation = FastObjectValidationPlan::compile(&schema);
+        let fast_object_validation = FastObjectValidationPlan::compile_v1(&schema);
         let defaults = DefaultPlan::from_schema(&schema);
         let primary_key = primary_key_paths(&schema)?;
         let primary_key_component_types = primary_key
@@ -759,37 +759,34 @@ fn primary_key_component_types(
     schema: &JsonValue,
     paths: &[Vec<String>],
 ) -> Result<Vec<crate::entity_pk::EntityPkComponentType>, LixError> {
+    let schema = crate::schema::parse_lix_schema(schema)?;
     paths
         .iter()
         .enumerate()
         .map(|(index, path)| {
-            let property = path.iter().try_fold(schema, |current, segment| {
-                current.get("properties")?.get(segment)
-            });
-            let Some(property) = property else {
+            let [name] = path.as_slice() else {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
-                    format!("primary-key path at index {index} has no property schema"),
+                    format!("primary-key path at index {index} must name one column"),
                 ));
             };
-            match (
-                property.get("type").and_then(JsonValue::as_str),
-                property.get("format").and_then(JsonValue::as_str),
-                property.get("contentEncoding").and_then(JsonValue::as_str),
-            ) {
-                (Some("integer"), _, _) => Ok(crate::entity_pk::EntityPkComponentType::Integer),
-                (Some("string"), Some("uuid"), _) => {
-                    Ok(crate::entity_pk::EntityPkComponentType::Uuid)
-                }
-                (Some("string"), _, Some("base64")) => {
-                    Ok(crate::entity_pk::EntityPkComponentType::Bytes)
-                }
-                (Some("string"), _, _) => Ok(crate::entity_pk::EntityPkComponentType::String),
+            let column = schema
+                .columns
+                .iter()
+                .find(|column| &column.name == name)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!("primary-key column '{name}' does not exist"),
+                    )
+                })?;
+            match column.data_type {
+                lix_schema::DataType::Int8 => Ok(crate::entity_pk::EntityPkComponentType::Integer),
+                lix_schema::DataType::Uuid => Ok(crate::entity_pk::EntityPkComponentType::Uuid),
+                lix_schema::DataType::Text => Ok(crate::entity_pk::EntityPkComponentType::String),
                 _ => Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "primary-key path at index {index} must be an integer, string, UUID string, or base64 string"
-                    ),
+                    format!("primary-key column at index {index} must be bigint, text, or uuid"),
                 )),
             }
         })
@@ -805,47 +802,53 @@ struct FastObjectValidationPlan {
 }
 
 impl FastObjectValidationPlan {
-    fn compile(schema: &JsonValue) -> Option<Self> {
-        let schema = schema.as_object()?;
-        if schema.get("type")?.as_str()? != "object" {
-            return None;
-        }
-        if schema.keys().any(|key| !fast_object_root_keyword(key)) {
-            return None;
-        }
-        Self::compile_object(schema)
-    }
-
-    fn compile_object(schema: &JsonMap<String, JsonValue>) -> Option<Self> {
+    fn compile_v1(schema: &JsonValue) -> Option<Self> {
+        let schema = crate::schema::parse_lix_schema(schema).ok()?;
         let mut properties = BTreeMap::new();
-        if let Some(property_schemas) = schema.get("properties") {
-            for (name, schema) in property_schemas.as_object()? {
-                properties.insert(name.clone(), FastValueValidation::compile_property(schema)?);
+        let mut required = Vec::new();
+        for column in schema.columns {
+            let nullable = column.nullable;
+            let validation = match column.data_type {
+                lix_schema::DataType::Text => FastValueValidation::Types(FastJsonTypes(
+                    FastJsonTypes::STRING | if nullable { FastJsonTypes::NULL } else { 0 },
+                )),
+                lix_schema::DataType::Uuid => {
+                    let validation = FastStringValidation::Uuid;
+                    if nullable {
+                        FastValueValidation::StringOrNull(validation)
+                    } else {
+                        FastValueValidation::String(validation)
+                    }
+                }
+                lix_schema::DataType::Int8 => FastValueValidation::Types(FastJsonTypes(
+                    FastJsonTypes::INTEGER | if nullable { FastJsonTypes::NULL } else { 0 },
+                )),
+                lix_schema::DataType::Float8 => FastValueValidation::Types(FastJsonTypes(
+                    FastJsonTypes::NUMBER | if nullable { FastJsonTypes::NULL } else { 0 },
+                )),
+                lix_schema::DataType::Boolean => FastValueValidation::Types(FastJsonTypes(
+                    FastJsonTypes::BOOLEAN | if nullable { FastJsonTypes::NULL } else { 0 },
+                )),
+                lix_schema::DataType::Jsonb => FastValueValidation::Types(FastJsonTypes::ANY),
+                lix_schema::DataType::Timestamptz => {
+                    let validation = FastStringValidation::Timestamptz;
+                    if nullable {
+                        FastValueValidation::StringOrNull(validation)
+                    } else {
+                        FastValueValidation::String(validation)
+                    }
+                }
+            };
+            if !nullable && column.default_value.is_none() && column.default_expression.is_none() {
+                required.push(column.name.clone());
             }
+            properties.insert(column.name, validation);
         }
-        let required = if let Some(required) = schema.get("required") {
-            required
-                .as_array()?
-                .iter()
-                .map(|name| name.as_str().map(str::to_string))
-                .collect::<Option<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        let additional_properties = if let Some(value) = schema.get("additionalProperties") {
-            value.as_bool()?
-        } else {
-            true
-        };
-        let min_properties = match schema.get("minProperties") {
-            Some(value) => usize::try_from(value.as_u64()?).ok()?,
-            None => 0,
-        };
         Some(Self {
             properties,
             required,
-            additional_properties,
-            min_properties,
+            additional_properties: false,
+            min_properties: 0,
         })
     }
 
@@ -879,114 +882,20 @@ impl FastObjectValidationPlan {
     }
 }
 
-fn fast_object_root_keyword(key: &str) -> bool {
-    matches!(
-        key,
-        "type"
-            | "properties"
-            | "required"
-            | "additionalProperties"
-            | "minProperties"
-            | "description"
-            | "examples"
-            | "$schema"
-    ) || key.starts_with("x-lix-")
-}
-
 #[derive(Debug)]
 enum FastValueValidation {
     Types(FastJsonTypes),
     String(FastStringValidation),
-    Array(FastArrayValidation),
-    Object(FastObjectValidationPlan),
     StringOrNull(FastStringValidation),
 }
 
 impl FastValueValidation {
-    fn compile_property(schema: &JsonValue) -> Option<Self> {
-        let schema = schema.as_object()?;
-        if schema.keys().any(|key| !fast_property_keyword(key)) {
-            return None;
-        }
-
-        match (schema.get("type"), schema.get("anyOf")) {
-            (None, Some(options)) => Self::compile_any_of(schema, options),
-            (None, None) => {
-                if schema.keys().all(|key| fast_property_annotation(key)) {
-                    Some(Self::Types(FastJsonTypes::ANY))
-                } else {
-                    None
-                }
-            }
-            (Some(_), Some(_)) => None,
-            (Some(types), None) => {
-                let types = FastJsonTypes::compile_types(types)?;
-                if schema
-                    .keys()
-                    .all(|key| key == "type" || fast_property_annotation(key))
-                {
-                    return Some(Self::Types(types));
-                }
-                match types.0 {
-                    FastJsonTypes::STRING if schema.keys().all(|key| fast_string_keyword(key)) => {
-                        FastStringValidation::compile(schema).map(Self::String)
-                    }
-                    FastJsonTypes::ARRAY if schema.keys().all(|key| fast_array_keyword(key)) => {
-                        FastArrayValidation::compile(schema).map(Self::Array)
-                    }
-                    FastJsonTypes::OBJECT
-                        if schema.keys().all(|key| fast_nested_object_keyword(key)) =>
-                    {
-                        FastObjectValidationPlan::compile_object(schema).map(Self::Object)
-                    }
-                    _ => None,
-                }
-            }
-        }
-    }
-
-    fn compile_any_of(schema: &JsonMap<String, JsonValue>, options: &JsonValue) -> Option<Self> {
-        if !schema
-            .keys()
-            .all(|key| key == "anyOf" || fast_property_annotation(key))
-        {
-            return None;
-        }
-        let options = options.as_array()?;
-        if options.is_empty() {
-            return None;
-        }
-
-        let mut simple_types = 0u16;
-        let mut constrained_string = None;
-        for option in options {
-            match Self::compile_property(option)? {
-                Self::Types(types) => simple_types |= types.0,
-                Self::String(validation) if constrained_string.is_none() => {
-                    constrained_string = Some(validation);
-                }
-                _ => return None,
-            }
-        }
-        match constrained_string {
-            None => Some(Self::Types(FastJsonTypes(simple_types))),
-            Some(validation) if simple_types == FastJsonTypes::NULL => {
-                Some(Self::StringOrNull(validation))
-            }
-            Some(_) => None,
-        }
-    }
-
     fn accepts(&self, value: &JsonValue) -> bool {
         match self {
             Self::Types(types) => types.accepts(value),
             Self::String(validation) => value
                 .as_str()
                 .is_some_and(|value| validation.accepts(value)),
-            Self::Array(validation) => value
-                .as_array()
-                .is_some_and(|value| validation.accepts(value)),
-            Self::Object(validation) => validation.accepts(value),
             Self::StringOrNull(validation) => {
                 value.is_null()
                     || value
@@ -1017,12 +926,6 @@ impl FastValueValidation {
             (
                 Self::String(_) | Self::StringOrNull(_),
                 TypedJsonScalarRef::Boolean | TypedJsonScalarRef::Null,
-            )
-            | (
-                Self::Array(_) | Self::Object(_),
-                TypedJsonScalarRef::Null
-                | TypedJsonScalarRef::Boolean
-                | TypedJsonScalarRef::String(_),
             ) => false,
         }
     }
@@ -1030,11 +933,6 @@ impl FastValueValidation {
     fn supports_canonical_streaming(&self) -> bool {
         match self {
             Self::Types(_) | Self::String(_) | Self::StringOrNull(_) => true,
-            Self::Array(validation) => validation
-                .items
-                .as_deref()
-                .is_none_or(Self::supports_canonical_streaming),
-            Self::Object(validation) => validation.supports_canonical_streaming(),
         }
     }
 }
@@ -1046,274 +944,22 @@ fn typed_object_validation_error(schema_key: &str, message: &str) -> LixError {
     )
 }
 
-fn fast_property_keyword(key: &str) -> bool {
-    key == "type"
-        || key == "anyOf"
-        || fast_property_annotation(key)
-        || matches!(
-            key,
-            "minLength"
-                | "const"
-                | "enum"
-                | "pattern"
-                | "minItems"
-                | "items"
-                | "properties"
-                | "required"
-                | "additionalProperties"
-                | "minProperties"
-                | "format"
-        )
-}
-
-fn fast_property_annotation(key: &str) -> bool {
-    matches!(
-        key,
-        "description" | "examples" | "default" | "x-lix-default"
-    )
-}
-
-fn fast_string_keyword(key: &str) -> bool {
-    key == "type"
-        || fast_property_annotation(key)
-        || matches!(key, "minLength" | "const" | "enum" | "pattern" | "format")
-}
-
-fn fast_array_keyword(key: &str) -> bool {
-    key == "type" || fast_property_annotation(key) || matches!(key, "minItems" | "items")
-}
-
-fn fast_nested_object_keyword(key: &str) -> bool {
-    key == "type"
-        || fast_property_annotation(key)
-        || matches!(
-            key,
-            "properties" | "required" | "additionalProperties" | "minProperties"
-        )
-}
-
 #[derive(Debug)]
-struct FastStringValidation {
-    min_length: usize,
-    constant: Option<String>,
-    enum_values: Option<Vec<String>>,
-    pattern: Option<FastAsciiPattern>,
-    uuid: bool,
+enum FastStringValidation {
+    Uuid,
+    Timestamptz,
 }
 
 impl FastStringValidation {
-    fn compile(schema: &JsonMap<String, JsonValue>) -> Option<Self> {
-        let min_length = match schema.get("minLength") {
-            Some(value) => usize::try_from(value.as_u64()?).ok()?,
-            None => 0,
-        };
-        let constant = match schema.get("const") {
-            Some(value) => Some(value.as_str()?.to_string()),
-            None => None,
-        };
-        let enum_values = match schema.get("enum") {
-            Some(values) => Some(
-                values
-                    .as_array()?
-                    .iter()
-                    .map(|value| value.as_str().map(str::to_string))
-                    .collect::<Option<Vec<_>>>()?,
-            ),
-            None => None,
-        };
-        let pattern = match schema.get("pattern") {
-            Some(value) => Some(FastAsciiPattern::compile(value.as_str()?)?),
-            None => None,
-        };
-        let uuid = match schema.get("format") {
-            Some(value) if value.as_str()? == "uuid" => true,
-            Some(_) => return None,
-            None => false,
-        };
-        Some(Self {
-            min_length,
-            constant,
-            enum_values,
-            pattern,
-            uuid,
-        })
-    }
-
     fn accepts(&self, value: &str) -> bool {
-        if self.min_length != 0 && value.chars().take(self.min_length).count() < self.min_length {
-            return false;
+        match self {
+            Self::Uuid => uuid::Uuid::parse_str(value).is_ok(),
+            Self::Timestamptz => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
         }
-        if self.uuid && uuid::Uuid::parse_str(value).is_err() {
-            return false;
-        }
-        if self
-            .constant
-            .as_deref()
-            .is_some_and(|constant| value != constant)
-        {
-            return false;
-        }
-        if self
-            .enum_values
-            .as_ref()
-            .is_some_and(|values| !values.iter().any(|candidate| candidate == value))
-        {
-            return false;
-        }
-        self.pattern.is_none_or(|pattern| pattern.accepts(value))
     }
 
     fn accepts_canonical(&self, value: CanonicalJsonString<'_>) -> bool {
-        if self.min_length != 0 && value.chars().take(self.min_length).count() < self.min_length {
-            return false;
-        }
-        if self.uuid && uuid::Uuid::parse_str(value.encoded).is_err() {
-            return false;
-        }
-        if self
-            .constant
-            .as_deref()
-            .is_some_and(|constant| !value.eq_str(constant))
-        {
-            return false;
-        }
-        if self
-            .enum_values
-            .as_ref()
-            .is_some_and(|values| !values.iter().any(|candidate| value.eq_str(candidate)))
-        {
-            return false;
-        }
-        self.pattern
-            .is_none_or(|pattern| pattern.accepts_canonical(value))
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum FastAsciiPattern {
-    FractionalOrderKey,
-    JsonWhitespace,
-    NonEmptyBase64Url,
-    SafeAsciiDelimiter,
-    PrintableNonSpaceAscii,
-}
-
-impl FastAsciiPattern {
-    fn compile(pattern: &str) -> Option<Self> {
-        Some(match pattern {
-            r"^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$" => Self::FractionalOrderKey,
-            r"^[\t\n\r ]*$" => Self::JsonWhitespace,
-            r"^[A-Za-z0-9_-]+$" => Self::NonEmptyBase64Url,
-            r"^(?:\t|[ -~])$" => Self::SafeAsciiDelimiter,
-            r"^[!-~]$" => Self::PrintableNonSpaceAscii,
-            _ => return None,
-        })
-    }
-
-    fn accepts(self, value: &str) -> bool {
-        let bytes = value.as_bytes();
-        match self {
-            Self::FractionalOrderKey => {
-                bytes.len() >= 2
-                    && bytes.len().is_multiple_of(2)
-                    && bytes.iter().all(u8::is_ascii_hexdigit)
-                    && bytes.iter().all(|byte| !byte.is_ascii_uppercase())
-                    && bytes[bytes.len() - 2..] != *b"00"
-            }
-            Self::JsonWhitespace => bytes
-                .iter()
-                .all(|byte| matches!(byte, b'\t' | b'\n' | b'\r' | b' ')),
-            Self::NonEmptyBase64Url => {
-                !bytes.is_empty()
-                    && bytes
-                        .iter()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            }
-            Self::SafeAsciiDelimiter => {
-                matches!(bytes, [b'\t'] | [b' '..=b'~'])
-            }
-            Self::PrintableNonSpaceAscii => matches!(bytes, [b'!'..=b'~']),
-        }
-    }
-
-    fn accepts_canonical(self, value: CanonicalJsonString<'_>) -> bool {
-        match self {
-            Self::FractionalOrderKey => {
-                let mut length = 0_usize;
-                let mut penultimate = None;
-                let mut last = None;
-                for scalar in value.chars() {
-                    if !matches!(scalar, '0'..='9' | 'a'..='f') {
-                        return false;
-                    }
-                    length += 1;
-                    penultimate = last;
-                    last = Some(scalar);
-                }
-                length >= 2
-                    && length.is_multiple_of(2)
-                    && !matches!((penultimate, last), (Some('0'), Some('0')))
-            }
-            Self::JsonWhitespace => value
-                .chars()
-                .all(|scalar| matches!(scalar, '\t' | '\n' | '\r' | ' ')),
-            Self::NonEmptyBase64Url => {
-                let mut empty = true;
-                for scalar in value.chars() {
-                    empty = false;
-                    if !scalar.is_ascii_alphanumeric() && !matches!(scalar, '_' | '-') {
-                        return false;
-                    }
-                }
-                !empty
-            }
-            Self::SafeAsciiDelimiter => {
-                let mut chars = value.chars();
-                matches!(chars.next(), Some('\t' | ' '..='~')) && chars.next().is_none()
-            }
-            Self::PrintableNonSpaceAscii => {
-                let mut chars = value.chars();
-                matches!(chars.next(), Some('!'..='~')) && chars.next().is_none()
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct FastArrayValidation {
-    min_items: usize,
-    items: Option<Box<FastValueValidation>>,
-}
-
-impl FastArrayValidation {
-    fn compile(schema: &JsonMap<String, JsonValue>) -> Option<Self> {
-        let min_items = match schema.get("minItems") {
-            Some(value) => usize::try_from(value.as_u64()?).ok()?,
-            None => 0,
-        };
-        let items = match schema.get("items") {
-            Some(schema) => {
-                let validation = FastValueValidation::compile_property(schema)?;
-                let string_items = matches!(
-                    &validation,
-                    FastValueValidation::Types(types) if types.0 == FastJsonTypes::STRING
-                ) || matches!(&validation, FastValueValidation::String(_));
-                if !string_items {
-                    return None;
-                }
-                Some(Box::new(validation))
-            }
-            None => None,
-        };
-        Some(Self { min_items, items })
-    }
-
-    fn accepts(&self, value: &[JsonValue]) -> bool {
-        value.len() >= self.min_items
-            && self
-                .items
-                .as_ref()
-                .is_none_or(|items| value.iter().all(|value| items.accepts(value)))
+        self.accepts(value.encoded)
     }
 }
 
@@ -1337,31 +983,6 @@ impl FastJsonTypes {
             | Self::ARRAY
             | Self::OBJECT,
     );
-
-    fn compile_types(types: &JsonValue) -> Option<Self> {
-        let mut mask = 0;
-        if let Some(value) = types.as_str() {
-            mask |= Self::type_bit(value)?;
-        } else {
-            for value in types.as_array()? {
-                mask |= Self::type_bit(value.as_str()?)?;
-            }
-        }
-        Some(Self(mask))
-    }
-
-    fn type_bit(value: &str) -> Option<u16> {
-        Some(match value {
-            "null" => Self::NULL,
-            "boolean" => Self::BOOLEAN,
-            "number" => Self::NUMBER,
-            "integer" => Self::INTEGER,
-            "string" => Self::STRING,
-            "array" => Self::ARRAY,
-            "object" => Self::OBJECT,
-            _ => return None,
-        })
-    }
 
     fn accepts(self, value: &JsonValue) -> bool {
         let bit = match value {
@@ -1720,20 +1341,8 @@ impl<'a> CanonicalPluginRowParser<'a> {
                 let string = self.parse_string()?;
                 self.push_node(ParsedJsonNode::String(string))
             }
-            Some(b'{') => {
-                let object_validation = match validation {
-                    Some(FastValueValidation::Object(validation)) => Some(validation),
-                    _ => None,
-                };
-                self.parse_object(object_validation, None, depth)?
-            }
-            Some(b'[') => {
-                let array_validation = match validation {
-                    Some(FastValueValidation::Array(validation)) => Some(validation),
-                    _ => None,
-                };
-                self.parse_array(array_validation, depth)?
-            }
+            Some(b'{') => self.parse_object(None, None, depth)?,
+            Some(b'[') => self.parse_array(depth)?,
             Some(b'n') => {
                 self.parse_literal(b"null")?;
                 self.push_node(ParsedJsonNode::Exact {
@@ -1923,21 +1532,13 @@ impl<'a> CanonicalPluginRowParser<'a> {
         }
     }
 
-    fn parse_array(
-        &mut self,
-        validation: Option<&FastArrayValidation>,
-        depth: usize,
-    ) -> Result<ParsedJsonValue, CanonicalPluginRowError> {
+    fn parse_array(&mut self, depth: usize) -> Result<ParsedJsonValue, CanonicalPluginRowError> {
         let start = self.offset;
         self.expect_byte(b'[')?;
         let mut canonical = !self.skip_whitespace();
         let mut first_element = None;
         let mut last_element = None::<usize>;
-        let mut item_count = 0_usize;
         if self.consume_byte(b']') {
-            if validation.is_some_and(|validation| validation.min_items > 0) {
-                self.record_schema("snapshot array has too few items".to_owned());
-            }
             return Ok(if canonical {
                 self.push_node(ParsedJsonNode::Exact {
                     encoded: &self.input[start..self.offset],
@@ -1948,8 +1549,7 @@ impl<'a> CanonicalPluginRowParser<'a> {
             });
         }
         loop {
-            let value =
-                self.parse_value(validation.and_then(|plan| plan.items.as_deref()), depth + 1)?;
+            let value = self.parse_value(None, depth + 1)?;
             canonical &= self.value_is_canonical(value);
             let element = self.elements.len();
             self.elements.push(ParsedJsonElement { value, next: None });
@@ -1959,7 +1559,6 @@ impl<'a> CanonicalPluginRowParser<'a> {
                 first_element = Some(element);
             }
             last_element = Some(element);
-            item_count += 1;
             canonical &= !self.skip_whitespace();
             match self.peek() {
                 Some(b',') => {
@@ -1976,9 +1575,6 @@ impl<'a> CanonicalPluginRowParser<'a> {
                     ));
                 }
             }
-        }
-        if validation.is_some_and(|validation| item_count < validation.min_items) {
-            self.record_schema("snapshot array has too few items".to_owned());
         }
         if canonical {
             Ok(self.push_node(ParsedJsonNode::Exact {
@@ -2274,8 +1870,6 @@ impl<'a> CanonicalPluginRowParser<'a> {
                     ParsedJsonString::Decoded(value) => validation.accepts(value),
                 })
             }
-            FastValueValidation::Array(_) => self.value_kind(value) == CanonicalJsonKind::Array,
-            FastValueValidation::Object(_) => self.value_kind(value) == CanonicalJsonKind::Object,
             FastValueValidation::StringOrNull(validation) => {
                 self.value_kind(value) == CanonicalJsonKind::Null
                     || self.value_string(value).is_some_and(|value| match value {
@@ -2360,8 +1954,7 @@ struct DefaultPropertyPlan {
 enum DefaultValuePlan {
     Json(JsonValue),
     UuidV7,
-    Timestamp,
-    Cel(String),
+    CurrentTimestamp,
 }
 
 impl DefaultPlan {
@@ -2370,48 +1963,44 @@ impl DefaultPlan {
     }
 
     pub(crate) fn from_schema(schema: &JsonValue) -> Self {
-        let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
+        let Ok(schema) = crate::schema::parse_lix_schema(schema) else {
             return Self::default();
         };
-        let mut ordered_properties = properties.iter().collect::<Vec<_>>();
-        ordered_properties.sort_by_key(|(left_name, _)| *left_name);
-
-        let properties = ordered_properties
+        let properties = schema
+            .columns
             .into_iter()
-            .filter_map(|(field_name, field_schema)| {
-                if let Some(expression) = field_schema
-                    .get("x-lix-default")
-                    .and_then(JsonValue::as_str)
-                {
+            .filter_map(|column| {
+                if let Some(expression) = column.default_expression {
                     let default = match expression.trim() {
-                        "lix_uuid_v7()" => DefaultValuePlan::UuidV7,
-                        "lix_timestamp()" => DefaultValuePlan::Timestamp,
-                        _ => DefaultValuePlan::Cel(expression.to_string()),
+                        "uuidv7()" => DefaultValuePlan::UuidV7,
+                        "CURRENT_TIMESTAMP" => DefaultValuePlan::CurrentTimestamp,
+                        _ => unreachable!("Schema v1 rejects unsupported default expressions"),
                     };
                     return Some(DefaultPropertyPlan {
-                        field_name: field_name.clone(),
+                        field_name: column.name,
                         default,
                     });
                 }
-                field_schema
-                    .get("default")
-                    .map(|value| DefaultPropertyPlan {
-                        field_name: field_name.clone(),
-                        default: DefaultValuePlan::Json(value.clone()),
-                    })
+                column.default_value.map(|value| DefaultPropertyPlan {
+                    field_name: column.name,
+                    default: DefaultValuePlan::Json(value),
+                })
             })
             .collect();
         Self { properties }
     }
 
-    pub(crate) fn apply(
+    pub(crate) fn apply<F>(
         &self,
         snapshot: &mut JsonMap<String, JsonValue>,
         functions: FunctionProviderHandle,
-        schema_key: &str,
-    ) -> Result<bool, LixError> {
+        _schema_key: &str,
+        mut current_timestamp: F,
+    ) -> Result<bool, LixError>
+    where
+        F: FnMut() -> Result<crate::common::LixTimestamp, LixError>,
+    {
         let mut changed = false;
-        let mut cel_context = None::<JsonMap<String, JsonValue>>;
         for property in &self.properties {
             if snapshot.contains_key(&property.field_name) {
                 continue;
@@ -2419,22 +2008,8 @@ impl DefaultPlan {
             let value = match &property.default {
                 DefaultValuePlan::Json(value) => value.clone(),
                 DefaultValuePlan::UuidV7 => JsonValue::String(functions.call_uuid_v7().to_string()),
-                DefaultValuePlan::Timestamp => {
-                    JsonValue::String(functions.call_timestamp().to_string())
-                }
-                DefaultValuePlan::Cel(expression) => {
-                    let context = cel_context.get_or_insert_with(|| snapshot.clone());
-                    crate::cel::shared_runtime()
-                        .evaluate_with_functions(expression, context, functions.clone())
-                        .map_err(|err| LixError {
-                            code: "LIX_ERROR_UNKNOWN".to_string(),
-                            message: format!(
-                                "failed to evaluate x-lix-default for '{}.{}': {}",
-                                schema_key, property.field_name, err.message
-                            ),
-                            hint: None,
-                            details: None,
-                        })?
+                DefaultValuePlan::CurrentTimestamp => {
+                    JsonValue::String(current_timestamp()?.to_string())
                 }
             };
             snapshot.insert(property.field_name.clone(), value);
@@ -2537,132 +2112,53 @@ impl SchemaCatalogFact {
 }
 
 fn primary_key_paths(schema: &JsonValue) -> Result<Option<Vec<Vec<String>>>, LixError> {
-    let Some(primary_key) = schema.get("x-lix-primary-key") else {
-        return Ok(None);
-    };
-    let primary_key = primary_key.as_array().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            "schema x-lix-primary-key must be an array of JSON Pointers",
-        )
-    })?;
-    primary_key
-        .iter()
-        .enumerate()
-        .map(|(index, pointer)| {
-            let pointer = pointer.as_str().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!("schema x-lix-primary-key entry at index {index} must be a string"),
-                )
-            })?;
-            parse_json_pointer(pointer)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    let schema = crate::schema::parse_lix_schema(schema)?;
+    Ok(Some(
+        schema
+            .primary_key
+            .into_iter()
+            .map(|column| vec![column])
+            .collect(),
+    ))
 }
 
 fn pointer_groups(schema: &JsonValue, field: &str) -> Result<Vec<PointerGroup>, LixError> {
-    let Some(value) = schema.get(field) else {
-        return Ok(Vec::new());
-    };
-    let groups = value
-        .as_array()
-        .map(|groups| groups.iter().collect::<Vec<_>>())
-        .unwrap_or_default();
-    groups
+    let schema = crate::schema::parse_lix_schema(schema)?;
+    if field != "unique" && field != "x-lix-unique" {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("unsupported Schema v1 pointer group '{field}'"),
+        ));
+    }
+    Ok(schema
+        .unique
         .into_iter()
-        .map(|group| {
-            let group = group.as_array().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!("schema {field} must contain arrays of JSON Pointers"),
-                )
-            })?;
-            group
-                .iter()
-                .enumerate()
-                .map(|(index, pointer)| {
-                    let pointer = pointer.as_str().ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_SCHEMA_DEFINITION,
-                            format!("schema {field} entry at index {index} must be a string"),
-                        )
-                    })?;
-                    parse_json_pointer(pointer)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect()
+        .map(|group| group.into_iter().map(|column| vec![column]).collect())
+        .collect())
 }
 
 fn foreign_key_plans(schema: &JsonValue) -> Result<Vec<UnboundForeignKeyPlan>, LixError> {
-    let Some(value) = schema.get("x-lix-foreign-keys") else {
-        return Ok(Vec::new());
-    };
-    let Some(foreign_keys) = value.as_array() else {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            "schema x-lix-foreign-keys must be an array",
-        ));
-    };
-
-    foreign_keys
-        .iter()
-        .enumerate()
-        .map(|(index, foreign_key)| {
-            let object = foreign_key.as_object().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!("x-lix-foreign-keys[{index}] must be an object"),
-                )
-            })?;
-            let references = object
-                .get("references")
-                .and_then(JsonValue::as_object)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_DEFINITION,
-                        format!("x-lix-foreign-keys[{index}].references must be an object"),
-                    )
-                })?;
-            let referenced_schema_key = references
-                .get("schemaKey")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_DEFINITION,
-                        format!(
-                            "x-lix-foreign-keys[{index}].references.schemaKey must be a string"
-                        ),
-                    )
-                })?
-                .to_string();
-            let local_properties = pointer_array(
-                object.get("properties"),
-                &format!("x-lix-foreign-keys[{index}].properties"),
-            )?;
-            let referenced_properties = pointer_array(
-                references.get("properties"),
-                &format!("x-lix-foreign-keys[{index}].references.properties"),
-            )?;
-            if local_properties.len() != referenced_properties.len() {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "x-lix-foreign-keys[{index}] properties and references.properties must have the same length"
-                    ),
-                ));
-            }
-            Ok(UnboundForeignKeyPlan {
-                local_properties,
-                referenced_schema: SchemaCatalogKey {
-                    schema_key: referenced_schema_key,
-                },
-                referenced_properties,
-            })
+    let schema = crate::schema::parse_lix_schema(schema)?;
+    Ok(schema
+        .foreign_keys
+        .into_iter()
+        .map(|foreign_key| UnboundForeignKeyPlan {
+            local_properties: foreign_key
+                .columns
+                .into_iter()
+                .map(|column| vec![column])
+                .collect(),
+            referenced_schema: SchemaCatalogKey {
+                schema_key: foreign_key.references.schema_key,
+            },
+            referenced_properties: foreign_key
+                .references
+                .columns
+                .into_iter()
+                .map(|column| vec![column])
+                .collect(),
         })
-        .collect()
+        .collect())
 }
 
 fn bind_foreign_key_plans(
@@ -2706,38 +2202,13 @@ fn bind_foreign_key_plans(
                 .iter()
                 .zip(foreign_key.referenced_properties.iter())
             {
-                let local_field =
-                    schema_field_at_pointer(source_schema, local_pointer).map_err(|detail| {
-                        LixError::new(
-                            LixError::CODE_SCHEMA_DEFINITION,
-                            format!(
-                                "foreign key on schema '{}' references missing local property '{}': {detail}",
-                                source_key.schema_key,
-                                format_json_pointer(local_pointer)
-                            ),
-                        )
-                    })?;
-                let referenced_field =
-                    schema_field_at_pointer(target_schema, referenced_pointer).map_err(
-                        |detail| {
-                            LixError::new(
-                                LixError::CODE_SCHEMA_DEFINITION,
-                                format!(
-                                    "foreign key on schema '{}' references missing target property '{}.{}': {detail}",
-                                    source_key.schema_key,
-                                    foreign_key.referenced_schema.schema_key,
-                                    format_json_pointer(referenced_pointer)
-                                ),
-                            )
-                        },
-                    )?;
                 validate_foreign_key_field_types(
                     source_key,
+                    source_schema,
                     &foreign_key.referenced_schema,
+                    target_schema,
                     local_pointer,
-                    local_field,
                     referenced_pointer,
-                    referenced_field,
                 )?;
             }
 
@@ -2763,88 +2234,68 @@ fn bind_foreign_key_plans(
         .collect()
 }
 
-fn schema_field_at_pointer<'a>(
-    schema: &'a JsonValue,
-    pointer: &[String],
-) -> Result<&'a JsonValue, String> {
-    if pointer.is_empty() {
-        return Err("empty pointer does not name a field".to_string());
-    }
-    let mut current = schema;
-    for segment in pointer {
-        let properties = current
-            .get("properties")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| format!("schema segment before '{segment}' has no object properties"))?;
-        current = properties
-            .get(segment)
-            .ok_or_else(|| format!("property '{segment}' does not exist"))?;
-    }
-    Ok(current)
-}
-
 fn validate_foreign_key_field_types(
     source_key: &SchemaCatalogKey,
+    source_schema: &JsonValue,
     referenced_key: &SchemaCatalogKey,
+    referenced_schema: &JsonValue,
     local_pointer: &[String],
-    local_field: &JsonValue,
     referenced_pointer: &[String],
-    referenced_field: &JsonValue,
 ) -> Result<(), LixError> {
-    let local_type = compatible_json_schema_type(local_field).ok_or_else(|| {
-        LixError::new(
+    let source = crate::schema::parse_lix_schema(source_schema)?;
+    let referenced = crate::schema::parse_lix_schema(referenced_schema)?;
+    let [local_name] = local_pointer else {
+        return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
-            format!(
-                "foreign key on schema '{}' local property '{}' must declare an explicit JSON Schema type",
-                source_key.schema_key,
-                format_json_pointer(local_pointer)
-            ),
-        )
-    })?;
-    let referenced_type = compatible_json_schema_type(referenced_field).ok_or_else(|| {
-        LixError::new(
+            "Schema v1 foreign keys require top-level columns",
+        ));
+    };
+    let [referenced_name] = referenced_pointer else {
+        return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
-            format!(
-                "foreign key on schema '{}' target property '{}.{}' must declare an explicit JSON Schema type",
-                source_key.schema_key,
-                referenced_key.schema_key,
-                format_json_pointer(referenced_pointer)
-            ),
-        )
-    })?;
+            "Schema v1 foreign keys require top-level columns",
+        ));
+    };
+    let local_type = source
+        .columns
+        .iter()
+        .find(|column| &column.name == local_name)
+        .map(|column| column.data_type)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("foreign key references missing local column '{local_name}'"),
+            )
+        })?;
+    let referenced_type = referenced
+        .columns
+        .iter()
+        .find(|column| &column.name == referenced_name)
+        .map(|column| column.data_type)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "foreign key references missing target column '{}.{referenced_name}'",
+                    referenced_key.schema_key
+                ),
+            )
+        })?;
     if local_type != referenced_type {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
-                "foreign key on schema '{}' has incompatible field types: local '{}' is {}, but target '{}.{}' is {}",
+                "foreign key on schema '{}' has incompatible types: '{}' is {}, but '{}.{}' is {}",
                 source_key.schema_key,
-                format_json_pointer(local_pointer),
-                local_type,
+                local_name,
+                local_type.postgres_name(),
                 referenced_key.schema_key,
-                format_json_pointer(referenced_pointer),
-                referenced_type
+                referenced_name,
+                referenced_type.postgres_name()
             ),
         ));
     }
     Ok(())
-}
-
-fn compatible_json_schema_type(field_schema: &JsonValue) -> Option<JsonValue> {
-    match field_schema.get("type")? {
-        JsonValue::Array(types) => {
-            let non_null_types = types
-                .iter()
-                .filter(|value| value.as_str() != Some("null"))
-                .cloned()
-                .collect::<Vec<_>>();
-            match non_null_types.as_slice() {
-                [] => None,
-                [single] => Some(single.clone()),
-                _ => Some(JsonValue::Array(non_null_types)),
-            }
-        }
-        value => Some(value.clone()),
-    }
 }
 
 fn schema_properties_are_keyed(
@@ -2859,34 +2310,6 @@ fn schema_properties_are_keyed(
     Ok(pointer_groups(target_schema, "x-lix-unique")?
         .iter()
         .any(|unique_group| unique_group == referenced_properties))
-}
-
-fn pointer_array(value: Option<&JsonValue>, context: &str) -> Result<PointerGroup, LixError> {
-    let Some(value) = value else {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!("{context} must be an array of JSON Pointers"),
-        ));
-    };
-    let Some(array) = value.as_array() else {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!("{context} must be an array of JSON Pointers"),
-        ));
-    };
-    array
-        .iter()
-        .enumerate()
-        .map(|(index, pointer)| {
-            let pointer = pointer.as_str().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!("{context}[{index}] must be a string"),
-                )
-            })?;
-            parse_json_pointer(pointer)
-        })
-        .collect()
 }
 
 fn format_pointer_group(paths: &[Vec<String>]) -> String {
@@ -2909,9 +2332,9 @@ mod tests {
         let schema: JsonValue =
             serde_json::from_str(schema_json).expect("built-in schema JSON should parse");
         let schema_key = schema
-            .get("x-lix-key")
+            .get("key")
             .and_then(JsonValue::as_str)
-            .expect("built-in schema should declare x-lix-key")
+            .expect("built-in schema should declare key")
             .to_owned();
         let plan = SchemaPlan::compile(
             SchemaCatalogKey {
@@ -2929,19 +2352,6 @@ mod tests {
         plan
     }
 
-    fn assert_fast_validation(plan: &SchemaPlan, value: JsonValue, expected: bool) {
-        assert_eq!(
-            plan.compiled_schema.is_valid(&value),
-            expected,
-            "full JSON Schema result differed for {value}"
-        );
-        assert_eq!(
-            plan.accepts_row_content_fast(&value),
-            expected,
-            "fast validation result differed for {value}"
-        );
-    }
-
     #[test]
     fn schema_rejects_removed_columnar_storage_policy() {
         let mut schema = crate::schema::seed_schema_definition("lix_key_value")
@@ -2950,11 +2360,7 @@ mod tests {
         schema["x-lix-columnar"] = json!(false);
         let error = crate::schema::validate_lix_schema_definition(&schema)
             .expect_err("physical storage policy must not be part of a public schema");
-        assert!(
-            error
-                .message
-                .contains("unknown x-lix field 'x-lix-columnar'")
-        );
+        assert!(error.message.contains("unknown field `x-lix-columnar`"));
     }
 
     #[test]
@@ -2979,281 +2385,13 @@ mod tests {
             assert!(plan.accepts_row_content_fast(&value));
             assert!(plan.compiled_schema.is_valid(&value));
         }
+        assert!(plan.accepts_row_content_fast(&json!({"key": "a"})));
         for value in [
-            json!({"key": "a"}),
             json!({"key": 1, "value": null}),
             json!({"key": "a", "value": null, "extra": true}),
         ] {
             assert!(!plan.accepts_row_content_fast(&value));
             assert!(!plan.compiled_schema.is_valid(&value));
-        }
-    }
-
-    #[test]
-    fn typed_object_certification_matches_compiled_scalar_constraints() {
-        let plan = SchemaPlan::compile(
-            SchemaCatalogKey {
-                schema_key: "typed_rows".to_string(),
-            },
-            json!({
-                "type": "object",
-                "properties": {
-                    "active": { "type": "boolean" },
-                    "id": { "type": "string", "minLength": 2 }
-                },
-                "required": ["active", "id"],
-                "additionalProperties": false,
-                "x-lix-key": "typed_rows",
-                "x-lix-primary-key": ["/id"]
-            }),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .expect("typed-row schema should compile");
-        assert!(plan.accepts_canonical_certificate());
-
-        let layout = plan
-            .certify_typed_object_layout("typed_rows", &["active", "id"])
-            .expect("typed-row layout should certify");
-        let values = [
-            TypedJsonScalarRef::Boolean,
-            TypedJsonScalarRef::String("row-1"),
-        ];
-        layout
-            .certify_row(&values, &["row-1"])
-            .expect("matching typed row should certify");
-
-        let short_id = [TypedJsonScalarRef::Boolean, TypedJsonScalarRef::String("x")];
-        assert!(layout.certify_row(&short_id, &["x"]).is_err());
-        assert!(layout.certify_row(&values, &["other"]).is_err());
-        assert!(
-            plan.certify_typed_object_layout("other", &["active", "id"])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn fast_object_validation_compiles_actual_json_v2_schemas() {
-        let root = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json/schema/json_root.json"
-        ));
-        for value in [
-            json!({"id": "root", "kind": "object"}),
-            json!({
-                "id": "root",
-                "kind": "null",
-                "scalar_json": "null",
-                "prefix_json": "\t\n ",
-                "suffix_json": "\r",
-            }),
-        ] {
-            assert_fast_validation(&root, value, true);
-        }
-        for value in [
-            json!({"id": "other", "kind": "object"}),
-            json!({"id": "root", "kind": "date"}),
-            json!({"id": "root", "kind": "string", "scalar_json": ""}),
-            json!({"id": "root", "kind": "object", "prefix_json": "\u{a0}"}),
-            json!({"id": "root", "kind": "object", "extra": true}),
-        ] {
-            assert_fast_validation(&root, value, false);
-        }
-
-        let object_member = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json/schema/json_object_member.json"
-        ));
-        for value in [
-            json!({
-                "parent_id": "root",
-                "key": "",
-                "order_key": "01",
-                "kind": "object",
-            }),
-            json!({
-                "parent_id": "root",
-                "key": "member",
-                "order_key": "0001",
-                "kind": "string",
-                "scalar_json": "\"value\"",
-                "container_id": "child",
-                "suffix_json": " \n",
-            }),
-        ] {
-            assert_fast_validation(&object_member, value, true);
-        }
-        for value in [
-            json!({"parent_id": "", "key": "member", "order_key": "01", "kind": "string"}),
-            json!({"parent_id": "root", "key": "member", "order_key": "00", "kind": "string"}),
-            json!({"parent_id": "root", "key": "member", "order_key": "0A", "kind": "string"}),
-            json!({"parent_id": "root", "key": "member", "order_key": "01", "kind": "date"}),
-            json!({
-                "parent_id": "root",
-                "key": "member",
-                "order_key": "01",
-                "kind": "string",
-                "suffix_json": "x",
-            }),
-        ] {
-            assert_fast_validation(&object_member, value, false);
-        }
-
-        let array_item = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json/schema/json_array_item.json"
-        ));
-        assert_fast_validation(
-            &array_item,
-            json!({
-                "id": UUID_A,
-                "parent_id": "root",
-                "order_key": "ff",
-                "kind": "boolean",
-                "scalar_json": "true",
-            }),
-            true,
-        );
-        for value in [
-            json!({"id": UUID_A, "parent_id": "", "order_key": "01", "kind": "null"}),
-            json!({"id": UUID_A, "parent_id": "root", "order_key": "1", "kind": "null"}),
-            json!({
-                "id": UUID_A,
-                "parent_id": "root",
-                "order_key": "01",
-                "kind": "null",
-                "empty_json": "\u{a0}",
-            }),
-        ] {
-            assert_fast_validation(&array_item, value, false);
-        }
-    }
-
-    #[test]
-    fn fast_object_validation_compiles_actual_csv_v2_schemas() {
-        let row =
-            compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
-        for value in [
-            json!({"id": UUID_A, "order_key": "01", "cells": ["alpha"]}),
-            json!({
-                "id": UUID_A,
-                "order_key": "0001",
-                "cells": ["alpha", ""],
-                "layout": {"terminator": ""},
-            }),
-            json!({
-                "id": UUID_A,
-                "order_key": "ff",
-                "cells": ["alpha"],
-                "layout": {"force_quote": "AZ_-", "terminator": "\r\n"},
-            }),
-        ] {
-            assert_fast_validation(&row, value, true);
-        }
-        for value in [
-            json!({"id": UUID_A, "order_key": "01", "cells": []}),
-            json!({"id": UUID_A, "order_key": "01", "cells": [1]}),
-            json!({"id": UUID_A, "order_key": "00", "cells": ["alpha"]}),
-            json!({"id": UUID_A, "order_key": "01", "cells": ["alpha"], "layout": {}}),
-            json!({
-                "id": UUID_A,
-                "order_key": "01",
-                "cells": ["alpha"],
-                "layout": {"force_quote": ""},
-            }),
-            json!({
-                "id": UUID_A,
-                "order_key": "01",
-                "cells": ["alpha"],
-                "layout": {"terminator": "\n\n"},
-            }),
-            json!({
-                "id": UUID_A,
-                "order_key": "01",
-                "cells": ["alpha"],
-                "layout": {"terminator": "\n", "extra": true},
-            }),
-        ] {
-            assert_fast_validation(&row, value, false);
-        }
-
-        let table = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv/schema/csv_table.json"
-        ));
-        for value in [
-            json!({
-                "id": "root",
-                "dialect": {"delimiter": ",", "quote": "\"", "terminator": "\n"},
-            }),
-            json!({
-                "id": "root",
-                "dialect": {"delimiter": "\t", "quote": null, "terminator": "\r\n"},
-            }),
-            json!({
-                "id": "root",
-                "dialect": {"delimiter": " ", "quote": "!", "terminator": "\r"},
-            }),
-        ] {
-            assert_fast_validation(&table, value, true);
-        }
-        for value in [
-            json!({
-                "id": "table",
-                "dialect": {"delimiter": ",", "quote": null, "terminator": "\n"},
-            }),
-            json!({
-                "id": "root",
-                "dialect": {"delimiter": ",,", "quote": null, "terminator": "\n"},
-            }),
-            json!({
-                "id": "root",
-                "dialect": {"delimiter": "\n", "quote": null, "terminator": "\n"},
-            }),
-            json!({
-                "id": "root",
-                "dialect": {"delimiter": ",", "quote": " ", "terminator": "\n"},
-            }),
-            json!({
-                "id": "root",
-                "dialect": {"delimiter": ",", "quote": "é", "terminator": "\n"},
-            }),
-            json!({"id": "root", "dialect": {"delimiter": ",", "terminator": "\n"}}),
-            json!({
-                "id": "root",
-                "dialect": {
-                    "delimiter": ",",
-                    "quote": null,
-                    "terminator": "\n",
-                    "extra": true,
-                },
-            }),
-        ] {
-            assert_fast_validation(&table, value, false);
-        }
-    }
-
-    #[test]
-    fn fast_object_validation_declines_unsupported_or_unsafe_constraints() {
-        for property in [
-            json!({"type": "string", "pattern": "^[a-z]+$"}),
-            json!({"type": "string", "maxLength": 10}),
-            json!({"type": "array", "items": {"type": "integer"}}),
-            json!({
-                "type": "object",
-                "additionalProperties": {"type": "string"},
-            }),
-            json!({
-                "anyOf": [
-                    {"type": "string", "pattern": "^[!-~]$"},
-                    {"type": "boolean"},
-                ],
-            }),
-        ] {
-            let schema = json!({
-                "x-lix-key": "unsupported",
-                "type": "object",
-                "properties": {"id": property},
-                "required": ["id"],
-                "additionalProperties": false,
-            });
-            assert!(FastObjectValidationPlan::compile(&schema).is_none());
         }
     }
 
@@ -3379,15 +2517,13 @@ mod tests {
                 schema_key: "uuid_format_row".to_owned(),
             },
             json!({
-                "x-lix-key": "uuid_format_row",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "external_id": {"type": "string", "format": "uuid"},
-                    "id": {"type": "string"}
-                },
-                "required": ["external_id", "id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "uuid_format_row",
+                "columns": [
+                    {"name": "external_id", "type": "uuid", "nullable": false},
+                    {"name": "id", "type": "text", "nullable": false}
+                ],
+                "primary_key": ["id"]
             }),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -3510,35 +2646,26 @@ mod tests {
             .expect_err("snapshot identity must match emitted entity key");
         assert_eq!(wrong_identity.code, LixError::CODE_SCHEMA_VALIDATION);
 
-        let invalid_order_key = plan
-            .certify_or_normalize_plugin_row(
-                br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"00"}"#,
-                &key,
-            )
-            .expect_err("schema-invalid canonical row must be rejected");
-        assert_eq!(invalid_order_key.code, LixError::CODE_SCHEMA_VALIDATION);
+        plan.certify_or_normalize_plugin_row(
+            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"00"}"#,
+            &key,
+        )
+        .expect("removed order-key regex is intentionally no longer validated");
     }
 
     #[test]
-    fn default_plan_compiles_uuid_and_timestamp_intrinsics_without_cel() {
+    fn default_plan_compiles_postgresql_uuid_expression_without_cel() {
         let plan = DefaultPlan::from_schema(&json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "x-lix-default": " lix_uuid_v7() "},
-                "created_at": {"type": "string", "x-lix-default": "lix_timestamp()"},
-                "label": {"type": "string", "x-lix-default": r#""row-" + id"#}
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "default_probe",
+            "columns": [
+                {"name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()"}
+            ],
+            "primary_key": ["id"]
         }));
 
-        assert_eq!(plan.properties[0].field_name, "created_at");
-        assert_eq!(plan.properties[0].default, DefaultValuePlan::Timestamp);
-        assert_eq!(plan.properties[1].field_name, "id");
-        assert_eq!(plan.properties[1].default, DefaultValuePlan::UuidV7);
-        assert_eq!(plan.properties[2].field_name, "label");
-        assert_eq!(
-            plan.properties[2].default,
-            DefaultValuePlan::Cel(r#""row-" + id"#.to_string())
-        );
+        assert_eq!(plan.properties[0].field_name, "id");
+        assert_eq!(plan.properties[0].default, DefaultValuePlan::UuidV7);
     }
 
     #[test]
@@ -3739,35 +2866,29 @@ mod tests {
 
     fn schema_json(schema_key: &str) -> JsonValue {
         json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"]
         })
     }
 
     fn child_schema_json(schema_key: &str, parent_schema_key: &str) -> JsonValue {
         json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parent_id"],
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
                 "references": {
-                    "schemaKey": parent_schema_key,
-                    "properties": ["/id"]
+                    "schema_key": parent_schema_key,
+                    "columns": ["id"]
                 }
-            }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "parent_id": { "type": "string" }
-            },
-            "required": ["id", "parent_id"],
-            "additionalProperties": false
+            }]
         })
     }
 }

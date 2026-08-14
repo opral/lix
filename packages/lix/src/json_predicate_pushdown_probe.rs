@@ -9,7 +9,7 @@
 //! The text spelling (`WHERE v = '{"n":1}'`) is a type error
 //! (`LIX_ERROR_TYPE_MISMATCH`) and never runs, so it cannot be the shape under
 //! test. This probe uses the spelling that type-checks,
-//! `WHERE v = lix_json('...')`, and a String-column arm as the control: same
+//! `WHERE v = CAST('...' AS JSONB)`, and a String-column arm as the control: same
 //! fixture size, same one-row answer, on a column that *is* pushable.
 //!
 //! Counted at the materialisation boundary (`apply_entity_batch_filters`),
@@ -35,20 +35,18 @@ async fn open_session() -> SessionContext<Memory> {
 
 async fn register(session: &SessionContext<Memory>, key: &str) {
     let schema = json!({
-        "x-lix-key": key,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "k": { "type": "string" },
-            "v": { "type": "object" }
-        },
-        "required": ["id", "k", "v"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": key,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "k", "type": "text", "nullable": false },
+            { "name": "v", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[crate::Value::Text(schema.to_string())],
         )
         .await
@@ -61,7 +59,7 @@ async fn seed(session: &SessionContext<Memory>, table: &str, count: usize) {
     while index < count {
         let end = (index + CHUNK).min(count);
         let values = (index..end)
-            .map(|i| format!("('r-{i}', 'k-{i}', lix_json('{{\"n\":{i}}}'))"))
+            .map(|i| format!("('r-{i}', 'k-{i}', CAST('{{\"n\":{i}}}' AS JSONB))"))
             .collect::<Vec<_>>()
             .join(",");
         session
@@ -145,7 +143,7 @@ async fn json_column_equality_materialization() {
 
         let (result, profile) = session
             .execute_profiled(
-                "SELECT id FROM jppjson WHERE v = lix_json('{\"n\":7}')",
+                "SELECT id FROM jppjson WHERE v = CAST('{\"n\":7}' AS JSONB)",
                 &[],
             )
             .await

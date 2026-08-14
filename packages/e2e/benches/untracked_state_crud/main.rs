@@ -1093,7 +1093,7 @@ where
 {
     let sql = format!(
         "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-         VALUES (lix_json('{}'), false, false)",
+         VALUES (CAST('{}' AS JSONB), false, false)",
         sql_string(JSON_POINTER_SCHEMA_JSON)
     );
     let affected = session
@@ -1137,7 +1137,7 @@ async fn insert_untracked_json_pointer_rows_homogeneous<StorageImpl>(
         .iter()
         .map(|row| ExecuteBatchStatement {
             label: None,
-            sql: "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, lix_json($2), true)".to_owned(),
+            sql: "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), true)".to_owned(),
             params: vec![
                 Value::Text(row.path.clone()),
                 Value::Text(row.value_json.clone()),
@@ -1366,7 +1366,7 @@ fn insert_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
         }
         let _ = write!(
             sql,
-            "('{}', lix_json('{}'), true)",
+            "('{}', CAST('{}' AS JSONB), true)",
             sql_string(row.path.as_str()),
             sql_string(row.value_json.as_str())
         );
@@ -1379,7 +1379,7 @@ fn update_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
         .first()
         .map_or("{}", |row| row.updated_value_json.as_str());
     format!(
-        "UPDATE json_pointer SET value = lix_json('{}') WHERE lixcol_untracked = true",
+        "UPDATE json_pointer SET value = CAST('{}' AS JSONB) WHERE lixcol_untracked = true",
         sql_string(value)
     )
 }

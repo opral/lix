@@ -2229,7 +2229,7 @@ where
     /// Persists execution-scoped runtime function state after a successful read.
     ///
     /// Reads do not otherwise own a write transaction, but SQL functions such as
-    /// `lix_uuid_v7()` can still advance runtime state. Persisting happens only
+    /// `uuidv7()` can still advance runtime state. Persisting happens only
     /// after successful execution so failed reads do not consume durable
     /// sequence state.
     async fn persist_runtime_functions_if_needed(
@@ -2806,6 +2806,10 @@ fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixEr
             }
             Value::Blob(value) => {
                 profile_checksum_sized_bytes(checksum, 6, value.as_bytes().as_ref())
+            }
+            Value::Timestamp(value) => {
+                let checksum = profile_checksum_bytes(checksum, &[7]);
+                profile_checksum_bytes(checksum, &value.to_le_bytes())
             }
         };
     }
@@ -4861,7 +4865,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES \
-                 ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, lix_json('{\"rank\":2}')), \
+                 ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, CAST('{\"rank\":2}' AS JSONB)), \
                  ('01920000-0000-7000-8000-0000000000f2', '/nested/a.txt', $2, NULL), \
                  ('01920000-0000-7000-8000-0000000000f3', '/a.txt', $3, NULL)",
                 &[
@@ -5010,7 +5014,7 @@ mod tests {
             ExecuteBatchExecution::Transaction(_)
         ));
         assert!(matches!(
-            classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")], &cache).unwrap(),
+            classify_execute_batch(&[batch_statement("SELECT uuidv7()")], &cache).unwrap(),
             ExecuteBatchExecution::Transaction(_)
         ));
     }
@@ -5092,7 +5096,7 @@ mod tests {
         );
         assert_eq!(
             session
-                .execution_disposition("SELECT lix_uuid_v7()")
+                .execution_disposition("SELECT uuidv7()")
                 .unwrap(),
             ExecutionDisposition::Durable
         );
@@ -5117,7 +5121,7 @@ mod tests {
             session
                 .execute_batch_disposition(&[
                     batch_statement("SELECT 1"),
-                    batch_statement("SELECT lix_timestamp()"),
+                    batch_statement("SELECT CURRENT_TIMESTAMP"),
                 ])
                 .unwrap(),
             ExecutionDisposition::Durable
@@ -5212,19 +5216,17 @@ mod tests {
     async fn public_insert_preserves_declared_integer_primary_key_type() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "integer_primary_key_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "integer" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "integer_primary_key_insert_probe",
+            "columns": [
+                { "name": "id", "type": "int8", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5255,20 +5257,17 @@ mod tests {
     async fn execute_batch_lowers_distinct_bound_entity_inserts_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string", "minLength": 3 }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5375,9 +5374,9 @@ mod tests {
                 },
             ])
             .await
-            .expect_err("the later normalization error must precede the committed conflict");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+            .expect_err("the committed conflict should be reported first");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
 
         session
             .create_checkpoint()
@@ -5426,20 +5425,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "ordered_packed_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "ordered_packed_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5491,19 +5487,17 @@ mod tests {
         const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "rootless_ordered_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "rootless_ordered_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5914,20 +5908,17 @@ mod tests {
         const BATCH_ROWS: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "successive_columnar_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "successive_columnar_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5995,19 +5986,16 @@ mod tests {
             .await
             .expect("repository branch should resolve");
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "columnar_lifecycle_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "columnar_lifecycle_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         main.execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -6450,31 +6438,24 @@ mod tests {
         const PARTIAL_ROW_COUNT: usize = ROW_COUNT / 2;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "ordered_packed_update_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "ordered_packed_update_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let insert_statements = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -6489,7 +6470,7 @@ mod tests {
 
         crate::transaction::take_complete_replacement_packed_current_base_retirements();
         let update_sql =
-            "UPDATE ordered_packed_update_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE ordered_packed_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for version in 1..=2 {
             let update_statements = (0..ROW_COUNT)
                 .map(|row_index| ExecuteBatchStatement {
@@ -6604,19 +6585,17 @@ mod tests {
     async fn ordered_batch_update_preserves_non_uniform_lifecycle_without_journal_admission() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "non_uniform_journal_admission_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "non_uniform_journal_admission_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6685,38 +6664,26 @@ mod tests {
         const ROW_COUNT: usize = 32 * 1024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "expdl_dense_untracked_lane_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "anyOf": [
-                        { "type": "object" },
-                        { "type": "array" },
-                        { "type": "string" },
-                        { "type": "number" },
-                        { "type": "boolean" },
-                        { "type": "null" }
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "expdl_dense_untracked_lane_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
                 "INSERT INTO lix_registered_schema \
                  (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, true)",
+                 VALUES (CAST($1 AS JSONB), false, true)",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("untracked schema registration should succeed");
 
         let sql = "INSERT INTO expdl_dense_untracked_lane_probe \
-                   (path, value, lixcol_untracked) VALUES ($1, lix_json($2), TRUE)";
+                   (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), TRUE)";
         let statements = (0..ROW_COUNT)
             .map(|index| ExecuteBatchStatement {
                 label: None,
@@ -6780,37 +6747,31 @@ mod tests {
         const ROW_COUNT: usize = 32 * 1024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let amended_schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" },
-                "source": { "type": "string", "default": "amended-plan" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+                { "name": "source", "type": "text", "nullable": false, "default_value": "amended-plan" },
+            ],
+            "primary_key": ["id"],
         });
         crate::transaction::take_direct_journal_replacement_publications(
             "amended_parameter_insert_probe",
@@ -6819,7 +6780,7 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_insert_probe\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"amended_parameter_insert_probe\"]' AS JSONB)",
                 &[Value::Json(amended_schema.into())],
             )
             .await
@@ -6879,64 +6840,50 @@ mod tests {
     async fn certified_replacement_batch_revalidates_after_staged_schema_amendment() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_update_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_update_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
         session
             .execute(
-                "INSERT INTO amended_parameter_update_probe (path, value) VALUES ('a', lix_json('\"old-a\"')), ('b', lix_json('\"old-b\"'))",
+                "INSERT INTO amended_parameter_update_probe (path, value) VALUES ('a', CAST('\"old-a\"' AS JSONB)), ('b', CAST('\"old-b\"' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
 
         let amended_schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_update_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                },
-                "source": { "type": "string", "default": "amended-plan" }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_update_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+                { "name": "source", "type": "text", "nullable": true, "default_value": "amended-plan" },
+            ],
+            "primary_key": ["path"],
         });
         let mut transaction = session.begin_transaction().await.unwrap();
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_update_probe\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"amended_parameter_update_probe\"]' AS JSONB)",
                 &[Value::Json(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
 
-        let sql = "UPDATE amended_parameter_update_probe SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE amended_parameter_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let statements = [
             ExecuteBatchStatement {
                 label: None,
@@ -7016,20 +6963,17 @@ mod tests {
             .expect("initialized storage should create engine");
         let setup = engine.open_session().await.unwrap();
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "concurrent_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "concurrent_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         setup
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7119,20 +7063,17 @@ mod tests {
     async fn consecutive_certified_batches_preserve_local_conflict_statement_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "consecutive_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "consecutive_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7234,25 +7175,17 @@ mod tests {
     async fn execute_batch_declines_uncertified_entity_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_fallback_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": {
-                    "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
-                    "additionalProperties": false
-                }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_fallback_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7260,7 +7193,7 @@ mod tests {
 
         sql2::take_certified_entity_insert_parameter_batch_executions();
         let sql =
-            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -7281,9 +7214,9 @@ mod tests {
                 },
             ])
             .await
-            .expect_err("the first row's schema failure must precede later expression evaluation");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+            .expect_err("the later invalid JSON expression should be reported");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
             sql2::take_certified_entity_insert_parameter_batch_executions(),
             0
@@ -7294,20 +7227,17 @@ mod tests {
     async fn execute_batch_declines_json_marked_utf8_for_string_columns() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_json_string_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_json_string_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7352,20 +7282,17 @@ mod tests {
     async fn execute_batch_preserves_early_duplicate_before_later_schema_error() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_error_order_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string", "minLength": 1 }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_error_order_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7416,20 +7343,17 @@ mod tests {
     async fn execute_batch_preserves_later_missing_branch_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_branch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_branch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7487,22 +7411,19 @@ mod tests {
     async fn execute_batch_preserves_later_durability_domain_error_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_durability_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_durability_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
                 "INSERT INTO lix_registered_schema \
                  (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, true)",
+                 VALUES (CAST($1 AS JSONB), false, true)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7553,20 +7474,17 @@ mod tests {
     async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7627,20 +7545,17 @@ mod tests {
     async fn execute_prepared_dml_batch_preserves_order_absence_and_atomic_errors() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "prepared_dml_contract_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "prepared_dml_contract_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7677,7 +7592,7 @@ mod tests {
         let error = session
             .execute_prepared_dml_batch(
                 Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
                 ),
                 PreparedDmlParameterBatch::from_rows([
                     vec![Value::Text("{invalid".into()), Value::Text("a".into())],
@@ -7710,7 +7625,7 @@ mod tests {
         let error = transaction
             .execute_prepared_dml_batch(
                 Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
                 ),
                 PreparedDmlParameterBatch::from_rows([
                     vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
@@ -7744,19 +7659,17 @@ mod tests {
     async fn execute_batch_lowers_distinct_literal_entity_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "literal_parameter_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "literal_parameter_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7806,19 +7719,17 @@ mod tests {
     async fn entity_insert_values_use_one_certified_canonical_batch() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "certified_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "certified_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7850,19 +7761,17 @@ mod tests {
     async fn conflict_insert_filters_rows_before_snapshot_validation() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "conflict_validation_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string", "minLength": 3 }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "conflict_validation_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7902,19 +7811,17 @@ mod tests {
 
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "explicit_uuid_key_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "format": "uuid" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "explicit_uuid_key_probe",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7924,7 +7831,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_entity_pk) \
-                 VALUES ($1, 'value', lix_json($2))",
+                 VALUES ($1, 'value', CAST($2 AS JSONB))",
                 &[
                     Value::Text(UUID.to_string()),
                     Value::Text(format!("[\"{UUID}\"]")),
@@ -7948,23 +7855,17 @@ mod tests {
     async fn execute_batch_certifies_out_of_order_complete_path_value_replacements() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "certified_replacement_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "certified_replacement_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7972,13 +7873,13 @@ mod tests {
         session
             .execute(
                 "INSERT INTO certified_replacement_probe (path, value) VALUES \
-                 ('/a', lix_json('\"old-a\"')), ('/b', lix_json('\"old-b\"'))",
+                 ('/a', CAST('\"old-a\"' AS JSONB)), ('/b', CAST('\"old-b\"' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
 
-        let sql = "UPDATE certified_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE certified_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let missing_results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -8077,7 +7978,7 @@ mod tests {
                     label: None,
                     sql: sql.to_string(),
                     params: vec![
-                        Value::Text("null".to_string()),
+                        Value::Text("true".to_string()),
                         Value::Text("/a".to_string()),
                     ],
                 },
@@ -8119,7 +8020,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows()[0].value("value").unwrap(), &Value::Null);
+        assert_eq!(
+            rows.rows()[0].value("value").unwrap(),
+            &Value::Json(serde_json::json!(true).into())
+        );
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!({"final": "b"})
@@ -8131,30 +8035,24 @@ mod tests {
         const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "packed_replacement_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "packed_replacement_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8170,7 +8068,7 @@ mod tests {
         crate::transaction::take_complete_replacement_packed_current_base_publications();
         crate::transaction::take_rootless_replacement_generation_publications();
         sql2::take_certified_generation_identity_replacements();
-        let update_sql = "UPDATE packed_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let update_sql = "UPDATE packed_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8459,7 +8357,7 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"branch\":true}') WHERE path = '/00000'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"branch\":true}' AS JSONB) WHERE path = '/00000'",
                 &[],
             )
             .await
@@ -8472,7 +8370,7 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"main\":true}') WHERE path = '/32767'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"main\":true}' AS JSONB) WHERE path = '/32767'",
                 &[],
             )
             .await
@@ -8550,7 +8448,7 @@ mod tests {
 
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"overlay\":true}') WHERE path = '/00000'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"overlay\":true}' AS JSONB) WHERE path = '/00000'",
                 &[],
             )
             .await
@@ -8601,7 +8499,7 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', lix_json('{\"reinserted\":true}'))",
+                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', CAST('{\"reinserted\":true}' AS JSONB))",
                 &[],
             )
             .await
@@ -8788,26 +8686,24 @@ mod tests {
         const ROW_COUNT: usize = 16;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "staged_generation_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": "object" }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "staged_generation_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO staged_generation_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO staged_generation_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8829,7 +8725,7 @@ mod tests {
             .await
             .unwrap();
 
-        let update_sql = "UPDATE staged_generation_probe SET value = lix_json($1) WHERE path = $2";
+        let update_sql = "UPDATE staged_generation_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8884,20 +8780,17 @@ mod tests {
     async fn execute_batch_keeps_repeated_generic_entity_identity_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_repeat_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_repeat_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -8977,20 +8870,17 @@ mod tests {
     async fn execute_batch_keeps_unsupported_parameterless_updates_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameterless_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameterless_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9039,21 +8929,18 @@ mod tests {
     async fn execute_batch_keeps_inter_row_constraints_on_sequential_execution() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_constraint_probe",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/value"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_constraint_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["value"]],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9126,20 +9013,17 @@ mod tests {
     async fn execute_batch_parameter_batch_preserves_failing_statement_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_error_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_error_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9154,7 +9038,7 @@ mod tests {
             .unwrap();
 
         sql2::take_entity_update_parameter_batch_executions();
-        let sql = "UPDATE parameter_batch_error_probe SET value = lix_json($1) WHERE id = $2";
+        let sql = "UPDATE parameter_batch_error_probe SET value = CAST($1 AS JSONB) WHERE id = $2";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -9194,20 +9078,17 @@ mod tests {
     async fn execute_batch_parameter_batch_indexes_parameter_count_errors() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_count_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_count_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9246,20 +9127,17 @@ mod tests {
         let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
         let session = open_session_with_telemetry(Arc::clone(&spans)).await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_telemetry_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_telemetry_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9781,17 +9659,16 @@ mod tests {
         );
 
         let custom_schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "custom_catalog_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "custom_catalog_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(custom_schema.to_string())],
             )
             .await
@@ -9824,10 +9701,10 @@ mod tests {
         );
 
         let mut next_schema = custom_schema.clone();
-        next_schema["x-lix-key"] = serde_json::json!("custom_catalog_probe_after_mutation");
+        next_schema["key"] = serde_json::json!("custom_catalog_probe_after_mutation");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(next_schema.to_string())],
             )
             .await
@@ -10083,28 +9960,24 @@ mod tests {
     async fn explicit_transaction_certified_json_pointer_updates_observe_staged_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "json_pointer",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_pointer",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("json pointer schema should register");
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text("/certified".to_string()),
                     Value::Text("{\"step\":0}".to_string()),
@@ -10118,7 +9991,7 @@ mod tests {
             .await
             .expect("transaction should begin");
         assert_eq!(sql2::take_certified_single_path_value_replacements(), 0);
-        let sql = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
         for step in [1, 2] {
             let result = transaction
                 .execute(
@@ -10170,21 +10043,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "packed_journal_overlay_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "packed_journal_overlay_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10192,7 +10061,7 @@ mod tests {
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
-                sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, lix_json($2))"
+                sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                     .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10209,7 +10078,7 @@ mod tests {
             .await
             .expect("transaction should begin");
         let update_sql =
-            "UPDATE packed_journal_overlay_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE packed_journal_overlay_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         transaction
             .execute(
                 update_sql,
@@ -10222,7 +10091,7 @@ mod tests {
             .expect("base update should prepare packed membership");
         transaction
             .execute(
-                "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ('2000', lix_json('{\"state\":\"inserted\"}'))",
+                "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ('2000', CAST('{\"state\":\"inserted\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10302,21 +10171,17 @@ mod tests {
             .await
             .expect("concurrent session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "stale_journal_replacement_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "stale_journal_replacement_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10324,7 +10189,7 @@ mod tests {
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
-                sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, lix_json($2))"
+                sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                     .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10352,7 +10217,7 @@ mod tests {
             .await
             .expect("replacement transaction should begin");
         let update_sql =
-            "UPDATE stale_journal_replacement_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE stale_journal_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             let result = replacement
                 .execute(
@@ -10370,7 +10235,7 @@ mod tests {
         concurrent_session
             .execute(
                 "INSERT INTO stale_journal_replacement_probe (path, value) \
-                 VALUES ('2000', lix_json('{\"state\":\"concurrent\"}'))",
+                 VALUES ('2000', CAST('{\"state\":\"concurrent\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10424,21 +10289,17 @@ mod tests {
         const ROW_COUNT: usize = 8_193;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "direct_journal_seal_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "direct_journal_seal_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10447,7 +10308,7 @@ mod tests {
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
                 sql:
-                    "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, lix_json($2))"
+                    "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                         .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10465,7 +10326,7 @@ mod tests {
             .await
             .expect("direct journal transaction should begin");
         let update_sql =
-            "UPDATE direct_journal_seal_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE direct_journal_seal_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             let result = transaction
                 .execute(
@@ -10549,21 +10410,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "journal_read_your_writes_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "journal_read_your_writes_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10573,7 +10430,7 @@ mod tests {
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
                         label: None,
-                        sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),
                             Value::Text("{\"state\":\"base\"}".to_string()),
@@ -10598,7 +10455,7 @@ mod tests {
 
         let mut transaction = session.begin_transaction().await.unwrap();
         let update_sql =
-            "UPDATE journal_read_your_writes_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE journal_read_your_writes_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             transaction
                 .execute(
@@ -10644,21 +10501,17 @@ mod tests {
     async fn mixed_journal_fallback_preserves_created_at() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "mixed_journal_lifecycle_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "mixed_journal_lifecycle_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10666,7 +10519,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
-                 VALUES ('existing', lix_json('{\"state\":\"base\"}'))",
+                 VALUES ('existing', CAST('{\"state\":\"base\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10687,14 +10540,14 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
-                 VALUES ('inserted', lix_json('{\"state\":\"inserted\"}'))",
+                 VALUES ('inserted', CAST('{\"state\":\"inserted\"}' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
         transaction
             .execute(
-                "UPDATE mixed_journal_lifecycle_probe SET value = lix_json($1) WHERE path = $2",
+                "UPDATE mixed_journal_lifecycle_probe SET value = CAST($1 AS JSONB) WHERE path = $2",
                 &[
                     Value::Text("{\"state\":\"updated\"}".to_string()),
                     Value::Text("existing".to_string()),
@@ -10723,21 +10576,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "rooted_journal_parent_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "rooted_journal_parent_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10747,7 +10596,7 @@ mod tests {
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
                         label: None,
-                        sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),
                             Value::Text("{\"state\":\"base\"}".to_string()),
@@ -10775,7 +10624,7 @@ mod tests {
         );
         let mut transaction = session.begin_transaction().await.unwrap();
         let update_sql =
-            "UPDATE rooted_journal_parent_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE rooted_journal_parent_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             transaction
                 .execute(
@@ -10964,19 +10813,17 @@ mod tests {
             .await
             .expect("second session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "read_plan_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "revision": { "type": "integer" }
-            },
-            "required": ["id", "revision"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "read_plan_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "revision", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -11033,16 +10880,16 @@ mod tests {
         assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
 
         let added_schema = serde_json::json!({
-            "x-lix-key": "read_plan_catalog_revision",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "read_plan_catalog_revision",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(added_schema.to_string())],
             )
             .await

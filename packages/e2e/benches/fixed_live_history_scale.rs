@@ -235,7 +235,7 @@ where
                 let result = self
                     .session
                     .execute(
-                        "UPDATE fixed_live SET value = lix_json($1) WHERE path = $2",
+                        "UPDATE fixed_live SET value = CAST($1 AS JSONB) WHERE path = $2",
                         &[
                             Value::Text(format!(r#"{{"update":{}}}"#, self.sequence)),
                             Value::Text(live_path(self.live_rows / 2)),
@@ -250,7 +250,7 @@ where
                 let result = self
                     .session
                     .execute(
-                        "INSERT INTO fixed_live (path, value) VALUES ($1, lix_json($2))",
+                        "INSERT INTO fixed_live (path, value) VALUES ($1, CAST($2 AS JSONB))",
                         &[
                             Value::Text(path),
                             Value::Text(format!(r#"{{"insert":{}}}"#, self.sequence)),
@@ -280,7 +280,7 @@ where
             let path = format!("/delete/{index:08}");
             self.session
                 .execute(
-                    "INSERT INTO fixed_live (path, value) VALUES ($1, lix_json('null'))",
+                    "INSERT INTO fixed_live (path, value) VALUES ($1, CAST('null' AS JSONB))",
                     &[Value::Text(path.clone())],
                 )
                 .await
@@ -384,21 +384,17 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "fixed_live",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "fixed_live",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -413,7 +409,7 @@ where
     for index in 0..live_rows {
         transaction
             .execute(
-                "INSERT INTO fixed_live (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO fixed_live (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(live_path(index)),
                     Value::Text(format!(r#"{{"seed":{index}}}"#)),

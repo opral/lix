@@ -1,5 +1,5 @@
 ---
-description: Query typed history for branch-reachable entity states and lix_change for repository-wide activity.
+description: Query typed history for branch-reachable entity states and lix_change for workspace-wide activity.
 ---
 
 # Change History
@@ -14,11 +14,11 @@ WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
-| title   | done  | lixcol_depth | lixcol_is_deleted |
-| :------ | :---- | -----------: | :---------------- |
-| Ship v2 | true  |            0 | false             |
-| Ship v2 | false |            1 | false             |
-| NULL    | NULL  |            2 | true              |
+| title | done | lixcol_depth | lixcol_is_deleted |
+| :-- | :-- | --: | :-- |
+| Ship v2 | true | 0 | false |
+| Ship v2 | false | 1 | false |
+| NULL | NULL | 2 | true |
 
 `lixcol_depth` `0` is the state at the head; higher depths walk back through
 reachable commits. The `lixcol_is_deleted` row is a tombstone: the task was
@@ -27,14 +27,14 @@ deleted at that revision and recreated later, so its state columns are `NULL`.
 Lix exposes two history concepts. Choose the surface that matches the scope of
 the question:
 
-| Surface                                                               | What it answers                                           |
-| :-------------------------------------------------------------------- | :-------------------------------------------------------- |
-| `<schema>_history()`, `lix_file_history()`, `lix_directory_history()` | Which logical revisions are reachable from a commit?      |
-| `lix_change`                                                          | Which retained changes exist anywhere in this repository? |
+| Surface | What it answers |
+| :-- | :-- |
+| `<schema>_history()`, `lix_file_history()`, `lix_directory_history()` | Which logical revisions are reachable from a commit? |
+| `lix_change` | Which retained changes exist anywhere in this workspace? |
 
 Typed history is exposed through table-valued functions. It is schema-specific
 and commit-reachability scoped. `lix_change` is heterogeneous and
-repository-wide. A change on an unmerged sibling branch can appear in
+workspace-wide. A change on an unmerged sibling branch can appear in
 `lix_change` without appearing in history read from the active branch.
 
 For the full surface grid, insert policies, and the
@@ -51,19 +51,19 @@ History starts at the active branch head. The user columns are the same typed
 columns exposed by the base relation. Entity history adds these system
 columns:
 
-| Column                      | What it is                                                                                                                                                                                                         |
-| :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lixcol_entity_pk`          | JSON array of primary-key values in `x-lix-primary-key` order.                                                                                                                                                     |
-| `lixcol_schema_key`         | The registered schema key.                                                                                                                                                                                         |
-| `lixcol_file_id`            | The owning file, or `NULL`.                                                                                                                                                                                        |
-| `lixcol_metadata`           | JSON change metadata.                                                                                                                                                                                              |
-| `lixcol_change_id`          | The `lix_change.id` that produced this state.                                                                                                                                                                      |
-| `lixcol_change_created_at`  | When that source change was created.                                                                                                                                                                               |
-| `lixcol_origin_key`         | Optional origin key attached to the source change.                                                                                                                                                                 |
-| `lixcol_observed_commit_id` | The commit where this state was observed.                                                                                                                                                                          |
-| `lixcol_commit_created_at`  | When that commit was created. It never falls back to the change timestamp.                                                                                                                                         |
-| `lixcol_depth`              | `0` is the revision at the anchor; higher values walk back through reachable history.                                                                                                                              |
-| `lixcol_is_deleted`         | `true` when the revision is a tombstone. The row keeps the entity identity — every declared primary-key root, including nested JSON roots — and the history metadata, while the nullable state columns are `NULL`. |
+| Column | What it is |
+| :-- | :-- |
+| `lixcol_entity_pk` | JSON array of primary-key values in Schema v1 `primary_key` order. |
+| `lixcol_schema_key` | The registered schema key. |
+| `lixcol_file_id` | The owning file, or `NULL`. |
+| `lixcol_metadata` | JSON change metadata. |
+| `lixcol_change_id` | The `lix_change.id` that produced this state. |
+| `lixcol_change_created_at` | When that source change was created. |
+| `lixcol_origin_key` | Optional origin key attached to the source change. |
+| `lixcol_observed_commit_id` | The commit where this state was observed. |
+| `lixcol_commit_created_at` | When that commit was created. It never falls back to the change timestamp. |
+| `lixcol_depth` | `0` is the revision at the anchor; higher values walk back through reachable history. |
+| `lixcol_is_deleted` | `true` when the revision is a tombstone. The row keeps the entity identity — every declared primary-key root, including nested JSON roots — and the history metadata, while the nullable state columns are `NULL`. |
 
 The commit argument sets the starting point for the whole query. Call the
 function without an argument to start at the active head, or pass a commit id
@@ -144,22 +144,22 @@ Rows are reconstructed through the anchor commit's ancestry. Equal-depth
 sibling commits are not treated as ancestors, and recursive deletion
 provenance retains the relevant ancestor tombstones.
 
-## Repository activity with `lix_change`
+## Workspace activity with `lix_change`
 
 `lix_change` contains every retained change across branches, without proving
 branch reachability. Ordinary untracked writes do not create change rows.
 
-| Column             | What it is                                           |
-| :----------------- | :--------------------------------------------------- |
-| `id`               | Unique change ID.                                    |
-| `entity_pk`        | JSON array of primary-key values in schema order.    |
-| `schema_key`       | Changed schema (`x-lix-key`).                        |
-| `file_id`          | Owning file, or `NULL`.                              |
-| `metadata`         | JSON change metadata.                                |
+| Column | What it is |
+| :-- | :-- |
+| `id` | Unique change ID. |
+| `entity_pk` | JSON array of primary-key values in schema order. |
+| `schema_key` | Changed Schema v1 key. |
+| `file_id` | Owning file, or `NULL`. |
+| `metadata` | JSON change metadata. |
 | `snapshot_content` | Snapshot after the change, or `NULL` for a deletion. |
-| `account_id`       | Account that authored the change.                    |
-| `origin_key`       | Optional origin key attached to the change.          |
-| `created_at`       | Change timestamp.                                    |
+| `account_id` | Account that authored the change. |
+| `origin_key` | Optional origin key attached to the change. |
+| `created_at` | Change timestamp. |
 
 `entity_pk` is an ordered JSON array even for a singleton key. Use numeric path
 segments for array indexes:
@@ -168,8 +168,8 @@ segments for array indexes:
 SELECT created_at, id, snapshot_content
 FROM lix_change
 WHERE schema_key = 'acme_issue'
-  AND lix_json_get_text(entity_pk, 0) = 'launch'
-  AND lix_json_get_text(entity_pk, 1) = '7'
+  AND entity_pk ->> 0 = 'launch'
+  AND entity_pk ->> 1 = '7'
 ORDER BY created_at, id;
 ```
 

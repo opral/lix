@@ -67,6 +67,7 @@ enum ParameterType {
     Real,
     Text,
     Json,
+    Timestamp,
     Blob,
 }
 
@@ -651,6 +652,7 @@ impl<CatalogKey> PhysicalReadPlanCacheKey<CatalogKey> {
                     continue;
                 }
                 Value::Blob(value) => (7, value.to_vec()),
+                Value::Timestamp(value) => (8, value.to_le_bytes().to_vec()),
             };
             parameters.push(tag);
             parameters.extend_from_slice(&bytes.len().to_le_bytes());
@@ -675,6 +677,7 @@ impl From<&Value> for ParameterType {
             Value::Text(_) => Self::Text,
             Value::Json(_) => Self::Json,
             Value::Blob(_) => Self::Blob,
+            Value::Timestamp(_) => Self::Timestamp,
         }
     }
 }
@@ -1277,18 +1280,18 @@ mod tests {
         let cache = test_cache(8);
         let first = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+                "UPDATE notes SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
             )
             .expect("literal update auto-parameterizes");
         let second = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
+                "UPDATE notes SET value = CAST('{\"text\":\"second\"}' AS JSONB) WHERE id = 'b'",
             )
             .expect("case-equivalent literal update auto-parameterizes");
 
         assert_eq!(
             first.sql.as_ref(),
-            "UPDATE notes SET value = lix_json($1) WHERE id = $2"
+            "UPDATE notes SET value = CAST($1 AS JSONB) WHERE id = $2"
         );
         assert_eq!(
             first.params,
@@ -1312,19 +1315,19 @@ mod tests {
         let cache = test_cache(8);
         let template = cache
             .auto_parameterized_update(
-                "UPDATE \"notes\" SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+                "UPDATE \"notes\" SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
             )
             .unwrap();
 
         assert!(cache.update_literal_shape_matches(
-            "UPDATE \"notes\" SET value = lix_json('{\"text\":\"it''''s fine\"}') WHERE id = 'b'",
+            "UPDATE \"notes\" SET value = CAST('{\"text\":\"it''''s fine\"}' AS JSONB) WHERE id = 'b'",
             &template.sql,
         ));
         for different_shape in [
-            "UPDATE \"notes\" SET value = lix_json('{}') WHERE other_id = 'b'",
-            "UPDATE notes SET value = lix_json('{}') WHERE id = 'b'",
-            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = 'b' -- comment",
-            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = $1",
+            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE other_id = 'b'",
+            "UPDATE notes SET value = CAST('{}' AS JSONB) WHERE id = 'b'",
+            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE id = 'b' -- comment",
+            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE id = $1",
         ] {
             assert!(
                 !cache.update_literal_shape_matches(different_shape, &template.sql),
@@ -1341,7 +1344,7 @@ mod tests {
         params[1].push_str("stale-id");
 
         assert!(cache.decode_certified_update_literals_into(
-            "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'b'",
+            "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'b'",
             &mut params,
         ));
         assert_eq!(params, ["{\"text\":\"it's fine\"}", "b"]);
@@ -1356,13 +1359,13 @@ mod tests {
         let cache = test_cache(8);
         let template = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+                "UPDATE notes SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
             )
             .unwrap();
         let mut escape_scratch = SmallVec::new();
         let borrowed = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
+                "UPDATE notes SET value = CAST('{\"text\":\"second\"}' AS JSONB) WHERE id = 'b'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1375,7 +1378,7 @@ mod tests {
 
         let escaped = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'c'",
+                "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'c'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1393,7 +1396,7 @@ mod tests {
         let allocation = escape_scratch[0].as_ptr();
         let escaped_again = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'd'",
+                "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'd'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1424,14 +1427,13 @@ mod tests {
         let catalog_a = "catalog-a".to_string();
         let catalog_b = "catalog-b".to_string();
         let schema = json!({
-            "x-lix-key": "app_note",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "text": { "type": "string" }
-            },
-            "required": ["id", "text"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "app_note",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "text", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
 
         let first = cache

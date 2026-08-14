@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 
+use crate::common::LixTimestamp;
 use crate::functions::FunctionProviderHandle;
 
 /// Per-session storage for the per-statement facts the execution UDFs report.
 ///
 /// The five execution functions (`lix_active_account_id`,
-/// `lix_active_branch_id`, `lix_active_branch_commit_id`, `lix_uuid_v7`,
-/// `lix_timestamp`) used to be registered and deregistered on every statement so
+/// `lix_active_branch_id`, `lix_active_branch_commit_id`, `uuidv7`,
+/// `CURRENT_TIMESTAMP`) used to be registered and deregistered on every statement so
 /// each one could capture that statement's values in its own fields. They are
 /// now registered once, when the session is created, and read this slot at
 /// invocation time instead.
@@ -28,6 +29,7 @@ struct ExecutionSlotValues {
     active_branch_id: Option<String>,
     active_branch_commit_id: Option<String>,
     functions: Option<FunctionProviderHandle>,
+    current_timestamp: Option<LixTimestamp>,
 }
 
 impl std::fmt::Debug for ExecutionSlots {
@@ -57,6 +59,7 @@ impl ExecutionSlots {
         assign(&mut values.active_branch_id, active_branch_id);
         assign(&mut values.active_branch_commit_id, active_branch_commit_id);
         values.functions = Some(functions);
+        values.current_timestamp = None;
     }
 
     pub(crate) fn active_account_id(&self) -> Option<String> {
@@ -83,6 +86,24 @@ impl ExecutionSlots {
                 "Lix SQL execution functions were invoked on an unbound session".to_string(),
             )
         })
+    }
+
+    /// PostgreSQL `CURRENT_TIMESTAMP`: one value fixed for this statement's
+    /// implicit transaction. The provider is invoked lazily so statements that
+    /// do not use a timestamp do not consume deterministic sequence state.
+    pub(crate) fn current_timestamp(&self) -> Result<LixTimestamp> {
+        let mut values = self.lock();
+        if let Some(timestamp) = values.current_timestamp {
+            return Ok(timestamp);
+        }
+        let functions = values.functions.clone().ok_or_else(|| {
+            DataFusionError::Internal(
+                "Lix SQL execution functions were invoked on an unbound session".to_string(),
+            )
+        })?;
+        let timestamp = functions.call_timestamp();
+        values.current_timestamp = Some(timestamp);
+        Ok(timestamp)
     }
 
     fn lock(&self) -> MutexGuard<'_, ExecutionSlotValues> {

@@ -747,6 +747,16 @@ impl TryFrom<LixValueDto> for Value {
             "json" => Ok(Self::Json(
                 value.value.unwrap_or(serde_json::Value::Null).into(),
             )),
+            "timestamp" => {
+                let raw = value
+                    .value
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| invalid_param("timestamp value must be an RFC 3339 string"))?;
+                let parsed = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
+                    invalid_param(format!("timestamp value is invalid: {error}"))
+                })?;
+                Ok(Self::Timestamp(parsed.timestamp_micros()))
+            }
             "blob" => value
                 .blob
                 .map(|bytes| Self::Blob(bytes.into_vec().into()))
@@ -770,6 +780,17 @@ impl TryFrom<&Value> for LixValueDto {
             Value::Real(_) => return Err(invalid_param("cannot encode non-finite real value")),
             Value::Text(value) => ("text", Some(serde_json::json!(value)), None),
             Value::Json(value) => ("json", Some(value.to_value()), None),
+            Value::Timestamp(value) => {
+                let value = chrono::DateTime::from_timestamp_micros(*value)
+                    .ok_or_else(|| invalid_param("timestamp is out of range"))?;
+                (
+                    "timestamp",
+                    Some(serde_json::Value::String(
+                        value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    )),
+                    None,
+                )
+            }
             Value::Blob(value) => ("blob", None, Some(ByteBuf::from(value.to_vec()))),
         };
         Ok(Self {

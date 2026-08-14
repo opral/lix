@@ -4,8 +4,8 @@ use lix::{engine::Engine, session::SessionContext};
 
 const MULTI_ENTITY_SQL: &str = "SELECT b.id AS bundle_id, m.id AS message_id, \
     v.id AS variant_id FROM bundle b \
-    LEFT JOIN message m ON m.\"bundleId\" = b.id \
-    LEFT JOIN variant v ON v.\"messageId\" = m.id WHERE b.id = $1";
+    LEFT JOIN message m ON m.\"bundle_id\" = b.id \
+    LEFT JOIN variant v ON v.\"message_id\" = m.id WHERE b.id = $1";
 
 #[tokio::test(flavor = "current_thread")]
 async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
@@ -21,7 +21,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     for schema in multi_entity_schemas() {
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -169,7 +169,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
 async fn insert_message_variant(session: &SessionContext, message_id: &str, bundle_id: &str) {
     session
         .execute(
-            "INSERT INTO message (id, \"bundleId\", locale, selectors) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO message (id, \"bundle_id\", locale, selectors) VALUES ($1, $2, $3, $4)",
             &[
                 Value::Text(message_id.to_string()),
                 Value::Text(bundle_id.to_string()),
@@ -181,7 +181,7 @@ async fn insert_message_variant(session: &SessionContext, message_id: &str, bund
         .expect("message should insert");
     session
         .execute(
-            "INSERT INTO variant (id, \"messageId\", matches, pattern) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO variant (id, \"message_id\", matches, pattern) VALUES ($1, $2, $3, $4)",
             &[
                 Value::Text(format!("{message_id}-0")),
                 Value::Text(message_id.to_string()),
@@ -196,19 +196,35 @@ async fn insert_message_variant(session: &SessionContext, message_id: &str, bund
 fn multi_entity_schemas() -> [serde_json::Value; 3] {
     [
         serde_json::json!({
-            "x-lix-key": "bundle", "x-lix-primary-key": ["/id"], "type": "object",
-            "properties": { "id": { "type": "string" }, "declarations": { "type": "array" } },
-            "required": ["id", "declarations"], "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bundle",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "declarations", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }),
         serde_json::json!({
-            "x-lix-key": "message", "x-lix-primary-key": ["/id"], "type": "object",
-            "properties": { "id": { "type": "string" }, "bundleId": { "type": "string" }, "locale": { "type": "string" }, "selectors": { "type": "array" } },
-            "required": ["id", "bundleId", "locale", "selectors"], "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "message",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "bundle_id", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+                { "name": "selectors", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }),
         serde_json::json!({
-            "x-lix-key": "variant", "x-lix-primary-key": ["/id"], "type": "object",
-            "properties": { "id": { "type": "string" }, "messageId": { "type": "string" }, "matches": { "type": "array" }, "pattern": { "type": "array" } },
-            "required": ["id", "messageId", "matches", "pattern"], "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "variant",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "message_id", "type": "text", "nullable": false },
+                { "name": "matches", "type": "jsonb", "nullable": false },
+                { "name": "pattern", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }),
     ]
 }

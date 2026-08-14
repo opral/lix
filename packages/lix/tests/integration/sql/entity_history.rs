@@ -19,7 +19,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"meta\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -32,7 +32,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_history_schema \
                  (lixcol_entity_pk, id, count, active, meta, lixcol_untracked) \
-                 VALUES (lix_json('[\"history-entity\"]'), 'history-entity', 1, true, lix_json('{\"source\":\"insert\"}'), false)",
+                 VALUES (CAST('[\"history-entity\"]' AS JSONB), 'history-entity', 1, true, CAST('{\"source\":\"insert\"}' AS JSONB), false)",
                 &[],
             )
             .await
@@ -46,8 +46,8 @@ simulation_test!(
         session
             .execute(
                 "UPDATE engine_history_schema \
-                 SET count = 2, active = false, meta = lix_json('{\"source\":\"update\"}') \
-                 WHERE lixcol_entity_pk = lix_json('[\"history-entity\"]')",
+                 SET count = 2, active = false, meta = CAST('{\"source\":\"update\"}' AS JSONB) \
+                 WHERE lixcol_entity_pk = CAST('[\"history-entity\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -64,7 +64,7 @@ simulation_test!(
                 &format!(
                     "SELECT id, count, active, meta, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_is_deleted, lixcol_depth \
                      FROM engine_history_schema_history('{second_commit_id}') \
-                     WHERE lixcol_entity_pk = lix_json('[\"history-entity\"]') \
+                     WHERE lixcol_entity_pk = CAST('[\"history-entity\"]' AS JSONB) \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -114,7 +114,7 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_error_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_error_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -127,7 +127,7 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
         .execute(
             "INSERT INTO engine_history_error_schema \
                  (lixcol_entity_pk, id, lixcol_untracked) \
-                 VALUES (lix_json('[\"history-default\"]'), 'history-default', false)",
+                 VALUES (CAST('[\"history-default\"]' AS JSONB), 'history-default', false)",
             &[],
         )
         .await
@@ -167,7 +167,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_bare_error_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_bare_error_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
@@ -28,6 +28,7 @@ pub(crate) enum EntityColumnType {
     Integer,
     Number,
     Boolean,
+    Timestamptz,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl EntitySurfaceSpec {
                 EntityColumnType::Integer => 3,
                 EntityColumnType::Number => 4,
                 EntityColumnType::Boolean => 5,
+                EntityColumnType::Timestamptz => 6,
             }]);
             hasher.update(&[u8::from(column.read_nullable)]);
         }
@@ -130,121 +132,87 @@ impl EntitySurfaceSpec {
 pub(crate) fn derive_entity_surface_spec_from_schema(
     schema: &JsonValue,
 ) -> Result<EntitySurfaceSpec, LixError> {
-    let schema_key = schema
-        .get("x-lix-key")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "schema is missing string x-lix-key".to_string(),
-            )
-        })?;
-
-    let properties = schema
-        .get("properties")
-        .and_then(JsonValue::as_object)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                format!("schema '{schema_key}' must define object properties"),
-            )
-        })?;
-    let required = schema
-        .get("required")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
-        .collect::<BTreeSet<_>>();
-    let primary_key_paths = parse_primary_key_paths(schema)?;
-    let primary_key_component_types = primary_key_paths
+    let parsed = crate::schema::parse_lix_schema(schema)?;
+    let schema_key = parsed.key.clone();
+    let primary_key_paths = parsed
+        .primary_key
         .iter()
-        .map(|path| {
-            let [property] = path.as_slice() else {
-                return EntityPkComponentType::String;
-            };
-            let property = properties
-                .get(property)
-                .expect("validated primary-key property must exist");
-            if property.get("type").and_then(JsonValue::as_str) == Some("integer") {
-                EntityPkComponentType::Integer
-            } else if property.get("format").and_then(JsonValue::as_str) == Some("uuid") {
-                EntityPkComponentType::Uuid
-            } else if property.get("contentEncoding").and_then(JsonValue::as_str) == Some("base64")
-            {
-                EntityPkComponentType::Bytes
-            } else {
-                EntityPkComponentType::String
+        .cloned()
+        .map(|column| vec![column])
+        .collect::<Vec<_>>();
+    let primary_key_component_types = parsed
+        .primary_key
+        .iter()
+        .map(|name| {
+            let column = parsed
+                .columns
+                .iter()
+                .find(|column| &column.name == name)
+                .expect("validated primary-key column must exist");
+            match column.data_type {
+                lix_schema::DataType::Uuid => EntityPkComponentType::Uuid,
+                lix_schema::DataType::Int8 => EntityPkComponentType::Integer,
+                lix_schema::DataType::Text => EntityPkComponentType::String,
+                _ => unreachable!("validated Schema v1 primary-key type"),
             }
         })
         .collect();
-    let primary_key_roots = primary_key_paths
+    let columns = parsed
+        .columns
         .iter()
-        .filter_map(|path| path.first())
-        .collect::<BTreeSet<_>>();
-
-    let mut columns = properties
-        .iter()
-        .filter(|(key, _)| !key.starts_with("lixcol_"))
-        .map(|(key, property_schema)| {
-            let column_type = entity_column_type_from_schema(property_schema).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "schema '{schema_key}' property '/{key}' must declare a SQL-projectable JSON Schema type"
-                    ),
-                )
-                .with_hint("Use an explicit type such as string, number, integer, boolean, object, array, or a supported union of those types.")
-            })?;
-            Ok(EntitySurfaceColumn {
-                name: key.clone(),
-                column_type,
-                read_nullable: !primary_key_roots.contains(key)
-                    && (!required.contains(key.as_str())
-                        || entity_schema_allows_null(property_schema)),
-                insert_required: required.contains(key.as_str()),
-                default_expression: property_schema
-                    .get("x-lix-default")
-                    .map(lix_default_expression)
-                    .or_else(|| {
-                        property_schema
-                            .get("default")
-                            .map(json_schema_default_expression)
-                    }),
-            })
+        .map(|column| EntitySurfaceColumn {
+            name: column.name.clone(),
+            column_type: match column.data_type {
+                lix_schema::DataType::Text | lix_schema::DataType::Uuid => EntityColumnType::String,
+                lix_schema::DataType::Int8 => EntityColumnType::Integer,
+                lix_schema::DataType::Float8 => EntityColumnType::Number,
+                lix_schema::DataType::Boolean => EntityColumnType::Boolean,
+                lix_schema::DataType::Jsonb => EntityColumnType::Json,
+                lix_schema::DataType::Timestamptz => EntityColumnType::Timestamptz,
+            },
+            read_nullable: column.nullable,
+            insert_required: !column.nullable
+                && column.default_value.is_none()
+                && column.default_expression.is_none(),
+            default_expression: column
+                .default_expression
+                .clone()
+                .or_else(|| column.default_value.as_ref().map(postgres_literal)),
         })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    columns.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let certifies_path_value_replacement = certifies_path_value_replacement(schema);
-    let columnar_snapshot_bijective = schema.get("additionalProperties")
-        == Some(&JsonValue::Bool(false))
-        && properties.len() == columns.len()
-        && columns.iter().all(|column| {
-            column.insert_required
-                && matches!(
-                    column.column_type,
-                    EntityColumnType::String
-                        | EntityColumnType::Integer
-                        | EntityColumnType::Boolean
-                )
+        .collect::<Vec<_>>();
+    let certifies_path_value_replacement = parsed.primary_key == ["path"]
+        && parsed.columns.len() == 2
+        && parsed.columns.iter().any(|column| {
+            column.name == "path"
+                && column.data_type == lix_schema::DataType::Text
+                && !column.nullable
+                && column.default_value.is_none()
+                && column.default_expression.is_none()
+        })
+        && parsed.columns.iter().any(|column| {
+            column.name == "value"
+                && column.data_type == lix_schema::DataType::Jsonb
+                && !column.nullable
+                && column.default_value.is_none()
+                && column.default_expression.is_none()
         });
-    let indexed_columns = derive_indexed_columns(schema, &columns, &primary_key_paths);
+    let indexed_columns = derive_indexed_columns(&parsed, &columns);
+    let columnar_snapshot_bijective = columns.iter().all(|column| {
+        !column.read_nullable
+            && column.default_expression.is_none()
+            && matches!(
+                column.column_type,
+                EntityColumnType::String | EntityColumnType::Integer | EntityColumnType::Boolean
+            )
+    });
     Ok(EntitySurfaceSpec {
-        schema_key: schema_key.to_string(),
+        schema_key,
         primary_key_paths,
         primary_key_component_types,
         indexed_columns,
         columns,
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
-        has_inter_row_constraints: ["x-lix-unique", "x-lix-foreign-keys"].into_iter().any(
-            |keyword| {
-                schema
-                    .get(keyword)
-                    .and_then(JsonValue::as_array)
-                    .is_some_and(|values| !values.is_empty())
-            },
-        ),
+        has_inter_row_constraints: !parsed.unique.is_empty() || !parsed.foreign_keys.is_empty(),
         certifies_path_value_replacement,
         columnar_snapshot_bijective,
     })
@@ -270,9 +238,8 @@ pub(crate) struct EntityIndexedColumn {
 /// - primary-key columns are skipped — the hot row key already indexes them,
 ///   and a second access path to the same rows would be a second mechanism.
 fn derive_indexed_columns(
-    schema: &JsonValue,
+    schema: &lix_schema::Schema,
     columns: &[EntitySurfaceColumn],
-    primary_key_paths: &[Vec<String>],
 ) -> Vec<EntityIndexedColumn> {
     let mut names = Vec::new();
     let mut push = |name: &str| {
@@ -280,41 +247,20 @@ fn derive_indexed_columns(
             names.push(name.to_string());
         }
     };
-    for group in schema
-        .get("x-lix-unique")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some([pointer]) = group.as_array().map(Vec::as_slice)
-            && let Some(name) = pointer.as_str().and_then(single_property_pointer)
-        {
+    for group in &schema.unique {
+        if let [name] = group.as_slice() {
             push(name);
         }
     }
-    for foreign_key in schema
-        .get("x-lix-foreign-keys")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some([pointer]) = foreign_key
-            .get("properties")
-            .and_then(JsonValue::as_array)
-            .map(Vec::as_slice)
-            && let Some(name) = pointer.as_str().and_then(single_property_pointer)
-        {
+    for foreign_key in &schema.foreign_keys {
+        if let [name] = foreign_key.columns.as_slice() {
             push(name);
         }
     }
     names.sort();
     names
         .into_iter()
-        .filter(|name| {
-            !primary_key_paths
-                .iter()
-                .any(|path| matches!(path.as_slice(), [component] if component == name))
-        })
+        .filter(|name| !schema.primary_key.contains(name))
         .filter_map(|name| {
             let column = columns.iter().find(|column| column.name == name)?;
             matches!(
@@ -335,119 +281,16 @@ fn derive_indexed_columns(
         .collect()
 }
 
-/// `"/name"` for a top-level property, `None` for anything nested.
-fn single_property_pointer(pointer: &str) -> Option<&str> {
-    let name = pointer.strip_prefix('/')?;
-    (!name.is_empty() && !name.contains('/')).then_some(name)
-}
-
-fn certifies_path_value_replacement(schema: &JsonValue) -> bool {
-    let Some(object) = schema.as_object() else {
-        return false;
-    };
-    let allowed_schema_keys = [
-        "$id",
-        "$schema",
-        "$comment",
-        "title",
-        "description",
-        "type",
-        "properties",
-        "required",
-        "additionalProperties",
-        "x-lix-key",
-        "x-lix-primary-key",
-    ];
-    if object
-        .keys()
-        .any(|key| !allowed_schema_keys.contains(&key.as_str()))
-        || object.get("type").and_then(JsonValue::as_str) != Some("object")
-        || object.get("additionalProperties") != Some(&JsonValue::Bool(false))
-    {
-        return false;
+fn postgres_literal(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "NULL".to_string(),
+        JsonValue::Bool(value) => value.to_string().to_ascii_uppercase(),
+        JsonValue::Number(value) => value.to_string(),
+        JsonValue::String(value) => format!("'{}'", value.replace('\'', "''")),
+        JsonValue::Array(_) | JsonValue::Object(_) => {
+            format!("'{}'::jsonb", value.to_string().replace('\'', "''"))
+        }
     }
-    let Some(properties) = object.get("properties").and_then(JsonValue::as_object) else {
-        return false;
-    };
-    if properties.len() != 2
-        || !properties.contains_key("path")
-        || !properties
-            .get("path")
-            .is_some_and(schema_accepts_string_identity)
-        || !properties
-            .get("value")
-            .is_some_and(schema_accepts_every_json_value)
-    {
-        return false;
-    }
-    let required = object
-        .get("required")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
-        .collect::<BTreeSet<_>>();
-    required == BTreeSet::from(["path", "value"])
-        && object
-            .get("x-lix-primary-key")
-            .and_then(JsonValue::as_array)
-            .is_some_and(|paths| paths.as_slice() == [JsonValue::String("/path".to_string())])
-}
-
-fn schema_accepts_string_identity(schema: &JsonValue) -> bool {
-    schema
-        .as_object()
-        .and_then(|schema| schema.get("type"))
-        .and_then(JsonValue::as_str)
-        == Some("string")
-}
-
-fn schema_accepts_every_json_value(schema: &JsonValue) -> bool {
-    if schema == &JsonValue::Bool(true) {
-        return true;
-    }
-    let Some(schema) = schema.as_object() else {
-        return false;
-    };
-    let annotations = ["$comment", "title", "description", "default", "examples"];
-    if schema.is_empty() || schema.keys().all(|key| annotations.contains(&key.as_str())) {
-        return true;
-    }
-    let validation_keys = schema
-        .keys()
-        .filter(|key| !annotations.contains(&key.as_str()))
-        .collect::<Vec<_>>();
-    if validation_keys.len() == 1 && validation_keys[0].as_str() == "type" {
-        let Some(types) = schema.get("type").and_then(JsonValue::as_array) else {
-            return false;
-        };
-        let accepted = types
-            .iter()
-            .filter_map(JsonValue::as_str)
-            .collect::<BTreeSet<_>>();
-        return accepted
-            == BTreeSet::from([
-                "array", "boolean", "integer", "null", "number", "object", "string",
-            ]);
-    }
-    if validation_keys.len() != 1 || validation_keys[0].as_str() != "anyOf" {
-        return false;
-    }
-    let Some(branches) = schema.get("anyOf").and_then(JsonValue::as_array) else {
-        return false;
-    };
-    let accepted = branches
-        .iter()
-        .filter_map(|branch| {
-            let branch = branch.as_object()?;
-            branch
-                .keys()
-                .all(|key| key == "type" || annotations.contains(&key.as_str()))
-                .then(|| branch.get("type")?.as_str())
-                .flatten()
-        })
-        .collect::<BTreeSet<_>>();
-    accepted == BTreeSet::from(["array", "boolean", "null", "number", "object", "string"])
 }
 
 pub(crate) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
@@ -549,147 +392,14 @@ pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
     fields
 }
 
-fn parse_primary_key_paths(schema: &JsonValue) -> Result<Vec<Vec<String>>, LixError> {
-    let Some(primary_key) = schema.get("x-lix-primary-key") else {
-        return Ok(Vec::new());
-    };
-    let primary_key = primary_key.as_array().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "schema x-lix-primary-key must be an array of JSON Pointers".to_string(),
-        )
-    })?;
-
-    primary_key
-        .iter()
-        .enumerate()
-        .map(|(index, pointer)| {
-            let pointer = pointer.as_str().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("schema x-lix-primary-key entry at index {index} must be a string"),
-                )
-            })?;
-            parse_json_pointer(pointer)
-        })
-        .collect()
-}
-
-// TODO(engine): share JSON Pointer parsing with schema/canonical validation once
-// those helpers have a clean module boundary for SQL providers.
-fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
-    if pointer.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !pointer.starts_with('/') {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("invalid JSON pointer '{pointer}'"),
-        ));
-    }
-    pointer[1..]
-        .split('/')
-        .map(decode_json_pointer_segment)
-        .collect()
-}
-
-fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
-    let mut out = String::new();
-    let mut chars = segment.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            match chars.next() {
-                Some('0') => out.push('~'),
-                Some('1') => out.push('/'),
-                _ => {
-                    return Err(LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!("invalid JSON pointer segment '{segment}'"),
-                    ));
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
-}
-
-fn entity_column_type_from_schema(schema: &JsonValue) -> Option<EntityColumnType> {
-    let mut kinds = BTreeSet::new();
-    collect_entity_type_kinds(schema, &mut kinds);
-    kinds.remove("null");
-
-    if kinds.is_empty() {
-        return None;
-    }
-
-    if kinds.len() == 1 {
-        return match kinds.into_iter().next() {
-            Some("boolean") => Some(EntityColumnType::Boolean),
-            Some("integer") => Some(EntityColumnType::Integer),
-            Some("number") => Some(EntityColumnType::Number),
-            Some("string") => Some(EntityColumnType::String),
-            Some("object" | "array") => Some(EntityColumnType::Json),
-            _ => None,
-        };
-    }
-
-    Some(EntityColumnType::Json)
-}
-
-fn entity_schema_allows_null(schema: &JsonValue) -> bool {
-    let mut kinds = BTreeSet::new();
-    collect_entity_type_kinds(schema, &mut kinds);
-    kinds.contains("null")
-}
-
-fn lix_default_expression(default: &JsonValue) -> String {
-    match default {
-        JsonValue::String(value) => value.clone(),
-        value => value.to_string(),
-    }
-}
-
-fn json_schema_default_expression(default: &JsonValue) -> String {
-    match default {
-        JsonValue::Null => "NULL".to_string(),
-        JsonValue::Bool(value) => value.to_string().to_ascii_uppercase(),
-        JsonValue::Number(value) => value.to_string(),
-        JsonValue::String(value) => format!("'{}'", value.replace('\'', "''")),
-        JsonValue::Array(_) | JsonValue::Object(_) => {
-            format!("lix_json('{}')", default.to_string().replace('\'', "''"))
-        }
-    }
-}
-
 fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> DataType {
     match column_type {
         EntityColumnType::String | EntityColumnType::Json => DataType::Utf8,
         EntityColumnType::Integer => DataType::Int64,
         EntityColumnType::Number => DataType::Float64,
         EntityColumnType::Boolean => DataType::Boolean,
-    }
-}
-
-fn collect_entity_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a str>) {
-    match schema.get("type") {
-        Some(JsonValue::String(kind)) => {
-            out.insert(kind.as_str());
-        }
-        Some(JsonValue::Array(kinds)) => {
-            for kind in kinds.iter().filter_map(JsonValue::as_str) {
-                out.insert(kind);
-            }
-        }
-        _ => {}
-    }
-
-    for keyword in ["anyOf", "oneOf", "allOf"] {
-        if let Some(JsonValue::Array(branches)) = schema.get(keyword) {
-            for branch in branches {
-                collect_entity_type_kinds(branch, out);
-            }
+        EntityColumnType::Timestamptz => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         }
     }
 }
@@ -702,32 +412,21 @@ mod tests {
         EntitySurfaceShape, derive_entity_surface_spec_from_schema, entity_surface_schema,
     };
 
-    fn path_value_schema(value_schema: serde_json::Value) -> serde_json::Value {
+    fn path_value_schema(value_type: &str) -> serde_json::Value {
         json!({
-            "x-lix-key": "arbitrary_name",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": value_schema
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "arbitrary_name",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": value_type, "nullable": false }
+            ],
+            "primary_key": ["path"]
         })
     }
 
     #[test]
     fn certifies_complete_path_value_rows_when_value_accepts_all_json() {
-        let spec = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "anyOf": [
-                { "type": "object" },
-                { "type": "array" },
-                { "type": "string" },
-                { "type": "number" },
-                { "type": "boolean" },
-                { "type": "null" }
-            ]
-        })))
+        let spec = derive_entity_surface_spec_from_schema(&path_value_schema("jsonb"))
         .expect("schema should derive");
 
         assert!(spec.certifies_path_value_replacement);
@@ -735,21 +434,19 @@ mod tests {
 
     #[test]
     fn columnar_snapshot_certificate_requires_exact_reversible_columns() {
-        let strings = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "type": "string"
-        })))
+        let strings = derive_entity_surface_spec_from_schema(&path_value_schema("text"))
         .expect("string schema should derive");
         assert!(strings.columnar_snapshot_bijective);
 
-        let numbers = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "type": "number"
-        })))
+        let numbers = derive_entity_surface_spec_from_schema(&path_value_schema("float8"))
         .expect("number schema should derive");
         assert!(!numbers.columnar_snapshot_bijective);
 
-        let mut reserved = path_value_schema(json!({ "type": "string" }));
-        reserved["properties"]["lixcol_user_value"] = json!({ "type": "string" });
-        reserved["required"] = json!(["path", "value", "lixcol_user_value"]);
+        let mut reserved = path_value_schema("text");
+        reserved["columns"]
+            .as_array_mut()
+            .expect("columns")
+            .push(json!({ "name": "lixcol_user_value", "type": "text", "nullable": true }));
         let reserved = derive_entity_surface_spec_from_schema(&reserved)
             .expect("reserved-name schema should still derive");
         assert!(!reserved.columnar_snapshot_bijective);
@@ -757,57 +454,31 @@ mod tests {
 
     #[test]
     fn does_not_certify_path_value_rows_with_value_constraints() {
-        let spec = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
-            "type": "object"
-        })))
-        .expect("schema should derive");
-        assert!(!spec.certifies_path_value_replacement);
-
-        let mut schema = path_value_schema(json!({
-            "anyOf": [
-                { "type": "object" },
-                { "type": "array" },
-                { "type": "string" },
-                { "type": "number" },
-                { "type": "boolean" },
-                { "type": "null" }
-            ]
-        }));
-        schema
-            .as_object_mut()
-            .expect("object schema")
-            .insert("minProperties".to_string(), json!(3));
+        let schema = path_value_schema("text");
         let spec = derive_entity_surface_spec_from_schema(&schema).expect("schema should derive");
         assert!(!spec.certifies_path_value_replacement);
     }
 
     #[test]
-    fn history_identity_roots_are_non_null_even_for_nested_keys() {
+    fn history_primary_key_columns_are_non_null() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "localized_document",
-            "x-lix-primary-key": ["/identity/tenant", "/identity/id", "/locale"],
-            "type": "object",
-            "properties": {
-                "identity": {
-                    "type": "object",
-                    "properties": {
-                        "tenant": { "type": "string" },
-                        "id": { "type": "string" }
-                    },
-                    "required": ["tenant", "id"]
-                },
-                "locale": { "type": "string" },
-                "body": { "type": "string" }
-            },
-            "required": ["identity", "locale", "body"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "localized_document",
+            "columns": [
+                { "name": "tenant", "type": "text", "nullable": false },
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["tenant", "id", "locale"],
         }))
         .expect("schema should derive");
 
         let history = entity_surface_schema(&spec, EntitySurfaceShape::History);
         assert!(
             !history
-                .field_with_name("identity")
-                .expect("nested identity root")
+                .field_with_name("tenant")
+                .expect("first identity column")
                 .is_nullable()
         );
         assert!(
@@ -826,7 +497,7 @@ mod tests {
         let active = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         assert!(
             !active
-                .field_with_name("identity")
+                .field_with_name("tenant")
                 .expect("active identity input")
                 .is_nullable(),
             "read nullability is independent from omission/default input semantics"
@@ -836,15 +507,23 @@ mod tests {
     #[test]
     fn columnar_layout_fingerprint_distinguishes_string_from_json_utf8() {
         let string_spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "payload",
-            "type": "object",
-            "properties": { "value": { "type": "string" } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "payload",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("string spec");
         let json_spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "payload",
-            "type": "object",
-            "properties": { "value": { "type": ["string", "object"] } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "payload",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("json spec");
 
@@ -872,38 +551,47 @@ mod tests {
     fn indexed_columns_imply_inter_row_constraints() {
         let cases = [
             json!({
-                "x-lix-key": "bypass_pk_only",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_pk_only",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "payload", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": "bypass_unique",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-unique": [["/slug"]],
-                "type": "object",
-                "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_unique",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "slug", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
+                "unique": [["slug"]],
             }),
             json!({
-                "x-lix-key": "bypass_fk",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parentId"],
-                    "references": { "schemaKey": "bypass_pk_only", "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_fk",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": "bypass_pk_only", "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": { "id": { "type": "string" }, "parentId": { "type": "string" } }
             }),
             json!({
-                "x-lix-key": "bypass_composite_unique",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-unique": [["/a", "/b"]],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "a": { "type": "string" },
-                    "b": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_composite_unique",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "a", "type": "text", "nullable": true },
+                    { "name": "b", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
+                "unique": [["a", "b"]],
             }),
         ];
         for schema in cases {
@@ -916,11 +604,14 @@ mod tests {
         }
 
         let unique = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "bypass_unique",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"]],
-            "type": "object",
-            "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bypass_unique",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"]],
         }))
         .expect("spec");
         assert_eq!(

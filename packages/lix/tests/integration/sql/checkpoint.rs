@@ -70,7 +70,7 @@ simulation_test!(
                 "SELECT entity_pk, schema_key, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"checkpoint-key\"]')",
+                   AND entity_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
             )
             .await,
             vec![vec![
@@ -331,7 +331,7 @@ simulation_test!(
                 "SELECT diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"working-removed\"]')",
+                   AND entity_pk = CAST('[\"working-removed\"]' AS JSONB)",
             )
             .await,
             vec![vec![Value::Text("removed".to_string())]],

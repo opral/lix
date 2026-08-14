@@ -3342,11 +3342,11 @@ mod tests {
                     _ => Some("文件"),
                 };
                 let entity_pk = if index % 2 == 0 {
-                    EntityPk::single(format!("entity\0{index:03}"))
+                    EntityPk::single(format!("entity-{index:03}"))
                 } else {
                     EntityPk::from_parts_unchecked(vec![
                         format!("entity-{index:03}"),
-                        "尾\0".to_string(),
+                        "尾-".to_string(),
                     ])
                 };
                 let key = TrackedStateKey {

@@ -140,21 +140,19 @@ async fn checkpoint_gc_retains_replay_and_selected_owners_after_reopen<S: Reopen
 
 async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>) {
     let schema = serde_json::json!({
-        "x-lix-key": SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "x-lix-unique": [["/indexed_value"]],
-        "type": "object",
-        "required": ["id", "indexed_value", "note", "generation"],
-        "properties": {
-            "id": { "type": "string" },
-            "indexed_value": { "type": "string" },
-            "note": { "type": "string" },
-            "generation": { "type": "integer" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "indexed_value", "type": "text", "nullable": false },
+            { "name": "note", "type": "text", "nullable": false },
+            { "name": "generation", "type": "int8", "nullable": false },
+        ],
+        "primary_key": ["id"],
+        "unique": [["indexed_value"]],
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
         &[Value::Text(schema.to_string())],
     )
     .await

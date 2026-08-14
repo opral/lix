@@ -138,8 +138,8 @@ async fn volatile_execution_functions_stay_fresh_on_a_reused_session() {
     let engine = open_engine().await;
     let session = engine.open_session().await.expect("session should open");
 
-    let sql = "SELECT lix_uuid_v7() AS first, lix_uuid_v7() AS second, \
-        lix_timestamp() AS stamp";
+    let sql = "SELECT uuidv7() AS first, uuidv7() AS second, \
+        CURRENT_TIMESTAMP AS stamp";
     let mut uuids = Vec::new();
     for _ in 0..3 {
         let rows = session.execute(sql, &[]).await.expect("volatile read");
@@ -149,7 +149,10 @@ async fn volatile_execution_functions_stay_fresh_on_a_reused_session() {
             first, second,
             "two calls in one statement returned the same uuid"
         );
-        assert!(text(&rows, "stamp").is_some());
+        assert!(matches!(
+            rows.rows()[0].value("stamp"),
+            Ok(Value::Timestamp(_))
+        ));
         uuids.push(first);
         uuids.push(second);
     }
@@ -224,15 +227,15 @@ async fn information_schema_stays_available_across_pooled_statements() {
 
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[Value::Text(
                 serde_json::json!({
-                    "x-lix-key": "pooled_probe",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": { "id": { "type": "string" } },
-                    "required": ["id"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "pooled_probe",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 })
                 .to_string(),
             )],

@@ -405,17 +405,16 @@ mod tests {
     #[test]
     fn registered_types_and_hidden_identity_round_trip() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "typed_sidecar",
-            "x-lix-primary-key": ["/id", "/ordinal"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "ordinal": { "type": "integer" },
-                "score": { "type": "number" },
-                "active": { "type": "boolean" },
-                "payload": { "type": ["object", "null"] }
-            },
-            "required": ["id", "ordinal", "score", "active"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "typed_sidecar",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "ordinal", "type": "int8", "nullable": false },
+                { "name": "score", "type": "float8", "nullable": false },
+                { "name": "active", "type": "boolean", "nullable": false },
+                { "name": "payload", "type": "jsonb", "nullable": true },
+            ],
+            "primary_key": ["id", "ordinal"],
         }))
         .expect("spec");
         let snapshots = [
@@ -486,15 +485,13 @@ mod tests {
     #[test]
     fn frontend_columns_match_canonical_encoding_when_clustering_is_absent() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "direct_columns",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "direct_columns",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("schema should derive");
         let ids = (0..128)
@@ -559,17 +556,13 @@ mod tests {
     #[test]
     fn frontend_json_columns_match_canonical_path_value_encoding() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "path_value_columns",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "path_value_columns",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         }))
         .expect("schema should derive");
         let paths = (0..128)
@@ -636,15 +629,14 @@ mod tests {
     #[test]
     fn input_coordinates_follow_the_clustered_physical_permutation() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "coordinate_fixture",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "active": { "type": "boolean" },
-                "lane": { "type": "string" }
-            },
-            "required": ["id", "active", "lane"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "coordinate_fixture",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "active", "type": "boolean", "nullable": false },
+                { "name": "lane", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
         .expect("spec");
         // Deliberately interleave clustering values so physical order differs
@@ -718,18 +710,13 @@ mod tests {
     #[test]
     fn any_json_property_encodes_in_registered_layout() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "json_layout",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_layout",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         }))
         .expect("spec");
         let snapshot = json!({"path":"a","value":"value-a"});
@@ -751,23 +738,22 @@ mod tests {
 
     #[test]
     fn clustering_has_a_global_partition_budget_for_wide_low_cardinality_schemas() {
-        let mut properties = serde_json::Map::new();
-        properties.insert("id".to_string(), json!({ "type": "string" }));
+        let mut columns = vec![json!({ "name": "id", "type": "text", "nullable": false })];
         for index in 0..2 {
-            properties.insert(format!("flag_{index}"), json!({ "type": "boolean" }));
+            columns.push(json!({
+                "name": format!("flag_{index}"), "type": "boolean", "nullable": false
+            }));
         }
         for index in 0..4 {
-            properties.insert(
-                format!("lane_{index}"),
-                json!({ "type": ["string", "null"] }),
-            );
+            columns.push(json!({
+                "name": format!("lane_{index}"), "type": "text", "nullable": true
+            }));
         }
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "wide_low_cardinality",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": properties,
-            "required": ["id"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "wide_low_cardinality",
+            "columns": columns,
+            "primary_key": ["id"]
         }))
         .expect("spec");
         let snapshots = (0..1_024)

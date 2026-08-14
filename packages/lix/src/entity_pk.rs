@@ -145,6 +145,15 @@ pub(crate) enum EntityPkComponentType {
     Uuid,
     Integer,
     String,
+    // Never constructed since the cut: its only constructor was the JSON
+    // Schema primary-key type mapper, which minted it for
+    // `"contentEncoding": "base64"`. Schema v1 has no binary type and no
+    // contentEncoding, so no schema can produce one. Kept rather than
+    // deleted because five live match arms in the shipping library still
+    // handle it, one of them feeding the entity-surface fingerprint
+    // (sql2/catalog/entity_surface.rs), so removing the variant is a
+    // design decision about binary primary keys, not dead-code hygiene.
+    #[allow(dead_code, reason = "unconstructible after the Schema v1 cut; see comment")]
     Bytes,
 }
 
@@ -275,6 +284,14 @@ impl EntityPk {
         if components.is_empty() {
             return Err(EntityPkError::EmptyPrimaryKey);
         }
+        for (index, component) in components.iter().enumerate() {
+            if matches!(component, EntityPkComponent::String(value) if value.contains('\0')) {
+                return Err(EntityPkError::InvalidPrimaryKeyValue {
+                    index,
+                    expected: "text without Unicode NUL",
+                });
+            }
+        }
         Ok(Self {
             components: EntityPkComponents::from_smallvec(components),
         })
@@ -363,7 +380,14 @@ impl EntityPk {
                             expected: "integer",
                         })?;
                 }
-                EntityPkComponentType::String => {}
+                EntityPkComponentType::String => {
+                    if part.contains('\0') {
+                        return Err(EntityPkError::InvalidPrimaryKeyValue {
+                            index,
+                            expected: "text without Unicode NUL",
+                        });
+                    }
+                }
                 EntityPkComponentType::Bytes => {
                     base64::engine::general_purpose::STANDARD
                         .decode(part.as_bytes())

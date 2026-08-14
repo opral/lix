@@ -3,6 +3,135 @@ use serde_json::json;
 
 use super::assert_rows_eq;
 
+simulation_test!(schema_v1_seven_types_have_a_runnable_entity_surface, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let schema = serde_json::json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "seven_type_probe",
+        "columns": [
+            {"name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()"},
+            {"name": "label", "type": "text", "nullable": false},
+            {"name": "count", "type": "int8", "nullable": false},
+            {"name": "ratio", "type": "float8", "nullable": false},
+            {"name": "active", "type": "boolean", "nullable": false},
+            {"name": "metadata", "type": "jsonb", "nullable": false},
+            {"name": "created_at", "type": "timestamptz", "nullable": false, "default_expression": "CURRENT_TIMESTAMP"}
+        ],
+        "primary_key": ["id"]
+    });
+    session.execute(
+        "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+        &[Value::Text("seven_type_probe".into()), Value::Text(schema.to_string())],
+    ).await.unwrap();
+    session.execute(
+        "INSERT INTO seven_type_probe (label, count, ratio, active, metadata) \
+         VALUES ('ready', 42, 1.5, true, '{\"answer\":42}'::jsonb)",
+        &[],
+    ).await.unwrap();
+
+    let result = session.execute(
+        "SELECT id, label, count, ratio, active, metadata, created_at FROM seven_type_probe",
+        &[],
+    ).await.unwrap();
+    let values = result.rows()[0].values();
+    assert!(matches!(&values[0], Value::Text(id) if uuid::Uuid::parse_str(id).is_ok()));
+    assert_eq!(values[1], Value::Text("ready".into()));
+    assert_eq!(values[2], Value::Integer(42));
+    assert_eq!(values[3], Value::Real(1.5));
+    assert_eq!(values[4], Value::Boolean(true));
+    assert_eq!(values[5], Value::Json(json!({"answer": 42}).into()));
+    assert!(matches!(values[6], Value::Timestamp(_)));
+});
+
+simulation_test!(timestamptz_is_native_and_current_timestamp_is_stable, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let schema = serde_json::json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "timestamp_probe",
+        "columns": [
+            {"name": "id", "type": "int8", "nullable": false},
+            {
+                "name": "created_at",
+                "type": "timestamptz",
+                "nullable": false,
+                "default_expression": "CURRENT_TIMESTAMP"
+            }
+        ],
+        "primary_key": ["id"]
+    });
+    session.execute(
+        "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+        &[Value::Text("timestamp_probe".into()), Value::Text(schema.to_string())],
+    ).await.unwrap();
+    session.execute("INSERT INTO timestamp_probe (id) VALUES (1)", &[])
+        .await
+        .unwrap();
+
+    let row = session
+        .execute(
+            "SELECT created_at, CURRENT_TIMESTAMP AS first, CURRENT_TIMESTAMP AS second \
+             FROM timestamp_probe WHERE id = 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(row.rows()[0].values()[0], Value::Timestamp(_)));
+    assert!(matches!(row.rows()[0].values()[1], Value::Timestamp(_)));
+    assert_eq!(row.rows()[0].values()[1], row.rows()[0].values()[2]);
+});
+
+simulation_test!(jsonb_identity_write_filters_use_one_canonicalizer, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let schema = serde_json::json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "jsonb_identity_probe",
+        "columns": [
+            {"name": "id", "type": "int8", "nullable": false},
+            {"name": "value", "type": "text", "nullable": false}
+        ],
+        "primary_key": ["id"]
+    });
+    session.execute(
+        "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+        &[Value::Text("jsonb_identity_probe".into()), Value::Text(schema.to_string())],
+    ).await.unwrap();
+    session.execute(
+        "INSERT INTO jsonb_identity_probe (id, value) VALUES (42, 'before')",
+        &[],
+    ).await.unwrap();
+
+    for spelling in ["[ 42 ]", "[42.0]", "[4.2e1]"] {
+        let result = session.execute(
+            "UPDATE jsonb_identity_probe SET value = 'after' WHERE lixcol_entity_pk = $1",
+            &[Value::Text(spelling.into())],
+        ).await.unwrap();
+        assert_eq!(result.rows_affected(), 1, "identity spelling {spelling}");
+    }
+});
+
+simulation_test!(text_primary_keys_reject_jsonb_nul, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let schema = serde_json::json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "nul_identity_probe",
+        "columns": [{"name": "id", "type": "text", "nullable": false}],
+        "primary_key": ["id"]
+    });
+    session.execute(
+        "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+        &[Value::Text("nul_identity_probe".into()), Value::Text(schema.to_string())],
+    ).await.unwrap();
+    let error = session.execute(
+        "INSERT INTO nul_identity_probe (id) VALUES ($1)",
+        &[Value::Text("a\0b".into())],
+    ).await.expect_err("NUL cannot be represented by JSONB identity");
+    assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+});
+
 simulation_test!(
     lix_json_expression_results_are_semantic_json,
     |sim| async move {
@@ -18,10 +147,10 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT \
-                lix_json('{\"name\":\"Ada\",\"tags\":[\"db\"]}') AS document, \
-                lix_json(NULL) AS json_null, \
-                lix_json_get('{\"name\":\"Ada\",\"tags\":[\"db\"]}', 'tags') AS tags, \
-                lix_json_get('{\"name\":\"Ada\"}', 'missing') AS missing",
+                CAST('{\"name\":\"Ada\",\"tags\":[\"db\"]}' AS JSONB) AS document, \
+                CAST(NULL AS JSONB) AS json_null, \
+                '{\"name\":\"Ada\",\"tags\":[\"db\"]}'::jsonb -> 'tags' AS tags, \
+                '{\"name\":\"Ada\"}'::jsonb -> 'missing' AS missing",
                 &[],
             )
             .await
@@ -31,7 +160,7 @@ simulation_test!(
             result,
             vec![vec![
                 Value::Json(json!({"name": "Ada", "tags": ["db"]}).into()),
-                Value::Json(json!(null).into()),
+                Value::Null,
                 Value::Json(json!(["db"]).into()),
                 Value::Null,
             ]],
@@ -39,7 +168,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_json_get_uses_variadic_path_segments, |sim| async move {
+simulation_test!(postgres_jsonb_path_operator_uses_text_array_path, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -51,7 +180,7 @@ simulation_test!(lix_json_get_uses_variadic_path_segments, |sim| async move {
 
     let result = session
             .execute(
-                "SELECT lix_json_get_text('{\"user\":{\"names\":[\"Ada\"]}}', 'user', 'names', 0) AS name",
+                "SELECT '{\"user\":{\"names\":[\"Ada\"]}}'::jsonb #>> '{user,names,0}' AS name",
                 &[],
             )
             .await
@@ -60,7 +189,7 @@ simulation_test!(lix_json_get_uses_variadic_path_segments, |sim| async move {
     assert_rows_eq(result, vec![vec![Value::Text("Ada".to_string())]]);
 });
 
-simulation_test!(lix_json_get_rejects_jsonpath_strings, |sim| async move {
+simulation_test!(postgres_jsonb_key_operator_treats_jsonpath_as_a_literal_key, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -70,19 +199,14 @@ simulation_test!(lix_json_get_rejects_jsonpath_strings, |sim| async move {
         &engine,
     );
 
-    let error = session
+    let result = session
         .execute(
-            "SELECT lix_json_get_text('{\"path\":\"ok\"}', '$.path')",
+            "SELECT '{\"path\":\"ok\"}'::jsonb ->> '$.path'",
             &[],
         )
         .await
-        .expect_err("JSONPath-looking strings should fail loudly");
-
-    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-    assert!(
-        error.message.contains("uses variadic path segments"),
-        "expected path segment diagnostic: {error}"
-    );
+        .expect("PostgreSQL key operands are literal keys");
+    assert_rows_eq(result, vec![vec![Value::Null]]);
 });
 
 simulation_test!(
@@ -107,8 +231,8 @@ simulation_test!(
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert!(
-            error.hint().is_some_and(|hint| hint.contains("lix_json")),
-            "expected lix_json hint: {error}"
+            error.hint().is_some_and(|hint| hint.contains("::jsonb")),
+            "expected PostgreSQL JSONB hint: {error}"
         );
     }
 );
@@ -137,8 +261,8 @@ simulation_test!(
 
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
             assert!(
-                error.hint().is_some_and(|hint| hint.contains("lix_json")),
-                "expected lix_json hint: {error}"
+                error.hint().is_some_and(|hint| hint.contains("::jsonb")),
+                "expected PostgreSQL JSONB hint: {error}"
             );
         }
 
@@ -164,7 +288,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    json_column_predicates_accept_lix_json_expressions,
+    json_column_predicates_accept_jsonb_expressions,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -177,7 +301,7 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT entity_pk FROM lix_change WHERE entity_pk = lix_json('[\"state-latest\"]')",
+                "SELECT entity_pk FROM lix_change WHERE entity_pk = CAST('[\"state-latest\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -201,7 +325,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_json_predicate_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"meta\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_json_predicate_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"meta\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -213,7 +337,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_json_predicate_schema (id, meta, lixcol_untracked) \
-                 VALUES ('json-predicate-1', lix_json('{\"flag\":true}'), false)",
+                 VALUES ('json-predicate-1', CAST('{\"flag\":true}' AS JSONB), false)",
                 &[],
             )
             .await
@@ -231,7 +355,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id FROM engine_json_predicate_schema WHERE meta = lix_json('{\"flag\":true}')",
+                "SELECT id FROM engine_json_predicate_schema WHERE meta = CAST('{\"flag\":true}' AS JSONB)",
                 &[],
             )
             .await
@@ -259,7 +383,7 @@ simulation_test!(
         let error = session
             .execute(
                 "UPDATE lix_registered_schema \
-                 SET value = lix_json('{\"x-lix-key\":\"engine_schema_update_history\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}') \
+                 SET value = CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_schema_update_history\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB) \
                  WHERE lixcol_entity_pk = 'engine_schema_update_history'",
                 &[],
             )

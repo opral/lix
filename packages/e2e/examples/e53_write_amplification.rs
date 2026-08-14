@@ -22,8 +22,6 @@
 //!
 //! Usage: `e53_write_amplification [rows_per_commit] [commits] [report_every]`
 
-use lix::{ExecuteBatchStatement, Value};
-use lix::{Lix, open_lix};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
@@ -31,6 +29,8 @@ use lix::storage_bench::{
     probe_hot_generation_planes, take_crud_physical_write_accounting, take_hot_retire_invocations,
     take_packed_base_publication_census,
 };
+use lix::{ExecuteBatchStatement, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[tokio::main(flavor = "current_thread")]
@@ -95,7 +95,7 @@ async fn main() {
     let mut last_bytes = 0_u64;
 
     if seed_rows > 0 {
-        let sql = "INSERT INTO e53_amp (path, value) VALUES ($1, lix_json($2))";
+        let sql = "INSERT INTO e53_amp (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let statements = (0..seed_rows)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -107,7 +107,10 @@ async fn main() {
             })
             .collect::<Vec<_>>();
         let start = std::time::Instant::now();
-        session.execute_batch(&statements).await.expect("seed batch");
+        session
+            .execute_batch(&statements)
+            .await
+            .expect("seed batch");
         let seed_nanos = start.elapsed().as_nanos();
         let packed = take_packed_base_publication_census();
         let (retires, retired_rows) = take_hot_retire_invocations();
@@ -210,7 +213,7 @@ where
     for index in 0..rows {
         transaction
             .execute(
-                "INSERT INTO e53_amp (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO e53_amp (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(format!("/inc/{batch:08}/{index:08}")),
                     Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
@@ -227,21 +230,17 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "e53_amp",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "e53_amp",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

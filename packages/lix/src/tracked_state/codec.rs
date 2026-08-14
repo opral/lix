@@ -2769,7 +2769,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "s\0".to_string(),
             file_id: Some(String::new()),
-            entity_pk: EntityPk::from_parts_unchecked(vec!["a\0".to_string(), String::new()]),
+            entity_pk: EntityPk::from_parts_unchecked(vec!["a!".to_string(), String::new()]),
         };
         let encoded = encode_key(&key);
 
@@ -2779,7 +2779,7 @@ mod tests {
                 b's', 0, 0xff, 0, 0, // schema "s\\0"
                 1, 0, 0, // Some("")
                 1, // entity-pk codec v1
-                2, b'a', 0, 0xff, 0, 1, // string non-final PK component "a\\0"
+                2, b'a', b'!', 0, 1, // string non-final PK component "a!"
                 2, 0, 0, // string final empty PK component
             ]
         );

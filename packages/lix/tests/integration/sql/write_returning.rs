@@ -14,7 +14,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"returning_task\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -143,7 +143,7 @@ simulation_test!(
         let by_branch = session
             .execute(
                 "INSERT INTO returning_task_by_branch (id, title, lixcol_branch_id) \
-                 VALUES ('returning-by-branch', 'By branch', $1) \
+                 VALUES ('01920000-0000-7000-8000-000000000002', 'By branch', $1) \
                  RETURNING id, title, lixcol_branch_id",
                 &[Value::Text(sim.main_branch_id().to_string())],
             )
@@ -152,7 +152,7 @@ simulation_test!(
         assert_rows_eq(
             by_branch,
             vec![vec![
-                Value::Text("returning-by-branch".to_string()),
+                Value::Text("01920000-0000-7000-8000-000000000002".to_string()),
                 Value::Text("By branch".to_string()),
                 Value::Text(sim.main_branch_id().to_string()),
             ]],
@@ -467,7 +467,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"atomic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"atomic_returning_task\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -506,7 +506,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"checkpoint_after_returning_error\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"checkpoint_after_returning_error\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -625,7 +625,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"deterministic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"deterministic_returning_task\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -633,7 +633,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+                 VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
                 &[],
             )
             .await

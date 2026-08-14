@@ -444,7 +444,7 @@ where
         }
         "key_value_write" => {
             lix.execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(format!("e16-probe-{probe:05}")),
                     Value::Text(format!("\"{probe}\"")),
@@ -613,7 +613,9 @@ fn build_text_plugin_archive() -> Vec<u8> {
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
-        writer.start_file(path, options).expect("start archive file");
+        writer
+            .start_file(path, options)
+            .expect("start archive file");
         writer.write_all(bytes).expect("write archive file");
     }
     writer.finish().expect("finish archive").into_inner()

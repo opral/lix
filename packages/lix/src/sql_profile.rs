@@ -264,19 +264,17 @@ mod tests {
             .await
             .expect("profile test session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "sql_profile_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "amount": { "type": "integer" }
-            },
-            "required": ["id", "amount"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "sql_profile_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "amount", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -331,19 +329,17 @@ mod tests {
             .await
             .expect("rows-examined session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "rows_examined_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "parent": { "type": "string" }
-            },
-            "required": ["id", "parent"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "rows_examined_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -413,20 +409,18 @@ mod tests {
 
         for table in ["sql_profile_cancel_a", "sql_profile_cancel_b"] {
             let schema = serde_json::json!({
-                "x-lix-key": table,
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "ordinal": { "type": "integer" },
-                    "payload": { "type": "string" }
-                },
-                "required": ["id", "ordinal", "payload"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": table,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "ordinal", "type": "int8", "nullable": false },
+                    { "name": "payload", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             });
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                     &[Value::Text(schema.to_string())],
                 )
                 .await

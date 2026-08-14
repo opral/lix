@@ -210,8 +210,8 @@ async fn register_constraint_schemas(
     session
         .execute(
             r#"INSERT INTO lix_registered_schema (value) VALUES
-               (lix_json('{"x-lix-key":"corruption_fuzz_parent","x-lix-primary-key":["/id"],"x-lix-unique":[["/slug"]],"type":"object","properties":{"id":{"type":"string"},"slug":{"type":"string"}},"required":["id","slug"],"additionalProperties":false}')),
-               (lix_json('{"x-lix-key":"corruption_fuzz_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"corruption_fuzz_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}'))"#,
+               (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"corruption_fuzz_parent","columns":[{"name":"id","type":"text","nullable":false},{"name":"slug","type":"text","nullable":false}],"primary_key":["id"],"unique":[["slug"]]}' AS JSONB)),
+               (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"corruption_fuzz_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"corruption_fuzz_parent","columns":["id"]}}]}' AS JSONB))"#,
             &[],
         )
         .await

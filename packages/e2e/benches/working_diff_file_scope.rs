@@ -15,7 +15,7 @@
 //!                     shows first
 //!   * `file_schema` — `WHERE file_id = $1 AND schema_key = $2`, the shape of
 //!                     the one file-scoped working-diff test in the tree
-//!   * `point`       — `WHERE schema_key = $1 AND entity_pk = lix_json($2) AND
+//!   * `point`       — `WHERE schema_key = $1 AND entity_pk = CAST($2 AS JSONB) AND
 //!                     file_id = $3`, which takes the finite-filter bypass in
 //!                     `hot_working_diff_entries` and therefore never reads the
 //!                     HOT_DIFF index or verifies its coverage proof. This is
@@ -210,7 +210,7 @@ async fn run<StorageImpl>(
     // point read. This is the floor a seekable file-scoped read aims at.
     let point_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
                      FROM lix_working_diff \
-                     WHERE schema_key = $1 AND entity_pk = lix_json($2) AND file_id = $3";
+                     WHERE schema_key = $1 AND entity_pk = CAST($2 AS JSONB) AND file_id = $3";
     // Live-state read of the same file. HOT_ROW is keyed
     // `schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` owns a
     // file-first prefix route; the entity surface pushes `lixcol_file_id` into
@@ -311,20 +311,18 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "value"],
-        "properties": {
-            "id": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "value", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

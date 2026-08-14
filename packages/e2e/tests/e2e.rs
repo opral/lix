@@ -5,6 +5,13 @@
 mod benchmark_metrics;
 
 use bytes::Bytes;
+use lix::plugin::runtime::{
+    WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
+    WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
+    WasmEntitySource, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
+    WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput, WasmPluginSelection,
+    WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters, WasmTransitionLimits,
+};
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
     ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
@@ -13,14 +20,6 @@ use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
 };
 use lix::storage_bench::{layout_space_catalog, space_inventory};
-use lix::plugin::runtime::{
-    WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
-    WasmEntitySource, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
-    WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput,
-    WasmPluginSelection, WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters,
-    WasmTransitionLimits,
-};
 use lix::wasm::WasmLimits;
 use lix::{
     CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, MergeBranchOptions,
@@ -6933,21 +6932,21 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(
-            r#"{"x-lix-key":"write_owner_task","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string","x-lix-default":"lix_uuid_v7()"},"title":{"type":"string"}},"required":["id","title"],"additionalProperties":false}"#.to_string(),
+            r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_task","columns":[{"name":"id","type":"uuid","nullable":false,"default_expression":"uuidv7()"},{"name":"title","type":"text","nullable":false}],"primary_key":["id"]}"#.to_string(),
         )],
     )
     .await
     .expect("register generated-default write-owner schema");
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1)), (lix_json($2))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB)), (CAST($2 AS JSONB))",
         &[
             Value::Text(
-                r#"{"x-lix-key":"write_owner_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.to_string(),
+                r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}"#.to_string(),
             ),
             Value::Text(
-                r#"{"x-lix-key":"write_owner_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"write_owner_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}"#.to_string(),
+                r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"write_owner_parent","columns":["id"]}}]}"#.to_string(),
             ),
         ],
     )
@@ -7358,7 +7357,7 @@ fn plugin_info_from_archive(archive_bytes: Vec<u8>) -> InstalledPluginInfo {
             .read_to_string(&mut schema_json)
             .unwrap();
         let schema: serde_json::Value = serde_json::from_str(&schema_json).unwrap();
-        schema_keys.push(schema["x-lix-key"].as_str().unwrap().to_string());
+        schema_keys.push(schema["key"].as_str().unwrap().to_string());
     }
     InstalledPluginInfo { key, schema_keys }
 }
@@ -7552,7 +7551,7 @@ where
         let inserted = transaction
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, false)",
+                 VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_owned())],
             )
             .await
@@ -7581,7 +7580,7 @@ where
             transaction
                 .execute(
                     "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                     VALUES (lix_json($1), false, false)",
+                     VALUES (CAST($1 AS JSONB), false, false)",
                     &[Value::Text(schema.to_owned())],
                 )
                 .await

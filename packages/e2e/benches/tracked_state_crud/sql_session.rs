@@ -13,8 +13,9 @@ use crate::workload::{UpdateWorkloadRow, WorkloadRow, sql_string};
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
 const BOUND_INSERT_ALL_SQL: &str = "INSERT INTO tracked_crud_insert (path, value) VALUES ($1, $2)";
 const BOUND_SEED_JSON_SQL: &str =
-    "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
-const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+    "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))";
+const BOUND_UPDATE_ALL_SQL: &str =
+    "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
 const BOUND_OLAP_UPDATE_LANE_SQL: &str = "UPDATE olap_row SET lane = $1 WHERE id = $2";
 const BOUND_OLAP_UPDATE_SCORE_SQL: &str = "UPDATE olap_row SET score = $1 WHERE id = $2";
 const BOUND_OLAP_UPDATE_ACTIVE_SQL: &str = "UPDATE olap_row SET active = $1 WHERE id = $2";
@@ -104,6 +105,7 @@ fn fold_value(accumulator: u64, value: &Value) -> u64 {
         Value::Text(value) => fold_bytes(accumulator, 4, value.as_bytes()),
         Value::Json(value) => fold_bytes(accumulator, 5, value.as_bytes()),
         Value::Blob(value) => fold_bytes(accumulator, 6, value.as_bytes()),
+        Value::Timestamp(value) => fold_bytes(accumulator, 7, &value.to_le_bytes()),
     }
 }
 
@@ -1024,7 +1026,7 @@ where
             return;
         }
         let sql = format!(
-            "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ('{UNTRACKED_PROBE_PATH}', lix_json('{{\"lane\":\"untracked\"}}'), true)"
+            "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ('{UNTRACKED_PROBE_PATH}', CAST('{{\"lane\":\"untracked\"}}' AS JSONB), true)"
         );
         let affected = execute(&self.session, &sql).await.rows_affected();
         assert_eq!(affected, 1, "insert untracked overlay probe");
@@ -1811,21 +1813,17 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "json_pointer",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "json_pointer",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1839,19 +1837,17 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "tracked_crud_insert",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "tracked_crud_insert",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1865,22 +1861,20 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "olap_row",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "ordinal", "lane", "score", "active"],
-        "properties": {
-            "id": { "type": "string" },
-            "ordinal": { "type": "integer" },
-            "lane": { "type": "string" },
-            "score": { "type": "number" },
-            "active": { "type": "boolean" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "olap_row",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "ordinal", "type": "int8", "nullable": false },
+            { "name": "lane", "type": "text", "nullable": false },
+            { "name": "score", "type": "float8", "nullable": false },
+            { "name": "active", "type": "boolean", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1946,7 +1940,7 @@ fn select_by_paths_sql<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
 
 fn update_row_sql(row: &WorkloadRow) -> String {
     format!(
-        "UPDATE json_pointer SET value = lix_json('{}') WHERE path = '{}'",
+        "UPDATE json_pointer SET value = CAST('{}' AS JSONB) WHERE path = '{}'",
         sql_string(row.updated_value_json.as_str()),
         sql_string(row.path.as_str())
     )

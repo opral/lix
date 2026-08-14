@@ -2607,7 +2607,10 @@ mod tests {
 
         let plan = run_ordinary_repository_gc(&storage).await;
         assert!(
-            !plan.sweep.tracked_commit_roots.contains(&old_root.commit_id),
+            !plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&old_root.commit_id),
             "an ancestor of the live head is what _history() reads; it must not be retired"
         );
         plan
@@ -2665,12 +2668,8 @@ mod tests {
         // is a rootless tracked serving generation, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("rootless-serving-base", 0, None, timestamp);
-        let old_root = replay_commit_record(
-            "rootless-serving-old",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
+        let old_root =
+            replay_commit_record("rootless-serving-old", 1, Some(base.commit_id), timestamp);
         let active = replay_commit_record(
             "rootless-serving-active",
             1,
@@ -3164,12 +3163,8 @@ mod tests {
         // is the finite selected-source owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("selected-owner-base", 0, None, timestamp);
-        let owner = replay_commit_record(
-            "selected-owner-source",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
+        let owner =
+            replay_commit_record("selected-owner-source", 1, Some(base.commit_id), timestamp);
         let checkpoint = replay_commit_record(
             "selected-owner-checkpoint",
             1,
@@ -3308,7 +3303,10 @@ mod tests {
                 .contains(&owner.commit_id)
         );
         assert!(
-            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
             "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
@@ -3362,18 +3360,9 @@ mod tests {
         // is the scoped-descriptor owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("scoped-part-base", 0, None, timestamp);
-        let owner = replay_commit_record(
-            "scoped-part-owner",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
-        let checkpoint = replay_commit_record(
-            "scoped-part-checkpoint",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
+        let owner = replay_commit_record("scoped-part-owner", 1, Some(base.commit_id), timestamp);
+        let checkpoint =
+            replay_commit_record("scoped-part-checkpoint", 1, Some(base.commit_id), timestamp);
         let mut base_manifest =
             test_commit_state_manifest(&base, CommitStateMutationInventory::default());
         base_manifest.replay_debt = CommitStateReplayDebt::default();
@@ -3508,7 +3497,10 @@ mod tests {
                 .contains(&owner.commit_id)
         );
         assert!(
-            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
             "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
@@ -3811,7 +3803,10 @@ mod tests {
                 .contains(&owner.commit_id)
         );
         assert!(
-            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
             "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
@@ -4220,28 +4215,23 @@ mod tests {
         S: crate::storage::Storage + Clone + Send + Sync + 'static,
     {
         let schema = serde_json::json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, false)",
+                 VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("payload fixture schema should register");
     }
-
 
     /// Undo-to-last-checkpoint must survive reclaim at any cadence.
     ///
@@ -4318,19 +4308,17 @@ mod tests {
             .expect("repository should open");
         let session = engine.open_session().await.expect("session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "gc_undo_cadence_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "gc_undo_cadence_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -4474,14 +4462,20 @@ mod tests {
         let old_reads_new_err = old_reads_new
             .err()
             .expect("a 4-field reader must reject a 6-field record");
-        println!("ARITY old_reader_vs_new_record: {}", old_reads_new_err.message);
+        println!(
+            "ARITY old_reader_vs_new_record: {}",
+            old_reads_new_err.message
+        );
 
         // Direction 2: a NEW reader against an OLD record.
         let new_reads_old = crate::storage_codec::decode::<ArityNew>("arity demo", &old_bytes);
         let new_reads_old_err = new_reads_old
             .err()
             .expect("a 6-field reader must reject a 4-field record");
-        println!("ARITY new_reader_vs_old_record: {}", new_reads_old_err.message);
+        println!(
+            "ARITY new_reader_vs_old_record: {}",
+            new_reads_old_err.message
+        );
 
         // The sharp point: bumping `format_version` inside the record does not
         // help, because a same-arity record still decodes cleanly and a
@@ -4607,7 +4601,7 @@ mod tests {
         let shared_ref = payload_ref_added_by(&backend, || async {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', lix_json($1))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
                     &[Value::Text(shared.clone())],
                 )
                 .await
@@ -4617,7 +4611,7 @@ mod tests {
         let before_mirror = json_payload_refs(&backend).await;
         session
             .execute(
-                "INSERT INTO gc_payload_mirror (path, value) VALUES ('/shared', lix_json($1))",
+                "INSERT INTO gc_payload_mirror (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
                 &[Value::Text(shared.clone())],
             )
             .await
@@ -4633,7 +4627,7 @@ mod tests {
         for revision in 1..=8 {
             session
                 .execute(
-                    "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/shared'",
+                    "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/shared'",
                     &[Value::Text(out_of_band_payload(revision))],
                 )
                 .await
@@ -4714,7 +4708,7 @@ mod tests {
         let shared_ref = payload_ref_added_by(&backend, || async {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/co', lix_json($1))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/co', CAST($1 AS JSONB))",
                     &[Value::Text(shared.clone())],
                 )
                 .await
@@ -4727,7 +4721,7 @@ mod tests {
                 .execute(
                     &format!(
                         "INSERT INTO {table} (path, value, lixcol_untracked) \
-                         VALUES ('/co', lix_json($1), true)"
+                         VALUES ('/co', CAST($1 AS JSONB), true)"
                     ),
                     &[Value::Text(shared.clone())],
                 )
@@ -4748,7 +4742,7 @@ mod tests {
         for revision in 1..=6 {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(format!("/churn-{revision}")),
                         Value::Text(out_of_band_payload(revision)),
@@ -4822,7 +4816,7 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO gc_payload_row (path, value) VALUES ('/row', lix_json($1))",
+                "INSERT INTO gc_payload_row (path, value) VALUES ('/row', CAST($1 AS JSONB))",
                 &[Value::Text(out_of_band_payload(0))],
             )
             .await
@@ -4832,7 +4826,7 @@ mod tests {
             live_ref = payload_ref_added_by(&backend, || async {
                 session
                     .execute(
-                        "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/row'",
+                        "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/row'",
                         &[Value::Text(out_of_band_payload(revision))],
                     )
                     .await
@@ -5281,49 +5275,6 @@ mod tests {
         )
     }
 
-    async fn run_binary_repository_gc(storage: &StorageAdapter<Memory>) {
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("binary repository-GC read should open"),
-        );
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
-            .await
-            .expect("binary repository GC should stage");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("binary repository GC should commit");
-    }
-
-    async fn assert_binary_cas_presence(
-        storage: &StorageAdapter<Memory>,
-        hash: crate::binary_cas::BlobId,
-        expected: bool,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("binary-CAS presence read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        let present = reader
-            .load_bytes_many(&[hash])
-            .await
-            .expect("binary-CAS presence should load")
-            .into_vec()[0]
-            .is_some();
-        assert_eq!(present, expected);
-    }
-
     /// The derivation replaces `gc.reachability_delta.v1`. It must name every
     /// commit that still owns physical state — including one no ref can reach,
     /// which is what a deleted branch leaves behind and what a walk from refs
@@ -5582,312 +5533,6 @@ mod tests {
                 "GC must not sweep a direct control's current public branch-ref ledger change"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn repository_gc_retains_active_history_diff_undo_redo_and_reclaims_deleted_branch_refs()
-    {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine.open_session().await.expect("session should open");
-        let schema = serde_json::json!({
-            "x-lix-key": "gc_history_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
-            },
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("history fixture schema should register");
-        let baseline = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .expect("history baseline should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("history baseline should have a commit id");
-        session
-            .execute(
-                "INSERT INTO gc_history_fixture (path, value) VALUES ('/row', lix_json('{\"v\":1}'))",
-                &[],
-            )
-            .await
-            .expect("history fixture first commit should publish");
-        session
-            .execute(
-                "UPDATE gc_history_fixture SET value = lix_json('{\"v\":2}') WHERE path = '/row'",
-                &[],
-            )
-            .await
-            .expect("history fixture second commit should publish");
-        let branch = session
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01990000-0000-7000-8000-000000000009".to_owned()),
-                name: "gc-history-dead".to_owned(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("history fixture branch should create");
-        session
-            .execute(
-                "DELETE FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch.id)],
-            )
-            .await
-            .expect("history fixture branch should delete");
-
-        let before_changes = {
-            let storage_adapter = StorageAdapter::new(storage.clone());
-            let read = storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("history fixture pre-GC read should open");
-            super::scan_all_gc_standalone_changes(read)
-                .await
-                .expect("history fixture standalone scan should load")
-        };
-        let active_refs_before = {
-            let storage_adapter = StorageAdapter::new(storage.clone());
-            let read = storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("history fixture control read should open");
-            BranchHeadControlContext::new()
-                .reader(read)
-                .scan()
-                .await
-                .expect("history fixture controls should load")
-                .into_iter()
-                .map(|(_, control)| control.ref_change_id)
-                .collect::<BTreeSet<_>>()
-        };
-        run_repository_gc(&storage).await;
-        let after_changes = {
-            let storage_adapter = StorageAdapter::new(storage.clone());
-            let read = storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("history fixture post-GC read should open");
-            super::scan_all_gc_standalone_changes(read)
-                .await
-                .expect("history fixture standalone post-GC scan should load")
-        };
-        let reclaimed = before_changes
-            .keys()
-            .filter(|change_id| !after_changes.contains_key(change_id))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        assert!(
-            !reclaimed.is_empty(),
-            "deleted branch refs should be reclaimed"
-        );
-        assert!(
-            reclaimed.is_disjoint(&active_refs_before),
-            "GC must not reclaim an active branch reference"
-        );
-        assert!(
-            reclaimed.iter().any(|change_id| {
-                before_changes
-                    .get(change_id)
-                    .is_some_and(|change| change.schema_key == "lix_branch_ref")
-            }),
-            "the retired branch's standalone reference must be reclaimed"
-        );
-        let after = after_changes.len();
-        let before = before_changes.len();
-        assert!(after < before, "deleted branch refs should be reclaimed");
-
-        drop(session);
-        let reopened_engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should reopen after GC");
-        let session = reopened_engine
-            .open_session()
-            .await
-            .expect("reopened session should open");
-        let head = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .expect("history head should remain readable")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("history head should have a commit id");
-        let diff = session
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'gc_history_fixture'",
-                &[Value::Text(baseline), Value::Text(head)],
-            )
-            .await
-            .expect("active history diff should survive GC");
-        assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
-        session.undo().await.expect("active undo should survive GC");
-        session.redo().await.expect("active redo should survive GC");
-    }
-
-    #[tokio::test]
-    async fn repository_gc_retains_historical_file_blob_until_replay_dependency_releases() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("historical blob repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("historical blob repository should open");
-        let main = engine
-            .open_session()
-            .await
-            .expect("historical blob main session should open");
-        let branch = main
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01990000-0000-7000-8000-00000000000a".to_owned()),
-                name: "gc-history-disposable".to_owned(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("historical disposable branch should create");
-        let branch_id = branch.id;
-        let session = engine
-            .open_session_at(branch_id.clone())
-            .await
-            .expect("historical disposable session should open");
-        let v1 = b"historical-file-v1";
-        let v2 = vec![0xa5; 256];
-        let v1_hash = crate::binary_cas::BlobId::from_content(v1);
-        let v2_hash = crate::binary_cas::BlobId::from_content(&v2);
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/history.bin', $1)",
-                &[Value::Blob(v1.to_vec().into())],
-            )
-            .await
-            .expect("historical file v1 should publish");
-        let root_a = session
-            .execute(
-                "SELECT commit_id FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch_id.clone())],
-            )
-            .await
-            .expect("historical root A should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("historical root A should exist");
-        session
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = '/history.bin'",
-                &[Value::Blob(v2.clone().into())],
-            )
-            .await
-            .expect("historical file v2 should publish");
-        let root_b = session
-            .execute(
-                "SELECT commit_id FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch_id.clone())],
-            )
-            .await
-            .expect("historical root B should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("historical root B should exist");
-        let storage = StorageAdapter::new(backend.clone());
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, v1_hash, true).await;
-        assert_binary_cas_presence(&storage, v2_hash, true).await;
-
-        drop(session);
-        drop(main);
-        drop(engine);
-        let reopened = Engine::new(backend.clone())
-            .await
-            .expect("historical blob repository should cold reopen");
-        let session = reopened
-            .open_session_at(branch_id.clone())
-            .await
-            .expect("historical disposable branch should cold reopen");
-        let diff = session
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'lix_binary_blob_ref'",
-                &[Value::Text(root_a), Value::Text(root_b)],
-            )
-            .await
-            .expect("historical blob diff should remain authenticated");
-        assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
-        session
-            .undo()
-            .await
-            .expect("historical blob undo should remain available");
-        let undone = session
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/history.bin'",
-                &[],
-            )
-            .await
-            .expect("historical v1 should read after undo");
-        assert_eq!(undone.rows()[0].get::<Vec<u8>>("content").unwrap(), v1);
-        session
-            .redo()
-            .await
-            .expect("historical blob redo should remain available");
-        let redone = session
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/history.bin'",
-                &[],
-            )
-            .await
-            .expect("historical v2 should read after redo");
-        assert_eq!(redone.rows()[0].get::<Vec<u8>>("content").unwrap(), v2);
-        drop(session);
-
-        let main = reopened
-            .open_session()
-            .await
-            .expect("historical main session should reopen");
-        main.execute(
-            "DELETE FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch_id.clone())],
-        )
-        .await
-        .expect("historical disposable branch should delete");
-        drop(main);
-        drop(reopened);
-
-        // Deletion publishes the authenticated B -> None retirement frontier.
-        // This fixture is below the queue page limit, so one production sweep
-        // must consume that frontier without creating a checkpoint alias for A.
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, v1_hash, false).await;
-        assert_binary_cas_presence(&storage, v2_hash, false).await;
-
-        let final_engine = Engine::new(backend)
-            .await
-            .expect("historical repository should reopen after branch retirement");
-        let final_main = final_engine
-            .open_session()
-            .await
-            .expect("historical main should open after branch retirement");
-        let branches = final_main
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch_id)],
-            )
-            .await
-            .expect("retired branch absence should read");
-        assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
     }
 
     #[tokio::test]
@@ -6468,24 +6113,6 @@ mod tests {
         );
     }
 
-    async fn run_repository_gc(storage: &Memory) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let read = SharedStorageAdapterRead::new(
-            storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("GC read should open"),
-        );
-        let mut writes = storage_adapter.new_write_set();
-        super::stage_repository_gc_full_recovery(read, &mut writes)
-            .await
-            .expect("repository GC should stage");
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("repository GC should commit");
-    }
-
     async fn stage_bare_json(storage: &Memory, content: &str) -> JsonRef {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let normalized = NormalizedJson::from_arc_unchecked(Arc::from(content));
@@ -6764,19 +6391,17 @@ mod tests {
             .await
             .expect("generation fixture session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "gc_generation_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "gc_generation_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6784,7 +6409,7 @@ mod tests {
         for row in 0..16 {
             session
                 .execute(
-                    "INSERT INTO gc_generation_fixture (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO gc_generation_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(format!("/row/{row}")),
                         Value::Text(format!(r#"{{"v":{row}}}"#)),
@@ -6808,7 +6433,7 @@ mod tests {
         for row in 0..16 {
             branch_session
                 .execute(
-                    "UPDATE gc_generation_fixture SET value = lix_json($2) WHERE path = $1",
+                    "UPDATE gc_generation_fixture SET value = CAST($2 AS JSONB) WHERE path = $1",
                     &[
                         Value::Text(format!("/row/{row}")),
                         Value::Text(format!(r#"{{"v":{}}}"#, row + 100)),

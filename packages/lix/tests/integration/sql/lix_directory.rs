@@ -542,7 +542,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_write_rejects_slash_in_name_at_schema_boundary,
+    lix_directory_write_rejects_invalid_name_segment_at_validator_boundary,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -562,8 +562,27 @@ simulation_test!(
             .await
             .expect_err("directory name must keep '/' as structural separator");
 
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(error.message.contains("lix_directory_descriptor"));
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(
+            error.message.contains("path segment must not contain '/'"),
+            "{error}"
+        );
+
+        // The half of the removed `pattern` that motivated hardcoding it:
+        // '.' and '..' must not be storable as directory names.
+        let traversal = session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name) \
+                 VALUES ('6469722d-736c-8173-8800-000000000001', NULL, '..')",
+                &[],
+            )
+            .await
+            .expect_err("directory name must not be a traversal segment");
+
+        assert!(
+            traversal.message.contains("cannot be '.' or '..'"),
+            "{traversal}"
+        );
     }
 );
 
@@ -1372,7 +1391,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata) \
-                 VALUES ('6469722d-7061-8468-8d6d-657461000000', '/path-meta', lix_json('{\"version\":1}'))",
+                 VALUES ('6469722d-7061-8468-8d6d-657461000000', '/path-meta', CAST('{\"version\":1}' AS JSONB))",
                 &[],
             )
             .await
@@ -1381,7 +1400,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata) \
-                 VALUES ('/path-meta', lix_json('{\"version\":2}')) \
+                 VALUES ('/path-meta', CAST('{\"version\":2}' AS JSONB)) \
                  ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
                 &[],
             )
@@ -1569,7 +1588,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata, lixcol_global) \
-                 VALUES ('6469722d-676c-8f62-816c-2d7061746800', '/global-dir', lix_json('{\"version\":1}'), true)",
+                 VALUES ('6469722d-676c-8f62-816c-2d7061746800', '/global-dir', CAST('{\"version\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1578,7 +1597,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata) \
-                 VALUES ('/global-dir', lix_json('{\"version\":2}')) \
+                 VALUES ('/global-dir', CAST('{\"version\":2}' AS JSONB)) \
                  ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
                 &[],
             )

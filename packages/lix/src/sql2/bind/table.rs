@@ -201,10 +201,12 @@ mod tests {
     #[test]
     fn catalog_rejects_runtime_schema_in_reserved_namespace_before_surface_collision() {
         let error = PublicCatalog::from_visible_schemas(&[json!({
-            "x-lix-key": "lix_file",
-            "properties": {
-                "id": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "lix_file",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         })])
         .expect_err("the complete lix_* runtime namespace should be rejected");
 
@@ -214,15 +216,16 @@ mod tests {
 
     #[test]
     fn catalog_uses_validated_entity_surface_derivation() {
-        let catalog = PublicCatalog::from_visible_schemas(&[json!({
-            "x-lix-key": "bad_entity",
-            "properties": {
-                "value": { "type": "null" }
-            }
+        let error = PublicCatalog::from_visible_schemas(&[json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bad_entity",
+            "columns": [
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["value"],
         })])
-        .expect("invalid entity schemas should match provider behavior and be skipped");
-
-        assert!(catalog.surface("bad_entity").is_none());
+        .expect_err("Schema v1 rejects unsupported primary-key types");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
 
     #[test]
@@ -376,12 +379,14 @@ mod tests {
 
     fn catalog() -> PublicCatalog {
         PublicCatalog::from_visible_schemas(&[json!({
-            "x-lix-key": "test_state_schema",
-            "properties": {
-                "id": { "type": "string" },
-                "name": { "type": "string" },
-                "lixcol_internal": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "test_state_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "name", "type": "text", "nullable": true },
+                { "name": "lixcol_internal", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
         })])
         .expect("test catalog")
     }

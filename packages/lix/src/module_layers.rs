@@ -93,7 +93,6 @@ const MODULE_LAYERS: &[&[&str]] = &[
 /// of its own — into `sql2` and `collection_generation`.
 const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("catalog", "not yet analysed"),
-    ("cel", "leaf utility, no layer semantics"),
     ("client_state", "entry-point plumbing, no layer semantics"),
     ("domain", "pure predicates, no owned invariant"),
     ("engine", "entry point; reaches everywhere by design"),

@@ -1313,8 +1313,8 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND entity_pk = lix_json('[\"merge-select-change\"]') \
-	       AND snapshot_content = lix_json('{\"key\":\"merge-select-change\",\"value\":\"source\"}')",
+	       AND entity_pk = CAST('[\"merge-select-change\"]' AS JSONB) \
+	       AND snapshot_content = CAST('{\"key\":\"merge-select-change\",\"value\":\"source\"}' AS JSONB)",
         )
         .await;
         assert_eq!(
@@ -1356,7 +1356,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"merge_task_item\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"merge_task_item\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB)\
                  )",
                 &[],
             )
@@ -2206,7 +2206,7 @@ simulation_test!(
                 "SELECT diff_type, before_change_id, after_change_id \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"branch-baseline\"]')",
+                   AND entity_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2264,7 +2264,7 @@ simulation_test!(
                 "INSERT INTO lix_revert (diff_id) \
                  SELECT diff_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"branch-revert\"]')",
+                   AND entity_pk = CAST('[\"branch-revert\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2322,7 +2322,7 @@ simulation_test!(
                 "SELECT diff_type, before_change_id \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"merge-baseline\"]')",
+                   AND entity_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2373,7 +2373,7 @@ simulation_test!(
             .execute(
                 "SELECT diff_type, before_change_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"branch-delete\"]')",
+                   AND entity_pk = CAST('[\"branch-delete\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2612,7 +2612,7 @@ simulation_test!(
             .execute(
                 "SELECT diff_type, before_change_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"switch-baseline\"]')",
+                   AND entity_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
                 &[],
             )
             .await

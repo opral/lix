@@ -129,7 +129,7 @@ fn deterministic_mode_insert_sql(timestamp_shuffle: bool) -> String {
     format!(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
          VALUES ('lix_deterministic_mode', \
-         lix_json('{{\"enabled\":true,\"timestamp_shuffle\":{timestamp_shuffle}}}'), true, true)"
+         CAST('{{\"enabled\":true,\"timestamp_shuffle\":{timestamp_shuffle}}}' AS JSONB), true, true)"
     )
 }
 

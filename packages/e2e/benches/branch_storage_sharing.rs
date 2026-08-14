@@ -453,7 +453,7 @@ where
             let index = start + written + offset;
             transaction
                 .execute(
-                    "UPDATE branch_fixture SET value = lix_json($1) WHERE path = $2",
+                    "UPDATE branch_fixture SET value = CAST($1 AS JSONB) WHERE path = $2",
                     &[
                         Value::Text(format!(r#"{{"seed":{index},"edited":true,"pad":"{PAD}"}}"#)),
                         Value::Text(row_path(index)),
@@ -481,22 +481,18 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "branch_fixture",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "branch_fixture",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -518,7 +514,7 @@ where
             let index = written + offset;
             transaction
                 .execute(
-                    "INSERT INTO branch_fixture (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO branch_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(row_path(index)),
                         Value::Text(format!(r#"{{"seed":{index},"pad":"{PAD}"}}"#)),

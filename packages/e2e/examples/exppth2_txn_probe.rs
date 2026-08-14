@@ -172,10 +172,7 @@ async fn run_profile(files: usize, updates: usize, payload: usize, loops: usize)
         for id in ids.iter().take(updates) {
             lix.execute(
                 "UPDATE lix_file SET content = $1 WHERE id = $2",
-                &[
-                    Value::Blob(updated.clone().into()),
-                    Value::Text(id.clone()),
-                ],
+                &[Value::Blob(updated.clone().into()), Value::Text(id.clone())],
             )
             .await
             .expect("update by id");
@@ -246,10 +243,7 @@ async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64
             for id in ids.iter().take(updates) {
                 lix.execute(
                     "UPDATE lix_file SET content = $1 WHERE id = $2",
-                    &[
-                        Value::Blob(updated.clone().into()),
-                        Value::Text(id.clone()),
-                    ],
+                    &[Value::Blob(updated.clone().into()), Value::Text(id.clone())],
                 )
                 .await
                 .expect("update by id");
@@ -261,10 +255,7 @@ async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64
                 transaction
                     .execute(
                         "UPDATE lix_file SET content = $1 WHERE id = $2",
-                        &[
-                            Value::Blob(updated.clone().into()),
-                            Value::Text(id.clone()),
-                        ],
+                        &[Value::Blob(updated.clone().into()), Value::Text(id.clone())],
                     )
                     .await
                     .expect("update by id in transaction");

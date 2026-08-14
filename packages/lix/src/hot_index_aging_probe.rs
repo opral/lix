@@ -81,28 +81,26 @@ async fn index_record_counts(storage: &Memory) -> (usize, usize) {
 fn probe_schemas(parent: &str, child: &str) -> [serde_json::Value; 2] {
     [
         json!({
-            "x-lix-key": parent,
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": parent,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }),
         json!({
-            "x-lix-key": child,
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parentId"],
-                "references": { "schemaKey": parent, "properties": ["/id"] }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": child,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
+                "references": { "schema_key": parent, "columns": ["id"] }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "parentId": { "type": "string" },
-                "locale": { "type": "string" }
-            },
-            "required": ["id", "parentId", "locale"],
-            "additionalProperties": false
         }),
     ]
 }
@@ -111,7 +109,7 @@ async fn register(session: &SessionContext<Memory>, schemas: [serde_json::Value;
     for schema in schemas {
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[crate::Value::Text(schema.to_string())],
             )
             .await
@@ -156,7 +154,7 @@ async fn insert_children(
             .join(",");
         session
             .execute(
-                &format!(r#"INSERT INTO {table} (id, "parentId", locale) VALUES {values}"#),
+                &format!(r#"INSERT INTO {table} (id, "parent_id", locale) VALUES {values}"#),
                 &[],
             )
             .await
@@ -242,7 +240,7 @@ async fn hot_index_read_path_candidate_amplification() {
             let (_, entries) = index_record_counts(&storage).await;
             let median = timed_lookup(
                 &session,
-                r#"SELECT id FROM agedc WHERE "parentId" = 'parent-0'"#,
+                r#"SELECT id FROM agedc WHERE "parent_id" = 'parent-0'"#,
                 1,
                 reps,
             )
@@ -273,7 +271,7 @@ async fn hot_index_read_path_candidate_amplification() {
             let (_, entries) = index_record_counts(&storage).await;
             let median = timed_lookup(
                 &session,
-                r#"SELECT id FROM freshc WHERE "parentId" = 'parent-0'"#,
+                r#"SELECT id FROM freshc WHERE "parent_id" = 'parent-0'"#,
                 1,
                 reps,
             )
@@ -288,14 +286,14 @@ async fn hot_index_read_path_candidate_amplification() {
             insert_children(&session, "movedc", n, |_| 0).await;
             mutate_children_except_first(
                 &session,
-                |ids| format!(r#"UPDATE movedc SET "parentId" = 'parent-1' WHERE id IN ({ids})"#),
+                |ids| format!(r#"UPDATE movedc SET "parent_id" = 'parent-1' WHERE id IN ({ids})"#),
                 n,
             )
             .await;
             let (_, entries) = index_record_counts(&storage).await;
             let median = timed_lookup(
                 &session,
-                r#"SELECT id FROM movedc WHERE "parentId" = 'parent-0'"#,
+                r#"SELECT id FROM movedc WHERE "parent_id" = 'parent-0'"#,
                 1,
                 reps,
             )
@@ -320,17 +318,15 @@ async fn hot_index_read_path_candidate_amplification() {
 
 fn unique_probe_schema(key: &str) -> serde_json::Value {
     json!({
-        "x-lix-key": key,
-        "x-lix-primary-key": ["/id"],
-        "x-lix-unique": [["/slug"]],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "slug": { "type": "string" },
-            "tag": { "type": "string" }
-        },
-        "required": ["id", "slug", "tag"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": key,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "slug", "type": "text", "nullable": false },
+            { "name": "tag", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
+        "unique": [["slug"]],
     })
 }
 
@@ -338,17 +334,15 @@ fn unique_probe_schema(key: &str) -> serde_json::Value {
 /// groups, so this collection keeps the scan route on the write path.
 fn composite_unique_schema(key: &str) -> serde_json::Value {
     json!({
-        "x-lix-key": key,
-        "x-lix-primary-key": ["/id"],
-        "x-lix-unique": [["/slug", "/tag"]],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "slug": { "type": "string" },
-            "tag": { "type": "string" }
-        },
-        "required": ["id", "slug", "tag"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": key,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "slug", "type": "text", "nullable": false },
+            { "name": "tag", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
+        "unique": [["slug", "tag"]],
     })
 }
 
@@ -382,7 +376,7 @@ async fn write_path_churn(table: &str, schema: serde_json::Value) {
     let (storage, session) = open_session().await;
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[crate::Value::Text(schema.to_string())],
         )
         .await

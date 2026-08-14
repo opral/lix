@@ -122,6 +122,7 @@ enum StoredValue {
     Real(f64),
     Text(String),
     Json(crate::Json),
+    Timestamp(i64),
     Blob(String),
 }
 
@@ -142,6 +143,7 @@ impl StoredValue {
             }
             Value::Text(value) => Self::Text(value.clone()),
             Value::Json(value) => Self::Json(value.clone()),
+            Value::Timestamp(value) => Self::Timestamp(*value),
             Value::Blob(value) => Self::Blob(BASE64.encode(value.as_ref())),
         })
     }
@@ -154,6 +156,7 @@ impl StoredValue {
             Self::Real(value) => Value::Real(value),
             Self::Text(value) => Value::Text(value),
             Self::Json(value) => Value::Json(value),
+            Self::Timestamp(value) => Value::Timestamp(value),
             Self::Blob(value) => Value::Blob(
                 BASE64
                     .decode(value.as_bytes())

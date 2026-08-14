@@ -14,6 +14,7 @@ export type WireValue =
 	| { kind: "float"; value: number }
 	| { kind: "text"; value: string }
 	| { kind: "json"; value: unknown }
+	| { kind: "timestamp"; value: string }
 	| { kind: "blob"; base64: string };
 
 export type WireRequestBlobSplice = {
@@ -180,6 +181,8 @@ export function encodeWireValue(value: NativeLixValue): WireValue {
 			return { kind: "text", value: value.value };
 		case "json":
 			return { kind: "json", value: value.value };
+		case "timestamp":
+			return { kind: "timestamp", value: value.value };
 		case "blob":
 			return { kind: "blob", base64: bytesToBase64(value.blob) };
 	}
@@ -581,6 +584,11 @@ function decodeWireValue(value: unknown): NativeLixValue {
 		case "json":
 			assertJsonValue(wire.value, "json wire value");
 			return { kind: "json", value: wire.value };
+		case "timestamp":
+			if (typeof wire.value !== "string") {
+				throw protocolError("timestamp wire value is invalid");
+			}
+			return { kind: "timestamp", value: wire.value };
 		case "blob":
 			if (typeof wire.base64 !== "string") {
 				throw protocolError("blob wire value is invalid");

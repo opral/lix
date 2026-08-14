@@ -1,12 +1,34 @@
 use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
+use datafusion::sql::sqlparser::ast::{
+    BinaryOperator, DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, Value, VisitMut,
+    VisitorMut,
+};
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+use serde_json::json;
+use std::ops::ControlFlow;
 
 use crate::LixError;
 
 pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
     let dialect = super::dialect::lix_sql_dialect();
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let mut has_anonymous = false;
+    let mut explicit_placeholders = Vec::new();
+
+    let mut tokens = Vec::new();
+    Tokenizer::new(&dialect, sql)
+        .tokenize_with_location_into_buf_with_mapper(&mut tokens, |token_span| {
+            if let Token::Placeholder(placeholder) = &token_span.token {
+                if placeholder == "?" {
+                    // Disambiguated below after the neighboring tokens are known:
+                    // GenericDialect tokenizes both anonymous parameters and
+                    // PostgreSQL's JSONB existence operator as `?` placeholders.
+                } else {
+                    explicit_placeholders.push(placeholder.clone());
+                }
+            }
+            token_span
+        })
         .map_err(|error| {
             LixError::new(
                 LixError::CODE_PARSE_ERROR,
@@ -14,7 +36,57 @@ pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError
             )
         })?;
 
+    let mut next_index = 1usize;
+    for index in 0..tokens.len() {
+        if !matches!(&tokens[index].token, Token::Placeholder(value) if value == "?") {
+            continue;
+        }
+        let next_is_literal = tokens[index + 1..]
+            .iter()
+            .find(|next| !matches!(next.token, Token::Whitespace(_)))
+            .is_some_and(|next| matches!(next.token, Token::SingleQuotedString(_)));
+        let previous_is_operand = tokens[..index]
+            .iter()
+            .rev()
+            .find(|previous| !matches!(previous.token, Token::Whitespace(_)))
+            .is_some_and(|previous| {
+                matches!(
+                    previous.token,
+                    Token::Word(ref word)
+                        if word.keyword
+                            == datafusion::sql::sqlparser::keywords::Keyword::NoKeyword
+                ) || matches!(
+                    previous.token,
+                    Token::RParen
+                        | Token::RBracket
+                        | Token::SingleQuotedString(_)
+                        | Token::Number(_, _)
+                        | Token::Placeholder(_)
+                )
+            });
+        let jsonb_existence_operator = next_is_literal || previous_is_operand;
+        if jsonb_existence_operator {
+            tokens[index].token = Token::Question;
+        } else {
+            has_anonymous = true;
+            tokens[index].token = Token::Placeholder(format!("${next_index}"));
+            next_index += 1;
+        }
+    }
+
     reject_sql_hex_literals(&tokens)?;
+
+    if has_anonymous && !explicit_placeholders.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_PARSE_ERROR,
+            "SQL mixes anonymous and explicit parameter placeholders",
+        )
+        .with_hint("Use either anonymous placeholders like ?, ? or numbered placeholders like $1, $2, but not both.")
+        .with_details(json!({
+            "operation": "execute",
+            "explicit_placeholders": explicit_placeholders,
+        })));
+    }
 
     let mut statements = DFParserBuilder::new(tokens)
         .with_dialect(&dialect)
@@ -30,12 +102,105 @@ pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError
         ));
     }
 
-    statements.pop_front().ok_or_else(|| {
+    let mut statement = statements.pop_front().ok_or_else(|| {
         LixError::new(
             LixError::CODE_PARSE_ERROR,
             "sql2 DataFusion error: No SQL statements were provided in the query string",
         )
-    })
+    })?;
+    rewrite_postgresql_expressions(&mut statement);
+    Ok(statement)
+}
+
+/// DataFusion 53 parses PostgreSQL JSON operators but does not plan them yet.
+/// Lower the public PostgreSQL syntax to private execution functions before
+/// either the read planner or bound-write planner sees the statement.
+fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
+    struct Rewriter;
+    impl VisitorMut for Rewriter {
+        type Break = ();
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Function(function) = expr {
+                let is_current_timestamp = function
+                    .name
+                    .0
+                    .last()
+                    .and_then(|part| match part {
+                        ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+                        ObjectNamePart::Function(_) => None,
+                    })
+                    .is_some_and(|name| name.eq_ignore_ascii_case("current_timestamp"));
+                let no_args = matches!(function.args, FunctionArguments::None)
+                    || matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
+                if is_current_timestamp && no_args {
+                    *expr = private_function("__lix_current_timestamp", Vec::new());
+                    return ControlFlow::Continue(());
+                }
+            }
+            if let Expr::Cast {
+                expr: inner,
+                data_type: SqlDataType::JSONB,
+                array: false,
+                format: None,
+                ..
+            } = expr
+            {
+                let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
+                let inner = std::mem::replace(inner, placeholder);
+                *expr = private_function("__lix_jsonb", vec![*inner]);
+                return ControlFlow::Continue(());
+            }
+            let Expr::BinaryOp { left, op, right } = expr else {
+                return ControlFlow::Continue(());
+            };
+            let name = match op {
+                BinaryOperator::Arrow => "__lix_json_get",
+                BinaryOperator::LongArrow => "__lix_json_get_text",
+                BinaryOperator::HashArrow => "__lix_json_path_get",
+                BinaryOperator::HashLongArrow => "__lix_json_path_get_text",
+                BinaryOperator::AtArrow => "__lix_json_contains",
+                BinaryOperator::Question => "__lix_json_exists",
+                _ => return ControlFlow::Continue(()),
+            };
+            let placeholder = || Box::new(Expr::Value(Value::Boolean(false).into()));
+            let left = std::mem::replace(left, placeholder());
+            let right = std::mem::replace(right, placeholder());
+            *expr = private_function(name, vec![*left, *right]);
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn private_function(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Function(Function {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: args
+                    .into_iter()
+                    .map(|arg| FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)))
+                    .collect(),
+                clauses: Vec::new(),
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: Vec::new(),
+        })
+    }
+
+    fn visit(statement: &mut DataFusionStatement, visitor: &mut Rewriter) {
+        match statement {
+            DataFusionStatement::Statement(statement) => {
+                let _ = statement.visit(visitor);
+            }
+            DataFusionStatement::Explain(explain) => visit(explain.statement.as_mut(), visitor),
+            _ => {}
+        }
+    }
+    visit(statement, &mut Rewriter);
 }
 
 pub(super) fn reject_sql_hex_literals(tokens: &[TokenWithSpan]) -> Result<(), LixError> {

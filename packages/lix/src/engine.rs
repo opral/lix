@@ -569,22 +569,18 @@ mod tests {
 
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
         let schema = json!({
-            "x-lix-key": "json_pointer",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_pointer",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         assert_eq!(
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), $2, false)",
+                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), $2, false)",
                     &[
                         crate::Value::Text(schema.to_string()),
                         crate::Value::Boolean(global),
@@ -1045,7 +1041,7 @@ mod tests {
         assert_eq!(
             session
                 .execute(
-                    "INSERT INTO json_pointer (path, value) VALUES ('/a', lix_json('{\"n\":1}')), ('/b', lix_json('{\"n\":2}')), ('/c', lix_json('{\"n\":3}'))",
+                    "INSERT INTO json_pointer (path, value) VALUES ('/a', CAST('{\"n\":1}' AS JSONB)), ('/b', CAST('{\"n\":2}' AS JSONB)), ('/c', CAST('{\"n\":3}' AS JSONB))",
                     &[],
                 )
                 .await
@@ -1093,12 +1089,12 @@ mod tests {
         // edge cases: empty strings, embedded NULs, control bytes, and UTF-8.
         // Compare equivalent orderings to exercise provider projection and
         // DataFusion ordering over the tracked-head primary-key codec.
-        let paths = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
+        let paths = ["", "a", "a\u{1}", "z", "é"];
         for (index, path) in paths.iter().enumerate() {
             assert_eq!(
                 session
                     .execute(
-                        "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                        "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))",
                         &[
                             crate::Value::Text((*path).to_string()),
                             crate::Value::Text(json!({"index": index}).to_string()),
@@ -1160,7 +1156,7 @@ mod tests {
         register_json_pointer_schema(&session).await;
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/committed', lix_json('{\"source\":\"tracked\"}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/committed', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1172,7 +1168,7 @@ mod tests {
             .expect("transaction should open");
         transaction
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/staged', lix_json('{\"source\":\"staged\"}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/staged', CAST('{\"source\":\"staged\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1209,7 +1205,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/tracked', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/tracked', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1217,7 +1213,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"source\":\"untracked\"}'), true)",
+                 VALUES ('/untracked', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1239,7 +1235,7 @@ mod tests {
         let error = session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/tracked', lix_json('{\"source\":\"collision\"}'), true)",
+                 VALUES ('/tracked', CAST('{\"source\":\"collision\"}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1249,7 +1245,7 @@ mod tests {
         let error = session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/untracked', lix_json('{\"source\":\"collision\"}'))",
+                 VALUES ('/untracked', CAST('{\"source\":\"collision\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1260,7 +1256,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/tracked', lix_json('{\"source\":\"tracked-upsert\"}'), true) \
+                     VALUES ('/tracked', CAST('{\"source\":\"tracked-upsert\"}' AS JSONB), true) \
                      ON CONFLICT (path) DO UPDATE SET value = excluded.value",
                     &[],
                 )
@@ -1273,7 +1269,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/untracked', lix_json('{\"source\":\"untracked-upsert\"}'), false) \
+                     VALUES ('/untracked', CAST('{\"source\":\"untracked-upsert\"}' AS JSONB), false) \
                      ON CONFLICT (path) DO UPDATE SET value = excluded.value",
                     &[],
                 )
@@ -1373,7 +1369,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/history-free', lix_json('{\"source\":\"untracked\"}'), true)",
+                     VALUES ('/history-free', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                     &[],
                 )
                 .await
@@ -1446,7 +1442,7 @@ mod tests {
         for path in ["/clean", "/modified", "/removed", "/recycled-source"] {
             session
                 .execute(
-                    "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json('{\"v\":0}'))",
+                    "INSERT INTO json_pointer (path, value) VALUES ($1, CAST('{\"v\":0}' AS JSONB))",
                     &[crate::Value::Text(path.to_string())],
                 )
                 .await
@@ -1466,7 +1462,7 @@ mod tests {
 
         session
             .execute(
-                "UPDATE json_pointer SET value = lix_json('{\"v\":1}') WHERE path = '/modified'",
+                "UPDATE json_pointer SET value = CAST('{\"v\":1}' AS JSONB) WHERE path = '/modified'",
                 &[],
             )
             .await
@@ -1477,7 +1473,7 @@ mod tests {
             .expect("delete should dirty the row");
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/added', lix_json('{\"v\":1}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/added', CAST('{\"v\":1}' AS JSONB))",
                 &[],
             )
             .await
@@ -1485,7 +1481,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/added-then-removed', lix_json('{\"v\":1}'))",
+                 VALUES ('/added-then-removed', CAST('{\"v\":1}' AS JSONB))",
                 &[],
             )
             .await
@@ -1500,7 +1496,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"v\":1}'), true)",
+                 VALUES ('/untracked', CAST('{\"v\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1514,7 +1510,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/recycled', lix_json('{\"v\":1}'), true)",
+                 VALUES ('/recycled', CAST('{\"v\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1526,7 +1522,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/recycled', lix_json('{\"v\":2}'))",
+                 VALUES ('/recycled', CAST('{\"v\":2}' AS JSONB))",
                 &[],
             )
             .await
@@ -1538,7 +1534,7 @@ mod tests {
         let retention_flip = session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/modified', lix_json('{\"v\":9}'), true)",
+                 VALUES ('/modified', CAST('{\"v\":9}' AS JSONB), true)",
                 &[],
             )
             .await;
@@ -1602,7 +1598,7 @@ mod tests {
             let finite = session
                 .execute(
                     "SELECT entity_pk, diff_type FROM lix_working_diff \
-                     WHERE schema_key = 'json_pointer' AND entity_pk = lix_json($1) \
+                     WHERE schema_key = 'json_pointer' AND entity_pk = CAST($1 AS JSONB) \
                      ORDER BY entity_pk",
                     &[crate::Value::Text(entity_pk.clone())],
                 )
@@ -1689,7 +1685,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":0}'), $2)",
+                     VALUES ($1, CAST('{\"v\":0}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -1707,7 +1703,7 @@ mod tests {
 
         session
             .execute(
-                "UPDATE json_pointer SET value = lix_json('{\"v\":1}') \
+                "UPDATE json_pointer SET value = CAST('{\"v\":1}' AS JSONB) \
                  WHERE path IN ('/modified', '/modified-b', '/modified-none')",
                 &[],
             )
@@ -1721,7 +1717,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":1}'), $2)",
+                     VALUES ($1, CAST('{\"v\":1}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -1756,7 +1752,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"v\":1}'), true)",
+                 VALUES ('/untracked', CAST('{\"v\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1924,7 +1920,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":0}'), $2)",
+                     VALUES ($1, CAST('{\"v\":0}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -1950,7 +1946,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":1}'), $2)",
+                     VALUES ($1, CAST('{\"v\":1}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -2070,7 +2066,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/checkpointed', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/checkpointed', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -2102,7 +2098,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/repository', lix_json('{\"source\":\"untracked\"}'), true)",
+                 VALUES ('/repository', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -2125,7 +2121,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/after-checkpoint', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/after-checkpoint', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -2157,7 +2153,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/dirty', lix_json('{\"value\":\"before-checkpoint\"}'))",
+                 VALUES ('/dirty', CAST('{\"value\":\"before-checkpoint\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -2236,7 +2232,7 @@ mod tests {
         global_session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('/global', lix_json('{\"source\":\"global\"}'), true, false)",
+                 VALUES ('/global', CAST('{\"source\":\"global\"}' AS JSONB), true, false)",
                 &[],
             )
             .await
@@ -2383,33 +2379,31 @@ mod tests {
         let session = engine.open_session().await.expect("session should open");
         for schema in [
             json!({
-                "x-lix-key": "index_probe_parent",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "index_probe_parent",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": "index_probe_child",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parentId"],
-                    "references": { "schemaKey": "index_probe_parent", "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "index_probe_child",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": "index_probe_parent", "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "parentId": { "type": "string" },
-                    "locale": { "type": "string" }
-                },
-                "required": ["id", "parentId", "locale"],
-                "additionalProperties": false
             }),
         ] {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2425,7 +2419,7 @@ mod tests {
         for index in 0..3 {
             session
                 .execute(
-                    r#"INSERT INTO index_probe_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO index_probe_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2441,32 +2435,30 @@ mod tests {
 
     /// The two schemas the index tests drive: a parent keyed only by its
     /// primary key, and a child declaring a foreign key onto it. The foreign
-    /// key is what makes `parentId` an indexed column.
+    /// key is what makes `parent_id` an indexed column.
     fn index_probe_schemas(parent: &str, child: &str) -> [serde_json::Value; 2] {
         [
             json!({
-                "x-lix-key": parent,
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": parent,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": child,
-                "x-lix-primary-key": ["/id"],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parentId"],
-                    "references": { "schemaKey": parent, "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": child,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": parent, "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "parentId": { "type": "string" },
-                    "locale": { "type": "string" }
-                },
-                "required": ["id", "parentId", "locale"],
-                "additionalProperties": false
             }),
         ]
     }
@@ -2530,7 +2522,7 @@ mod tests {
         for schema in index_probe_schemas("counted_parent", "counted_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2544,7 +2536,7 @@ mod tests {
         for index in 0..4 {
             session
                 .execute(
-                    r#"INSERT INTO counted_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO counted_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2576,7 +2568,7 @@ mod tests {
         for schema in index_probe_schemas("degraded_parent", "degraded_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2598,7 +2590,7 @@ mod tests {
             .join(",");
         session
             .execute(
-                &format!(r#"INSERT INTO degraded_child (id, "parentId", locale) VALUES {values}"#),
+                &format!(r#"INSERT INTO degraded_child (id, "parent_id", locale) VALUES {values}"#),
                 &[],
             )
             .await
@@ -2612,7 +2604,7 @@ mod tests {
         session
             .execute(
                 &format!(
-                    r#"UPDATE degraded_child SET "parentId" = 'parent-1' WHERE id IN ({moved})"#
+                    r#"UPDATE degraded_child SET "parent_id" = 'parent-1' WHERE id IN ({moved})"#
                 ),
                 &[],
             )
@@ -2639,7 +2631,7 @@ mod tests {
         async fn ids(session: &SessionContext<Memory>, parent: &str) -> Vec<String> {
             let rows = session
                 .execute(
-                    r#"SELECT id FROM degraded_child WHERE "parentId" = $1 ORDER BY id"#,
+                    r#"SELECT id FROM degraded_child WHERE "parent_id" = $1 ORDER BY id"#,
                     &[crate::Value::Text(parent.into())],
                 )
                 .await
@@ -2675,7 +2667,7 @@ mod tests {
         for schema in index_probe_schemas("stale_parent", "stale_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2693,7 +2685,7 @@ mod tests {
         for index in 0..3 {
             session
                 .execute(
-                    r#"INSERT INTO stale_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO stale_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2703,7 +2695,7 @@ mod tests {
         async fn count(session: &SessionContext<Memory>, parent: &str) -> usize {
             session
                 .execute(
-                    r#"SELECT id FROM stale_child WHERE "parentId" = $1"#,
+                    r#"SELECT id FROM stale_child WHERE "parent_id" = $1"#,
                     &[crate::Value::Text(parent.into())],
                 )
                 .await
@@ -2716,7 +2708,7 @@ mod tests {
 
         session
             .execute(
-                r#"UPDATE stale_child SET "parentId" = 'parent-1' WHERE id = 'child-1'"#,
+                r#"UPDATE stale_child SET "parent_id" = 'parent-1' WHERE id = 'child-1'"#,
                 &[],
             )
             .await
@@ -2758,7 +2750,7 @@ mod tests {
         for schema in index_probe_schemas("ckpt_parent", "ckpt_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2771,7 +2763,7 @@ mod tests {
         for index in 0..3 {
             session
                 .execute(
-                    r#"INSERT INTO ckpt_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    r#"INSERT INTO ckpt_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
                     &[crate::Value::Text(format!("child-{index}"))],
                 )
                 .await
@@ -2784,7 +2776,7 @@ mod tests {
 
         let rows = session
             .execute(
-                r#"SELECT id FROM ckpt_child WHERE "parentId" = 'parent-0'"#,
+                r#"SELECT id FROM ckpt_child WHERE "parent_id" = 'parent-0'"#,
                 &[],
             )
             .await
@@ -2797,14 +2789,14 @@ mod tests {
 
         session
             .execute(
-                r#"INSERT INTO ckpt_child (id, "parentId", locale) VALUES ('child-3', 'parent-0', 'en')"#,
+                r#"INSERT INTO ckpt_child (id, "parent_id", locale) VALUES ('child-3', 'parent-0', 'en')"#,
                 &[],
             )
             .await
             .expect("post-checkpoint child should insert");
         let rows = session
             .execute(
-                r#"SELECT id FROM ckpt_child WHERE "parentId" = 'parent-0'"#,
+                r#"SELECT id FROM ckpt_child WHERE "parent_id" = 'parent-0'"#,
                 &[],
             )
             .await
@@ -2824,19 +2816,17 @@ mod tests {
         let (_storage, session) = open_index_probe_session().await;
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[crate::Value::Text(
                     json!({
-                        "x-lix-key": "probe_unique",
-                        "x-lix-primary-key": ["/id"],
-                        "x-lix-unique": [["/slug"]],
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "slug": { "type": "string" }
-                        },
-                        "required": ["id", "slug"],
-                        "additionalProperties": false
+                        "$schema": "https://lix.dev/schema-v1.json",
+                        "key": "probe_unique",
+                        "columns": [
+                            { "name": "id", "type": "text", "nullable": false },
+                            { "name": "slug", "type": "text", "nullable": false },
+                        ],
+                        "primary_key": ["id"],
+                        "unique": [["slug"]],
                     })
                     .to_string(),
                 )],

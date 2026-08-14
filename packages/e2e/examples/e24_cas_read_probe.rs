@@ -74,10 +74,17 @@ async fn main() {
         .next()
         .and_then(|v| v.parse().ok())
         .expect("usage: e24_cas_read_probe <asset_kib> <asset_count> <reps> <dir> [batch]");
-    let asset_count: usize = args.next().and_then(|v| v.parse().ok()).expect("asset_count");
+    let asset_count: usize = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .expect("asset_count");
     let reps: usize = args.next().and_then(|v| v.parse().ok()).expect("reps");
     let dir = PathBuf::from(args.next().expect("dir"));
-    let import_batch: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(50).max(1);
+    let import_batch: usize = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .max(1);
     let skip_write = std::env::var("E24_SKIP_WRITE").is_ok();
 
     fs::create_dir_all(&dir).expect("create probe dir");
@@ -115,7 +122,10 @@ async fn main() {
             lix.execute(&sql, &params).await.expect("seed import");
             cursor += n;
         }
-        println!("e24 seed_ms={:.1}", seed_started.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "e24 seed_ms={:.1}",
+            seed_started.elapsed().as_secs_f64() * 1000.0
+        );
         lix.close().await.expect("close seed lix");
     }
 

@@ -180,8 +180,8 @@ jobs:
         if: matrix.task == 'test'
         run: |
           rustup target add wasm32-wasip2
-          cargo package --locked -p lix --no-verify
-          package_archive="$(find target/package -maxdepth 1 -type f -name 'lix-*.crate' | head -n 1)"
+          cargo package --locked -p lix-schema -p lix --no-verify
+          package_archive="$(find target/package -maxdepth 1 -type f -name 'lix-[0-9]*.crate' | head -n 1)"
           tar -tf "$package_archive" |
             rg '^[^/]+/wit/lix-plugin\.wit$'
           packaged_lix="$(mktemp -d)"

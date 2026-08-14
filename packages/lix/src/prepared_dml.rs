@@ -30,6 +30,7 @@ enum PreparedDmlValueKind {
     Real,
     Text,
     Json,
+    Timestamp,
     Blob,
 }
 
@@ -51,6 +52,7 @@ pub(crate) enum PreparedDmlValueRef<'a> {
     Real(f64),
     Text(&'a str),
     Json(&'a [u8]),
+    Timestamp(i64),
     Blob(&'a [u8]),
 }
 
@@ -145,6 +147,9 @@ impl PreparedDmlParameterBatch {
                 })?)
             }
             PreparedDmlValueKind::Json => PreparedDmlValueRef::Json(self.slice(cell)),
+            PreparedDmlValueKind::Timestamp => {
+                PreparedDmlValueRef::Timestamp(i64::from_le_bytes(cell.scalar))
+            }
             PreparedDmlValueKind::Blob => PreparedDmlValueRef::Blob(self.slice(cell)),
         };
         Ok(value)
@@ -170,6 +175,9 @@ impl PreparedDmlParameterBatch {
                 })
             }
             PreparedDmlValueKind::Json => PreparedDmlValueRef::Json(self.slice(cell)),
+            PreparedDmlValueKind::Timestamp => {
+                PreparedDmlValueRef::Timestamp(i64::from_le_bytes(cell.scalar))
+            }
             PreparedDmlValueKind::Blob => PreparedDmlValueRef::Blob(self.slice(cell)),
         }
     }
@@ -199,6 +207,7 @@ impl PreparedDmlParameterBatch {
                             format!("prepared DML JSON parameter is invalid: {error}"),
                         )
                     }),
+                PreparedDmlValueRef::Timestamp(value) => Ok(Value::Timestamp(value)),
                 PreparedDmlValueRef::Blob(value) => Ok(Value::Blob(Blob::from(value.to_vec()))),
             })
             .collect()
@@ -238,6 +247,10 @@ impl PreparedDmlParameterBatch {
                     )
                 })?;
                 Self::set_bytes(&mut cell, bytes, &encoded)?;
+            }
+            Value::Timestamp(value) => {
+                cell.kind = PreparedDmlValueKind::Timestamp;
+                cell.scalar = value.to_le_bytes();
             }
             Value::Blob(value) => {
                 cell.kind = PreparedDmlValueKind::Blob;

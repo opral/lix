@@ -23,7 +23,7 @@ where
         .expect("repository should open");
     lix.execute(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-             VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+             VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
         &[],
     )
     .await
@@ -39,7 +39,7 @@ where
         .await
         .expect("repository should reopen");
     let result = lix
-        .execute("SELECT lix_uuid_v7() AS value", &[])
+        .execute("SELECT uuidv7() AS value", &[])
         .await
         .expect("valid deterministic authority should produce the next UUID");
     let value = result.rows()[0]
@@ -138,7 +138,7 @@ where
         .await
         .expect("member-corrupt repository should open structurally");
     let error = lix
-        .execute("SELECT lix_uuid_v7()", &[])
+        .execute("SELECT uuidv7()", &[])
         .await
         .expect_err("missing selected sequence member must fail closed");
     assert!(

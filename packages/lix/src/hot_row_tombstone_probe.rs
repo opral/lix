@@ -235,22 +235,20 @@ async fn run_repository_gc(storage: &Memory) {
 
 fn probe_schema(key: &str) -> serde_json::Value {
     json!({
-        "x-lix-key": key,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "locale": { "type": "string" }
-        },
-        "required": ["id", "locale"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": key,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "locale", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     })
 }
 
 async fn register(session: &SessionContext<Memory>, schema: serde_json::Value) {
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[crate::Value::Text(schema.to_string())],
         )
         .await

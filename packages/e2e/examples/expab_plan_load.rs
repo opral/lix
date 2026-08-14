@@ -336,7 +336,7 @@ where
     for index in 0..rows {
         transaction
             .execute(
-                "INSERT INTO replay_scope (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO replay_scope (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(format!("/row/{batch:08}/{index:08}")),
                     Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
@@ -353,21 +353,17 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "replay_scope",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "replay_scope",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

@@ -31,10 +31,10 @@
 //! Default checkpoints: 25 50 100 200 400 800.
 
 use lix::Value;
-use lix::{Lix, open_lix};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{hot_generation_branches, layout_accounting, probe_hot_generation_planes};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::{BlockFetchCounters, PerfProbe, RocksDB};
 
 const PROBE_REPS: usize = 3;
@@ -123,14 +123,22 @@ async fn main() {
                 for space in &per_space {
                     println!(
                         "    space=0x{:08x} rows={} pages={} open_nanos={} total_nanos={}",
-                        space.space_id, space.rows, space.pages, space.open_nanos, space.total_nanos
+                        space.space_id,
+                        space.rows,
+                        space.pages,
+                        space.open_nanos,
+                        space.total_nanos
                     );
                 }
             } else {
                 for space in &per_space {
                     println!(
                         "  L space=0x{:08x} rows={} pages={} open_nanos={} total_nanos={}",
-                        space.space_id, space.rows, space.pages, space.open_nanos, space.total_nanos
+                        space.space_id,
+                        space.rows,
+                        space.pages,
+                        space.open_nanos,
+                        space.total_nanos
                     );
                 }
             }
@@ -187,7 +195,7 @@ where
     for index in 0..rows {
         transaction
             .execute(
-                "INSERT INTO e53_locality (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO e53_locality (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(format!("/row/{batch:08}/{index:08}")),
                     Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
@@ -204,21 +212,17 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "e53_locality",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "e53_locality",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

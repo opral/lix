@@ -142,24 +142,20 @@ fn canonicalize_json_text_literal(expr: Expr) -> Result<Expr, DataFusionError> {
     let canonical = match &literal {
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Some(canonical_json_text(value)?),
+        | ScalarValue::LargeUtf8(Some(value)) => Some(
+            crate::sql2::udfs::common::canonical_jsonb_text(value).map_err(|error| {
+                lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("JSON comparison value is not valid JSON: {error}"),
+                ))
+            })?,
+        ),
         _ => None,
     };
     Ok(canonical.map_or_else(
         || Expr::Literal(literal, metadata),
         |value| Expr::Literal(ScalarValue::Utf8(Some(value)), Some(json_field_metadata())),
     ))
-}
-
-fn canonical_json_text(raw: &str) -> Result<String, DataFusionError> {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map(|value| value.to_string())
-        .map_err(|error| {
-            lix_error_to_datafusion_error(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("JSON comparison value is not valid JSON: {error}"),
-            ))
-        })
 }
 
 fn json_field_metadata() -> FieldMetadata {
@@ -459,7 +455,10 @@ fn is_json_expr<'a>(
             .inner()
             .get(LIX_VALUE_TYPE_METADATA_KEY)
             .is_some_and(|value| value == LIX_VALUE_TYPE_JSON),
-        Expr::ScalarFunction(function) => matches!(function.name(), "lix_json" | "lix_json_get"),
+        Expr::ScalarFunction(function) => matches!(
+            function.name(),
+            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        ),
         Expr::Alias(alias) => is_json_expr(&alias.expr, lookup_field),
         Expr::Cast(cast) => is_json_expr(&cast.expr, lookup_field),
         Expr::TryCast(cast) => is_json_expr(&cast.expr, lookup_field),
@@ -500,5 +499,5 @@ fn json_predicate_type_error(expr: &Expr) -> LixError {
         LixError::CODE_TYPE_MISMATCH,
         format!("JSON columns can only be compared with JSON expressions, got {expr}"),
     )
-    .with_hint("Wrap JSON text with lix_json(...), use lix_json_get(...) for JSON values, or use IS NULL for null checks.")
+    .with_hint("Cast JSON text with ::jsonb, use PostgreSQL -> or ->> for JSON access, or use IS NULL for null checks.")
 }

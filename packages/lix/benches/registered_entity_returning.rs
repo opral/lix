@@ -39,12 +39,12 @@ const DEFAULT_ROUNDS: usize = 11;
 const DEFAULT_WARMUP_ROUNDS: usize = 1;
 const ENTITY_TABLE: &str = "benchmark_returning_entity";
 const REGISTER_SCHEMA_SQL: &str = "INSERT INTO lix_registered_schema \
-    (value, lixcol_global, lixcol_untracked) VALUES (\
-    lix_json('{\"x-lix-key\":\"benchmark_returning_entity\",\
-    \"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\
-    \"properties\":{\"id\":{\"type\":\"string\"},\
-    \"payload\":{\"type\":\"string\"}},\"required\":[\"id\",\"payload\"],\
-    \"additionalProperties\":false}'), false, false)";
+    (schema_key, value, lixcol_global, lixcol_untracked) VALUES (\
+    'benchmark_returning_entity', CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\
+    \"key\":\"benchmark_returning_entity\",\"columns\":[\
+    {\"name\":\"id\",\"type\":\"text\",\"nullable\":false},\
+    {\"name\":\"payload\",\"type\":\"text\",\"nullable\":false}],\
+    \"primary_key\":[\"id\"]}' AS JSONB), false, false)";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {

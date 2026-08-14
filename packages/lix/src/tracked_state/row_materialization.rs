@@ -781,21 +781,18 @@ mod tests {
                 .expect("engine should open");
             let session = engine.open_session().await.expect("session should open");
 
-            let mut id_property = json!({ "type": "string" });
-            if uuid_pk {
-                id_property["format"] = json!("uuid");
-            }
             let schema = json!({
-                "x-lix-key": schema_key,
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": id_property, "locale": { "type": "string" } },
-                "required": ["id", "locale"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": schema_key,
+                "columns": [
+                    { "name": "id", "type": if uuid_pk { "uuid" } else { "text" }, "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false }
+                ],
+                "primary_key": ["id"]
             });
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await

@@ -1816,7 +1816,8 @@ where
         let (result, result_has_more) = cursor
             .next_page(chunk_size)
             .await
-            .map_err(|error| error.to_string())?.into_parts();
+            .map_err(|error| error.to_string())?
+            .into_parts();
 
         scanned += result.len();
         chunks += usize::from(!result.is_empty() || result_has_more);

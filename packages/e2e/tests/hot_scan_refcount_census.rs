@@ -28,19 +28,17 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
     let lix = open_lix().await.expect("open in-memory lix");
 
     let schema = serde_json::json!({
-        "x-lix-key": SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "ordinal": { "type": "number" },
-            "lane": { "type": "string" }
-        },
-        "required": ["id", "ordinal", "lane"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "ordinal", "type": "float8", "nullable": false },
+            { "name": "lane", "type": "text", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await
@@ -77,12 +75,21 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
     // materialized batch row by row.
     let result = lix
         .execute(
-            &format!("SELECT id, ordinal, lane FROM {SCHEMA_KEY} WHERE ordinal >= $1 AND ordinal < $2"),
-            &[Value::Integer(0), Value::Integer(i64::try_from(ROWS).expect("fits i64"))],
+            &format!(
+                "SELECT id, ordinal, lane FROM {SCHEMA_KEY} WHERE ordinal >= $1 AND ordinal < $2"
+            ),
+            &[
+                Value::Integer(0),
+                Value::Integer(i64::try_from(ROWS).expect("fits i64")),
+            ],
         )
         .await
         .expect("scan census rows");
-    assert_eq!(result.rows().len(), ROWS, "the census must observe a full scan");
+    assert_eq!(
+        result.rows().len(),
+        ROWS,
+        "the census must observe a full scan"
+    );
 
     let (rows_decoded, key_clones, value_clones, row_clones) = take_hot_scan_refcount_census();
 

@@ -480,6 +480,9 @@ pub enum Value {
     Real(f64),
     Text(String),
     Json(Json),
+    /// PostgreSQL `timestamptz`, represented losslessly as signed UTC
+    /// microseconds since the Unix epoch.
+    Timestamp(i64),
     Blob(Blob),
 }
 

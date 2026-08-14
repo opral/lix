@@ -19,7 +19,7 @@ simulation_test!(
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_history_table_type\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_table_type\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -61,7 +61,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_contract_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"meta\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -112,7 +112,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_conformance\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_conformance\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -125,7 +125,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
             .execute(
                 "INSERT INTO engine_history_conformance \
                  (lixcol_entity_pk, id, value, lixcol_untracked) \
-                 VALUES (lix_json('[\"history-conformance-entity\"]'), 'history-conformance-entity', 'one', false)",
+                 VALUES (CAST('[\"history-conformance-entity\"]' AS JSONB), 'history-conformance-entity', 'one', false)",
                 &[],
             )
             .await
@@ -134,7 +134,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
         .execute(
             "UPDATE engine_history_conformance \
                  SET value = 'two' \
-                 WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB)",
             &[],
         )
         .await
@@ -142,7 +142,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
     session
         .execute(
             "DELETE FROM engine_history_conformance \
-                 WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB)",
             &[],
         )
         .await
@@ -152,7 +152,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
         &session,
         "SELECT id, value, lixcol_entity_pk, lixcol_depth \
              FROM engine_history_conformance_history() \
-               WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
+               WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB) \
              ORDER BY lixcol_depth",
     )
     .await;
@@ -160,7 +160,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
     assert_eq!(
         typed_rows[0],
         vec![
-            Value::Null,
+            Value::Text("history-conformance-entity".to_string()),
             Value::Null,
             Value::Json(serde_json::json!(["history-conformance-entity"]).into()),
             Value::Integer(0),
@@ -241,7 +241,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_composite_pk\",\"columns\":[{\"name\":\"namespace\",\"type\":\"text\",\"nullable\":false},{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"namespace\",\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -299,7 +299,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_history_reconstructs_nested_primary_key_roots_on_tombstones,
+    typed_entity_history_reconstructs_flat_primary_key_columns_on_tombstones,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -314,7 +314,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_nested_pk\",\"x-lix-primary-key\":[\"/identity/tenant\",\"/identity/id\"],\"type\":\"object\",\"properties\":{\"identity\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"tenant\",\"id\"],\"additionalProperties\":false},\"value\":{\"type\":\"string\"}},\"required\":[\"identity\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_history_nested_pk\",\"columns\":[{\"name\":\"tenant\",\"type\":\"text\",\"nullable\":false},{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"tenant\",\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -326,8 +326,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_history_nested_pk \
-                 (identity, value, lixcol_untracked) \
-                 VALUES (lix_json('{\"tenant\":\"acme\",\"id\":\"7\"}'), 'one', false)",
+                 (tenant, id, value, lixcol_untracked) \
+                 VALUES ('acme', '7', 'one', false)",
                 &[],
             )
             .await
@@ -335,7 +335,7 @@ simulation_test!(
         session
             .execute(
                 "DELETE FROM engine_history_nested_pk \
-                 WHERE lixcol_entity_pk = lix_json('[\"acme\",\"7\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"acme\",\"7\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -343,10 +343,9 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT identity, value, lixcol_depth \
+            "SELECT tenant, id, value, lixcol_depth \
              FROM engine_history_nested_pk_history() \
-               WHERE lix_json_get_text(identity, 'tenant') = 'acme' \
-               AND lix_json_get_text(identity, 'id') = '7' \
+               WHERE tenant = 'acme' AND id = '7' \
              ORDER BY lixcol_depth",
         )
         .await;
@@ -355,24 +354,14 @@ simulation_test!(
             rows,
             vec![
                 vec![
-                    Value::Json(
-                        serde_json::json!({
-                            "tenant": "acme",
-                            "id": "7"
-                        })
-                        .into()
-                    ),
+                    Value::Text("acme".to_string()),
+                    Value::Text("7".to_string()),
                     Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
-                    Value::Json(
-                        serde_json::json!({
-                            "tenant": "acme",
-                            "id": "7"
-                        })
-                        .into()
-                    ),
+                    Value::Text("acme".to_string()),
+                    Value::Text("7".to_string()),
                     Value::Text("one".to_string()),
                     Value::Integer(1),
                 ],
@@ -384,7 +373,7 @@ simulation_test!(
             "SELECT is_nullable \
              FROM information_schema.table_functions \
              WHERE function_name = 'engine_history_nested_pk_history' \
-               AND result_column = 'identity'",
+               AND result_column = 'tenant'",
         )
         .await;
         assert_eq!(nullability, vec![vec![Value::Text("NO".to_string())]]);

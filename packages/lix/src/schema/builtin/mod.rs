@@ -1,8 +1,6 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::lix_schema_definition;
-
 const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ACCOUNT_SCHEMA_KEY: &str = "lix_account";
@@ -82,7 +80,9 @@ pub(super) fn seed_schema_definitions() -> Vec<&'static JsonValue> {
 pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonValue> {
     match schema_key {
         LIX_REGISTERED_SCHEMA_KEY => {
-            Some(LIX_REGISTERED_SCHEMA.get_or_init(parse_registered_schema_with_inlined_definition))
+            Some(LIX_REGISTERED_SCHEMA.get_or_init(|| {
+                parse_builtin_schema("lix_registered_schema.json", LIX_REGISTERED_SCHEMA_JSON)
+            }))
         }
         LIX_KEY_VALUE_SCHEMA_KEY => {
             Some(LIX_KEY_VALUE_SCHEMA.get_or_init(|| {
@@ -154,23 +154,6 @@ fn parse_builtin_schema(file_name: &str, raw_json: &str) -> JsonValue {
     })
 }
 
-fn parse_registered_schema_with_inlined_definition() -> JsonValue {
-    let mut schema = parse_builtin_schema("lix_registered_schema.json", LIX_REGISTERED_SCHEMA_JSON);
-    let value_schema = schema
-        .pointer_mut("/properties/value")
-        .expect("lix_registered_schema.json must define /properties/value");
-    let value_schema_object = value_schema
-        .as_object_mut()
-        .expect("lix_registered_schema.json /properties/value must be an object");
-
-    value_schema_object.insert(
-        "allOf".to_string(),
-        JsonValue::Array(vec![lix_schema_definition().clone()]),
-    );
-
-    schema
-}
-
 #[cfg(test)]
 mod tests {
     use super::{BUILTIN_SCHEMA_KEYS, seed_schema_definition};
@@ -182,14 +165,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn registered_schema_value_inlines_lix_schema_definition() {
-        let schema = seed_schema_definition("lix_registered_schema").expect("schema should exist");
-        let all_of = schema
-            .pointer("/properties/value/allOf")
-            .and_then(|value| value.as_array())
-            .expect("registered schema value must define allOf array");
-        assert_eq!(all_of.len(), 1);
-        assert_eq!(all_of[0], *crate::schema::lix_schema_definition());
-    }
 }

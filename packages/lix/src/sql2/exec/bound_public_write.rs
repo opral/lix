@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray,
+    TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -20,6 +21,7 @@ use crate::hot_state::{
     HotStateFilter, HotStateProjection, HotStateRowFilter, HotStateScanRequest,
     MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
+use crate::plugin::runtime::WasmEntityKey;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -40,7 +42,6 @@ use crate::transaction_types::{
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
     TypedMutationJournalBatch,
 };
-use crate::plugin::runtime::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 
@@ -1595,15 +1596,27 @@ fn direct_path_value_replacement(
     {
         return None;
     }
-    let BoundExpr::Function { name, args } = &assignment.value else {
-        return None;
-    };
-    let [BoundExpr::Param(param)] = args.as_slice() else {
-        return None;
-    };
-    (name == "lix_json").then(|| DirectPathValueReplacement {
+    let param = jsonb_parameter(&assignment.value)?;
+    Some(DirectPathValueReplacement {
         value_param_index: param.index.saturating_sub(1),
     })
+}
+
+fn jsonb_parameter(expr: &BoundExpr) -> Option<&crate::sql2::bind::expr::BoundParamRef> {
+    match expr {
+        BoundExpr::Cast {
+            expr,
+            data_type: BoundCastType::Jsonb,
+        } => match expr.as_ref() {
+            BoundExpr::Param(param) => Some(param),
+            _ => None,
+        },
+        BoundExpr::Function { name, args } if name == "__lix_jsonb" => match args.as_slice() {
+            [BoundExpr::Param(param)] => Some(param),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn append_direct_path_value_replacement_row<'a>(
@@ -1639,7 +1652,7 @@ fn append_direct_path_value_replacement_json(
         Some(_) => {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "lix_json expects a text argument",
+                "JSONB cast expects text or a structured JSON parameter",
             ));
         }
         None => {
@@ -1671,7 +1684,7 @@ fn append_direct_path_value_replacement_json_text(
     Ok(())
 }
 
-/// Appends a `lix_json` parameter in serde_json's stable compact form.
+/// Appends a JSONB parameter in canonical compact form.
 ///
 /// Public parameters do not carry a canonical-JSON type certificate. The
 /// streaming recognizer proves already-canonical input in one allocation-free
@@ -1679,20 +1692,10 @@ fn append_direct_path_value_replacement_json_text(
 /// without the former redundant serde validation scan. Inputs outside this
 /// deliberately narrow scalar grammar retain the canonical DOM fallback.
 fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Result<(), LixError> {
-    if CanonicalJsonText::recognizes(raw) {
-        normalized.extend_from_slice(raw.as_bytes());
-        return Ok(());
-    }
-    let original_len = normalized.len();
-    if CanonicalJsonText::append_normalized(raw, normalized) {
-        return Ok(());
-    }
-    normalized.truncate(original_len);
-
-    let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+    let value = crate::sql2::udfs::common::parse_jsonb(raw).map_err(|error| {
         LixError::new(
             LixError::CODE_TYPE_MISMATCH,
-            format!("lix_json argument is not valid JSON: {error}"),
+            format!("invalid JSONB value: {error}"),
         )
     })?;
     serde_json::to_writer(normalized, &value).map_err(|error| {
@@ -1700,345 +1703,6 @@ fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Resul
             "certified replacement value failed to serialize: {error}"
         ))
     })
-}
-
-struct CanonicalJsonText<'a> {
-    bytes: &'a [u8],
-    position: usize,
-    remaining_depth: u8,
-}
-
-impl<'a> CanonicalJsonText<'a> {
-    // serde_json's default recursion limit rejects the 128th nested container.
-    const MAX_DEPTH: u8 = 127;
-
-    fn recognizes(raw: &'a str) -> bool {
-        let mut parser = Self {
-            bytes: raw.as_bytes(),
-            position: 0,
-            remaining_depth: Self::MAX_DEPTH,
-        };
-        parser.value() && parser.position == parser.bytes.len()
-    }
-
-    fn append_normalized(raw: &'a str, output: &mut Vec<u8>) -> bool {
-        let mut parser = Self {
-            bytes: raw.as_bytes(),
-            position: 0,
-            remaining_depth: Self::MAX_DEPTH,
-        };
-        parser.write_value(output) && parser.position == parser.bytes.len()
-    }
-
-    fn value(&mut self) -> bool {
-        match self.peek() {
-            Some(b'n') => self.literal(b"null"),
-            Some(b't') => self.literal(b"true"),
-            Some(b'f') => self.literal(b"false"),
-            Some(b'"') => self.string(false).is_some(),
-            Some(b'[') => self.with_container_depth(Self::array),
-            Some(b'{') => self.with_container_depth(Self::object),
-            Some(b'-' | b'0'..=b'9') => self.integer(),
-            _ => false,
-        }
-    }
-
-    fn array(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b']') {
-            return true;
-        }
-        loop {
-            if !self.value() {
-                return false;
-            }
-            if self.take(b']') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn object(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b'}') {
-            return true;
-        }
-        let mut previous_key: Option<&[u8]> = None;
-        loop {
-            let Some(key) = self.string(true) else {
-                return false;
-            };
-            if previous_key.is_some_and(|previous| previous >= key) {
-                return false;
-            }
-            previous_key = Some(key);
-            if !self.take(b':') || !self.value() {
-                return false;
-            }
-            if self.take(b'}') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn write_value(&mut self, output: &mut Vec<u8>) -> bool {
-        let start = self.position;
-        match self.peek() {
-            Some(b'n') if self.literal(b"null") => output.extend_from_slice(b"null"),
-            Some(b't') if self.literal(b"true") => output.extend_from_slice(b"true"),
-            Some(b'f') if self.literal(b"false") => output.extend_from_slice(b"false"),
-            Some(b'"') if self.string(false).is_some() => {
-                output.extend_from_slice(&self.bytes[start..self.position]);
-            }
-            Some(b'[') => return self.write_array(output),
-            Some(b'{') => return self.write_object(output),
-            Some(b'-' | b'0'..=b'9') if self.integer() => {
-                output.extend_from_slice(&self.bytes[start..self.position]);
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    fn write_array(&mut self, output: &mut Vec<u8>) -> bool {
-        self.with_container_depth(|parser| parser.write_array_inner(output))
-    }
-
-    fn write_array_inner(&mut self, output: &mut Vec<u8>) -> bool {
-        self.position += 1;
-        output.push(b'[');
-        if self.take(b']') {
-            output.push(b']');
-            return true;
-        }
-        let mut first = true;
-        loop {
-            if !first {
-                output.push(b',');
-            }
-            first = false;
-            if !self.write_value(output) {
-                return false;
-            }
-            if self.take(b']') {
-                output.push(b']');
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn write_object(&mut self, output: &mut Vec<u8>) -> bool {
-        self.with_container_depth(|parser| parser.write_object_inner(output))
-    }
-
-    fn write_object_inner(&mut self, output: &mut Vec<u8>) -> bool {
-        self.position += 1;
-        if self.take(b'}') {
-            output.extend_from_slice(b"{}");
-            return true;
-        }
-        let mut members = smallvec::SmallVec::<[(&'a [u8], &'a [u8]); 8]>::new();
-        loop {
-            let Some(key) = self.string(true) else {
-                return false;
-            };
-            if !self.take(b':') {
-                return false;
-            }
-            let value_start = self.position;
-            if !self.skip_value() {
-                return false;
-            }
-            members.push((key, &self.bytes[value_start..self.position]));
-            if self.take(b'}') {
-                break;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-        members.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return false;
-        }
-
-        output.push(b'{');
-        for (index, (key, value)) in members.into_iter().enumerate() {
-            if index != 0 {
-                output.push(b',');
-            }
-            output.push(b'"');
-            output.extend_from_slice(key);
-            output.extend_from_slice(b"\":");
-            let mut value_parser = Self {
-                bytes: value,
-                position: 0,
-                remaining_depth: self.remaining_depth,
-            };
-            if !value_parser.write_value(output) || value_parser.position != value.len() {
-                return false;
-            }
-        }
-        output.push(b'}');
-        true
-    }
-
-    fn skip_value(&mut self) -> bool {
-        match self.peek() {
-            Some(b'n') => self.literal(b"null"),
-            Some(b't') => self.literal(b"true"),
-            Some(b'f') => self.literal(b"false"),
-            Some(b'"') => self.string(false).is_some(),
-            Some(b'[') => self.skip_array(),
-            Some(b'{') => self.skip_object(),
-            Some(b'-' | b'0'..=b'9') => self.integer(),
-            _ => false,
-        }
-    }
-
-    fn skip_array(&mut self) -> bool {
-        self.with_container_depth(Self::skip_array_inner)
-    }
-
-    fn skip_array_inner(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b']') {
-            return true;
-        }
-        loop {
-            if !self.skip_value() {
-                return false;
-            }
-            if self.take(b']') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn skip_object(&mut self) -> bool {
-        self.with_container_depth(Self::skip_object_inner)
-    }
-
-    fn skip_object_inner(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b'}') {
-            return true;
-        }
-        loop {
-            if self.string(true).is_none() || !self.take(b':') || !self.skip_value() {
-                return false;
-            }
-            if self.take(b'}') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn with_container_depth(&mut self, parse: impl FnOnce(&mut Self) -> bool) -> bool {
-        let Some(remaining_depth) = self.remaining_depth.checked_sub(1) else {
-            return false;
-        };
-        self.remaining_depth = remaining_depth;
-        let result = parse(self);
-        self.remaining_depth = self.remaining_depth.saturating_add(1);
-        result
-    }
-
-    fn string(&mut self, reject_escapes: bool) -> Option<&'a [u8]> {
-        if !self.take(b'"') {
-            return None;
-        }
-        let start = self.position;
-        while let Some(byte) = self.peek() {
-            match byte {
-                b'"' => {
-                    let end = self.position;
-                    self.position += 1;
-                    return Some(&self.bytes[start..end]);
-                }
-                b'\\' => {
-                    if reject_escapes {
-                        return None;
-                    }
-                    self.position += 1;
-                    match self.peek() {
-                        Some(b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't') => {
-                            self.position += 1;
-                        }
-                        // `\/` and `\uXXXX` are valid but serde_json emits a
-                        // different compact spelling after decoding them.
-                        _ => return None,
-                    }
-                }
-                0x00..=0x1f => return None,
-                _ => self.position += 1,
-            }
-        }
-        None
-    }
-
-    fn integer(&mut self) -> bool {
-        let start = self.position;
-        if self.take(b'-') && !matches!(self.peek(), Some(b'1'..=b'9')) {
-            return false;
-        }
-        if self.take(b'0') {
-            if matches!(self.peek(), Some(b'0'..=b'9' | b'.' | b'e' | b'E')) {
-                return false;
-            }
-        } else {
-            let digit_start = self.position;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.position += 1;
-            }
-            if self.position == digit_start || matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
-                return false;
-            }
-        }
-        let Ok(text) = std::str::from_utf8(&self.bytes[start..self.position]) else {
-            return false;
-        };
-        if text.starts_with('-') {
-            text.parse::<i64>().is_ok()
-        } else {
-            text.parse::<u64>().is_ok()
-        }
-    }
-
-    fn literal(&mut self, literal: &[u8]) -> bool {
-        if self.bytes.get(self.position..self.position + literal.len()) != Some(literal) {
-            return false;
-        }
-        self.position += literal.len();
-        true
-    }
-
-    fn take(&mut self, expected: u8) -> bool {
-        if self.peek() != Some(expected) {
-            return false;
-        }
-        self.position += 1;
-        true
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.position).copied()
-    }
 }
 
 fn append_direct_path_value_replacement_prepared_row(
@@ -2505,9 +2169,9 @@ mod active_branch_commit_id_reference_tests {
     fn detects_active_branch_commit_id_in_nested_write_expressions() {
         let plan = update_plan(
             BoundPredicate::True,
-            BoundExpr::Function {
-                name: "lix_json".to_string(),
-                args: vec![active_branch_commit_id()],
+            BoundExpr::Cast {
+                expr: Box::new(active_branch_commit_id()),
+                data_type: BoundCastType::Jsonb,
             },
         );
 
@@ -2526,7 +2190,7 @@ mod active_branch_commit_id_reference_tests {
                 active_branch_commit_id(),
             ),
             BoundExpr::Function {
-                name: "lix_timestamp".to_string(),
+                name: "__lix_current_timestamp".to_string(),
                 args: Vec::new(),
             },
         );
@@ -2536,7 +2200,7 @@ mod active_branch_commit_id_reference_tests {
         let no_head_plan = update_plan(
             BoundPredicate::True,
             BoundExpr::Function {
-                name: "lix_timestamp".to_string(),
+                name: "__lix_current_timestamp".to_string(),
                 args: Vec::new(),
             },
         );
@@ -5054,6 +4718,20 @@ fn certified_direct_parameter_insert_batch(
                             }
                         })))
                     }
+                    (EntityColumnType::Timestamptz, Some(input)) => Arc::new(
+                        TimestampMicrosecondArray::from_iter((0..row_count).map(|row_index| {
+                            match parameter_batch.value(input.parameter_index, row_index) {
+                                DirectParameterValue::Null => None,
+                                DirectParameterValue::String(value) => Some(
+                                    chrono::DateTime::parse_from_rfc3339(value)
+                                        .expect("certified timestamptz parameter must be valid")
+                                        .timestamp_micros(),
+                                ),
+                                DirectParameterValue::Boolean(_) => unreachable!(),
+                            }
+                        }))
+                        .with_timezone("UTC"),
+                    ),
                     (EntityColumnType::String | EntityColumnType::Json, None) => {
                         Arc::new(StringArray::new_null(row_count))
                     }
@@ -5062,6 +4740,9 @@ fn certified_direct_parameter_insert_batch(
                     }
                     (EntityColumnType::Integer, None) => Arc::new(Int64Array::new_null(row_count)),
                     (EntityColumnType::Number, None) => Arc::new(Float64Array::new_null(row_count)),
+                    (EntityColumnType::Timestamptz, None) => Arc::new(
+                        TimestampMicrosecondArray::new_null(row_count).with_timezone("UTC"),
+                    ),
                     (
                         EntityColumnType::Json
                         | EntityColumnType::Integer
@@ -5131,14 +4812,14 @@ fn certified_direct_path_value_insert_batch(
                 },
             ) if name == "path" => path_param_index = Some(param.index.saturating_sub(1)),
             (
-                BoundExpr::Function { name, args },
+                expr,
                 InsertColumnTarget::Visible {
                     name: column_name,
                     column_type: EntityColumnType::Json,
                     ..
                 },
-            ) if name == "lix_json" && column_name == "value" => {
-                let [BoundExpr::Param(param)] = args.as_slice() else {
+            ) if column_name == "value" => {
+                let Some(param) = jsonb_parameter(expr) else {
                     return Ok(None);
                 };
                 value_param_index = Some(param.index.saturating_sub(1));
@@ -5197,11 +4878,11 @@ fn certified_direct_path_value_insert_batch(
         else {
             return Ok(None);
         };
-        let value = serde_json::from_str::<JsonValue>(raw_value).map_err(|error| {
+        let value = crate::sql2::udfs::common::parse_jsonb(raw_value).map_err(|error| {
             with_parameter_batch_statement_index(
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    format!("lix_json argument is not valid JSON: {error}"),
+                    format!("invalid JSONB value: {error}"),
                 ),
                 statement_index,
             )
@@ -5733,8 +5414,14 @@ fn append_entity_insert_row(
         }
     }
 
-    spec.defaults
-        .apply(&mut snapshot, ctx.functions(), &layout.schema_key)?;
+    populate_registered_schema_key(&layout.schema_key, &mut snapshot)?;
+    let functions = ctx.functions();
+    spec.defaults.apply(
+        &mut snapshot,
+        functions,
+        &layout.schema_key,
+        || Ok(ctx.current_timestamp()),
+    )?;
     let snapshot = JsonValue::Object(snapshot);
     if !spec.primary_key_paths.is_empty() {
         let derived_entity_pk = EntityPk::from_primary_key_plan(
@@ -5785,6 +5472,30 @@ fn append_entity_insert_row(
         untracked.unwrap_or(false),
         branch_id.into(),
     );
+    Ok(())
+}
+
+fn populate_registered_schema_key(
+    target_schema_key: &str,
+    snapshot: &mut serde_json::Map<String, JsonValue>,
+) -> Result<(), LixError> {
+    if target_schema_key != "lix_registered_schema" || snapshot.contains_key("schema_key") {
+        return Ok(());
+    }
+    let Some(value) = snapshot.get("value") else {
+        return Ok(());
+    };
+    let key = value
+        .get("key")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                "lix_registered_schema value is missing string key",
+            )
+        })?;
+    snapshot.insert("schema_key".into(), JsonValue::String(key));
     Ok(())
 }
 
@@ -6080,12 +5791,27 @@ fn cast_entity_eval_value(
         ));
     }
 
+    if cast_type == BoundCastType::Jsonb {
+        return match value {
+            EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
+            EntityEvalValue::Json(value) => Ok(EntityEvalValue::Json(value)),
+            EntityEvalValue::SqlText(value) => serde_json::from_str(&value)
+                .map(EntityEvalValue::Json)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("CAST AS JSONB failed: {error}"),
+                    )
+                }),
+        };
+    }
     let target_type = match cast_type {
         BoundCastType::Text => DataType::Utf8,
         BoundCastType::BigInt => DataType::Int64,
         BoundCastType::Double => DataType::Float64,
         BoundCastType::Boolean => DataType::Boolean,
         BoundCastType::Binary => unreachable!("binary entity casts rejected above"),
+        BoundCastType::Jsonb => unreachable!("JSONB entity casts handled above"),
     };
     let scalar = scalar_from_entity_eval_value(value);
     let casted = scalar.cast_to(&target_type).map_err(|error| {
@@ -6192,34 +5918,14 @@ fn eval_expr_value(
             let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
             cast_entity_eval_value(value, *data_type)
         }
-        BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
-            let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
-            let raw = match raw {
-                EntityEvalValue::SqlNull => return Ok(EntityEvalValue::Json(JsonValue::Null)),
-                EntityEvalValue::SqlText(value) => JsonValue::String(value),
-                EntityEvalValue::Json(value) => value,
-            };
-            let JsonValue::String(raw) = raw else {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "lix_json expects a text argument",
-                ));
-            };
-            serde_json::from_str(&raw)
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_TYPE_MISMATCH,
-                        format!("lix_json argument is not valid JSON: {error}"),
-                    )
-                })
-                .map(EntityEvalValue::Json)
-        }
-        BoundExpr::Function { name, args } if name == "lix_uuid_v7" && args.is_empty() => Ok(
+        BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => Ok(
             EntityEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
         ),
-        BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => Ok(
-            EntityEvalValue::SqlText(ctx.functions().call_timestamp().to_string()),
-        ),
+        BoundExpr::Function { name, args }
+            if name == "__lix_current_timestamp" && args.is_empty() =>
+        {
+            Ok(EntityEvalValue::SqlText(ctx.current_timestamp().to_string()))
+        }
         BoundExpr::Function { name, args } if name == "lix_active_branch_id" && args.is_empty() => {
             Ok(EntityEvalValue::SqlText(ctx.active_branch_id().to_string()))
         }
@@ -6230,8 +5936,44 @@ fn eval_expr_value(
                 .map(|commit_id| EntityEvalValue::SqlText(commit_id.to_string()))
                 .unwrap_or(EntityEvalValue::SqlNull))
         }
+        BoundExpr::Function { name, args } if name == "__lix_jsonb" && args.len() == 1 => {
+            let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
+            match value {
+                EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
+                EntityEvalValue::SqlText(raw) => crate::sql2::udfs::common::parse_jsonb(&raw)
+                    .map(EntityEvalValue::Json)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB value: {error}"),
+                        )
+                    }),
+                EntityEvalValue::Json(value) => {
+                    let raw = serde_json::to_string(&value).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB value: {error}"),
+                        )
+                    })?;
+                    crate::sql2::udfs::common::parse_jsonb(&raw)
+                        .map(EntityEvalValue::Json)
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_TYPE_MISMATCH,
+                                format!("invalid JSONB value: {error}"),
+                            )
+                        })
+                }
+            }
+        }
         BoundExpr::Function { name, args }
-            if (name == "lix_json_get" || name == "lix_json_get_text") && args.len() >= 2 =>
+            if matches!(
+                name.as_str(),
+                "__lix_json_get"
+                    | "__lix_json_get_text"
+                    | "__lix_json_path_get"
+                    | "__lix_json_path_get_text"
+            ) && args.len() >= 2 =>
         {
             let root = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let mut current = match root {
@@ -6258,7 +6000,10 @@ fn eval_expr_value(
                 };
                 current = next;
             }
-            if name == "lix_json_get_text" {
+            if matches!(
+                name.as_str(),
+                "__lix_json_get_text" | "__lix_json_path_get_text"
+            ) {
                 if current.is_null() {
                     return Ok(EntityEvalValue::SqlNull);
                 }
@@ -6416,9 +6161,10 @@ fn numeric_comparison_value(
                 json_double_value(Some(value), &spec.schema_key, &column.name)
                     .map(|value| value.map(NumericComparisonValue::Double))
             }
-            EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {
-                Ok(None)
-            }
+            EntityColumnType::String
+            | EntityColumnType::Json
+            | EntityColumnType::Boolean
+            | EntityColumnType::Timestamptz => Ok(None),
         };
     }
 
@@ -6508,7 +6254,7 @@ fn normalize_json_comparison_value(
     let JsonValue::String(raw) = value else {
         return Ok(value);
     };
-    serde_json::from_str(&raw).map_err(|error| {
+    crate::sql2::udfs::common::parse_jsonb(&raw).map_err(|error| {
         LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             format!("JSON comparison parameter is not valid JSON: {error}"),
@@ -6737,7 +6483,7 @@ fn require_json_comparison_operand(
         LixError::CODE_TYPE_MISMATCH,
         "JSON columns can only be compared with JSON expressions",
     )
-    .with_hint("Wrap JSON text with lix_json(...), use lix_json_get(...) for JSON values, or use IS NULL for null checks."))
+    .with_hint("Cast JSON text with ::jsonb, use PostgreSQL -> or ->> for JSON access, or use IS NULL for null checks."))
 }
 
 fn is_identity_json_expr(expr: &BoundExpr) -> bool {
@@ -6765,7 +6511,10 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
                 || matches!(column.name.as_str(), "lixcol_entity_pk" | "lixcol_metadata")
         }
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
-        BoundExpr::Function { name, .. } => matches!(name.as_str(), "lix_json" | "lix_json_get"),
+        BoundExpr::Function { name, .. } => matches!(
+            name.as_str(),
+            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        ),
         _ => false,
     }
 }
@@ -6783,13 +6532,19 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
-                "lix_json" if args.len() == 1 => {}
-                "lix_uuid_v7"
-                | "lix_timestamp"
+                "uuidv7"
+                | "__lix_current_timestamp"
                 | "lix_active_branch_id"
                 | "lix_active_branch_commit_id"
                     if args.is_empty() => {}
-                "lix_json_get" | "lix_json_get_text" if args.len() >= 2 => {}
+                "__lix_json_get"
+                | "__lix_json_get_text"
+                | "__lix_json_path_get"
+                | "__lix_json_path_get_text"
+                | "__lix_json_contains"
+                | "__lix_json_exists"
+                    if args.len() == 2 => {}
+                "__lix_jsonb" if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
@@ -6860,6 +6615,20 @@ fn entity_json_value(
         }
         EntityColumnType::Number => {
             json_double_value(Some(&value), schema_key, column_name)?;
+        }
+        EntityColumnType::Timestamptz => {
+            let timestamp = value.as_str().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("{schema_key}.{column_name} expects timestamptz"),
+                )
+            })?;
+            chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("{schema_key}.{column_name} expects RFC 3339 timestamptz: {error}"),
+                )
+            })?;
         }
         EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {}
     }
@@ -7058,6 +6827,7 @@ fn value_json(value: &Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
         Value::Json(value) => value.to_value(),
+        Value::Timestamp(value) => JsonValue::from(*value),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
         }
@@ -7116,7 +6886,7 @@ fn json_text_value(value: &JsonValue) -> Result<String, LixError> {
             serde_json::to_string(value).map_err(|error| {
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    format!("lix_json_get_text() could not render JSON value: {error}"),
+                    format!("JSONB ->> could not render JSON value: {error}"),
                 )
             })
         }
@@ -7466,80 +7236,6 @@ mod primary_key_route_tests {
     }
 
     #[test]
-    fn streaming_json_canonicalizer_matches_serde_for_supported_text() {
-        let canonical = [
-            "null",
-            "true",
-            "false",
-            "0",
-            "18446744073709551615",
-            "-9223372036854775808",
-            r#""plain""#,
-            r#""quote\" and slash\\ and line\n""#,
-            r#"[0,true,"café",{"a":1,"b":[2,3]}]"#,
-            r#"{"a":1,"b":{"c":"value"},"z":null}"#,
-        ];
-        for raw in canonical {
-            let mut actual = Vec::new();
-            assert!(CanonicalJsonText::append_normalized(raw, &mut actual));
-            let parsed: JsonValue = serde_json::from_str(raw).unwrap();
-            assert_eq!(actual, serde_json::to_vec(&parsed).unwrap());
-        }
-
-        for raw in [
-            " 0",
-            "0 ",
-            "-0",
-            "1.0",
-            "1e2",
-            "18446744073709551616",
-            "\"literal\ncontrol\"",
-            r#""unicode \u0061""#,
-            r#""escaped\/slash""#,
-            r#"{"a":1,"a":2}"#,
-            r#"{"escaped\u0061":1}"#,
-        ] {
-            let mut actual = Vec::new();
-            assert!(!CanonicalJsonText::append_normalized(raw, &mut actual));
-        }
-    }
-
-    #[test]
-    fn streaming_json_recursion_limit_matches_serde_and_wide_canonical_objects_stay_direct() {
-        for depth in [127, 128, 129] {
-            let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
-            assert_eq!(
-                CanonicalJsonText::recognizes(&raw),
-                serde_json::from_str::<JsonValue>(&raw).is_ok(),
-                "recognizer depth mismatch at {depth}"
-            );
-        }
-
-        let wide = format!(
-            "{{{}}}",
-            (0..16)
-                .map(|index| format!("\"k{index:02}\":{index}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        assert!(CanonicalJsonText::recognizes(&wide));
-        let mut actual = Vec::new();
-        append_canonical_json_parameter(&mut actual, &wide).unwrap();
-        assert_eq!(actual, wide.as_bytes());
-
-        let too_deep = format!(
-            "{}0{}",
-            "[".repeat(usize::from(CanonicalJsonText::MAX_DEPTH) + 1),
-            "]".repeat(usize::from(CanonicalJsonText::MAX_DEPTH) + 1)
-        );
-        assert!(!CanonicalJsonText::append_normalized(
-            &too_deep,
-            &mut Vec::new()
-        ));
-        assert!(append_canonical_json_parameter(&mut Vec::new(), &too_deep).is_err());
-    }
-
-    #[test]
     fn canonical_json_parameter_preserves_existing_normalization() {
         for raw in [
             " { \"b\" : 1, \"a\" : 2 } ",
@@ -7549,8 +7245,9 @@ mod primary_key_route_tests {
         ] {
             let mut actual = Vec::new();
             append_canonical_json_parameter(&mut actual, raw).unwrap();
-            let expected =
-                serde_json::to_vec(&serde_json::from_str::<JsonValue>(raw).unwrap()).unwrap();
+            let expected = crate::sql2::udfs::common::canonical_jsonb_text(raw)
+                .unwrap()
+                .into_bytes();
             assert_eq!(actual, expected);
         }
     }
@@ -7559,17 +7256,13 @@ mod primary_key_route_tests {
     fn compiles_single_text_primary_key_parameter_once() {
         let spec = crate::sql2::catalog::derive_entity_surface_spec_from_schema(
             &serde_json::json!({
-                "x-lix-key": "entity",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "required": ["id", "value"],
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": {
-                        "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                    }
-                },
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "entity",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "jsonb", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
         )
         .expect("entity surface schema should compile");
@@ -7774,30 +7467,28 @@ mod primary_key_route_tests {
     fn only_constraint_source_assignments_require_commit_validation() {
         let catalog = crate::catalog::CatalogSnapshot::from_visible_schemas(&[
             serde_json::json!({
-                "x-lix-key": "parent",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "parent",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             serde_json::json!({
-                "x-lix-key": "child",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-unique": [["/slug"]],
-                "x-lix-foreign-keys": [{
-                    "properties": ["/parent_id"],
-                    "references": { "schemaKey": "parent", "properties": ["/id"] }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "child",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "slug", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "unique": [["slug"]],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": "parent", "columns": ["id"] }
                 }],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "parent_id": { "type": "string" },
-                    "slug": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "parent_id", "slug", "value"],
-                "additionalProperties": false
             }),
         ])
         .expect("constraint schemas should compile");
@@ -7960,22 +7651,20 @@ mod constraints_unchanged_tests {
 
     fn schema() -> JsonValue {
         json!({
-            "x-lix-key": "constraint_probe",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"]],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parentId"],
-                "references": { "schemaKey": "constraint_probe_parent", "properties": ["/id"] }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "constraint_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false },
+                { "name": "payload", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"]],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
+                "references": { "schema_key": "constraint_probe_parent", "columns": ["id"] }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "slug": { "type": "string" },
-                "parentId": { "type": "string" },
-                "payload": { "type": "string" }
-            },
-            "required": ["id", "slug", "parentId", "payload"],
-            "additionalProperties": false
         })
     }
 
@@ -7998,16 +7687,16 @@ mod constraints_unchanged_tests {
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["parentId", "slug"],
+            vec!["parent_id", "slug"],
             "the probe schema must actually declare indexed columns"
         );
         let parent = json!({
-            "x-lix-key": "constraint_probe_parent",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "constraint_probe_parent",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let parent_key = SchemaCatalogKey {
             schema_key: "constraint_probe_parent".to_owned(),

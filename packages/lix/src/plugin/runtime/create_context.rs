@@ -16,11 +16,11 @@ use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
 use crate::hot_state::{MaterializedHotStateExactBatch, MaterializedHotStateRow};
-use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::plugin::runtime::{
     WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
     WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
 };
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 
 use super::{PluginActorKey, PluginRegistryEntry};
 

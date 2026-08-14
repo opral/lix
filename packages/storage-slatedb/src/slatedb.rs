@@ -5934,7 +5934,8 @@ mod tests {
         let (restarted, _restarted_has_more) = restart
             .next_page(2)
             .await
-            .expect("drain fresh worker-cancellation cursor").into_parts();
+            .expect("drain fresh worker-cancellation cursor")
+            .into_parts();
         assert_eq!(
             restarted
                 .iter()
@@ -6026,7 +6027,8 @@ mod tests {
         let (restarted, _restarted_has_more) = restart
             .next_page(1)
             .await
-            .expect("read explicit exclusive restart page").into_parts();
+            .expect("read explicit exclusive restart page")
+            .into_parts();
         assert_eq!(restarted.len(), 1);
         assert_eq!(restarted[0].key, second_key);
         assert_eq!(

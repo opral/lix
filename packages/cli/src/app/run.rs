@@ -76,13 +76,13 @@ mod tests {
                 "LIX_ERROR_UNSUPPORTED_WRITE_EXPRESSION",
                 "json(...) is not supported",
             )
-            .with_hint("use lix_json('...') instead"),
+            .with_hint("use '...'::jsonb instead"),
         );
         let out = rendered(&err, false);
         assert_eq!(
             out,
             "sql execution failed: json(...) is not supported\n\
-             hint: use lix_json('...') instead\n"
+             hint: use '...'::jsonb instead\n"
         );
     }
 

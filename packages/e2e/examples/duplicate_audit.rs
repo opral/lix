@@ -219,22 +219,18 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "audit_row",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "audit_row",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["path"],
     });
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -275,7 +271,7 @@ where
         while index < end {
             transaction
                 .execute(
-                    "INSERT INTO audit_row (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO audit_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(format!("/row/{index:08}")),
                         Value::Text(shape.json(index, 0)),
@@ -307,7 +303,7 @@ async fn edit_rows<S>(
             let index = (round * 7 + offset) % live_rows;
             transaction
                 .execute(
-                    "UPDATE audit_row SET value = lix_json($2) WHERE path = $1",
+                    "UPDATE audit_row SET value = CAST($2 AS JSONB) WHERE path = $1",
                     &[
                         Value::Text(format!("/row/{index:08}")),
                         Value::Text(shape.json(index, round)),

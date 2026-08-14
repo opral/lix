@@ -3400,9 +3400,9 @@ fn primary_key_identity_error(
     error: EntityPkError,
 ) -> LixError {
     let reason = match error {
-        EntityPkError::EmptyPrimaryKey => "empty x-lix-primary-key".to_string(),
+        EntityPkError::EmptyPrimaryKey => "empty primary_key".to_string(),
         EntityPkError::EmptyPrimaryKeyPath { index } => {
-            format!("empty x-lix-primary-key pointer at index {index}")
+            format!("empty primary_key column at index {index}")
         }
         EntityPkError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
@@ -3500,20 +3500,16 @@ fn validate_foreign_key_definition(
 }
 
 fn validate_schema_field_pointer(schema: &JsonValue, pointer: &[String]) -> Result<(), String> {
-    if pointer.is_empty() {
-        return Err("empty pointer does not name a field".to_string());
-    }
-    let mut current = schema;
-    for segment in pointer {
-        let properties = current
-            .get("properties")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| format!("schema segment before '{segment}' has no object properties"))?;
-        current = properties
-            .get(segment)
-            .ok_or_else(|| format!("property '{segment}' does not exist"))?;
-    }
-    Ok(())
+    let [column] = pointer else {
+        return Err("Schema v1 fields are top-level column names".to_string());
+    };
+    let schema = crate::schema::parse_lix_schema(schema).map_err(|error| error.to_string())?;
+    schema
+        .columns
+        .iter()
+        .any(|candidate| candidate.name == *column)
+        .then_some(())
+        .ok_or_else(|| format!("column '{column}' does not exist"))
 }
 
 fn referenced_properties_are_keyed(
@@ -4124,8 +4120,10 @@ mod tests {
     #[test]
     fn schema_catalog_indexes_visible_schemas_by_key_and_branch() {
         let visible_schemas = vec![json!({
-            "x-lix-key": "visible_schema",
-            "type": "object",
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "visible_schema",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"],
         })];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
@@ -4141,8 +4139,10 @@ mod tests {
         let visible_schemas = vec![
             registered_schema(),
             json!({
-                "x-lix-key": "visible_schema",
-                "type": "object",
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "visible_schema",
+                "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                "primary_key": ["id"],
             }),
         ];
         let staged_writes = PreparedWriteSet {
@@ -4622,11 +4622,12 @@ mod tests {
         let visible_schemas = vec![
             registered_schema(),
             json!({
-                "x-lix-key": "same_schema",
-                "type": "object",
-                "properties": {
-                    "old": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "same_schema",
+                "columns": [
+                    { "name": "old", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["old"],
             }),
         ];
         let staged_writes = PreparedWriteSet {
@@ -4762,18 +4763,9 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_foreign_key_missing_local_field() {
         let mut child = fk_child_schema();
-        child["x-lix-foreign-keys"][0]["properties"] = json!(["/missing_parent_id"]);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                pending_registered_schema_from_definition(fk_parent_schema()),
-                pending_registered_schema_from_definition(child),
-            ],
-            ..empty_staged_write_set()
-        };
-        let visible_schemas = vec![registered_schema()];
-
-        let error = catalog_from_transaction_parts(&staged_writes, &visible_schemas)
-            .expect_err("missing local FK field should fail");
+        child["foreign_keys"][0]["columns"] = json!(["missing_parent_id"]);
+        let error = schema_key_from_definition(&child)
+            .expect_err("missing local FK field should fail during Schema v1 compilation");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
@@ -4781,7 +4773,7 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_foreign_key_missing_referenced_field() {
         let mut child = fk_child_schema();
-        child["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/missing_id"]);
+        child["foreign_keys"][0]["references"]["columns"] = json!(["missing_id"]);
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(fk_parent_schema()),
@@ -4800,9 +4792,12 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_foreign_key_to_non_unique_target_field() {
         let mut parent = fk_parent_schema();
-        parent["properties"]["name"] = json!({ "type": "string" });
+        parent["columns"]
+            .as_array_mut()
+            .expect("columns")
+            .push(json!({ "name": "name", "type": "text", "nullable": false }));
         let mut child = fk_child_schema();
-        child["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/name"]);
+        child["foreign_keys"][0]["references"]["columns"] = json!(["name"]);
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(parent),
@@ -4959,17 +4954,15 @@ mod tests {
     #[tokio::test]
     async fn extraction_reports_declared_ordinals_without_a_value() {
         let schema = json!({
-            "x-lix-key": "sparse_index_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"], ["/rank"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "slug": { "type": ["string", "null"] },
-                "rank": { "type": ["integer", "null"] }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "sparse_index_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": true },
+                { "name": "rank", "type": "int8", "nullable": true },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"], ["rank"]],
         });
         let mut row = staged_row(
             "sparse_index_schema",
@@ -5052,14 +5045,14 @@ mod tests {
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![staged_row(
                 "lix_key_value",
-                Some(json!({ "key": "k" }).to_string()),
+                Some(json!({ "key": "k", "extra": true }).to_string()),
             )],
             ..empty_staged_write_set()
         };
 
         let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect_err("missing required snapshot field should fail");
+            .expect_err("unknown snapshot column should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
     }
@@ -7664,13 +7657,12 @@ mod tests {
 
     fn pending_registered_schema_row(schema_key: &str) -> TestPreparedStateRow {
         pending_registered_schema_from_definition(json!({
-            "x-lix-key": schema_key,
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" }
-            },
-            "required": ["id"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
     }
 
@@ -7682,7 +7674,9 @@ mod tests {
             entity_pk: registered_schema_entity_pk(&key.schema_key),
             schema_key: REGISTERED_SCHEMA_KEY.into(),
             file_id: None,
-            snapshot: Some(test_stage_json(&json!({ "value": schema }).to_string())),
+            snapshot: Some(test_stage_json(
+                &json!({ "schema_key": key.schema_key.clone(), "value": schema }).to_string(),
+            )),
             metadata: None,
             origin: None,
             origin_key: None,
@@ -7699,11 +7693,9 @@ mod tests {
     fn registered_schema_entity_pk(schema_key: &str) -> EntityPk {
         EntityPk::from_primary_key_paths(
             &serde_json::json!({
-                "value": {
-                    "x-lix-key": schema_key,
-                }
+                "schema_key": schema_key,
             }),
-            &[vec!["value".to_string(), "x-lix-key".to_string()]],
+            &[vec!["schema_key".to_string()]],
         )
         .expect("registered schema identity should derive")
     }
@@ -7734,67 +7726,59 @@ mod tests {
 
     fn unique_schema() -> JsonValue {
         json!({
-            "x-lix-key": "unique_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "slug": { "type": "string" },
-                "title": { "type": "string" }
-            },
-            "required": ["id", "slug", "title"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "unique_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"]],
         })
     }
 
     fn nullable_unique_schema() -> JsonValue {
         json!({
-            "x-lix-key": "nullable_unique_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/scope", "/name"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "scope": { "type": ["string", "null"] },
-                "name": { "type": "string" }
-            },
-            "required": ["id", "scope", "name"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "nullable_unique_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "scope", "type": "jsonb", "nullable": false },
+                { "name": "name", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["scope", "name"]],
         })
     }
 
     fn fk_parent_schema() -> JsonValue {
         json!({
-            "x-lix-key": "fk_parent_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "fk_parent_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn fk_child_schema() -> JsonValue {
         json!({
-            "x-lix-key": "fk_child_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parent_id"],
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "fk_child_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
                 "references": {
-                    "schemaKey": "fk_parent_schema",
-                    "properties": ["/id"]
+                    "schema_key": "fk_parent_schema",
+                    "columns": ["id"]
                 }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "parent_id": { "type": "string" }
-            },
-            "required": ["id", "parent_id"],
-            "additionalProperties": false
         })
     }
 

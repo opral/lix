@@ -30,20 +30,6 @@ pub(crate) fn format_json_pointer(segments: &[String]) -> String {
     )
 }
 
-pub(crate) fn top_level_property_name(pointer: &str) -> Result<Option<String>, LixError> {
-    if pointer.is_empty() {
-        return Ok(None);
-    }
-    if !pointer.starts_with('/') {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!("invalid JSON pointer '{pointer}'"),
-        ));
-    }
-    let segment = pointer[1..].split('/').next().unwrap_or_default();
-    Ok(Some(decode_json_pointer_segment(segment)?))
-}
-
 fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
     let mut out = String::new();
     let mut chars = segment.chars();

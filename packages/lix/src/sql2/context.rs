@@ -184,6 +184,9 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         crate::ANONYMOUS_ACCOUNT_ID
     }
     fn functions(&self) -> FunctionProviderHandle;
+    fn current_timestamp(&mut self) -> crate::common::LixTimestamp {
+        self.functions().call_timestamp()
+    }
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
     fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
         Ok(Arc::new(PublicCatalog::from_visible_schemas(

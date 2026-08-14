@@ -106,7 +106,7 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 
 	await registerCrmTaskSchema(lix);
 	await lix.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		[
 			"task-1",
 			"Draft native SDK flow",
@@ -245,8 +245,8 @@ test("execute and executeBatch expose registered-entity RETURNING postimages", a
 	await registerCrmTaskSchema(lix);
 
 	const inserted = await lix.execute(
-		"INSERT INTO crm_task (title, done) VALUES ($1, $2) RETURNING id, title",
-		["Created through SDK RETURNING", false],
+		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3) RETURNING id, title",
+		["returning-task", "Created through SDK RETURNING", false],
 	);
 	expect(inserted.rowsAffected).toBe(1);
 	expect(inserted.columns).toEqual(["id", "title"]);
@@ -268,8 +268,8 @@ test("execute and executeBatch expose registered-entity RETURNING postimages", a
 
 	const [batched] = await lix.executeBatch([
 		{
-			sql: "INSERT INTO crm_task (title, done) VALUES ($1, $2) RETURNING id, title",
-			params: ["Batched SDK RETURNING", true],
+			sql: "INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3) RETURNING id, title",
+			params: ["batched-returning-task", "Batched SDK RETURNING", true],
 		},
 	]);
 	expect(batched?.rowsAffected).toBe(1);
@@ -389,7 +389,7 @@ test("worker preserves queued execution order", async () => {
 	await registerCrmTaskSchema(lix);
 
 	const first = lix.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		["queued-1", "Queued 1", false, "{}"],
 	);
 	const second = lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
@@ -1106,11 +1106,11 @@ test("beginTransaction commits multiple statements together", async () => {
 
 	const tx = await lix.beginTransaction();
 	await tx.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		["tx-task-1", "First", false, JSON.stringify({ batch: 1 })],
 	);
 	await tx.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		["tx-task-2", "Second", true, JSON.stringify({ batch: 1 })],
 	);
 
@@ -1146,7 +1146,7 @@ test("beginTransaction rollback discards writes and closes handle", async () => 
 
 	const tx = await lix.beginTransaction();
 	await tx.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		["rolled-back-task", "Rollback", false, JSON.stringify({ batch: 1 })],
 	);
 	await tx.rollback();
@@ -1168,7 +1168,7 @@ test("beginTransaction preserves handle after failed statement", async () => {
 
 	const tx = await lix.beginTransaction();
 	await tx.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		["failed-tx-task", "Before failure", false, JSON.stringify({ batch: 1 })],
 	);
 	await expect(
@@ -1194,7 +1194,7 @@ test("beginTransaction can continue after failed statement", async () => {
 
 	const tx = await lix.beginTransaction();
 	await tx.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		[
 			"continued-tx-task-1",
 			"Before failure",
@@ -1210,7 +1210,7 @@ test("beginTransaction can continue after failed statement", async () => {
 		code: "LIX_PARSE_ERROR",
 	});
 	await tx.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		[
 			"continued-tx-task-2",
 			"After failure",
@@ -1253,7 +1253,7 @@ test("beginTransaction blocks session reads and writes on the same handle", asyn
 
 	const tx = await lix.beginTransaction();
 	await tx.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		["tx-only-task", "Inside tx", false, JSON.stringify({ batch: 1 })],
 	);
 
@@ -1262,7 +1262,7 @@ test("beginTransaction blocks session reads and writes on the same handle", asyn
 	});
 	await expect(
 		lix.execute(
-			"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+			"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 			["outside-task", "Outside tx", false, JSON.stringify({ batch: 1 })],
 		),
 	).rejects.toMatchObject({ code: "LIX_INVALID_TRANSACTION_STATE" });
@@ -1304,7 +1304,7 @@ test("createBranch can start from an explicit commit id", async () => {
 	expect(typeof fromCommitId).toBe("string");
 
 	await lix.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		[
 			"after-base",
 			"Written after base",
@@ -1357,7 +1357,7 @@ test("merge conflicts expose structured preview details and merge error", async 
 	const mainBranchId = await lix.activeBranchId();
 	await registerCrmTaskSchema(lix);
 	await lix.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
 		["conflict-task", "Base", false, JSON.stringify({ priority: "normal" })],
 	);
 	const draft = await lix.createBranch({
@@ -1818,22 +1818,19 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 
 async function registerCrmTaskSchema(lix: Lix): Promise<void> {
 	const schema = {
-		$schema: "https://json-schema.org/draft/2020-12/schema",
-		"x-lix-key": "crm_task",
-		"x-lix-primary-key": ["/id"],
-		type: "object",
-		required: ["id", "title", "done"],
-		properties: {
-			id: { type: "string", "x-lix-default": "lix_uuid_v7()" },
-			title: { type: "string" },
-			done: { type: "boolean" },
-			meta: { type: "object" },
-		},
-		additionalProperties: false,
+		$schema: "https://lix.dev/schema-v1.json",
+		key: "crm_task",
+		columns: [
+			{ name: "id", type: "text", nullable: false },
+			{ name: "title", type: "text", nullable: false },
+			{ name: "done", type: "boolean", nullable: false },
+			{ name: "meta", type: "jsonb", nullable: true },
+		],
+		primary_key: ["id"],
 	} as const;
 
 	await lix.execute(
-		"INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+		"INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
 		[JSON.stringify(schema)],
 	);
 }

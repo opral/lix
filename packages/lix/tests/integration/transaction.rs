@@ -25,7 +25,7 @@ where
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (lix_json('{"x-lix-key":"untracked_race_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"untracked_race_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, false)"#,
             &[],
         )
         .await
@@ -33,7 +33,7 @@ where
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (lix_json('{"x-lix-key":"untracked_race_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"untracked_race_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}'), false, false)"#,
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"untracked_race_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"untracked_race_parent","columns":["id"]}}]}' AS JSONB), false, false)"#,
             &[],
         )
         .await
@@ -322,7 +322,7 @@ simulation_test!(
         session
             .execute(
                 r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-                   VALUES (lix_json('{"x-lix-key":"transaction_collection_delete","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
+                   VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"transaction_collection_delete","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, false)"#,
                 &[],
             )
             .await
@@ -746,7 +746,7 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
         .execute(
             "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
              VALUES ('lix_deterministic_mode', \
-             lix_json('{\"enabled\":true}'), true, true)",
+             CAST('{\"enabled\":true}' AS JSONB), true, true)",
             &[],
         )
         .await
@@ -758,13 +758,13 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
         .expect("transaction should begin");
 
     let error = session
-        .execute("SELECT lix_uuid_v7()", &[])
+        .execute("SELECT uuidv7()", &[])
         .await
         .expect_err("session read should be blocked while transaction is active");
     assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
 
     let result = tx
-        .execute("SELECT lix_uuid_v7()", &[])
+        .execute("SELECT uuidv7()", &[])
         .await
         .expect("deterministic transaction read should succeed");
     assert_eq!(
@@ -772,7 +772,7 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
             .rows()
             .first()
             .expect("read should return a row")
-            .get::<String>("lix_uuid_v7()")
+            .get::<String>("uuidv7()")
             .expect("uuid should be returned as text"),
         "01920000-0000-7000-8000-000000000000",
     );

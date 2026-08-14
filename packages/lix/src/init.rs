@@ -704,7 +704,9 @@ fn account_snapshot(id: &str, name: &str, kind: &str) -> Result<String, LixError
 }
 
 fn registered_schema_snapshot(schema: &serde_json::Value) -> Result<String, LixError> {
+    let schema_key = schema_key_from_definition(schema)?;
     encode_snapshot(json!({
+        "schema_key": schema_key.schema_key,
         "value": schema,
     }))
 }
@@ -797,13 +799,13 @@ mod tests {
         );
         assert!(registered_schema_changes.iter().any(|change| {
             snapshot(change)
-                .pointer("/value/x-lix-key")
+                .pointer("/value/key")
                 .and_then(JsonValue::as_str)
                 == Some(REGISTERED_SCHEMA_KEY)
         }));
         assert!(registered_schema_changes.iter().any(|change| {
             snapshot(change)
-                .pointer("/value/x-lix-key")
+                .pointer("/value/key")
                 .and_then(JsonValue::as_str)
                 == Some(KEY_VALUE_SCHEMA_KEY)
         }));

@@ -1,14 +1,15 @@
-mod common;
+pub(crate) mod common;
 pub(crate) mod execution_slots;
+mod current_timestamp;
 mod lix_active_account_id;
 mod lix_active_branch_commit_id;
 mod lix_active_branch_id;
-mod lix_json;
 mod lix_json_get;
 mod lix_json_get_text;
+mod lix_json_predicate;
+mod lix_jsonb;
 mod lix_octet_length;
-mod lix_timestamp;
-mod lix_uuid_v7;
+mod uuidv7;
 
 use std::sync::Arc;
 
@@ -25,9 +26,25 @@ pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
 }
 
 pub(crate) fn register_static_sql2_functions(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new()));
-    ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new()));
-    ctx.register_udf(ScalarUDF::from(lix_json::LixJson));
+    ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new(
+        "__lix_json_get",
+    )));
+    ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new(
+        "__lix_json_path_get",
+    )));
+    ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new(
+        "__lix_json_get_text",
+    )));
+    ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new(
+        "__lix_json_path_get_text",
+    )));
+    ctx.register_udf(ScalarUDF::from(
+        lix_json_predicate::LixJsonPredicate::contains(),
+    ));
+    ctx.register_udf(ScalarUDF::from(
+        lix_json_predicate::LixJsonPredicate::exists(),
+    ));
+    ctx.register_udf(ScalarUDF::from(lix_jsonb::LixJsonb::new()));
     ctx.register_udf(ScalarUDF::from(lix_octet_length::LixOctetLength::new()));
 }
 
@@ -49,10 +66,10 @@ pub(crate) fn register_execution_sql2_functions(ctx: &SessionContext, slots: Arc
     ctx.register_udf(ScalarUDF::from(
         lix_active_branch_commit_id::LixActiveBranchCommitId::new(Arc::clone(&slots)),
     ));
-    ctx.register_udf(ScalarUDF::from(lix_uuid_v7::LixUuidV7 {
+    ctx.register_udf(ScalarUDF::from(uuidv7::UuidV7 {
         slots: Arc::clone(&slots),
     }));
-    ctx.register_udf(ScalarUDF::from(lix_timestamp::LixTimestamp { slots }));
+    ctx.register_udf(ScalarUDF::from(current_timestamp::CurrentTimestamp { slots }));
 }
 
 /// Points the session's execution functions at this statement's facts.

@@ -78,7 +78,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     register_crm_task_schema(&lix).await;
 
     lix.execute(
-        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
         &[
             Value::Text("task-1".to_string()),
             Value::Text("Draft RS SDK flow".to_string()),
@@ -209,7 +209,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     let second = open_lix().with_storage(storage).await.unwrap();
     let result = second
         .execute(
-            "SELECT key FROM lix_key_value WHERE key = 'close-key' AND value = lix_json('\"close-value\"')",
+            "SELECT key FROM lix_key_value WHERE key = 'close-key' AND value = CAST('\"close-value\"' AS JSONB)",
             &[],
         )
         .await
@@ -245,7 +245,7 @@ async fn failed_write_validation_does_not_poison_storage_transaction() {
     assert_eq!(result.rows()[0].values(), &[Value::Integer(1)]);
 
     lix.execute(
-        "INSERT INTO poison_task (id, title, meta) VALUES ($1, $2, lix_json($3))",
+        "INSERT INTO poison_task (id, title, meta) VALUES ($1, $2, CAST($3 AS JSONB))",
         &[
             Value::Text("good-task".to_string()),
             Value::Text("valid".to_string()),
@@ -265,7 +265,7 @@ async fn transaction_commits_multiple_statements_together() {
 
     let mut tx = lix.begin_transaction().await.unwrap();
     tx.execute(
-        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
         &[
             Value::Text("tx-task-1".to_string()),
             Value::Text("First".to_string()),
@@ -276,7 +276,7 @@ async fn transaction_commits_multiple_statements_together() {
     .await
     .unwrap();
     tx.execute(
-        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
         &[
             Value::Text("tx-task-2".to_string()),
             Value::Text("Second".to_string()),
@@ -546,7 +546,7 @@ async fn transaction_rollback_discards_staged_writes() {
 
     let mut tx = lix.begin_transaction().await.unwrap();
     tx.execute(
-        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
         &[
             Value::Text("rolled-back-task".to_string()),
             Value::Text("Rollback".to_string()),
@@ -576,7 +576,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 
     let mut tx = lix.begin_transaction().await.unwrap();
     tx.execute(
-        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
         &[
             Value::Text("tx-only-task".to_string()),
             Value::Text("Inside tx".to_string()),
@@ -589,7 +589,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 
     let error = lix
         .execute(
-            "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+            "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
             &[
                 Value::Text("outside-task".to_string()),
                 Value::Text("Outside tx".to_string()),
@@ -1581,22 +1581,19 @@ async fn wait_for_lix_directory(lix: &Lix<FilesystemStorage>, path: &str, expect
 
 async fn register_crm_task_schema(lix: &Lix) {
     let schema = r#"{
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "x-lix-key": "crm_task",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "title", "done", "meta"],
-        "properties": {
-            "id": { "type": "string" },
-            "title": { "type": "string" },
-            "done": { "type": "boolean" },
-            "meta": { "type": "object" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "crm_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "done", "type": "boolean", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["id"]
     }"#;
 
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await
@@ -1636,21 +1633,18 @@ fn assert_crm_task_projection(result: &lix::ExecuteResult) {
 
 async fn register_poison_task_schema(lix: &Lix) {
     let schema = r#"{
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "x-lix-key": "poison_task",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "title", "meta"],
-        "properties": {
-            "id": { "type": "string" },
-            "title": { "type": "string" },
-            "meta": { "type": "object" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "poison_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["id"]
     }"#;
 
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await
