@@ -1386,7 +1386,7 @@ test("same-row merges use host column LWW without conflict details", async () =>
 		["conflict-task"],
 	);
 	expect(merged.rows).toHaveLength(1);
-	expect(["Draft", "Main"]).toContain(merged.rows[0]?.title);
+	expect(["Draft", "Main"]).toContain(merged.rows[0]?.get("title"));
 
 	await lix.close();
 });
