@@ -605,6 +605,7 @@ impl CommitChangePageV3 {
             // envelope remains the sole authority for the empty membership.
             return Ok(PreparedCommitChangePages {
                 objects: Vec::new(),
+                member_counts: Vec::new(),
                 member_locations: Vec::new(),
             });
         }
@@ -685,6 +686,7 @@ impl CommitChangePageV3 {
         }
 
         let mut encoded = Vec::with_capacity(chunks.len());
+        let mut member_counts = Vec::with_capacity(chunks.len());
         let mut member_locations = Vec::with_capacity(members.len());
         for (start_ordinal, page_members) in chunks {
             let page = Self {
@@ -698,6 +700,10 @@ impl CommitChangePageV3 {
                 page_ordinal:
                     u32::try_from(ordinal).expect("page member count is bounded below u32"),
             }));
+            member_counts.push(
+                u32::try_from(page.members.len())
+                    .expect("page member count is bounded below u32"),
+            );
             encoded.push((id, bytes));
         }
         if encoded.len() + 2 > AUTHENTICATED_EDGE_PAGE_ENTRIES {
@@ -707,6 +713,7 @@ impl CommitChangePageV3 {
         }
         Ok(PreparedCommitChangePages {
             objects: encoded,
+            member_counts,
             member_locations,
         })
     }
@@ -722,6 +729,7 @@ pub(crate) struct StatePageLocation {
 #[derive(Debug)]
 pub(crate) struct PreparedCommitChangePages {
     pub(crate) objects: Vec<(ObjectId, Bytes)>,
+    pub(crate) member_counts: Vec<u32>,
     pub(crate) member_locations: Vec<StatePageLocation>,
 }
 
@@ -732,6 +740,11 @@ pub(crate) struct CommitObjectV1 {
     pub(crate) parent_commit_object_ids: Vec<ObjectId>,
     pub(crate) members: Vec<CommitMemberV3>,
     pub(crate) member_page_object_ids: Vec<ObjectId>,
+    /// Canonical member cardinality aligned with `member_page_object_ids`.
+    /// Together the vectors are the commit-bound routing directory: an exact
+    /// current-pack page back-edge can prove its global ordinal without
+    /// decoding every preceding page.
+    pub(crate) member_page_member_counts: Vec<u32>,
     pub(crate) global_state_root: ObjectId,
     pub(crate) local_state_root: ObjectId,
     /// Authenticated, branch-bound first-parent checkpoint chronology.
@@ -1001,8 +1014,13 @@ impl CommitObjectV1 {
                 u32::try_from(self.member_page_object_ids.len())
                     .map_err(|_| corruption("commit change-page count exceeds u32"))?,
             );
-            for page_id in &self.member_page_object_ids {
+            for (page_id, member_count) in self
+                .member_page_object_ids
+                .iter()
+                .zip(&self.member_page_member_counts)
+            {
                 encode_id(encoder, *page_id);
+                encoder.u32(*member_count);
             }
             encode_id(encoder, self.global_state_root);
             encode_id(encoder, self.local_state_root);
@@ -1055,12 +1073,14 @@ impl CommitObjectV1 {
         validate_count(
             page_count,
             decoder.remaining(),
-            32,
+            36,
             "commit change-page count",
         )?;
         let mut member_page_object_ids = Vec::with_capacity(page_count);
+        let mut member_page_member_counts = Vec::with_capacity(page_count);
         for _ in 0..page_count {
             member_page_object_ids.push(decode_id(&mut decoder)?);
+            member_page_member_counts.push(decoder.u32()?);
         }
         let value = Self {
             commit_id,
@@ -1068,6 +1088,7 @@ impl CommitObjectV1 {
             parent_commit_object_ids,
             members: Vec::new(),
             member_page_object_ids,
+            member_page_member_counts,
             global_state_root: decode_id(&mut decoder)?,
             local_state_root: decode_id(&mut decoder)?,
             checkpoint_cursor: match decoder.u8()? {
@@ -1118,10 +1139,20 @@ impl CommitObjectV1 {
 
     fn validate_edge_bound(&self) -> Result<(), StorageError> {
         validate_nonzero_ids("commit change page", &self.member_page_object_ids)?;
-        if self
-            .member_page_object_ids
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
+        if self.member_page_object_ids.len() != self.member_page_member_counts.len()
+            || self.member_page_member_counts.contains(&0)
+            || self
+                .member_page_member_counts
+                .iter()
+                .try_fold(0_u32, |total, count| total.checked_add(*count))
+                .is_none()
+        {
+            return Err(corruption(
+                "commit change-page routing directory is not canonical",
+            ));
+        }
+        if self.member_page_object_ids.iter().copied().collect::<BTreeSet<_>>().len()
+            != self.member_page_object_ids.len()
         {
             return Err(corruption("commit repeats one change-page object"));
         }
@@ -1153,14 +1184,17 @@ impl CommitObjectV1 {
         let pages = CommitChangePageV3::encode_pages(self.commit_id, &self.members)?;
         let page_ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         if !self.member_page_object_ids.is_empty() {
-            if self.member_page_object_ids != page_ids {
+            if self.member_page_object_ids != page_ids
+                || self.member_page_member_counts != pages.member_counts
+            {
                 return Err(corruption(
-                    "commit change-page vector does not match its ordered member closure",
+                    "commit change-page directory does not match its ordered member closure",
                 ));
             }
             return Ok(pages.objects);
         }
         self.member_page_object_ids = page_ids;
+        self.member_page_member_counts = pages.member_counts;
         Ok(pages.objects)
     }
 
@@ -1179,16 +1213,21 @@ impl CommitObjectV1 {
             return Err(corruption("paged commit carries an inline member closure"));
         }
         let mut output = Vec::new();
-        for page_id in &self.member_page_object_ids {
+        for (page_id, expected_count) in self
+            .member_page_object_ids
+            .iter()
+            .zip(&self.member_page_member_counts)
+        {
             let page = CommitChangePageV3::decode(*page_id, &load(*page_id)?)?;
             if page.commit_id != self.commit_id
                 || page.start_ordinal
                     != u32::try_from(output.len()).map_err(|_| {
                         corruption("commit member page ordinal exceeds u32 while loading")
                     })?
+                || usize::try_from(*expected_count).ok() != Some(page.members.len())
             {
                 return Err(corruption(
-                    "commit member page chain has a mismatched commit or ordinal",
+                    "commit member page chain has a mismatched commit, ordinal, or count",
                 ));
             }
             output.extend(page.members);

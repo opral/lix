@@ -65,6 +65,7 @@ fn chronology_fixture_commit(
         parent_commit_object_ids: parent_ids,
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: ObjectId::from_bytes([0xa1; 32]),
         local_state_root: ObjectId::from_bytes([0xa2; 32]),
         checkpoint_cursor,
@@ -766,6 +767,7 @@ fn four_page_stale_fixture() -> (
     CommitId,
     Vec<(ObjectId, Bytes)>,
     Vec<ObjectId>,
+    Vec<u32>,
     Vec<CommitChangePageV3>,
 ) {
     let commit_id = CommitId::from_bytes(raw_id(0xd0));
@@ -778,15 +780,21 @@ fn four_page_stale_fixture() -> (
         .iter()
         .map(|(id, bytes)| CommitChangePageV3::decode(*id, bytes).expect("fixture page"))
         .collect::<Vec<_>>();
-    (commit_id, pages.objects, page_ids, decoded)
+    (
+        commit_id,
+        pages.objects,
+        page_ids,
+        pages.member_counts,
+        decoded,
+    )
 }
 
 async fn validate_four_page_stale_fixture(
     commit_id: CommitId,
     objects: Vec<(ObjectId, Bytes)>,
     page_ids: Vec<ObjectId>,
+    page_member_counts: Vec<u32>,
     selected_page_object_id: ObjectId,
-    selected_page: &CommitChangePageV3,
 ) -> Result<(), StorageError> {
     let storage = Memory::new();
     let mut writes = StorageWriteSet::new();
@@ -802,79 +810,123 @@ async fn validate_four_page_stale_fixture(
     );
     let binding_id = 1;
     let mut cache = super::serving::StaleMemberAuthCache::new(binding_id);
+    let selected_bytes = super::view::load_object_bytes(&read, selected_page_object_id).await?;
+    let selected_page =
+        CommitChangePageV3::decode(selected_page_object_id, &selected_bytes)?;
     super::serving::validate_stale_page_position(
-        &read,
         binding_id,
-        content_id(0xd1),
         commit_id,
         &page_ids,
+        &page_member_counts,
         selected_page_object_id,
-        selected_page,
+        &selected_page,
         &mut cache,
     )
     .await
 }
 
 #[tokio::test]
-async fn stale_page_prefix_gap_before_selected_page_fails_closed() {
-    let (commit_id, mut objects, page_ids, pages) = four_page_stale_fixture();
-    let mut middle = pages[1].clone();
-    middle.start_ordinal += 1;
-    let (middle_id, middle_bytes) = middle.encode().expect("gapped middle page");
+async fn stale_page_selected_ordinal_gap_fails_closed() {
+    let (commit_id, mut objects, page_ids, page_counts, pages) = four_page_stale_fixture();
     let mut selected = pages[3].clone();
     selected.start_ordinal += 1;
     let (selected_id, selected_bytes) = selected.encode().expect("shifted selected page");
-    objects.push((middle_id, middle_bytes));
     objects.push((selected_id, selected_bytes));
-    let page_ids = vec![page_ids[0], middle_id, page_ids[2], selected_id];
+    let page_ids = vec![page_ids[0], page_ids[1], page_ids[2], selected_id];
     assert!(
-        validate_four_page_stale_fixture(commit_id, objects, page_ids, selected_id, &selected,)
+        validate_four_page_stale_fixture(commit_id, objects, page_ids, page_counts, selected_id)
             .await
             .is_err(),
-        "a gap hidden before the selected page must fail closed"
+        "a selected page ordinal gap must fail closed"
     );
 }
 
 #[tokio::test]
-async fn stale_page_prefix_wrong_commit_fails_closed() {
-    let (commit_id, mut objects, page_ids, pages) = four_page_stale_fixture();
-    let mut wrong_first = pages[0].clone();
-    wrong_first.commit_id = CommitId::from_bytes(raw_id(0xd2));
-    let (wrong_first_id, wrong_first_bytes) = wrong_first.encode().expect("wrong first page");
-    objects.push((wrong_first_id, wrong_first_bytes));
-    let page_ids = vec![wrong_first_id, page_ids[1], page_ids[2], page_ids[3]];
-    let selected_page_object_id = page_ids[3];
+async fn stale_page_selected_wrong_commit_fails_closed() {
+    let (commit_id, mut objects, page_ids, page_counts, pages) = four_page_stale_fixture();
+    let mut wrong_selected = pages[3].clone();
+    wrong_selected.commit_id = CommitId::from_bytes(raw_id(0xd2));
+    let (wrong_selected_id, wrong_selected_bytes) =
+        wrong_selected.encode().expect("wrong selected page");
+    objects.push((wrong_selected_id, wrong_selected_bytes));
+    let page_ids = vec![page_ids[0], page_ids[1], page_ids[2], wrong_selected_id];
     assert!(
         validate_four_page_stale_fixture(
             commit_id,
             objects,
             page_ids,
-            selected_page_object_id,
-            &pages[3],
+            page_counts,
+            wrong_selected_id,
         )
         .await
         .is_err(),
-        "a wrong-commit prefix page must fail closed"
+        "a wrong-commit selected page must fail closed"
     );
 }
 
 #[tokio::test]
-async fn stale_page_prefix_missing_page_fails_closed() {
-    let (commit_id, objects, page_ids, pages) = four_page_stale_fixture();
+async fn stale_page_selected_missing_page_fails_closed() {
+    let (commit_id, objects, page_ids, page_counts, _pages) = four_page_stale_fixture();
     let missing_id = content_id(0xd3);
-    let page_ids = vec![page_ids[0], missing_id, page_ids[2], page_ids[3]];
-    let selected_page_object_id = page_ids[3];
+    let page_ids = vec![page_ids[0], page_ids[1], page_ids[2], missing_id];
     assert!(
         validate_four_page_stale_fixture(
             commit_id,
             objects,
             page_ids,
-            selected_page_object_id,
-            &pages[3],
+            page_counts,
+            missing_id,
         )
         .await
         .is_err(),
-        "a missing prefix page must fail closed"
+        "a missing selected page must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn stale_page_selected_count_substitution_fails_closed() {
+    let (commit_id, objects, page_ids, mut page_counts, _pages) = four_page_stale_fixture();
+    let selected_id = page_ids[3];
+    page_counts[3] = page_counts[3].checked_add(1).expect("fixture count");
+    assert!(
+        validate_four_page_stale_fixture(
+            commit_id,
+            objects,
+            page_ids,
+            page_counts,
+            selected_id,
+        )
+        .await
+        .is_err(),
+        "a substituted selected-page count must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn stale_page_routing_shape_and_overflow_fail_closed() {
+    let (commit_id, objects, page_ids, page_counts, _pages) = four_page_stale_fixture();
+    let selected_id = page_ids[3];
+
+    assert!(
+        validate_four_page_stale_fixture(
+            commit_id,
+            objects.clone(),
+            page_ids.clone(),
+            page_counts[..3].to_vec(),
+            selected_id,
+        )
+        .await
+        .is_err(),
+        "a truncated count directory must fail closed"
+    );
+
+    let mut overflow = page_counts;
+    overflow[0] = u32::MAX;
+    assert!(
+        validate_four_page_stale_fixture(commit_id, objects, page_ids, overflow, selected_id)
+            .await
+            .is_err(),
+        "an overflowing count directory must fail closed"
     );
 }
 
@@ -939,6 +991,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
         member_page_object_ids: seed_commit.member_page_object_ids,
+        member_page_member_counts: seed_commit.member_page_member_counts,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::root(),
@@ -1390,6 +1443,9 @@ fn build_seed() -> SeedData {
             .iter()
             .map(|(id, _)| *id)
             .collect(),
+        member_page_member_counts: CommitChangePageV3::encode_pages(commit_id, &members)
+            .expect("seed member page counts")
+            .member_counts,
         members: members.clone(),
         global_state_root,
         local_state_root,
@@ -1685,6 +1741,7 @@ fn insert_graph_commit_with_options(
         parent_commit_object_ids,
         members: Vec::new(),
         member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
+        member_page_member_counts: pages.member_counts.clone(),
         global_state_root,
         local_state_root,
         checkpoint_cursor,
@@ -1746,6 +1803,7 @@ fn insert_indexed_chronology_commit(
         parent_commit_object_ids,
         members: Vec::new(),
         member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
+        member_page_member_counts: pages.member_counts.clone(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         checkpoint_cursor,
@@ -2775,16 +2833,9 @@ async fn branch_transition_with_members<R: StorageAdapterRead>(
     members: Vec<CommitMemberV3>,
 ) -> BranchStateTransition {
     let commit_id = CommitId::from_bytes(raw_id(identity));
-    let member_page_object_ids = if members.is_empty() {
-        Vec::new()
-    } else {
-        CommitChangePageV3::encode_pages(commit_id, &members)
-            .expect("transition change pages")
-            .objects
-            .iter()
-            .map(|(id, _)| *id)
-            .collect()
-    };
+    let member_pages = CommitChangePageV3::encode_pages(commit_id, &members)
+        .expect("transition change pages");
+    let member_page_object_ids = member_pages.objects.iter().map(|(id, _)| *id).collect();
     let parent_id = view.branch_snapshot().semantic_head_commit_object_id;
     let parent_bytes = view
         .load_object_bytes(parent_id)
@@ -2798,6 +2849,7 @@ async fn branch_transition_with_members<R: StorageAdapterRead>(
         parent_commit_object_ids: vec![parent_id],
         members,
         member_page_object_ids,
+        member_page_member_counts: member_pages.member_counts,
         global_state_root: view.repository_root().global_state_root,
         local_state_root: state_edit.root,
         checkpoint_cursor: CheckpointCursorV1::after_first_parent(
@@ -3626,6 +3678,7 @@ async fn historical_missing_state_root_fails_before_empty_result() {
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
         member_page_object_ids: seed_commit.member_page_object_ids,
+        member_page_member_counts: seed_commit.member_page_member_counts,
         global_state_root: content_id(0xf1),
         local_state_root: seed.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::root(),
@@ -4408,6 +4461,7 @@ async fn zero_edge_commit_change_pages_reopen_at_member_count_boundary() {
             parent_commit_object_ids: Vec::new(),
             members,
             member_page_object_ids: Vec::new(),
+            member_page_member_counts: Vec::new(),
             global_state_root: content_id(0xb2),
             local_state_root: content_id(0xb3),
             checkpoint_cursor: CheckpointCursorV1::root(),
@@ -4691,6 +4745,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::root(),
@@ -4710,6 +4765,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         parent_commit_object_ids: vec![grandparent_object_id],
         members: parent_members,
         member_page_object_ids: parent_page_ids,
+        member_page_member_counts: vec![1],
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::after_first_parent(
@@ -4731,6 +4787,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         parent_commit_object_ids: vec![parent_object_id],
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::after_first_parent(
@@ -4752,6 +4809,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         parent_commit_object_ids: vec![parent_object_id],
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::after_first_parent(
@@ -5041,6 +5099,7 @@ async fn commit_graph_cycle_and_generation_edges_fail_closed() {
         parent_commit_object_ids: vec![second_object_id],
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         checkpoint_cursor: {
@@ -5399,6 +5458,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         parent_commit_object_ids: vec![out_of_uuid_order.commit_object_id],
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: out_of_uuid_order.global_state_root,
         local_state_root: out_of_uuid_order.local_state_root,
         checkpoint_cursor: {
@@ -5563,6 +5623,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::root(),
@@ -5583,6 +5644,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         parent_commit_object_ids: vec![parent_id],
         members: child_members,
         member_page_object_ids: child_page_ids,
+        member_page_member_counts: vec![1],
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         checkpoint_cursor: CheckpointCursorV1::after_first_parent(
@@ -7691,6 +7753,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
             parent_commit_object_ids: Vec::new(),
             members,
             member_page_object_ids: Vec::new(),
+            member_page_member_counts: Vec::new(),
             global_state_root: content_id(0x71),
             local_state_root: content_id(0x72),
             checkpoint_cursor: CheckpointCursorV1::root(),
@@ -7775,6 +7838,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         parent_commit_object_ids: Vec::new(),
         members,
         member_page_object_ids: Vec::new(),
+        member_page_member_counts: Vec::new(),
         global_state_root: content_id(0x73),
         local_state_root: content_id(0x74),
         checkpoint_cursor: CheckpointCursorV1::root(),
@@ -7850,6 +7914,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
         member_page_object_ids: vec![ObjectId::ZERO],
+        member_page_member_counts: vec![1],
         global_state_root: content_id(0x75),
         local_state_root: content_id(0x76),
         checkpoint_cursor: CheckpointCursorV1::root(),
@@ -7866,6 +7931,7 @@ struct ThreePageStaleFixture {
     selected_key: Vec<u8>,
     selected_change_id: ChangeId,
     page_ids: Vec<ObjectId>,
+    page_counts: Vec<u32>,
 }
 
 fn build_three_page_stale_fixture() -> ThreePageStaleFixture {
@@ -7883,6 +7949,18 @@ fn build_three_page_stale_fixture() -> ThreePageStaleFixture {
         .collect::<Vec<_>>();
     let (rows, members, page_objects, pack_objects) = encode_test_state_entries(0xc1, entries);
     let page_ids = page_objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let page_counts = page_objects
+        .iter()
+        .map(|(id, bytes)| {
+            u32::try_from(
+                CommitChangePageV3::decode(*id, bytes)
+                    .expect("stale page count")
+                    .members
+                    .len(),
+            )
+            .expect("stale page count fits u32")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         page_ids.len(),
         3,
@@ -7923,6 +8001,7 @@ fn build_three_page_stale_fixture() -> ThreePageStaleFixture {
         parent_commit_object_ids: vec![seed.commit_object_id],
         members: members.clone(),
         member_page_object_ids: page_ids.clone(),
+        member_page_member_counts: page_counts.clone(),
         global_state_root: seed.global_state_root,
         local_state_root,
         checkpoint_cursor: CheckpointCursorV1::after_first_parent(
@@ -8002,6 +8081,7 @@ fn build_three_page_stale_fixture() -> ThreePageStaleFixture {
         selected_key,
         selected_change_id,
         page_ids,
+        page_counts,
     }
 }
 
@@ -8050,6 +8130,7 @@ fn rewrite_three_page_fixture_with_raw_commit(
             parent_commit_object_ids: original.parent_commit_object_ids,
             members: Vec::new(),
             member_page_object_ids: page_ids,
+            member_page_member_counts: original.member_page_member_counts,
             global_state_root: original.global_state_root,
             local_state_root: original.local_state_root,
             checkpoint_cursor: original.checkpoint_cursor,

@@ -375,6 +375,7 @@ where
         parent_commit_object_ids: Vec::new(),
         members: semantic_members,
         member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
+        member_page_member_counts: member_pages.member_counts.clone(),
         global_state_root: global_state.root.object_id,
         local_state_root: local_state.root.object_id,
         checkpoint_cursor: super::model::CheckpointCursorV1::root(),

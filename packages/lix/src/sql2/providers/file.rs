@@ -8561,6 +8561,7 @@ mod tests {
             parent_commit_object_ids: vec![parent_id],
             members,
             member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
+            member_page_member_counts: pages.member_counts.clone(),
             global_state_root: state_edit.root,
             local_state_root: initial_view.branch_snapshot().local_state_root,
             checkpoint_cursor: crate::forktree::CheckpointCursorV1::after_first_parent(

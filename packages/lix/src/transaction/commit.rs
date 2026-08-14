@@ -571,6 +571,7 @@ where
         parent_commit_object_ids: parent_object_ids,
         members,
         member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
+        member_page_member_counts: member_pages.member_counts.clone(),
         global_state_root,
         local_state_root,
         checkpoint_cursor,
@@ -935,6 +936,7 @@ struct OrderedCommitContent {
     mutations: Vec<StateTreeMutation>,
     members: Vec<CommitMemberV3>,
     member_page_object_ids: Vec<ObjectId>,
+    member_page_member_counts: Vec<u32>,
     current_pack_objects: Vec<(ObjectId, bytes::Bytes)>,
     max_selected_source_generation: Option<u64>,
 }
@@ -1384,6 +1386,7 @@ where
             mutations,
             members,
             member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
+            member_page_member_counts: member_pages.member_counts,
             current_pack_objects: current_packs.objects,
             max_selected_source_generation,
         });
@@ -1477,6 +1480,7 @@ where
             parent_commit_object_ids: parent_object_ids,
             members: content.members.clone(),
             member_page_object_ids: content.member_page_object_ids.clone(),
+            member_page_member_counts: content.member_page_member_counts.clone(),
             global_state_root,
             local_state_root,
             checkpoint_cursor,

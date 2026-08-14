@@ -10,6 +10,11 @@ autobenches = false
 autotests = false
 autoexamples = false
 
+[[bench]]
+name = "physical_layout_commit_page_routing"
+path = "benches/physical_layout_commit_page_routing.rs"
+harness = false
+
 [lints]
 workspace = true
 

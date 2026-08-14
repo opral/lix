@@ -49,7 +49,11 @@ where
     let mut members = Vec::new();
     let pages =
         super::view::load_object_map(read, commit.member_page_object_ids.iter().copied()).await?;
-    for page_id in &commit.member_page_object_ids {
+    for (page_id, expected_count) in commit
+        .member_page_object_ids
+        .iter()
+        .zip(&commit.member_page_member_counts)
+    {
         let bytes = pages
             .get(page_id)
             .ok_or_else(|| corruption("commit change page is absent"))?;
@@ -58,9 +62,10 @@ where
             || page.start_ordinal
                 != u32::try_from(members.len())
                     .map_err(|_| corruption("commit member page ordinal exceeds u32"))?
+            || usize::try_from(*expected_count).ok() != Some(page.members.len())
         {
             return Err(corruption(
-                "commit member page chain has a mismatched commit or ordinal",
+                "commit member page chain has a mismatched commit, ordinal, or count",
             ));
         }
         members.extend(page.members);
@@ -2716,51 +2721,26 @@ impl StaleCommitSummaryCache {
     }
 }
 
-async fn load_stale_page_for_position<R>(
-    read: &R,
+/// Proves the selected page's position from the commit-authenticated routing
+/// directory without loading any unrelated page. Duplicate vector entries,
+/// count overflow, and selected-page count/ordinal substitution fail closed.
+pub(super) async fn validate_stale_page_position(
     binding_id: u64,
-    commit_object_id: ObjectId,
-    commit_id: CommitId,
-    page_object_id: ObjectId,
-    cache: &mut StaleMemberAuthCache,
-) -> Result<super::model::CommitChangePageV3, StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let key = (commit_object_id, page_object_id);
-    if let Some(page) = cache.pages.get(&key) {
-        return Ok(page.clone());
-    }
-    let bytes = super::view::load_object_bytes(read, page_object_id).await?;
-    let page = super::model::CommitChangePageV3::decode(page_object_id, &bytes)?;
-    if page.commit_id != commit_id {
-        return Err(corruption(
-            "commit change page belongs to a different Commit",
-        ));
-    }
-    cache.pages.insert(key, page.clone());
-    Ok(page)
-}
-
-/// Proves the selected page's position in the commit's authenticated ordered
-/// page vector without loading the unrelated member closure.  The selected
-/// page and its immediate neighbors establish ordinal adjacency; duplicate
-/// vector entries are rejected globally because they make the vector
-/// ambiguous even when the duplicate is not selected by this request.
-pub(super) async fn validate_stale_page_position<R>(
-    read: &R,
-    binding_id: u64,
-    commit_object_id: ObjectId,
     commit_id: CommitId,
     page_object_ids: &[ObjectId],
+    page_member_counts: &[u32],
     page_object_id: ObjectId,
     page: &super::model::CommitChangePageV3,
     cache: &mut StaleMemberAuthCache,
-) -> Result<(), StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
+) -> Result<(), StorageError> {
     cache.assert_binding(binding_id)?;
+    if page_object_ids.len() != page_member_counts.len()
+        || page_member_counts.contains(&0)
+    {
+        return Err(corruption(
+            "commit change-page routing directory is not canonical",
+        ));
+    }
     let mut seen = BTreeSet::new();
     for id in page_object_ids {
         if !seen.insert(*id) {
@@ -2774,52 +2754,16 @@ where
     if page.commit_id != commit_id {
         return Err(corruption("selected page belongs to a different Commit"));
     }
-    let mut expected_start = 0_u32;
-    for prefix_page_object_id in page_object_ids.iter().take(index + 1) {
-        let prefix_page = load_stale_page_for_position(
-            read,
-            binding_id,
-            commit_object_id,
-            commit_id,
-            *prefix_page_object_id,
-            cache,
-        )
-        .await?;
-        if prefix_page.start_ordinal != expected_start {
-            return Err(corruption(
-                "commit change-page vector has a gap or overlap in the selected prefix",
-            ));
-        }
-        expected_start = prefix_page
-            .start_ordinal
-            .checked_add(
-                u32::try_from(prefix_page.members.len())
-                    .map_err(|_| corruption("commit member page count overflows u32"))?,
-            )
-            .ok_or_else(|| corruption("commit member page ordinal overflows u32"))?;
-    }
-    if let Some(next_id) = page_object_ids.get(index + 1) {
-        let next = load_stale_page_for_position(
-            read,
-            binding_id,
-            commit_object_id,
-            commit_id,
-            *next_id,
-            cache,
-        )
-        .await?;
-        let expected = page
-            .start_ordinal
-            .checked_add(
-                u32::try_from(page.members.len())
-                    .map_err(|_| corruption("selected page member count overflows u32"))?,
-            )
-            .ok_or_else(|| corruption("selected page ordinal overflows u32"))?;
-        if next.start_ordinal != expected {
-            return Err(corruption(
-                "commit change-page vector has a gap or overlap after selected page",
-            ));
-        }
+    let expected_start = page_member_counts[..index]
+        .iter()
+        .try_fold(0_u32, |total, count| total.checked_add(*count))
+        .ok_or_else(|| corruption("commit member page ordinal overflows u32"))?;
+    if page.start_ordinal != expected_start
+        || usize::try_from(page_member_counts[index]).ok() != Some(page.members.len())
+    {
+        return Err(corruption(
+            "selected change page disagrees with its authenticated routing descriptor",
+        ));
     }
     Ok(())
 }
@@ -2919,11 +2863,10 @@ where
             page.clone(),
         );
         validate_stale_page_position(
-            read,
             binding_id,
-            commit_object_id,
             commit.commit_id,
             &commit.member_page_object_ids,
+            &commit.member_page_member_counts,
             pack_row.history_page_object_id,
             &page,
             cache,
@@ -3167,11 +3110,10 @@ where
             .cloned()
             .ok_or_else(|| corruption("authenticated source state page is absent"))?;
         validate_stale_page_position(
-            read,
             binding_id,
-            lookup.request.commit_object_id,
             lookup.commit.commit_id,
             &lookup.commit.member_page_object_ids,
+            &lookup.commit.member_page_member_counts,
             lookup.pack_row.history_page_object_id,
             &page,
             cache,
@@ -4231,11 +4173,10 @@ where
             ));
         }
         validate_stale_page_position(
-            read,
             binding_id,
-            page_summary.commit_object_id,
             page_summary.commit_id,
             &page_summary.member_page_object_ids,
+            &page_summary.member_page_member_counts,
             pack_row.history_page_object_id,
             page,
             &mut stale_member_cache,
@@ -4294,11 +4235,10 @@ where
             ));
         }
         validate_stale_page_position(
-            read,
             binding_id,
-            page_summary.commit_object_id,
             page_summary.commit_id,
             &page_summary.member_page_object_ids,
+            &page_summary.member_page_member_counts,
             pack_row.history_page_object_id,
             page,
             &mut stale_member_cache,
@@ -5214,6 +5154,7 @@ pub(super) struct StaleCommitSummary {
     global_state_root: ObjectId,
     local_state_root: ObjectId,
     member_page_object_ids: Vec<ObjectId>,
+    member_page_member_counts: Vec<u32>,
 }
 
 impl StaleCommitSummary {
@@ -5271,6 +5212,7 @@ where
         global_state_root: commit.global_state_root,
         local_state_root: commit.local_state_root,
         member_page_object_ids: commit.member_page_object_ids.clone(),
+        member_page_member_counts: commit.member_page_member_counts.clone(),
     };
     cache.entries.insert(commit_id, summary);
     Ok(cache
