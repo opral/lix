@@ -566,8 +566,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value as JsonValue;
-
     use super::{load_commit_delta, load_node, only_parent};
     use crate::engine::Engine;
     use crate::sql2::SqlWriteExecutionContext;
@@ -607,7 +605,7 @@ mod tests {
             .and_then(|row| row.get::<Value>("value").ok())
             .and_then(|value| match value {
                 Value::Text(value) => Some(value),
-                Value::Json(JsonValue::String(value)) => Some(value),
+                Value::Json(value) => value.as_json_string(),
                 _ => None,
             })
     }

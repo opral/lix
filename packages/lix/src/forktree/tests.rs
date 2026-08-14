@@ -1086,8 +1086,16 @@ fn test_state_member(
     });
     let change_id = test_change_id(commit_byte, &key, global);
     let snapshot = match cell {
-        StateCellRef::Value(value) => JsonSlot::Inline(value.into()),
-        StateCellRef::Null => JsonSlot::Inline("null".into()),
+        StateCellRef::Value(value) => JsonSlot::Inline(
+            serde_json::json!({"id": primary_key, "value": value})
+                .to_string()
+                .into(),
+        ),
+        StateCellRef::Null => JsonSlot::Inline(
+            serde_json::json!({"id": primary_key, "value": null})
+                .to_string()
+                .into(),
+        ),
         StateCellRef::Tombstone => JsonSlot::None,
     };
     let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
@@ -1191,8 +1199,27 @@ fn encode_test_state_entries(
                 .expect("test state payload");
             let cell = match record.snapshot {
                 JsonSlot::None => StateCell::Tombstone,
-                JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
-                JsonSlot::Inline(value) => StateCell::Value(value.into()),
+                JsonSlot::Inline(value) => {
+                    let key = super::decode_state_key(key).expect("test state key");
+                    let schema = if key.schema_key == "app.row" {
+                        test_state_schema()
+                    } else {
+                        crate::native_row::seed_schema(&key.schema_key)
+                            .expect("trusted test state schema")
+                    };
+                    let snapshot = serde_json::from_str(value.as_ref())
+                        .expect("test state snapshot is canonical JSON");
+                    StateCell::NativeRow(
+                        crate::native_row::encode(
+                            &schema,
+                            &key.entity_pk,
+                            global,
+                            key.file_id.as_deref(),
+                            &snapshot,
+                        )
+                        .expect("test native state row"),
+                    )
+                }
                 JsonSlot::ForkTreeObject(_) => panic!("test state payload must be inline"),
             };
             let metadata = match record.metadata {
@@ -1261,6 +1288,52 @@ fn encode_test_state_entries(
         })
         .collect();
     (rows, members, pages.objects, pack_objects)
+}
+
+fn test_state_schema() -> lix_schema::Schema {
+    let column = |name: &str, data_type: lix_schema::DataType, nullable: bool| lix_schema::Column {
+        name: name.to_owned(),
+        data_type,
+        nullable,
+        default_value: None,
+        default_expression: None,
+        description: None,
+        examples: Vec::new(),
+        deprecated: false,
+    };
+    lix_schema::Schema {
+        schema: lix_schema::SCHEMA_V1_URI.to_owned(),
+        // This fixture predates Schema-v1 identifier validation. Constructing
+        // the typed plan directly preserves its authenticated StateKey while
+        // removing the obsolete JSON current-state carrier.
+        key: "app.row".to_owned(),
+        description: None,
+        columns: vec![
+            column("id", lix_schema::DataType::Text, false),
+            column("value", lix_schema::DataType::Jsonb, true),
+        ],
+        primary_key: vec!["id".to_owned()],
+        unique: Vec::new(),
+        foreign_keys: Vec::new(),
+        examples: Vec::new(),
+        deprecated: false,
+    }
+}
+
+fn test_state_payload(row: &VisibleStateRow) -> serde_json::Value {
+    let key = super::decode_state_key(&row.encoded_key).expect("visible test state key");
+    let StateCell::NativeRow(native) = &row.value.cell else {
+        panic!("visible test state must use the native row carrier");
+    };
+    crate::native_row::logical_value(
+        &test_state_schema(),
+        &key.entity_pk,
+        row.source == StateSource::Global,
+        key.file_id.as_deref(),
+        native,
+    )
+    .expect("visible native test row authenticates")["value"]
+        .clone()
 }
 
 fn state_entry(
@@ -3085,24 +3158,18 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
         .expect("point a")
         .expect("a visible");
     assert_eq!(a.source, StateSource::Branch);
-    assert!(
-        matches!(a.value.cell, StateCell::Value(ref value) if <_ as AsRef<str>>::as_ref(value) == "local-a")
-    );
+    assert_eq!(test_state_payload(&a), serde_json::json!("local-a"));
     assert!(
         state_point(&view, &seed.state_keys[1], false)
             .await
             .expect("point b")
             .is_none()
     );
-    assert!(matches!(
-        state_point(&view, &seed.state_keys[2], false)
-            .await
-            .expect("point c")
-            .expect("c visible")
-            .value
-            .cell,
-        StateCell::Null
-    ));
+    let c = state_point(&view, &seed.state_keys[2], false)
+        .await
+        .expect("point c")
+        .expect("c visible");
+    assert_eq!(test_state_payload(&c), serde_json::Value::Null);
     let exact = state_points(
         &view,
         &[
@@ -3116,10 +3183,10 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     .await
     .expect("batched exact state");
     assert_eq!(exact.len(), 4);
-    assert!(matches!(
-        exact[0].as_ref().map(|row| &row.value.cell),
-        Some(StateCell::Null)
-    ));
+    assert_eq!(
+        exact[0].as_ref().map(test_state_payload),
+        Some(serde_json::Value::Null)
+    );
     assert_eq!(exact[0], exact[3]);
     assert_eq!(
         exact[1].as_ref().map(|row| row.source),
@@ -3333,7 +3400,10 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
     let masked = masked_row.after.expect("masked endpoint");
     assert!(!masked.global);
     assert!(!masked.deleted);
-    assert_eq!(masked.snapshot_content.as_deref(), Some("local-b"));
+    assert_eq!(
+        masked.snapshot_content.as_deref(),
+        Some(r#"{"id":"b","value":"local-b"}"#)
+    );
 
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
@@ -3383,11 +3453,17 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
     let before = unmasked_row.before.expect("masked before endpoint");
     assert!(!before.global);
     assert!(!before.deleted);
-    assert_eq!(before.snapshot_content.as_deref(), Some("local-b"));
+    assert_eq!(
+        before.snapshot_content.as_deref(),
+        Some(r#"{"id":"b","value":"local-b"}"#)
+    );
     let after = unmasked_row.after.expect("global fallback endpoint");
     assert!(after.global);
     assert!(!after.deleted);
-    assert_eq!(after.snapshot_content.as_deref(), Some("global-b"));
+    assert_eq!(
+        after.snapshot_content.as_deref(),
+        Some(r#"{"id":"b","value":"global-b"}"#)
+    );
 }
 
 #[cfg(any())]
