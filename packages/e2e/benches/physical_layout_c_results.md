@@ -80,9 +80,12 @@ All 36 physical RocksDB/SlateDB cells wrote the exact authenticated branch and p
 
 ## Evidence
 
-- Final combined model and physical-backend sweep: `/root/repos/lix-evidence/experiment-c-ff57/model/backend-sweep-reviewed.csv`, SHA-256 `ad2452a2df410dfbb2029ae9f3ca8af8a19b6886a302181d36c4d8d0091dc615`; stderr is empty (SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+- Approved experimental sweep: `/root/repos/lix-evidence/experiment-c-ff57/model/backend-sweep-reviewed.csv`, SHA-256 `ad2452a2df410dfbb2029ae9f3ca8af8a19b6886a302181d36c4d8d0091dc615`.
+- Exact-main rebind sweep: `/root/repos/lix-evidence/experiment-c-dc4/model/backend-sweep.csv`, SHA-256 `6bbcd2af70edf71ae4ec4fe00a00571727aec3598e1500a6a6630e14b794f4c4`; stderr is empty (SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
 - Rejected intermediate sweeps remain evidence only and are not used for the decision.
 
-## Final-rebind requirement
+## Final main rebind
 
-The selected C2 model must be rebound by object identity to commit `2cf539744e7864f79bf1994e002f47cfd3281dc0`, tree `89a6e9a0623483268cb7841f757446c5e29559dd`. The 64/256-byte dominant fixtures are schema-bound scalar tuples with no JSONB; the 1/4 KiB cases add one optional opaque varlen cell. The page layer carries those canonical tuple bytes and schema fingerprint opaquely; it must not parse text, uuid, int8, float8, boolean, jsonb, or timestamptz fields.
+The selected C2 model is rebound directly by object identity to final main commit `dc4f42917937150fa20fcb7517c46c21d1840045`, tree `6b4b9e14eb95dfa5fb5fc7046cf169c12f4813e1`. The exact release binary SHA-256 is `cd93bf6e967035ee0966287ee3d82ca290b50e941d06816b2874f6402addf700`. The public seven-type integration passes 2/2 (base and tracked-state rebuild), log SHA-256 `b2d2d4aa9aabf71a186ae15926c5a52fcf820373e4dd0ec4a94b017be28f3329`.
+
+The 64/256-byte dominant fixtures are schema-bound scalar tuples with no JSONB; the 1/4 KiB cases add one optional opaque varlen cell. The page layer carries those canonical tuple bytes and schema fingerprint opaquely; it does not parse text, uuid, int8, float8, boolean, jsonb, or timestamptz fields.
