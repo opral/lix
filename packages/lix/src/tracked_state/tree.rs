@@ -210,6 +210,17 @@ impl TrackedStateTree {
         if request.limit == Some(0) {
             return Ok(Vec::new());
         }
+        if !request.row_pks.is_empty()
+            && request.row_pks.iter().all(|row_pk| {
+                !crate::tracked_state::row_pk_satisfies_bounds(
+                    row_pk,
+                    request.row_pk_lower.as_ref(),
+                    request.row_pk_upper.as_ref(),
+                )
+            })
+        {
+            return Ok(Vec::new());
+        }
 
         let ranges = scan_ranges(request);
         let key_decode_hint = scan_key_decode_hint(request, &ranges);
@@ -2912,6 +2923,42 @@ mod tests {
         ));
 
         assert_eq!(storage_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_candidates_outside_primary_key_bounds_do_zero_tree_reads() {
+        let bytes = encode_leaf_node(&[]);
+        let hash = hash_bytes(&bytes);
+        let storage_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageAdapterReadScope::new(CountingChunkRead {
+            hash,
+            bytes,
+            storage_reads: Arc::clone(&storage_reads),
+            corrupt_first_read: false,
+        });
+        let rows = TrackedStateTree::new()
+            .scan(
+                &store,
+                &TrackedStateRootId::new(hash),
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema".to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    row_pks: vec![RowPk::single("a"), RowPk::single("b")],
+                    row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("c"),
+                        inclusive: true,
+                    }),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("d"),
+                        inclusive: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("empty exact/range intersection should short circuit");
+        assert!(rows.is_empty());
+        assert_eq!(storage_reads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
