@@ -1894,6 +1894,12 @@ where
 }
 
 fn select_by_pk_sql(rows: &[WorkloadRow]) -> String {
+    if let [row] = rows {
+        return format!(
+            "SELECT path, value FROM json_pointer WHERE path = '{}' LIMIT 1",
+            sql_string(&row.path)
+        );
+    }
     select_by_paths_sql(rows.iter().map(|row| row.path.as_str()))
 }
 

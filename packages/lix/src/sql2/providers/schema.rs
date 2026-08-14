@@ -70,6 +70,53 @@ use super::values::{
 };
 use crate::storage_adapter::StorageAdapterRead;
 
+/// Executes the already-proved unique registered-schema point shape without
+/// constructing a DataFusion plan or Arrow batch. The retained snapshot
+/// reader remains the sole visibility/authentication authority.
+pub(crate) async fn execute_exact_schema_point_read(
+    spec: &SchemaSurfaceSpec,
+    active_branch_id: &str,
+    reader: Arc<dyn RowSnapshotReader>,
+    row_pk: RowPk,
+    projected_columns: &[String],
+    output_columns: Vec<String>,
+) -> Result<crate::SqlQueryResult, LixError> {
+    let mut request = row_hot_state_scan_request(
+        &spec.schema_key,
+        Some(active_branch_id),
+        None,
+        Some(1),
+        true,
+    );
+    request.filter.row_pks = vec![row_pk];
+    let snapshots = reader.scan_row_snapshots(request).await?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "exact schema point route lost its retained snapshot capability",
+        )
+    })?;
+    if snapshots.len() > 1 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "exact schema point route returned more than one row",
+        ));
+    }
+    let rows = snapshots
+        .first()
+        .map(|snapshot| {
+            RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?
+                .decode_public_values(snapshot.as_deref())
+        })
+        .transpose()?
+        .into_iter()
+        .collect();
+    Ok(crate::SqlQueryResult {
+        rows,
+        columns: output_columns,
+        notices: Vec::new(),
+    })
+}
+
 pub(crate) async fn register_row_providers<S>(
     ctx: &SessionContext,
     active_branch_id: &str,
