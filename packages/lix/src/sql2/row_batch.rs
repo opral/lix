@@ -33,6 +33,11 @@ pub(crate) struct RowColumnarScanLayout {
     /// inventory for key-bound singleton layouts. Bulk layouts retain their
     /// physical hidden identity column and leave this empty.
     pub(crate) singleton_row_pk: Option<RowPk>,
+    /// Exact identities already consumed by the provider's primary-key
+    /// analyzer. Non-empty requests are admitted only for key-bound singleton
+    /// layouts; the scan source applies them to both the immutable member and
+    /// its overlay before producing any row.
+    pub(crate) requested_row_pks: Arc<Vec<RowPk>>,
     pub(crate) overlay: Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
     pub(crate) branch_id: Arc<str>,
     pub(crate) head_commit_id: crate::changelog::CommitId,
@@ -234,6 +239,7 @@ where
                         manifest,
                         manifest_digest,
                         singleton_row_pk,
+                        requested_row_pks: Arc::new(request.filter.row_pks.clone()),
                         overlay,
                         branch_id: Arc::from(branch_id),
                         head_commit_id,
@@ -445,9 +451,7 @@ fn direct_row_snapshot_request(request: &HotStateScanRequest) -> bool {
 }
 
 fn direct_row_columnar_request(request: &HotStateScanRequest) -> bool {
-    direct_row_snapshot_request(request)
-        && request.filter.row_pks.is_empty()
-        && request.limit.is_none()
+    direct_row_snapshot_request(request) && request.limit.is_none()
 }
 
 #[cfg(test)]
@@ -466,6 +470,7 @@ mod tests {
             }),
             manifest_digest: [42; 32],
             singleton_row_pk: None,
+            requested_row_pks: Arc::new(Vec::new()),
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from("branch-a"),
             head_commit_id: crate::changelog::CommitId::for_test_label("cache-key-head"),
@@ -488,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_primary_key_and_limit_bypass_columnar_scan() {
+    fn exact_primary_key_can_use_singleton_columnar_scan_but_limit_cannot() {
         let mut request = HotStateScanRequest::default();
         assert!(direct_row_columnar_request(&request));
 
@@ -496,7 +501,7 @@ mod tests {
             .filter
             .row_pks
             .push(RowPk::single("point-read"));
-        assert!(!direct_row_columnar_request(&request));
+        assert!(direct_row_columnar_request(&request));
 
         request.filter.row_pks.clear();
         request.limit = Some(1);

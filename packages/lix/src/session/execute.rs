@@ -6057,6 +6057,26 @@ mod tests {
         assert_eq!(current.rows()[0].get::<i64>("id").unwrap(), 7);
         assert_eq!(current.rows()[0].get::<String>("value").unwrap(), "native");
 
+        let exact = session
+            .execute(
+                "SELECT tenant, id, value, payload FROM key_bound_singleton_probe WHERE tenant = $1 AND id = $2",
+                &[Value::Text(tenant.clone()), Value::Integer(7)],
+            )
+            .await
+            .expect("exact native current read");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact.rows()[0].get::<String>("tenant").unwrap(), tenant);
+        assert_eq!(exact.rows()[0].get::<i64>("id").unwrap(), 7);
+        assert_eq!(exact.rows()[0].get::<String>("value").unwrap(), "native");
+        let missing = session
+            .execute(
+                "SELECT tenant, id FROM key_bound_singleton_probe WHERE tenant = $1 AND id = $2",
+                &[Value::Text(tenant.clone()), Value::Integer(8)],
+            )
+            .await
+            .expect("missing exact native current read");
+        assert!(missing.is_empty());
+
         let history = session.execute(
             &format!("SELECT tenant, id, value FROM key_bound_singleton_probe_history('{head}')"),
             &[],
@@ -6087,6 +6107,71 @@ mod tests {
             tenant
         );
         assert_eq!(reopened_rows.rows()[0].get::<i64>("id").unwrap(), 7);
+        let reopened_exact = reopened_session
+            .execute(
+                "SELECT tenant, id, value FROM key_bound_singleton_probe WHERE tenant = $1 AND id = $2",
+                &[Value::Text(tenant.clone()), Value::Integer(7)],
+            )
+            .await
+            .expect("cold exact native current read");
+        assert_eq!(reopened_exact.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_bulk_columnar_layout_does_not_capture_exact_point_reads() {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone()).await.expect("initialize");
+        let engine = Engine::new(storage).await.expect("open");
+        let session = engine
+            .open_session_with_account(crate::SYSTEM_ACCOUNT_ID)
+            .await
+            .expect("session");
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bulk_cache_point_probe",
+            "columns": [
+                { "name": "id", "type": "int8", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("register");
+        session
+            .execute(
+                "INSERT INTO bulk_cache_point_probe (id, value) VALUES (1, 'one'), (2, 'two')",
+                &[],
+            )
+            .await
+            .expect("bulk insert");
+
+        let broad = session
+            .execute("SELECT id, value FROM bulk_cache_point_probe", &[])
+            .await
+            .expect("broad scan warms columnar layout cache");
+        assert_eq!(broad.len(), 2);
+        let exact = session
+            .execute(
+                "SELECT id, value FROM bulk_cache_point_probe WHERE id = $1",
+                &[Value::Integer(2)],
+            )
+            .await
+            .expect("exact read after broad cache warm");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact.rows()[0].get::<String>("value").unwrap(), "two");
+        let missing = session
+            .execute(
+                "SELECT id FROM bulk_cache_point_probe WHERE id = $1",
+                &[Value::Integer(3)],
+            )
+            .await
+            .expect("missing exact read after broad cache warm");
+        assert!(missing.is_empty());
     }
 
     #[tokio::test]

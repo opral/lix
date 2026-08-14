@@ -644,8 +644,7 @@ where
         )>,
         LixError,
     > {
-        if !request.filter.row_pks.is_empty()
-            || request.limit.is_some()
+        if request.limit.is_some()
             || !matches!(request.filter.rows, HotStateRowFilter::All)
             || request.filter.include_tombstones
             || request.filter.untracked.is_some()
@@ -666,6 +665,9 @@ where
             schema_key: schema_key.clone(),
         };
         if let Some(layout) = self.row_columnar_layout_cache.get(&key) {
+            if !request.filter.row_pks.is_empty() && layout.singleton_row_pk.is_none() {
+                return Ok(None);
+            }
             return Ok(Some((
                 layout.id,
                 std::sync::Arc::clone(&layout.manifest),
@@ -686,6 +688,13 @@ where
         let Some((id, manifest, singleton_row_pk, overlay, live_count)) = layout else {
             return Ok(None);
         };
+        // Exact primary-key reads may use this route only when identity lives
+        // in the authenticated commit inventory. Bulk row groups retain their
+        // established point reader because their identities are physical
+        // columns and require a different bounded lookup primitive.
+        if !request.filter.row_pks.is_empty() && singleton_row_pk.is_none() {
+            return Ok(None);
+        }
         let manifest_digest = manifest.content_digest()?;
         let layout = self.row_columnar_layout_cache.insert(
             key,

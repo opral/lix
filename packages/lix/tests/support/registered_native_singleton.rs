@@ -9,19 +9,19 @@ where
         .with_storage(storage)
         .await
         .expect("open registered singleton repository");
-    let schema = serde_json::json!({
-        "$schema": "https://lix.dev/schema-v1.json",
-        "key": "adapter_native_singleton",
-        "columns": [
-            { "name": "id", "type": "int8", "nullable": false },
-            { "name": "value", "type": "text", "nullable": false },
-            { "name": "payload", "type": "jsonb", "nullable": false }
+    let schema = r#"{
+        "$schema":"https://lix.dev/schema-v1.json",
+        "key":"adapter_native_singleton",
+        "columns":[
+            {"name":"id","type":"int8","nullable":false},
+            {"name":"value","type":"text","nullable":false},
+            {"name":"payload","type":"jsonb","nullable":false}
         ],
-        "primary_key": ["id"]
-    });
+        "primary_key":["id"]
+    }"#;
     lix.execute(
         "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
-        &[Value::Text(schema.to_string())],
+        &[Value::Text(schema.to_owned())],
     )
     .await
     .expect("register adapter singleton schema");
@@ -66,8 +66,8 @@ where
         rows.rows()[0].get::<String>("value").expect("value"),
         "native"
     );
-    assert_eq!(
-        rows.rows()[0].get::<String>("payload").expect("payload"),
-        r#"{"adapter":true}"#
-    );
+    let Value::Json(payload) = rows.rows()[0].value("payload").expect("payload") else {
+        panic!("declared jsonb payload must remain JSON")
+    };
+    assert_eq!(payload.as_str(), r#"{"adapter":true}"#);
 }

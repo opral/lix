@@ -33,12 +33,17 @@ pub(crate) struct MaterializedChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChangePayloadProjection {
     pub(crate) snapshot_content: bool,
+    /// Native rows build whole-row JSON only for an explicitly selected
+    /// public JSON column. Typed history sets this false while still loading
+    /// legacy JSON rows that have no native authority.
+    pub(crate) native_snapshot_content: bool,
     pub(crate) metadata: bool,
 }
 
 impl ChangePayloadProjection {
     pub(crate) const ALL: Self = Self {
         snapshot_content: true,
+        native_snapshot_content: true,
         metadata: true,
     };
 }
@@ -89,7 +94,9 @@ where
     S: StorageAdapterRead,
 {
     let native_snapshot = change.snapshot.native_row().cloned();
-    let snapshot_content = if payload_projection.snapshot_content {
+    let snapshot_content = if payload_projection.snapshot_content
+        && (payload_projection.native_snapshot_content || native_snapshot.is_none())
+    {
         load_change_snapshot(
             json_reader,
             &change.snapshot,
@@ -226,6 +233,7 @@ mod tests {
             ),
             ChangePayloadProjection {
                 snapshot_content: false,
+                native_snapshot_content: false,
                 metadata: false,
             },
         )
@@ -255,6 +263,7 @@ mod tests {
             change(JsonSlot::Ref(missing_ref), JsonSlot::None),
             ChangePayloadProjection {
                 snapshot_content: true,
+                native_snapshot_content: true,
                 metadata: false,
             },
         )
@@ -342,12 +351,13 @@ mod tests {
             &mut json_reader,
             change.clone(),
             ChangePayloadProjection {
-                snapshot_content: false,
+                snapshot_content: true,
+                native_snapshot_content: false,
                 metadata: false,
             },
         )
         .await
-        .expect("unprojected native snapshot must not build JSON");
+        .expect("typed history must not build native whole-row JSON");
         assert!(row.native_snapshot.is_some());
         assert!(row.snapshot_content.is_none());
 
@@ -356,6 +366,7 @@ mod tests {
             change,
             ChangePayloadProjection {
                 snapshot_content: true,
+                native_snapshot_content: true,
                 metadata: false,
             },
         )

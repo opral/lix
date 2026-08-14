@@ -140,6 +140,7 @@ fn change_payload_projection(schema: &Schema, filters: &[Expr]) -> ChangePayload
     };
     ChangePayloadProjection {
         snapshot_content: needs("snapshot_content"),
+        native_snapshot_content: needs("snapshot_content"),
         metadata: needs("metadata"),
     }
 }

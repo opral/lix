@@ -695,7 +695,14 @@ impl TableSpec for SchemaSpec {
                 &self.spec,
             )?
         {
-            let group_indices = row_columnar_group_indices(&layout.manifest, &row_filters);
+            let mut group_indices = row_columnar_group_indices(&layout.manifest, &row_filters);
+            if !layout.requested_row_pks.is_empty()
+                && !layout.singleton_row_pk.as_ref().is_some_and(|row_pk| {
+                    layout.requested_row_pks.iter().any(|requested| requested == row_pk)
+                })
+            {
+                group_indices.clear();
+            }
             return Ok(PlannedScan {
                 schema: Arc::clone(&schema),
                 ordering: None,
@@ -1024,7 +1031,9 @@ async fn row_columnar_scan_source(
     }
     let mut overlay_cache_projection = projection.cache_key.clone();
     overlay_cache_projection.push(usize::MAX);
-    let filter_digest = blake3::hash(format!("{row_filters:?}").as_bytes());
+    let filter_digest = blake3::hash(
+        format!("{row_filters:?}:{:?}", layout.requested_row_pks).as_bytes(),
+    );
     overlay_cache_projection.extend(
         filter_digest
             .as_bytes()
@@ -1049,6 +1058,7 @@ async fn row_columnar_scan_source(
             spec.as_ref(),
             Arc::clone(&schema),
             layout.overlay.as_ref(),
+            layout.requested_row_pks.as_ref(),
             &row_filters,
         )?;
         if let [batch] = batches.as_slice() {
@@ -1142,7 +1152,7 @@ async fn row_columnar_scan_source(
             statistics.iter(),
             schema.as_ref(),
         )?)
-    } else if row_filters.is_empty() {
+    } else if row_filters.is_empty() && layout.requested_row_pks.is_empty() {
         let live_count = usize::try_from(layout.live_count).map_err(|_| {
             DataFusionError::Execution("row collection cardinality exceeds usize".to_owned())
         })?;
@@ -1488,10 +1498,16 @@ fn row_columnar_overlay_batches(
     spec: &SchemaSurfaceSpec,
     schema: SchemaRef,
     rows: &[crate::hot_state::RowColumnarOverlayRow],
+    requested_row_pks: &[RowPk],
     row_filters: &[RowFilter],
 ) -> Result<Vec<RecordBatch>> {
     let mut snapshots = Vec::new();
     for row in rows {
+        if !requested_row_pks.is_empty()
+            && !requested_row_pks.iter().any(|requested| requested == &row.row_pk)
+        {
+            continue;
+        }
         if row.deleted {
             continue;
         }
@@ -6155,8 +6171,13 @@ mod tests {
             column_type: SchemaColumnType::Boolean,
             value: super::RowFilterValue::Boolean(true),
         }];
-        let overlay =
-            super::row_columnar_overlay_batches(&spec, public_schema, &overlays, &filters)
+        let overlay = super::row_columnar_overlay_batches(
+            &spec,
+            public_schema.clone(),
+            &overlays,
+            &[],
+            &filters,
+        )
                 .expect("typed overlay");
         let [overlay] = overlay.as_slice() else {
             panic!("expected one bounded overlay batch")
@@ -6172,6 +6193,25 @@ mod tests {
             "insert-c",
             "the updated row moved out of the predicate and its stale base was already shadowed"
         );
+
+        let exact_overlay = super::row_columnar_overlay_batches(
+            &spec,
+            public_schema.clone(),
+            &overlays,
+            &[TestRowPk::single("c")],
+            &filters,
+        )
+        .expect("exact typed overlay");
+        assert_eq!(exact_overlay.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let missing_overlay = super::row_columnar_overlay_batches(
+            &spec,
+            public_schema,
+            &overlays,
+            &[TestRowPk::single("missing")],
+            &filters,
+        )
+        .expect("missing exact typed overlay");
+        assert!(missing_overlay.is_empty());
     }
 
     #[test]
@@ -6259,6 +6299,7 @@ mod tests {
             manifest: Arc::new(encoded.manifest.clone()),
             manifest_digest: encoded.manifest.content_digest().expect("manifest digest"),
             singleton_row_pk: None,
+            requested_row_pks: Arc::new(Vec::new()),
             overlay: Arc::new(vec![
                 crate::hot_state::RowColumnarOverlayRow {
                     row_pk: identities[0].clone(),
@@ -6316,6 +6357,7 @@ mod tests {
             }),
             manifest_digest: [24; 32],
             singleton_row_pk: None,
+            requested_row_pks: Arc::new(Vec::new()),
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from(branch_id),
             head_commit_id: CommitId::for_test_label("cached-batch-test-head"),

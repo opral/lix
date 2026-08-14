@@ -208,7 +208,8 @@ where
         vec![spec.schema_key.clone()],
         metadata_projection,
         crate::sql2::change_materialization::ChangePayloadProjection {
-            snapshot_content: false,
+            snapshot_content: true,
+            native_snapshot_content: false,
             metadata: true,
         },
         limit,
