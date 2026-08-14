@@ -15,6 +15,7 @@ mod current_state_data_part;
 pub(crate) mod current_state_envelope;
 mod diff;
 mod diff_id;
+pub(crate) mod history_directory;
 mod merge;
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
@@ -55,6 +56,7 @@ pub(crate) use merge::{
 pub(crate) use mutation_directory::{
     MUTATION_DIRECTORY_NODE_SPACE, collect_mutation_directory_node_ids,
 };
+pub(crate) use history_directory::{HISTORY_DIRECTORY_NODE_SPACE, HISTORY_DIRECTORY_ROOT_SPACE};
 pub(crate) use replacement_part::{
     EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
     ReplacementPartRowRef, encode_replacement_part_with_compressor,
