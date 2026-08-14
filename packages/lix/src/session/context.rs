@@ -56,9 +56,7 @@ pub(crate) async fn load_default_branch_id_from_index(
                 entity_pk: EntityPk::single(crate::init::DEFAULT_BRANCH_KEY),
                 file_id: None,
             }],
-            projection: HotStateProjection {
-                columns: vec!["snapshot_content".to_string()],
-            },
+            projection: HotStateProjection::default(),
             untracked: Some(false),
             include_tombstones: false,
         })
@@ -69,32 +67,42 @@ pub(crate) async fn load_default_branch_id_from_index(
             "repository default branch is missing lix_key_value:lix_default_branch_id",
         )
     })?;
-    let snapshot_content = row
-        .snapshot_content()
-        .map(|value| value.as_ref())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "repository default branch is missing snapshot_content",
-            )
-        })?;
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+    let expected_pk = EntityPk::single(crate::init::DEFAULT_BRANCH_KEY);
+    if row.schema_key() != "lix_key_value"
+        || row.entity_pk() != &expected_pk
+        || row.file_id().is_some()
+        || row.branch_id() != GLOBAL_BRANCH_ID
+        || !row.global()
+        || row.untracked()
+        || row.deleted()
+    {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "repository default branch has mismatched state identity",
+        ));
+    }
+    let native = row.native_snapshot().ok_or_else(|| {
         LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("repository default branch snapshot is invalid JSON: {error}"),
+            LixError::CODE_STORAGE_ERROR,
+            "repository default branch is missing its native scalar tuple",
         )
     })?;
-    let branch_id = snapshot
-        .get("value")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "repository default branch value must be a non-empty string",
-            )
-        })?
-        .to_string();
+    let values = crate::native_row::decode(crate::native_row::seed_schema("lix_key_value")?, native)?;
+    let [lix_schema::value_layout::BodyValue::Jsonb(JsonValue::String(branch_id))] =
+        values.as_slice()
+    else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "repository default branch native value must be a string",
+        ));
+    };
+    if branch_id.is_empty() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "repository default branch value must be a non-empty string",
+        ));
+    }
+    let branch_id = branch_id.clone();
 
     let branch_ref = branch_ctx.ref_reader(reader);
     BranchLifecycle::new(&branch_ref)

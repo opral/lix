@@ -20,10 +20,94 @@ use std::sync::{LazyLock, Mutex};
 use bytes::Bytes;
 
 use crate::LixError;
+use crate::GLOBAL_BRANCH_ID;
+use crate::commit_graph::CommitGraphContext;
+use crate::entity_pk::EntityPk;
+use crate::hot_state::{
+    HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateProjection,
+};
 use crate::storage_adapter::{
     REVISION_KEY_ACCOUNT, REVISION_SPACE, StorageAdapterRead, StorageValue, StorageWriteSet,
     load_revision, revision_key,
 };
+use crate::tracked_state::TrackedStateContext;
+
+/// Loads the status cell from the authenticated native `lix_account` tuple.
+///
+/// The retained HOT reader authenticates the full state-key owner before it
+/// exposes the tuple.  Account validation deliberately has no whole-row JSON
+/// fallback: a selected Schema-v1 account without its native tuple is storage
+/// corruption.
+pub(crate) async fn load_account_status(
+    read: &(impl StorageAdapterRead + ?Sized),
+    account_id: &str,
+) -> Result<Option<String>, LixError> {
+    let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
+        LixError::new(
+            "LIX_INVALID_ACCOUNT_ID",
+            format!("active account id '{account_id}' is not a canonical UUID"),
+        )
+    })?;
+    let rows = HotStateContext::new(
+        TrackedStateContext::new(),
+        CommitGraphContext::new(),
+    )
+    .reader(read)
+    .load_exact_batch(&HotStateExactBatchRequest {
+        rows: vec![HotStateExactRowRequest {
+            schema_key: "lix_account".to_owned(),
+            branch_id: GLOBAL_BRANCH_ID.to_owned(),
+            entity_pk: account_pk.clone(),
+            file_id: None,
+        }],
+        projection: HotStateProjection::default(),
+        untracked: Some(false),
+        include_tombstones: false,
+    })
+    .await?;
+    let Some(row) = rows.row(0) else {
+        return Ok(None);
+    };
+    if row.schema_key() != "lix_account"
+        || row.entity_pk() != &account_pk
+        || row.file_id().is_some()
+        || row.branch_id() != GLOBAL_BRANCH_ID
+        || !row.global()
+        || row.untracked()
+        || row.deleted()
+    {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("account '{account_id}' has mismatched state identity"),
+        ));
+    }
+    let native = row.native_snapshot().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("account '{account_id}' is missing its native scalar tuple"),
+        )
+    })?;
+    let schema = crate::native_row::seed_schema("lix_account")?;
+    let values = crate::native_row::decode(schema, native)?;
+    let status_ordinal = schema
+        .columns
+        .iter()
+        .filter(|column| !schema.primary_key.contains(&column.name))
+        .position(|column| column.name == "status")
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "compile-time lix_account schema has no status column",
+            )
+        })?;
+    let Some(lix_schema::value_layout::BodyValue::Text(status)) = values.get(status_ordinal) else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("account '{account_id}' has an invalid native status cell"),
+        ));
+    };
+    Ok(Some(status.clone()))
+}
 
 /// Storage-snapshot identity for the visible `lix_account` rows.
 pub(crate) async fn load_account_revision(

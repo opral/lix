@@ -71,7 +71,7 @@ pub(crate) struct BranchHeadControlCache {
 /// rebuilt from canonical records on any change, never an authority.
 #[derive(Debug, Default)]
 pub(crate) struct GlobalKeyValueRowCache {
-    entries: StdMutex<Vec<(BranchHeadControl, String, Option<MaterializedHotStateRow>)>>,
+    entries: StdMutex<Vec<(BranchHeadControl, String, Option<MaterializedHotStateExactBatch>)>>,
 }
 
 const GLOBAL_KEY_VALUE_ROW_CACHE_MAX_ENTRIES: usize = 8;
@@ -81,7 +81,7 @@ impl GlobalKeyValueRowCache {
         &self,
         control: BranchHeadControl,
         key: &str,
-    ) -> Option<Option<MaterializedHotStateRow>> {
+    ) -> Option<Option<MaterializedHotStateExactBatch>> {
         let entries = self
             .entries
             .lock()
@@ -96,7 +96,7 @@ impl GlobalKeyValueRowCache {
         &self,
         control: BranchHeadControl,
         key: &str,
-        row: Option<MaterializedHotStateRow>,
+        row: Option<MaterializedHotStateExactBatch>,
     ) {
         let mut entries = self
             .entries

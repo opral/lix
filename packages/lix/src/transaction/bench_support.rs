@@ -275,6 +275,15 @@ where
         schema_key: &str,
         entity_pk: &str,
     ) -> Result<bool, crate::LixError> {
+        Self::reopen_native_row_on_branch(storage, BENCH_BRANCH_ID, schema_key, entity_pk).await
+    }
+
+    pub async fn reopen_native_row_on_branch(
+        storage: StorageAdapter<StorageImpl>,
+        branch_id: &str,
+        schema_key: &str,
+        entity_pk: &str,
+    ) -> Result<bool, crate::LixError> {
         let hot_state = HotStateContext::new(
             TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
@@ -290,7 +299,7 @@ where
             .load_exact_batch(&crate::hot_state::HotStateExactBatchRequest {
                 rows: vec![crate::hot_state::HotStateExactRowRequest {
                     schema_key: schema_key.to_owned(),
-                    branch_id: BENCH_BRANCH_ID.to_owned(),
+                    branch_id: branch_id.to_owned(),
                     entity_pk: EntityPk::uuid_from_canonical(entity_pk)
                         .expect("reopened native-row UUID should be canonical"),
                     file_id: None,
@@ -312,6 +321,21 @@ where
         schema_key: &str,
         entity_pk: &str,
     ) -> Vec<u8> {
+        Self::native_uuid_physical_key_on_branch(
+            storage,
+            BENCH_BRANCH_ID,
+            schema_key,
+            entity_pk,
+        )
+        .await
+    }
+
+    pub async fn native_uuid_physical_key_on_branch(
+        storage: StorageAdapter<StorageImpl>,
+        branch_id: &str,
+        schema_key: &str,
+        entity_pk: &str,
+    ) -> Vec<u8> {
         let read = SharedStorageAdapterRead::new(
             storage
                 .begin_read(StorageReadOptions::default())
@@ -320,12 +344,12 @@ where
         );
         let control = BranchHeadControlContext::new()
             .reader(&read)
-            .load(BENCH_BRANCH_ID)
+            .load(branch_id)
             .await
             .expect("load native-row physical-key branch")
             .expect("native-row physical-key branch should exist");
         crate::hot_state::encoded_hot_row_key_for_probe(
-            BENCH_BRANCH_ID,
+            branch_id,
             control.tracked_generation,
             schema_key,
             EntityPk::uuid_from_canonical(entity_pk)
@@ -333,11 +357,53 @@ where
         )
     }
 
+    pub async fn native_uuid_physical_value_on_branch(
+        storage: StorageAdapter<StorageImpl>,
+        branch_id: &str,
+        schema_key: &str,
+        entity_pk: &str,
+    ) -> Vec<u8> {
+        let key = Self::native_uuid_physical_key_on_branch(
+            storage.clone(),
+            branch_id,
+            schema_key,
+            entity_pk,
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin native-row physical-value read");
+        crate::storage_bench::space_inventory(&read, "hot_state.row.v21")
+            .await
+            .into_iter()
+            .find(|(candidate, _)| candidate == &key)
+            .map(|(_, value)| value)
+            .expect("exact authenticated StateKey has no physical current-state value")
+    }
+
     /// Replaces the requested current-state row with a correctly encoded
     /// native tuple certified for a different same-shaped owner. The next
     /// production retained read must reject it at the StateKey boundary.
     pub async fn substitute_native_uuid_owner(
         storage: StorageAdapter<StorageImpl>,
+        requested_entity_pk: &str,
+        substituted_entity_pk: &str,
+    ) {
+        Self::substitute_native_uuid_owner_on_branch(
+            storage,
+            BENCH_BRANCH_ID,
+            "native_carrier_probe",
+            requested_entity_pk,
+            substituted_entity_pk,
+        )
+        .await;
+    }
+
+    pub async fn substitute_native_uuid_owner_on_branch(
+        storage: StorageAdapter<StorageImpl>,
+        branch_id: &str,
+        schema_key: &str,
         requested_entity_pk: &str,
         substituted_entity_pk: &str,
     ) {
@@ -353,7 +419,7 @@ where
         );
         let control = BranchHeadControlContext::new()
             .reader(&read)
-            .load(BENCH_BRANCH_ID)
+            .load(branch_id)
             .await
             .expect("load native-row substitution branch")
             .expect("native-row substitution branch should exist");
@@ -361,9 +427,9 @@ where
         crate::hot_state::stage_native_owner_substitution_for_probe(
             &read,
             &mut writes,
-            BENCH_BRANCH_ID,
+            branch_id,
             control.tracked_generation,
-            "native_carrier_probe",
+            schema_key,
             &requested,
             &substituted,
         )

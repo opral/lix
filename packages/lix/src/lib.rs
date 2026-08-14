@@ -66,6 +66,7 @@ pub(crate) mod domain;
 mod engine;
 pub(crate) mod entity_columnar;
 pub(crate) mod entity_pk;
+pub(crate) mod native_row;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
 pub(crate) mod gc;

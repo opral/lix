@@ -5,7 +5,6 @@
 )]
 
 use crate::LixError;
-use crate::NullableKeyFilter;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
@@ -24,8 +23,8 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::hot_state::{
-    HotStateContext, HotStateRowRequest, HotTrackedSnapshot, MaterializedHotStateRow,
-    TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    HotTrackedSnapshot, MaterializedHotStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch,
+    WorkingDiffIndexCoverage,
     stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
 };
 use crate::json_store::{
@@ -1713,6 +1712,7 @@ fn transaction_change_record_from_state_row<'a>(
 struct EngineCurrentRow {
     branch_id: String,
     change: ChangeRecord,
+    native_snapshot: crate::transaction_types::NativeRowPayload,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
 }
@@ -1771,10 +1771,19 @@ fn deterministic_sequence_current_row(
     active_account_id: &str,
 ) -> Result<EngineCurrentRow, LixError> {
     let entity_pk = EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY);
-    let snapshot = serde_json::to_string(&serde_json::json!({
+    let snapshot_value = serde_json::json!({
         "key": crate::functions::DETERMINISTIC_SEQUENCE_KEY,
         "value": highest_seen,
-    }))
+    });
+    let native_snapshot = crate::native_row::encode(
+        crate::native_row::seed_schema("lix_key_value")?,
+        &entity_pk,
+        crate::GLOBAL_BRANCH_ID,
+        None,
+        true,
+        &snapshot_value,
+    )?;
+    let snapshot = serde_json::to_string(&snapshot_value)
     .map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1795,6 +1804,7 @@ fn deterministic_sequence_current_row(
             created_at: timestamp,
             origin_key: None,
         },
+        native_snapshot,
         created_at: timestamp,
         updated_at: timestamp,
     })
@@ -2132,7 +2142,7 @@ fn current_state_delta_from_engine_row(
         created_at: row.created_at,
         updated_at: row.updated_at,
         snapshot: row.change.snapshot.as_ref_slot(),
-        native_snapshot: None,
+        native_snapshot: Some(&row.native_snapshot),
         metadata: row.change.metadata.as_ref_slot(),
         columnar_base_coordinate: None,
     }
@@ -6547,12 +6557,6 @@ async fn validate_active_account_and_account_rows(
     prepared_writes: &PreparedWriteSet,
     active_account_id: &str,
 ) -> Result<(), LixError> {
-    let account_pk = EntityPk::uuid_from_canonical(active_account_id).map_err(|_| {
-        LixError::new(
-            "LIX_INVALID_ACCOUNT_ID",
-            format!("active account id '{active_account_id}' is not a canonical UUID"),
-        )
-    })?;
     // Proving the account is active is a hot-state point read plus a JSON
     // parse of its snapshot, and it re-proves the same fact on every commit.
     // The account token identifies the account view this snapshot sees: a
@@ -6569,37 +6573,9 @@ async fn validate_active_account_and_account_rows(
     {
         return validate_prepared_account_rows(prepared_writes);
     }
-    let account = HotStateContext::new(
-        TrackedStateContext::new(),
-        crate::commit_graph::CommitGraphContext::new(),
-    )
-    .reader(&*read)
-    .load_row(&HotStateRowRequest {
-        schema_key: "lix_account".to_string(),
-        branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
-        entity_pk: account_pk,
-        file_id: NullableKeyFilter::Null,
-    })
-    .await?;
-    if let Some(account) = account {
-        let account_snapshot = account.snapshot_content.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("account '{active_account_id}' has no snapshot"),
-            )
-        })?;
-        let account_value: serde_json::Value =
-            serde_json::from_str(&account_snapshot).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("account '{active_account_id}' has invalid JSON: {error}"),
-                )
-            })?;
-        if account_value
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            != Some("active")
-        {
+    let account_status = crate::account::load_account_status(&*read, active_account_id).await?;
+    if let Some(account_status) = account_status {
+        if account_status != "active" {
             return Err(LixError::new(
                 "LIX_ACCOUNT_DISABLED",
                 format!("active account '{active_account_id}' is disabled"),

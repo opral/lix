@@ -347,13 +347,24 @@ mod tests {
     }
 
     async fn write_key_value(storage: StorageAdapter, key: &str, value: serde_json::Value) {
-        let snapshot_content = serde_json::to_string(&serde_json::json!({
+        let snapshot_value = serde_json::json!({
             "key": key,
             "value": value,
-        }))
+        });
+        let snapshot_content = serde_json::to_string(&snapshot_value)
         .expect("snapshot should serialize");
         let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
         let entity_pk = EntityPk::single(key);
+        let native_snapshot = crate::native_row::encode(
+            crate::native_row::seed_schema("lix_key_value")
+                .expect("lix_key_value schema should exist"),
+            &entity_pk,
+            GLOBAL_BRANCH_ID,
+            None,
+            true,
+            &snapshot_value,
+        )
+        .expect("test key-value tuple should encode");
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -385,7 +396,7 @@ mod tests {
                     created_at: timestamp,
                     updated_at: timestamp,
                     snapshot: snapshot.as_ref_slot(),
-                    native_snapshot: None,
+                    native_snapshot: Some(&native_snapshot),
                     metadata: crate::json_store::JsonSlotRef::None,
                     columnar_base_coordinate: None,
                 }],

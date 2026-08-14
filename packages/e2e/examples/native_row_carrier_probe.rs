@@ -5,9 +5,9 @@ use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{NativeRowDurableCounters, native_row_durable_counters};
 use lix::transaction::bench::BenchTransactionFixture;
+use lix::{Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
-use std::sync::Arc;
 
 const ID: &str = "018f8b7c-2d91-7b4d-8c41-5dbacb2fca21";
 const WRONG_ID: &str = "018f8b7c-2d91-7b4d-8c41-5dbacb2fca22";
@@ -83,36 +83,55 @@ async fn run_backend<S: DurableFixture>(path: PathBuf) {
             {"name": "count", "type": "int8", "nullable": false},
             {"name": "ratio", "type": "float8", "nullable": false},
             {"name": "active", "type": "boolean", "nullable": false},
-            {"name": "created_at", "type": "timestamptz", "nullable": false}
+            {"name": "created_at", "type": "timestamptz", "nullable": false, "default_expression": "CURRENT_TIMESTAMP"}
         ],
         "primary_key": ["id"]
     });
-    let value = Arc::new(serde_json::json!({
-        "id": ID,
-        "label": "ready",
-        "count": 42,
-        "ratio": 1.5,
-        "active": true,
-        "created_at": "2026-01-02T03:04:05Z"
-    }));
-    let mut fixture = BenchTransactionFixture::new_with_schema_definition(
-        StorageAdapter::new(storage.clone()),
-        vec![],
-        Some(schema.clone()),
-    )
-    .await;
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("initialize public native-row repository");
+    let registration = lix
+        .open_another_session()
+        .await
+        .expect("open public registration session");
+    registration
+        .execute(
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+            &[
+                Value::Text("native_carrier_probe".into()),
+                Value::Text(schema.to_string()),
+            ],
+        )
+        .await
+        .expect("register public native-row schema");
+    drop(registration);
+    let session = lix
+        .open_another_session()
+        .await
+        .expect("open public native-row session");
+    let branch_id = session.active_branch_id().await.expect("active branch");
     let before = native_row_durable_counters();
-    assert_eq!(
-        fixture
-            .insert_native_uuid_row("native_carrier_probe", ID, value)
-            .await
-            .logical_rows,
-        1
-    );
+    session
+        .execute(
+            "INSERT INTO native_carrier_probe (id, label, count, ratio, active) VALUES ($1, 'ready', 42, 1.5, true)",
+            &[Value::Text(ID.into())],
+        )
+        .await
+        .expect("insert public native row");
     let after_insert = native_row_durable_counters();
+    let selected = session
+        .execute(
+            "SELECT id, label, count, ratio, active, created_at FROM native_carrier_probe WHERE id = $1",
+            &[Value::Text(ID.into())],
+        )
+        .await
+        .expect("select public native row");
+    assert_eq!(selected.len(), 1);
     assert!(
-        BenchTransactionFixture::reopen_native_row(
+        BenchTransactionFixture::<S>::reopen_native_row_on_branch(
             StorageAdapter::new(storage.clone()),
+            &branch_id,
             "native_carrier_probe",
             ID,
         )
@@ -120,18 +139,13 @@ async fn run_backend<S: DurableFixture>(path: PathBuf) {
         .expect("read retained native scalar tuple"),
         "retained read did not expose the native scalar tuple"
     );
-    let hot_rows = fixture.space_inventory("hot_state.row.v21").await;
-    let expected_key = BenchTransactionFixture::native_uuid_physical_key(
+    let native_value = BenchTransactionFixture::<S>::native_uuid_physical_value_on_branch(
         StorageAdapter::new(storage.clone()),
+        &branch_id,
         "native_carrier_probe",
         ID,
     )
     .await;
-    let native_value = hot_rows
-        .iter()
-        .find(|(key, _)| key == &expected_key)
-        .map(|(_, value)| value)
-        .expect("exact authenticated StateKey has no physical current-state value");
     let magic_offset = native_value
         .windows(b"LIXROW01".len())
         .position(|window| window == b"LIXROW01")
@@ -167,15 +181,17 @@ async fn run_backend<S: DurableFixture>(path: PathBuf) {
     assert_eq!(retained_read.whole_row_json_reads, 0);
     assert_eq!(retained_read.whole_row_json_read_bytes, 0);
 
-    drop(fixture);
+    drop(session);
+    drop(lix);
     storage.flush_all().await;
     drop(storage);
 
     let reopened_storage = S::open_at(&path);
     let before_reopen = native_row_durable_counters();
     assert!(
-        BenchTransactionFixture::reopen_native_row(
+        BenchTransactionFixture::<S>::reopen_native_row_on_branch(
             StorageAdapter::new(reopened_storage.clone()),
+            &branch_id,
             "native_carrier_probe",
             ID,
         )
@@ -190,14 +206,17 @@ async fn run_backend<S: DurableFixture>(path: PathBuf) {
     );
     assert_eq!(cold.whole_row_json_reads, 0);
     assert_eq!(cold.whole_row_json_read_bytes, 0);
-    BenchTransactionFixture::substitute_native_uuid_owner(
+    BenchTransactionFixture::<S>::substitute_native_uuid_owner_on_branch(
         StorageAdapter::new(reopened_storage.clone()),
+        &branch_id,
+        "native_carrier_probe",
         ID,
         WRONG_ID,
     )
     .await;
-    let substitution = BenchTransactionFixture::reopen_native_row(
+    let substitution = BenchTransactionFixture::<S>::reopen_native_row_on_branch(
         StorageAdapter::new(reopened_storage.clone()),
+        &branch_id,
         "native_carrier_probe",
         ID,
     )

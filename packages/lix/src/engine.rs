@@ -237,35 +237,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let Some(row) = self
-            .hot_state
-            .reader(read)
-            .load_row(&HotStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(physical_key),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-        else {
-            return Ok(None);
-        };
-        // Client state is only ever written untracked; a tracked row under the
-        // same key is not client state and must not answer this read.
-        if row.deleted || !row.untracked {
-            return Ok(None);
-        }
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-            return Ok(None);
-        };
-        let snapshot: serde_json::Value =
-            serde_json::from_str(snapshot_content).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("invalid lix_key_value snapshot JSON: {error}"),
-                )
-            })?;
-        Ok(snapshot.get("value").cloned())
+        crate::functions::load_untracked_key_value(&read, physical_key).await
     }
 
     pub(crate) async fn open_session_at(
@@ -419,26 +391,12 @@ where
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
-        let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
-            LixError::new(
-                "LIX_INVALID_ACCOUNT_ID",
-                format!("active account id '{account_id}' is not a canonical UUID"),
-            )
-        })?;
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let row = self
-            .hot_state
-            .reader(read)
-            .load_row(&HotStateRowRequest {
-                schema_key: "lix_account".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: account_pk,
-                file_id: NullableKeyFilter::Null,
-            })
+        let status = crate::account::load_account_status(&read, account_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -446,19 +404,7 @@ where
                     format!("active account '{account_id}' does not exist"),
                 )
             })?;
-        let snapshot = row.snapshot_content.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("account '{account_id}' has no snapshot"),
-            )
-        })?;
-        let value: serde_json::Value = serde_json::from_str(&snapshot).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("account '{account_id}' has invalid JSON: {error}"),
-            )
-        })?;
-        if value.get("status").and_then(serde_json::Value::as_str) != Some("active") {
+        if status != "active" {
             return Err(LixError::new(
                 "LIX_ACCOUNT_DISABLED",
                 format!("active account '{account_id}' is disabled"),

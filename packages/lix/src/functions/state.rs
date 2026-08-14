@@ -1,5 +1,4 @@
 use serde_json::Value as JsonValue;
-use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
@@ -11,12 +10,10 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::hot_state::{
-    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRow,
-    TrackedHeadContext,
+    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain,
+    MaterializedHotStateExactBatch, TrackedHeadContext,
 };
-use crate::json_store::{
-    JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
-};
+use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
 
@@ -57,6 +54,19 @@ pub(crate) async fn load_sequence(
     parse_sequence_value(value)
 }
 
+/// Reads one global untracked `lix_key_value` cell from its authenticated
+/// native tuple. Public/system callers share this owner instead of rebuilding
+/// a JSON snapshot reader.
+pub(crate) async fn load_untracked_key_value(
+    read: &(impl StorageAdapterRead + ?Sized),
+    key: &str,
+) -> Result<Option<JsonValue>, LixError> {
+    load_key_value_row(read, None, key)
+        .await?
+        .map(|rows| key_value_payload(&rows, key))
+        .transpose()
+}
+
 /// Persists the highest deterministic sequence value used by an execution.
 ///
 /// The row is untracked global `lix_key_value` current state. It never enters
@@ -68,18 +78,19 @@ pub(crate) async fn stage_sequence(
     timestamp: LixTimestamp,
     change_id: ChangeId,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
+    let snapshot = serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
         "value": sequence.highest_seen,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("deterministic sequence snapshot serialization failed: {error}"),
-        )
-    })?;
-    let snapshot = NormalizedJson::from_arc_unchecked(Arc::from(snapshot_content.as_str()));
+    });
     let entity_pk = EntityPk::single(DETERMINISTIC_SEQUENCE_KEY);
+    let native_snapshot = crate::native_row::encode(
+        key_value_schema(),
+        &entity_pk,
+        GLOBAL_BRANCH_ID,
+        None,
+        true,
+        &snapshot,
+    )?;
     let mut observations = BranchHeadControlContext::new()
         .reader(read)
         .load_observed(&[GLOBAL_BRANCH_ID.to_string()])
@@ -91,16 +102,7 @@ pub(crate) async fn stage_sequence(
             "global branch control is missing while staging deterministic state",
         )
     })?;
-    let mut preconditions = Vec::with_capacity(2);
-    JsonStoreContext::new().writer().stage_batch(
-        writes,
-        JsonWritePlacementRef::OutOfBand,
-        [NormalizedJsonRef::from(&snapshot)],
-    )?;
-    // This lane commits its own write set, outside the ordinary commit path's
-    // fence, so it takes the publisher half itself.
-    crate::json_store::stage_json_publication_fence(read, writes, &mut preconditions).await?;
-    let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
+    let mut preconditions = Vec::with_capacity(1);
     let next_revision = control
         .next_current_state_revision()?
         .current_state_revision;
@@ -122,8 +124,8 @@ pub(crate) async fn stage_sequence(
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
-                snapshot: snapshot_slot.as_ref_slot(),
-                native_snapshot: None,
+                snapshot: crate::json_store::JsonSlotRef::None,
+                native_snapshot: Some(&native_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 columnar_base_coordinate: None,
             }],
@@ -148,7 +150,7 @@ async fn load_key_value_row(
     read: &(impl StorageAdapterRead + ?Sized),
     cache: Option<&GlobalKeyValueRowCache>,
     key: &str,
-) -> Result<Option<MaterializedHotStateRow>, LixError> {
+) -> Result<Option<MaterializedHotStateExactBatch>, LixError> {
     let Some(control) = BranchHeadControlContext::new()
         .reader(read)
         .load(GLOBAL_BRANCH_ID)
@@ -177,7 +179,7 @@ async fn load_key_value_row(
             file_id: None,
         }];
         let projection = ChangeRecordProjection {
-            snapshot_content: true,
+            snapshot_content: false,
             metadata: false,
         };
         let reader = TrackedHeadContext::new().reader(read);
@@ -222,7 +224,7 @@ async fn load_key_value_row(
                 ),
             ));
         }
-        Some(row.to_owned())
+        Some(rows)
     };
     if let Some(cache) = cache {
         cache.insert(control, key, row.clone());
@@ -230,32 +232,54 @@ async fn load_key_value_row(
     Ok(row)
 }
 
-fn key_value_payload(row: &MaterializedHotStateRow, key: &str) -> Result<JsonValue, LixError> {
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("deterministic key-value row '{key}' is missing snapshot_content"),
-        )
-    })?;
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("deterministic key-value row '{key}' has invalid JSON: {error}"),
-        )
-    })?;
-    let stored_key = snapshot.get("key").and_then(JsonValue::as_str);
-    if stored_key != Some(key) {
+fn key_value_schema() -> &'static lix_schema::Schema {
+    crate::native_row::seed_schema(KEY_VALUE_SCHEMA_KEY)
+        .expect("compile-time lix_key_value Schema v1 definition must be valid")
+}
+
+fn key_value_payload(
+    rows: &MaterializedHotStateExactBatch,
+    key: &str,
+) -> Result<JsonValue, LixError> {
+    if rows.len() != 1 {
         return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("deterministic key-value row '{key}' has mismatched key field"),
+            LixError::CODE_STORAGE_ERROR,
+            format!("deterministic key-value lookup '{key}' returned {} rows", rows.len()),
         ));
     }
-    snapshot.get("value").cloned().ok_or_else(|| {
+    let row = rows.row(0).ok_or_else(|| {
         LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("deterministic key-value row '{key}' is missing value"),
+            LixError::CODE_STORAGE_ERROR,
+            format!("deterministic key-value lookup '{key}' returned an empty slot"),
         )
-    })
+    })?;
+    if row.schema_key() != KEY_VALUE_SCHEMA_KEY
+        || row.entity_pk().as_single_string()? != key
+        || row.file_id().is_some()
+        || row.branch_id() != GLOBAL_BRANCH_ID
+        || !row.global()
+        || !row.untracked()
+        || row.deleted()
+    {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("deterministic key-value row '{key}' has mismatched state identity"),
+        ));
+    }
+    let native = row.native_snapshot().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("deterministic key-value row '{key}' is missing its native scalar tuple"),
+        )
+    })?;
+    let values = crate::native_row::decode(key_value_schema(), native)?;
+    let [lix_schema::value_layout::BodyValue::Jsonb(value)] = values.as_slice() else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("deterministic key-value row '{key}' has an invalid native value tuple"),
+        ));
+    };
+    Ok(value.clone())
 }
 
 fn parse_mode_value(value: JsonValue) -> Result<DeterministicMode, LixError> {
@@ -554,19 +578,36 @@ mod tests {
             Some(ChangeId::for_test_label("sequence-change-7"))
         );
         assert_eq!(row.commit_id, None);
+        assert_eq!(row.snapshot_content, None);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("native sequence read should open");
         assert_eq!(
-            row.snapshot_content.as_deref(),
-            Some("{\"key\":\"lix_deterministic_sequence_number\",\"value\":7}")
+            load_sequence(&read, None)
+                .await
+                .expect("native sequence should decode"),
+            DeterministicSequence { highest_seen: 7 }
         );
     }
 
     async fn write_test_key_value(storage: StorageAdapter, key: &str, value: JsonValue) {
-        let snapshot_content = serde_json::to_string(&serde_json::json!({
+        let snapshot_value = serde_json::json!({
             "key": key,
             "value": value,
-        }))
-        .expect("snapshot should serialize");
+        });
+        let snapshot_content =
+            serde_json::to_string(&snapshot_value).expect("snapshot should serialize");
         let entity_pk = EntityPk::single(key);
+        let native_snapshot = crate::native_row::encode(
+            key_value_schema(),
+            &entity_pk,
+            GLOBAL_BRANCH_ID,
+            None,
+            true,
+            &snapshot_value,
+        )
+        .expect("test key-value tuple should encode");
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -598,7 +639,7 @@ mod tests {
                     created_at: test_timestamp(),
                     updated_at: test_timestamp(),
                     snapshot: snapshot.as_ref_slot(),
-                    native_snapshot: None,
+                    native_snapshot: Some(&native_snapshot),
                     metadata: crate::json_store::JsonSlotRef::None,
                     columnar_base_coordinate: None,
                 }],

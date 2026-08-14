@@ -743,24 +743,6 @@ impl TableSpec for EntitySpec {
                         record_rows_examined(entity_pks.len());
                         return entity_primary_key_record_batch(&spec, schema, entity_pks);
                     }
-                    if let Some(direct_entity_snapshot) = direct_entity_snapshot
-                        && let Some(rows) = direct_entity_snapshot
-                            .scan_entity_snapshots(request.clone())
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                    {
-                        record_rows_examined(rows.len());
-                        let decoder = EntityProjectionDecoder::new(
-                            &spec,
-                            schema.fields().iter().map(|field| field.name().as_str()),
-                        )
-                        .map_err(entity_projection_error_to_datafusion_error)?;
-                        let columns = decoder
-                            .decode_arrow_columns(rows.iter().map(Option::as_deref))
-                            .map_err(entity_projection_error_to_datafusion_error)?;
-                        return RecordBatch::try_new(schema, columns)
-                            .map_err(DataFusionError::from);
-                    }
                     let rows = hot_state
                         .scan_batch(&request)
                         .await

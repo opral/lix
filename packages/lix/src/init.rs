@@ -458,9 +458,35 @@ where
         // The initial commit is shared, but the branch-scoped marker and
         // groups are intentionally independent so normal reads never need a
         // reconstruction path immediately after initialization.
+        let native_head_payloads = plan
+            .changes
+            .iter()
+            .zip(&authored_changes)
+            .map(|(seed, change)| {
+                let snapshot = serde_json::from_str::<serde_json::Value>(&seed.snapshot_content)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "initial Schema v1 row '{}' is invalid JSON: {error}",
+                                seed.schema_key
+                            ),
+                        )
+                    })?;
+                crate::native_row::encode(
+                    crate::native_row::seed_schema(&seed.schema_key)?,
+                    &change.entity_pk,
+                    GLOBAL_BRANCH_ID,
+                    change.file_id.as_deref(),
+                    false,
+                    &snapshot,
+                )
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
         let tracked_head_deltas = authored_changes
             .iter()
-            .map(|change| CurrentStateDeltaRef {
+            .zip(&native_head_payloads)
+            .map(|(change, native)| CurrentStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
                 entity_pk: &change.entity_pk,
@@ -471,7 +497,7 @@ where
                 created_at: change.created_at,
                 updated_at: change.created_at,
                 snapshot: change.snapshot.as_ref_slot(),
-                native_snapshot: None,
+                native_snapshot: Some(native),
                 metadata: change.metadata.as_ref_slot(),
                 columnar_base_coordinate: None,
             })

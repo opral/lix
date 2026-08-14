@@ -18,6 +18,7 @@ pub(crate) use provider::{
 #[cfg(feature = "storage-benches")]
 pub(crate) use state::DETERMINISTIC_MODE_KEY;
 pub(crate) use state::DETERMINISTIC_SEQUENCE_KEY;
+pub(crate) use state::load_untracked_key_value;
 pub(crate) use types::{DeterministicMode, DeterministicSequence};
 
 pub(crate) type DeterministicRuntimeGuard = tokio::sync::OwnedMutexGuard<()>;

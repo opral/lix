@@ -45,7 +45,7 @@ pub(crate) struct CatalogContext {
 }
 
 /// Fingerprint of the raw catalog rows visible to a domain, hashed before any
-/// JSON decoding. The raw `snapshot_content` bytes uniquely determine the
+/// JSONB-cell decoding. The native layout/body bytes uniquely determine the
 /// decoded facts, so this key is at least as discriminating as the facts
 /// fingerprint: textual or ordering variations can only cause a conservative
 /// cache miss, never a wrong hit.
@@ -132,11 +132,11 @@ impl CatalogContext {
         let mut hasher = blake3::Hasher::new();
         for (schema_domain, row) in catalog_rows.iter() {
             hash_fingerprint_part(&mut hasher, &schema_domain.fingerprint_component());
-            let snapshot_content = row
-                .snapshot_content()
-                .map(|content| content.as_str())
-                .expect("catalog rows are filtered to rows with snapshot_content");
-            hash_fingerprint_part(&mut hasher, snapshot_content);
+            let native = row
+                .native_snapshot()
+                .expect("catalog rows are filtered to rows with native tuples");
+            hasher.update(&native.layout_id);
+            hasher.update(&native.body);
         }
         let fingerprint = CatalogRowsFingerprint(hasher.finalize().to_hex().to_string());
 
@@ -337,7 +337,8 @@ fn row_belongs_to_schema_catalog_domain(
 ) -> bool {
     row.schema_key() == REGISTERED_SCHEMA_KEY
         && row.file_id().is_none()
-        && row.snapshot_content().is_some()
+        && !row.deleted()
+        && row.native_snapshot().is_some()
         && row.branch_id() == domain.branch_id()
         && row.untracked() == domain.untracked()
         && committed_row_ref_is_exact_branch_scoped(row, domain.branch_id())
@@ -356,16 +357,27 @@ fn decode_registered_schema_row(
         ));
     }
 
-    let Some(snapshot_content) = row.snapshot_content().map(|content| content.as_str()) else {
+    if row.deleted() {
         return Ok(None);
-    };
-
-    let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|err| {
+    }
+    let native = row.native_snapshot().ok_or_else(|| {
         LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("invalid registered schema snapshot JSON: {err}"),
+            LixError::CODE_STORAGE_ERROR,
+            "registered schema current-state row is missing its native scalar tuple",
         )
     })?;
+    let values = crate::native_row::decode(
+        crate::native_row::seed_schema(REGISTERED_SCHEMA_KEY)?,
+        native,
+    )?;
+    let [lix_schema::value_layout::BodyValue::Jsonb(value)] = values.as_slice() else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "registered schema current-state row has an invalid native value tuple",
+        ));
+    };
+    let schema_key = row.entity_pk().as_single_string()?;
+    let snapshot = serde_json::json!({ "schema_key": schema_key, "value": value });
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
     Ok(Some((key, schema)))
 }
