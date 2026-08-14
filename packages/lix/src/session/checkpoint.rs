@@ -171,6 +171,11 @@ where
             // write gate; concurrent schedules serialize, and only the first
             // one that still sees debt performs work.
             let gc_session = self.clone();
+            #[cfg(not(target_family = "wasm"))]
+            crate::background_task::spawn("lix-checkpoint-gc", move || async move {
+                gc_session.collect_checkpoint_garbage_best_effort().await;
+            })?;
+            #[cfg(target_family = "wasm")]
             tokio::spawn(async move {
                 gc_session.collect_checkpoint_garbage_best_effort().await;
             });

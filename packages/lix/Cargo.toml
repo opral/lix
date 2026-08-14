@@ -146,6 +146,7 @@ parking_lot = "0.12"
 uuid = { version = "1", features = ["v5", "v7", "std", "js", "fast-rng"] }
 web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-lite = "2"
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 blake3 = "1"

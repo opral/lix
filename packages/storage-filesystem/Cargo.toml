@@ -24,6 +24,7 @@ notify-debouncer-full = { version = "0.7.0", default-features = false, features 
 tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
+futures-lite = "2"
 tempfile = "3"
 
 [[example]]

@@ -55,6 +55,28 @@ fn actor_contract_types_are_public(
 ) {
 }
 
+#[test]
+fn public_sdk_opens_writes_and_reads_without_a_tokio_runtime() {
+    futures_lite::future::block_on(async {
+        let lix = open_lix().await.expect("open Lix under plain block_on");
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('executor', lix_json('true'))",
+            &[],
+        )
+        .await
+        .expect("write under plain block_on");
+        let result = lix
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'executor'",
+                &[],
+            )
+            .await
+            .expect("read under plain block_on");
+        assert_eq!(result.rows().len(), 1);
+        lix.close().await.expect("close under plain block_on");
+    });
+}
+
 #[tokio::test]
 async fn custom_runtime_is_usable_through_the_public_sdk() {
     let lix = open_lix()

@@ -112,9 +112,11 @@ impl ObserveInvalidation {
             }
         };
         let invalidation = Arc::downgrade(self);
-        tokio::spawn(async move {
+        crate::background_task::spawn("lix-observe-invalidation", move || async move {
             loop {
-                tokio::time::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL).await;
+                // This is a dedicated Lix-owned worker. Sleeping the worker
+                // thread avoids requiring a Tokio timer driver from the host.
+                std::thread::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL);
                 let Some(invalidation) = invalidation.upgrade() else {
                     break;
                 };
@@ -148,7 +150,7 @@ impl ObserveInvalidation {
                     invalidation.bump();
                 }
             }
-        });
+        })?;
         *watcher_started = true;
         Ok(())
     }
