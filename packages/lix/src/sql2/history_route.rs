@@ -355,6 +355,32 @@ pub(crate) async fn load_history_entries<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    load_history_entries_with_payload_projection(
+        descriptor,
+        commit_graph,
+        query_source,
+        route,
+        schema_keys,
+        metadata_projection,
+        crate::sql2::change_materialization::ChangePayloadProjection::ALL,
+        limit,
+    )
+    .await
+}
+
+pub(crate) async fn load_history_entries_with_payload_projection<S>(
+    descriptor: HistoryViewDescriptor<'_>,
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    route: &HistoryRoute,
+    schema_keys: Vec<String>,
+    metadata_projection: HistoryMetadataProjection,
+    payload_projection: crate::sql2::change_materialization::ChangePayloadProjection,
+    limit: Option<usize>,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     if route.invalid_as_of_commit_filter {
         return Err(invalid_history_anchor_error(
             descriptor.as_of_commit_column,
@@ -408,7 +434,12 @@ where
             .collect::<BTreeMap<_, _>>();
 
         for entry in entries {
-            let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
+            let change = materialize_located_history_change(
+                &mut json_reader,
+                entry.change,
+                payload_projection,
+            )
+            .await?;
             let commit_created_at = if metadata_projection.commit_created_at {
                 Some(
                     reachable_by_id

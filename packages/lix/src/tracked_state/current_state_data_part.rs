@@ -10,9 +10,6 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 
-use crate::changelog::{
-    AuthenticatedNativeRow, ChangePayload, CommitId, NativeRowField, NativeScalarCell,
-};
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageSpace, StorageSpaceId, ValueSemantics};
 use crate::tracked_state::codec::decode_value;
@@ -21,7 +18,7 @@ use crate::{LixError, storage_codec};
 
 pub(crate) const CURRENT_STATE_DATA_PART_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_002f),
-    "tracked_state.current_state_data_part.v2",
+    "tracked_state.current_state_data_part.v1",
     ValueSemantics::Immutable,
 );
 pub(crate) const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace = StorageSpace::declare(
@@ -34,16 +31,16 @@ pub(crate) const CURRENT_STATE_DATA_PART_MAX_ROWS: usize = 512;
 pub(crate) const CURRENT_STATE_DATA_PART_TARGET_BYTES: usize = 64 * 1024;
 const CURRENT_STATE_DATA_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CURRENT_STATE_DATA_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
-const RAW_MAGIC: &[u8; 7] = b"LXCSP02";
-const ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ2";
-const DIGEST_CONTEXT: &str = "lix native current-state data part v2";
+const RAW_MAGIC: &[u8; 7] = b"LXCSP01";
+const ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ1";
+const DIGEST_CONTEXT: &str = "lix native current-state data part v1";
 const REFS_DIGEST_CONTEXT: &str = "lix native current-state data part refs v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CurrentStateDataRow {
     pub(crate) encoded_key: Vec<u8>,
     pub(crate) value: TrackedStateIndexValue,
-    pub(crate) snapshot: ChangePayload,
+    pub(crate) snapshot: JsonSlot,
     pub(crate) metadata: JsonSlot,
 }
 
@@ -54,153 +51,10 @@ struct StoredCurrentStateDataRow {
     encoded_key: Vec<u8>,
     #[musli(bytes)]
     encoded_value: Vec<u8>,
-    payload_kind: u8,
     #[musli(with = crate::json_store::json_slot_storage)]
     snapshot: JsonSlot,
-    native: Vec<StoredNativeRow>,
     #[musli(with = crate::json_store::json_slot_storage)]
     metadata: JsonSlot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredNativeRow {
-    owner_commit_id: [u8; 16],
-    row_group_set_id: [u8; 16],
-    manifest_digest: [u8; 32],
-    state_key_digest: [u8; 32],
-    layout_fingerprint: String,
-    semantic_payload_digest: [u8; 32],
-    fields: Vec<StoredNativeRowField>,
-    cells: Vec<StoredNativeScalarCell>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-enum StoredNativeRowField {
-    PrimaryKey { name: String, component_index: u32 },
-    Cell { name: String, cell_index: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-enum StoredNativeScalarCell {
-    Null,
-    Text(String),
-    Uuid([u8; 16]),
-    Int8(i64),
-    Float8Bits(u64),
-    Boolean(bool),
-    Jsonb(Vec<u8>),
-    Timestamptz(crate::common::LixTimestamp),
-}
-
-impl From<&NativeScalarCell> for StoredNativeScalarCell {
-    fn from(cell: &NativeScalarCell) -> Self {
-        match cell {
-            NativeScalarCell::Null => Self::Null,
-            NativeScalarCell::Text(value) => Self::Text(value.clone()),
-            NativeScalarCell::Uuid(value) => Self::Uuid(*value),
-            NativeScalarCell::Int8(value) => Self::Int8(*value),
-            NativeScalarCell::Float8Bits(value) => Self::Float8Bits(*value),
-            NativeScalarCell::Boolean(value) => Self::Boolean(*value),
-            NativeScalarCell::Jsonb(value) => Self::Jsonb(value.clone()),
-            NativeScalarCell::Timestamptz(value) => Self::Timestamptz(*value),
-        }
-    }
-}
-
-impl From<StoredNativeScalarCell> for NativeScalarCell {
-    fn from(cell: StoredNativeScalarCell) -> Self {
-        match cell {
-            StoredNativeScalarCell::Null => Self::Null,
-            StoredNativeScalarCell::Text(value) => Self::Text(value),
-            StoredNativeScalarCell::Uuid(value) => Self::Uuid(value),
-            StoredNativeScalarCell::Int8(value) => Self::Int8(value),
-            StoredNativeScalarCell::Float8Bits(value) => Self::Float8Bits(value),
-            StoredNativeScalarCell::Boolean(value) => Self::Boolean(value),
-            StoredNativeScalarCell::Jsonb(value) => Self::Jsonb(value),
-            StoredNativeScalarCell::Timestamptz(value) => Self::Timestamptz(value),
-        }
-    }
-}
-
-fn stored_payload(payload: &ChangePayload) -> (u8, JsonSlot, Vec<StoredNativeRow>) {
-    match payload {
-        ChangePayload::Tombstone => (0, JsonSlot::None, Vec::new()),
-        ChangePayload::Json(slot) => (1, slot.clone(), Vec::new()),
-        ChangePayload::Native(row) => (
-            2,
-            JsonSlot::None,
-            vec![StoredNativeRow {
-                owner_commit_id: *row.owner_commit_id.as_uuid().as_bytes(),
-                row_group_set_id: row.row_group_set_id,
-                manifest_digest: row.manifest_digest,
-                state_key_digest: row.state_key_digest,
-                layout_fingerprint: row.layout_fingerprint.clone(),
-                semantic_payload_digest: row.semantic_payload_digest,
-                fields: row
-                    .fields
-                    .iter()
-                    .map(|field| match field {
-                        NativeRowField::PrimaryKey {
-                            name,
-                            component_index,
-                        } => StoredNativeRowField::PrimaryKey {
-                            name: name.clone(),
-                            component_index: *component_index,
-                        },
-                        NativeRowField::Cell { name, cell_index } => StoredNativeRowField::Cell {
-                            name: name.clone(),
-                            cell_index: *cell_index,
-                        },
-                    })
-                    .collect(),
-                cells: row.cells.iter().map(Into::into).collect(),
-            }],
-        ),
-    }
-}
-
-fn decoded_payload(
-    kind: u8,
-    snapshot: JsonSlot,
-    mut native: Vec<StoredNativeRow>,
-) -> Result<ChangePayload, LixError> {
-    match (kind, snapshot, native.as_slice()) {
-        (0, JsonSlot::None, []) => Ok(ChangePayload::Tombstone),
-        (1, JsonSlot::Inline(value), []) => {
-            Ok(ChangePayload::Json(JsonSlot::Inline(value)))
-        }
-        (1, JsonSlot::Ref(value), []) => Ok(ChangePayload::Json(JsonSlot::Ref(value))),
-        (2, JsonSlot::None, [_]) => {
-            let row = native.pop().expect("one native payload was validated");
-            Ok(ChangePayload::Native(AuthenticatedNativeRow {
-            owner_commit_id: CommitId::new(uuid::Uuid::from_bytes(row.owner_commit_id)),
-            row_group_set_id: row.row_group_set_id,
-            manifest_digest: row.manifest_digest,
-            state_key_digest: row.state_key_digest,
-            layout_fingerprint: row.layout_fingerprint,
-            semantic_payload_digest: row.semantic_payload_digest,
-            fields: row
-                .fields
-                .into_iter()
-                .map(|field| match field {
-                    StoredNativeRowField::PrimaryKey {
-                        name,
-                        component_index,
-                    } => NativeRowField::PrimaryKey {
-                        name,
-                        component_index,
-                    },
-                    StoredNativeRowField::Cell { name, cell_index } => {
-                        NativeRowField::Cell { name, cell_index }
-                    }
-                })
-                .collect(),
-            cells: row.cells.into_iter().map(Into::into).collect(),
-            }))
-        }
-        _ => Err(part_error("payload authority is malformed or duplicated")),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -221,24 +75,19 @@ pub(crate) fn encode_current_state_data_part(
     validate_rows(rows)?;
     let stored = rows
         .iter()
-        .map(|row| {
-            let (payload_kind, snapshot, native) = stored_payload(&row.snapshot);
-            StoredCurrentStateDataRow {
-                encoded_key: row.encoded_key.clone(),
-                encoded_value: super::codec::encode_value_ref(
-                    super::types::TrackedStateIndexValueRef {
-                        change_id: row.value.change_id,
-                        commit_id: row.value.commit_id,
-                        deleted: row.value.deleted,
-                        created_at: row.value.created_at,
-                        updated_at: row.value.updated_at,
-                    },
-                ),
-                payload_kind,
-                snapshot,
-                native,
-                metadata: row.metadata.clone(),
-            }
+        .map(|row| StoredCurrentStateDataRow {
+            encoded_key: row.encoded_key.clone(),
+            encoded_value: super::codec::encode_value_ref(
+                super::types::TrackedStateIndexValueRef {
+                    change_id: row.value.change_id,
+                    commit_id: row.value.commit_id,
+                    deleted: row.value.deleted,
+                    created_at: row.value.created_at,
+                    updated_at: row.value.updated_at,
+                },
+            ),
+            snapshot: row.snapshot.clone(),
+            metadata: row.metadata.clone(),
         })
         .collect::<Vec<_>>();
     let payload = storage_codec::encode("native current-state data part", &stored)?;
@@ -278,14 +127,7 @@ pub(crate) fn encode_current_state_data_part(
     let digest = digest(&encoded);
     let mut refs = rows
         .iter()
-        .flat_map(|row| {
-            let snapshot = match &row.snapshot {
-                ChangePayload::Json(slot) => Some(slot),
-                ChangePayload::Tombstone | ChangePayload::Native(_) => None,
-            };
-            [snapshot, Some(&row.metadata)]
-        })
-        .flatten()
+        .flat_map(|row| [&row.snapshot, &row.metadata])
         .filter_map(|slot| match slot {
             JsonSlot::Ref(reference) => Some(*reference.as_hash_array()),
             JsonSlot::None | JsonSlot::Inline(_) => None,
@@ -380,7 +222,7 @@ pub(crate) fn decode_current_state_data_part(
             Ok(CurrentStateDataRow {
                 encoded_key: row.encoded_key,
                 value: decode_value(&row.encoded_value)?,
-                snapshot: decoded_payload(row.payload_kind, row.snapshot, row.native)?,
+                snapshot: row.snapshot,
                 metadata: row.metadata,
             })
         })
@@ -392,7 +234,7 @@ pub(crate) fn decode_current_state_data_part(
 pub(crate) fn decode_current_state_data_part_commit_ids(
     expected_digest: &[u8; 32],
     encoded: &[u8],
-) -> Result<BTreeSet<CommitId>, LixError> {
+) -> Result<BTreeSet<crate::changelog::CommitId>, LixError> {
     Ok(decode_current_state_data_part(expected_digest, encoded)?
         .into_iter()
         .map(|row| row.value.commit_id)
@@ -404,16 +246,7 @@ fn validate_rows(rows: &[CurrentStateDataRow]) -> Result<(), LixError> {
         || rows.len() > CURRENT_STATE_DATA_PART_MAX_ROWS
         || rows
             .iter()
-            .any(|row| {
-                row.encoded_key.is_empty()
-                    || row.value.deleted
-                    || row.snapshot.is_none()
-                    || row.snapshot.native_row().is_some_and(|native| {
-                        native.owner_commit_id != row.value.commit_id
-                            || native.state_key_digest
-                                != *blake3::hash(&row.encoded_key).as_bytes()
-                    })
-            })
+            .any(|row| row.encoded_key.is_empty() || row.value.deleted || row.snapshot.is_none())
         || rows
             .windows(2)
             .any(|pair| pair[0].encoded_key >= pair[1].encoded_key)
@@ -462,9 +295,7 @@ mod tests {
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64 + 1),
             },
-            snapshot: ChangePayload::Json(JsonSlot::Inline(
-                format!(r#"{{"index":{index}}}"#).into(),
-            )),
+            snapshot: JsonSlot::Inline(format!(r#"{{"index":{index}}}"#).into()),
             metadata: JsonSlot::None,
         }
     }
@@ -502,41 +333,5 @@ mod tests {
         rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
         rows[0].value.deleted = true;
         assert!(encode_bounded_current_state_data_parts(&rows).is_err());
-    }
-
-    #[test]
-    fn typed_payload_is_key_and_owner_bound_and_round_trips_without_json() {
-        let mut row = row(0);
-        let owner_commit_id = row.value.commit_id;
-        row.snapshot = ChangePayload::Native(AuthenticatedNativeRow {
-            owner_commit_id,
-            row_group_set_id: [1; 16],
-            manifest_digest: [2; 32],
-            state_key_digest: *blake3::hash(&row.encoded_key).as_bytes(),
-            layout_fingerprint: "schema-v1:test-layout".to_owned(),
-            semantic_payload_digest: [3; 32],
-            fields: vec![NativeRowField::Cell {
-                name: "value".to_owned(),
-                cell_index: 0,
-            }],
-            cells: vec![NativeScalarCell::Text("native".to_owned())],
-        });
-
-        let encoded = encode_current_state_data_part(&[row.clone()], &mut None)
-            .expect("typed payload should encode");
-        let decoded = decode_current_state_data_part(&encoded.digest, &encoded.bytes)
-            .expect("typed payload should decode");
-        assert_eq!(decoded, vec![row.clone()]);
-        assert!(matches!(decoded[0].snapshot, ChangePayload::Native(_)));
-
-        if let ChangePayload::Native(native) = &mut row.snapshot {
-            native.owner_commit_id = CommitId::for_test_label("wrong-owner");
-        }
-        assert!(encode_current_state_data_part(&[row.clone()], &mut None).is_err());
-        if let ChangePayload::Native(native) = &mut row.snapshot {
-            native.owner_commit_id = owner_commit_id;
-            native.state_key_digest = [9; 32];
-        }
-        assert!(encode_current_state_data_part(&[row], &mut None).is_err());
     }
 }

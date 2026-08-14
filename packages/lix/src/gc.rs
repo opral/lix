@@ -3563,9 +3563,7 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
             },
-            snapshot: crate::changelog::ChangePayload::from(JsonSlot::Inline(
-                r#"{"native":true}"#.into(),
-            )),
+            snapshot: JsonSlot::Inline(r#"{"native":true}"#.into()),
             metadata: JsonSlot::None,
         };
         let encoded = crate::tracked_state::encode_current_state_data_part(

@@ -46,11 +46,12 @@ impl ChangePayloadProjection {
 pub(crate) async fn materialize_located_history_change<S>(
     json_reader: &mut JsonStoreReader<S>,
     change: crate::commit_graph::CommitGraphChange,
+    payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
     S: StorageAdapterRead,
 {
-    materialize_commit_graph_change(json_reader, change, ChangePayloadProjection::ALL).await
+    materialize_commit_graph_change(json_reader, change, payload_projection).await
 }
 
 pub(crate) async fn materialize_changelog_change_record<S>(

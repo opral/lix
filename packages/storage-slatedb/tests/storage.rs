@@ -5,6 +5,8 @@
 
 #[path = "../../lix/tests/adapter_deterministic_sequence_corruption.rs"]
 mod deterministic_sequence_corruption;
+#[path = "../../lix/tests/support/registered_native_singleton.rs"]
+mod registered_native_singleton;
 #[path = "../../lix/tests/adapter_undo_redo_checkpoint.rs"]
 mod undo_redo_checkpoint;
 
@@ -136,6 +138,19 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
             .expect("byte length should decode"),
         3
     );
+}
+
+#[tokio::test]
+async fn registered_native_singleton_survives_slatedb_cold_reopen() {
+    let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
+    let path = temp_dir.path().join("registered-native-singleton.slatedb");
+    let storage = SlateDB::open(&path).expect("open SlateDB storage");
+    registered_native_singleton::stage_and_assert_registered_singleton(storage.clone()).await;
+    storage.flush().await.expect("flush registered singleton");
+    drop(storage);
+
+    let reopened = SlateDB::open(&path).expect("reopen SlateDB storage");
+    registered_native_singleton::assert_reopened_registered_singleton(reopened).await;
 }
 
 #[tokio::test]

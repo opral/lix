@@ -3,6 +3,8 @@ mod deterministic_sequence_corruption;
 mod file_sql;
 mod native_file_read;
 mod native_file_upsert;
+#[path = "../../../lix/tests/support/registered_native_singleton.rs"]
+mod registered_native_singleton;
 mod rocksdb_specific;
 #[path = "../../../lix/tests/adapter_undo_redo_checkpoint.rs"]
 mod undo_redo_checkpoint;
@@ -90,4 +92,17 @@ async fn deterministic_sequence_member_corruption_fails_closed_on_rocksdb() {
 
     let storage = RocksDB::open(&corrupt_path).expect("reopen corrupt sequence storage");
     deterministic_sequence_corruption::assert_missing_sequence_member_fails_closed(storage).await;
+}
+
+#[tokio::test]
+async fn registered_native_singleton_survives_rocksdb_cold_reopen() {
+    let temp_dir = tempfile::tempdir().expect("create RocksDB temp directory");
+    let path = temp_dir.path().join("registered-native-singleton.rocksdb");
+    let storage = RocksDB::open(&path).expect("open RocksDB storage");
+    registered_native_singleton::stage_and_assert_registered_singleton(storage.clone()).await;
+    storage.flush().expect("flush registered singleton");
+    drop(storage);
+
+    let reopened = RocksDB::open(&path).expect("reopen RocksDB storage");
+    registered_native_singleton::assert_reopened_registered_singleton(reopened).await;
 }

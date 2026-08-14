@@ -2822,6 +2822,15 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
         // rebuildable serving root and let canonical replay answer the commit.
         return Ok(None);
     }
+    if members
+        .iter()
+        .any(|member| matches!(member.change.snapshot, crate::changelog::ChangePayload::Native(_)))
+    {
+        // The authenticated row-group remains the single native tuple
+        // authority. Do not duplicate it into the rebuildable sparse serving
+        // part; canonical replay/current projection resolves the row group.
+        return Ok(None);
+    }
 
     let mut mutations = BTreeMap::<Vec<u8>, Option<CurrentStateDataRow>>::new();
     for member in members {
@@ -2831,12 +2840,27 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
             ));
         }
         let encoded_key = crate::tracked_state::codec::encode_key(&member.key);
-        let row = (!member.value.deleted).then(|| CurrentStateDataRow {
-            encoded_key: encoded_key.clone(),
-            value: member.value,
-            snapshot: member.change.snapshot,
-            metadata: member.change.metadata,
-        });
+        let row = if member.value.deleted {
+            None
+        } else {
+            let snapshot = match member.change.snapshot {
+                crate::changelog::ChangePayload::Json(snapshot) => snapshot,
+                crate::changelog::ChangePayload::Tombstone => {
+                    return Err(replacement_payload_error(
+                        "live sparse row has a tombstone payload",
+                    ));
+                }
+                crate::changelog::ChangePayload::Native(_) => {
+                    unreachable!("native sparse rows returned before staging")
+                }
+            };
+            Some(CurrentStateDataRow {
+                encoded_key: encoded_key.clone(),
+                value: member.value,
+                snapshot,
+                metadata: member.change.metadata,
+            })
+        };
         if mutations.insert(encoded_key, row).is_some() {
             return Err(replacement_payload_error(
                 "sparse scoped-range rewrite contains a duplicate identity",
@@ -3340,11 +3364,9 @@ async fn load_scoped_current_state_descriptor_rows(
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
                         },
-                        snapshot: crate::changelog::ChangePayload::from_legacy_json(
-                            owned_scoped_json_slot(decoded.snapshot(ordinal)?.ok_or_else(|| {
-                                replacement_payload_error("replacement source omitted snapshot")
-                            })?),
-                        ),
+                        snapshot: owned_scoped_json_slot(decoded.snapshot(ordinal)?.ok_or_else(
+                            || replacement_payload_error("replacement source omitted snapshot"),
+                        )?),
                         metadata: owned_scoped_json_slot(decoded.metadata(ordinal)?.ok_or_else(
                             || replacement_payload_error("replacement source omitted metadata"),
                         )?),
@@ -3513,7 +3535,19 @@ async fn load_scoped_current_state_descriptor_rows(
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
                         },
-                        snapshot: record.snapshot,
+                        snapshot: match record.snapshot {
+                            crate::changelog::ChangePayload::Json(snapshot) => snapshot,
+                            crate::changelog::ChangePayload::Tombstone => {
+                                return Err(replacement_payload_error(
+                                    "live columnar source has a tombstone payload",
+                                ));
+                            }
+                            crate::changelog::ChangePayload::Native(_) => {
+                                return Err(replacement_payload_error(
+                                    "native singleton row group cannot be copied into a current-state data part",
+                                ));
+                            }
+                        },
                         metadata: record.metadata,
                     })
                 })
@@ -14237,9 +14271,7 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: crate::changelog::ChangePayload::from(JsonSlot::Inline(
-                    format!("{{\"version\":{index}}}").into(),
-                )),
+                snapshot: JsonSlot::Inline(format!("{{\"version\":{index}}}").into()),
                 metadata: JsonSlot::None,
             })
             .collect::<Vec<_>>();
@@ -14337,7 +14369,7 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: crate::changelog::ChangePayload::from(JsonSlot::Inline("{}".into())),
+                snapshot: JsonSlot::Inline("{}".into()),
                 metadata: JsonSlot::None,
             })
             .collect::<Vec<_>>();

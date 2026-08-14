@@ -29,8 +29,8 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_IS_DELETED,
-    HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-    parse_history_filter, validate_history_anchor_filter,
+    HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, parse_history_filter,
+    validate_history_anchor_filter,
 };
 use crate::sql2::providers::schema::{
     parse_snapshot, row_f64_value, row_i64_value, row_json_text_value,
@@ -197,7 +197,7 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let history_view_name = format!("{}_history", spec.schema_key);
-    let entries = load_history_entries(
+    let entries = crate::sql2::history_route::load_history_entries_with_payload_projection(
         HistoryViewDescriptor {
             view_name: history_view_name.as_str(),
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
@@ -207,6 +207,10 @@ where
         route,
         vec![spec.schema_key.clone()],
         metadata_projection,
+        crate::sql2::change_materialization::ChangePayloadProjection {
+            snapshot_content: false,
+            metadata: true,
+        },
         limit,
     )
     .await?;

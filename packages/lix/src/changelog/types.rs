@@ -740,6 +740,7 @@ impl ChangePayload {
             (Self::Native(left), Self::Native(right)) => {
                 left.layout_fingerprint == right.layout_fingerprint
                     && left.semantic_payload_digest == right.semantic_payload_digest
+                    && left.fields == right.fields
                     && left.cells == right.cells
             }
             _ => false,
