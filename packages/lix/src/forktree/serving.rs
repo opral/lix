@@ -23,7 +23,7 @@ use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
     apply_ordered_mutations_idempotent_inserts, delete_ordered_range, lookup_many_on_read,
     lookup_on_read, scan_bounded_page_on_read, scan_page_on_read, scan_range_on_read,
-    scan_ranges_on_read, validate_root_on_read,
+    scan_ranges_on_read, summarize_state_range_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE};
 
@@ -4318,6 +4318,11 @@ where
                 "current-state pack row identity differs from its state key",
             ));
         }
+        if value_ref.tombstone != matches!(pack_row.value.cell, StateCell::Tombstone) {
+            return Err(corruption(
+                "current-state pack row tombstone differs from its authenticated state leaf",
+            ));
+        }
         output.push(Some((
             ResolvedCurrentPackRow {
                 value: pack_row.value.clone(),
@@ -4738,6 +4743,56 @@ where
             view_instance_id: view.view_instance_id(),
         })
         .collect())
+}
+
+/// Returns the authenticated live-row cardinality for a canonical state-key
+/// range. A single populated root is answered from node summaries. When both
+/// global and local roots contain rows in the range, masking cannot be proven
+/// from cardinalities alone, so the implementation descends through the same
+/// retained view and performs the canonical overlay merge.
+pub(crate) async fn state_live_count<R>(
+    view: &CoherentView<R>,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> Result<u64, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let (global_root, local_root) = current_state_roots(view);
+    let global = summarize_state_range_on_read(
+        global_root,
+        lower,
+        upper,
+        view.retained_read(),
+    )
+    .await?;
+    let Some(local_root) = local_root else {
+        return Ok(global.live_count);
+    };
+    let local = summarize_state_range_on_read(
+        local_root,
+        lower,
+        upper,
+        view.retained_read(),
+    )
+    .await?;
+    if local.entry_count == 0 {
+        return Ok(global.live_count);
+    }
+    if global.entry_count == 0 {
+        return Ok(local.live_count);
+    }
+    let rows = state_range_on_roots(
+        global_root,
+        Some(local_root),
+        view.retained_read(),
+        lower,
+        upper,
+        None,
+        false,
+    )
+    .await?;
+    u64::try_from(rows.len()).map_err(|_| corruption("state live count exceeds u64"))
 }
 
 /// Resolves several disjoint canonical state ranges through one retained
@@ -5270,10 +5325,15 @@ where
         };
         decode_state_key(key).map_err(|error| corruption(error.to_string()))?;
         if let Some(value) = value {
-            let _ = decode_state_value_storage(value)?;
+            let value_ref = decode_state_value_storage(value)?;
+            wrote_tombstone |= value_ref.tombstone;
+            if audit.is_some_and(|audit| audit.tombstone != value_ref.tombstone) {
+                return Err(corruption(
+                    "state mutation audit tombstone differs from its authenticated state leaf",
+                ));
+            }
         }
         if let Some(audit) = audit {
-            wrote_tombstone |= audit.tombstone;
             written_commit_ids.insert(audit.commit_id);
             added_blob_roots.extend(
                 audit
@@ -5392,8 +5452,14 @@ where
     let mut added_blob_roots = BTreeMap::new();
     let mut written_commit_ids = BTreeSet::new();
     let mut wrote_tombstone = false;
-    for (_, _, audit) in replacement {
-        wrote_tombstone |= audit.tombstone;
+    for (_, value, audit) in replacement {
+        let value_ref = decode_state_value_storage(&value)?;
+        if audit.tombstone != value_ref.tombstone {
+            return Err(corruption(
+                "state replacement audit tombstone differs from its authenticated state leaf",
+            ));
+        }
+        wrote_tombstone |= value_ref.tombstone;
         written_commit_ids.insert(audit.commit_id);
         added_blob_roots.extend(
             audit

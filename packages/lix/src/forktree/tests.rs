@@ -1255,6 +1255,7 @@ fn encode_test_state_entries(
                 encode_state_value(StateValueRef {
                     pack_object_id: location.pack_object_id,
                     pack_ordinal: location.pack_ordinal,
+                    tombstone: false,
                 })
                 .expect("state value"),
             )
@@ -1278,6 +1279,7 @@ fn state_entry(
     let value = encode_state_value(StateValueRef {
         pack_object_id: content_id(commit_byte),
         pack_ordinal: 0,
+        tombstone: false,
     })
     .expect("state value");
     (key, value)
@@ -2536,6 +2538,7 @@ fn diff_state_rows(values: &[(usize, u8)]) -> Vec<(Vec<u8>, Vec<u8>)> {
             let value = encode_state_value(StateValueRef {
                 pack_object_id: content_id(value.saturating_add(1)),
                 pack_ordinal: *index as u32,
+                tombstone: false,
             })
             .expect("state diff value");
             (key, value)
@@ -2867,16 +2870,56 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     let encoded = encode_state_value(StateValueRef {
         pack_object_id,
         pack_ordinal: 3,
+        tombstone: false,
     })
     .expect("typed state");
     let decoded = super::decode_state_value(&encoded).expect("typed state");
     assert_eq!(decoded.pack_object_id, pack_object_id);
     assert_eq!(decoded.pack_ordinal, 3);
+    assert!(!decoded.tombstone);
+    let tombstone = encode_state_value(StateValueRef {
+        pack_object_id,
+        pack_ordinal: 4,
+        tombstone: true,
+    })
+    .expect("tombstone state ref");
+    assert!(super::decode_state_value(&tombstone)
+        .expect("tombstone state ref")
+        .tombstone);
+    let mut malformed_tombstone = tombstone.clone();
+    *malformed_tombstone.last_mut().expect("state ref tag") = 2;
+    assert!(super::decode_state_value(&malformed_tombstone).is_err());
     let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
     let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
     let entity_pk = EntityPk::single("typed-key");
     assert!(super::encode_state_entity_prefix("app.row", &entity_pk).len() < key.len());
+    let live_key = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: None,
+        entity_pk: &EntityPk::single("live"),
+    });
+    let tombstone_key = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: None,
+        entity_pk: &EntityPk::single("tombstone"),
+    });
+    let live_ref = encode_state_value(StateValueRef {
+        pack_object_id: content_id(8),
+        pack_ordinal: 0,
+        tombstone: false,
+    })
+    .expect("live state ref");
+    let tombstone_ref = encode_state_value(StateValueRef {
+        pack_object_id: content_id(9),
+        pack_ordinal: 0,
+        tombstone: true,
+    })
+    .expect("tombstone state ref");
+    let tree = build_state_tree(&[(live_key, live_ref), (tombstone_key, tombstone_ref)])
+        .expect("state tree with cardinality summary");
+    assert_eq!(tree.root.entry_count, 2);
+    assert_eq!(tree.root.live_count, 1);
     assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
 }
 
@@ -3239,6 +3282,46 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
         .expect("authenticated complete range replacement");
     assert_eq!(replacement.entry_count(), 1);
     assert!(replacement.copied_nodes() >= 1);
+    let authenticated_tombstone = encode_state_value(StateValueRef {
+        pack_object_id: content_id(0x22),
+        pack_ordinal: 0,
+        tombstone: true,
+    })
+    .expect("authenticated tombstone state ref");
+    let mismatched_audit = StateMutationAudit {
+        commit_id: raw_id(0x22),
+        tombstone: false,
+        blob_manifest_object_ids: Vec::new(),
+    };
+    assert!(
+        edit_state_tree(
+            view.branch_snapshot().local_state_root,
+            vec![StateTreeMutation::insert_bound(
+                seed.state_keys[0].clone(),
+                authenticated_tombstone.clone(),
+                mismatched_audit.clone(),
+            )],
+            view.test_storage_read(),
+        )
+        .await
+        .is_err(),
+        "point mutation audit must agree with the authenticated tombstone bit"
+    );
+    assert!(
+        view.replace_state_tree_range(
+            view.branch_snapshot().local_state_root,
+            super::encode_state_entity_prefix_bounds("app.row", &EntityPk::empty()).lower,
+            super::encode_state_entity_prefix_bounds("app.row", &EntityPk::empty()).upper,
+            vec![(
+                seed.state_keys[0].clone(),
+                authenticated_tombstone,
+                mismatched_audit,
+            )],
+        )
+        .await
+        .is_err(),
+        "range replacement audit must agree with the authenticated tombstone bit"
+    );
     assert!(
         edit_state_tree(
             view.branch_snapshot().local_state_root,

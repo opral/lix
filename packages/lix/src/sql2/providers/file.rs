@@ -8540,6 +8540,7 @@ mod tests {
                     encode_state_value(StateValueRef {
                         pack_object_id: location.pack_object_id,
                         pack_ordinal: location.pack_ordinal,
+                        tombstone: false,
                     })
                     .expect("global native fixture state value"),
                     StateMutationAudit {

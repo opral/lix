@@ -462,6 +462,7 @@ where
             let encoded = encode_state_value(StateValueRef {
                 pack_object_id: location.pack_object_id,
                 pack_ordinal: location.pack_ordinal,
+                tombstone: row.snapshot.is_none(),
             })?;
             let audit = StateMutationAudit {
                 commit_id: *commit_id.as_uuid().as_bytes(),
@@ -1388,6 +1389,7 @@ where
                         let encoded = encode_state_value(StateValueRef {
                             pack_object_id: location.pack_object_id,
                             pack_ordinal: location.pack_ordinal,
+                            tombstone,
                         })?;
                         let audit = StateMutationAudit {
                             commit_id: *draft.commit_id.as_uuid().as_bytes(),
