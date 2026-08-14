@@ -1137,6 +1137,24 @@ fn selected_change_count(batches: &[StagedCommitChangeBatch]) -> usize {
     batches.iter().map(StagedCommitChangeBatch::len).sum()
 }
 
+fn selected_change_count_after_authored_shadow(
+    commit_id: CommitId,
+    state_rows: &PreparedStateBatch,
+    state_row_indices: &[RowIndex],
+    batches: &[StagedCommitChangeBatch],
+) -> usize {
+    selected_changes(batches)
+        .filter(|change_ref| {
+            !selected_change_is_shadowed_by_authored_row(
+                *change_ref,
+                commit_id,
+                state_rows,
+                state_row_indices,
+            )
+        })
+        .count()
+}
+
 fn dense_selected_source_is_exact<'a>(
     source_commit_id: CommitId,
     segment_row_counts: &[u16],
@@ -1366,6 +1384,9 @@ async fn stage_changelog_commits(
             parent_jump_record,
         )?;
         let selected_as_new_rootless = rootless_commit_ids.contains(&commit_id);
+        let commit_row_indices = tracked_row_indices_by_commit
+            .get(&commit_id)
+            .map(Vec::as_slice);
         let commit_delta_rows = tracked_row_indices_by_commit
             .get(&commit_id)
             .map_or(0, Vec::len)
@@ -1382,13 +1403,15 @@ async fn stage_changelog_commits(
                 )
             })
             .and_then(|rows| {
-                rows.checked_add(selected_change_count(&commit.selected_change_batches))
+                rows.checked_add(selected_change_count_after_authored_shadow(
+                    commit_id,
+                    state_rows,
+                    commit_row_indices.unwrap_or_default(),
+                    &commit.selected_change_batches,
+                ))
             })
             .and_then(|rows| u64::try_from(rows).ok())
             .ok_or_else(|| LixError::unknown("tracked-state rootless row count exceeds u64"))?;
-        let commit_row_indices = tracked_row_indices_by_commit
-            .get(&commit_id)
-            .map(Vec::as_slice);
         let commit_delta_bytes = if let Some(journal) = ordered_replacements.get(&commit_id) {
             journal.replacement_proof().replay_bytes
         } else if let Some(proof) = state_rows
@@ -1407,7 +1430,12 @@ async fn stage_changelog_commits(
         let has_unbounded_payload_sources = certified_packet_root_rows
             .get(&commit_id)
             .is_some_and(|rows| !rows.is_empty())
-            || selected_change_count(&commit.selected_change_batches) > 0
+            || selected_change_count_after_authored_shadow(
+                commit_id,
+                state_rows,
+                commit_row_indices.unwrap_or_default(),
+                &commit.selected_change_batches,
+            ) > 0
             || mutation_inventories
                 .get(&commit_id)
                 .and_then(CommitStateMutationInventory::selected_source_commit_id)
@@ -1599,7 +1627,12 @@ async fn stage_changelog_commits(
             + certified_packet_root_rows
                 .get(&commit_row.commit_id)
                 .map_or(0, Vec::len)
-            + selected_change_count(&commit_row.selected_change_batches);
+            + selected_change_count_after_authored_shadow(
+                commit_row.commit_id,
+                state_rows,
+                state_row_indices,
+                &commit_row.selected_change_batches,
+            );
         staged.insert(
             commit_row.commit_id,
             StagedChangelogCommit {
@@ -1639,7 +1672,7 @@ fn validate_selected_change_refs(
         return Ok(());
     }
 
-    let mut identities = BTreeSet::new();
+    let mut authored_identities = BTreeSet::new();
     for &row_index in state_row_indices {
         let row = state_rows.row(row_index);
         row.change_id.ok_or_else(|| {
@@ -1648,7 +1681,7 @@ fn validate_selected_change_refs(
                 "tracked staged row is missing change_id before changelog append",
             )
         })?;
-        if !identities.insert((
+        if !authored_identities.insert((
             row.schema_key.as_str(),
             row.file_id.map(crate::common::SharedStr::as_str),
             row.entity_pk,
@@ -1658,12 +1691,17 @@ fn validate_selected_change_refs(
             )));
         }
     }
+    let mut selected_identities = BTreeSet::new();
     for change_ref in selected_changes(selected_change_batches) {
-        if !identities.insert((
+        let identity = (
             change_ref.schema_key(),
             change_ref.file_id(),
             change_ref.entity_pk(),
-        )) {
+        );
+        if authored_identities.contains(&identity) {
+            continue;
+        }
+        if !selected_identities.insert(identity) {
             return Err(LixError::unknown(format!(
                 "commit '{commit_id}' has duplicate change ref key"
             )));
@@ -2589,6 +2627,8 @@ async fn stage_tracked_commit_delta_index(
         }
         let selected_source_alias = if certified_root_rows.is_empty()
             && selected_members_by_source.len() == 1
+            && selected_members_by_source.values().sum::<usize>()
+                == selected_change_count(&staged.selected_change_batches)
         {
             let source_commit_id = *selected_members_by_source
                 .first_key_value()
@@ -7549,16 +7589,15 @@ mod tests {
     }
 
     #[test]
-    fn selected_change_refs_reject_overlap_with_normal_rows() {
+    fn selected_change_refs_allow_authored_rows_to_shadow_selected_rows() {
         let row = tracked_global_row("normal-change");
-        let error = validate_selected_change_refs(
+        validate_selected_change_refs(
             commit_id("test-uuid-1"),
             &prepared_rows![row],
             &[0],
             &[selected_change_batch("selected-change", "entity-1")],
         )
-        .expect_err("selected ref must not duplicate a normal row identity");
-        assert!(error.message.contains("duplicate change ref key"));
+        .expect("an authored row must shadow a selected row with the same identity");
 
         let row = tracked_global_row("normal-change");
         validate_selected_change_refs(
@@ -7568,6 +7607,16 @@ mod tests {
             &[selected_change_batch("normal-change", "other-entity")],
         )
         .expect("different semantic identities may share one source change id");
+
+        let duplicate = selected_change_batch("selected-change", "selected-only");
+        let error = validate_selected_change_refs(
+            commit_id("test-uuid-1"),
+            &PreparedStateBatch::default(),
+            &[],
+            &[duplicate.clone(), duplicate],
+        )
+        .expect_err("duplicate selected identities must still fail closed");
+        assert!(error.message.contains("duplicate change ref key"));
     }
 
     #[tokio::test]
