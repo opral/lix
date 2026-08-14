@@ -12,17 +12,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async move {
         let storage = FilesystemStorage::new(&root).open()?;
         let lix = open_lix().with_storage(storage.clone()).await?;
-        let sync = storage.start_sync(&lix).await?;
+        storage.start_sync(&lix).await?;
 
-        // Import changes already present on disk immediately. The returned
-        // sync handle also keeps watching while it remains alive.
-        sync.sync_disk_to_lix().await?;
+        // Import changes already present on disk immediately. The storage
+        // keeps watching until explicitly stopped or finally dropped.
+        storage.sync_disk_to_lix().await?;
 
         let files = lix
             .execute("SELECT path FROM lix_file ORDER BY path", &[])
             .await?;
         println!("{} repository files", files.rows().len());
 
+        storage.stop_sync().await?;
         lix.close().await?;
         Ok::<_, lix::LixError>(())
     })?;

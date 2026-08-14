@@ -6,8 +6,7 @@
 mod filesystem;
 
 pub use filesystem::{
-    FilesystemStorage, FilesystemStorageOptions, FilesystemStorageRead, FilesystemStorageSync,
-    FilesystemStorageWrite,
+    FilesystemStorage, FilesystemStorageOptions, FilesystemStorageRead, FilesystemStorageWrite,
 };
 pub use lix_storage_rocksdb::{
     RocksDB as RocksDBFilesystem, RocksDBRead as RocksDBFilesystemRead,

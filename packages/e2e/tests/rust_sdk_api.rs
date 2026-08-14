@@ -4,7 +4,7 @@ use lix::{
     CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
     MergeBranchOutcome, SwitchBranchOptions, Value, open_lix,
 };
-use lix_storage_filesystem::{FilesystemStorage, FilesystemStorageSync};
+use lix_storage_filesystem::FilesystemStorage;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -729,7 +729,7 @@ async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata(
 
 struct SyncedFilesystemLix {
     lix: Lix<FilesystemStorage>,
-    _sync: FilesystemStorageSync,
+    _storage: FilesystemStorage,
 }
 
 impl Deref for SyncedFilesystemLix {
@@ -743,8 +743,11 @@ impl Deref for SyncedFilesystemLix {
 async fn open_filesystem_lix(path: &Path) -> SyncedFilesystemLix {
     let storage = FilesystemStorage::new(path).open().unwrap();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
-    let sync = storage.start_sync(&lix).await.unwrap();
-    SyncedFilesystemLix { lix, _sync: sync }
+    storage.start_sync(&lix).await.unwrap();
+    SyncedFilesystemLix {
+        lix,
+        _storage: storage,
+    }
 }
 
 async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> SyncedFilesystemLix {
@@ -753,9 +756,15 @@ async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> Sync
         .open()
         .unwrap();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
-    let sync = storage.start_sync(&lix).await.unwrap();
-    sync.import_paths(file_paths.iter().copied()).await.unwrap();
-    SyncedFilesystemLix { lix, _sync: sync }
+    storage.start_sync(&lix).await.unwrap();
+    storage
+        .import_paths(file_paths.iter().copied())
+        .await
+        .unwrap();
+    SyncedFilesystemLix {
+        lix,
+        _storage: storage,
+    }
 }
 
 #[tokio::test]
@@ -775,11 +784,11 @@ async fn rocksdb_filesystem_storage_allows_same_process_multi_open() {
         .with_storage(storage_b.clone())
         .await
         .expect("second lix opens");
-    let _sync_a = storage_a
+    storage_a
         .start_sync(&lix_a)
         .await
         .expect("first sync starts");
-    let _sync_b = storage_b
+    storage_b
         .start_sync(&lix_b)
         .await
         .expect("second sync starts");

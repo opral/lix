@@ -15,7 +15,7 @@ use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
     StorageWrite, WriteOptions,
 };
-use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value};
+use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value, open_lix};
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::oneshot;
@@ -93,7 +93,9 @@ impl FilesystemStorageOptions {
             inner: open_filesystem_rocksdb(&layout)?,
             layout,
             sync_all_files: self.sync_all_files,
-            supervisor: Arc::new(Mutex::new(None)),
+            sync_lifecycle: Arc::new(FilesystemSyncLifecycle {
+                state: Mutex::new(FilesystemSyncState::Stopped),
+            }),
         })
     }
 }
@@ -125,7 +127,7 @@ pub struct FilesystemStorage {
     inner: RocksDBFilesystem,
     layout: FilesystemLayout,
     sync_all_files: bool,
-    supervisor: Arc<Mutex<Option<Weak<FilesystemSupervisorInner>>>>,
+    sync_lifecycle: Arc<FilesystemSyncLifecycle>,
 }
 
 pub type FilesystemStorageRead<'a> = crate::RocksDBFilesystemRead<'a>;
@@ -141,10 +143,19 @@ struct FilesystemSupervisor {
     inner: Arc<FilesystemSupervisorInner>,
 }
 
-#[derive(Clone)]
-#[expect(missing_debug_implementations)]
-pub struct FilesystemStorageSync {
-    supervisor: FilesystemSupervisor,
+struct FilesystemSyncLifecycle {
+    state: Mutex<FilesystemSyncState>,
+}
+
+struct FilesystemSyncStartup {
+    lifecycle: Arc<FilesystemSyncLifecycle>,
+    completed: bool,
+}
+
+enum FilesystemSyncState {
+    Stopped,
+    Starting,
+    Started(FilesystemSupervisor),
 }
 
 struct FilesystemSupervisorInner {
@@ -164,7 +175,7 @@ struct FilesystemWatchPath {
 }
 
 struct FilesystemState {
-    lix: Lix<FilesystemStorage>,
+    lix: Lix<RocksDBFilesystem>,
     layout: FilesystemLayout,
     path_filter: Mutex<FilesystemPathFilter>,
     sync_lock: tokio::sync::Mutex<()>,
@@ -319,52 +330,48 @@ enum FilesystemEvent {
 }
 
 impl FilesystemStorage {
-    /// Starts bidirectional filesystem synchronization using another session
-    /// on the supplied Lix repository.
-    pub async fn start_sync(
-        &self,
-        lix: &Lix<FilesystemStorage>,
-    ) -> Result<FilesystemStorageSync, LixError> {
-        if self
-            .supervisor
-            .lock()
-            .expect("filesystem supervisor lock should not poison")
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .is_some()
-        {
-            return Err(LixError::new(
-                "LIX_FILESYSTEM_SYNC_ALREADY_STARTED",
-                "filesystem synchronization is already running",
-            ));
-        }
-
-        let sync_lix = lix
-            .open_another_session()
-            .with_account(SYSTEM_ACCOUNT_ID)
-            .await?;
-        let supervisor = FilesystemSupervisor::open(
-            sync_lix,
-            self.layout.clone(),
-            FilesystemPathFilter::from_sync_all_files(self.sync_all_files),
-        )
-        .await?;
-        *self
-            .supervisor
-            .lock()
-            .expect("filesystem supervisor lock should not poison") =
-            Some(Arc::downgrade(&supervisor.inner));
-        Ok(FilesystemStorageSync { supervisor })
+    /// Starts bidirectional filesystem synchronization owned by this storage.
+    pub async fn start_sync(&self, lix: &Lix<FilesystemStorage>) -> Result<(), LixError> {
+        let startup = FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle))?;
+        let supervisor = self.open_supervisor(lix).await?;
+        startup.complete(supervisor);
+        Ok(())
     }
-}
 
-impl FilesystemStorageSync {
+    /// Stops synchronization and waits for its worker and internal Lix session.
+    ///
+    /// This is optional for normal applications, which may rely on dropping the
+    /// final storage clone. It is recommended for tests and before immediately
+    /// reopening the same repository path.
+    pub async fn stop_sync(&self) -> Result<(), LixError> {
+        let supervisor = {
+            let mut state = self
+                .sync_lifecycle
+                .state
+                .lock()
+                .expect("filesystem sync lifecycle lock should not poison");
+            match std::mem::replace(&mut *state, FilesystemSyncState::Stopped) {
+                FilesystemSyncState::Stopped => return Ok(()),
+                FilesystemSyncState::Starting => {
+                    *state = FilesystemSyncState::Starting;
+                    return Err(LixError::new(
+                        "LIX_FILESYSTEM_SYNC_STARTING",
+                        "filesystem synchronization is still starting",
+                    ));
+                }
+                FilesystemSyncState::Started(supervisor) => supervisor,
+            }
+        };
+        supervisor.shutdown();
+        Ok(())
+    }
+
     pub async fn import_paths<I, S>(&self, paths: I) -> Result<(), LixError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.supervisor
+        self.running_supervisor()?
             .import_paths(
                 paths
                     .into_iter()
@@ -375,7 +382,107 @@ impl FilesystemStorageSync {
     }
 
     pub async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
-        self.supervisor.sync_disk_to_lix().await
+        self.running_supervisor()?.sync_disk_to_lix().await
+    }
+
+    async fn open_supervisor(
+        &self,
+        lix: &Lix<FilesystemStorage>,
+    ) -> Result<FilesystemSupervisor, LixError> {
+        // The supervisor intentionally uses the underlying RocksDB adapter,
+        // not FilesystemStorage. This breaks the ownership cycle
+        // storage -> supervisor -> Lix session -> storage and prevents its own
+        // writes from recursively requesting another filesystem sync.
+        let primary = open_lix().with_storage(self.inner.clone()).await?;
+        let active_branch_id = lix.active_branch_id().await?;
+        let sync_lix = primary
+            .open_another_session()
+            .with_branch(active_branch_id)
+            .with_account(SYSTEM_ACCOUNT_ID)
+            .await?;
+        primary.close().await?;
+        FilesystemSupervisor::open(
+            sync_lix,
+            self.layout.clone(),
+            FilesystemPathFilter::from_sync_all_files(self.sync_all_files),
+        )
+        .await
+    }
+
+    fn running_supervisor(&self) -> Result<FilesystemSupervisor, LixError> {
+        let state = self
+            .sync_lifecycle
+            .state
+            .lock()
+            .expect("filesystem sync lifecycle lock should not poison");
+        match &*state {
+            FilesystemSyncState::Started(supervisor) => Ok(supervisor.clone()),
+            _ => Err(filesystem_error(
+                "filesystem synchronization is not running",
+            )),
+        }
+    }
+}
+
+impl FilesystemSyncStartup {
+    fn begin(lifecycle: Arc<FilesystemSyncLifecycle>) -> Result<Self, LixError> {
+        {
+            let mut state = lifecycle
+                .state
+                .lock()
+                .expect("filesystem sync lifecycle lock should not poison");
+            if !matches!(*state, FilesystemSyncState::Stopped) {
+                return Err(LixError::new(
+                    "LIX_FILESYSTEM_SYNC_ALREADY_STARTED",
+                    "filesystem synchronization is already running",
+                ));
+            }
+            *state = FilesystemSyncState::Starting;
+        }
+        Ok(Self {
+            lifecycle,
+            completed: false,
+        })
+    }
+
+    fn complete(mut self, supervisor: FilesystemSupervisor) {
+        *self
+            .lifecycle
+            .state
+            .lock()
+            .expect("filesystem sync lifecycle lock should not poison") =
+            FilesystemSyncState::Started(supervisor);
+        self.completed = true;
+    }
+}
+
+impl Drop for FilesystemSyncStartup {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .expect("filesystem sync lifecycle lock should not poison");
+        if matches!(*state, FilesystemSyncState::Starting) {
+            *state = FilesystemSyncState::Stopped;
+        }
+    }
+}
+
+impl Drop for FilesystemSyncLifecycle {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .expect("filesystem sync lifecycle lock should not poison");
+        if let FilesystemSyncState::Started(supervisor) =
+            std::mem::replace(state, FilesystemSyncState::Stopped)
+        {
+            supervisor.shutdown();
+        }
     }
 }
 
@@ -405,10 +512,9 @@ impl Storage for FilesystemStorage {
             Ok(FilesystemStorageWrite {
                 inner: self.inner.begin_write(opts).await?,
                 supervisor: self
-                    .supervisor
-                    .lock()
-                    .expect("filesystem supervisor lock should not poison")
-                    .clone(),
+                    .running_supervisor()
+                    .ok()
+                    .map(|supervisor| Arc::downgrade(&supervisor.inner)),
             })
         }
     }
@@ -458,8 +564,12 @@ impl StorageWrite for FilesystemStorageWrite {
 }
 
 impl FilesystemSupervisor {
+    fn shutdown(self) {
+        self.inner.shutdown();
+    }
+
     async fn open(
-        lix: Lix<FilesystemStorage>,
+        lix: Lix<RocksDBFilesystem>,
         layout: FilesystemLayout,
         path_filter: FilesystemPathFilter,
     ) -> Result<Self, LixError> {
@@ -2335,9 +2445,14 @@ mod tests {
             inner: open_filesystem_rocksdb(&layout).unwrap(),
             layout: layout.clone(),
             sync_all_files: path_filter.is_unfiltered(),
-            supervisor: Arc::new(Mutex::new(None)),
+            sync_lifecycle: Arc::new(FilesystemSyncLifecycle {
+                state: Mutex::new(FilesystemSyncState::Stopped),
+            }),
         };
-        let lix = lix::open_lix().with_storage(storage).await.unwrap();
+        let lix = open_lix()
+            .with_storage(storage.inner.clone())
+            .await
+            .unwrap();
         FilesystemState {
             lix,
             layout,
@@ -2724,13 +2839,13 @@ mod tests {
         std::fs::write(tempdir.path().join("ignored.md"), b"ignored").unwrap();
 
         let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
-        let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
-        let sync = storage.start_sync(&lix).await.unwrap();
+        let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+        storage.start_sync(&lix).await.unwrap();
 
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
         std::fs::write(tempdir.path().join("ignored.md"), b"changed").unwrap();
 
-        sync.sync_disk_to_lix().await.unwrap();
+        storage.sync_disk_to_lix().await.unwrap();
 
         let tracked = lix
             .execute(
@@ -2775,15 +2890,15 @@ mod tests {
         std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
 
         let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
-        let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
-        let sync = storage.start_sync(&lix).await.unwrap();
+        let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+        storage.start_sync(&lix).await.unwrap();
 
         lix.close().await.unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
 
-        sync.sync_disk_to_lix().await.unwrap();
+        storage.sync_disk_to_lix().await.unwrap();
 
-        let lix = lix::open_lix().with_storage(storage).await.unwrap();
+        let lix = open_lix().with_storage(storage).await.unwrap();
         let tracked = lix
             .execute(
                 "SELECT content FROM lix_file WHERE path = $1",
@@ -2801,5 +2916,117 @@ mod tests {
             b"changed"
         );
         lix.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filesystem_storage_owns_start_stop_and_restart_lifecycle() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
+        let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+
+        storage.start_sync(&lix).await.unwrap();
+        let repeated = storage.start_sync(&lix).await.unwrap_err();
+        assert_eq!(repeated.code, "LIX_FILESYSTEM_SYNC_ALREADY_STARTED");
+
+        storage.stop_sync().await.unwrap();
+        storage.stop_sync().await.unwrap();
+        storage.start_sync(&lix).await.unwrap();
+        storage.stop_sync().await.unwrap();
+        lix.close().await.unwrap();
+    }
+
+    #[test]
+    fn cancelled_filesystem_sync_start_restores_stopped_state() {
+        let lifecycle = Arc::new(FilesystemSyncLifecycle {
+            state: Mutex::new(FilesystemSyncState::Stopped),
+        });
+        let startup = FilesystemSyncStartup::begin(Arc::clone(&lifecycle)).unwrap();
+        assert!(matches!(
+            *lifecycle.state.lock().unwrap(),
+            FilesystemSyncState::Starting
+        ));
+
+        // Dropping this guard models cancellation while open_supervisor awaits.
+        drop(startup);
+        assert!(matches!(
+            *lifecycle.state.lock().unwrap(),
+            FilesystemSyncState::Stopped
+        ));
+
+        // A later attempt can acquire the lifecycle again.
+        drop(FilesystemSyncStartup::begin(lifecycle).unwrap());
+    }
+
+    #[tokio::test]
+    async fn filesystem_sync_on_secondary_branch_does_not_change_primary_preference() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
+        let primary = open_lix().with_storage(storage.clone()).await.unwrap();
+        let primary_branch_id = primary.active_branch_id().await.unwrap();
+        let branch = primary
+            .create_branch(lix::CreateBranchOptions {
+                id: None,
+                name: "sync-secondary".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let secondary = primary.open_another_session().await.unwrap();
+        secondary
+            .switch_branch(lix::SwitchBranchOptions {
+                branch_id: branch.id,
+            })
+            .await
+            .unwrap();
+
+        storage.start_sync(&secondary).await.unwrap();
+        storage.stop_sync().await.unwrap();
+        secondary.close().await.unwrap();
+        primary.close().await.unwrap();
+        drop(secondary);
+        drop(primary);
+
+        let reopened = open_lix().with_storage(storage).await.unwrap();
+        assert_eq!(
+            reopened.active_branch_id().await.unwrap(),
+            primary_branch_id
+        );
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filesystem_storage_stop_allows_immediate_reopen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
+        let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+        storage.start_sync(&lix).await.unwrap();
+        storage.stop_sync().await.unwrap();
+        lix.close().await.unwrap();
+        drop(lix);
+        drop(storage);
+
+        let reopened = FilesystemStorage::new(tempdir.path()).open().unwrap();
+        let lix = open_lix().with_storage(reopened.clone()).await.unwrap();
+        reopened.start_sync(&lix).await.unwrap();
+        reopened.stop_sync().await.unwrap();
+        lix.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filesystem_storage_final_drop_breaks_supervisor_cycle() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
+        let lifecycle = Arc::downgrade(&storage.sync_lifecycle);
+        let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+        storage.start_sync(&lix).await.unwrap();
+
+        lix.close().await.unwrap();
+        drop(lix);
+        drop(storage);
+
+        assert!(
+            lifecycle.upgrade().is_none(),
+            "the internally retained supervisor must not form an ownership cycle"
+        );
     }
 }

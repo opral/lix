@@ -25,7 +25,11 @@ use lix_storage_filesystem::FilesystemStorage;
 # async fn example() -> Result<(), lix::LixError> {
 let storage = FilesystemStorage::new("./repository").open()?;
 let lix = open_lix().with_storage(storage.clone()).await?;
-let _sync = storage.start_sync(&lix).await?;
+storage.start_sync(&lix).await?;
 # Ok(())
 # }
 ```
+
+The storage owns synchronization until `storage.stop_sync().await?` or until
+the final storage/repository instance is dropped. Explicitly stopping is useful
+for tests and before immediately reopening the same path.

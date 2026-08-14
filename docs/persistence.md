@@ -55,14 +55,16 @@ use lix_storage_filesystem::FilesystemStorage;
 
 let storage = FilesystemStorage::new("./repository").open()?;
 let lix = open_lix().with_storage(storage.clone()).await?;
-let sync = storage.start_sync(&lix).await?;
+storage.start_sync(&lix).await?;
 
-sync.sync_disk_to_lix().await?;
+storage.sync_disk_to_lix().await?;
+storage.stop_sync().await?;
 ```
 
-Keep `sync` alive while filesystem synchronization should run. It owns a
-separate session on the existing Lix repository; the storage adapter does not
-open or configure the Lix engine.
+`FilesystemStorage` owns synchronization after `start_sync()` returns. Calling
+`stop_sync()` is optional for normal applications and recommended for tests or
+before reopening the same RocksDB path immediately. Dropping the final storage
+or repository instance performs a best-effort shutdown.
 
 Pass `syncAllFiles: false` to begin with no regular repository files and import
 selected paths with `storage.importPaths(paths)`.
