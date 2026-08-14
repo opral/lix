@@ -9,9 +9,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, StringArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
@@ -19,17 +22,18 @@ use crate::columnar_row_group::{
     EncodedRowGroupSet, ROW_GROUP_MAX_ROWS, RowGroupRowLocation,
     encode_row_group_set_preserving_batches,
 };
-use crate::row_pk::RowPk;
-use crate::sql2::{
-    SchemaColumnType, RowProjectionDecoder, SchemaSurfaceSpec, row_visible_fields,
-};
+use crate::row_pk::{RowPk, RowPkComponent, RowPkComponentType};
+use crate::sql2::{RowProjectionDecoder, SchemaColumnType, SchemaSurfaceSpec, row_visible_fields};
 
 pub(crate) const ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.row_columnar.layout_fingerprint.v1";
 pub(crate) const ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.row_columnar.base_coordinates.v1";
+pub(crate) const ROW_COLUMNAR_AUTHORITATIVE_SINGLETON_METADATA_KEY: &str =
+    "lix.row_columnar.authoritative_singleton_key_bound.v1";
+const AUTHORITATIVE_SINGLETON_LAYOUT: &str = "authoritative-singleton-key-bound-v1";
 pub(crate) use crate::hot_state::{
-    ROW_COLUMNAR_ROW_PK_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, ROW_COLUMNAR_ROW_PK_FIELD,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
@@ -45,6 +49,343 @@ pub(crate) struct RowColumnarRowRef<'a> {
     pub(crate) row_pk: &'a RowPk,
     pub(crate) snapshot_bytes: &'a [u8],
     pub(crate) snapshot_value: &'a JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SingletonLayoutDescriptor {
+    layout: String,
+    schema_fingerprint: String,
+    field_count: u32,
+    primary_key: Vec<SingletonPrimaryKeyColumn>,
+    absent_non_primary_key: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SingletonPrimaryKeyColumn {
+    column_index: u32,
+    name: String,
+    component_type: SingletonPrimaryKeyType,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SingletonPrimaryKeyType {
+    Uuid,
+    Integer,
+    String,
+    Bytes,
+}
+
+impl From<RowPkComponentType> for SingletonPrimaryKeyType {
+    fn from(value: RowPkComponentType) -> Self {
+        match value {
+            RowPkComponentType::Uuid => Self::Uuid,
+            RowPkComponentType::Integer => Self::Integer,
+            RowPkComponentType::String => Self::String,
+            RowPkComponentType::Bytes => Self::Bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SingletonOrderedField {
+    PrimaryKey {
+        name: String,
+        component_index: usize,
+        component_type: SingletonPrimaryKeyType,
+    },
+    Physical {
+        name: String,
+        column_index: usize,
+        absent: bool,
+    },
+}
+
+/// Validated, catalog-independent interpretation of an authoritative
+/// singleton manifest.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthoritativeSingletonLayout {
+    pub(crate) schema_fingerprint: String,
+    physical_fields: Vec<Field>,
+    ordered_fields: Vec<SingletonOrderedField>,
+}
+
+impl AuthoritativeSingletonLayout {
+    /// Reconstructs declared fields in schema order. Missing nullable fields
+    /// remain absent; explicit nulls are emitted as JSON null.
+    pub(crate) fn reconstruct_full_ordered_field_map(
+        &self,
+        row_pk: &RowPk,
+        batch: &RecordBatch,
+    ) -> Result<Vec<(String, JsonValue)>, LixError> {
+        if batch.num_rows() != 1 || batch.num_columns() != self.physical_fields.len() {
+            return Err(row_columnar_error(
+                "authoritative singleton reconstruction requires exactly one row and the declared physical columns",
+            ));
+        }
+        for (actual, expected) in batch.schema().fields().iter().zip(&self.physical_fields) {
+            if actual.as_ref() != expected {
+                return Err(row_columnar_error(
+                    "authoritative singleton Arrow fields do not match validated metadata",
+                ));
+            }
+        }
+        let components = row_pk.components.as_slice();
+        let primary_key_count = self
+            .ordered_fields
+            .iter()
+            .filter(|field| matches!(field, SingletonOrderedField::PrimaryKey { .. }))
+            .count();
+        if components.len() != primary_key_count {
+            return Err(row_columnar_error(
+                "authoritative singleton key component count does not match metadata",
+            ));
+        }
+
+        let mut fields = Vec::with_capacity(self.ordered_fields.len());
+        for field in &self.ordered_fields {
+            match field {
+                SingletonOrderedField::PrimaryKey {
+                    name,
+                    component_index,
+                    component_type,
+                } => {
+                    let component = &components[*component_index];
+                    if !singleton_key_component_matches(component, *component_type) {
+                        return Err(row_columnar_error(format!(
+                            "authoritative singleton key component {component_index} has the wrong type"
+                        )));
+                    }
+                    fields.push((name.clone(), component.external_json()));
+                }
+                SingletonOrderedField::Physical {
+                    name,
+                    column_index,
+                    absent,
+                } => {
+                    if !absent {
+                        fields.push((
+                            name.clone(),
+                            singleton_arrow_value(
+                                &self.physical_fields[*column_index],
+                                batch.column(*column_index),
+                            )?,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(fields)
+    }
+}
+
+fn singleton_key_component_matches(
+    component: &RowPkComponent,
+    component_type: SingletonPrimaryKeyType,
+) -> bool {
+    matches!(
+        (component, component_type),
+        (RowPkComponent::Uuid(_), SingletonPrimaryKeyType::Uuid)
+            | (RowPkComponent::Integer(_), SingletonPrimaryKeyType::Integer)
+            | (RowPkComponent::String(_), SingletonPrimaryKeyType::String)
+            | (RowPkComponent::Bytes(_), SingletonPrimaryKeyType::Bytes)
+    )
+}
+
+fn singleton_arrow_value(field: &Field, array: &ArrayRef) -> Result<JsonValue, LixError> {
+    if array.len() != 1 {
+        return Err(row_columnar_error(
+            "authoritative singleton column does not contain exactly one value",
+        ));
+    }
+    if array.is_null(0) {
+        return Ok(JsonValue::Null);
+    }
+    match field.data_type() {
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| row_columnar_error("singleton UTF-8 field has a non-UTF-8 array"))?;
+            if crate::sql2::result_metadata::field_is_json(field) {
+                serde_json::from_str(values.value(0)).map_err(|error| {
+                    row_columnar_error(format!(
+                        "singleton JSON field '{}' is invalid: {error}",
+                        field.name()
+                    ))
+                })
+            } else {
+                Ok(JsonValue::String(values.value(0).to_owned()))
+            }
+        }
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| row_columnar_error("singleton int64 field has the wrong array"))?;
+            Ok(JsonValue::from(values.value(0)))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| row_columnar_error("singleton float64 field has the wrong array"))?;
+            serde_json::Number::from_f64(values.value(0))
+                .map(JsonValue::Number)
+                .ok_or_else(|| row_columnar_error("singleton float is not representable in JSON"))
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| row_columnar_error("singleton boolean field has the wrong array"))?;
+            Ok(JsonValue::from(values.value(0)))
+        }
+        other => Err(row_columnar_error(format!(
+            "unsupported authoritative singleton Arrow type {other}"
+        ))),
+    }
+}
+
+/// Identifies and validates the canonical singleton metadata carried by an
+/// Arrow schema. Absence means this is another row-columnar layout; malformed
+/// marked metadata is an error.
+pub(crate) fn identify_authoritative_singleton_layout(
+    schema: &Schema,
+) -> Result<Option<AuthoritativeSingletonLayout>, LixError> {
+    let Some(encoded) = schema
+        .metadata()
+        .get(ROW_COLUMNAR_AUTHORITATIVE_SINGLETON_METADATA_KEY)
+    else {
+        return Ok(None);
+    };
+    let descriptor: SingletonLayoutDescriptor = serde_json::from_str(encoded)
+        .map_err(|error| row_columnar_error(format!("invalid singleton metadata: {error}")))?;
+    let canonical = serde_json::to_string(&descriptor).map_err(|error| {
+        row_columnar_error(format!("cannot canonicalize singleton metadata: {error}"))
+    })?;
+    if &canonical != encoded {
+        return Err(row_columnar_error(
+            "authoritative singleton metadata is not canonically encoded",
+        ));
+    }
+    if descriptor.layout != AUTHORITATIVE_SINGLETON_LAYOUT {
+        return Err(row_columnar_error(
+            "authoritative singleton metadata has an unknown layout marker",
+        ));
+    }
+    if !canonical_fingerprint(&descriptor.schema_fingerprint)
+        || schema
+            .metadata()
+            .get(ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+            != Some(&descriptor.schema_fingerprint)
+    {
+        return Err(row_columnar_error(
+            "authoritative singleton metadata is not bound to its schema fingerprint",
+        ));
+    }
+    if schema
+        .metadata()
+        .get(ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
+        .map(String::as_str)
+        != Some("true")
+    {
+        return Err(row_columnar_error(
+            "authoritative singleton metadata is missing its lossless marker",
+        ));
+    }
+    let field_count = usize::try_from(descriptor.field_count)
+        .map_err(|_| row_columnar_error("singleton field count does not fit usize"))?;
+    if field_count != schema.fields().len() + descriptor.primary_key.len() {
+        return Err(row_columnar_error(
+            "authoritative singleton field count does not match its schema",
+        ));
+    }
+
+    let mut ordered_fields = vec![None; field_count];
+    let mut names = std::collections::BTreeSet::new();
+    for (component_index, primary_key) in descriptor.primary_key.iter().enumerate() {
+        let column_index = usize::try_from(primary_key.column_index)
+            .map_err(|_| row_columnar_error("singleton PK position does not fit usize"))?;
+        if column_index >= field_count
+            || ordered_fields[column_index].is_some()
+            || !names.insert(primary_key.name.clone())
+        {
+            return Err(row_columnar_error(
+                "authoritative singleton metadata has duplicate or invalid PK fields",
+            ));
+        }
+        ordered_fields[column_index] = Some(SingletonOrderedField::PrimaryKey {
+            name: primary_key.name.clone(),
+            component_index,
+            component_type: primary_key.component_type,
+        });
+    }
+    let absent = descriptor
+        .absent_non_primary_key
+        .iter()
+        .map(|index| usize::try_from(*index))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .map_err(|_| row_columnar_error("singleton absent position does not fit usize"))?;
+    if absent.len() != descriptor.absent_non_primary_key.len()
+        || absent.iter().any(|index| *index >= field_count)
+    {
+        return Err(row_columnar_error(
+            "authoritative singleton metadata has duplicate or invalid absent fields",
+        ));
+    }
+    let mut physical_index = 0;
+    for (field_index, slot) in ordered_fields.iter_mut().enumerate() {
+        if slot.is_some() {
+            if absent.contains(&field_index) {
+                return Err(row_columnar_error(
+                    "authoritative singleton PK field cannot be absent",
+                ));
+            }
+            continue;
+        }
+        let field = schema.fields().get(physical_index).ok_or_else(|| {
+            row_columnar_error("authoritative singleton metadata omits a physical field")
+        })?;
+        if field.name() == ROW_COLUMNAR_ROW_PK_FIELD || !names.insert(field.name().clone()) {
+            return Err(row_columnar_error(
+                "authoritative singleton physical fields contain identity or duplicate names",
+            ));
+        }
+        *slot = Some(SingletonOrderedField::Physical {
+            name: field.name().clone(),
+            column_index: physical_index,
+            absent: absent.contains(&field_index),
+        });
+        physical_index += 1;
+    }
+    if physical_index != schema.fields().len() {
+        return Err(row_columnar_error(
+            "authoritative singleton metadata leaves extra physical fields",
+        ));
+    }
+
+    Ok(Some(AuthoritativeSingletonLayout {
+        schema_fingerprint: descriptor.schema_fingerprint,
+        physical_fields: schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+        ordered_fields: ordered_fields
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .expect("every singleton field position was filled"),
+    }))
+}
+
+fn canonical_fingerprint(fingerprint: &str) -> bool {
+    fingerprint.len() == 64
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +451,178 @@ impl Deref for EncodedRowGroups {
 impl EncodedRowGroups {
     pub(crate) fn into_parts(self) -> (EncodedRowGroupSet, RowGroupLocations) {
         (self.encoded, self.input_locations)
+    }
+}
+
+/// Encodes one authoritative key-bound row group. Primary-key values remain
+/// solely in the surrounding authenticated key; the payload contains only
+/// non-PK Schema-v1 columns.
+pub(crate) fn encode_authoritative_singleton_row_group(
+    spec: &SchemaSurfaceSpec,
+    row: RowColumnarRowRef<'_>,
+) -> Result<EncodedRowGroups, LixError> {
+    let (schema, batch) = authoritative_singleton_batch(spec, row)?;
+    let encoded =
+        encode_row_group_set_preserving_batches(&spec.schema_key, Arc::clone(&schema), &[batch])?;
+    Ok(EncodedRowGroups {
+        encoded,
+        input_locations: RowGroupLocations::Dense { row_count: 1 },
+    })
+}
+
+fn authoritative_singleton_batch(
+    spec: &SchemaSurfaceSpec,
+    row: RowColumnarRowRef<'_>,
+) -> Result<(Arc<Schema>, RecordBatch), LixError> {
+    let primary_key = spec.top_level_primary_key_columns().ok_or_else(|| {
+        row_columnar_error("authoritative singleton requires a complete top-level primary key")
+    })?;
+    let snapshot_pk = RowPk::from_primary_key_plan(
+        row.snapshot_value,
+        &spec.primary_key_paths,
+        &spec.primary_key_component_types,
+    )
+    .map_err(|error| row_columnar_error(format!("snapshot primary key is invalid: {error}")))?;
+    if &snapshot_pk != row.row_pk {
+        return Err(row_columnar_error(
+            "supplied row key does not match the snapshot primary key",
+        ));
+    }
+    let snapshot = row
+        .snapshot_value
+        .as_object()
+        .ok_or_else(|| row_columnar_error("authoritative singleton snapshot is not an object"))?;
+    let primary_key_indices = primary_key
+        .iter()
+        .map(|column| column.column_index)
+        .collect::<std::collections::BTreeSet<_>>();
+    let visible_fields = row_visible_fields(spec);
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    let mut absent_non_primary_key = Vec::new();
+    for (column_index, (column, visible_field)) in
+        spec.columns.iter().zip(visible_fields).enumerate()
+    {
+        if primary_key_indices.contains(&column_index) {
+            continue;
+        }
+        let value = snapshot.get(&column.name);
+        if value.is_none() {
+            absent_non_primary_key.push(
+                u32::try_from(column_index)
+                    .map_err(|_| row_columnar_error("schema column index exceeds u32"))?,
+            );
+        }
+        let field = if column.column_type == SchemaColumnType::Timestamptz {
+            Field::new(&column.name, DataType::Utf8, column.read_nullable)
+        } else {
+            visible_field
+        };
+        columns.push(authoritative_singleton_column(
+            &column.name,
+            column.column_type,
+            value,
+        )?);
+        fields.push(field);
+    }
+    let descriptor = SingletonLayoutDescriptor {
+        layout: AUTHORITATIVE_SINGLETON_LAYOUT.to_owned(),
+        schema_fingerprint: spec.columnar_layout_fingerprint(),
+        field_count: u32::try_from(spec.columns.len())
+            .map_err(|_| row_columnar_error("schema field count exceeds u32"))?,
+        primary_key: primary_key
+            .into_iter()
+            .map(|column| {
+                Ok(SingletonPrimaryKeyColumn {
+                    column_index: u32::try_from(column.column_index)
+                        .map_err(|_| row_columnar_error("schema PK column index exceeds u32"))?,
+                    name: column.name,
+                    component_type: column.component_type.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?,
+        absent_non_primary_key,
+    };
+    let descriptor = serde_json::to_string(&descriptor).map_err(|error| {
+        row_columnar_error(format!("cannot encode singleton layout metadata: {error}"))
+    })?;
+    let fingerprint = spec.columnar_layout_fingerprint();
+    let metadata = HashMap::from([
+        (
+            ROW_COLUMNAR_AUTHORITATIVE_SINGLETON_METADATA_KEY.to_owned(),
+            descriptor,
+        ),
+        (
+            ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_owned(),
+            fingerprint,
+        ),
+        (
+            ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY.to_owned(),
+            "true".to_owned(),
+        ),
+    ]);
+    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    let options = RecordBatchOptions::new().with_row_count(Some(1));
+    let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
+        .map_err(|error| row_columnar_error(error.to_string()))?;
+    Ok((schema, batch))
+}
+
+fn authoritative_singleton_column(
+    column_name: &str,
+    column_type: SchemaColumnType,
+    value: Option<&JsonValue>,
+) -> Result<ArrayRef, LixError> {
+    let type_error = || {
+        row_columnar_error(format!(
+            "column '{}' does not match its declared Schema-v1 type",
+            column_name
+        ))
+    };
+    match column_type {
+        SchemaColumnType::String | SchemaColumnType::Timestamptz => {
+            let value = match value {
+                None | Some(JsonValue::Null) => None,
+                Some(JsonValue::String(value)) => Some(value.as_str()),
+                Some(_) => return Err(type_error()),
+            };
+            Ok(Arc::new(StringArray::from(vec![value])))
+        }
+        SchemaColumnType::Json => {
+            let value = value
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| row_columnar_error(error.to_string()))?;
+            Ok(Arc::new(StringArray::from(vec![value])))
+        }
+        SchemaColumnType::Integer => {
+            let value = match value {
+                None | Some(JsonValue::Null) => None,
+                Some(JsonValue::Number(value)) => {
+                    value.as_i64().ok_or_else(type_error).map(Some)?
+                }
+                Some(_) => return Err(type_error()),
+            };
+            Ok(Arc::new(Int64Array::from(vec![value])))
+        }
+        SchemaColumnType::Number => {
+            let value = match value {
+                None | Some(JsonValue::Null) => None,
+                Some(JsonValue::Number(value)) => {
+                    value.as_f64().ok_or_else(type_error).map(Some)?
+                }
+                Some(_) => return Err(type_error()),
+            };
+            Ok(Arc::new(Float64Array::from(vec![value])))
+        }
+        SchemaColumnType::Boolean => {
+            let value = match value {
+                None | Some(JsonValue::Null) => None,
+                Some(JsonValue::Bool(value)) => Some(*value),
+                Some(_) => return Err(type_error()),
+            };
+            Ok(Arc::new(BooleanArray::from(vec![value])))
+        }
     }
 }
 
@@ -182,11 +695,7 @@ pub(crate) fn encode_unclustered_registered_row_groups(
     }
 
     let mut fields = row_visible_fields(spec);
-    fields.push(Field::new(
-        ROW_COLUMNAR_ROW_PK_FIELD,
-        DataType::Utf8,
-        false,
-    ));
+    fields.push(Field::new(ROW_COLUMNAR_ROW_PK_FIELD, DataType::Utf8, false));
     let metadata = row_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
     columns.push(row_pks);
@@ -219,11 +728,7 @@ where
     I: ExactSizeIterator<Item = RowColumnarRowRef<'a>>,
 {
     let mut fields = row_visible_fields(spec);
-    fields.push(Field::new(
-        ROW_COLUMNAR_ROW_PK_FIELD,
-        DataType::Utf8,
-        false,
-    ));
+    fields.push(Field::new(ROW_COLUMNAR_ROW_PK_FIELD, DataType::Utf8, false));
     let metadata = row_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
     let decoder =
@@ -353,9 +858,7 @@ where
             input_locations
                 .into_iter()
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    row_columnar_error("row-group permutation omitted an input row")
-                })?,
+                .ok_or_else(|| row_columnar_error("row-group permutation omitted an input row"))?,
         ),
     })
 }
@@ -401,6 +904,158 @@ mod tests {
     use crate::columnar_row_group::RowGroupScalar;
     use crate::row_pk::RowPk;
     use crate::sql2::derive_schema_surface_spec_from_schema;
+
+    fn authoritative_all_types_spec() -> SchemaSurfaceSpec {
+        derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "authoritative_all_types",
+            "columns": [
+                { "name": "tenant", "type": "text", "nullable": false },
+                { "name": "ordinal", "type": "int8", "nullable": false },
+                { "name": "text_value", "type": "text", "nullable": false },
+                { "name": "uuid_value", "type": "uuid", "nullable": false },
+                { "name": "integer_value", "type": "int8", "nullable": false },
+                { "name": "number_value", "type": "float8", "nullable": false },
+                { "name": "boolean_value", "type": "boolean", "nullable": false },
+                { "name": "json_value", "type": "jsonb", "nullable": false },
+                { "name": "time_value", "type": "timestamptz", "nullable": false }
+            ],
+            "primary_key": ["tenant", "ordinal"]
+        }))
+        .expect("all Schema-v1 types should derive")
+    }
+
+    fn authoritative_all_types_snapshot() -> JsonValue {
+        json!({
+            "tenant": "acme",
+            "ordinal": 7,
+            "text_value": "{\"stays\":\"text\"}",
+            "uuid_value": "018f3f7a-6c2d-7c21-8a42-4e16fd6f66a1",
+            "integer_value": -9,
+            "number_value": 3.5,
+            "boolean_value": true,
+            "json_value": {"nested": [1, true]},
+            "time_value": "2026-08-14T12:34:56Z"
+        })
+    }
+
+    #[test]
+    fn authoritative_singleton_is_key_bound_pk_free_and_reconstructable() {
+        let spec = authoritative_all_types_spec();
+        let snapshot = authoritative_all_types_snapshot();
+        let row_pk = RowPk::from_primary_key_plan(
+            &snapshot,
+            &spec.primary_key_paths,
+            &spec.primary_key_component_types,
+        )
+        .expect("composite identity");
+        let canonical = snapshot.to_string();
+        let row = RowColumnarRowRef {
+            row_pk: &row_pk,
+            snapshot_bytes: canonical.as_bytes(),
+            snapshot_value: &snapshot,
+        };
+        let encoded =
+            encode_authoritative_singleton_row_group(&spec, row).expect("authoritative singleton");
+        assert!(matches!(
+            encoded.input_locations,
+            RowGroupLocations::Dense { row_count: 1 }
+        ));
+        assert_eq!(
+            encoded
+                .manifest
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "text_value",
+                "uuid_value",
+                "integer_value",
+                "number_value",
+                "boolean_value",
+                "json_value",
+                "time_value"
+            ]
+        );
+        assert!(
+            encoded
+                .manifest
+                .fields
+                .iter()
+                .all(|field| field.name != ROW_COLUMNAR_ROW_PK_FIELD)
+        );
+        assert_eq!(
+            encoded
+                .manifest
+                .metadata
+                .get(ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY),
+            Some(&spec.columnar_layout_fingerprint())
+        );
+
+        let (schema, batch) = authoritative_singleton_batch(&spec, row).expect("batch");
+        let layout = identify_authoritative_singleton_layout(&schema)
+            .expect("valid metadata")
+            .expect("singleton marker");
+        assert_eq!(
+            layout.schema_fingerprint,
+            spec.columnar_layout_fingerprint()
+        );
+        let reconstructed = layout
+            .reconstruct_full_ordered_field_map(&row_pk, &batch)
+            .expect("catalog-free reconstruction");
+        assert_eq!(
+            reconstructed,
+            spec.columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.name.clone(),
+                        snapshot.get(&column.name).expect("declared value").clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reconstructed[2].1, json!("{\"stays\":\"text\"}"));
+        assert_eq!(reconstructed[7].1, json!({"nested": [1, true]}));
+
+        let mut wrong_metadata = schema.metadata().clone();
+        wrong_metadata.insert(
+            ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_owned(),
+            "0".repeat(64),
+        );
+        let wrong_schema = Schema::new_with_metadata(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>(),
+            wrong_metadata,
+        );
+        assert!(identify_authoritative_singleton_layout(&wrong_schema).is_err());
+    }
+
+    #[test]
+    fn authoritative_singleton_rejects_wrong_supplied_pk() {
+        let spec = authoritative_all_types_spec();
+        let snapshot = authoritative_all_types_snapshot();
+        let canonical = snapshot.to_string();
+        let wrong_pk = RowPk::from_json_values(
+            &[json!("other"), json!(7)],
+            &spec.primary_key_component_types,
+        )
+        .expect("typed wrong key");
+        let error = encode_authoritative_singleton_row_group(
+            &spec,
+            RowColumnarRowRef {
+                row_pk: &wrong_pk,
+                snapshot_bytes: canonical.as_bytes(),
+                snapshot_value: &snapshot,
+            },
+        )
+        .expect_err("wrong key must be rejected");
+        assert!(error.message.contains("does not match"));
+    }
 
     #[test]
     fn registered_types_and_hidden_identity_round_trip() {

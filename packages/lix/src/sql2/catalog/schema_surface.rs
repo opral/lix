@@ -8,9 +8,9 @@ use crate::LixError;
 use crate::row_pk::RowPkComponentType;
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ROW_PK, HISTORY_COL_FILE_ID,
-    HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_FILE_ID, HISTORY_COL_IS_DELETED,
+    HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
+    HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY,
 };
 use crate::sql2::result_metadata::{json_field, mark_json_field};
 
@@ -70,6 +70,15 @@ pub(crate) struct SchemaSurfaceSpec {
     pub(crate) columnar_snapshot_bijective: bool,
 }
 
+/// One top-level primary-key column in component order, with its position in
+/// the schema's declared column order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaPrimaryKeyColumn {
+    pub(crate) name: String,
+    pub(crate) column_index: usize,
+    pub(crate) component_type: RowPkComponentType,
+}
+
 impl SchemaSurfaceSpec {
     #[cfg(test)]
     pub(crate) fn visible_column_names(&self) -> impl Iterator<Item = &str> {
@@ -80,6 +89,32 @@ impl SchemaSurfaceSpec {
         self.columns
             .iter()
             .find(|column| column.name == column_name)
+    }
+
+    /// Returns the complete top-level key plan required by key-bound physical
+    /// layouts. `None` fails closed for a future nested-key schema surface.
+    pub(crate) fn top_level_primary_key_columns(&self) -> Option<Vec<SchemaPrimaryKeyColumn>> {
+        if self.primary_key_paths.len() != self.primary_key_component_types.len() {
+            return None;
+        }
+        self.primary_key_paths
+            .iter()
+            .zip(&self.primary_key_component_types)
+            .map(|(path, component_type)| {
+                let [name] = path.as_slice() else {
+                    return None;
+                };
+                let column_index = self
+                    .columns
+                    .iter()
+                    .position(|column| column.name == *name)?;
+                Some(SchemaPrimaryKeyColumn {
+                    name: name.clone(),
+                    column_index,
+                    component_type: *component_type,
+                })
+            })
+            .collect()
     }
 
     /// Stable identity of the registered schema properties that determine an
@@ -427,7 +462,7 @@ mod tests {
     #[test]
     fn certifies_complete_path_value_rows_when_value_accepts_all_json() {
         let spec = derive_schema_surface_spec_from_schema(&path_value_schema("jsonb"))
-        .expect("schema should derive");
+            .expect("schema should derive");
 
         assert!(spec.certifies_path_value_replacement);
     }
@@ -435,11 +470,11 @@ mod tests {
     #[test]
     fn columnar_snapshot_certificate_requires_exact_reversible_columns() {
         let strings = derive_schema_surface_spec_from_schema(&path_value_schema("text"))
-        .expect("string schema should derive");
+            .expect("string schema should derive");
         assert!(strings.columnar_snapshot_bijective);
 
         let numbers = derive_schema_surface_spec_from_schema(&path_value_schema("float8"))
-        .expect("number schema should derive");
+            .expect("number schema should derive");
         assert!(!numbers.columnar_snapshot_bijective);
 
         let mut reserved = path_value_schema("text");
