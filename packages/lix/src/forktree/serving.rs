@@ -4258,6 +4258,7 @@ where
     .await?;
 
     let mut output = Vec::with_capacity(selected.len());
+    let mut native_schema_cache = BTreeMap::<(ObjectId, String), lix_schema::Schema>::new();
     for (row, pack_row) in selected.iter().zip(pack_rows) {
         let (Some((encoded_key, _, source)), Some((pack_row, pack_source))) = (row, pack_row)
         else {
@@ -4332,6 +4333,34 @@ where
             ));
         }
         validate_resolved_member_pack_binding(&resolved, encoded_key, *source, &pack_row.value)?;
+        if let StateCell::NativeRow(native) = &pack_row.value.cell {
+            let state_key = decode_state_key(encoded_key)
+                .map_err(|error| corruption(error.to_string()))?;
+            let schema_cache_key = (
+                resolved.source_commit_object_id,
+                state_key.schema_key.clone(),
+            );
+            if !native_schema_cache.contains_key(&schema_cache_key) {
+                let schema = schema_for_historical_native_row(
+                    read,
+                    resolved.source_commit_object_id,
+                    &state_key.schema_key,
+                )
+                .await?;
+                native_schema_cache.insert(schema_cache_key.clone(), schema);
+            }
+            let schema = native_schema_cache
+                .get(&schema_cache_key)
+                .expect("historical native schema was inserted");
+            crate::native_row::decode(
+                schema,
+                &state_key.entity_pk,
+                expected_global,
+                state_key.file_id.as_deref(),
+                native,
+            )
+            .map_err(|error| corruption(error.to_string()))?;
+        }
         output.push(Some((pack_row.value, *source)));
     }
 
