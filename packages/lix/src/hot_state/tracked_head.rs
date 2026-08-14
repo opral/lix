@@ -49,9 +49,7 @@ pub(crate) struct ColumnarBaseCoordinate {
     pub(crate) row_index: u32,
 }
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -304,7 +302,6 @@ struct BranchRef<'a> {
 
 #[derive(Debug, Clone, musli::Encode, musli::Decode)]
 #[musli(packed)]
-#[cfg(test)]
 struct BranchRefKey {
     branch_id: String,
 }
@@ -813,7 +810,6 @@ async fn load_tracked_working_diff_epoch(
 /// checkpoint epoch. This deliberately runs only from repository GC: a
 /// checkpoint reset is O(1), while old index prefixes are unreachable as soon
 /// as its marker commits.
-#[cfg(test)]
 pub(crate) async fn stage_collect_stale_working_diff_indexes<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -831,21 +827,6 @@ where
     hot::stage_collect_stale_hot_diff_records(store, writes, &active).await
 }
 
-pub(crate) async fn stage_delete_tracked_working_diff_epoch<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    hot::stage_delete_hot_diff_scope(store, writes, branch_id, checkpoint_commit_id, generation)
-        .await
-}
-
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveWorkingDiffScope {
     checkpoint_commit_id: CommitId,
@@ -856,7 +837,6 @@ struct ActiveWorkingDiffScope {
 /// authoritative branch control. Broken auxiliary bytes are reclaimed here
 /// rather than turning background GC into a retry loop; normal readers already
 /// select canonical replay for the same cases.
-#[cfg(test)]
 async fn stage_active_working_diff_scopes<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -1476,6 +1456,30 @@ fn effective_hot_commit_id(
     ) {
         (Some(active), Some(owner)) if owner != active => Some(active),
         _ => Some(commit_id),
+    }
+}
+
+/// Returns the checkpoint-canonical creation timestamp without rewriting the
+/// current row when an epoch rotates.
+///
+/// A row first created in the previous interval carries `BeforeAbsent` and is
+/// canonicalized by checkpoint history to its change timestamp. Rows that
+/// existed at the checkpoint retain their original creation timestamp.
+fn effective_hot_created_at(
+    value: HeadValueView<'_>,
+    active_checkpoint_commit_id: Option<CommitId>,
+) -> LixTimestamp {
+    match (
+        active_checkpoint_commit_id,
+        value.working_diff_baseline,
+    ) {
+        (
+            Some(active),
+            WorkingDiffBaseline::BeforeAbsent {
+                checkpoint_commit_id,
+            },
+        ) if checkpoint_commit_id != active => value.updated_at,
+        _ => value.created_at,
     }
 }
 
@@ -2238,7 +2242,7 @@ where
             snapshot_content,
             metadata,
             value.deleted,
-            value.created_at,
+            effective_hot_created_at(value, active_checkpoint_commit_id),
             value.updated_at,
             global,
             value.change_id,

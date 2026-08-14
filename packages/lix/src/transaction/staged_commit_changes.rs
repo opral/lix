@@ -90,6 +90,10 @@ struct StagedCommitChangeColumns {
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
     updated_at: Vec<LixTimestamp>,
+    /// Logical row ordinals whose selected change is a deletion. Built once
+    /// while the typed columns are produced so checkpoint publication can
+    /// visit O(deletes) rather than rescan every selected member.
+    deleted_rows: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +133,7 @@ impl StagedCommitChangeBatchBuilder {
                 deleted: Vec::with_capacity(row_count),
                 created_at: Vec::with_capacity(row_count),
                 updated_at: Vec::with_capacity(row_count),
+                deleted_rows: Vec::new(),
             },
         }
     }
@@ -142,6 +147,12 @@ impl StagedCommitChangeBatchBuilder {
         created_at: LixTimestamp,
         updated_at: LixTimestamp,
     ) {
+        if deleted {
+            self.columns.deleted_rows.push(
+                u32::try_from(self.columns.identities.len())
+                    .expect("staged commit change batch exceeds u32 rows"),
+            );
+        }
         self.columns.identities.push(identity);
         self.columns.source_commit_ids.push(source_commit_id);
         self.columns.change_ids.push(change_id);
@@ -202,6 +213,32 @@ impl StagedCommitChangeBatch {
         (0..self.len()).map(|row_index| self.row(row_index))
     }
 
+    /// Selected deletion members without scanning non-deleted rows.
+    pub(crate) fn deleted_iter(
+        &self,
+    ) -> impl Iterator<Item = StagedCommitChangeRef<'_>> + '_ {
+        self.columns
+            .deleted_rows
+            .iter()
+            .copied()
+            .filter(move |&column_index| {
+                self.selection
+                    .as_ref()
+                    .is_none_or(|selection| selection.binary_search(&column_index).is_ok())
+            })
+            .map(move |column_index| {
+                let logical_index = self.selection.as_ref().map_or(column_index, |selection| {
+                    u32::try_from(
+                        selection
+                            .binary_search(&column_index)
+                            .expect("filtered deleted row belongs to selection"),
+                    )
+                    .expect("selected commit change batch exceeds u32 rows")
+                });
+                self.row(logical_index as usize)
+            })
+    }
+
     fn row(&self, row_index: usize) -> StagedCommitChangeRef<'_> {
         let column_index = self
             .selection
@@ -246,6 +283,7 @@ impl StagedCommitChangeBatch {
             + usize::from(!self.columns.deleted.is_empty())
             + usize::from(!self.columns.created_at.is_empty())
             + usize::from(!self.columns.updated_at.is_empty())
+            + usize::from(!self.columns.deleted_rows.is_empty())
             + usize::from(self.selection.is_some())
     }
 }
