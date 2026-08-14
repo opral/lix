@@ -3477,24 +3477,29 @@ mod tests {
     }
 
     #[test]
-    fn default_plan_compiles_uuid_and_timestamp_intrinsics_without_cel() {
+    fn default_plan_compiles_schema_v1_intrinsics_and_literal_without_cel() {
         let plan = DefaultPlan::from_schema(&json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "x-lix-default": " lix_uuid_v7() "},
-                "created_at": {"type": "string", "x-lix-default": "lix_timestamp()"},
-                "label": {"type": "string", "x-lix-default": r#""row-" + id"#}
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "default_probe",
+            "columns": [
+                {"name": "created_at", "type": "timestamptz", "nullable": false, "default_expression": "CURRENT_TIMESTAMP"},
+                {"name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()"},
+                {"name": "label", "type": "text", "nullable": false, "default_value": "row-static"}
+            ],
+            "primary_key": ["id"]
         }));
 
         assert_eq!(plan.properties[0].field_name, "created_at");
-        assert_eq!(plan.properties[0].default, DefaultValuePlan::Timestamp);
+        assert_eq!(
+            plan.properties[0].default,
+            DefaultValuePlan::CurrentTimestamp
+        );
         assert_eq!(plan.properties[1].field_name, "id");
         assert_eq!(plan.properties[1].default, DefaultValuePlan::UuidV7);
         assert_eq!(plan.properties[2].field_name, "label");
         assert_eq!(
             plan.properties[2].default,
-            DefaultValuePlan::Cel(r#""row-" + id"#.to_string())
+            DefaultValuePlan::Json(JsonValue::String("row-static".to_owned()))
         );
     }
 

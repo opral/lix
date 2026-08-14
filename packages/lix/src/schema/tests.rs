@@ -89,9 +89,9 @@ async fn postgresql_jsonb_syntax_registers_queries_and_updates_rows() {
     use crate::storage::Memory;
 
     let storage = Memory::new();
-    Engine::initialize(storage.clone()).await.unwrap();
+    let receipt = Engine::initialize(storage.clone()).await.unwrap();
     let engine = Engine::new(storage).await.unwrap();
-    let session = engine.open_session().await.unwrap();
+    let session = engine.open_session(receipt.main_branch_id).await.unwrap();
     let definition = json!({
         "$schema": "https://lix.dev/schema-v1.json",
         "key": "acme_jsonb_probe",

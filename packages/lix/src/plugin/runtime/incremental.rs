@@ -4070,9 +4070,10 @@ mod tests {
 
     #[test]
     fn certified_plugin_rows_retain_source_buffers_without_an_arena() {
-        let schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
@@ -4152,9 +4153,10 @@ mod tests {
 
     #[test]
     fn canonical_plugin_rows_skip_dom_and_share_the_normalized_arena() {
-        let schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
@@ -4209,9 +4211,10 @@ mod tests {
 
     #[test]
     fn plugin_row_parser_counts_one_pass_for_canonical_compatibility_and_invalid_rows() {
-        let schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
@@ -4282,11 +4285,12 @@ mod tests {
 
     #[test]
     fn streaming_plugin_parser_matches_dom_canonicalization_for_compatibility_corpus() {
-        let row_schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let row_schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let table_schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv/schema/csv_table.json"
+            "../../../../../plugins/csv/schema/csv_table.json"
         ))
         .expect("CSV table schema");
         let catalog = CatalogSnapshot::from_schema_facts(&[

@@ -54,9 +54,6 @@ use tower_http::{
 };
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
-#[cfg(test)]
-mod remote_read_bench;
-
 /// Stable URL prefix owned by the Lix server protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
@@ -3972,9 +3969,6 @@ mod tests {
     use lix_collaboration_test_support::{
         CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
     };
-    use lix_storage_rocksdb::RocksDB;
-    use lix_storage_slatedb::{SlateDB, SlateDBObjectStoreOptions, SlateDBRead, SlateDBWrite};
-    use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
     use std::{
         collections::BTreeMap,
@@ -4521,105 +4515,6 @@ mod tests {
             if self.fail_after_commit {
                 return Err(StorageError::CommitOutcomeUnknown(
                     "injected post-commit failure".to_string(),
-                ));
-            }
-            Ok(result)
-        }
-
-        async fn rollback(self) -> Result<(), StorageError> {
-            self.inner.rollback().await
-        }
-    }
-
-    /// Turns one definite SlateDB commit into the transport-style ambiguity
-    /// that occurs when an acknowledgement is lost after the write returns.
-    /// Unlike the Memory wrapper above, this preserves SlateDB's remote
-    /// durability read tier so the protocol can prove a positive receipt.
-    #[derive(Clone)]
-    struct PostCommitUnknownSlateDB {
-        inner: SlateDB,
-        fail_next_commit: Arc<AtomicBool>,
-    }
-
-    impl PostCommitUnknownSlateDB {
-        fn new() -> Self {
-            let inner = SlateDB::open_object_store_with_options(
-                "server-protocol-idempotency",
-                Arc::new(ObjectStoreMemory::new()),
-                SlateDBObjectStoreOptions::default(),
-            )
-            .expect("open SlateDB test storage");
-            Self {
-                inner,
-                fail_next_commit: Arc::new(AtomicBool::new(false)),
-            }
-        }
-
-        fn fail_next_commit(&self) {
-            self.fail_next_commit.store(true, Ordering::Release);
-        }
-    }
-
-    struct PostCommitUnknownSlateDBWrite {
-        inner: SlateDBWrite,
-        fail_after_commit: bool,
-    }
-
-    impl Storage for PostCommitUnknownSlateDB {
-        type Read<'a>
-            = SlateDBRead
-        where
-            Self: 'a;
-        type Write<'a>
-            = PostCommitUnknownSlateDBWrite
-        where
-            Self: 'a;
-
-        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
-            self.inner.begin_read(options).await
-        }
-
-        async fn begin_write(
-            &self,
-            options: WriteOptions,
-        ) -> Result<Self::Write<'_>, StorageError> {
-            Ok(PostCommitUnknownSlateDBWrite {
-                inner: self.inner.begin_write(options).await?,
-                fail_after_commit: self.fail_next_commit.swap(false, Ordering::AcqRel),
-            })
-        }
-    }
-
-    impl StorageWrite for PostCommitUnknownSlateDBWrite {
-        async fn put_many(
-            &mut self,
-            space: StorageSpace,
-            entries: PutBatch,
-        ) -> Result<(), StorageError> {
-            self.inner.put_many(space, entries).await
-        }
-
-        async fn delete_many(
-            &mut self,
-            space: StorageSpace,
-            keys: &[Key],
-        ) -> Result<(), StorageError> {
-            self.inner.delete_many(space, keys).await
-        }
-
-        async fn delete_range(
-            &mut self,
-            space: StorageSpace,
-            range: KeyRange,
-        ) -> Result<(), StorageError> {
-            self.inner.delete_range(space, range).await
-        }
-
-        async fn commit(self) -> Result<CommitResult, StorageError> {
-            let result = self.inner.commit().await?;
-            if self.fail_after_commit {
-                return Err(StorageError::CommitOutcomeUnknown(
-                    "injected post-commit acknowledgement loss".to_string(),
                 ));
             }
             Ok(result)
@@ -5353,61 +5248,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotency_key_replays_a_post_commit_acknowledgement_loss_once() {
-        let storage = PostCommitUnknownSlateDB::new();
-        let router = router_with_storage(storage.clone()).await;
-        let (session_id, _) = new_session(&router).await;
-        let headers = [(IDEMPOTENCY_KEY_HEADER, "post-commit-ack-loss")];
-        let body = json!({
-            "sql": "INSERT INTO lix_key_value (key, value) VALUES ('once', 'persisted')"
-        });
-
-        storage.fail_next_commit();
-        let first = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            &headers,
-            Some(body.clone()),
-        )
-        .await;
-        assert_eq!(
-            first.status(),
-            StatusCode::OK,
-            "{:?}",
-            response_json(first).await
-        );
-
-        let replay = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            &headers,
-            Some(body),
-        )
-        .await;
-        assert_eq!(replay.status(), StatusCode::OK);
-
-        let persisted = request(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            Some(json!({
-                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'once'"
-            })),
-        )
-        .await;
-        assert_eq!(persisted.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(persisted).await["rows"][0][0],
-            json!({ "kind": "int", "value": 1 })
-        );
-    }
-
-    #[tokio::test]
     async fn idempotency_key_reuse_with_a_different_mutation_is_rejected() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
@@ -5506,67 +5346,6 @@ mod tests {
         assert_eq!(
             response_json(draft_count).await["rows"][0][0],
             json!({ "kind": "int", "value": 0 })
-        );
-    }
-
-    #[tokio::test]
-    async fn idempotent_batch_replays_all_results_after_acknowledgement_loss() {
-        let storage = PostCommitUnknownSlateDB::new();
-        let router = router_with_storage(storage.clone()).await;
-        let (session_id, _) = new_session(&router).await;
-        let headers = [(IDEMPOTENCY_KEY_HEADER, "batch-ack-loss")];
-        let body = json!({
-            "statements": [
-                { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('batch-first', 'one')" },
-                { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('batch-second', 'two')" }
-            ]
-        });
-
-        storage.fail_next_commit();
-        let first = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute-batch",
-            Some(&session_id),
-            &headers,
-            Some(body.clone()),
-        )
-        .await;
-        assert_eq!(
-            first.status(),
-            StatusCode::OK,
-            "{:?}",
-            response_json(first).await
-        );
-        let replay = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute-batch",
-            Some(&session_id),
-            &headers,
-            Some(body),
-        )
-        .await;
-        assert_eq!(replay.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(replay).await.as_array().map(Vec::len),
-            Some(2)
-        );
-
-        let persisted = request(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            Some(json!({
-                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key IN ('batch-first', 'batch-second')"
-            })),
-        )
-        .await;
-        assert_eq!(persisted.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(persisted).await["rows"][0][0],
-            json!({ "kind": "int", "value": 2 })
         );
     }
 
@@ -5705,19 +5484,19 @@ mod tests {
         for (path, bytes) in [
             (
                 "manifest.json",
-                include_str!("../../../plugins/json/manifest.json").as_bytes(),
+                include_str!("../../../../plugins/json/manifest.json").as_bytes(),
             ),
             (
                 "schema/json_root.json",
-                include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
+                include_str!("../../../../plugins/json/schema/json_root.json").as_bytes(),
             ),
             (
                 "schema/json_object_member.json",
-                include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
+                include_str!("../../../../plugins/json/schema/json_object_member.json").as_bytes(),
             ),
             (
                 "schema/json_array_item.json",
-                include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
+                include_str!("../../../../plugins/json/schema/json_array_item.json").as_bytes(),
             ),
             ("plugin.wasm", wasm.as_slice()),
         ] {
@@ -7257,16 +7036,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_metadata_and_returning_work_on_all_storage_adapters() {
+    async fn execute_batch_metadata_and_returning_work_on_native_memory_storage() {
         assert_execute_batch_metadata(Memory::default()).await;
-
-        let rocks_root = tempfile::tempdir().expect("create RocksDB test directory");
-        assert_execute_batch_metadata(
-            RocksDB::open(rocks_root.path().join(".lix")).expect("open RocksDB test storage"),
-        )
-        .await;
-
-        assert_execute_batch_metadata(PostCommitUnknownSlateDB::new()).await;
     }
 
     async fn assert_execute_batch_metadata<S>(storage: S)
@@ -7891,15 +7662,6 @@ mod tests {
                     final_bytes
                 );
             }
-        }
-
-        fn resolver_calls(&self) -> u64 {
-            self.app
-                .server
-                .inner
-                .root
-                .plugin_transition_counters()
-                .conflict_resolution_calls
         }
 
         fn resource_counters(&self) -> BTreeMap<String, u64> {

@@ -3370,6 +3370,36 @@ fn entity_column_array(
                 .map(|value| value.and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
+        EntityColumnType::Timestamptz => Arc::new(
+            TimestampMicrosecondArray::from(
+                values
+                    .iter()
+                    .map(|value| {
+                        let Some(value) = value else {
+                            return Ok(None);
+                        };
+                        if value.is_null() {
+                            return Ok(None);
+                        }
+                        let text = value.as_str().ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "{}.{} expected timestamptz text",
+                                spec.schema_key, column_name
+                            ))
+                        })?;
+                        chrono::DateTime::parse_from_rfc3339(text)
+                            .map(|timestamp| Some(timestamp.timestamp_micros()))
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "{}.{} contains invalid timestamptz: {error}",
+                                    spec.schema_key, column_name
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .with_timezone("UTC"),
+        ) as ArrayRef,
     })
 }
 

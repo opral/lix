@@ -287,18 +287,38 @@ mod tests {
     use crate::common::LixTimestamp;
 
     use super::*;
-    use crate::forktree::state::StateCell;
+    use crate::entity_pk::EntityPk;
+    use crate::forktree::state::{StateCell, StateKeyRef, encode_state_key};
 
-    fn value(byte: u8) -> StateValue {
-        StateValue {
-            change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes([byte; 16])),
-            commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes([0x41; 16])),
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-            updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
-            cell: StateCell::Value(format!("value-{byte}").into()),
-            metadata: Some("metadata".into()),
-            origin_key: Some("origin".to_owned()),
-            blob_manifest_object_ids: vec![ObjectId::from_bytes([byte.wrapping_add(1); 32])],
+    fn row(label: &str, byte: u8, history_byte: u8, history_ordinal: u32) -> CurrentStatePackRowV1 {
+        let entity_pk = EntityPk::single(label);
+        let schema = crate::native_row::seed_schema("lix_key_value").expect("key-value schema");
+        let native = crate::native_row::encode(
+            &schema,
+            &entity_pk,
+            false,
+            None,
+            &serde_json::json!({"key": label, "value": format!("value-{byte}")}),
+        )
+        .expect("native test row");
+        CurrentStatePackRowV1 {
+            encoded_key: encode_state_key(StateKeyRef {
+                schema_key: "lix_key_value",
+                file_id: None,
+                entity_pk: &entity_pk,
+            }),
+            value: StateValue {
+                change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes([byte; 16])),
+                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes([0x41; 16])),
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell: StateCell::NativeRow(native),
+                metadata: Some("metadata".into()),
+                origin_key: Some("origin".to_owned()),
+                blob_manifest_object_ids: vec![ObjectId::from_bytes([byte.wrapping_add(1); 32])],
+            },
+            history_page_object_id: ObjectId::from_bytes([history_byte; 32]),
+            history_page_ordinal: history_ordinal,
         }
     }
 
@@ -308,18 +328,8 @@ mod tests {
             owner_commit_id: CommitId::from_bytes([0x41; 16]),
             global: false,
             rows: vec![
-                CurrentStatePackRowV1 {
-                    encoded_key: b"key-a".to_vec(),
-                    value: value(1),
-                    history_page_object_id: ObjectId::from_bytes([0x51; 32]),
-                    history_page_ordinal: 3,
-                },
-                CurrentStatePackRowV1 {
-                    encoded_key: b"key-b".to_vec(),
-                    value: value(2),
-                    history_page_object_id: ObjectId::from_bytes([0x52; 32]),
-                    history_page_ordinal: 4,
-                },
+                row("key-a", 1, 0x51, 3),
+                row("key-b", 2, 0x52, 4),
             ],
         };
         let (id, bytes) = pack.encode().expect("current-state pack");
@@ -339,12 +349,7 @@ mod tests {
 
     #[test]
     fn current_state_pack_rejects_wrong_owner_order_and_history_identity() {
-        let canonical = CurrentStatePackRowV1 {
-            encoded_key: b"key-a".to_vec(),
-            value: value(1),
-            history_page_object_id: ObjectId::from_bytes([0x51; 32]),
-            history_page_ordinal: 3,
-        };
+        let canonical = row("key-a", 1, 0x51, 3);
         let mut wrong_owner = canonical.clone();
         wrong_owner.value.commit_id =
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes([0x42; 16]));
