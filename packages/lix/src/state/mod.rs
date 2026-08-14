@@ -444,25 +444,71 @@ where
 }
 
 fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<StateKey> {
-    let mut left = left.into_iter().peekable();
-    let mut right = right.into_iter().peekable();
+    // Native tree diffs are ordered by durable encoded bytes
+    // (schema, entity_pk, file_id). `StateKey::Ord` follows struct field order
+    // (schema, file_id, entity_pk), so it is not an authority for this merge.
+    // Encode each input exactly once and preserve the two linear streams.
+    let encode = |key: &StateKey| {
+        crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        })
+    };
+    let mut left = left
+        .into_iter()
+        .map(|key| (encode(&key), key))
+        .peekable();
+    let mut right = right
+        .into_iter()
+        .map(|key| (encode(&key), key))
+        .peekable();
     let mut merged = Vec::new();
     loop {
         match (left.peek(), right.peek()) {
             (None, None) => break,
-            (Some(_), None) => merged.push(left.next().expect("peeked left key")),
-            (None, Some(_)) => merged.push(right.next().expect("peeked right key")),
-            (Some(left_key), Some(right_key)) => match left_key.cmp(right_key) {
-                Ordering::Less => merged.push(left.next().expect("peeked left key")),
-                Ordering::Greater => merged.push(right.next().expect("peeked right key")),
+            (Some(_), None) => merged.push(left.next().expect("peeked left key").1),
+            (None, Some(_)) => merged.push(right.next().expect("peeked right key").1),
+            (Some((left_encoded, _)), Some((right_encoded, _))) => {
+                match left_encoded.cmp(right_encoded) {
+                Ordering::Less => merged.push(left.next().expect("peeked left key").1),
+                Ordering::Greater => merged.push(right.next().expect("peeked right key").1),
                 Ordering::Equal => {
-                    merged.push(left.next().expect("peeked left key"));
+                    merged.push(left.next().expect("peeked left key").1);
                     right.next();
                 }
-            },
+                }
+            }
         }
     }
     merged
+}
+
+#[cfg(test)]
+mod key_order_tests {
+    use super::{StateKey, merge_sorted_state_keys};
+    use crate::entity_pk::EntityPk;
+
+    fn key(entity_pk: &str, file_id: &str) -> StateKey {
+        StateKey {
+            schema_key: "app.row".to_owned(),
+            file_id: Some(file_id.to_owned()),
+            entity_pk: EntityPk::single(entity_pk),
+        }
+    }
+
+    #[test]
+    fn root_diff_merge_uses_canonical_pk_before_file_order_and_dedupes() {
+        let duplicate = key("a", "z-file");
+        let merged = merge_sorted_state_keys(
+            vec![duplicate.clone(), key("c", "a-file")],
+            vec![duplicate, key("b", "b-file")],
+        );
+        assert_eq!(
+            merged,
+            vec![key("a", "z-file"), key("b", "b-file"), key("c", "a-file")]
+        );
+    }
 }
 
 /// One transaction's committed retained view plus an ordered staged overlay.
