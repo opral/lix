@@ -69,6 +69,11 @@ impl StorageSpace {
     pub const fn value_semantics(self) -> ValueSemantics {
         self.value_semantics
     }
+
+    #[cfg(feature = "storage-benches")]
+    pub const fn benchmark_mutable(id: u32, name: &'static str) -> Self {
+        Self::engine_declared(id, name, ValueSemantics::Mutable)
+    }
 }
 
 mod private {

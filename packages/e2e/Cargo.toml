@@ -404,6 +404,12 @@ path = "benches/uuid_v7_physical_keys.rs"
 harness = false
 required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
 
+[[bench]]
+name = "commit_pack_20"
+path = "benches/commit_pack_20.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
 
 
 [[example]]

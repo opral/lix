@@ -1,0 +1,11 @@
+[package]
+name = "commit-pack-20-model"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+blake3 = "1"
+zstd = "0.13"
