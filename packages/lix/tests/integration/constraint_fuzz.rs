@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use lix::{LixError, Value};
 
-const SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
+const DEFAULT_SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
 const STEPS_PER_SEED: usize = 48;
 const IDS: usize = 8;
 
@@ -12,7 +12,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -20,7 +20,7 @@ simulation_test!(
         register_constraint_schemas(&session).await;
         let mut operations_seen = [false; 8];
 
-        for seed in SEEDS {
+        for seed in crate::support::fuzz_seeds(&DEFAULT_SEEDS) {
             let prefix = format!("constraint-fuzz-{seed:016x}-");
             let mut parents = BTreeMap::<String, String>::new();
             let mut children = BTreeMap::<String, String>::new();
@@ -103,9 +103,14 @@ simulation_test!(
                         }
                     }
                     3 => {
+                        // A child insert can violate both constraints at once
+                        // (the id already exists *and* the referenced parent
+                        // does not). The engine validates referential integrity
+                        // first and reports the foreign-key violation, so the
+                        // model must not claim UNIQUE whenever the id exists.
                         let expected_error =
                             children.contains_key(&child_id) || !parents.contains_key(&parent_id);
-                        let expected_code = if children.contains_key(&child_id) {
+                        let expected_code = if parents.contains_key(&parent_id) {
                             LixError::CODE_UNIQUE
                         } else {
                             LixError::CODE_FOREIGN_KEY
@@ -180,7 +185,7 @@ simulation_test!(
                         .unwrap_or_else(|error| panic!("{label}: reopen failed: {error:?}"));
                     let reopened = sim.wrap_session(
                         reopened_engine
-                            .open_workspace_session()
+                            .open_session()
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("{label}: reopened session failed: {error:?}")
@@ -205,8 +210,8 @@ async fn register_constraint_schemas(
     session
         .execute(
             r#"INSERT INTO lix_registered_schema (value) VALUES
-               (lix_json('{"x-lix-key":"corruption_fuzz_parent","x-lix-primary-key":["/id"],"x-lix-unique":[["/slug"]],"type":"object","properties":{"id":{"type":"string"},"slug":{"type":"string"}},"required":["id","slug"],"additionalProperties":false}')),
-               (lix_json('{"x-lix-key":"corruption_fuzz_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"corruption_fuzz_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}'))"#,
+               (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"corruption_fuzz_parent","columns":[{"name":"id","type":"text","nullable":false},{"name":"slug","type":"text","nullable":false}],"primary_key":["id"],"unique":[["slug"]]}' AS JSONB)),
+               (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"corruption_fuzz_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"corruption_fuzz_parent","columns":["id"]}}]}' AS JSONB))"#,
             &[],
         )
         .await

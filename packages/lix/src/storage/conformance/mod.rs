@@ -72,6 +72,7 @@ mod tests {
                 "baseline::empty_space_reads_are_empty",
                 "baseline::get_many_returns_requested_slots",
                 "baseline::get_many_empty_key_list",
+                "baseline::content_addressed_space_returns_identical_bytes",
                 "baseline::delete_many_missing_keys_is_idempotent",
                 "baseline::delete_many_removes_existing_keys",
                 "baseline::delete_range_removes_exact_range",

@@ -30,7 +30,7 @@ use super::stats::MergeStats;
 use crate::common::{SharedStr, compose_directory_path, compose_file_path};
 use crate::session::context::SessionContext;
 use crate::transaction::types::StagedCommitChangeBatchBuilder;
-use crate::wasm::{
+use crate::plugin::runtime::{
     WasmByteSource, WasmChangeEffect, WasmConflictResolution, WasmConflictTake, WasmEntityConflict,
     WasmEntityKey, WasmFileDescriptor, WasmHostBytes, WasmPluginSelection, WasmSourceRange,
     WasmSourceSlice,

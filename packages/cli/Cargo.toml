@@ -12,6 +12,7 @@ readme.workspace = true
 keywords.workspace = true
 categories = ["command-line-utilities", "development-tools", "artificial-intelligence", "filesystem"]
 rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -32,6 +33,7 @@ plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = 
 clap = { version = "4.5.31", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 comfy-table = "7.1"
 base64 = "0.22"
 bytes = "1"

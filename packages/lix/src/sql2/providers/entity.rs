@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, not_impl_err};
@@ -1458,6 +1460,30 @@ fn entity_update_json_value(
                 &other,
             )),
         },
+        EntityColumnType::Timestamptz => match value {
+            ScalarValue::TimestampMicrosecond(Some(value), _) => {
+                chrono::DateTime::from_timestamp_micros(value)
+                    .map(|timestamp| {
+                        JsonValue::String(
+                            timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        entity_update_type_error(
+                            spec,
+                            column_name,
+                            "TIMESTAMPTZ",
+                            &ScalarValue::TimestampMicrosecond(Some(value), Some("UTC".into())),
+                        )
+                    })
+            }
+            other => Err(entity_update_type_error(
+                spec,
+                column_name,
+                "TIMESTAMPTZ",
+                &other,
+            )),
+        },
     }
 }
 
@@ -2066,7 +2092,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
             | EntityColumnType::Boolean
             | EntityColumnType::Integer
             | EntityColumnType::Number => Some(column.name.as_str()),
-            EntityColumnType::Json => None,
+            EntityColumnType::Json | EntityColumnType::Timestamptz => None,
         }
     }
 }
@@ -2160,7 +2186,10 @@ fn entity_filter_value_literal(
             EntityFilterValue::Integer(_) | EntityFilterValue::Number(_),
             EntityColumnType::Number,
         )
-        | (EntityFilterValue::String(_), EntityColumnType::String) => Some(value),
+        | (
+            EntityFilterValue::String(_),
+            EntityColumnType::String | EntityColumnType::Timestamptz,
+        ) => Some(value),
         _ => None,
     }
 }
@@ -2187,6 +2216,9 @@ fn entity_snapshot_value(
         }
         EntityColumnType::Boolean => value.as_bool().map(EntityFilterValue::Boolean),
         EntityColumnType::Json => None,
+        EntityColumnType::Timestamptz => value
+            .as_str()
+            .map(|value| EntityFilterValue::String(value.to_owned())),
     })
 }
 
@@ -2791,6 +2823,21 @@ fn path_value_record_batch_from_slots(
                         .iter()
                         .map(|value| value.as_ref().and_then(JsonValue::as_bool)),
                 )),
+                EntityColumnType::Timestamptz => Arc::new(
+                    TimestampMicrosecondArray::from(
+                        values
+                            .iter()
+                            .map(|value| {
+                                entity_timestamptz_value(
+                                    value.as_ref(),
+                                    &spec.schema_key,
+                                    field.name(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                    .with_timezone("UTC"),
+                ),
             };
             Ok(array)
         })
@@ -2856,8 +2903,46 @@ fn entity_slot_column_array(
                 .iter()
                 .map(|value| value.as_ref().and_then(JsonValue::as_bool)),
         )),
+        EntityColumnType::Timestamptz => Arc::new(
+            TimestampMicrosecondArray::from(
+                values
+                    .iter()
+                    .map(|value| {
+                        entity_timestamptz_value(
+                            value.as_ref(),
+                            &spec.schema_key,
+                            column_name,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .with_timezone("UTC"),
+        ),
     };
     Ok(array)
+}
+
+fn entity_timestamptz_value(
+    value: Option<&JsonValue>,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<Option<i64>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "{schema_key}.{column_name} expected timestamptz text"
+        ))
+    })?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|timestamp| Some(timestamp.timestamp_micros()))
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "{schema_key}.{column_name} contains invalid timestamptz: {error}"
+            ))
+        })
 }
 
 /// Certified state snapshots may encode a primary-key component only in the

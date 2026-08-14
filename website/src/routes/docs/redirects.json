@@ -1,4 +1,5 @@
 {
   "/docs": "/docs/what-is-lix",
-  "/docs/storage": "/docs/persistence"
+  "/docs/storage": "/docs/persistence",
+  "/docs/versions": "/docs/branching"
 }

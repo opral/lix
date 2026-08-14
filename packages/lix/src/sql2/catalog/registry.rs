@@ -17,8 +17,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
     HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_SOURCE_CHANGES,
+    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
 #[cfg(test)]
 use crate::sql2::providers::filesystem_working_diff_schema;
@@ -47,14 +46,22 @@ impl PublicCatalog {
     /// complete `lix_*` namespace, so only trusted bootstrap schemas can add
     /// Lix-owned surfaces to this catalog.
     pub(crate) fn fixed_system() -> &'static Self {
-        static FIXED_SYSTEM_CATALOG: OnceLock<PublicCatalog> = OnceLock::new();
+        Self::fixed_system_shared()
+    }
+
+    /// The same immutable catalog behind an `Arc` so per-statement provider
+    /// registration can share it instead of deep-copying two `BTreeMap`s.
+    pub(crate) fn fixed_system_shared() -> &'static Arc<Self> {
+        static FIXED_SYSTEM_CATALOG: OnceLock<Arc<PublicCatalog>> = OnceLock::new();
         FIXED_SYSTEM_CATALOG.get_or_init(|| {
             let schemas = crate::schema::seed_schema_definitions()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            Self::from_visible_schemas(&schemas)
-                .expect("compile-time Lix schemas must form a valid SQL catalog")
+            Arc::new(
+                Self::from_visible_schemas(&schemas)
+                    .expect("compile-time Lix schemas must form a valid SQL catalog"),
+            )
         })
     }
 
@@ -103,8 +110,6 @@ impl PublicCatalog {
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
-            PublicSurfaceKind::Checkpoint => checkpoint_schema(false),
-            PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
             PublicSurfaceKind::WorkingDiff => working_diff_schema(false),
             PublicSurfaceKind::WorkingDiffByBranch => working_diff_schema(true),
             PublicSurfaceKind::Revert
@@ -225,27 +230,6 @@ impl PublicCatalog {
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
-            "lix_checkpoint",
-            PublicSurfaceKind::Checkpoint,
-            public_columns([
-                ("commit_id", false),
-                ("created_at", false),
-                ("lixcol_depth", false),
-            ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
-            "lix_checkpoint_by_branch",
-            PublicSurfaceKind::CheckpointByBranch,
-            public_columns([
-                ("commit_id", false),
-                ("created_at", false),
-                ("lixcol_branch_id", false),
-                ("lixcol_depth", false),
-            ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
             "lix_working_diff",
             PublicSurfaceKind::WorkingDiff,
             public_columns([
@@ -350,14 +334,15 @@ impl PublicCatalog {
     }
 
     fn insert_entity_surfaces_from_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
-        if let Some(schema_key) = schema.get("x-lix-key").and_then(JsonValue::as_str)
-            && Self::runtime_schema_key_uses_reserved_namespace(schema_key)
-            && !crate::schema::is_seed_schema_key(schema_key)
+        let parsed = crate::schema::parse_lix_schema(schema)?;
+        if Self::runtime_schema_key_uses_reserved_namespace(&parsed.key)
+            && !crate::schema::is_seed_schema_key(&parsed.key)
         {
             return Err(LixError::new(
                 LixError::CODE_RESERVED_SCHEMA_NAMESPACE,
                 format!(
-                    "registered schema '{schema_key}' uses the reserved Lix schema namespace but is not a Lix bootstrap schema"
+                    "registered schema '{}' uses the reserved Lix schema namespace but is not a Lix bootstrap schema",
+                    parsed.key
                 ),
             )
             .with_hint(
@@ -365,9 +350,7 @@ impl PublicCatalog {
             ));
         }
 
-        let Ok(spec) = derive_entity_surface_spec_from_schema(schema) else {
-            return Ok(());
-        };
+        let spec = derive_entity_surface_spec_from_schema(schema)?;
 
         if !schema_exposed_as_entity_surface(&spec.schema_key) {
             return Ok(());
@@ -391,17 +374,19 @@ impl PublicCatalog {
             capabilities.clone(),
         ))?;
 
-        let mut by_branch_columns = entity_columns(&spec);
-        by_branch_columns.extend(entity_hidden_columns(&spec, true));
+        if spec.schema_key != crate::schema::LIX_CHECKPOINT_SCHEMA_KEY {
+            let mut by_branch_columns = entity_columns(&spec);
+            by_branch_columns.extend(entity_hidden_columns(&spec, true));
 
-        self.insert(surface(
-            format!("{}_by_branch", spec.schema_key),
-            PublicSurfaceKind::EntityByBranch {
-                schema_key: spec.schema_key.clone(),
-            },
-            by_branch_columns,
-            capabilities,
-        ))?;
+            self.insert(surface(
+                format!("{}_by_branch", spec.schema_key),
+                PublicSurfaceKind::EntityByBranch {
+                    schema_key: spec.schema_key.clone(),
+                },
+                by_branch_columns,
+                capabilities,
+            ))?;
+        }
 
         if schema_exposed_as_entity_history_surface(&spec.schema_key) {
             let history_identity_roots = primary_key_roots(&spec);
@@ -430,19 +415,6 @@ impl PublicCatalog {
         self.entity_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
-}
-
-#[cfg(test)]
-fn checkpoint_schema(by_branch: bool) -> SchemaRef {
-    let mut fields = vec![
-        Field::new("commit_id", DataType::Utf8, false),
-        Field::new("created_at", DataType::Utf8, false),
-    ];
-    if by_branch {
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    }
-    fields.push(Field::new("lixcol_depth", DataType::Int64, false));
-    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
@@ -585,7 +557,7 @@ fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
 
 fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::public_insert_only("id", false).with_default("lix_uuid_v7()"),
+        PublicColumn::public_insert_only("id", false).with_default("uuidv7()"),
         PublicColumn::public("path", false).conditional_on_insert(),
         PublicColumn::public("directory_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
@@ -597,7 +569,7 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
 
 fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::public_insert_only("id", false).with_default("lix_uuid_v7()"),
+        PublicColumn::public_insert_only("id", false).with_default("uuidv7()"),
         PublicColumn::public("path", true).conditional_on_insert(),
         PublicColumn::public("parent_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
@@ -650,7 +622,6 @@ fn entity_system_columns(
         entity_pk,
         PublicColumn::public_read_only("lixcol_schema_key", false),
         PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
-        PublicColumn::hidden("lixcol_snapshot_content", true),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
         PublicColumn::public_read_only("lixcol_created_at", false),
         PublicColumn::public_read_only("lixcol_updated_at", false),
@@ -669,7 +640,6 @@ fn entity_history_system_columns() -> Vec<PublicColumn> {
         (HISTORY_COL_ENTITY_PK, false),
         (HISTORY_COL_SCHEMA_KEY, false),
         (HISTORY_COL_FILE_ID, true),
-        (HISTORY_COL_SNAPSHOT_CONTENT, true),
         (HISTORY_COL_METADATA, true),
         (HISTORY_COL_CHANGE_ID, false),
         (HISTORY_COL_CHANGE_CREATED_AT, false),
@@ -739,21 +709,23 @@ mod tests {
     fn catalog_rejects_legacy_runtime_schema_in_reserved_lix_namespace() {
         for legacy_schema in [
             json!({
-                "x-lix-key": "lix_plugin_note",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false,
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "lix_plugin_note",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             }),
             json!({
-                "x-lix-key": "lix_registry_only_legacy",
-                "type": "object",
-                "properties": { "payload": {} },
-                "additionalProperties": false,
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "lix_registry_only_legacy",
+                "columns": [
+                    { "name": "payload", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["payload"],
             }),
         ] {
-            let schema_key = legacy_schema["x-lix-key"]
+            let schema_key = legacy_schema["key"]
                 .as_str()
                 .expect("test schema key")
                 .to_string();

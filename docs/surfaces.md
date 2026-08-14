@@ -6,20 +6,20 @@ description: "The application-oriented SQL surfaces in Lix: typed entities, file
 
 Lix exposes logical application data through typed SQL relations:
 
-| Data | Active branch | Cross-branch | History / diff functions |
-| :-- | :-- | :-- | :-- |
-| Registered application entity `X` | `<schema>` | `<schema>_by_branch` | `<schema>_history()` |
-| Files | `lix_file` | `lix_file_by_branch` | `lix_file_history()` |
-| Directories | `lix_directory` | `lix_directory_by_branch` | `lix_directory_history()` |
-| Working diffs | `lix_working_diff` | `lix_working_diff_by_branch` | `lix_diff(from_commit, to_commit)` |
-| File working diffs | `lix_file_working_diff` | `lix_file_working_diff_by_branch` | — |
-| Directory working diffs | `lix_directory_working_diff` | `lix_directory_working_diff_by_branch` | — |
-| Checkpoints | `lix_checkpoint` | `lix_checkpoint_by_branch` | — |
+| Data                              | Active branch                | Cross-branch                           | History / diff functions           |
+| :-------------------------------- | :--------------------------- | :------------------------------------- | :--------------------------------- |
+| Registered application entity `X` | `<schema>`                   | `<schema>_by_branch`                   | `<schema>_history()`               |
+| Files                             | `lix_file`                   | `lix_file_by_branch`                   | `lix_file_history()`               |
+| Directories                       | `lix_directory`              | `lix_directory_by_branch`              | `lix_directory_history()`          |
+| Working diffs                     | `lix_working_diff`           | `lix_working_diff_by_branch`           | `lix_diff(from_commit, to_commit)` |
+| File working diffs                | `lix_file_working_diff`      | `lix_file_working_diff_by_branch`      | —                                  |
+| Directory working diffs           | `lix_directory_working_diff` | `lix_directory_working_diff_by_branch` | —                                  |
+| Checkpoints                       | `lix_checkpoint`             | `lix_checkpoint_by_branch`             | —                                  |
 
 The history functions read revisions reachable from a commit; `lix_diff`
 compares two arbitrary commits. `lix_registered_schema*` provides schema
-discovery and `lix_key_value*` provides shared workspace metadata.
-`lix_change` records workspace-wide activity; [Change History](./history.md)
+discovery and `lix_key_value*` provides shared repository metadata.
+`lix_change` records repository-wide activity; [Change History](./history.md)
 documents it together with the history functions.
 
 `lix_file` represents regular file contents only. Its public columns are `id`,
@@ -77,12 +77,12 @@ omitted on insert, and rejects an explicit `NULL`.
 
 `lix_insert_policy` describes omission on `INSERT`:
 
-| Policy | Meaning |
-| :-- | :-- |
-| `READ_ONLY` | The column cannot be supplied on insert. |
-| `REQUIRED` | Every inserted row must supply the column. |
-| `OPTIONAL` | The column may be omitted without generating a value. |
-| `DEFAULT` | Omission evaluates the expression in `column_default`. |
+| Policy        | Meaning                                                           |
+| :------------ | :---------------------------------------------------------------- |
+| `READ_ONLY`   | The column cannot be supplied on insert.                          |
+| `REQUIRED`    | Every inserted row must supply the column.                        |
+| `OPTIONAL`    | The column may be omitted without generating a value.             |
+| `DEFAULT`     | Omission evaluates the expression in `column_default`.            |
 | `CONDITIONAL` | Whether the column is required depends on the row's other inputs. |
 
 `CONDITIONAL` covers deliberate alternative forms: filesystem rows can use a
@@ -92,14 +92,14 @@ describe omission only; `is_nullable` still describes read values.
 
 ## Typed entity surfaces
 
-Registering an application schema with `x-lix-key: "acme_task"` produces:
+Registering a Schema v1 document with `key: "acme_task"` produces:
 
-| Surface | Use for |
-| :-- | :-- |
-| `acme_task` | Read and mutate tasks on the active branch. |
-| `acme_task_by_branch` | Read or mutate tasks with an explicit `lixcol_branch_id`. |
-| `acme_task_history()` | Read task revisions reachable from the active head. |
-| `acme_task_history($commit)` | Read task revisions reachable from an explicit commit. |
+| Surface                      | Use for                                                   |
+| :--------------------------- | :-------------------------------------------------------- |
+| `acme_task`                  | Read and mutate tasks on the active branch.               |
+| `acme_task_by_branch`        | Read or mutate tasks with an explicit `lixcol_branch_id`. |
+| `acme_task_history()`        | Read task revisions reachable from the active head.       |
+| `acme_task_history($commit)` | Read task revisions reachable from an explicit commit.    |
 
 User properties become ordinary typed columns:
 
@@ -122,9 +122,7 @@ composite-key lookups, and tombstones.
 `lix_registered_schema` is the authoritative schema registry:
 
 ```sql
-SELECT
-  lix_json_get_text(value, 'x-lix-key') AS schema_key,
-  lix_json_get(value, 'x-lix-primary-key') AS primary_key
+SELECT schema_key, value -> 'primary_key' AS primary_key
 FROM lix_registered_schema
 ORDER BY schema_key;
 ```
@@ -135,22 +133,22 @@ relation. The storage-level schemas `lix_file_descriptor`,
 `lix_directory_descriptor`, and `lix_binary_blob_ref` are registered for
 interoperability while their implementation relations are private.
 
-Applications and plugins cannot register the exact `x-lix-key` `lix` or a key
+Applications and plugins cannot register the exact Schema v1 key `lix` or a key
 beginning with `lix_`; their base or generated SQL names occupy the namespace
 reserved for Lix bootstrap schemas. Use an owner-specific prefix such as
 `acme_task`.
 
 `lix_key_value`, `lix_key_value_by_branch`, and `lix_key_value_history()` are
-public for shared workspace settings and interoperability metadata.
+public for shared repository settings and interoperability metadata.
 
 ## Files
 
 `lix_file` exposes logical files, including their byte content:
 
-| Surface | Use for |
-| :-- | :-- |
-| `lix_file` | Current files on the active branch. |
-| `lix_file_by_branch` | Files with explicit branch scope. |
+| Surface              | Use for                                 |
+| :------------------- | :-------------------------------------- |
+| `lix_file`           | Current files on the active branch.     |
+| `lix_file_by_branch` | Files with explicit branch scope.       |
 | `lix_file_history()` | File revisions reachable from a commit. |
 
 User columns are `id`, `path`, `directory_id`, `name`, and `content`.
@@ -183,10 +181,10 @@ File history records revisions of the composed file projection with structured
 
 Directories use the same three scopes:
 
-| Surface | Use for |
-| :-- | :-- |
-| `lix_directory` | Current directories on the active branch. |
-| `lix_directory_by_branch` | Directories with explicit branch scope. |
+| Surface                   | Use for                                      |
+| :------------------------ | :------------------------------------------- |
+| `lix_directory`           | Current directories on the active branch.    |
+| `lix_directory_by_branch` | Directories with explicit branch scope.      |
 | `lix_directory_history()` | Directory revisions reachable from a commit. |
 
 User columns are `id`, `path`, `parent_id`, and `name`. Directory and file

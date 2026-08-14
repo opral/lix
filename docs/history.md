@@ -53,10 +53,9 @@ columns:
 
 | Column | What it is |
 | :-- | :-- |
-| `lixcol_entity_pk` | JSON array of primary-key values in `x-lix-primary-key` order. |
+| `lixcol_entity_pk` | JSON array of primary-key values in Schema v1 `primary_key` order. |
 | `lixcol_schema_key` | The registered schema key. |
 | `lixcol_file_id` | The owning file, or `NULL`. |
-| `lixcol_snapshot_content` | JSON snapshot at this revision. `NULL` for a tombstone: a deletion produces a change with no snapshot. |
 | `lixcol_metadata` | JSON change metadata. |
 | `lixcol_change_id` | The `lix_change.id` that produced this state. |
 | `lixcol_change_created_at` | When that source change was created. |
@@ -154,7 +153,7 @@ branch reachability. Ordinary untracked writes do not create change rows.
 | :-- | :-- |
 | `id` | Unique change ID. |
 | `entity_pk` | JSON array of primary-key values in schema order. |
-| `schema_key` | Changed schema (`x-lix-key`). |
+| `schema_key` | Changed Schema v1 key. |
 | `file_id` | Owning file, or `NULL`. |
 | `metadata` | JSON change metadata. |
 | `snapshot_content` | Snapshot after the change, or `NULL` for a deletion. |
@@ -169,8 +168,8 @@ segments for array indexes:
 SELECT created_at, id, snapshot_content
 FROM lix_change
 WHERE schema_key = 'acme_issue'
-  AND lix_json_get_text(entity_pk, 0) = 'launch'
-  AND lix_json_get_text(entity_pk, 1) = '7'
+  AND entity_pk ->> 0 = 'launch'
+  AND entity_pk ->> 1 = '7'
 ORDER BY created_at, id;
 ```
 

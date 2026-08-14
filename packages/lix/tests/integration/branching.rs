@@ -1,6 +1,6 @@
 use crate::support;
 use lix::Value;
-use lix::integration::Engine;
+use lix::engine::Engine;
 use lix::{
     CreateBranchOptions, LixError, MergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreviewOptions, MergeChangeStats, SwitchBranchOptions,
@@ -149,7 +149,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -185,7 +185,7 @@ simulation_test!(
 
         let from_initial = main.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-000000000003")
+                .open_session_at("01930000-0000-7000-8000-000000000003")
                 .await
                 .expect("explicit commit branch session should open"),
             &engine,
@@ -204,7 +204,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -246,22 +246,19 @@ simulation_test!(created_branch_sees_inherited_state, |sim| async move {
 });
 
 simulation_test!(
-    open_workspace_session_starts_on_seeded_main_branch,
+    open_session_starts_on_seeded_repository_default_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let workspace = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
         assert_eq!(
-            workspace
+            session
                 .active_branch_id()
                 .await
-                .expect("workspace active branch should resolve"),
+                .expect("active branch should resolve"),
             sim.main_branch_id()
         );
     }
@@ -336,13 +333,32 @@ simulation_test!(switch_branch_updates_session_in_place, |sim| async move {
     drop(engine);
 });
 
+simulation_test!(cannot_delete_repository_default_branch, |sim| async move {
+    let (_engine, _main, draft) = create_draft_from_main(&sim).await;
+
+    let error = draft
+        .execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(sim.main_branch_id().to_string())],
+        )
+        .await
+        .expect_err("repository default branch deletion should fail");
+
+    assert!(
+        error
+            .message
+            .contains("cannot delete repository default branch"),
+        "unexpected error: {error:?}"
+    );
+});
+
 simulation_test!(
     cached_write_templates_are_isolated_across_branch_switches,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
         let main_snapshot = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id().to_string())
+                .open_session_at(sim.main_branch_id().to_string())
                 .await
                 .expect("open independent main session"),
             &engine,
@@ -384,7 +400,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    pinned_switch_branch_is_ephemeral_and_does_not_advance_refs,
+    switch_branch_is_session_local_and_does_not_advance_refs,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
         let main_head_before = engine
@@ -395,20 +411,20 @@ simulation_test!(
             .load_branch_head_commit_id("01930000-0000-7000-8000-000000000001")
             .await
             .expect("draft head should load");
-        let workspace_before = sim.wrap_session(
+        let default_before = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("default session should open"),
             &engine,
         );
         assert_eq!(
-            workspace_before
+            default_before
                 .active_branch_id()
                 .await
-                .expect("workspace selector should resolve"),
+                .expect("default branch should resolve"),
             sim.main_branch_id(),
-            "pinned session setup should not have moved the workspace selector"
+            "session setup should not move the repository default"
         );
 
         main.switch_branch(SwitchBranchOptions {
@@ -433,31 +449,31 @@ simulation_test!(
             draft_head_before,
             "switching must not mutate the target branch ref"
         );
-        let workspace_after = sim.wrap_session(
+        let default_after = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("default session should open"),
             &engine,
         );
         assert_eq!(
-            workspace_after
+            default_after
                 .active_branch_id()
                 .await
-                .expect("workspace selector should resolve"),
+                .expect("default branch should resolve"),
             sim.main_branch_id(),
-            "pinned switching must not mutate the shared workspace selector"
+            "switching must not mutate the repository default"
         );
     }
 );
 
 simulation_test!(
-    workspace_switch_branch_updates_shared_workspace_selector,
+    independently_opened_sessions_keep_independent_branch_selection,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
         draft
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('workspace-draft-only', 'draft')",
+                "INSERT INTO lix_key_value (key, value) VALUES ('session-draft-only', 'draft')",
                 &[],
             )
             .await
@@ -471,75 +487,72 @@ simulation_test!(
             .await
             .expect("draft head should load");
 
-        let workspace_a = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+        let session_a = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
-        let workspace_b = sim.wrap_session(
+        let session_b = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("second workspace session should open"),
+                .expect("second session should open"),
             &engine,
         );
         assert_eq!(
-            workspace_a
+            session_a
                 .active_branch_id()
                 .await
-                .expect("workspace selector should resolve"),
+                .expect("session branch should resolve"),
             sim.main_branch_id()
         );
 
-        let receipt = workspace_a
+        let receipt = session_a
             .switch_branch(SwitchBranchOptions {
                 branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
             .await
-            .expect("workspace switch should succeed");
+            .expect("session switch should succeed");
 
         assert_eq!(receipt.branch_id, "01930000-0000-7000-8000-000000000001");
         assert_eq!(
-            workspace_a
+            session_a
                 .active_branch_id()
                 .await
-                .expect("switched workspace selector should resolve"),
+                .expect("switched session branch should resolve"),
             "01930000-0000-7000-8000-000000000001"
         );
         assert_eq!(
-            workspace_b
+            session_b
                 .active_branch_id()
                 .await
-                .expect("existing workspace session should retain its branch"),
+                .expect("independent session should retain its branch"),
             sim.main_branch_id(),
-            "workspace sessions pin the selector observed when they open"
+            "independent sessions retain their own branch selection"
         );
-        assert_key_value(&workspace_b, "workspace-draft-only", None).await;
-        let workspace_c = sim.wrap_session(
+        assert_key_value(&session_b, "session-draft-only", None).await;
+        let session_c = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("new workspace session should open"),
+                .expect("new default session should open"),
             &engine,
         );
         assert_eq!(
-            workspace_c
+            session_c
                 .active_branch_id()
                 .await
-                .expect("new workspace session should observe selector"),
-            "01930000-0000-7000-8000-000000000001"
+                .expect("repository default should resolve"),
+            sim.main_branch_id()
         );
-        assert_key_value(&workspace_c, "workspace-draft-only", Some("\"draft\"")).await;
-        assert_key_value(&main, "workspace-draft-only", None).await;
+        assert_key_value(&session_c, "session-draft-only", None).await;
+        assert_key_value(&main, "session-draft-only", None).await;
         assert_eq!(
             engine
                 .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             main_head_before,
-            "workspace switching must not mutate the old branch ref"
+            "session switching must not mutate the old branch ref"
         );
         assert_eq!(
             engine
@@ -547,63 +560,55 @@ simulation_test!(
                 .await
                 .expect("draft head should load"),
             draft_head_before,
-            "workspace switching must not mutate the new branch ref"
+            "session switching must not mutate the new branch ref"
         );
     }
 );
 
 simulation_test!(
-    workspace_switch_branch_persists_across_reopened_engine,
+    session_switch_does_not_persist_across_reopened_engine,
     |sim| async move {
         let (engine, _main, draft) = create_draft_from_main(&sim).await;
         draft
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('workspace-reopen-draft', 'draft')",
+                "INSERT INTO lix_key_value (key, value) VALUES ('session-reopen-draft', 'draft')",
                 &[],
             )
             .await
             .expect("draft write should succeed");
 
-        let workspace = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
-        workspace
+        session
             .switch_branch(SwitchBranchOptions {
                 branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
             .await
-            .expect("workspace switch should persist");
+            .expect("session switch should succeed");
 
         let reopened_engine = sim
             .reboot_engine_from_current_snapshot()
             .await
             .expect("engine should reopen from current snapshot");
-        let reopened_workspace = sim.wrap_session(
+        let reopened_session = sim.wrap_session(
             reopened_engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("reopened workspace session should open"),
+                .expect("reopened session should open"),
             &reopened_engine,
         );
 
         assert_eq!(
-            reopened_workspace
+            reopened_session
                 .active_branch_id()
                 .await
-                .expect("workspace selector should resolve after reopen"),
-            "01930000-0000-7000-8000-000000000001",
-            "workspace switch should survive reopening the engine"
+                .expect("repository default should resolve after reopen"),
+            sim.main_branch_id(),
+            "session switching must not change the repository default"
         );
-        assert_key_value(
-            &reopened_workspace,
-            "workspace-reopen-draft",
-            Some("\"draft\""),
-        )
-        .await;
+        assert_key_value(&reopened_session, "session-reopen-draft", None).await;
     }
 );
 
@@ -613,7 +618,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -783,7 +788,7 @@ simulation_test!(
 
         let global = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -888,9 +893,10 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[0].values(),
             &[
-                Value::Json(JsonValue::Array(vec![JsonValue::String(
-                    "draft-merge-source".to_string()
-                )])),
+                Value::Json(
+                    JsonValue::Array(vec![JsonValue::String("draft-merge-source".to_string())])
+                        .into()
+                ),
                 Value::Text("added".to_string()),
             ],
             "the selected source delta must remain visible against the target checkpoint"
@@ -898,9 +904,10 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[1].values(),
             &[
-                Value::Json(JsonValue::Array(vec![JsonValue::String(
-                    "main-merge-target".to_string()
-                )])),
+                Value::Json(
+                    JsonValue::Array(vec![JsonValue::String("main-merge-target".to_string())])
+                        .into()
+                ),
                 Value::Text("added".to_string()),
             ],
             "the target delta must remain visible against the target checkpoint"
@@ -908,7 +915,7 @@ simulation_test!(
 
         let global = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -997,7 +1004,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_branch_does_not_import_source_checkpoint_marker,
+    merge_branch_does_not_republish_global_checkpoint_entity,
     |sim| async move {
         let (_engine, main, draft) = create_draft_from_main(&sim).await;
         main.execute(
@@ -1013,10 +1020,22 @@ simulation_test!(
             )
             .await
             .expect("draft write should succeed");
-        draft
+        let checkpoint = draft
             .create_checkpoint()
             .await
             .expect("draft checkpoint should succeed");
+        assert_eq!(
+            main.execute(
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
+                &[Value::Text(checkpoint.commit_id.clone())],
+            )
+            .await
+            .expect("global checkpoint should be visible from main")
+            .rows()[0]
+                .values(),
+            &[Value::Text(checkpoint.commit_id.clone())],
+            "a checkpoint is a global entity inherited by every branch"
+        );
 
         let receipt = main
             .merge_branch(MergeBranchOptions {
@@ -1038,21 +1057,218 @@ simulation_test!(
 
         let checkpoints = main
             .execute(
-                "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_depth",
-                &[],
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
+                &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await
-            .expect("target checkpoint history should remain queryable");
+            .expect("global checkpoint should remain queryable");
         assert_eq!(
             checkpoints.len(),
             1,
-            "selecting a source marker must not label the target merge commit"
+            "merge must not duplicate the checkpoint entity"
         );
         assert_eq!(
             checkpoints.rows()[0].values(),
-            &[Value::Text(sim.initial_commit_id().to_string())]
+            &[Value::Text(checkpoint.commit_id)]
         );
         assert_key_value(&main, "checkpoint-merge-source", Some("\"draft\"")).await;
+    }
+);
+
+simulation_test!(
+    checkpoint_preserves_branch_fork_as_merge_ancestry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES \
+             ('checkpoint-fork-source', 'shared-source'), \
+             ('checkpoint-fork-target', 'shared-target')",
+            &[],
+        )
+        .await
+        .expect("shared rows should be inserted");
+        let fork_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+        let checkpoint = main
+            .create_checkpoint()
+            .await
+            .expect("target checkpoint should succeed");
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000001".to_string()),
+                name: "Recovered source".to_string(),
+                from_commit_id: Some(fork_commit_id.clone()),
+            })
+            .await
+            .expect("historical recovered head should remain branchable while pending");
+        assert_eq!(branch.commit_id, fork_commit_id);
+        let draft = sim.wrap_session(
+            engine
+                .open_session_at("01930000-0000-7000-8000-000000000001")
+                .await
+                .expect("recovered source session should open"),
+            &engine,
+        );
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'source' \
+                 WHERE key = 'checkpoint-fork-source'",
+                &[],
+            )
+            .await
+            .expect("source edit should succeed");
+        let source_commit_id = engine
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000001")
+            .await
+            .expect("source head should load")
+            .expect("source head should exist");
+        main.execute(
+            "UPDATE lix_key_value SET value = 'target' \
+             WHERE key = 'checkpoint-fork-target'",
+            &[],
+        )
+        .await
+        .expect("target edit should succeed");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("disjoint changes should merge without conflicts");
+        assert_eq!(preview.base_commit_id, checkpoint.commit_id);
+        assert_eq!(preview.outcome, MergeBranchOutcome::MergeCommitted);
+        assert_eq!(preview.conflicts.len(), 0);
+        assert_eq!(
+            preview.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 0,
+                modified: 1,
+                removed: 0,
+            }
+        );
+
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("disjoint changes should merge");
+        assert_eq!(receipt.base_commit_id, checkpoint.commit_id);
+        assert_key_value(&main, "checkpoint-fork-source", Some("\"source\"")).await;
+        assert_key_value(&main, "checkpoint-fork-target", Some("\"target\"")).await;
+
+        let global = sim.wrap_session(
+            engine
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        assert_eq!(
+            commit_parent_edges(&global, &checkpoint.commit_id).await,
+            vec![(sim.initial_commit_id().to_string(), 0)],
+            "checkpoint compaction must not retain the recovered interval as permanent ancestry",
+        );
+        assert_eq!(
+            commit_parent_edges(&global, &source_commit_id).await,
+            vec![(fork_commit_id, 0), (checkpoint.commit_id, 1)],
+            "the first source commit should consume serving context into canonical graph parents",
+        );
+    }
+);
+
+simulation_test!(
+    checkpoint_branch_bridge_preserves_true_conflict,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-bridge-conflict', 'base')",
+            &[],
+        )
+        .await
+        .expect("shared conflict row should insert");
+        let recovered_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("recovered head should load")
+            .expect("recovered head should exist");
+        let checkpoint = main
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed")
+            .commit_id;
+        main.create_branch(CreateBranchOptions {
+            id: Some("01930000-0000-7000-8000-000000000002".to_string()),
+            name: "Recovered conflict source".to_string(),
+            from_commit_id: Some(recovered_head.clone()),
+        })
+        .await
+        .expect("recovered conflict source should remain branchable");
+        let source = sim.wrap_session(
+            engine
+                .open_session_at("01930000-0000-7000-8000-000000000002")
+                .await
+                .expect("conflict source session should open"),
+            &engine,
+        );
+        source
+            .execute(
+                "UPDATE lix_key_value SET value = 'source' WHERE key = 'checkpoint-bridge-conflict'",
+                &[],
+            )
+            .await
+            .expect("source conflict edit should succeed");
+        let source_head = engine
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000002")
+            .await
+            .expect("source conflict head should load")
+            .expect("source conflict head should exist");
+        main.execute(
+            "UPDATE lix_key_value SET value = 'target' WHERE key = 'checkpoint-bridge-conflict'",
+            &[],
+        )
+        .await
+        .expect("target conflict edit should succeed");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000002".to_string(),
+            })
+            .await
+            .expect("true conflict preview should succeed");
+        assert_eq!(preview.base_commit_id, checkpoint);
+        assert_eq!(preview.conflicts.len(), 1);
+        assert_eq!(
+            commit_parent_edges(&main, &source_head).await,
+            vec![(recovered_head, 0), (checkpoint, 1)]
+        );
+        let error = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000002".to_string(),
+            })
+            .await
+            .expect_err("same-identity changes must still conflict");
+        assert_merge_conflict_error(&error);
+        assert_key_value(&main, "checkpoint-bridge-conflict", Some("\"target\"")).await;
     }
 );
 
@@ -1087,7 +1303,7 @@ simulation_test!(
 
         let global = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -1097,8 +1313,8 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND entity_pk = lix_json('[\"merge-select-change\"]') \
-	       AND snapshot_content = lix_json('{\"key\":\"merge-select-change\",\"value\":\"source\"}')",
+	       AND entity_pk = CAST('[\"merge-select-change\"]' AS JSONB) \
+	       AND snapshot_content = CAST('{\"key\":\"merge-select-change\",\"value\":\"source\"}' AS JSONB)",
         )
         .await;
         assert_eq!(
@@ -1140,7 +1356,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"merge_task_item\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"merge_task_item\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB)\
                  )",
                 &[],
             )
@@ -1164,7 +1380,7 @@ simulation_test!(
 
         let reopened_main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should reopen after merge"),
             &engine,
@@ -1559,7 +1775,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1603,7 +1819,7 @@ simulation_test!(merge_branch_rejects_self_merge, |sim| async move {
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1660,7 +1876,7 @@ async fn create_draft_after_shared_write(
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
         engine
-            .open_session(sim.main_branch_id())
+            .open_session_at(sim.main_branch_id())
             .await
             .expect("main session should open"),
         &engine,
@@ -1686,7 +1902,7 @@ async fn create_draft_from_main(
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
         engine
-            .open_session(sim.main_branch_id())
+            .open_session_at(sim.main_branch_id())
             .await
             .expect("main session should open"),
         &engine,
@@ -1728,7 +1944,7 @@ async fn create_draft(
     );
     main.wrap_session(
         engine
-            .open_session(receipt.id)
+            .open_session_at(receipt.id)
             .await
             .expect("draft session should open"),
         engine,
@@ -1753,7 +1969,10 @@ async fn assert_key_value(
             assert_eq!(rows.len(), 1);
             let expected_json = serde_json::from_str::<JsonValue>(value)
                 .expect("expected key-value should be valid JSON");
-            assert_eq!(rows.rows()[0].values(), &[Value::Json(expected_json)]);
+            assert_eq!(
+                rows.rows()[0].values(),
+                &[Value::Json(expected_json.into())]
+            );
         }
         None => assert_eq!(rows.len(), 0),
     }
@@ -1929,7 +2148,7 @@ async fn assert_empty_merge_commit(
 
     let global = session.wrap_session(
         engine
-            .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+            .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("global session should open"),
         engine,
@@ -1946,3 +2165,581 @@ async fn assert_empty_merge_commit(
         "empty merge commit should preserve target/source ancestry"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: root-backed generations must not lose the working-diff baseline.
+// ---------------------------------------------------------------------------
+
+simulation_test!(
+    working_diff_first_branch_edit_of_existing_row_is_modified,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-baseline', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-baseline'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+
+        let rows = draft
+            .execute(
+                "SELECT diff_type, before_change_id, after_change_id \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the edited row must appear in the working diff"
+        );
+        let values = rows.rows()[0].values().to_vec();
+        assert!(
+            matches!(&values[1], Value::Text(_)),
+            "the first branch-local edit of a checkpointed row must carry a before image, got {values:?}"
+        );
+        assert_eq!(
+            values[0],
+            Value::Text("modified".to_string()),
+            "the first branch-local edit of a checkpointed row must classify as modified, got {values:?}"
+        );
+    }
+);
+
+simulation_test!(
+    revert_of_first_branch_edit_restores_the_checkpoint_value,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-revert', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-revert'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+
+        draft
+            .execute(
+                "INSERT INTO lix_revert (diff_id) \
+                 SELECT diff_id FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = CAST('[\"branch-revert\"]' AS JSONB)",
+                &[],
+            )
+            .await
+            .expect("revert should succeed");
+
+        assert_key_value(&draft, "branch-revert", Some("\"before\"")).await;
+    }
+);
+
+simulation_test!(
+    working_diff_first_edit_after_merge_of_existing_row_is_modified,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-baseline', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('merge-unrelated', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+
+        main.create_checkpoint()
+            .await
+            .expect("target checkpoint should succeed");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("merge should succeed");
+
+        main.execute(
+            "UPDATE lix_key_value SET value = 'after' WHERE key = 'merge-baseline'",
+            &[],
+        )
+        .await
+        .expect("first post-merge edit should succeed");
+
+        let rows = main
+            .execute(
+                "SELECT diff_type, before_change_id \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the edited row must appear in the working diff"
+        );
+        let values = rows.rows()[0].values().to_vec();
+        assert!(
+            matches!(&values[1], Value::Text(_)),
+            "the first post-merge edit of a checkpointed row must carry a before image, got {values:?}"
+        );
+        assert_eq!(
+            values[0],
+            Value::Text("modified".to_string()),
+            "the first post-merge edit of a checkpointed row must classify as modified, got {values:?}"
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_first_branch_delete_of_existing_row_is_removed,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-delete', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        delete_key_value(&draft, "branch-delete").await;
+
+        let narrow = draft
+            .execute(
+                "SELECT diff_type, before_change_id FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = CAST('[\"branch-delete\"]' AS JSONB)",
+                &[],
+            )
+            .await
+            .expect("narrow working diff should load");
+        assert_eq!(
+            narrow.len(),
+            1,
+            "the deleted row must appear in the narrow working diff"
+        );
+        assert_eq!(
+            narrow.rows()[0].values()[0],
+            Value::Text("removed".to_string()),
+            "deleting a checkpointed row on a fresh branch must classify as removed, got {:?}",
+            narrow.rows()[0].values()
+        );
+
+        let broad = draft
+            .execute(
+                "SELECT entity_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("broad working diff should load");
+        assert_eq!(
+            broad.len(),
+            1,
+            "the deleted row must also appear in the unfiltered working diff, got {:?}",
+            broad
+                .rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_branch_edit_is_modified_for_broad_and_repeated_edits,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-broad-a', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-broad-b', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('branch-broad-new', 'new')",
+                &[],
+            )
+            .await
+            .expect("unrelated branch insert should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-broad-a'",
+                &[],
+            )
+            .await
+            .expect("first edit should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after-2' WHERE key = 'branch-broad-a'",
+                &[],
+            )
+            .await
+            .expect("second edit of the same row should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-broad-b'",
+                &[],
+            )
+            .await
+            .expect("edit of a second pre-existing row should succeed");
+
+        let rows = draft
+            .execute(
+                "SELECT entity_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("broad working diff should load");
+        let actual = rows
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                vec![
+                    Value::Json(
+                        JsonValue::Array(vec![JsonValue::String("branch-broad-a".to_string())])
+                            .into()
+                    ),
+                    Value::Text("modified".to_string()),
+                ],
+                vec![
+                    Value::Json(
+                        JsonValue::Array(vec![JsonValue::String("branch-broad-b".to_string())])
+                            .into()
+                    ),
+                    Value::Text("modified".to_string()),
+                ],
+                vec![
+                    Value::Json(
+                        JsonValue::Array(vec![JsonValue::String("branch-broad-new".to_string())])
+                            .into()
+                    ),
+                    Value::Text("added".to_string()),
+                ],
+            ],
+            "every branch-local edit of a checkpointed row must classify as modified"
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_restoring_the_checkpoint_payload_on_a_branch_is_net_empty,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-restore', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-restore'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'before' WHERE key = 'branch-restore'",
+                &[],
+            )
+            .await
+            .expect("restoring the checkpoint payload should succeed");
+
+        let rows = draft
+            .execute(
+                "SELECT entity_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        // The branch-local baseline stores only the before image's change id,
+        // so this net-empty answer is exactly the case that forces the reader
+        // to hydrate the referenced change record. A regression to change-id
+        // equality alone would report `modified` here.
+        assert_eq!(
+            rows.len(),
+            0,
+            "restoring the checkpoint payload must be net empty, got {:?}",
+            rows.rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_first_edit_after_switch_branch_of_existing_row_is_modified,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('switch-baseline', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+        let draft = create_draft(&engine, &main).await;
+        drop(draft);
+
+        main.switch_branch(SwitchBranchOptions {
+            branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("switch should succeed");
+
+        main.execute(
+            "UPDATE lix_key_value SET value = 'after' WHERE key = 'switch-baseline'",
+            &[],
+        )
+        .await
+        .expect("first edit after switch should succeed");
+
+        let rows = main
+            .execute(
+                "SELECT diff_type, before_change_id FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.rows()[0].values()[0],
+            Value::Text("modified".to_string()),
+            "the first edit after a branch switch must classify as modified, got {:?}",
+            rows.rows()[0].values()
+        );
+    }
+);
+
+simulation_test!(
+    checkpoint_after_first_branch_edit_keeps_the_edited_value,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-checkpoint', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-checkpoint'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+        draft
+            .create_checkpoint()
+            .await
+            .expect("branch checkpoint should succeed");
+
+        assert_key_value(&draft, "branch-checkpoint", Some("\"after\"")).await;
+        let rows = draft
+            .execute(
+                "SELECT entity_pk FROM lix_working_diff WHERE schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(
+            rows.len(),
+            0,
+            "a fresh checkpoint has an empty working diff"
+        );
+    }
+);
+
+simulation_test!(
+    merging_a_first_branch_edit_reports_modified_and_lands_the_value,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session_at(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-first-edit', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'merge-first-edit'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("preview should succeed");
+        assert_eq!(
+            preview.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 0,
+                modified: 1,
+                removed: 0,
+            },
+            "merge preview must see the branch-local edit as a modification"
+        );
+
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("merge should succeed");
+        assert_eq!(
+            receipt.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 0,
+                modified: 1,
+                removed: 0,
+            },
+            "merge must record the branch-local edit as a modification"
+        );
+        assert_key_value(&main, "merge-first-edit", Some("\"after\"")).await;
+    }
+);

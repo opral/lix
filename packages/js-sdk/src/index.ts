@@ -1,10 +1,15 @@
 export {
-	LocalFilesystem,
+	IndexedDbStorage,
 	Lix,
 	LixTransaction,
 	ObserveEvents,
 	openLix,
 } from "./open-lix.js";
+export type {
+	LixStorage,
+	LixStorageAdapterConfig,
+	LixStorageConnection,
+} from "./storage-adapter.js";
 export {
 	bundledPluginArchives,
 	type BundledPluginArchive,
@@ -21,7 +26,7 @@ export type {
 	ExecuteResult,
 	LixBatchOptions,
 	LixBatchStatement,
-	LocalFilesystemOptions,
+	IndexedDbStorageOptions,
 	JsonValue,
 	LixValue,
 	MergeBranchOptions,
@@ -35,7 +40,6 @@ export type {
 	OpenLixOptions,
 	LixTelemetryOptions,
 	LixTelemetrySpan,
-	LixSnapshotStorage,
 	RemoteLixFetch,
 	RemoteLixServerOptions,
 	UndoReceipt,

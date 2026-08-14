@@ -4,7 +4,10 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 
 # JavaScript API Reference
 
-The main JavaScript SDK exports are `openLix()` and `LocalFilesystem` from `@lix-js/sdk`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
+The main JavaScript SDK exports `openLix()` and `IndexedDbStorage` from
+`@lix-js/sdk`. Filesystem storage is provided separately by
+`@lix-js/storage-filesystem`. `openLix()` returns a `Lix` instance connected to
+a local or remote repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -20,11 +23,11 @@ const lix = await openLix(options?);
 
 Options:
 
-| Option      | Type                                     | Description                                                                      |
-| ----------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
-| `storage`   | `LocalFilesystem \| LixSnapshotStorage` | Local storage. Omit it for memory.                                               |
-| `server`    | `RemoteLixServerOptions`                 | Connect to a remote Lix server. Cannot be combined with local workspace storage. |
-| `telemetry` | `LixTelemetryOptions`                    | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only. |
+| Option      | Type                                  | Description                                                                         |
+| ----------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
+| `storage`   | `FilesystemStorage \| IndexedDbStorage` | Local storage. Omit it for memory.                                                  |
+| `server`    | `RemoteLixServerOptions`              | Connect to a remote Lix server. When present, `storage` contains only client state. |
+| `telemetry` | `LixTelemetryOptions`                 | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only.    |
 
 Connect to a remote server:
 
@@ -32,51 +35,41 @@ Connect to a remote server:
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: "https://example.com/workspaces/acme",
+    url: "https://example.com/repositories/acme",
     headers: () => ({ Authorization: `Bearer ${token}` }),
   },
 });
 ```
 
-Remote file content, SQL rows, and branches live on the server. An optional `LixSnapshotStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
+Remote file content, SQL rows, and branches live on the server. An optional `IndexedDbStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
-Use `LocalFilesystem` for a filesystem workspace directory backed by RocksDB at
-`<workspace>/.lix/.internal/rocksdb`:
+Use `IndexedDbStorage` to persist a complete local browser Lix across reloads:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { IndexedDbStorage, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./workspace",
-    syncAllFiles: true,
-  }),
+  storage: new IndexedDbStorage({ name: "atelier" }),
 });
 ```
 
-Pass `lixDir` for filesystem sync with repository metadata in an external
-`.lix` directory. This does not write `<workspace>/.lix`:
+Use `FilesystemStorage` for a repository directory backed by RocksDB at
+`<repository>/.lix/.internal/rocksdb`:
 
 ```ts
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
+
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./workspace",
-    lixDir: "/tmp/session/.lix",
-    syncAllFiles: true,
-  }),
+  storage: new FilesystemStorage({ path: "./repository" }),
 });
 ```
 
-Set `syncAllFiles: false` to start filesystem sync with no regular workspace
-files, then import selected files with `storage.importPaths()`. Imported paths are
-exact workspace-relative file paths, not directories or globs. They may be
-written with or without a leading slash, for example `"notes/today.md"` or
-`"/notes/today.md"`. This scopes disk import, file watching, and
-materialization; it does not filter unrelated Lix SQL state.
+Use selective synchronization when only explicit paths should be imported:
 
 ```ts
-const storage = new LocalFilesystem({
-  path: "./workspace",
+const storage = new FilesystemStorage({
+  path: "./repository",
   syncAllFiles: false,
 });
 const lix = await openLix({ storage });
@@ -99,15 +92,15 @@ await storage.syncDiskToLix();
 const result = await lix.execute(sql, params?, options?);
 ```
 
-Executes one DataFusion SQL statement against the active Lix session.
+Executes one PostgreSQL-dialect SQL statement against the active Lix session.
 
 Parameters:
 
-| Parameter | Type                     | Description                                                        |
-| --------- | ------------------------ | ------------------------------------------------------------------ |
-| `sql`     | `string`                 | One SQL statement. Use DataFusion SQL, not SQLite SQL.             |
-| `params`  | `SqlParam[]`             | Optional positional parameters addressed as `$1`, `$2`, and so on. |
-| `options` | `ExecuteOptions`         | Optional execution options. See below.                             |
+| Parameter | Type             | Description                                                        |
+| --------- | ---------------- | ------------------------------------------------------------------ |
+| `sql`     | `string`         | One statement from Lix's PostgreSQL-dialect subset.                |
+| `params`  | `SqlParam[]`     | Optional positional parameters addressed as `$1`, `$2`, and so on. |
+| `options` | `ExecuteOptions` | Optional execution options. See below.                             |
 
 `SqlParam` accepts JSON values, `Uint8Array`, or a `Value`:
 
@@ -117,9 +110,9 @@ type SqlParam = JsonValue | Uint8Array | Value;
 
 `ExecuteOptions`:
 
-| Option           | Type     | Description                                                                                                                                       |
-| ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `originKey`      | `string` | Optional origin label for the mutation.                                                                                                            |
+| Option           | Type     | Description                                                                                                                                                                                                                                                                       |
+| ---------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `originKey`      | `string` | Optional origin label for the mutation.                                                                                                                                                                                                                                           |
 | `idempotencyKey` | `string` | Stable identity for one logical remote SQL mutation. This is the retry story: supply the same key when retrying after a lost response, and the server applies the mutation only once. Remote Lix generates one per call when omitted. Sent as `Idempotency-Key`, not SQL options. |
 
 Result:
@@ -169,7 +162,11 @@ labels are opaque and may repeat. If a label is omitted, the result has no
 
 ```ts
 const results = await lix.executeBatch([
-  { label: "create", sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/a.txt", bytes] },
+  {
+    label: "create",
+    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+    params: ["/a.txt", bytes],
+  },
   { sql: "SELECT count(*) AS n FROM lix_file" },
 ]);
 
@@ -177,7 +174,11 @@ console.log(results[0].statementIndex, results[0].label); // 0, "create"
 console.log(results[1].statementIndex, results[1].label); // 1, undefined
 
 const returning = await lix.executeBatch([
-  { label: "update", sql: "UPDATE task SET done = true WHERE id = $1 RETURNING id, done", params: ["task-1"] },
+  {
+    label: "update",
+    sql: "UPDATE task SET done = true WHERE id = $1 RETURNING id, done",
+    params: ["task-1"],
+  },
 ]);
 console.log(returning[0].rows[0]?.get("done"));
 ```
@@ -412,17 +413,22 @@ Closes the Lix handle and its storage resources.
 
 ### clientState
 
-`lix.clientState` stores private client-local JSON state with `get`, `set`, `delete`, and `subscribe`; it is available when the storage supports client state, for example a `LixSnapshotStorage` in remote mode.
+`lix.clientState` stores private client-local JSON state with asynchronous `get`, `set`, and `delete` methods plus `subscribe`; pass `IndexedDbStorage` in remote mode to persist it locally.
+
+```ts
+const preference = await lix.clientState.get("preference");
+await lix.clientState.set("preference", { sidebar: "history" });
+```
 
 ## Transaction
 
 Transactions expose:
 
-| Method                            | Description                                                    |
-| --------------------------------- | -------------------------------------------------------------- |
+| Method                            | Description                                                                   |
+| --------------------------------- | ----------------------------------------------------------------------------- |
 | `execute(sql, params?, options?)` | Execute SQL inside the transaction. Same `ExecuteOptions` as `lix.execute()`. |
-| `commit()`                        | Commit the transaction and close the transaction handle.       |
-| `rollback()`                      | Roll back the transaction and close the transaction handle.    |
+| `commit()`                        | Commit the transaction and close the transaction handle.                      |
+| `rollback()`                      | Roll back the transaction and close the transaction handle.                   |
 
 ## Row
 
@@ -452,13 +458,13 @@ Accessors:
 
 Constructors:
 
-| Method                 | Description                                                                    |
-| ---------------------- | ------------------------------------------------------------------------------ |
-| `Value.null()`         | Create a SQL null value.                                                       |
-| `Value.integer(value)` | Create an integer value.                                                       |
-| `Value.boolean(value)` | Create a boolean value.                                                        |
-| `Value.real(value)`    | Create a real number value.                                                    |
-| `Value.text(value)`    | Create a text value.                                                           |
-| `Value.json(value)`    | Create a JSON value.                                                           |
-| `Value.blob(value)`    | Create a blob value from `Uint8Array`.                                         |
-| `Value.from(raw)`      | Convert a JSON-compatible JS value, `Uint8Array`, or `Value` into a `Value`.   |
+| Method                 | Description                                                                  |
+| ---------------------- | ---------------------------------------------------------------------------- |
+| `Value.null()`         | Create a SQL null value.                                                     |
+| `Value.integer(value)` | Create an integer value.                                                     |
+| `Value.boolean(value)` | Create a boolean value.                                                      |
+| `Value.real(value)`    | Create a real number value.                                                  |
+| `Value.text(value)`    | Create a text value.                                                         |
+| `Value.json(value)`    | Create a JSON value.                                                         |
+| `Value.blob(value)`    | Create a blob value from `Uint8Array`.                                       |
+| `Value.from(raw)`      | Convert a JSON-compatible JS value, `Uint8Array`, or `Value` into a `Value`. |

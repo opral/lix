@@ -8,10 +8,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -95,10 +92,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -123,7 +117,7 @@ simulation_test!(
             direct,
             vec![vec![
                 Value::Text("returning-direct".to_string()),
-                Value::Json(json!("before")),
+                Value::Json(json!("before").into()),
             ]],
         );
 
@@ -163,11 +157,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("returning-like-a".to_string()),
-                    Value::Json(json!("A")),
+                    Value::Json(json!("A").into()),
                 ],
                 vec![
                     Value::Text("returning-like-b".to_string()),
-                    Value::Json(json!("B")),
+                    Value::Json(json!("B").into()),
                 ],
             ]
         );
@@ -179,10 +173,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 

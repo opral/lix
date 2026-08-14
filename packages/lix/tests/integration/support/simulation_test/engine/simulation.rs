@@ -1,4 +1,3 @@
-use lix::integration::{Engine, InitReceipt, SessionContext};
 use lix::storage::Memory;
 use lix::{
     CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteResult,
@@ -6,6 +5,7 @@ use lix::{
     SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 use lix::{LixError, Value};
+use lix::{engine::Engine, init::InitReceipt, session::SessionContext};
 
 use super::mode::{SimulationMode, SimulationOptions};
 

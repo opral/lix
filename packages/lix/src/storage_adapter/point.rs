@@ -251,11 +251,6 @@ impl PointValues<'_> {
         self.requested_to_unique.is_empty()
     }
 
-    pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
-        let unique_index = self.requested_to_unique.unique_index(requested_index)?;
-        self.unique_values.get(unique_index)?.as_ref()
-    }
-
     pub fn materialize_caller_order(self) -> Vec<Option<ProjectedValue>> {
         materialize_caller_order(self.unique_values, self.requested_to_unique)
     }

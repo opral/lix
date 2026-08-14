@@ -30,12 +30,18 @@ const TABLE_FUNCTIONS: &str = "table_functions";
 /// between read nullability and insert-time omission/default behavior.
 pub(crate) fn register(
     session: &SessionContext,
-    public_catalog: &PublicCatalog,
+    public_catalog: Arc<PublicCatalog>,
 ) -> Result<(), LixError> {
-    let state = session.state();
+    // Borrow the live session state. `SessionState::clone` deep-copies the
+    // `String`-keyed registries for every built-in scalar, aggregate and window
+    // function; this call site only needs two config strings and the catalog
+    // list `Arc`.
+    let state_ref = session.state_ref();
+    let state = state_ref.read();
     let catalog_name = state.config_options().catalog.default_catalog.clone();
     let schema_name = state.config_options().catalog.default_schema.clone();
     let catalog_list = Arc::clone(state.catalog_list());
+    drop(state);
     let catalog = catalog_list.catalog(&catalog_name).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -44,7 +50,7 @@ pub(crate) fn register(
     })?;
     let provider: Arc<dyn SchemaProvider> = Arc::new(LixInformationSchemaProvider::new(
         catalog_list,
-        public_catalog.clone(),
+        public_catalog,
         catalog_name.clone(),
         schema_name,
     ));
@@ -60,7 +66,7 @@ struct LixInformationSchemaProvider {
     // reference here would create a cycle that retains every session table
     // provider and its storage read handles.
     catalog_list: Weak<dyn CatalogProviderList>,
-    public_catalog: PublicCatalog,
+    public_catalog: Arc<PublicCatalog>,
     public_catalog_name: String,
     public_schema_name: String,
 }
@@ -68,7 +74,7 @@ struct LixInformationSchemaProvider {
 impl LixInformationSchemaProvider {
     fn new(
         catalog_list: Arc<dyn CatalogProviderList>,
-        public_catalog: PublicCatalog,
+        public_catalog: Arc<PublicCatalog>,
         public_catalog_name: String,
         public_schema_name: String,
     ) -> Self {

@@ -34,7 +34,7 @@ use crate::transaction::types::{
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
     TypedMutationJournalBatch,
 };
-use crate::wasm::WasmEntityKey;
+use crate::plugin::runtime::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 
@@ -3070,8 +3070,9 @@ fn eval_fast_file_metadata(
             Some(Value::Null) => return Ok(None),
             Some(Value::Text(value)) => parse_row_metadata_value(value, "lix_file")?,
             Some(Value::Json(value)) => {
-                validate_row_metadata(value, "lix_file")?;
-                value.clone()
+                let value = value.to_value();
+                validate_row_metadata(&value, "lix_file")?;
+                value
             }
             Some(_) => {
                 return Err(LixError::new(
@@ -3986,7 +3987,7 @@ fn entity_returning_value(
                 Value::Null
             }
             EntityEvalValue::SqlText(value) => Value::Text(value),
-            EntityEvalValue::Json(value) => Value::Json(value),
+            EntityEvalValue::Json(value) => Value::Json(value.into()),
         });
     }
     if let Some(column) = visible_entity_column(expr, spec) {
@@ -4013,7 +4014,7 @@ fn entity_returning_value(
             .or_else(|| value.as_f64().map(Value::Real))
             .unwrap_or_else(|| Value::Text(value.to_string())),
         EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
-            Value::Json(value)
+            Value::Json(value.into())
         }
     })
 }
@@ -5764,8 +5765,14 @@ fn append_entity_insert_row(
         }
     }
 
-    spec.defaults
-        .apply(&mut snapshot, ctx.functions(), &layout.schema_key)?;
+    let functions = ctx.functions();
+    let mut statement_timestamp = None;
+    spec.defaults.apply(
+        &mut snapshot,
+        functions.clone(),
+        &layout.schema_key,
+        || Ok(*statement_timestamp.get_or_insert_with(|| functions.call_timestamp())),
+    )?;
     let snapshot = JsonValue::Object(snapshot);
     if !spec.primary_key_paths.is_empty() {
         let derived_entity_pk = EntityPk::from_primary_key_plan(
@@ -6184,12 +6191,28 @@ fn cast_entity_eval_value(
         ));
     }
 
+    if cast_type == BoundCastType::Jsonb {
+        return match value {
+            EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
+            EntityEvalValue::Json(value) => Ok(EntityEvalValue::Json(value)),
+            EntityEvalValue::SqlText(value) => serde_json::from_str(&value)
+                .map(EntityEvalValue::Json)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("CAST AS JSONB failed: {error}"),
+                    )
+                }),
+        };
+    }
+
     let target_type = match cast_type {
         BoundCastType::Text => DataType::Utf8,
         BoundCastType::BigInt => DataType::Int64,
         BoundCastType::Double => DataType::Float64,
         BoundCastType::Boolean => DataType::Boolean,
         BoundCastType::Binary => unreachable!("binary entity casts rejected above"),
+        BoundCastType::Jsonb => unreachable!("JSONB entity casts handled above"),
     };
     let scalar = scalar_from_entity_eval_value(value);
     let casted = scalar.cast_to(&target_type).map_err(|error| {
@@ -6333,6 +6356,36 @@ fn eval_expr_value(
             Ok(active_branch_commit_id
                 .map(|commit_id| EntityEvalValue::SqlText(commit_id.to_string()))
                 .unwrap_or(EntityEvalValue::SqlNull))
+        }
+        BoundExpr::Function { name, args } if name == "__lix_jsonb" && args.len() == 1 => {
+            let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
+            match value {
+                EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
+                EntityEvalValue::SqlText(raw) => crate::sql2::udfs::common::parse_jsonb(&raw)
+                    .map(EntityEvalValue::Json)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB value: {error}"),
+                        )
+                    }),
+                EntityEvalValue::Json(value) => {
+                    let raw = serde_json::to_string(&value).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB value: {error}"),
+                        )
+                    })?;
+                    crate::sql2::udfs::common::parse_jsonb(&raw)
+                        .map(EntityEvalValue::Json)
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_TYPE_MISMATCH,
+                                format!("invalid JSONB value: {error}"),
+                            )
+                        })
+                }
+            }
         }
         BoundExpr::Function { name, args }
             if (name == "lix_json_get" || name == "lix_json_get_text") && args.len() >= 2 =>
@@ -6520,7 +6573,10 @@ fn numeric_comparison_value(
                 json_double_value(Some(value), &spec.schema_key, &column.name)
                     .map(|value| value.map(NumericComparisonValue::Double))
             }
-            EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {
+            EntityColumnType::String
+            | EntityColumnType::Json
+            | EntityColumnType::Boolean
+            | EntityColumnType::Timestamptz => {
                 Ok(None)
             }
         };
@@ -6890,7 +6946,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
-                "lix_json" if args.len() == 1 => {}
+                "lix_json" | "__lix_jsonb" if args.len() == 1 => {}
                 "lix_uuid_v7"
                 | "lix_timestamp"
                 | "lix_active_branch_id"
@@ -6968,7 +7024,10 @@ fn entity_json_value(
         EntityColumnType::Number => {
             json_double_value(Some(&value), schema_key, column_name)?;
         }
-        EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {}
+        EntityColumnType::String
+        | EntityColumnType::Json
+        | EntityColumnType::Boolean
+        | EntityColumnType::Timestamptz => {}
     }
     Ok(value)
 }
@@ -7164,7 +7223,8 @@ fn value_json(value: &Value) -> JsonValue {
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
-        Value::Json(value) => value.clone(),
+        Value::Json(value) => value.to_value(),
+        Value::Timestamp(value) => JsonValue::from(*value),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
         }

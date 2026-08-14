@@ -1,0 +1,58 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "markdown_node",
+  "description": "A durable node in the authoritative GitHub Flavored Markdown syntax graph. Structural children are linked by parent_id and order_key; text-bearing leaves embed their inline AST.",
+  "columns": [
+    {
+      "name": "format_json",
+      "type": "text",
+      "nullable": false,
+      "description": "Canonical JSON text for render-effective Markdown spelling choices. A document node may also carry a validated base64 lexical fallback for accepted noncanonical source bytes."
+    },
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false,
+      "default_expression": "uuidv7()",
+      "description": "Stable UUIDv7 node primary key assigned by Lix on create."
+    },
+    {
+      "name": "kind",
+      "type": "text",
+      "nullable": false
+    },
+    {
+      "name": "order_key",
+      "type": "text",
+      "nullable": true,
+      "description": "Sibling position. Equal keys are legal and are deterministically ordered by id."
+    },
+    {
+      "name": "parent_id",
+      "type": "text",
+      "nullable": true
+    },
+    {
+      "name": "payload_json",
+      "type": "text",
+      "nullable": false,
+      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because the durable entity profile does not admit JSON number nodes."
+    }
+  ],
+  "primary_key": [
+    "id"
+  ],
+  "foreign_keys": [
+    {
+      "columns": [
+        "parent_id"
+      ],
+      "references": {
+        "schema_key": "markdown_node",
+        "columns": [
+          "id"
+        ]
+      }
+    }
+  ]
+}

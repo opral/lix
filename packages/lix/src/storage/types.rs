@@ -341,6 +341,16 @@ pub struct ScanChunk {
     pub has_more: bool,
 }
 
+impl ScanChunk {
+    pub fn new(entries: Vec<ReadEntry>, has_more: bool) -> Self {
+        Self { entries, has_more }
+    }
+
+    pub fn into_parts(self) -> (Vec<ReadEntry>, bool) {
+        (self.entries, self.has_more)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetManyResult {
     /// One slot per key passed to `get_many`, flattened in request order and

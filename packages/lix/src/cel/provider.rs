@@ -7,3 +7,13 @@ pub(crate) trait CelFunctionProvider: Clone + Send + Sync + 'static {
     fn call_uuid_v7(&self) -> uuid::Uuid;
     fn call_timestamp(&self) -> String;
 }
+
+impl CelFunctionProvider for crate::functions::FunctionProviderHandle {
+    fn call_uuid_v7(&self) -> uuid::Uuid {
+        self.call_uuid_v7()
+    }
+
+    fn call_timestamp(&self) -> String {
+        self.call_timestamp().to_string()
+    }
+}

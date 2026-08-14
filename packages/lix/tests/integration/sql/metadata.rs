@@ -8,7 +8,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -54,7 +54,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -100,7 +100,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -111,7 +111,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path, lixcol_metadata) \
                  VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700.txt', $1)",
-                &[Value::Json(file_metadata.clone())],
+                &[Value::Json(file_metadata.clone().into())],
             )
             .await
             .expect("file insert should succeed");
@@ -132,7 +132,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata) \
                  VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700', $1)",
-                &[Value::Json(directory_metadata.clone())],
+                &[Value::Json(directory_metadata.clone().into())],
             )
             .await
             .expect("directory insert should succeed");
@@ -156,7 +156,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -177,32 +177,30 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
-                     VALUES ('metadata-entity-json-null-insert', 'value', lix_json('null'))",
+                     VALUES ('metadata-entity-json-null-insert', 'value', CAST('null' AS JSONB))",
                     &[],
                 )
                 .await
                 .expect_err("JSON null typed entity metadata should be rejected on INSERT"),
         );
 
-        assert_invalid_metadata_error(
-            session
-                .execute(
+        session
+            .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
-                     VALUES ('metadata-entity-lix-json-sql-null-insert', 'value', lix_json(NULL))",
+                     VALUES ('metadata-entity-lix-json-sql-null-insert', 'value', CAST(NULL AS JSONB))",
                     &[],
                 )
                 .await
-                .expect_err("lix_json(NULL) metadata should be rejected as JSON null on INSERT"),
-        );
+                .expect("CAST(NULL AS JSONB) is SQL NULL metadata");
 
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('metadata-entity-json-null-value', lix_json(NULL))",
+                 VALUES ('metadata-entity-json-null-value', CAST(NULL AS JSONB))",
                 &[],
             )
             .await
-            .expect("lix_json(NULL) should be accepted for JSON entity columns");
+            .expect("CAST(NULL AS JSONB) should be accepted for JSON entity columns");
         assert_metadata_null(
             session
                 .execute(
@@ -219,7 +217,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('metadata-entity-json-string-value', lix_json('\"{\\\"source\\\":\\\"json-string\\\"}\"'))",
+                 VALUES ('metadata-entity-json-string-value', CAST('\"{\\\"source\\\":\\\"json-string\\\"}\"' AS JSONB))",
                 &[],
             )
             .await
@@ -264,7 +262,7 @@ simulation_test!(
                 .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
                      VALUES ('metadata-entity-json-null-param-insert', 'value', $1)",
-                    &[Value::Json(json!(null))],
+                    &[Value::Json(json!(null).into())],
                 )
                 .await
                 .expect_err("JSON null parameter metadata should be rejected on INSERT"),
@@ -304,7 +302,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_key_value \
-                 SET lixcol_metadata = lix_json_get(lix_json('{}'), 'missing') \
+                 SET lixcol_metadata = CAST('{}' AS JSONB) -> 'missing' \
                  WHERE key = 'metadata-entity-update'",
                 &[],
             )
@@ -327,7 +325,7 @@ simulation_test!(
             session
                 .execute(
                     "UPDATE lix_key_value \
-                     SET lixcol_metadata = lix_json_get(lix_json('{\"m\":null}'), 'm') \
+                     SET lixcol_metadata = CAST('{\"m\":null}' AS JSONB) -> 'm' \
                      WHERE key = 'metadata-entity-update'",
                     &[],
                 )
@@ -338,7 +336,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_key_value \
-                 SET lixcol_metadata = lix_json_get_text(lix_json('{\"m\":null}'), 'm') \
+                 SET lixcol_metadata = CAST('{\"m\":null}' AS JSONB) ->> 'm' \
                  WHERE key = 'metadata-entity-update'",
                 &[],
             )
@@ -373,7 +371,7 @@ simulation_test!(
             session
                 .execute(
                     "UPDATE lix_key_value \
-                     SET lixcol_metadata = lix_json_get(lix_json('{\"m\":\"{\\\"source\\\":\\\"json-string\\\"}\"}'), 'm') \
+                     SET lixcol_metadata = CAST('{\"m\":\"{\\\"source\\\":\\\"json-string\\\"}\"}' AS JSONB) -> 'm' \
                      WHERE key = 'metadata-entity-update'",
                     &[],
                 )
@@ -415,7 +413,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_key_value \
-                 SET lixcol_metadata = lix_json_get(lix_json('\"{\\\"m\\\":{\\\"source\\\":\\\"json-string-root\\\"}}\"'), 'm') \
+                 SET lixcol_metadata = CAST('\"{\\\"m\\\":{\\\"source\\\":\\\"json-string-root\\\"}}\"' AS JSONB) -> 'm' \
                  WHERE key = 'metadata-entity-update'",
                 &[],
             )
@@ -450,7 +448,7 @@ simulation_test!(
             session
                 .execute(
                     "UPDATE lix_key_value \
-                     SET lixcol_metadata = lix_json('null') \
+                     SET lixcol_metadata = CAST('null' AS JSONB) \
                      WHERE key = 'metadata-entity-update'",
                     &[],
                 )
@@ -458,17 +456,15 @@ simulation_test!(
                 .expect_err("JSON null typed entity metadata should be rejected on UPDATE"),
         );
 
-        assert_invalid_metadata_error(
-            session
-                .execute(
-                    "UPDATE lix_key_value \
-                     SET lixcol_metadata = lix_json(NULL) \
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                     SET lixcol_metadata = CAST(NULL AS JSONB) \
                      WHERE key = 'metadata-entity-update'",
-                    &[],
-                )
-                .await
-                .expect_err("lix_json(NULL) metadata should be rejected as JSON null on UPDATE"),
-        );
+                &[],
+            )
+            .await
+            .expect("CAST(NULL AS JSONB) is SQL NULL metadata on UPDATE");
 
         session
             .execute(
@@ -498,7 +494,7 @@ simulation_test!(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = $1 \
                      WHERE key = 'metadata-entity-update'",
-                    &[Value::Json(json!(null))],
+                    &[Value::Json(json!(null).into())],
                 )
                 .await
                 .expect_err("JSON null parameter metadata should be rejected on UPDATE"),
@@ -512,7 +508,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -559,7 +555,7 @@ simulation_test!(
                 .execute(
                     "SELECT metadata \
                      FROM lix_change \
-                     WHERE entity_pk = lix_json('[\"metadata-valid-object\"]') \
+                     WHERE entity_pk = CAST('[\"metadata-valid-object\"]' AS JSONB) \
                        AND schema_key = 'lix_key_value'",
                     &[],
                 )
@@ -608,7 +604,7 @@ fn assert_metadata_value(result: lix::ExecuteResult, column: &str, expected: &se
     let value = result.rows()[0]
         .get::<Value>(column)
         .unwrap_or_else(|_| panic!("{column} should be present"));
-    assert_eq!(value, Value::Json(expected.clone()));
+    assert_eq!(value, Value::Json(expected.clone().into()));
 }
 
 fn assert_metadata_null(result: lix::ExecuteResult, column: &str) {

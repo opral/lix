@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
 use lix::{ExecuteBatchStatement, Value};
+use lix::{engine::Engine, session::SessionContext};
 
 const FILE_COUNT_ENV: &str = "LIX_EXECUTE_BATCH_BENCH_FILES";
 const ROUNDS_ENV: &str = "LIX_EXECUTE_BATCH_BENCH_ROUNDS";
@@ -132,7 +132,7 @@ async fn execute_batch_benchmark_probe() {
     let storage = CountingStorage::new();
     Engine::initialize(storage.clone()).await.unwrap();
     let engine = Engine::new(storage.clone()).await.unwrap();
-    let session = engine.open_workspace_session().await.unwrap();
+    let session = engine.open_session().await.unwrap();
     seed_files(&session, file_count).await;
 
     for (workload, statements) in [

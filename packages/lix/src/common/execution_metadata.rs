@@ -94,7 +94,7 @@ impl VerifiedRequestBlob {
 ///
 /// This is execution metadata, not a second public file-write API. Callers
 /// continue to bind the fully reconstructed blob through ordinary SQL. The
-/// remote protocol uses this sidecar so the file write path can hand an
+/// Lix Server Protocol uses this sidecar so the file write path can hand an
 /// incremental runtime the original localized edit without guessing it again
 /// from two complete blobs.
 #[doc(hidden)]

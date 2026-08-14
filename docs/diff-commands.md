@@ -90,7 +90,7 @@ a parameterized `VALUES` relation:
 
 ```sql
 INSERT INTO lix_revert (diff_id)
-SELECT diff_id FROM VALUES ($1) AS selected(diff_id);
+SELECT diff_id FROM (VALUES ($1)) AS selected(diff_id);
 ```
 
 Direct `INSERT ... VALUES` is intentionally rejected. Every command must be
@@ -133,6 +133,13 @@ deterministic, versioned encoding of the native before/after change pair (its
 current textual form starts with `d1.`), but clients must not construct or
 decode it. Use `before_change_id` and `after_change_id` for joins to
 `lix_change` and for debugging.
+
+A `diff_id` is only valid while the entity is still on the side the command
+starts from, so it is a short-lived selection token rather than a durable
+handle — do not persist one and expect it to resolve later. It also describes a
+change, not an entity's history: an entity that was deleted in an earlier
+checkpoint and later re-added encodes the same way as one that was never
+present, even though `before_change_id` still reports the underlying row.
 
 These command names describe state transformations. They are not a session
 undo/redo stack.

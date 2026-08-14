@@ -22,14 +22,18 @@ use datafusion::arrow::compute::{SortOptions, and, filter_record_batch, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DFSchema, DataFusionError, Result, SchemaExt};
+use datafusion::common::{
+    Column as DFColumn, DFSchema, DataFusionError, Result, ScalarValue, SchemaExt,
+};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{
-    EquivalenceProperties, PhysicalExpr, PhysicalSortExpr, create_physical_expr,
+    AcrossPartitions, ConstExpr, EquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
+    create_physical_expr,
 };
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -322,6 +326,32 @@ pub(super) struct PlannedScan {
     pub(super) ordering: Option<String>,
 }
 
+/// Replans this scan with an extra `IN` restriction on one probe key column.
+///
+/// The closure re-enters the spec's own [`TableSpec::plan_scan`] with the
+/// original projection, filters and limit plus one appended `IN` list, so the
+/// restricted scan is an ordinary scan of a narrower predicate — same route
+/// selection, same residual row filters, same rows.
+type ProbeRebind =
+    Arc<dyn Fn(String, Vec<ScalarValue>) -> BoxFuture<'static, Result<PlannedScan>> + Send + Sync>;
+
+/// The execution-time narrowing a scan will accept, if any.
+#[derive(Clone)]
+pub(super) struct ScanProbeBinding {
+    columns: Arc<[String]>,
+    /// The constant columns the unrestricted scan advertised. A probe adds a
+    /// multi-value `IN`, which pins nothing, so the restricted scan advertises
+    /// exactly the same set.
+    constant_columns: Arc<[String]>,
+    rebind: ProbeRebind,
+}
+
+impl ScanProbeBinding {
+    fn serves(&self, column: &str) -> bool {
+        self.columns.iter().any(|name| name == column)
+    }
+}
+
 /// A planned UPDATE/DELETE: the candidate-row source the filters run against,
 /// and the handler that stages writes for the rows that matched.
 ///
@@ -372,6 +402,19 @@ where
 
     fn filter_pushdown(&self, _filter: &Expr) -> TableProviderFilterPushDown {
         TableProviderFilterPushDown::Unsupported
+    }
+
+    /// Columns for which this table has an access path keyed by value, so a
+    /// scan restricted to a known set of values is cheaper than the scan these
+    /// `filters` alone would produce.
+    ///
+    /// Naming a column here only permits [`SpecScanExec::rebind_probe`] to
+    /// replan the scan with an extra `IN` filter on it. The replan goes through
+    /// the spec's ordinary [`TableSpec::plan_scan`], so the answer is the same
+    /// rows either way and a spec that names a column it cannot actually seek
+    /// loses performance, never correctness.
+    fn probe_key_columns(&self, _filters: &[Expr]) -> Vec<String> {
+        Vec::new()
     }
 
     /// Rejects filters that would be unsafe to leave as residual expressions.
@@ -965,6 +1008,7 @@ where
             filters: filters.iter().map(ToString::to_string).collect(),
             limit,
         };
+        let constant_columns = exact_filter_constant_columns(self.spec.as_ref(), filters);
         let planned = self
             .spec
             .plan_scan(projection, filters, limit, state.execution_props())
@@ -978,13 +1022,123 @@ where
                 table: self.spec.table_name().into(),
                 projection: projection.cloned(),
             });
+        let probe_binding =
+            self.probe_binding(projection, filters, limit, state, &constant_columns);
         Ok(Arc::new(SpecScanExec::new(
             self.spec.table_name().into(),
             planned,
             state.config().target_partitions(),
             statement_cache_key,
             physical_cache_key,
-        )))
+            &constant_columns,
+            probe_binding,
+        )?))
+    }
+}
+
+/// Output columns pinned to one literal value by a fully-applied (`Exact`)
+/// pushed-down filter.
+///
+/// `Exact` pushdown means the provider applies the predicate in full, so every
+/// row leaving the scan satisfies it. For predicates shaped `col = literal` or
+/// `col IN (single literal)` the column is therefore constant across the scan's
+/// output — the same fact `FilterExec` would have advertised through its
+/// equivalence properties had the filter stayed above the scan. Restoring it
+/// here lets DataFusion's own `EnforceSorting` rule elide sort operators whose
+/// sort keys are pinned; the canonical beneficiary is the point read
+/// `WHERE pk = … ORDER BY pk`, which otherwise streams its at-most-one row
+/// through a full `SortExec`. Conjunctions recurse — an exactly-applied
+/// `a = 'x' AND b = 'y'` pins both columns — while `OR`, negated `IN`, and
+/// multi-value `IN` pin nothing. Filters the spec reports as `Inexact` or
+/// `Unsupported` are skipped: their rows are only narrowed above the scan, so
+/// the scan itself proves nothing.
+fn exact_filter_constant_columns<R>(spec: &dyn TableSpec<R>, filters: &[Expr]) -> Vec<String>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    fn collect(filter: &Expr, columns: &mut Vec<String>) {
+        match filter {
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                collect(&binary.left, columns);
+                collect(&binary.right, columns);
+            }
+            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+                match (binary.left.as_ref(), binary.right.as_ref()) {
+                    (Expr::Column(column), Expr::Literal(..))
+                    | (Expr::Literal(..), Expr::Column(column)) => {
+                        columns.push(column.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            Expr::InList(in_list) if !in_list.negated && in_list.list.len() == 1 => {
+                if let (Expr::Column(column), Expr::Literal(..)) =
+                    (in_list.expr.as_ref(), &in_list.list[0])
+                {
+                    columns.push(column.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut columns = Vec::new();
+    for filter in filters {
+        if spec.filter_pushdown(filter) != TableProviderFilterPushDown::Exact {
+            continue;
+        }
+        collect(filter, &mut columns);
+    }
+    columns
+}
+
+impl<R> SpecTableProvider<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    /// Captures everything needed to replan this scan with one extra `IN`
+    /// restriction, so a join can narrow it once its probe keys are known.
+    fn probe_binding(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        state: &dyn Session,
+        constant_columns: &[String],
+    ) -> Option<ScanProbeBinding> {
+        // A pushed-down limit picks *which* rows the scan returns. Narrowing
+        // the row set underneath it would change that choice, so a limited scan
+        // keeps the plan it was given.
+        if limit.is_some() {
+            return None;
+        }
+        let columns: Arc<[String]> = self.spec.probe_key_columns(filters).into();
+        if columns.is_empty() {
+            return None;
+        }
+        let spec = Arc::clone(&self.spec);
+        let projection = projection.cloned();
+        let filters = filters.to_vec();
+        let props = state.execution_props().clone();
+        Some(ScanProbeBinding {
+            columns,
+            constant_columns: constant_columns.into(),
+            rebind: Arc::new(move |column: String, values: Vec<ScalarValue>| {
+                let spec = Arc::clone(&spec);
+                let projection = projection.clone();
+                let mut filters = filters.clone();
+                let props = props.clone();
+                Box::pin(async move {
+                    filters.push(Expr::InList(InList::new(
+                        Box::new(Expr::Column(DFColumn::new_unqualified(column))),
+                        values.into_iter().map(lit).collect(),
+                        false,
+                    )));
+                    spec.plan_scan(projection.as_ref(), &filters, limit, &props)
+                        .await
+                })
+            }),
+        })
     }
 }
 
@@ -1106,6 +1260,8 @@ pub(crate) struct SpecScanExec {
     properties: Arc<PlanProperties>,
     statement_cache_key: Option<StatementScanKey>,
     physical_cache_key: PhysicalScanKey,
+    target_partitions: usize,
+    probe_binding: Option<ScanProbeBinding>,
 }
 
 impl SpecScanExec {
@@ -1115,13 +1271,15 @@ impl SpecScanExec {
         target_partitions: usize,
         statement_cache_key: Option<StatementScanKey>,
         physical_cache_key: PhysicalScanKey,
-    ) -> Self {
+        constant_columns: &[String],
+        probe_binding: Option<ScanProbeBinding>,
+    ) -> Result<Self> {
         // A declared ordering only proves that each source fragment is sorted,
         // not that adjacent fragments have non-overlapping value ranges.
         // Keep ordered fragments separate unless the source can eventually
         // provide that stronger cross-fragment guarantee.
         let preserve_fragment_boundaries = planned.ordering.is_some();
-        let equivalence_properties = planned
+        let mut equivalence_properties = planned
             .ordering
             .as_deref()
             .and_then(|column_name| {
@@ -1143,6 +1301,23 @@ impl SpecScanExec {
                     })
             })
             .unwrap_or_else(|| EquivalenceProperties::new(Arc::clone(&planned.schema)));
+        // Exact-pushdown equalities pin these output columns to one literal
+        // value, uniformly across every partition. Columns pruned from the
+        // projected schema carry no ordering obligations and are skipped.
+        let constants = constant_columns
+            .iter()
+            .filter_map(|column_name| {
+                planned.schema.index_of(column_name).ok().map(|index| {
+                    ConstExpr::new(
+                        Arc::new(Column::new(column_name, index)),
+                        AcrossPartitions::Uniform(None),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !constants.is_empty() {
+            equivalence_properties.add_constants(constants)?;
+        }
         let grouped_target = if preserve_fragment_boundaries {
             planned.source.partition_count
         } else {
@@ -1156,7 +1331,7 @@ impl SpecScanExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self {
+        Ok(Self {
             table,
             schema: planned.schema,
             source: planned.source,
@@ -1164,7 +1339,9 @@ impl SpecScanExec {
             properties: Arc::new(properties),
             statement_cache_key,
             physical_cache_key,
-        }
+            target_partitions,
+            probe_binding,
+        })
     }
 
     #[cfg(test)]
@@ -1186,7 +1363,10 @@ impl SpecScanExec {
             target_partitions,
             statement_cache_key,
             physical_cache_key,
+            &[],
+            None,
         )
+        .expect("test scan properties build")
     }
 
     pub(crate) fn statement_cache_key(&self) -> Option<&StatementScanKey> {
@@ -1195,6 +1375,61 @@ impl SpecScanExec {
 
     pub(crate) fn physical_cache_key(&self) -> &PhysicalScanKey {
         &self.physical_cache_key
+    }
+
+    /// Whether this scan can be replanned restricted to values of `column`.
+    pub(crate) fn serves_probe_column(&self, column: &str) -> bool {
+        self.probe_binding
+            .as_ref()
+            .is_some_and(|binding| binding.serves(column))
+    }
+
+    /// Replans this scan restricted to rows whose `column` is one of `values`.
+    ///
+    /// The restriction is an ordinary `IN` predicate handed back to the spec,
+    /// so the replanned scan returns exactly the subset of this scan's rows
+    /// that satisfy it — never a different row set, and never a wider one. A
+    /// spec free to ignore the hint still answers correctly; it only loses the
+    /// point lookup.
+    ///
+    /// Returns `None` unless the replanned scan is a drop-in replacement for
+    /// this one. The caller has already published this scan's schema and
+    /// partition count to the operator above it, so a replan that lands on a
+    /// different layout must be discarded rather than substituted — a scan with
+    /// more partitions than the plan advertises would have rows nobody reads.
+    pub(crate) async fn rebind_probe(
+        &self,
+        column: &str,
+        values: Vec<ScalarValue>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(binding) = self.probe_binding.as_ref() else {
+            return Ok(None);
+        };
+        let planned = (binding.rebind)(column.to_string(), values).await?;
+        if planned
+            .schema
+            .logically_equivalent_names_and_types(&self.schema)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let restricted = Self::new(
+            Arc::clone(&self.table),
+            planned,
+            self.target_partitions,
+            // A probe-restricted scan is built during execution from values
+            // that exist only in this execution. It must never be shared as a
+            // statement-level scan, and it is never a physical-plan template
+            // leaf, so it carries no reusable identity.
+            None,
+            self.physical_cache_key.clone(),
+            &binding.constant_columns,
+            None,
+        )?;
+        if restricted.fragment_ranges.len() != self.fragment_ranges.len() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(restricted)))
     }
 }
 
@@ -1686,16 +1921,21 @@ mod scan_source_tests {
         session
             .register_table("counted", Arc::new(SpecTableProvider::new(spec)))
             .expect("counted test table should register");
-        let dataframe = session
-            .sql(
+        let plan = session
+            .state()
+            .create_logical_plan(
                 "WITH reused AS (SELECT value FROM counted) \
                  SELECT value FROM reused UNION ALL SELECT value FROM reused",
             )
             .await
             .expect("CTE should plan");
-        let batches = crate::sql2::runtime::collect_dataframe(dataframe, None)
-            .await
-            .expect("CTE should execute");
+        let batches = crate::sql2::runtime::collect_plan(
+            &session.state(),
+            crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
+            None,
+        )
+        .await
+        .expect("CTE should execute");
         let values = batches
             .iter()
             .flat_map(|batch| {

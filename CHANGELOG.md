@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.11.0 - 2026-08-09
+
+### Minor
+
+- Removed the SQLite storage option from `@lix-js/sdk` and `lix_sdk`.
+
+  Use the RocksDB-backed `LocalFilesystem` adapter for persistent local development. The standalone Rust SQLite storage adapter remains available for specialized use.
+- Unified the Rust engine and SDK as the `lix` crate, with `open_lix().await?` as the in-memory quick start and builder methods for storage, telemetry, and custom Wasm runtimes.
+
+  This is a breaking Rust API migration: `lix_engine`, `lix_sdk`, `OpenLixOptions`, and the specialized `open_lix_with_*` entry points have been removed. Persistent backends now live in independently versioned `lix-storage-*` crates.
+
+### Patch
+
+- Bounded first publication of columnar current state on long commit histories.
+
+  Lix now authenticates cumulative touched schema families in each commit-state manifest and carries that bounded absence authority across linear, merged, and selected-source lineages. Mutation scopes that cannot be bounded exactly still fail closed.
+- Reduced sparse current-state publication latency and serving-index allocation.
+
+  Lix now stores contiguous scoped-range leaves as shared scope runs and encodes immutable node fields through borrowed views, while retaining authenticated point reads, structural sharing, and opaque physical-part payloads.
+- Reduced current-state serving-index storage for large tracked repositories.
+
+  Lix now uses one authenticated scoped-range index for point reads, diffs, and sparse state sharing while preserving transactional history and branch semantics.
+
 ## 0.10.0 - 2026-08-03
 
 ### Minor
@@ -7,7 +30,7 @@
 - Added repository-native accounts and single-account change attribution across local and remote sessions.
 
   Every change now has one required account, anonymous work uses the built-in anonymous account, and applications can select an active account through the Rust, JavaScript, SQL, and server-protocol APIs.
-- Added persistent undo and redo for tracked branch history across the Rust SDK, JavaScript SDK, remote protocol, and CLI.
+- Added persistent undo and redo for tracked branch history across the Rust SDK, JavaScript SDK, Lix Server Protocol, and CLI.
 
   Undo and redo append inverse and replay commits without rewinding branch history. Atomic batches and transactions remain one undo unit, while untracked state remains unchanged; checkpoints and merge commits form undo boundaries.
 - Renamed the `lix_file`, `lix_file_by_branch`, and `lix_file_history` binary payload column from `data` to `content`. Native file read and write APIs now use `content` names as well; the former `data` surface is not supported.
@@ -47,7 +70,7 @@
 - Rename the filesystem working-diff SQL surfaces for consistent terminology.
 
   `lix_file_working_diff`, `lix_file_working_diff_by_branch`, `lix_directory_working_diff`, and `lix_directory_working_diff_by_branch` replace their `*_working_change*` predecessors. The old names are not retained as aliases.
-- Lix is substantially faster and more storage-efficient for large files and workspaces.
+- Lix is substantially faster and more storage-efficient for large files and repositories.
 
   v0.9 adds indexed and batched file operations, faster SQL reads and writes, compressed native storage, lower-copy blob handling, and more efficient tracked-state merges. Remote clients also transfer localized file and query changes instead of repeatedly sending complete payloads.
 
@@ -59,7 +82,7 @@
 
   Reference plugins for CSV and TSV, JSON, Markdown, Excalidraw, and Git-compatible text turn localized file edits into sparse semantic changes without reparsing or rendering the complete document. Concurrent edits merge at the entity level, and plugin authors can build on the same public Rust API used by the bundled plugins.
 - Git replay can now target RocksDB or SlateDB and compare the full semantic plugin path with an explicit no-plugin control. Replay profiles identify the selected adapter and include per-commit WASM transition work counters.
-- Run Lix workspaces remotely with live, low-latency clients.
+- Run Lix repositories remotely with live, low-latency clients.
 
   `openLix()` can connect to the versioned Lix HTTP protocol for SQL, branches, atomic batches, binary file operations, and multiplexed live queries. Each client gets an isolated branch-pinned session, retries writes safely, persists private local state locally, and sends compact deltas for localized edits.
 - Plugin-backed atomic imports now scale independently of document count. The engine automatically reuses its bounded live-Store working set for fresh and existing documents while preserving actively contested same-file leases, so callers no longer need a special single-writer ingestion API or actor-retention policy. Retained session observations also recover from benign working-set eviction when their exact durable semantic root is unchanged.
@@ -128,12 +151,12 @@
 - Added `LocalFilesystem.syncDiskToLix()` as an awaitable filesystem sync barrier.
 
   The filesystem storage picks up disk edits in the background with debouncing. `storage.syncDiskToLix()` flushes pending on-disk changes into Lix and resolves once they are materialized, so subsequent queries reflect the current disk state.
-- Added a `lixDir` option to `LocalFilesystem` for storing lix state outside the workspace.
+- Added a `lixDir` option to `LocalFilesystem` for storing lix state outside the repository.
 
-  By default, state lives in `<workspace>/.lix`. Passing `lixDir` keeps repository metadata in an external `.lix` directory and writes no `.lix` directory into the workspace. Pointing `lixDir` at a temporary directory gives ephemeral filesystem sync: workspace files are imported and watched without persisting lix state.
+  By default, state lives in `<repository>/.lix`. Passing `lixDir` keeps repository metadata in an external `.lix` directory and writes no `.lix` directory into the repository. Pointing `lixDir` at a temporary directory gives ephemeral filesystem sync: repository files are imported and watched without persisting lix state.
 - `LocalFilesystem` now requires an explicit `syncAllFiles` option and supports on-demand file sync.
 
-  `new LocalFilesystem({ path, syncAllFiles: true })` syncs the full workspace as before. With `syncAllFiles: false`, the lix opens without workspace files and `storage.importPaths(["notes/today.md"])` syncs selected files on demand. Imported paths are exact workspace-relative file paths, not directories or globs. In Rust, use `LocalFilesystemOpenOptions::new(root, sync_all_files)` and `LocalFilesystem::import_paths()`.
+  `new LocalFilesystem({ path, syncAllFiles: true })` syncs the full repository as before. With `syncAllFiles: false`, the lix opens without repository files and `storage.importPaths(["notes/today.md"])` syncs selected files on demand. Imported paths are exact repository-relative file paths, not directories or globs. In Rust, use `LocalFilesystemOpenOptions::new(root, sync_all_files)` and `LocalFilesystem::import_paths()`.
 - Added optional origin keys for tagging Lix writes.
 
   `lix.execute(sql, params, { originKey })` in JavaScript and `execute_with_options(sql, params, options)` in Rust stamp the change records a write produces. The key is exposed as `origin_key` on `lix_change` and as `lixcol_origin_key` on state, file, and history surfaces; writes without an origin key stay `NULL`.

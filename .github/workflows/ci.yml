@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, ready_for_review]
   push:
     branches:
       - main
@@ -20,6 +20,7 @@ defaults:
 jobs:
   changelog:
     name: Changelog
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
 
     steps:
@@ -31,6 +32,7 @@ jobs:
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -47,11 +49,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate Cargo configuration
-        run: cargo metadata --format-version 1 --no-deps
+      - name: Validate Cargo configuration and publish surface
+        run: |
+          node scripts/validate-publish-surface.mjs
+          node --test scripts/release.test.mjs
 
   cargo:
     name: Cargo ${{ matrix.name }}
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
     strategy:
       fail-fast: false
@@ -105,33 +110,91 @@ jobs:
         if: matrix.task == 'clippy'
         run: cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
 
+      # The one supported configuration nothing else here builds: `cfg(test)`
+      # with `storage-benches` OFF, which is exactly what a plain
+      # `cargo test -p lix` — the dev loop `packages/lix/AGENTS.md` documents —
+      # compiles. Every other step has the feature on (`--all-features`), and a
+      # `--no-default-features` check has no test targets at all, so a
+      # `#[cfg(test)]` item that calls the feature-only `storage_bench` module
+      # breaks `cargo test -p lix` while clippy, the full test matrix and the
+      # `--all-features` build all stay green. Two such call sites had
+      # accumulated in `gc.rs` before this step existed. `check` rather than
+      # `test`: the matrix below already runs the tests, this only has to prove
+      # the configuration compiles.
+      - name: Check lix test targets with default features
+        if: matrix.task == 'clippy'
+        run: cargo check -p lix --tests
+
+      # `--all-features` is deliberate: it is the only thing that compiles
+      # feature-gated sources such as `packages/lix/src/storage_bench.rs`
+      # (behind `lix/storage-benches`), where a stale assertion once survived
+      # roughly ten pull requests because a plain `cargo test -p lix` never
+      # built it.
+      #
+      # `lix_e2e` is excluded from that blanket only because its `tpch`
+      # feature pulls `duckdb` with the `bundled` C++ build. No test needs it —
+      # DuckDB is used solely by `[[bench]] tpch`, and `cargo test` never runs
+      # benches — so it was minutes of CI spent compiling a dependency nothing
+      # here executes. The crate is still compiled and tested below with every
+      # feature its tests actually require.
+      #
+      # That feature list is exhaustive, not a guess: every `[[test]]` target in
+      # `packages/e2e/Cargo.toml` declares `required-features` within
+      # {sdk-tests, storage-benches, slatedb, rocksdb}, and `storage-benches`
+      # implies `rocksdb`. `sdk-tests` covers the 11 targets folded in from the
+      # former `lix_tests` crate; it turns on `lix/default_wasm_runtime`, which
+      # those tests need and which the benches in that crate deliberately do not
+      # build with. `root-replay-trace` carries no test of its own but gates
+      # instrumentation sources, so it is listed to keep them compiling —
+      # dropping it would recreate exactly the `storage_bench.rs` blind spot
+      # described above.
       - name: Compile Rust workspace tests
         if: matrix.task == 'test'
-        run: cargo test --profile test --workspace --all-features --no-run
+        run: |
+          cargo test --profile test --workspace --exclude lix_e2e --all-features --no-run
+          cargo test --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-run
 
       - name: Run Rust workspace tests
-        if: matrix.task == 'test'
-        env:
-          # The CRUD public-result parity test exercises every adapter in one
-          # libtest worker and can exceed Rust's 2 MiB worker-stack default.
-          RUST_MIN_STACK: 8388608
-        run: cargo test --profile test --workspace --all-features
-
-      - name: Verify the packaged plugin API contract
+        # Deliberately no RUST_MIN_STACK here. Tests that need more than
+        # libtest's 2 MiB worker-stack default must size their own thread
+        # (see `run_on_sized_stack` in the CRUD public-result parity test), so
+        # that the command a developer runs by hand behaves like CI's.
+        #
+        # `--no-fail-fast` is required, not cosmetic. Without it cargo stops at
+        # the first failing target and never runs the rest, so a single red
+        # crate hides every later one. #1329 broke two tests; the second sat
+        # invisible behind the first for hours because CI could only ever
+        # report one, and it appeared in the logs as a compiled executable that
+        # never ran.
         if: matrix.task == 'test'
         run: |
-          cargo package --locked -p lix_plugin_api
-          cargo package --locked -p lix_plugin_api --list |
-            rg '^wit/lix-plugin\.wit$'
+          cargo test --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
+          cargo test --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
 
-      - name: Build a downstream Component plugin through the public API
+      # The e2e test compilation above already builds the real workspace plugin
+      # artifacts. This one external fixture covers the distinct risk: whether
+      # the packaged `lix` crate contains and exposes everything a plugin author
+      # needs. `--no-verify` avoids compiling the native engine a second time;
+      # compiling the extracted package for WASIp2 is the relevant verification.
+      - name: Verify the packaged Lix plugin contract
         if: matrix.task == 'test'
         run: |
           rustup target add wasm32-wasip2
-          cargo build --release -p plugin_csv --target wasm32-wasip2
+          cargo package --locked -p lix-schema -p lix --no-verify
+          package_archive="$(find target/package -maxdepth 1 -type f -name 'lix-[0-9]*.crate' | head -n 1)"
+          tar -tf "$package_archive" |
+            rg '^[^/]+/wit/lix-plugin\.wit$'
+          packaged_lix="$(mktemp -d)"
+          tar -xf "$package_archive" -C "$packaged_lix" --strip-components=1
+          downstream="$(mktemp -d)"
+          cargo init --lib --name downstream_lix_plugin "$downstream"
+          cargo add --manifest-path "$downstream/Cargo.toml" --path "$packaged_lix" lix
+          cp packages/lix/examples/plugin_minimal.rs "$downstream/src/lib.rs"
+          cargo build --manifest-path "$downstream/Cargo.toml" --target wasm32-wasip2
 
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
     strategy:
       fail-fast: false
@@ -212,11 +275,18 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: packages/js-sdk/package-lock.json
+          cache-dependency-path: |
+            packages/js-sdk/package-lock.json
+            packages/storage-filesystem/package-lock.json
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
         run: npm ci
+
+      - name: Install filesystem storage dependencies
+        if: matrix.runtime == 'native'
+        working-directory: packages/storage-filesystem
+        run: npm ci --legacy-peer-deps
 
       - name: Install Chromium
         if: matrix.runtime == 'browser'
@@ -231,6 +301,19 @@ jobs:
           npm run build:native
           npm run build:ts
           npm run build:plugins
+
+      - name: Build and check filesystem storage package
+        if: matrix.runtime == 'native'
+        working-directory: packages/storage-filesystem
+        run: |
+          npm run build
+          npm run typecheck
+          npm test
+
+      - name: Typecheck native JS SDK
+        if: matrix.runtime == 'native'
+        working-directory: packages/js-sdk
+        run: npm run typecheck
 
       - name: Run native JS SDK tests
         if: matrix.runtime == 'native'

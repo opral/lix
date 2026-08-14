@@ -1,8 +1,6 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::lix_schema_definition;
-
 const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ACCOUNT_SCHEMA_KEY: &str = "lix_account";
@@ -14,7 +12,7 @@ const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const LIX_FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const LIX_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const LIX_CHECKPOINT_MARKER_SCHEMA_KEY: &str = "lix_checkpoint_marker";
+pub(crate) const LIX_CHECKPOINT_SCHEMA_KEY: &str = "lix_checkpoint";
 const LIX_UNDO_REDO_MARKER_SCHEMA_KEY: &str = "lix_undo_redo_marker";
 const LIX_COLLECTION_GENERATION_SCHEMA_KEY: &str = "lix_collection_generation";
 
@@ -29,7 +27,7 @@ const LIX_COMMIT_EDGE_SCHEMA_JSON: &str = include_str!("lix_commit_edge.json");
 const LIX_FILE_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_file_descriptor.json");
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_directory_descriptor.json");
 const LIX_BINARY_BLOB_REF_SCHEMA_JSON: &str = include_str!("lix_binary_blob_ref.json");
-const LIX_CHECKPOINT_MARKER_SCHEMA_JSON: &str = include_str!("lix_checkpoint_marker.json");
+const LIX_CHECKPOINT_SCHEMA_JSON: &str = include_str!("lix_checkpoint.json");
 const LIX_UNDO_REDO_MARKER_SCHEMA_JSON: &str = include_str!("lix_undo_redo_marker.json");
 const LIX_COLLECTION_GENERATION_SCHEMA_JSON: &str = include_str!("lix_collection_generation.json");
 
@@ -44,7 +42,7 @@ static LIX_COMMIT_EDGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_FILE_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_DIRECTORY_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_BINARY_BLOB_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
-static LIX_CHECKPOINT_MARKER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_CHECKPOINT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_UNDO_REDO_MARKER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COLLECTION_GENERATION_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 
@@ -60,7 +58,7 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_FILE_DESCRIPTOR_SCHEMA_KEY,
     LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
     LIX_BINARY_BLOB_REF_SCHEMA_KEY,
-    LIX_CHECKPOINT_MARKER_SCHEMA_KEY,
+    LIX_CHECKPOINT_SCHEMA_KEY,
     LIX_UNDO_REDO_MARKER_SCHEMA_KEY,
     LIX_COLLECTION_GENERATION_SCHEMA_KEY,
 ];
@@ -82,7 +80,9 @@ pub(super) fn seed_schema_definitions() -> Vec<&'static JsonValue> {
 pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonValue> {
     match schema_key {
         LIX_REGISTERED_SCHEMA_KEY => {
-            Some(LIX_REGISTERED_SCHEMA.get_or_init(parse_registered_schema_with_inlined_definition))
+            Some(LIX_REGISTERED_SCHEMA.get_or_init(|| {
+                parse_builtin_schema("lix_registered_schema.json", LIX_REGISTERED_SCHEMA_JSON)
+            }))
         }
         LIX_KEY_VALUE_SCHEMA_KEY => {
             Some(LIX_KEY_VALUE_SCHEMA.get_or_init(|| {
@@ -127,11 +127,8 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
         LIX_BINARY_BLOB_REF_SCHEMA_KEY => Some(LIX_BINARY_BLOB_REF_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_binary_blob_ref.json", LIX_BINARY_BLOB_REF_SCHEMA_JSON)
         })),
-        LIX_CHECKPOINT_MARKER_SCHEMA_KEY => Some(LIX_CHECKPOINT_MARKER_SCHEMA.get_or_init(|| {
-            parse_builtin_schema(
-                "lix_checkpoint_marker.json",
-                LIX_CHECKPOINT_MARKER_SCHEMA_JSON,
-            )
+        LIX_CHECKPOINT_SCHEMA_KEY => Some(LIX_CHECKPOINT_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_checkpoint.json", LIX_CHECKPOINT_SCHEMA_JSON)
         })),
         LIX_UNDO_REDO_MARKER_SCHEMA_KEY => Some(LIX_UNDO_REDO_MARKER_SCHEMA.get_or_init(|| {
             parse_builtin_schema(
@@ -157,23 +154,6 @@ fn parse_builtin_schema(file_name: &str, raw_json: &str) -> JsonValue {
     })
 }
 
-fn parse_registered_schema_with_inlined_definition() -> JsonValue {
-    let mut schema = parse_builtin_schema("lix_registered_schema.json", LIX_REGISTERED_SCHEMA_JSON);
-    let value_schema = schema
-        .pointer_mut("/properties/value")
-        .expect("lix_registered_schema.json must define /properties/value");
-    let value_schema_object = value_schema
-        .as_object_mut()
-        .expect("lix_registered_schema.json /properties/value must be an object");
-
-    value_schema_object.insert(
-        "allOf".to_string(),
-        JsonValue::Array(vec![lix_schema_definition().clone()]),
-    );
-
-    schema
-}
-
 #[cfg(test)]
 mod tests {
     use super::{BUILTIN_SCHEMA_KEYS, seed_schema_definition};
@@ -185,14 +165,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn registered_schema_value_inlines_lix_schema_definition() {
-        let schema = seed_schema_definition("lix_registered_schema").expect("schema should exist");
-        let all_of = schema
-            .pointer("/properties/value/allOf")
-            .and_then(|value| value.as_array())
-            .expect("registered schema value must define allOf array");
-        assert_eq!(all_of.len(), 1);
-        assert_eq!(all_of[0], *crate::schema::lix_schema_definition());
-    }
 }

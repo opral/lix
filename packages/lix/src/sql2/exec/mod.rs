@@ -78,7 +78,7 @@ pub(crate) use datafusion::{
     DataFusionLogicalPlan as SqlDataFusionLogicalPlan, SessionReadResult, SessionReadSqlResult,
     execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
     execute_transaction_read_statement_from_parsed, prepare_read_session,
-    prepare_read_session_at_head, query_result_from_batches,
+    prepare_read_session_at_head, query_result_from_batches, statement_has_table_function,
 };
 #[cfg(test)]
 pub(crate) use write::{

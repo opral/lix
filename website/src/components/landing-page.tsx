@@ -105,11 +105,234 @@ function CopyInstallButton({
   );
 }
 
+/**
+ * Hero diagram: your product sits on top of a Lix repo that holds files, a SQL
+ * database, and version control.
+ *
+ * @example
+ * <LixRepoDiagram />
+ */
+function LixRepoDiagram() {
+  return (
+    <div className="w-[300px] shrink-0 self-center sm:w-[340px]">
+      <svg
+        viewBox="0 0 400 326"
+        className="block h-auto w-full"
+        role="img"
+        aria-label="Your product uses a Lix repo containing files, a database, and version control."
+      >
+        <defs>
+          <marker
+            id="hero-repo-arrow"
+            markerWidth="8"
+            markerHeight="8"
+            refX="6"
+            refY="4"
+            orient="auto"
+          >
+            <path d="M0 0 L7 4 L0 8 Z" fill="#8A8F96" />
+          </marker>
+        </defs>
+        <rect
+          x="115"
+          y="10"
+          width="170"
+          height="40"
+          rx="20"
+          fill="#FFFFFF"
+          stroke="#C9C7BF"
+        />
+        <text
+          x="200"
+          y="35"
+          textAnchor="middle"
+          className="font-mono text-[11px] font-bold tracking-[0.07em]"
+          fill="#15171B"
+        >
+          YOUR PRODUCT
+        </text>
+        <line
+          x1="200"
+          y1="50"
+          x2="200"
+          y2="76"
+          stroke="#8A8F96"
+          strokeWidth="1.2"
+          markerEnd="url(#hero-repo-arrow)"
+        />
+        <rect
+          x="20"
+          y="82"
+          width="360"
+          height="230"
+          rx="14"
+          fill="rgba(7,182,213,0.05)"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+        />
+        <text
+          x="200"
+          y="112"
+          textAnchor="middle"
+          className="font-mono text-[11.5px] font-bold tracking-[0.09em]"
+          fill="#0891AC"
+        >
+          LIX REPO
+        </text>
+
+        <g transform="translate(110, 196)">
+          <rect
+            x="-14"
+            y="-28"
+            width="30"
+            height="40"
+            rx="3"
+            fill="#FBFAF7"
+            stroke="#C9C7BF"
+            strokeWidth="1.5"
+          />
+          <rect
+            x="-19"
+            y="-23"
+            width="30"
+            height="40"
+            rx="3"
+            fill="#FFFFFF"
+            stroke="#8A8F96"
+            strokeWidth="1.5"
+          />
+          <line
+            x1="-12"
+            y1="-13"
+            x2="4"
+            y2="-13"
+            stroke="#C9C7BF"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+          <line
+            x1="-12"
+            y1="-5"
+            x2="4"
+            y2="-5"
+            stroke="#C9C7BF"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+          <line
+            x1="-12"
+            y1="3"
+            x2="-3"
+            y2="3"
+            stroke="#07B6D5"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+        </g>
+        <text
+          x="110"
+          y="248"
+          textAnchor="middle"
+          className="font-mono text-[10.5px]"
+          fill="#6B7076"
+        >
+          files
+        </text>
+
+        <g transform="translate(200, 196)">
+          <ellipse
+            cx="0"
+            cy="-16"
+            rx="19"
+            ry="6"
+            fill="#FFFFFF"
+            stroke="#8A8F96"
+            strokeWidth="1.5"
+          />
+          <path
+            d="M-19 -16 V10 C-19 13.3 -10.5 16 0 16 C10.5 16 19 13.3 19 10 V-16"
+            fill="none"
+            stroke="#8A8F96"
+            strokeWidth="1.5"
+          />
+          <path
+            d="M-19 -3 C-19 0.3 -10.5 3 0 3 C10.5 3 19 0.3 19 -3"
+            fill="none"
+            stroke="#C9C7BF"
+            strokeWidth="1.5"
+          />
+          <line
+            x1="-7"
+            y1="9"
+            x2="7"
+            y2="9"
+            stroke="#07B6D5"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+        </g>
+        <text
+          x="200"
+          y="248"
+          textAnchor="middle"
+          className="font-mono text-[10.5px]"
+          fill="#6B7076"
+        >
+          database
+        </text>
+
+        <g transform="translate(290, 196)">
+          <line
+            x1="-26"
+            y1="12"
+            x2="26"
+            y2="12"
+            stroke="#8A8F96"
+            strokeWidth="1.5"
+          />
+          <path
+            d="M-18 12 C-18 -2 -8 -10 0 -10 C10 -10 18 -2 18 12"
+            fill="none"
+            stroke="#07B6D5"
+            strokeWidth="1.5"
+          />
+          <circle cx="0" cy="-10" r="3.2" fill="#07B6D5" />
+          <circle
+            cx="-18"
+            cy="12"
+            r="3.2"
+            fill="#FFFFFF"
+            stroke="#8A8F96"
+            strokeWidth="1.5"
+          />
+          <circle
+            cx="18"
+            cy="12"
+            r="3.2"
+            fill="#FFFFFF"
+            stroke="#8A8F96"
+            strokeWidth="1.5"
+          />
+        </g>
+        <text
+          x="290"
+          y="248"
+          textAnchor="middle"
+          className="font-mono text-[10.5px]"
+          fill="#6B7076"
+        >
+          version control
+        </text>
+      </svg>
+    </div>
+  );
+}
+
 const whatYouGet = [
   {
-    title: "Works with any file format",
+    title: "Files, in any format",
     description:
-      "Companies produce DOCX, XLSX, and CAD, not just text. Plugins map any format to versioned entities.",
+      "Text and Markdown, but also DOCX, XLSX, and CAD. Plugins map any format to versioned entities.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
@@ -173,106 +396,7 @@ const whatYouGet = [
     ),
   },
   {
-    title: "Semantic changes",
-    description:
-      "A spreadsheet diff is a cell, not a byte blob. Review the clause, cell, or row that changed.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="16"
-          y="10"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="33"
-          y="10"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="50"
-          y="10"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="16"
-          y="23"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="33"
-          y="23"
-          width="14"
-          height="10"
-          rx="2"
-          fill="rgba(7,182,213,0.14)"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="50"
-          y="23"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="16"
-          y="36"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="33"
-          y="36"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="50"
-          y="36"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-      </svg>
-    ),
-  },
-  {
-    title: "SQL and transactions",
+    title: "SQL database",
     description:
       "File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.",
     icon: (
@@ -306,6 +430,46 @@ const whatYouGet = [
           stroke="#07B6D5"
           strokeWidth="1.5"
           strokeLinecap="round"
+        />
+      </svg>
+    ),
+  },
+  {
+    title: "Version control",
+    description:
+      "Semantic changes: the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.",
+    icon: (
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
+        <line
+          x1="14"
+          y1="40"
+          x2="66"
+          y2="40"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <path
+          d="M22 40 C22 26 30 18 40 18 C50 18 58 26 58 40"
+          fill="none"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+        />
+        <circle cx="40" cy="18" r="3.5" fill="#07B6D5" />
+        <circle
+          cx="22"
+          cy="40"
+          r="3.5"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <circle
+          cx="58"
+          cy="40"
+          r="3.5"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
         />
       </svg>
     ),
@@ -350,64 +514,6 @@ const whatYouGet = [
     ),
   },
   {
-    title: "Pluggable storage",
-    description:
-      "An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale, in contrast to existing VCS like Git that assume a local POSIX filesystem.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="32"
-          y="8"
-          width="16"
-          height="14"
-          rx="3"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <line
-          x1="40"
-          y1="22"
-          x2="40"
-          y2="32"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeDasharray="3 3"
-        />
-        <rect
-          x="14"
-          y="34"
-          width="16"
-          height="14"
-          rx="3"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="32"
-          y="34"
-          width="16"
-          height="14"
-          rx="3"
-          fill="rgba(7,182,213,0.14)"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="50"
-          y="34"
-          width="16"
-          height="14"
-          rx="3"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-      </svg>
-    ),
-  },
-  {
     title: "Permissions",
     badge: "soon",
     description:
@@ -415,27 +521,27 @@ const whatYouGet = [
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <path
-          d="M31 26 v-6 a9 9 0 0 1 18 0 v6"
+          d="M32 25 V18 a8 8 0 0 1 16 0 V25"
           fill="none"
-          stroke="#8A8F96"
+          stroke="#C9C7BF"
           strokeWidth="1.5"
         />
         <rect
-          x="26"
-          y="26"
-          width="28"
-          height="22"
-          rx="4"
+          x="27"
+          y="25"
+          width="26"
+          height="21"
+          rx="3"
           fill="#FFFFFF"
           stroke="#8A8F96"
           strokeWidth="1.5"
         />
-        <circle cx="40" cy="35" r="3" fill="#07B6D5" />
+        <circle cx="40" cy="33.5" r="2.6" fill="#07B6D5" />
         <line
           x1="40"
-          y1="37"
+          y1="36"
           x2="40"
-          y2="42"
+          y2="40.5"
           stroke="#07B6D5"
           strokeWidth="1.5"
           strokeLinecap="round"
@@ -459,46 +565,49 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
       <Header width="narrow" />
       <main className="mx-auto w-full max-w-[1100px] px-8">
         {/* Hero */}
-        <section className="max-w-[720px] pt-16">
-          <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
-            Open source · MIT
-          </p>
-          <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-            A version control system for files and data beyond code
-          </h1>
-          <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-            Agents and tools work with files. Applications need a database.
-            Teams need version control. Lix combines all three: normal files
-            for tools, SQL rows for apps, and version control for every change.
-          </p>
-          <div className="mt-6 flex flex-wrap items-center gap-5">
-            <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
-              <JsLogo className="h-3.5 w-3.5" />
-              JavaScript
-            </span>
-            {sdkLanguages.map(({ label, href, Logo }) => (
+        <section className="flex flex-wrap items-center justify-between gap-12 pt-16">
+          <div className="min-w-[300px] max-w-[620px] flex-1">
+            <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
+              Open source · MIT
+            </p>
+            <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
+              Repository backend for AI products
+            </h1>
+            <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
+              AI products want a repository: files for agents, a SQL database
+              for your app, and version control over both. Lix is that
+              repository, an embeddable backend.
+            </p>
+            <div className="mt-6 flex flex-wrap items-center gap-5">
+              <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
+                <JsLogo className="h-3.5 w-3.5" />
+                JavaScript
+              </span>
+              {sdkLanguages.map(({ label, href, Logo }) => (
+                <a
+                  key={label}
+                  href={href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={`The ${label} SDK is planned. Upvote the issue on GitHub.`}
+                  className="flex items-center gap-1.5 border-b-2 border-transparent pb-0.5 text-[13px] text-ink-muted transition-colors hover:text-cyan-deep"
+                >
+                  <Logo className="h-3.5 w-3.5" />
+                  {label}
+                </a>
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <CopyInstallButton background="white" />
               <a
-                key={label}
-                href={href}
-                target="_blank"
-                rel="noopener noreferrer"
-                title={`The ${label} SDK is planned. Upvote the issue on GitHub.`}
-                className="flex items-center gap-1.5 border-b-2 border-transparent pb-0.5 text-[13px] text-ink-muted transition-colors hover:text-cyan-deep"
+                href="/docs/what-is-lix"
+                className="flex h-10 items-center rounded-lg bg-ink px-4 text-[13.5px] font-semibold text-paper transition-colors hover:text-paper"
               >
-                <Logo className="h-3.5 w-3.5" />
-                {label}
+                Read the docs
               </a>
-            ))}
+            </div>
           </div>
-          <div className="mt-3 flex flex-wrap items-center gap-3">
-            <CopyInstallButton background="white" />
-            <a
-              href="/docs/what-is-lix"
-              className="flex h-10 items-center rounded-lg bg-ink px-4 text-[13.5px] font-semibold text-paper transition-colors hover:text-paper"
-            >
-              Read the docs
-            </a>
-          </div>
+          <LixRepoDiagram />
         </section>
 
         {/* Stats */}
@@ -533,8 +642,8 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             What you get
           </h2>
           <p className="mt-3 max-w-[640px] text-[15px] leading-[1.6] text-ink-secondary">
-            Putting more than code into a repository needs six things a code
-            VCS never had:
+            Files for AI agents, SQL for your app, version control for review
+            flows. All in one repository.
           </p>
           <div className="mt-5">
             {whatYouGet.map((item, index) => (

@@ -19,8 +19,8 @@ use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions};
 use crate::storage_adapter::{Storage, StorageAdapter};
 use crate::telemetry::TelemetrySink;
 use crate::transaction::CommitCoordinator;
-use crate::wasm::WasmTransitionCounters;
-use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
+use crate::plugin::runtime::WasmTransitionCounters;
+use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]

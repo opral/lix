@@ -1,6 +1,5 @@
 use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
-use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use smallvec::SmallVec;
 
@@ -10,7 +9,7 @@ use crate::domain::{Domain, DomainSchemaIdentity};
 use crate::entity_pk::{EntityPk, canonical_json_text};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
-use crate::wasm::WasmEntityKey;
+use crate::plugin::runtime::WasmEntityKey;
 
 #[derive(Default)]
 pub(crate) struct CatalogSnapshot {
@@ -380,7 +379,7 @@ pub(crate) struct SchemaPlan {
     pub(crate) key: SchemaCatalogKey,
     pub(crate) schema: Arc<JsonValue>,
     fingerprint: Arc<SchemaPlanFingerprint>,
-    pub(crate) compiled_schema: JSONSchema,
+    pub(crate) compiled_schema: lix_schema::CompiledSchema,
     fast_object_validation: Option<FastObjectValidationPlan>,
     pub(crate) defaults: DefaultPlan,
     pub(crate) primary_key: Option<PointerGroup>,
@@ -2348,8 +2347,7 @@ struct DefaultPropertyPlan {
 enum DefaultValuePlan {
     Json(JsonValue),
     UuidV7,
-    Timestamp,
-    Cel(String),
+    CurrentTimestamp,
 }
 
 impl DefaultPlan {
@@ -2358,35 +2356,28 @@ impl DefaultPlan {
     }
 
     pub(crate) fn from_schema(schema: &JsonValue) -> Self {
-        let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
+        let Ok(schema) = crate::schema::parse_lix_schema(schema) else {
             return Self::default();
         };
-        let mut ordered_properties = properties.iter().collect::<Vec<_>>();
-        ordered_properties.sort_by_key(|(left_name, _)| *left_name);
-
-        let properties = ordered_properties
+        let properties = schema
+            .columns
             .into_iter()
-            .filter_map(|(field_name, field_schema)| {
-                if let Some(expression) = field_schema
-                    .get("x-lix-default")
-                    .and_then(JsonValue::as_str)
-                {
+            .filter_map(|column| {
+                if let Some(expression) = column.default_expression {
                     let default = match expression.trim() {
-                        "lix_uuid_v7()" => DefaultValuePlan::UuidV7,
-                        "lix_timestamp()" => DefaultValuePlan::Timestamp,
-                        _ => DefaultValuePlan::Cel(expression.to_string()),
+                        "uuidv7()" => DefaultValuePlan::UuidV7,
+                        "CURRENT_TIMESTAMP" => DefaultValuePlan::CurrentTimestamp,
+                        _ => unreachable!("Schema v1 rejects unsupported default expressions"),
                     };
                     return Some(DefaultPropertyPlan {
-                        field_name: field_name.clone(),
+                        field_name: column.name,
                         default,
                     });
                 }
-                field_schema
-                    .get("default")
-                    .map(|value| DefaultPropertyPlan {
-                        field_name: field_name.clone(),
-                        default: DefaultValuePlan::Json(value.clone()),
-                    })
+                column.default_value.map(|value| DefaultPropertyPlan {
+                    field_name: column.name,
+                    default: DefaultValuePlan::Json(value),
+                })
             })
             .collect();
         Self { properties }
@@ -2396,10 +2387,10 @@ impl DefaultPlan {
         &self,
         snapshot: &mut JsonMap<String, JsonValue>,
         functions: FunctionProviderHandle,
-        schema_key: &str,
+        _schema_key: &str,
+        mut statement_timestamp: impl FnMut() -> Result<crate::common::LixTimestamp, LixError>,
     ) -> Result<bool, LixError> {
         let mut changed = false;
-        let mut cel_context = None::<JsonMap<String, JsonValue>>;
         for property in &self.properties {
             if snapshot.contains_key(&property.field_name) {
                 continue;
@@ -2407,22 +2398,8 @@ impl DefaultPlan {
             let value = match &property.default {
                 DefaultValuePlan::Json(value) => value.clone(),
                 DefaultValuePlan::UuidV7 => JsonValue::String(functions.call_uuid_v7().to_string()),
-                DefaultValuePlan::Timestamp => {
-                    JsonValue::String(functions.call_timestamp().to_string())
-                }
-                DefaultValuePlan::Cel(expression) => {
-                    let context = cel_context.get_or_insert_with(|| snapshot.clone());
-                    crate::cel::shared_runtime()
-                        .evaluate_with_functions(expression, context, functions.clone())
-                        .map_err(|err| LixError {
-                            code: "LIX_ERROR_UNKNOWN".to_string(),
-                            message: format!(
-                                "failed to evaluate x-lix-default for '{}.{}': {}",
-                                schema_key, property.field_name, err.message
-                            ),
-                            hint: None,
-                            details: None,
-                        })?
+                DefaultValuePlan::CurrentTimestamp => {
+                    JsonValue::String(statement_timestamp()?.to_string())
                 }
             };
             snapshot.insert(property.field_name.clone(), value);

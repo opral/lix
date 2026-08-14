@@ -1,0 +1,1674 @@
+use lix::storage::Storage;
+use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryValue};
+use lix::{
+    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
+    MergeBranchOutcome, SwitchBranchOptions, Value, open_lix,
+};
+use lix_storage_filesystem::FilesystemStorage;
+use std::ops::Deref;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+#[tokio::test]
+async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
+    let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+    let captured = Arc::clone(&spans);
+    let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
+        captured.lock().unwrap().push(span);
+    }));
+    let lix = open_lix().with_telemetry(telemetry).await.unwrap();
+
+    lix.execute("SELECT 'private-value' AS value, 42 AS number", &[])
+        .await
+        .unwrap();
+
+    let spans = spans.lock().unwrap();
+    let span = spans
+        .iter()
+        .find(|span| {
+            span.start.name == "lix.sql.query"
+                && span.start.attributes.iter().any(|attribute| {
+                    matches!(
+                        (&attribute.key, &attribute.value),
+                        (
+                            &"db.query.text",
+                            TelemetryValue::String(value)
+                        ) if value == "SELECT ? AS value, ? AS number"
+                    )
+                })
+        })
+        .expect("query telemetry should be emitted when configured");
+    let query_text = span
+        .start
+        .attributes
+        .iter()
+        .find_map(|attribute| match (&attribute.key, &attribute.value) {
+            (&"db.query.text", TelemetryValue::String(value)) => Some(value.as_str()),
+            _ => None,
+        })
+        .expect("query telemetry includes sanitized SQL");
+    assert_eq!(query_text, "SELECT ? AS value, ? AS number");
+    assert!(span.end.duration_ns > 0);
+}
+
+#[tokio::test]
+async fn rs_sdk_create_checkpoint_returns_the_new_active_head() {
+    let lix = open_lix().await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-test', 'working')",
+        &[],
+    )
+    .await
+    .unwrap();
+    let before = active_head_commit_id(&lix).await;
+
+    let checkpoint = lix.create_checkpoint().await.unwrap();
+
+    assert_ne!(checkpoint.commit_id, before);
+    assert_eq!(checkpoint.commit_id, active_head_commit_id(&lix).await);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
+    let lix = open_lix().await.unwrap();
+    let main_branch_id = lix.active_branch_id().await.unwrap();
+
+    register_crm_task_schema(&lix).await;
+
+    lix.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+        &[
+            Value::Text("task-1".to_string()),
+            Value::Text("Draft RS SDK flow".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"priority":"high","tags":["sdk","json"]}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let projected = lix
+        .execute(
+            "SELECT title, done, meta FROM crm_task WHERE id = $1",
+            &[Value::Text("task-1".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_crm_task_projection(&projected);
+
+    assert!(!task_done(&lix, "task-1").await);
+
+    let draft = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-000000000502".to_string()),
+            name: "Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(draft.id, "01920000-0000-7000-8000-000000000502");
+    assert_eq!(draft.name, "Draft");
+    assert!(!draft.hidden);
+
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: draft.id.clone(),
+    })
+    .await
+    .unwrap();
+
+    lix.execute(
+        "UPDATE crm_task SET done = $1 WHERE id = $2",
+        &[Value::Boolean(true), Value::Text("task-1".to_string())],
+    )
+    .await
+    .unwrap();
+
+    assert!(task_done(&lix, "task-1").await);
+
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: main_branch_id.clone(),
+    })
+    .await
+    .unwrap();
+
+    assert!(!task_done(&lix, "task-1").await);
+
+    let merge = lix
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: draft.id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(merge.outcome, MergeBranchOutcome::FastForward);
+    assert_eq!(merge.target_branch_id, main_branch_id);
+    assert_eq!(merge.change_stats.total, 1);
+    assert_eq!(merge.change_stats.modified, 1);
+    assert_eq!(merge.created_merge_commit_id, None);
+    assert!(task_done(&lix, "task-1").await);
+
+    lix.close().await.unwrap();
+}
+
+async fn active_head_commit_id(lix: &Lix<Memory>) -> String {
+    let result = lix
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .unwrap();
+    match &result.rows()[0].values()[0] {
+        Value::Text(commit_id) => commit_id.clone(),
+        value => panic!("expected text commit id, got {value:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+
+    lix.close().await.unwrap();
+    lix.close().await.unwrap();
+
+    let error = lix
+        .execute("SELECT value FROM lix_key_value WHERE key = 'lix_id'", &[])
+        .await
+        .expect_err("execute after close should fail");
+    assert_closed(error);
+
+    let error = lix
+        .active_branch_id()
+        .await
+        .expect_err("active_branch_id after close should fail");
+    assert_closed(error);
+}
+
+#[tokio::test]
+async fn rs_sdk_close_does_not_destroy_committed_data() {
+    let storage = Memory::new();
+    let first = open_lix().with_storage(storage.clone()).await.unwrap();
+
+    first
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('close-key', 'close-value')",
+            &[],
+        )
+        .await
+        .unwrap();
+    first.close().await.unwrap();
+
+    let error = first
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'close-key'",
+            &[],
+        )
+        .await
+        .expect_err("closed handle should not be usable");
+    assert_closed(error);
+
+    let second = open_lix().with_storage(storage).await.unwrap();
+    let result = second
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = 'close-key' AND value = CAST('\"close-value\"' AS JSONB)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("close-key".to_string())]
+    );
+    second.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_write_validation_does_not_poison_storage_transaction() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+
+    register_poison_task_schema(&lix).await;
+
+    let error = lix
+        .execute(
+            "INSERT INTO poison_task (id, title) VALUES ($1, $2)",
+            &[
+                Value::Text("bad-task".to_string()),
+                Value::Text("missing meta".to_string()),
+            ],
+        )
+        .await
+        .expect_err("schema validation should reject missing required field");
+    assert_eq!(error.code, "LIX_ERROR_SCHEMA_VALIDATION");
+
+    let result = lix.execute("SELECT 1 AS ok", &[]).await.unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].values(), &[Value::Integer(1)]);
+
+    lix.execute(
+        "INSERT INTO poison_task (id, title, meta) VALUES ($1, $2, CAST($3 AS JSONB))",
+        &[
+            Value::Text("good-task".to_string()),
+            Value::Text("valid".to_string()),
+            Value::Text(r#"{"priority":"high"}"#.to_string()),
+        ],
+    )
+    .await
+    .expect("valid write after failed write should succeed");
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_commits_multiple_statements_together() {
+    let lix = open_lix().await.unwrap();
+    register_crm_task_schema(&lix).await;
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+        &[
+            Value::Text("tx-task-1".to_string()),
+            Value::Text("First".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+        &[
+            Value::Text("tx-task-2".to_string()),
+            Value::Text("Second".to_string()),
+            Value::Boolean(true),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let staged = tx
+        .execute(
+            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+            &[
+                Value::Text("tx-task-1".to_string()),
+                Value::Text("tx-task-2".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.len(), 2);
+
+    tx.commit().await.unwrap();
+
+    let committed = lix
+        .execute(
+            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+            &[
+                Value::Text("tx-task-1".to_string()),
+                Value::Text("tx-task-2".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 2);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn execute_batch_is_atomic_and_returns_ordered_results() {
+    let lix = open_lix().await.unwrap();
+    let results = lix
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                label: None,
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+                params: vec![
+                    Value::Text("batch-rs-a".to_string()),
+                    Value::Text("first".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                label: None,
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+                params: vec![
+                    Value::Text("batch-rs-b".to_string()),
+                    Value::Text("second".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                label: None,
+                sql: "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key"
+                    .to_string(),
+                params: vec![
+                    Value::Text("batch-rs-a".to_string()),
+                    Value::Text("batch-rs-b".to_string()),
+                ],
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.statement_index())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+    assert_eq!(results[0].label(), None);
+    assert_eq!(results[0].rows_affected(), 1);
+    assert_eq!(results[1].rows_affected(), 1);
+    assert_eq!(
+        results[2]
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Text("batch-rs-a".to_string()),
+                Value::Json(serde_json::json!("first").into()),
+            ],
+            vec![
+                Value::Text("batch-rs-b".to_string()),
+                Value::Json(serde_json::json!("second").into()),
+            ],
+        ]
+    );
+
+    let error = lix
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                label: None,
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+                params: vec![
+                    Value::Text("batch-rs-rollback".to_string()),
+                    Value::Text("before failure".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                label: None,
+                sql: "SELECT id FROM lix_file_history('one', 'two')".to_string(),
+                params: Vec::new(),
+            },
+        ])
+        .await
+        .expect_err("middle batch statement should fail");
+    assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+    assert!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("statementIndex"))
+            .is_some_and(|value| value.as_u64() == Some(1)),
+    );
+
+    let rolled_back = lix
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = $1",
+            &[Value::Text("batch-rs-rollback".to_string())],
+        )
+        .await
+        .unwrap();
+    assert!(rolled_back.is_empty());
+
+    let empty_error = lix
+        .execute_batch(&[])
+        .await
+        .expect_err("empty batch should be rejected");
+    assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn execute_batch_indexes_all_eighteen_writes_and_echoes_labels() {
+    let lix = open_lix().await.unwrap();
+    let statements = (0..18)
+        .map(|index| ExecuteBatchStatement {
+            label: Some(format!("file-{index}")),
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+            params: vec![
+                Value::Text(format!("batch-eighteen-{index}")),
+                Value::Text(index.to_string()),
+            ],
+        })
+        .collect::<Vec<_>>();
+
+    let results = lix.execute_batch(&statements).await.unwrap();
+    assert_eq!(results.len(), 18);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.statement_index())
+            .collect::<Vec<_>>(),
+        (0..18).map(Some).collect::<Vec<_>>()
+    );
+    let expected_labels = (0..18)
+        .map(|index| format!("file-{index}"))
+        .collect::<Vec<_>>();
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result.label(), Some(expected_labels[index].as_str()));
+    }
+    assert!(results.iter().all(|result| result.rows_affected() == 1));
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_lix_file_content_reads_staged_file_bytes() {
+    let lix = open_lix().await.unwrap();
+    let mut tx = lix.begin_transaction().await.unwrap();
+    let path = "/tx-file-data.bin".to_string();
+    let original = b"staged bytes before commit".to_vec();
+
+    tx.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+        &[
+            Value::Text(path.clone()),
+            Value::Blob(original.clone().into()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let selected = tx
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1 AND content = $2",
+            &[
+                Value::Text(path.clone()),
+                Value::Blob(original.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected.rows()[0].values(),
+        &[Value::Blob(original.clone().into())]
+    );
+
+    let updated = b"updated bytes before commit".to_vec();
+    let update = tx
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = $2 AND content = $3",
+            &[
+                Value::Blob(updated.clone().into()),
+                Value::Text(path.clone()),
+                Value::Blob(original.into()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.rows_affected(), 1);
+
+    let after_update = tx
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1 AND content = $2",
+            &[
+                Value::Text(path.clone()),
+                Value::Blob(updated.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_update.len(), 1);
+    assert_eq!(
+        after_update.rows()[0].values(),
+        &[Value::Blob(updated.clone().into())]
+    );
+
+    let delete = tx
+        .execute(
+            "DELETE FROM lix_file WHERE path = $1 AND content = $2",
+            &[Value::Text(path.clone()), Value::Blob(updated.into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.rows_affected(), 1);
+
+    let after_delete = tx
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(path)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_delete.len(), 0);
+
+    tx.rollback().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_rollback_discards_staged_writes() {
+    let lix = open_lix().await.unwrap();
+    register_crm_task_schema(&lix).await;
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+        &[
+            Value::Text("rolled-back-task".to_string()),
+            Value::Text("Rollback".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+
+    let result = lix
+        .execute(
+            "SELECT id FROM crm_task WHERE id = $1",
+            &[Value::Text("rolled-back-task".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 0);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_blocks_session_execute_on_same_handle() {
+    let lix = open_lix().await.unwrap();
+    register_crm_task_schema(&lix).await;
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+        &[
+            Value::Text("tx-only-task".to_string()),
+            Value::Text("Inside tx".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let error = lix
+        .execute(
+            "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+            &[
+                Value::Text("outside-task".to_string()),
+                Value::Text("Outside tx".to_string()),
+                Value::Boolean(false),
+                Value::Text(r#"{"batch":1}"#.to_string()),
+            ],
+        )
+        .await
+        .expect_err("session writes should be blocked while explicit transaction is active");
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let error = lix
+        .execute("SELECT 1 AS ok", &[])
+        .await
+        .expect_err("session reads should be blocked while explicit transaction is active");
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let tx_read = tx
+        .execute("SELECT 1 AS ok", &[])
+        .await
+        .expect("transaction reads should remain available");
+    assert_eq!(tx_read.rows()[0].get::<i64>("ok").unwrap(), 1);
+
+    tx.commit().await.unwrap();
+
+    let committed = lix
+        .execute(
+            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+            &[
+                Value::Text("outside-task".to_string()),
+                Value::Text("tx-only-task".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(
+        committed.rows()[0].values(),
+        &[Value::Text("tx-only-task".to_string())]
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+    std::fs::create_dir_all(tempdir.path().join("empty")).unwrap();
+    std::fs::write(tempdir.path().join("docs/readme.txt"), b"local").unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(
+        read_file(&lix, "/docs/readme.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"local".as_slice())
+    );
+    assert!(readdir(&lix, "/empty").await.unwrap().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(tempdir.path().join("docs/readme.txt")).unwrap(),
+        b"local"
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_initialization_wipes_legacy_sqlite_internal_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let internal_dir = tempdir.path().join(".lix/.internal");
+    std::fs::create_dir_all(&internal_dir).unwrap();
+    std::fs::write(internal_dir.join("db.sqlite"), b"legacy sqlite metadata").unwrap();
+    std::fs::write(internal_dir.join("old-cache"), b"legacy internal data").unwrap();
+    std::fs::write(tempdir.path().join("note.txt"), b"workspace").unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert!(!internal_dir.join("db.sqlite").exists());
+    assert!(!internal_dir.join("old-cache").exists());
+    assert!(internal_dir.join("rocksdb").is_dir());
+    assert_eq!(
+        read_file(&lix, "/.lix/.internal/db.sqlite")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/note.txt").await.unwrap().as_deref(),
+        Some(b"workspace".as_slice())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix_dir = tempdir.path().join(".lix");
+    let system_dir = tempdir.path().join(".lix_system");
+    std::fs::create_dir_all(&lix_dir).unwrap();
+    std::fs::create_dir_all(&system_dir).unwrap();
+    std::fs::write(lix_dir.join("db.sqlite"), b"legacy sqlite metadata").unwrap();
+    std::fs::write(lix_dir.join("db.sqlite-wal"), b"legacy sqlite wal").unwrap();
+    std::fs::write(system_dir.join("cache"), b"legacy system data").unwrap();
+    std::fs::write(tempdir.path().join("note.txt"), b"workspace").unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert!(!lix_dir.join("db.sqlite").exists());
+    assert!(!lix_dir.join("db.sqlite-wal").exists());
+    assert!(!system_dir.exists());
+    assert_eq!(
+        read_file(&lix, "/.lix/db.sqlite").await.unwrap().as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix/db.sqlite-wal")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix_system/cache")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/note.txt").await.unwrap().as_deref(),
+        Some(b"workspace".as_slice())
+    );
+    lix.close().await.unwrap();
+}
+
+struct SyncedFilesystemLix {
+    lix: Lix<FilesystemStorage>,
+    _storage: FilesystemStorage,
+}
+
+impl Deref for SyncedFilesystemLix {
+    type Target = Lix<FilesystemStorage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lix
+    }
+}
+
+async fn open_filesystem_lix(path: &Path) -> SyncedFilesystemLix {
+    let storage = FilesystemStorage::new(path).open().unwrap();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    storage.start_sync(&lix).await.unwrap();
+    SyncedFilesystemLix {
+        lix,
+        _storage: storage,
+    }
+}
+
+async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> SyncedFilesystemLix {
+    let storage = FilesystemStorage::new(path)
+        .sync_all_files(false)
+        .open()
+        .unwrap();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    storage.start_sync(&lix).await.unwrap();
+    storage
+        .import_paths(file_paths.iter().copied())
+        .await
+        .unwrap();
+    SyncedFilesystemLix {
+        lix,
+        _storage: storage,
+    }
+}
+
+#[tokio::test]
+async fn rocksdb_filesystem_storage_allows_same_process_multi_open() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let storage_a = FilesystemStorage::new(tempdir.path())
+        .open()
+        .expect("first rocksdb fs storage opens");
+    let storage_b = FilesystemStorage::new(tempdir.path())
+        .open()
+        .expect("second rocksdb fs storage reuses process-local DB");
+    let lix_a = open_lix()
+        .with_storage(storage_a.clone())
+        .await
+        .expect("first lix opens");
+    let lix_b = open_lix()
+        .with_storage(storage_b.clone())
+        .await
+        .expect("second lix opens");
+    storage_a
+        .start_sync(&lix_a)
+        .await
+        .expect("first sync starts");
+    storage_b
+        .start_sync(&lix_b)
+        .await
+        .expect("second sync starts");
+
+    write_file(&lix_a, "/from-a.txt", b"a".to_vec())
+        .await
+        .expect("first lix writes");
+    assert_eq!(
+        read_file(&lix_b, "/from-a.txt").await.unwrap().as_deref(),
+        Some(b"a".as_slice())
+    );
+
+    write_file(&lix_b, "/from-b.txt", b"b".to_vec())
+        .await
+        .expect("second lix writes");
+    assert_eq!(
+        read_file(&lix_a, "/from-b.txt").await.unwrap().as_deref(),
+        Some(b"b".as_slice())
+    );
+
+    lix_a.close().await.unwrap();
+    lix_b.close().await.unwrap();
+}
+
+async fn read_file<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let result = lix
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    result
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("content"))
+        .transpose()
+}
+
+async fn write_file<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+    data: Vec<u8>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+        &[Value::Text(path.to_string()), Value::Blob(data.into())],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn mkdir<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+        &[Value::Text(path.to_string())],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rm<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "DELETE FROM lix_directory WHERE path = $1",
+        &[Value::Text(path.to_string())],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn readdir<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+) -> Result<Option<Vec<String>>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    if path == "/" {
+        let entries = lix
+            .execute(
+                "SELECT name FROM lix_directory WHERE parent_id IS NULL \
+                 UNION ALL \
+                 SELECT name FROM lix_file WHERE directory_id IS NULL \
+                 ORDER BY name",
+                &[],
+            )
+            .await?;
+        return Ok(Some(
+            entries
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("name"))
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+    }
+
+    let directory = lix
+        .execute(
+            "SELECT id FROM lix_directory WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    let Some(directory) = directory.rows().first() else {
+        return Ok(None);
+    };
+    let directory_id = directory.get::<String>("id")?;
+    let entries = lix
+        .execute(
+            "SELECT name FROM lix_directory WHERE parent_id = $1 \
+             UNION ALL \
+             SELECT name FROM lix_file WHERE directory_id = $1 \
+             ORDER BY name",
+            &[Value::Text(directory_id)],
+        )
+        .await?;
+    Ok(Some(
+        entries
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("name"))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+#[tokio::test]
+async fn filesystem_creates_gitignore_files_for_lix_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(
+        std::fs::read(tempdir.path().join(".lix/.gitignore")).unwrap(),
+        b"*\n"
+    );
+    assert!(!tempdir.path().join(".lix/.internal/.gitignore").exists());
+    assert_eq!(read_file(&lix, "/.lix/.gitignore").await.unwrap(), None);
+    assert_eq!(
+        read_file(&lix, "/.lix/.internal/.gitignore").await.unwrap(),
+        None
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_initial_import_ignores_git_entries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
+    std::fs::write(tempdir.path().join(".git/config"), b"git").unwrap();
+    std::fs::create_dir_all(tempdir.path().join("nested/.git")).unwrap();
+    std::fs::write(tempdir.path().join("nested/.git/config"), b"nested").unwrap();
+    std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+    std::fs::write(tempdir.path().join("docs/.git"), b"git-file").unwrap();
+    std::fs::write(tempdir.path().join("docs/readme.txt"), b"normal").unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(
+        read_file(&lix, "/docs/readme.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"normal".as_slice())
+    );
+    assert_eq!(readdir(&lix, "/.git").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/nested/.git").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/nested/.git/config").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
+    assert!(tempdir.path().join(".git/config").is_file());
+    assert!(tempdir.path().join("nested/.git/config").is_file());
+    assert!(tempdir.path().join("docs/.git").is_file());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let seed = open_filesystem_lix(tempdir.path()).await;
+    write_file(&seed, "/.git/config", b"old".to_vec())
+        .await
+        .unwrap();
+    write_file(&seed, "/docs/.git", b"old".to_vec())
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
+    assert!(!tempdir.path().join(".git").exists());
+    assert!(!tempdir.path().join("docs/.git").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let seed = open_filesystem_lix(tempdir.path()).await;
+    write_file(&seed, "/old.txt", b"old".to_vec())
+        .await
+        .unwrap();
+    mkdir(&seed, "/old-empty").await.unwrap();
+    seed.close().await.unwrap();
+    std::fs::remove_file(tempdir.path().join("old.txt")).unwrap();
+    std::fs::remove_dir(tempdir.path().join("old-empty")).unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(read_file(&lix, "/old.txt").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/old-empty").await.unwrap(), None);
+    assert!(!tempdir.path().join("old.txt").exists());
+    assert!(!tempdir.path().join("old-empty").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    std::fs::write(tempdir.path().join("pending-local.txt"), b"pending").unwrap();
+    write_file(&lix, "/sdk.txt", b"sdk".to_vec()).await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("sdk.txt"), Some(b"sdk"));
+    assert_eq!(
+        std::fs::read(tempdir.path().join("pending-local.txt")).unwrap(),
+        b"pending"
+    );
+    wait_for_lix_file(&lix, "/pending-local.txt", Some(b"pending")).await;
+
+    mkdir(&lix, "/empty-sdk").await.unwrap();
+    assert!(tempdir.path().join("empty-sdk").is_dir());
+
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql.txt".to_string()),
+            Value::Blob(b"sql".to_vec().into()),
+        ],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"sql"));
+
+    lix.execute(
+        "UPDATE lix_file SET content = $1 WHERE path = $2",
+        &[
+            Value::Blob(b"updated".to_vec().into()),
+            Value::Text("/sql.txt".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"updated"));
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+        &[
+            Value::Text("/tx.txt".to_string()),
+            Value::Blob(b"tx".to_vec().into()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(!tempdir.path().join("tx.txt").exists());
+    tx.commit().await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("tx.txt"), Some(b"tx"));
+
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/sql.txt".to_string())],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("sql.txt"), None);
+
+    rm(&lix, "/empty-sdk").await.unwrap();
+    assert!(!tempdir.path().join("empty-sdk").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn on_demand_filesystem_materializes_lix_created_file_outside_initial_imports() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
+    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["initial.md"]).await;
+
+    write_file(&lix, "/new-file.md", b"new".to_vec())
+        .await
+        .unwrap();
+
+    wait_for_disk_file(&tempdir.path().join("new-file.md"), Some(b"new"));
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn on_demand_filesystem_watches_nested_lix_created_file_after_materialization() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
+    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["initial.md"]).await;
+
+    write_file(&lix, "/nested/new-file.md", b"new".to_vec())
+        .await
+        .unwrap();
+    let disk_path = tempdir.path().join("nested/new-file.md");
+    wait_for_disk_file(&disk_path, Some(b"new"));
+
+    std::fs::write(&disk_path, b"edited").unwrap();
+    wait_for_lix_file(&lix, "/nested/new-file.md", Some(b"edited")).await;
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn on_demand_filesystem_lix_delete_removes_path_from_active_imports() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
+    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["initial.md"]).await;
+
+    write_file(&lix, "/new-file.md", b"new".to_vec())
+        .await
+        .unwrap();
+    let deleted_path = tempdir.path().join("new-file.md");
+    wait_for_disk_file(&deleted_path, Some(b"new"));
+
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/new-file.md".to_string())],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&deleted_path, None);
+
+    std::fs::write(&deleted_path, b"recreated").unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"changed").unwrap();
+    wait_for_lix_file(&lix, "/initial.md", Some(b"changed")).await;
+    assert_eq!(read_file(&lix, "/new-file.md").await.unwrap(), None);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("old.md"), b"old").unwrap();
+    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["old.md"]).await;
+
+    lix.execute(
+        "UPDATE lix_file SET path = $1 WHERE path = $2",
+        &[
+            Value::Text("/nested/renamed.md".to_string()),
+            Value::Text("/old.md".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let old_path = tempdir.path().join("old.md");
+    let renamed_path = tempdir.path().join("nested/renamed.md");
+    wait_for_disk_file(&old_path, None);
+    wait_for_disk_file(&renamed_path, Some(b"old"));
+
+    std::fs::write(&old_path, b"recreated").unwrap();
+    std::fs::write(&renamed_path, b"edited").unwrap();
+    wait_for_lix_file(&lix, "/nested/renamed.md", Some(b"edited")).await;
+    assert_eq!(read_file(&lix, "/old.md").await.unwrap(), None);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_materializes_untracked_sdk_sql_writes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text("01920000-0000-7000-8000-000000000503".to_string()),
+            Value::Text("/untracked.txt".to_string()),
+            Value::Blob(b"untracked".to_vec().into()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(tempdir.path().join("untracked.txt")).unwrap(),
+        b"untracked"
+    );
+
+    lix.execute(
+        "INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)",
+        &[
+            Value::Text("01920000-0000-7000-8000-000000000512".to_string()),
+            Value::Text("/untracked-dir".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(tempdir.path().join("untracked-dir").is_dir());
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_watcher_syncs_disk_changes_to_lix() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    std::fs::write(tempdir.path().join("disk.txt"), b"disk").unwrap();
+    wait_for_lix_file(&lix, "/disk.txt", Some(b"disk")).await;
+
+    std::fs::write(tempdir.path().join("disk.txt"), b"changed").unwrap();
+    wait_for_lix_file(&lix, "/disk.txt", Some(b"changed")).await;
+
+    std::fs::create_dir(tempdir.path().join("empty-disk")).unwrap();
+    wait_for_lix_directory(&lix, "/empty-disk", true).await;
+
+    std::fs::remove_file(tempdir.path().join("disk.txt")).unwrap();
+    wait_for_lix_file(&lix, "/disk.txt", None).await;
+
+    std::fs::remove_dir(tempdir.path().join("empty-disk")).unwrap();
+    wait_for_lix_directory(&lix, "/empty-disk", false).await;
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_watcher_ignores_git_entries_created_after_open() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
+    std::fs::write(tempdir.path().join(".git/config"), b"git").unwrap();
+    std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+    std::fs::write(tempdir.path().join("docs/.git"), b"git-file").unwrap();
+    std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
+
+    wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
+    assert_eq!(readdir(&lix, "/.git").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_materialization_skips_git_entries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    write_file(&lix, "/.git/config", b"lix".to_vec())
+        .await
+        .unwrap();
+    write_file(&lix, "/docs/.git", b"lix".to_vec())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_file(&lix, "/.git/config").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert_eq!(
+        read_file(&lix, "/docs/.git").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert!(!tempdir.path().join(".git/config").exists());
+    assert!(!tempdir.path().join("docs/.git").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_imports_opaque_lix_path_names() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
+    std::fs::write(tempdir.path().join("#hash.txt"), b"hash").unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(
+        read_file(&lix, "/bad%name.txt").await.unwrap().as_deref(),
+        Some(b"bad".as_slice())
+    );
+    assert_eq!(
+        read_file(&lix, "/#hash.txt").await.unwrap().as_deref(),
+        Some(b"hash".as_slice())
+    );
+    write_file(&lix, "/written%23.txt", b"written".to_vec())
+        .await
+        .unwrap();
+    wait_for_disk_file(&tempdir.path().join("written%23.txt"), Some(b"written"));
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn filesystem_rejects_symlink_root() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tempdir.path().join("real-root")).unwrap();
+    symlink("real-root", tempdir.path().join("linked-root")).unwrap();
+
+    let Err(error) = FilesystemStorage::new(tempdir.path().join("linked-root")).open() else {
+        panic!("symlink root should fail");
+    };
+
+    assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn filesystem_ignores_symlinks_on_initial_import() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
+    std::fs::create_dir(tempdir.path().join("real-dir")).unwrap();
+    std::fs::write(tempdir.path().join("real-dir/file.txt"), b"nested").unwrap();
+    symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
+    symlink("real-dir", tempdir.path().join("linked-dir")).unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(
+        read_file(&lix, "/target.txt").await.unwrap().as_deref(),
+        Some(b"target".as_slice())
+    );
+    assert_eq!(
+        read_file(&lix, "/real-dir/file.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"nested".as_slice())
+    );
+    assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/linked-dir").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("linked-dir"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn filesystem_ignores_special_and_invalid_utf8_entries() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let socket_path = tempdir.path().join("socket");
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+    let invalid_path = tempdir
+        .path()
+        .join(OsString::from_vec(b"invalid-\xff.txt".to_vec()));
+    let invalid_path_created = std::fs::write(&invalid_path, b"invalid").is_ok();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    assert_eq!(read_file(&lix, "/socket").await.unwrap(), None);
+    assert_eq!(
+        lix.execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(
+        std::fs::symlink_metadata(socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    if invalid_path_created {
+        assert!(invalid_path.exists());
+    }
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn filesystem_watcher_ignores_symlinks_created_after_open() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
+    std::fs::create_dir(tempdir.path().join("real-dir")).unwrap();
+    std::fs::write(tempdir.path().join("real-dir/file.txt"), b"nested").unwrap();
+    symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
+    symlink("real-dir", tempdir.path().join("linked-dir")).unwrap();
+    std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
+
+    wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
+    assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/linked-dir").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn filesystem_materialization_reports_symlink_collisions() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("outside.txt"), b"outside").unwrap();
+    symlink(
+        outside.path().join("outside.txt"),
+        tempdir.path().join("blocked.txt"),
+    )
+    .unwrap();
+    symlink(outside.path(), tempdir.path().join("blocked-dir")).unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+    let file_error = write_file(&lix, "/blocked.txt", b"lix".to_vec())
+        .await
+        .expect_err("a symlink collision must be reported");
+    assert!(
+        file_error
+            .message
+            .contains("LIX_FILESYSTEM_UNSUPPORTED_ENTRY")
+    );
+    let directory_error = write_file(&lix, "/blocked-dir/file.txt", b"nested".to_vec())
+        .await
+        .expect_err("a symlink ancestor must be reported");
+    assert!(
+        directory_error
+            .message
+            .contains("LIX_FILESYSTEM_UNSUPPORTED_ENTRY")
+    );
+
+    assert_eq!(
+        read_file(&lix, "/blocked.txt").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert_eq!(
+        read_file(&lix, "/blocked-dir/file.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"nested".as_slice())
+    );
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("blocked.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("blocked-dir"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("outside.txt")).unwrap(),
+        b"outside"
+    );
+    assert!(!outside.path().join("file.txt").exists());
+
+    std::fs::remove_file(tempdir.path().join("blocked.txt")).unwrap();
+    std::fs::remove_file(tempdir.path().join("blocked-dir")).unwrap();
+    wait_for_disk_file(&tempdir.path().join("blocked.txt"), Some(b"lix"));
+    wait_for_disk_file(
+        &tempdir.path().join("blocked-dir/file.txt"),
+        Some(b"nested"),
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("outside.txt")).unwrap(),
+        b"outside"
+    );
+    assert!(!outside.path().join("file.txt").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn filesystem_materialization_reports_special_file_collisions() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let socket_path = tempdir.path().join("socket");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let lix = open_filesystem_lix(tempdir.path()).await;
+    let error = write_file(&lix, "/socket", b"lix".to_vec())
+        .await
+        .expect_err("a socket collision must be reported");
+    assert!(error.message.contains("LIX_FILESYSTEM_UNSUPPORTED_ENTRY"));
+
+    assert_eq!(
+        read_file(&lix, "/socket").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert!(
+        std::fs::symlink_metadata(socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+
+    drop(listener);
+    std::fs::remove_file(tempdir.path().join("socket")).unwrap();
+    wait_for_disk_file_with_timeout(
+        &tempdir.path().join("socket"),
+        Some(b"lix"),
+        Duration::from_secs(20),
+    );
+    lix.close().await.unwrap();
+}
+
+#[track_caller]
+fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
+    wait_for_disk_file_with_timeout(path, expected, Duration::from_secs(5));
+}
+
+#[track_caller]
+fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let path_display = path.display();
+    loop {
+        let actual = std::fs::read(path).ok();
+        if actual.as_deref() == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for disk file {path_display} to be {expected:?}, got {actual:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn wait_for_lix_file(lix: &Lix<FilesystemStorage>, path: &str, expected: Option<&[u8]>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = read_file(lix, path).await.unwrap();
+        if actual.as_deref() == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Lix file {path} to be {expected:?}, got {actual:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn wait_for_lix_directory(lix: &Lix<FilesystemStorage>, path: &str, expected: bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let actual = readdir(lix, path).await.unwrap().is_some();
+        if actual == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Lix directory {path} existence to be {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn register_crm_task_schema(lix: &Lix) {
+    let schema = r#"{
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "crm_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "done", "type": "boolean", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["id"]
+    }"#;
+
+    lix.execute(
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+        &[Value::Text(schema.to_string())],
+    )
+    .await
+    .unwrap();
+}
+
+fn assert_crm_task_projection(result: &lix::ExecuteResult) {
+    assert_eq!(result.len(), 1);
+    let row = &result.rows()[0];
+    assert_eq!(
+        row.get::<String>("title").unwrap(),
+        "Draft RS SDK flow".to_string()
+    );
+    assert!(!row.get::<bool>("done").unwrap());
+
+    let meta = row.get::<Value>("meta").unwrap();
+    let Value::Json(meta) = meta else {
+        panic!("expected meta JSON value, got {meta:?}");
+    };
+    let meta = meta.to_value();
+    assert_eq!(
+        meta.get("priority").and_then(|value| value.as_str()),
+        Some("high")
+    );
+    assert_eq!(
+        meta.get("tags")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let missing = row
+        .value("missing")
+        .expect_err("missing column should return a structured error");
+    assert_eq!(missing.code, "LIX_COLUMN_NOT_FOUND");
+}
+
+async fn register_poison_task_schema(lix: &Lix) {
+    let schema = r#"{
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "poison_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["id"]
+    }"#;
+
+    lix.execute(
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+        &[Value::Text(schema.to_string())],
+    )
+    .await
+    .unwrap();
+}
+
+async fn task_done(lix: &Lix, task_id: &str) -> bool {
+    let result = lix
+        .execute(
+            "SELECT done FROM crm_task WHERE id = $1",
+            &[Value::Text(task_id.to_string())],
+        )
+        .await
+        .unwrap();
+
+    let rows = result;
+    assert_eq!(rows.len(), 1);
+
+    match rows.rows()[0].values().first() {
+        Some(Value::Boolean(done)) => *done,
+        value => panic!("expected boolean done value, got {value:?}"),
+    }
+}
+
+fn assert_closed(error: LixError) {
+    assert_eq!(error.code, LixError::CODE_CLOSED);
+}

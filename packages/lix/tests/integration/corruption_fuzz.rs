@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use lix::{LixError, Value};
 
-const SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
+const DEFAULT_SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
 const TRANSACTIONS_PER_SEED: usize = 32;
 const KEYS_PER_SEED: usize = 8;
 
@@ -12,13 +12,13 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
-        for seed in SEEDS {
+        for seed in crate::support::fuzz_seeds(&DEFAULT_SEEDS) {
             let prefix = format!("corruption-fuzz-{seed:016x}-");
             let keys = (0..KEYS_PER_SEED)
                 .map(|index| format!("{prefix}{index}"))
@@ -43,7 +43,7 @@ simulation_test!(
                                 .execute(
                                     "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
                                      ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                                    &[Value::Text(key.clone()), Value::Json(value.clone())],
+                                    &[Value::Text(key.clone()), Value::Json(value.clone().into())],
                                 )
                                 .await
                                 .unwrap_or_else(|error| {
@@ -57,7 +57,7 @@ simulation_test!(
                             transaction
                                 .execute(
                                     "UPDATE lix_key_value SET value = $2 WHERE key = $1",
-                                    &[Value::Text(key.clone()), Value::Json(value.clone())],
+                                    &[Value::Text(key.clone()), Value::Json(value.clone().into())],
                                 )
                                 .await
                                 .unwrap_or_else(|error| {
@@ -121,7 +121,7 @@ simulation_test!(
                         .unwrap_or_else(|error| panic!("{label}: reopen failed: {error:?}"));
                     let reopened = sim.wrap_session(
                         reopened_engine
-                            .open_workspace_session()
+                            .open_session()
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("{label}: reopened session failed: {error:?}")
@@ -151,7 +151,10 @@ async fn exercise_rejected_batch(
         let error = transaction
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ($1, $2), ($1, $2)",
-                &[Value::Text(duplicate_key.clone()), Value::Json(value)],
+                &[
+                    Value::Text(duplicate_key.clone()),
+                    Value::Json(value.into()),
+                ],
             )
             .await
             .expect_err("same-batch duplicate must be rejected");
@@ -165,7 +168,7 @@ async fn exercise_rejected_batch(
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 &[
                     Value::Text(duplicate_key.clone()),
-                    Value::Json(staged_value.clone()),
+                    Value::Json(staged_value.clone().into()),
                 ],
             )
             .await
@@ -180,7 +183,7 @@ async fn exercise_rejected_batch(
                 &[
                     Value::Text(fresh_key.clone()),
                     Value::Text(duplicate_key),
-                    Value::Json(rejected_value),
+                    Value::Json(rejected_value.into()),
                 ],
             )
             .await;
@@ -242,7 +245,7 @@ fn assert_rows(actual: &[lix::Row], expected: &BTreeMap<String, serde_json::Valu
                 if value.is_null() {
                     Value::Null
                 } else {
-                    Value::Json(value.clone())
+                    Value::Json(value.clone().into())
                 },
             ]
         })

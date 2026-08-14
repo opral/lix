@@ -21,7 +21,7 @@ use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, RawWriteBatch,
     TransactionWrite, TransactionWriteMode, TransactionWriteOutcome, TypedMutationJournalBatch,
 };
-use crate::wasm::UnsupportedWasmRuntime;
+use crate::plugin::runtime::UnsupportedWasmRuntime;
 
 use super::{PublicCatalog, SessionFileViews};
 

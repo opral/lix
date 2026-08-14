@@ -1,0 +1,35 @@
+[package]
+name = "lix-storage-filesystem"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+exclude = ["js/", "package.json", "package-lock.json", "tsconfig.json", "tsconfig.test.json"]
+
+[lints]
+workspace = true
+
+[dependencies]
+lix = { workspace = true }
+lix_storage_rocksdb = { workspace = true }
+notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "profile_fs_open"
+path = "examples/profile_fs_open.rs"
+
+[[example]]
+name = "sync_repository"
+path = "examples/sync_repository.rs"

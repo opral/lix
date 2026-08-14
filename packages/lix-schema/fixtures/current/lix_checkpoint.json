@@ -1,0 +1,35 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "lix_checkpoint",
+  "description": "A repository-global checkpoint. Each checkpoint is a normal immutable entity whose identity references the commit containing the checkpointed state.",
+  "columns": [
+    {
+      "name": "commit_id",
+      "type": "uuid",
+      "nullable": false,
+      "description": "Commit containing the state captured by this checkpoint."
+    },
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false,
+      "description": "Commit containing the state captured by this checkpoint."
+    }
+  ],
+  "primary_key": [
+    "id"
+  ],
+  "foreign_keys": [
+    {
+      "columns": [
+        "commit_id"
+      ],
+      "references": {
+        "schema_key": "lix_commit",
+        "columns": [
+          "id"
+        ]
+      }
+    }
+  ]
+}

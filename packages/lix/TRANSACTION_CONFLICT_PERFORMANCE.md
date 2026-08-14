@@ -3,7 +3,7 @@
 Release-mode microbenchmarks isolate stale-commit discovery work from plugin
 execution, storage commit latency, and observation delivery. End-to-end
 capacity results remain in
-`packages/rs-sdk-tests/REALTIME_COLLABORATION_CAPACITY.md`.
+`packages/e2e/REALTIME_COLLABORATION_CAPACITY.md`.
 
 ## Indexed overlap discovery
 
@@ -96,11 +96,11 @@ cargo test -p lix --release \
 cargo test -p lix --release \
   generation_write_set_benchmark_probe --lib -- --ignored --nocapture
 
-cargo test -p lix_tests --release --test e2e \
+cargo test -p lix_e2e --release --test e2e \
   stale_plugin_replay_batch_benchmark_probe -- --ignored --nocapture
 
 LIX_CRDT_B3_CLIENTS=100 LIX_CRDT_SAMPLES=8 \
-cargo test -p lix_tests --release --test crdt_benchmarks_baseline \
+cargo test -p lix_e2e --release --test crdt_benchmarks_baseline \
   crdt_benchmarks_b3_1_json_concurrent_map_sets -- --ignored --exact --nocapture
 ```
 

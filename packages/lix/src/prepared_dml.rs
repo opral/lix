@@ -30,6 +30,7 @@ enum PreparedDmlValueKind {
     Real,
     Text,
     Json,
+    Timestamp,
     Blob,
 }
 
@@ -51,6 +52,7 @@ pub enum PreparedDmlValueRef<'a> {
     Real(f64),
     Text(&'a str),
     Json(&'a [u8]),
+    Timestamp(i64),
     Blob(&'a [u8]),
 }
 
@@ -62,6 +64,7 @@ impl PreparedDmlParameterBatch {
 
     /// Returns and resets page executions and rows. This is an observability
     /// certificate for real production callers, not a routing switch.
+    #[allow(dead_code)]
     pub fn take_execution_counters() -> (u64, u64) {
         (
             PREPARED_DML_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed),
@@ -114,7 +117,11 @@ impl PreparedDmlParameterBatch {
     }
 
     /// Returns a borrowed cell view with fail-closed bounds and encoding checks.
-    pub fn get(&self, row: usize, column: usize) -> Result<PreparedDmlValueRef<'_>, LixError> {
+    pub fn get(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Result<PreparedDmlValueRef<'_>, LixError> {
         if row >= self.row_count || column >= self.column_count {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -140,6 +147,9 @@ impl PreparedDmlParameterBatch {
                 })?)
             }
             PreparedDmlValueKind::Json => PreparedDmlValueRef::Json(self.slice(cell)),
+            PreparedDmlValueKind::Timestamp => {
+                PreparedDmlValueRef::Timestamp(i64::from_le_bytes(cell.scalar))
+            }
             PreparedDmlValueKind::Blob => PreparedDmlValueRef::Blob(self.slice(cell)),
         };
         Ok(value)
@@ -165,6 +175,9 @@ impl PreparedDmlParameterBatch {
                 })
             }
             PreparedDmlValueKind::Json => PreparedDmlValueRef::Json(self.slice(cell)),
+            PreparedDmlValueKind::Timestamp => {
+                PreparedDmlValueRef::Timestamp(i64::from_le_bytes(cell.scalar))
+            }
             PreparedDmlValueKind::Blob => PreparedDmlValueRef::Blob(self.slice(cell)),
         }
     }
@@ -194,6 +207,7 @@ impl PreparedDmlParameterBatch {
                             format!("prepared DML JSON parameter is invalid: {error}"),
                         )
                     }),
+                PreparedDmlValueRef::Timestamp(value) => Ok(Value::Timestamp(value)),
                 PreparedDmlValueRef::Blob(value) => Ok(Value::Blob(Blob::from(value.to_vec()))),
             })
             .collect()
@@ -233,6 +247,10 @@ impl PreparedDmlParameterBatch {
                     )
                 })?;
                 Self::set_bytes(&mut cell, bytes, &encoded)?;
+            }
+            Value::Timestamp(value) => {
+                cell.kind = PreparedDmlValueKind::Timestamp;
+                cell.scalar = value.to_le_bytes();
             }
             Value::Blob(value) => {
                 cell.kind = PreparedDmlValueKind::Blob;
@@ -283,7 +301,7 @@ mod tests {
             Value::Integer(7),
             Value::Real(1.5),
             Value::Text("text".to_string()),
-            Value::Json(serde_json::json!({"ok": true})),
+            Value::Json(serde_json::json!({"ok": true}).into()),
             Value::Blob(Blob::from(vec![1_u8, 2, 3])),
         ]])
         .expect("rectangular parameter batch");

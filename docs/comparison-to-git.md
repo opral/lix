@@ -46,7 +46,6 @@ LIMIT 20;
 
 - A mature ecosystem: GitHub, CI, code review, hosting, and two decades of tooling.
 - A universal CLI workflow every developer already knows.
-- Line diffs for every text format out of the box. Lix ships Markdown and CSV plugins; other formats need a plugin.
 - Battle-tested stability. Lix is in alpha.
 
 ## Deeper reading

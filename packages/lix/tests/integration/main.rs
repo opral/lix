@@ -1,14 +1,9 @@
-#![recursion_limit = "256"]
-
-#[macro_use]
-mod support;
-
 mod branching;
 mod checkpoint_gc;
 mod code_structure;
 mod commit_graph;
 mod constraint_fuzz;
-mod correlated_live_state_perf;
+mod correlated_hot_state_perf;
 mod corruption_fuzz;
 mod durable_function_fast_path;
 mod engine;
@@ -16,10 +11,17 @@ mod execute_batch_benchmark;
 mod filesystem_fuzz;
 mod fs_api;
 mod json_pointer_crud_storage;
+// Imports `lix::storage_bench` at module scope, which exists only under
+// `storage-benches`; the `integration` target itself carries no required-features.
+#[cfg(feature = "storage-benches")]
+mod lix_file_returning_route;
 mod merge_fuzz;
+mod mutation_identity;
 mod observe;
 mod observe_mutation_revision;
 mod physical_plan_cache;
+mod pooled_session_reuse;
 mod sql;
 mod storage_accounting;
 mod transaction;
+mod version_control_model_fuzz;

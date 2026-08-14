@@ -1,0 +1,368 @@
+openapi: 3.1.0
+info:
+  title: Lix Server Protocol
+  version: "2"
+  description: Canonical HTTP surface implemented by lix::server_protocol.
+servers:
+  - url: https://host.example/{repositoryPrefix}
+    variables:
+      repositoryPrefix:
+        default: repositories/example
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+  - {}
+paths:
+  /lix/v1:
+    get:
+      operationId: handshake
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: activeBranchId
+          in: query
+          schema: { type: string, minLength: 1 }
+          description: Allowed only while creating a session.
+      responses:
+        "200":
+          description: Session created or resumed.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Handshake" }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/session:
+    delete:
+      operationId: deleteSession
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      responses:
+        "204": { description: Session deleted. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/execute:
+    post:
+      operationId: execute
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/ExecuteRequest" } }
+      responses:
+        "200": { $ref: "#/components/responses/Execute" }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/execute-batch:
+    post:
+      operationId: executeBatch
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [statements]
+              properties:
+                statements:
+                  type: array
+                  items: { $ref: "#/components/schemas/ExecuteBatchStatement" }
+                options: { $ref: "#/components/schemas/ExecuteOptions" }
+                cacheBlobs: { type: boolean }
+      responses:
+        "200":
+          description: Ordered statement results.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ExecuteResponse" }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/transaction/begin:
+    post:
+      operationId: beginTransaction
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      responses:
+        "200":
+          description: Transaction capability.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transactionId]
+                properties: { transactionId: { type: string } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/transaction/execute:
+    post:
+      operationId: transactionExecute
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/TransactionId"
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/ExecuteRequest" } }
+      responses:
+        "200": { $ref: "#/components/responses/Execute" }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/transaction/commit:
+    post:
+      operationId: commitTransaction
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "204": { description: Transaction committed. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/transaction/rollback:
+    post:
+      operationId: rollbackTransaction
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "204": { description: Transaction rolled back. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/file:
+    get:
+      operationId: readFile
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/FilePath"
+        - name: Range
+          in: header
+          schema: { type: string, pattern: "^bytes=[0-9]+-[0-9]*$" }
+      responses:
+        "200": { $ref: "#/components/responses/File" }
+        "206": { $ref: "#/components/responses/File" }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/file/upsert:
+    post:
+      operationId: upsertFile
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/FilePath"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: Lix-Upload-Id
+          in: header
+          schema: { type: string }
+        - name: Content-Range
+          in: header
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, contentEncoding: binary } }
+      responses:
+        "200": { $ref: "#/components/responses/Execute" }
+        "308": { description: Resumable upload part accepted. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/file/upsert-batch:
+    post:
+      operationId: upsertFileBatch
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, contentEncoding: binary }
+      responses:
+        "200": { $ref: "#/components/responses/Execute" }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/branch/create:
+    post:
+      operationId: createBranch
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                id: { type: string }
+                name: { type: string, minLength: 1 }
+                fromCommitId: { type: string }
+      responses:
+        "200": { description: Branch created. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/checkpoint/create:
+    post:
+      operationId: createCheckpoint
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      responses:
+        "200": { description: Checkpoint created. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/undo:
+    post:
+      operationId: undo
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      responses:
+        "200": { description: Undo committed. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/redo:
+    post:
+      operationId: redo
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      responses:
+        "200": { description: Redo committed. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/branch/switch:
+    post:
+      operationId: switchBranch
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [branchId]
+              properties: { branchId: { type: string, minLength: 1 } }
+      responses:
+        "200": { description: Session switched. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/observe:
+    post:
+      operationId: observe
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/ExecuteRequest" } }
+      responses:
+        "200": { $ref: "#/components/responses/EventStream" }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/observe/multiplex:
+    post:
+      operationId: observeMultiplex
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subscriptions]
+              properties:
+                subscriptions:
+                  type: array
+                  minItems: 1
+                  maxItems: 32
+                  items:
+                    allOf:
+                      - $ref: "#/components/schemas/ExecuteRequest"
+                      - type: object
+                        required: [id]
+                        properties: { id: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/EventStream" }
+        default: { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+    cookieAuth: { type: apiKey, in: cookie, name: session }
+  parameters:
+    SessionId:
+      name: Lix-Session-Id
+      in: header
+      required: false
+      schema: { type: string }
+    RequiredSessionId:
+      name: Lix-Session-Id
+      in: header
+      required: true
+      schema: { type: string }
+    TransactionId:
+      name: Lix-Transaction-Id
+      in: header
+      required: true
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 255 }
+    FilePath:
+      name: path
+      in: query
+      required: true
+      schema: { type: string, minLength: 1 }
+  responses:
+    Execute:
+      description: SQL result.
+      content:
+        application/json: { schema: { $ref: "#/components/schemas/ExecuteResponse" } }
+    File:
+      description: Raw file contents. Lix-File-Found distinguishes missing and empty files.
+      headers:
+        Lix-File-Found: { schema: { type: string, enum: ["true", "false"] } }
+        Accept-Ranges: { schema: { type: string, const: bytes } }
+      content:
+        application/octet-stream: { schema: { type: string, contentEncoding: binary } }
+    EventStream:
+      description: Server-sent `next` and `error` events.
+      content:
+        text/event-stream: { schema: { type: string } }
+    Error:
+      description: Canonical protocol error.
+      content:
+        application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } }
+  schemas:
+    Handshake:
+      type: object
+      required: [protocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
+      properties:
+        protocolVersion: { type: integer, const: 2 }
+        activeBranchId: { type: string }
+        activeAccountId: { type: string }
+        sessionId: { type: string }
+        capabilities:
+          type: object
+          required: [binaryFileUpsert, binaryFileUpsertBatch, binaryFileRead]
+          properties:
+            binaryFileUpsert: { type: boolean }
+            binaryFileUpsertBatch: { type: boolean }
+            binaryFileRead: { type: boolean }
+    ExecuteOptions:
+      type: object
+      properties: { originKey: { type: string } }
+    ExecuteRequest:
+      type: object
+      required: [sql]
+      properties:
+        sql: { type: string, minLength: 1 }
+        params: { type: array, items: {} }
+        options: { $ref: "#/components/schemas/ExecuteOptions" }
+        cacheBlobs: { type: boolean }
+    ExecuteBatchStatement:
+      type: object
+      required: [sql]
+      properties:
+        sql: { type: string, minLength: 1 }
+        params: { type: array, items: {} }
+        label: { type: string }
+    ExecuteResponse:
+      type: object
+      required: [columns, rows, rowsAffected, notices]
+      properties:
+        columns: { type: array, items: { type: string } }
+        rows: { type: array, items: { type: array, items: {} } }
+        rowsAffected: { type: integer, minimum: 0 }
+        notices: { type: array, items: { type: object } }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            hint: { type: string }
+            details: {}

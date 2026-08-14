@@ -94,8 +94,8 @@ pub(crate) async fn load_workspace_branch_id_from_index(
     BranchLifecycle::new(&branch_ref)
         .require_existing_ref(
             &branch_id,
-            BranchOperation::LoadWorkspaceSelector,
-            BranchReferenceRole::WorkspaceSelector,
+            BranchOperation::LoadDefaultBranch,
+            BranchReferenceRole::DefaultBranch,
         )
         .await?;
 

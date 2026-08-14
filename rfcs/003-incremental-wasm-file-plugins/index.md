@@ -18,7 +18,7 @@ the component boundary with the rest of the file.
 
 The production contract is WIT package `lix:plugin@2.1.0` and packet format
 `packet-v1`. The public Rust authoring surface and canonical WIT copy live in
-[`packages/plugin-api`](../../packages/plugin-api/README.md). The engine and
+[`lix::plugin`](../../packages/lix/PLUGIN.md). The engine and
 Rust SDK retain package-local WIT mirrors for generated host bindings; CI
 enforces byte-for-byte parity so every published crate remains self-contained.
 
@@ -208,7 +208,7 @@ and alignment contract.
 ## Identity
 
 Schemas whose `/id` primary-key string property declares both
-`"format": "uuid"` and `"x-lix-default": "lix_uuid_v7()"` permit keyless
+`"format": "uuid"` and `"x-lix-default": "uuidv7()"` permit keyless
 creates. The plugin emits a transition-local `u32` reference and an ID-free
 snapshot. The host derives the canonical UUIDv7, completes and validates the
 snapshot, and converts the create to an ordinary keyed entity before storage.

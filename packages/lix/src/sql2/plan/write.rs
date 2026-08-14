@@ -117,16 +117,14 @@ mod tests {
         let plan = plan_sql_with_schemas(
             "UPDATE app_doc SET title = 'new' WHERE schema_key = 'draft'",
             &[serde_json::json!({
-                "x-lix-key": "app_doc",
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "schema_key": { "type": "string" },
-                    "title": { "type": "string" }
-                },
-                "x-lix-primary-key": ["/id"],
-                "required": ["id", "schema_key", "title"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "app_doc",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "schema_key", "type": "text", "nullable": false },
+                    { "name": "title", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         );
 

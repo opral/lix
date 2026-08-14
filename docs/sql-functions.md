@@ -1,115 +1,66 @@
 ---
-description: Built-in scalar SQL functions provided by the Lix engine. Covers JSON parsing and projection, ID and timestamp generation, and helpers for the active branch.
+description: Built-in scalar SQL functions and PostgreSQL JSONB syntax supported by Lix.
 ---
 
 # SQL Functions
 
-Lix's DataFusion-backed engine registers a small set of scalar functions for use inside `lix.execute()`. They cover the gaps between standard SQL and Lix's own conventions: parsing JSON parameters, producing IDs and timestamps, and resolving the active branch and its commit id.
+Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and
+operators; there are no public `lix_json_*` functions.
 
-## At a glance
-
-| Function | Returns | Use for |
+| Function | Returns | Purpose |
 | :-- | :-- | :-- |
-| `lix_active_account_id()` | text | Reading the current SQL session's active account id. |
-| `lix_active_branch_id()` | text | Reading the current SQL session's active branch id. |
-| `lix_active_branch_commit_id()` | text | Reading the active branch head pinned for this SQL statement. |
-| `lix_json(text)` | JSON | Parse a JSON string parameter into a JSON-typed value. |
-| `lix_json_get(json, path...)` | JSON | Project a value out of a JSON column, preserving JSON type. |
-| `lix_json_get_text(json, path...)` | text | Project a value out of a JSON column as plain text. |
-| `lix_uuid_v7()` | text | Generate a UUIDv7 string. |
-| `lix_timestamp()` | text | Current ISO-8601 timestamp string. |
+| `lix_active_account_id()` | text | Active SQL-session account. |
+| `lix_active_branch_id()` | text | Active branch. |
+| `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
+| `uuidv7()` | uuid | Generate a UUIDv7 value using PostgreSQL 18 syntax. |
+| `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
 
-All functions are scalar; call them anywhere a SQL expression is allowed.
+## JSONB
 
-## Branch & history
-
-### `lix_active_account_id()`
-
-Returns the active account id of the current SQL session. Each session has its own active account, so concurrent sessions on the same Lix can act as different accounts.
-
-### `lix_active_branch_id()`
-
-Returns the active branch id of the current SQL session. Branch-pinned clients therefore get their own branch id even when multiple sessions query the same Lix.
-
-### `lix_active_branch_commit_id()`
-
-Returns the commit id at the tip of the **currently active** branch, as resolved when the SQL statement was planned.
-
-History table functions (`<schema>_history`, `lix_file_history`, and
-`lix_directory_history`) use that same pinned active-branch head when called
-without an argument:
+Cast JSON text or a bound JSON value with `::jsonb` and use PostgreSQL
+operators:
 
 ```sql
--- Walk one entity's history from the active branch's tip
-SELECT lixcol_depth, lixcol_observed_commit_id, title
+SELECT
+  value -> 'primary_key' AS primary_key,
+  value ->> 'key' AS schema_key
+FROM lix_registered_schema
+WHERE value @> '{"deprecated":false}'::jsonb;
+```
+
+Supported syntax includes `->`, `->>`, `#>`, `#>>`, `@>`, `?`, equality, and
+`'…'::jsonb`. Missing paths return SQL `NULL`; `->` preserves JSONB `null`,
+while `->>` converts JSONB `null` to SQL `NULL`. Negative array indexes follow
+PostgreSQL behavior.
+
+The SDK accepts structured JSON parameters directly. If a parameter contains
+JSON text, cast it explicitly:
+
+```ts
+await lix.execute(
+  "INSERT INTO acme_event (id, payload) VALUES ($1, $2::jsonb)",
+  [id, JSON.stringify(payload)],
+);
+```
+
+## Branch and history
+
+`lix_active_branch_commit_id()` resolves the same pinned head used by history
+functions called without an explicit commit:
+
+```sql
+SELECT lixcol_depth, title
 FROM acme_task_history()
 WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
-For time travel and querying other branches, see [History](./history.md).
-
-## JSON
-
-### `lix_json(text)`
-
-Parses a JSON string into a JSON-typed value. Use this when binding a JSON parameter, since DataFusion otherwise treats the bound value as plain text:
-
-```ts
-await lix.execute(
-  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-  [JSON.stringify(schema)],
-);
-```
-
-### `lix_json_get(json, path...)`
-
-Returns the value at a JSON path, **preserving JSON type** (objects, arrays, numbers, booleans, strings stay as JSON). Variadic path: pass each segment as a separate argument.
+## IDs and time
 
 ```sql
-SELECT lix_json_get(value, 'x-lix-primary-key')
-FROM lix_registered_schema
-WHERE lix_json_get_text(value, 'x-lix-key') = 'acme_task';
--- returns ["/id"] as JSON
+INSERT INTO event (id, occurred_at)
+VALUES (uuidv7(), CURRENT_TIMESTAMP);
 ```
 
-### `lix_json_get_text(json, path...)`
-
-Same as `lix_json_get` but returns the value as plain text. Useful for filtering or display:
-
-```sql
-SELECT lix_json_get_text(value, 'x-lix-key') AS schema_key
-FROM lix_registered_schema
-WHERE lix_json_get_text(value, 'type') = 'object';
-```
-
-Both return `NULL` if the path is missing or the underlying value is `null`.
-
-## IDs & time
-
-### `lix_uuid_v7()`
-
-Generates a fresh RFC 9562 UUIDv7 string. Useful in `INSERT` defaults and CEL `x-lix-default` expressions in JSON Schema:
-
-```sql
-INSERT INTO task (id, title, done)
-VALUES (lix_uuid_v7(), 'New task', false);
-```
-
-### `lix_timestamp()`
-
-Returns the current time as an ISO-8601 string.
-
-```sql
-INSERT INTO event (id, occurred_at) VALUES (lix_uuid_v7(), lix_timestamp());
-```
-
-## Text & bytes
-
-For the column types Lix accepts in `CAST` expressions (for example `TEXT` and `BYTEA`), see [the executable column contract](./surfaces.md#the-executable-column-contract).
-
-## Notes
-
-- Functions are pure scalars; they do not consume rows or take aggregates.
-- Bound parameters can use `?` or `$1`, `$2`, …
-- `lix_active_branch_id()`, `lix_active_branch_commit_id()`, `lix_uuid_v7()`, and `lix_timestamp()` reflect the engine's current view at planning/execution time and are stable across the rows of a single statement.
+Bound parameters may use `?` or `$1`, `$2`, and so on, but a statement cannot
+mix the two styles.

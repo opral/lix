@@ -8,9 +8,9 @@ use js_sys::{Array, Function, Reflect};
 use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
 use lix::{
     CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, Memory, MergeBranchOptions as RsMergeBranchOptions,
-    MergeBranchOutcome, MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, SqlScriptPlan,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
     parse_sql_script as parse_rs_sql_script,
 };
@@ -18,14 +18,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
 use wasm_bindgen::prelude::*;
 
-type BrowserLix = RsLix<Memory>;
-type BrowserTransaction = RsLixTransaction<Memory>;
-type BrowserObserveEvents = RsObserveEvents<Memory>;
+use crate::indexeddb::{BrowserStorage, IndexedDb, IndexedDbBackend};
+
+type BrowserLix = RsLix<BrowserStorage>;
+type BrowserTransaction = RsLixTransaction<BrowserStorage>;
+type BrowserObserveEvents = RsObserveEvents<BrowserStorage>;
 
 #[wasm_bindgen]
 pub struct WasmLix {
     inner: BrowserLix,
-    storage: Memory,
+    storage: BrowserStorage,
 }
 
 #[wasm_bindgen]
@@ -42,7 +44,7 @@ pub struct WasmObserveEvents {
 
 #[wasm_bindgen(js_name = openMemory)]
 pub async fn open_memory(telemetry_dispatch: Option<Function>) -> Result<WasmLix, JsValue> {
-    open_memory_from_snapshot(telemetry_dispatch, None).await
+    open_browser_storage(BrowserStorage::Memory(Memory::new()), telemetry_dispatch).await
 }
 
 #[wasm_bindgen(js_name = openMemoryFromSnapshot)]
@@ -50,13 +52,38 @@ pub async fn open_memory_from_snapshot(
     telemetry_dispatch: Option<Function>,
     snapshot: Option<Vec<u8>>,
 ) -> Result<WasmLix, JsValue> {
-    console_error_panic_hook::set_once();
     let storage = match snapshot {
         Some(snapshot) => {
             Memory::from_snapshot(&snapshot).map_err(|error| lix_error_to_js(error.into()))?
         }
         None => Memory::new(),
     };
+    open_browser_storage(BrowserStorage::Memory(storage), telemetry_dispatch).await
+}
+
+#[wasm_bindgen(js_name = openIndexedDb)]
+pub async fn open_indexed_db(
+    backend: IndexedDbBackend,
+    telemetry_dispatch: Option<Function>,
+) -> Result<WasmLix, JsValue> {
+    let storage = IndexedDb::open(backend)
+        .await
+        .map_err(|error| lix_error_to_js(error.into()))?;
+    let browser_storage = BrowserStorage::IndexedDb(storage);
+    match open_browser_storage(browser_storage.clone(), telemetry_dispatch).await {
+        Ok(lix) => Ok(lix),
+        Err(error) => {
+            let _ = browser_storage.close().await;
+            Err(error)
+        }
+    }
+}
+
+async fn open_browser_storage(
+    storage: BrowserStorage,
+    telemetry_dispatch: Option<Function>,
+) -> Result<WasmLix, JsValue> {
+    console_error_panic_hook::set_once();
     let telemetry = telemetry_dispatch.map(|dispatch| {
         let dispatch = BrowserTelemetryDispatch(dispatch);
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
@@ -99,9 +126,14 @@ pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsVa
 impl WasmLix {
     #[wasm_bindgen(js_name = exportSnapshot)]
     pub async fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        self.storage
-            .export_snapshot()
-            .map_err(|error| lix_error_to_js(error.into()))
+        match &self.storage {
+            BrowserStorage::Memory(storage) => storage
+                .export_snapshot()
+                .map_err(|error| lix_error_to_js(error.into())),
+            BrowserStorage::IndexedDb(_) => Err(JsValue::from_str(
+                "snapshot export is only available for memory storage",
+            )),
+        }
     }
 
     #[wasm_bindgen(js_name = execute)]
@@ -113,11 +145,12 @@ impl WasmLix {
     ) -> Result<JsValue, JsValue> {
         let params = values_from_js(params)?;
         let options = execute_options_from_js(options)?;
-        let result = self
-            .inner
-            .execute_with_options(&sql, &params, options)
-            .await
-            .map_err(lix_error_to_js)?;
+        let execution = self.inner.execute(&sql, &params);
+        let execution = match options {
+            Some(origin_key) => execution.with_origin_key(origin_key),
+            None => execution,
+        };
+        let result = execution.await.map_err(lix_error_to_js)?;
         execute_result_to_js(result)
     }
 
@@ -129,11 +162,12 @@ impl WasmLix {
     ) -> Result<JsValue, JsValue> {
         let statements = batch_statements_from_js(statements)?;
         let options = execute_options_from_js(options)?;
-        let results = self
-            .inner
-            .execute_batch_with_options(&statements, options)
-            .await
-            .map_err(lix_error_to_js)?;
+        let execution = self.inner.execute_batch(&statements);
+        let execution = match options {
+            Some(origin_key) => execution.with_origin_key(origin_key),
+            None => execution,
+        };
+        let results = execution.await.map_err(lix_error_to_js)?;
         let results = results
             .into_iter()
             .map(ExecuteResultDto::try_from)
@@ -175,20 +209,6 @@ impl WasmLix {
     #[wasm_bindgen(js_name = activeAccountId)]
     pub async fn active_account_id(&self) -> Result<String, JsValue> {
         Ok(self.inner.active_account_id().to_string())
-    }
-
-    #[wasm_bindgen(js_name = clientStateEntries)]
-    pub async fn client_state_entries(&self) -> Result<JsValue, JsValue> {
-        let entries = self
-            .inner
-            .client_state()
-            .entries()
-            .await
-            .map_err(lix_error_to_js)?
-            .into_iter()
-            .map(|(key, value)| ClientStateEntryDto { key, value })
-            .collect::<Vec<_>>();
-        to_js(&entries)
     }
 
     #[wasm_bindgen(js_name = clientStateGet)]
@@ -319,7 +339,11 @@ impl WasmLix {
 
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) -> Result<(), JsValue> {
-        self.inner.close().await.map_err(lix_error_to_js)
+        self.inner.close().await.map_err(lix_error_to_js)?;
+        self.storage
+            .close()
+            .await
+            .map_err(|error| lix_error_to_js(error.into()))
     }
 }
 
@@ -335,10 +359,12 @@ impl WasmLixTransaction {
         let params = values_from_js(params)?;
         let options = execute_options_from_js(options)?;
         let inner = self.inner.as_mut().ok_or_else(transaction_closed_error)?;
-        let result = inner
-            .execute_with_options(sql, params, options)
-            .await
-            .map_err(lix_error_to_js)?;
+        let execution = inner.execute(&sql, &params);
+        let execution = match options {
+            Some(origin_key) => execution.with_origin_key(origin_key),
+            None => execution,
+        };
+        let result = execution.await.map_err(lix_error_to_js)?;
         execute_result_to_js(result)
     }
 
@@ -409,13 +435,6 @@ struct ExecuteOptionsDto {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClientStateEntryDto {
-    key: String,
-    value: serde_json::Value,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SqlScriptPlanDto {
     statements: Vec<SqlScriptStatementDto>,
 }
@@ -444,15 +463,13 @@ impl From<SqlScriptPlan> for SqlScriptPlanDto {
     }
 }
 
-fn execute_options_from_js(options: Option<JsValue>) -> Result<RsExecuteOptions, JsValue> {
+fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, JsValue> {
     match options {
         Some(value) if !value.is_null() && !value.is_undefined() => {
             let options: ExecuteOptionsDto = from_js(value)?;
-            Ok(RsExecuteOptions {
-                origin_key: options.origin_key,
-            })
+            Ok(options.origin_key)
         }
-        _ => Ok(RsExecuteOptions::default()),
+        _ => Ok(None),
     }
 }
 
@@ -727,7 +744,19 @@ impl TryFrom<LixValueDto> for Value {
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .map(Self::Text)
                 .ok_or_else(|| invalid_param("text value must be a string")),
-            "json" => Ok(Self::Json(value.value.unwrap_or(serde_json::Value::Null))),
+            "json" => Ok(Self::Json(
+                value.value.unwrap_or(serde_json::Value::Null).into(),
+            )),
+            "timestamp" => {
+                let raw = value
+                    .value
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| invalid_param("timestamp value must be an RFC 3339 string"))?;
+                let parsed = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
+                    invalid_param(format!("timestamp value is invalid: {error}"))
+                })?;
+                Ok(Self::Timestamp(parsed.timestamp_micros()))
+            }
             "blob" => value
                 .blob
                 .map(|bytes| Self::Blob(bytes.into_vec().into()))
@@ -750,7 +779,18 @@ impl TryFrom<&Value> for LixValueDto {
             }
             Value::Real(_) => return Err(invalid_param("cannot encode non-finite real value")),
             Value::Text(value) => ("text", Some(serde_json::json!(value)), None),
-            Value::Json(value) => ("json", Some(value.clone()), None),
+            Value::Json(value) => ("json", Some(value.to_value()), None),
+            Value::Timestamp(value) => {
+                let value = chrono::DateTime::from_timestamp_micros(*value)
+                    .ok_or_else(|| invalid_param("timestamp is out of range"))?;
+                (
+                    "timestamp",
+                    Some(serde_json::Value::String(
+                        value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    )),
+                    None,
+                )
+            }
             Value::Blob(value) => ("blob", None, Some(ByteBuf::from(value.to_vec()))),
         };
         Ok(Self {

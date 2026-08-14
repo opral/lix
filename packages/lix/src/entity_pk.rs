@@ -24,6 +24,25 @@ pub(crate) struct EntityPk {
     pub(crate) components: EntityPkComponents,
 }
 
+impl EntityPk {
+    /// How many refcounted buffer handles one `clone` of this key duplicates.
+    ///
+    /// A composite key shares one `Arc` over its component slice, so it costs
+    /// exactly one handle no matter how many components it has; a single
+    /// string or bytes component costs one; a UUID or integer costs none.
+    #[cfg(feature = "storage-benches")]
+    pub(crate) fn shared_handle_count(&self) -> usize {
+        match &self.components {
+            EntityPkComponents::Empty => 0,
+            EntityPkComponents::Single(component) => match component {
+                EntityPkComponent::String(_) | EntityPkComponent::Bytes(_) => 1,
+                EntityPkComponent::Uuid(_) | EntityPkComponent::Integer(_) => 0,
+            },
+            EntityPkComponents::Shared(_) => 1,
+        }
+    }
+}
+
 /// A single primary-key component stays inline; composite tuples share one
 /// immutable component slice across every identity clone.
 ///
@@ -126,6 +145,15 @@ pub(crate) enum EntityPkComponentType {
     Uuid,
     Integer,
     String,
+    // Never constructed since the cut: its only constructor was the JSON
+    // Schema primary-key type mapper, which minted it for
+    // `"contentEncoding": "base64"`. Schema v1 has no binary type and no
+    // contentEncoding, so no schema can produce one. Kept rather than
+    // deleted because five live match arms in the shipping library still
+    // handle it, one of them feeding the entity-surface fingerprint
+    // (sql2/catalog/entity_surface.rs), so removing the variant is a
+    // design decision about binary primary keys, not dead-code hygiene.
+    #[allow(dead_code, reason = "unconstructible after the Schema v1 cut; see comment")]
     Bytes,
 }
 
@@ -262,6 +290,14 @@ impl EntityPk {
         if components.is_empty() {
             return Err(EntityPkError::EmptyPrimaryKey);
         }
+        for (index, component) in components.iter().enumerate() {
+            if matches!(component, EntityPkComponent::String(value) if value.contains('\0')) {
+                return Err(EntityPkError::InvalidPrimaryKeyValue {
+                    index,
+                    expected: "text without Unicode NUL",
+                });
+            }
+        }
         Ok(Self {
             components: EntityPkComponents::from_smallvec(components),
         })
@@ -344,7 +380,14 @@ impl EntityPk {
                             expected: "integer",
                         })?;
                 }
-                EntityPkComponentType::String => {}
+                EntityPkComponentType::String => {
+                    if part.contains('\0') {
+                        return Err(EntityPkError::InvalidPrimaryKeyValue {
+                            index,
+                            expected: "text without Unicode NUL",
+                        });
+                    }
+                }
                 EntityPkComponentType::Bytes => {
                     base64::engine::general_purpose::STANDARD
                         .decode(part.as_bytes())

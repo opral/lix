@@ -31,7 +31,7 @@ pub trait Plugin: 'static {
 struct NotePlugin;
 
 // After implementing every callback above, export the Component entry point.
-lix_plugin_api::export_plugin!(NotePlugin);
+lix::plugin::export!(NotePlugin);
 ```
 
 The export macro is required in the plugin crate. Without it, the Rust code may

@@ -1,4 +1,6 @@
-use lix::wasm::v1::{ByteEdit, PerformanceMeasurement, Root, Store, compare_to_baseline};
+use lix::plugin::runtime::v1::{
+    ByteEdit, PerformanceMeasurement, Root, Store, compare_to_baseline,
+};
 use std::hint::black_box;
 use std::time::Instant;
 

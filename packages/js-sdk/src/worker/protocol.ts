@@ -43,7 +43,6 @@ export type WorkerOperation =
 	| { kind: "transaction.rollback"; transactionId: number }
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
-	| { kind: "clientState.entries" }
 	| { kind: "clientState.get"; key: string }
 	| { kind: "clientState.set"; key: string; value: JsonValue }
 	| { kind: "clientState.delete"; key: string }
@@ -56,7 +55,6 @@ export type WorkerOperation =
 	| { kind: "mergeBranch"; options: MergeBranchOptions }
 	| { kind: "importFilesystemPaths"; paths: string[] }
 	| { kind: "syncDiskToLix" }
-	| { kind: "exportSnapshot" }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
 	| { kind: "close" };

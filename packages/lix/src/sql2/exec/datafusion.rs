@@ -527,7 +527,7 @@ fn logical_plan_has_scalar_function(plan: &LogicalPlan) -> bool {
     found
 }
 
-fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
+pub(crate) fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
     struct TableFunctionVisitor(bool);
 
     impl Visitor for TableFunctionVisitor {
@@ -2460,6 +2460,7 @@ fn datafusion_expr_from_bound_expr(
                 BoundCastType::BigInt => DataType::Int64,
                 BoundCastType::Double => DataType::Float64,
                 BoundCastType::Boolean => DataType::Boolean,
+                BoundCastType::Jsonb => DataType::Utf8,
             };
             Ok(Expr::Cast(Cast::new(
                 Box::new(datafusion_expr_from_bound_expr(session, expr, params)?),
@@ -2929,9 +2930,14 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
         Value::Real(value) => ScalarValue::Float64(Some(*value)).into(),
         Value::Text(value) => ScalarValue::Utf8(Some(value.clone())).into(),
         Value::Json(value) => ScalarAndMetadata::new(
-            ScalarValue::Utf8(Some(value.to_string())),
+            ScalarValue::Utf8(Some(value.as_str().to_owned())),
             Some(json_field_metadata()),
         ),
+        Value::Timestamp(value) => ScalarValue::TimestampMicrosecond(
+            Some(*value),
+            Some("UTC".into()),
+        )
+        .into(),
         Value::Blob(value) => ScalarValue::LargeBinary(Some(value.to_vec())).into(),
     }
 }
@@ -3022,6 +3028,8 @@ fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Resul
             Ok(Value::Blob(value.into()))
         }
         ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Ok(Value::Null),
+        ScalarValue::TimestampMicrosecond(Some(value), _) => Ok(Value::Timestamp(value)),
+        ScalarValue::TimestampMicrosecond(None, _) => Ok(Value::Null),
         other => Ok(Value::Text(other.to_string())),
     }
 }
@@ -3039,7 +3047,7 @@ fn finite_query_float(value: f64) -> Result<Value, LixError> {
 fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Value, LixError> {
     if field.is_some_and(field_is_json) {
         return serde_json::from_str::<serde_json::Value>(&value)
-            .map(Value::Json)
+            .map(|value| Value::Json(value.into()))
             .map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_INVALID_JSON",

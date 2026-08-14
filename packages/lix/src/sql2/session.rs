@@ -1,4 +1,5 @@
-use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::catalog::CatalogProviderList;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use std::collections::BTreeSet;
@@ -11,7 +12,10 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::branch_ref::PreparedBranchRefReader;
 use super::providers;
-use super::udfs::{register_execution_sql2_functions, register_static_sql2_functions};
+use super::udfs::{
+    ExecutionSlots, bind_execution_sql2_functions, register_execution_sql2_functions,
+    register_static_sql2_functions,
+};
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
 pub(crate) async fn build_read_session<C>(
@@ -73,12 +77,12 @@ where
             .await?
             .map(|head| head.commit_id.to_string()),
     };
-    register_execution_sql2_functions(
+    bind_execution_sql2_functions(
         &session,
         ctx.functions(),
-        ctx.active_account_id().to_string(),
-        Some(ctx.active_branch_id().to_string()),
-        active_branch_commit_id.clone(),
+        ctx.active_account_id(),
+        Some(ctx.active_branch_id()),
+        active_branch_commit_id.as_deref(),
     );
     let commit_graph = ctx.commit_graph();
     let commit_graph = Arc::new(tokio::sync::Mutex::new(commit_graph));
@@ -114,12 +118,12 @@ where
         .load_head(read_ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id.to_string());
-    register_execution_sql2_functions(
+    bind_execution_sql2_functions(
         &session,
         read_ctx.functions(),
-        read_ctx.active_account_id().to_string(),
-        Some(read_ctx.active_branch_id().to_string()),
-        active_branch_commit_id.clone(),
+        read_ctx.active_account_id(),
+        Some(read_ctx.active_branch_id()),
+        active_branch_commit_id.as_deref(),
     );
     let commit_graph = read_ctx.commit_graph();
     let commit_graph = Arc::new(tokio::sync::Mutex::new(commit_graph));
@@ -207,12 +211,12 @@ where
                     "active branch",
                 )
             })?;
-    register_execution_sql2_functions(
+    bind_execution_sql2_functions(
         &session,
         write_ctx.functions(),
-        write_ctx.active_account_id().to_string(),
-        Some(active_branch_id),
-        Some(active_branch_commit_id.commit_id.to_string()),
+        &write_ctx.active_account_id(),
+        Some(active_branch_id.as_str()),
+        Some(active_branch_commit_id.commit_id.to_string().as_str()),
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
@@ -224,6 +228,10 @@ where
 
 pub(crate) fn new_sql_session_context() -> SessionContext {
     let config = SessionConfig::new()
+        .set_str(
+            "datafusion.sql_parser.dialect",
+            super::dialect::DATAFUSION_SQL_DIALECT,
+        )
         .with_information_schema(false)
         .with_target_partitions(1)
         .set_bool("datafusion.optimizer.repartition_aggregations", false)
@@ -249,5 +257,20 @@ pub(crate) fn new_sql_session_context() -> SessionContext {
         .build();
     let session = SessionContext::new_with_state(state);
     register_static_sql2_functions(&session);
+    sql_session_from_template(session.state(), None)
+}
+
+pub(crate) fn sql_session_from_template(
+    template: SessionState,
+    catalog_list: Option<Arc<dyn CatalogProviderList>>,
+) -> SessionContext {
+    let slots = Arc::new(ExecutionSlots::default());
+    let config = template.config().clone().with_extension(Arc::clone(&slots));
+    let mut builder = SessionStateBuilder::new_from_existing(template).with_config(config);
+    if let Some(catalog_list) = catalog_list {
+        builder = builder.with_catalog_list(catalog_list);
+    }
+    let session = SessionContext::new_with_state(builder.build());
+    register_execution_sql2_functions(&session, slots);
     session
 }

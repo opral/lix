@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 264" role="img" aria-label="Diagram: your product creates one Lix repository per customer, each holding a different mix of automations, handbooks, pricing, and knowledge files." font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+  <defs>
+    <marker id="uc1-arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L7 4 L0 8 Z" fill="#8A8F96"/></marker>
+  </defs>
+  <rect x="0.75" y="0.75" width="678.5" height="262.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
+  <g transform="translate(20, 20)">
+    <rect x="228" y="8" width="184" height="44" rx="8" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <text x="320" y="35" text-anchor="middle" font-size="12" font-weight="700" letter-spacing="1" fill="#15171B">YOUR PRODUCT</text>
+    <path d="M320 52 L320 70 M118 70 L522 70 M118 70 L118 88 M320 70 L320 88 M522 70 L522 88" fill="none" stroke="#8A8F96" stroke-width="1.2"/>
+    <line x1="118" y1="88" x2="118" y2="98" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#uc1-arr)"/>
+    <line x1="320" y1="88" x2="320" y2="98" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#uc1-arr)"/>
+    <line x1="522" y1="88" x2="522" y2="98" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#uc1-arr)"/>
+    <g transform="translate(118, 158)">
+      <rect x="-84" y="-52" width="168" height="104" rx="10" fill="rgba(7,182,213,0.05)" stroke="#07B6D5" stroke-width="1.5"/>
+      <text x="0" y="-30" text-anchor="middle" font-size="10.5" font-weight="700" letter-spacing="0.8" fill="#0891AC">CUSTOMER A REPO</text>
+      <rect x="-66" y="-16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
+      <text x="0" y="1" text-anchor="middle" font-size="10.5" fill="#3D4046">automations/</text>
+      <rect x="-66" y="16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
+      <text x="0" y="33" text-anchor="middle" font-size="10.5" fill="#3D4046">handbook.md</text>
+    </g>
+    <g transform="translate(320, 158)">
+      <rect x="-84" y="-52" width="168" height="104" rx="10" fill="rgba(7,182,213,0.05)" stroke="#07B6D5" stroke-width="1.5"/>
+      <text x="0" y="-30" text-anchor="middle" font-size="10.5" font-weight="700" letter-spacing="0.8" fill="#0891AC">CUSTOMER B REPO</text>
+      <rect x="-66" y="-16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
+      <text x="0" y="1" text-anchor="middle" font-size="10.5" fill="#3D4046">automations/</text>
+      <rect x="-66" y="16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
+      <text x="0" y="33" text-anchor="middle" font-size="10.5" fill="#3D4046">pricing.xlsx</text>
+    </g>
+    <g transform="translate(522, 158)">
+      <rect x="-84" y="-52" width="168" height="104" rx="10" fill="rgba(7,182,213,0.05)" stroke="#07B6D5" stroke-width="1.5"/>
+      <text x="0" y="-30" text-anchor="middle" font-size="10.5" font-weight="700" letter-spacing="0.8" fill="#0891AC">CUSTOMER C REPO</text>
+      <rect x="-66" y="-16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
+      <text x="0" y="1" text-anchor="middle" font-size="10.5" fill="#3D4046">knowledge/</text>
+      <rect x="-66" y="16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
+      <text x="0" y="33" text-anchor="middle" font-size="10.5" fill="#3D4046">contracts/</text>
+    </g>
+  </g>
+</svg>

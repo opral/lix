@@ -4,6 +4,7 @@ mod branch_scope;
 mod catalog;
 mod change_materialization;
 mod context;
+mod dialect;
 mod dml;
 mod entity_batch;
 mod error;

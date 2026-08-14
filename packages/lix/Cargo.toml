@@ -1,6 +1,6 @@
 [package]
 name = "lix"
-version = "0.11.0"
+version.workspace = true
 authors.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -22,7 +22,19 @@ workspace = true
 default = ["default_wasm_runtime"]
 all-simulations = []
 storage-benches = []
+root-replay-trace = ["storage-benches"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+server-protocol = [
+  "dep:axum",
+  "dep:async-stream",
+  "dep:futures-core",
+  "dep:getrandom",
+  "dep:http",
+  "dep:http-body",
+  "dep:serde_urlencoded",
+  "dep:tower-http",
+  "tokio/time",
+]
 
 [[test]]
 name = "integration"
@@ -52,6 +64,10 @@ path = "tests/semantic_merge.rs"
 name = "send_futures"
 path = "tests/send_futures.rs"
 
+[[test]]
+name = "schema_v1_public_smoke"
+path = "tests/schema_v1_public_smoke.rs"
+
 [[bench]]
 name = "profile_sql_result_streaming"
 path = "benches/profile_sql_result_streaming.rs"
@@ -63,7 +79,10 @@ name = "plugin_arena_scorecard"
 path = "tests/plugin_arena_scorecard.rs"
 
 [dependencies]
+lix_schema.workspace = true
 ahash = "0.8"
+axum = { version = "0.8", optional = true }
+async-stream = { version = "0.3", optional = true }
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
@@ -78,6 +97,7 @@ datafusion = { version = "53.0.0", default-features = false, features = [
 musli = { version = "0.0.149", features = ["storage"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+serde_urlencoded = { version = "0.7", optional = true }
 sha2 = "0.10"
 smallvec = "1.15"
 jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
@@ -89,18 +109,23 @@ parking_lot = "0.12"
 uuid = { version = "1", features = ["v5", "v7", "std", "js", "fast-rng"] }
 web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-core = { version = "0.3", optional = true }
+getrandom = { version = "0.3", optional = true }
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-zstd", "decompression-gzip", "decompression-zstd"], optional = true }
 blake3 = "1"
 fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-wasmtime = { version = "45", default-features = false, features = ["cache", "component-model", "cranelift", "runtime", "std"], optional = true }
-wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
 [dev-dependencies]
+flate2 = "1"
+http-body-util = "0.1"
 paste = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
@@ -108,6 +133,13 @@ plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", targ
 plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 wasm-encoder = "0.248"
 wit-parser = "0.247"
+
+[target.'cfg(any(not(target_arch = "wasm32"), all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
+wit-bindgen = "0.57"
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
+wasmtime = { version = "45", default-features = false, features = ["cache", "component-model", "cranelift", "runtime", "std"], optional = true }
+wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zstd = "0.13"

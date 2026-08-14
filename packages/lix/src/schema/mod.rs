@@ -7,7 +7,10 @@ pub(crate) mod seed;
 mod tests;
 
 pub(crate) use compatibility::validate_schema_amendment;
-pub(crate) use definition::{compile_lix_schema, format_lix_schema_validation_errors};
+pub(crate) use builtin::LIX_CHECKPOINT_SCHEMA_KEY;
+pub(crate) use definition::{
+    compile_lix_schema, format_lix_schema_validation_errors, parse_lix_schema,
+};
 pub use definition::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
     validate_lix_schema_definition,

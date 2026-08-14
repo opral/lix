@@ -34,8 +34,6 @@ pub(crate) enum PublicSurfaceKind {
     DirectoryByBranch,
     DirectoryHistory,
     Branch,
-    Checkpoint,
-    CheckpointByBranch,
     WorkingDiff,
     WorkingDiffByBranch,
     Revert,

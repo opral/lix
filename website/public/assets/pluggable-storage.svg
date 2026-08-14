@@ -1,35 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 320" role="img" aria-label="Lix embeds in your product and runs on a storage adapter: in memory, local filesystem, or S3 bucket." font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 240" role="img" aria-label="Diagram: Lix runs in-process inside your product, with an arrow to pluggable storage: memory, filesystem, or S3." font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
   <defs>
-    <marker id="ps-arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L7 4 L0 8 Z" fill="#8A8F96"></path></marker>
+    <marker id="ps-arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L7 4 L0 8 Z" fill="#8A8F96"/></marker>
   </defs>
-  <rect x="0.75" y="0.75" width="678.5" height="318.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
+  <rect x="0.75" y="0.75" width="678.5" height="238.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
   <g transform="translate(20, 20)">
-    <rect x="150" y="24" width="340" height="120" rx="10" fill="#FFFFFF" stroke="#E6E4DD"></rect>
-    <text x="320" y="52" text-anchor="middle" font-size="12" font-weight="700" letter-spacing="1" fill="#15171B">YOUR PRODUCT</text>
-    <rect x="200" y="68" width="240" height="52" rx="8" fill="rgba(7,182,213,0.07)" stroke="#07B6D5" stroke-width="1.5"></rect>
-    <text x="320" y="91" text-anchor="middle" font-size="13" font-weight="700" fill="#0891AC">lix</text>
-    <text x="320" y="109" text-anchor="middle" font-size="11" fill="#3D4046">embedded</text>
-    <line x1="320" y1="144" x2="320" y2="162" stroke="#8A8F96" stroke-width="1.2"></line>
-    <line x1="128" y1="168" x2="512" y2="168" stroke="#8A8F96" stroke-width="1.2"></line>
-    <text x="530" y="172" font-size="10.5" letter-spacing="0.5" fill="#8A8F96">storage</text>
-    <text x="530" y="186" font-size="10.5" letter-spacing="0.5" fill="#8A8F96">adapters</text>
-    <g transform="translate(128, 232)">
-      <rect x="-78" y="-28" width="156" height="56" rx="8" fill="#FFFFFF" stroke="#E6E4DD"></rect>
-      <text x="0" y="-2" text-anchor="middle" font-size="12" font-weight="500" fill="#3D4046">in memory</text>
-      <text x="0" y="16" text-anchor="middle" font-size="11" fill="#8A8F96">tests, ephemeral</text>
-    </g>
-    <line x1="128" y1="168" x2="128" y2="196" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#ps-arr)"></line>
-    <g transform="translate(320, 232)">
-      <rect x="-78" y="-28" width="156" height="56" rx="8" fill="#FFFFFF" stroke="#E6E4DD"></rect>
-      <text x="0" y="-2" text-anchor="middle" font-size="12" font-weight="500" fill="#3D4046">local filesystem</text>
-      <text x="0" y="16" text-anchor="middle" font-size="11" fill="#8A8F96">desktop, CLI</text>
-    </g>
-    <line x1="320" y1="168" x2="320" y2="196" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#ps-arr)"></line>
-    <g transform="translate(512, 232)">
-      <rect x="-78" y="-28" width="156" height="56" rx="8" fill="#FFFFFF" stroke="#E6E4DD"></rect>
-      <text x="0" y="-2" text-anchor="middle" font-size="12" font-weight="500" fill="#3D4046">S3 bucket</text>
-      <text x="0" y="16" text-anchor="middle" font-size="11" fill="#8A8F96">server, scale</text>
-    </g>
-    <line x1="512" y1="168" x2="512" y2="196" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#ps-arr)"></line>
+    <rect x="140" y="10" width="360" height="112" rx="10" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <text x="320" y="38" text-anchor="middle" font-size="12" font-weight="700" letter-spacing="0.8" fill="#15171B">YOUR PRODUCT</text>
+    <rect x="162" y="54" width="316" height="50" rx="8" fill="rgba(7,182,213,0.07)" stroke="#07B6D5" stroke-width="1.5"/>
+    <text x="320" y="76" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0891AC">lix</text>
+    <text x="320" y="93" text-anchor="middle" font-size="10.5" fill="#3D4046">in-process</text>
+    <line x1="320" y1="122" x2="320" y2="132" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#ps-arr)"/>
+    <rect x="140" y="136" width="360" height="58" rx="8" fill="#FFFFFF" stroke="#E6E4DD" stroke-dasharray="5 4"/>
+    <text x="320" y="155" text-anchor="middle" font-size="10.5" font-weight="700" letter-spacing="0.8" fill="#8A8F96">PLUGGABLE STORAGE</text>
+    <rect x="156" y="162" width="104" height="22" rx="5" fill="#F7F6F1" stroke="#C9C7BF"/>
+    <text x="208" y="177" text-anchor="middle" font-size="10.5" fill="#3D4046">memory</text>
+    <rect x="268" y="162" width="104" height="22" rx="5" fill="#F7F6F1" stroke="#C9C7BF"/>
+    <text x="320" y="177" text-anchor="middle" font-size="10.5" fill="#3D4046">filesystem</text>
+    <rect x="380" y="162" width="104" height="22" rx="5" fill="#F7F6F1" stroke="#C9C7BF"/>
+    <text x="432" y="177" text-anchor="middle" font-size="10.5" fill="#3D4046">S3</text>
   </g>
 </svg>

@@ -8,10 +8,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let initial_commit_id = sim.initial_commit_id().to_string();
@@ -19,12 +16,13 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT commit_id, lixcol_depth FROM lix_checkpoint ORDER BY lixcol_depth",
+                "SELECT id, commit_id, lixcol_global FROM lix_checkpoint",
             )
             .await,
             vec![vec![
                 Value::Text(initial_commit_id.clone()),
-                Value::Integer(0),
+                Value::Text(initial_commit_id.clone()),
+                Value::Boolean(true),
             ]]
         );
 
@@ -49,18 +47,9 @@ simulation_test!(
             .expect("head should exist");
 
         assert_eq!(
-            select_rows(
-                &session,
-                "SELECT commit_id, lixcol_depth \
-                 FROM lix_checkpoint \
-                 WHERE lixcol_depth = 2",
-            )
-            .await,
-            vec![vec![
-                Value::Text(initial_commit_id.clone()),
-                Value::Integer(2),
-            ]],
-            "checkpoint depth is commit distance from the active head"
+            select_rows(&session, "SELECT commit_id FROM lix_checkpoint").await,
+            vec![vec![Value::Text(initial_commit_id.clone())]],
+            "ordinary branch commits do not mutate the global checkpoint entity"
         );
         assert_eq!(
             select_rows(
@@ -70,7 +59,7 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Json(json!(["checkpoint-key"])),
+                Value::Json(json!(["checkpoint-key"]).into()),
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
@@ -81,11 +70,11 @@ simulation_test!(
                 "SELECT entity_pk, schema_key, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"checkpoint-key\"]')",
+                   AND entity_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
             )
             .await,
             vec![vec![
-                Value::Json(json!(["checkpoint-key"])),
+                Value::Json(json!(["checkpoint-key"]).into()),
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
@@ -106,6 +95,7 @@ simulation_test!(
             .await
             .expect("checkpoint should succeed");
         assert_ne!(receipt.commit_id, old_head);
+        assert_ne!(receipt.change_id, receipt.commit_id);
         assert_eq!(
             engine
                 .load_branch_head_commit_id(sim.main_branch_id())
@@ -121,13 +111,66 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT commit_id, lixcol_depth FROM lix_checkpoint ORDER BY lixcol_depth",
+                &format!(
+                    "SELECT id, commit_id, lixcol_change_id, lixcol_global \
+                     FROM lix_checkpoint WHERE id = '{}'",
+                    receipt.commit_id
+                ),
             )
             .await,
+            vec![vec![
+                Value::Text(receipt.commit_id.clone()),
+                Value::Text(receipt.commit_id.clone()),
+                Value::Text(receipt.change_id.clone()),
+                Value::Boolean(true),
+            ]]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT schema_key, entity_pk FROM lix_change WHERE id = '{}'",
+                    receipt.change_id
+                ),
+            )
+            .await,
+            vec![vec![
+                Value::Text("lix_checkpoint".to_string()),
+                Value::Json(json!([receipt.commit_id.clone()]).into()),
+            ]],
+            "checkpoint publication must be a normal logical change"
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT id FROM lix_commit WHERE id = '{}'",
+                    receipt.commit_id
+                ),
+            )
+            .await,
+            vec![vec![Value::Text(receipt.commit_id.clone())]],
+            "checkpoint.commit_id foreign key must resolve to the captured branch commit"
+        );
+        let checkpoint_history = select_rows(
+            &session,
+            "SELECT commit_id, lixcol_change_id \
+             FROM lix_checkpoint_history() \
+             ORDER BY lixcol_depth",
+        )
+        .await;
+        assert_eq!(checkpoint_history.len(), 2);
+        assert_eq!(
+            checkpoint_history[0],
             vec![
-                vec![Value::Text(receipt.commit_id.clone()), Value::Integer(0),],
-                vec![Value::Text(initial_commit_id.clone()), Value::Integer(1)],
-            ]
+                Value::Text(receipt.commit_id.clone()),
+                Value::Text(receipt.change_id.clone()),
+            ],
+            "latest checkpoint history row is the newly published logical change"
+        );
+        assert_eq!(
+            checkpoint_history[1][0],
+            Value::Text(initial_commit_id.clone())
         );
         assert_eq!(
             select_rows(
@@ -147,7 +190,7 @@ simulation_test!(
                 "SELECT value FROM lix_key_value WHERE key = 'checkpoint-key'",
             )
             .await,
-            vec![vec![Value::Json(json!("two"))]]
+            vec![vec![Value::Json(json!("two").into())]]
         );
 
         let timestamps_before_rebuild = select_rows(
@@ -170,36 +213,33 @@ simulation_test!(
 );
 
 simulation_test!(
-    checkpoint_surfaces_are_branch_explicit_and_read_only,
+    checkpoint_surface_is_global_entity_and_read_only,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
-        let rows = select_rows(
-            &session,
-            "SELECT lixcol_branch_id, commit_id \
-             FROM lix_checkpoint_by_branch \
-             ORDER BY lixcol_branch_id, lixcol_depth",
-        )
-        .await;
+        let rows = select_rows(&session, "SELECT id, commit_id FROM lix_checkpoint").await;
         assert_eq!(
             rows,
             vec![vec![
-                Value::Text(sim.main_branch_id().to_string()),
+                Value::Text(sim.initial_commit_id().to_string()),
                 Value::Text(sim.initial_commit_id().to_string()),
             ]]
         );
 
+        let missing_by_branch = session
+            .execute("SELECT * FROM lix_checkpoint_by_branch", &[])
+            .await
+            .expect_err("global checkpoint must not expose a branch-shaped surface");
+        assert_eq!(missing_by_branch.code, LixError::CODE_TABLE_NOT_FOUND);
+
         for sql in [
-            "INSERT INTO lix_checkpoint (commit_id, created_at, lixcol_depth) \
-             VALUES ('fake', '2026-01-01T00:00:00Z', 0)",
-            "UPDATE lix_checkpoint SET created_at = 'fake'",
+            "INSERT INTO lix_checkpoint (id, commit_id) \
+             VALUES ('01930000-0000-7000-8000-000000000001', 'fake')",
+            "UPDATE lix_checkpoint SET commit_id = 'fake'",
             "DELETE FROM lix_working_diff",
             "UPDATE lix_working_diff_by_branch SET diff_type = 'fake'",
             "DELETE FROM lix_file_working_diff",
@@ -219,10 +259,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -263,11 +300,11 @@ simulation_test!(
             .await,
             vec![
                 vec![
-                    Value::Json(json!(["working-added"])),
+                    Value::Json(json!(["working-added"]).into()),
                     Value::Text("added".to_string()),
                 ],
                 vec![
-                    Value::Json(json!(["working-removed"])),
+                    Value::Json(json!(["working-removed"]).into()),
                     Value::Text("removed".to_string()),
                 ],
             ],
@@ -279,7 +316,7 @@ simulation_test!(
                 "SELECT diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"working-removed\"]')",
+                   AND entity_pk = CAST('[\"working-removed\"]' AS JSONB)",
             )
             .await,
             vec![vec![Value::Text("removed".to_string())]],
@@ -403,10 +440,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let file_id = "01950000-0000-7000-8000-000000000099";
@@ -538,10 +572,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 

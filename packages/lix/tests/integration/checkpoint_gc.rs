@@ -11,10 +11,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -82,7 +79,7 @@ simulation_test!(
             .expect("current state should remain readable after collection");
         assert_eq!(
             state.rows()[0].values(),
-            &[Value::Json(json!("interval-two"))]
+            &[Value::Json(json!("interval-two").into())]
         );
         assert_eq!(
             session
@@ -96,14 +93,11 @@ simulation_test!(
 );
 
 simulation_test!(
-    checkpoint_gc_keeps_commits_referenced_by_another_branch,
+    checkpoint_gc_keeps_then_reclaims_recovered_branch_interval,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -121,9 +115,11 @@ simulation_test!(
         .await
         .expect("protected interval update should succeed");
         let protected_head = branch_head(&engine, sim.main_branch_id()).await;
-        main.create_checkpoint()
+        let compacted_checkpoint = main
+            .create_checkpoint()
             .await
-            .expect("checkpoint retaining the first interval should succeed");
+            .expect("checkpoint retaining the first interval should succeed")
+            .commit_id;
 
         main.create_branch(CreateBranchOptions {
             id: Some("01920000-0000-7000-8000-000000000510".to_string()),
@@ -132,6 +128,25 @@ simulation_test!(
         })
         .await
         .expect("branch should be created from the recoverable auto-commit");
+        let protected = sim.wrap_session(
+            engine
+                .open_session_at("01920000-0000-7000-8000-000000000510")
+                .await
+                .expect("protected branch session should open"),
+            &engine,
+        );
+        protected
+            .execute(
+                "UPDATE lix_key_value SET value = 'protected-source' WHERE key = 'branch-gc-key'",
+                &[],
+            )
+            .await
+            .expect("first source commit should consume the checkpoint bridge");
+        let source_head = branch_head(&engine, "01920000-0000-7000-8000-000000000510").await;
+        assert_eq!(
+            commit_parent_edges(&main, &source_head).await,
+            vec![(protected_head.clone(), 0), (compacted_checkpoint, 1),],
+        );
         advance_to_next_gc(&main, 1).await;
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('main-after-branch', 'main')",
@@ -145,13 +160,6 @@ simulation_test!(
 
         assert_commits(&main, &[&protected_first, &protected_head], true).await;
 
-        let protected = sim.wrap_session(
-            engine
-                .open_session("01920000-0000-7000-8000-000000000510")
-                .await
-                .expect("protected branch session should open"),
-            &engine,
-        );
         let state = protected
             .execute(
                 "SELECT value FROM lix_key_value WHERE key = 'branch-gc-key'",
@@ -161,8 +169,24 @@ simulation_test!(
             .expect("protected branch state should remain readable");
         assert_eq!(
             state.rows()[0].values(),
-            &[Value::Json(json!("protected-head"))]
+            &[Value::Json(json!("protected-source").into())]
         );
+
+        drop(protected);
+        main.execute(
+            "DELETE FROM lix_branch WHERE id = '01920000-0000-7000-8000-000000000510'",
+            &[],
+        )
+        .await
+        .expect("protected branch should delete");
+        for _ in 0..CHECKPOINT_GC_INTERVAL {
+            main.create_checkpoint()
+                .await
+                .expect("post-delete GC checkpoint should succeed");
+        }
+        // This contract covers the recovered pre-checkpoint interval. The
+        // deleted branch's final head has independent history/undo ownership.
+        wait_for_commits(&main, &[&protected_first, &protected_head], false).await;
     }
 );
 
@@ -171,10 +195,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         main.create_branch(CreateBranchOptions {
@@ -186,7 +207,7 @@ simulation_test!(
         .expect("other branch should be created");
         let other = sim.wrap_session(
             engine
-                .open_session("01920000-0000-7000-8000-000000000511")
+                .open_session_at("01920000-0000-7000-8000-000000000511")
                 .await
                 .expect("other branch session should open"),
             &engine,
@@ -292,10 +313,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -437,9 +455,9 @@ simulation_test!(
             .expect("engine should reopen after replay GC");
         let reopened = sim.wrap_session(
             reopened_engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("reopened workspace session should open"),
+                .expect("reopened session should open"),
             &reopened_engine,
         );
         assert_replay_gc_state(&reopened).await;
@@ -455,22 +473,20 @@ simulation_test!(
 
 async fn register_replay_gc_schema(session: &support::simulation_test::engine::SimSession) {
     let schema = json!({
-        "x-lix-key": REPLAY_GC_SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "x-lix-unique": [["/indexed_value"]],
-        "type": "object",
-        "required": ["id", "indexed_value", "note", "generation"],
-        "properties": {
-            "id": { "type": "string" },
-            "indexed_value": { "type": "string" },
-            "note": { "type": "string" },
-            "generation": { "type": "integer" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": REPLAY_GC_SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "indexed_value", "type": "text", "nullable": false },
+            { "name": "note", "type": "text", "nullable": false },
+            { "name": "generation", "type": "int8", "nullable": false },
+        ],
+        "primary_key": ["id"],
+        "unique": [["indexed_value"]],
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -497,12 +513,40 @@ async fn advance_to_next_gc(session: &support::simulation_test::engine::SimSessi
     }
 }
 
-async fn branch_head(engine: &lix::integration::Engine, branch_id: &str) -> String {
+async fn branch_head(engine: &lix::engine::Engine, branch_id: &str) -> String {
     engine
         .load_branch_head_commit_id(branch_id)
         .await
         .expect("branch head should load")
         .expect("branch head should exist")
+}
+
+async fn commit_parent_edges(
+    session: &support::simulation_test::engine::SimSession,
+    commit_id: &str,
+) -> Vec<(String, i64)> {
+    session
+        .execute(
+            &format!(
+                "SELECT parent_id, parent_order FROM lix_commit_edge \
+                 WHERE child_id = '{commit_id}' ORDER BY parent_order"
+            ),
+            &[],
+        )
+        .await
+        .expect("commit parent edges should read")
+        .rows()
+        .iter()
+        .map(|row| {
+            let Value::Text(parent_id) = &row.values()[0] else {
+                panic!("parent id should be text");
+            };
+            let Value::Integer(parent_order) = row.values()[1] else {
+                panic!("parent order should be integer");
+            };
+            (parent_id.clone(), parent_order)
+        })
+        .collect()
 }
 
 async fn assert_commits(

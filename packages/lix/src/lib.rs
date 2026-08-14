@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Rust SDK for Lix.
 //!
 //! Embedded version control for files and data.
@@ -30,6 +32,17 @@
 // consumers now that the former engine and SDK share one crate.
 extern crate self as lix;
 
+pub mod plugin;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+macro_rules! engine_surface {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+engine_surface! {
 mod binary_cas;
 pub(crate) mod branch;
 pub(crate) mod catalog;
@@ -44,8 +57,6 @@ pub(crate) mod collection_generation;
 pub(crate) mod commit_graph;
 mod common;
 pub(crate) mod compression;
-#[cfg(feature = "default_wasm_runtime")]
-mod default_wasm_runtime;
 pub(crate) mod domain;
 mod engine;
 pub(crate) mod entity_pk;
@@ -58,12 +69,10 @@ pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
-pub(crate) mod plugin;
-mod plugin_arena;
-mod plugin_layout;
-mod plugin_wire;
 mod prepared_dml;
 mod schema;
+#[cfg(feature = "server-protocol")]
+pub mod server_protocol;
 mod session;
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
@@ -101,7 +110,7 @@ pub mod integration {
 pub use client_state::ClientState;
 #[cfg(feature = "default_wasm_runtime")]
 #[doc(hidden)]
-pub use default_wasm_runtime::runtime as default_wasm_runtime;
+pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{Lix, LixTransaction, OpenLixBuilder, open_lix};
 
 pub use schema::{
@@ -109,8 +118,11 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
+/// PostgreSQL-derived Lix Schema v1 model and validation API.
+pub use lix_schema as schema_v1;
+
 pub use common::LixError;
-pub use common::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
+pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
@@ -141,3 +153,4 @@ pub const SYSTEM_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000001";
 
 /// Fixed author used when a host opens a session without an authenticated account.
 pub const ANONYMOUS_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000002";
+}

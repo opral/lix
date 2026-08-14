@@ -110,7 +110,7 @@ use crate::transaction::types::{
 };
 use crate::transaction::validation::validate_prepared_writes_by_branch;
 
-use crate::wasm::{
+use crate::plugin::runtime::{
     WASM_COMPONENT_API_VERSION, WasmCertifiedEntityBatch, WasmChangeEffect, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictTake,
     WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
@@ -4465,6 +4465,7 @@ where
                                     descriptor,
                                     file: Arc::new(ArcByteSource::new(source_bytes)),
                                     creates,
+                                    certified_packets_available: true,
                                 },
                             )
                             .instrument(tracing::debug_span!(
@@ -4898,7 +4899,7 @@ where
                                         (hash, offset, delete_len, insert_len)
                                     },
                                 );
-                                let before_source: Arc<dyn crate::wasm::WasmByteSource> =
+                                let before_source: Arc<dyn crate::plugin::runtime::WasmByteSource> =
                                     Arc::new(ArcByteSource::new(before_bytes.clone()));
                                 (
                                     Some(before_source),
@@ -5547,6 +5548,7 @@ where
                             descriptor,
                             file: Arc::new(source),
                             creates,
+                            certified_packets_available: true,
                         },
                     )
                     .instrument(tracing::debug_span!(
@@ -6151,7 +6153,13 @@ where
             let mut scalar_facts = PreparedScalarBatch::with_capacity(rows.len());
             for index in 0..rows.len() {
                 let normalized =
-                    normalize_raw_write_row_in_place(&mut rows, index, catalog, functions.clone())?;
+                    normalize_raw_write_row_in_place(
+                        &mut rows,
+                        index,
+                        catalog,
+                        functions.clone(),
+                        &mut default_timestamp,
+                    )?;
                 scalar_facts.push(plan_prepared_row_scalars(
                     rows.row(index),
                     normalized,
@@ -6241,6 +6249,7 @@ where
                     index,
                     catalog,
                     functions.clone(),
+                    &mut default_timestamp,
                 )?);
             }
             // Preserve the historical domain-by-domain provider/error order:
@@ -10249,7 +10258,7 @@ async fn render_semantic_changes_with_lease(
         PendingPluginActorPublication,
         crate::Blob,
         Option<ValidatedSameLengthOutputSplice>,
-        crate::wasm::WasmTransitionCounters,
+        crate::plugin::runtime::WasmTransitionCounters,
     ),
     (LixError, PendingPluginActorPublication),
 > {
@@ -11196,8 +11205,8 @@ async fn resolve_active_branch_id(
             BranchLifecycle::new(&branch_ref)
                 .require_existing_ref(
                     &branch_id,
-                    BranchOperation::LoadWorkspaceSelector,
-                    BranchReferenceRole::WorkspaceSelector,
+                    BranchOperation::LoadDefaultBranch,
+                    BranchReferenceRole::DefaultBranch,
                 )
                 .await?;
             Ok(branch_id.clone())

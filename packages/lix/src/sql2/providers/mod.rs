@@ -87,12 +87,10 @@ where
     if selection.is_empty() {
         return Ok(());
     }
-    let dynamic_catalog;
     let catalog = if selection.requires_visible_schemas() {
-        dynamic_catalog = ctx.public_catalog().await?;
-        dynamic_catalog.as_ref()
+        ctx.public_catalog().await?
     } else {
-        PublicCatalog::fixed_system()
+        Arc::clone(PublicCatalog::fixed_system_shared())
     };
     register_read_from_catalog(
         session,
@@ -101,7 +99,7 @@ where
         active_branch_commit_id,
         commit_graph,
         changelog_query_source,
-        catalog,
+        catalog.as_ref(),
         ReadProviderScope::All,
         selection,
     )
@@ -251,8 +249,6 @@ where
                 PublicSurfaceKind::FileHistory
                     | PublicSurfaceKind::DirectoryHistory
                     | PublicSurfaceKind::EntityHistory { .. }
-                    | PublicSurfaceKind::Checkpoint
-                    | PublicSurfaceKind::CheckpointByBranch
                     | PublicSurfaceKind::WorkingDiff
                     | PublicSurfaceKind::WorkingDiffByBranch
                     | PublicSurfaceKind::FileWorkingDiff
@@ -302,26 +298,6 @@ where
                     &surface.name,
                     ctx.state_view(),
                     Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::Checkpoint => {
-                checkpoint::register_checkpoint_provider(
-                    session,
-                    &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    query_source_for_provider()?,
-                )
-                .await?;
-            }
-            PublicSurfaceKind::CheckpointByBranch => {
-                checkpoint::register_checkpoint_provider(
-                    session,
-                    &surface.name,
-                    None,
-                    Arc::clone(&branch_ref),
-                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -537,7 +513,7 @@ where
     let catalog = write_ctx.public_catalog()?;
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    crate::sql2::information_schema::register(session, Arc::clone(&catalog))
 }
 
 pub(crate) async fn register_transaction<C, R>(
@@ -581,7 +557,7 @@ where
         selection,
     )
     .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    crate::sql2::information_schema::register(session, Arc::clone(&catalog))
 }
 
 async fn register_write_from_catalog<R>(
@@ -675,8 +651,6 @@ where
                 .await?;
             }
             PublicSurfaceKind::Change
-            | PublicSurfaceKind::Checkpoint
-            | PublicSurfaceKind::CheckpointByBranch
             | PublicSurfaceKind::WorkingDiff
             | PublicSurfaceKind::WorkingDiffByBranch
             | PublicSurfaceKind::FileWorkingDiff

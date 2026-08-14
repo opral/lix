@@ -255,6 +255,7 @@ enum ParameterKind {
     Real,
     Text,
     Json,
+    Timestamp,
     Blob,
 }
 
@@ -267,6 +268,7 @@ impl ParameterKind {
             Value::Real(_) => Some(Self::Real),
             Value::Text(_) => Some(Self::Text),
             Value::Json(_) => Some(Self::Json),
+            Value::Timestamp(_) => Some(Self::Timestamp),
             Value::Blob(_) => Some(Self::Blob),
         }
     }
@@ -277,6 +279,10 @@ impl ParameterKind {
             Self::Integer => DataType::Int64,
             Self::Real => DataType::Float64,
             Self::Text | Self::Json => DataType::Utf8,
+            Self::Timestamp => DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
             Self::Blob => DataType::LargeBinary,
         }
     }
@@ -288,11 +294,18 @@ impl ParameterKind {
             (Self::Real, Value::Real(value)) => Ok(ScalarValue::Float64(Some(*value))),
             (Self::Text, Value::Text(value)) => Ok(ScalarValue::Utf8(Some(value.clone()))),
             (Self::Json, Value::Json(value)) => Ok(ScalarValue::Utf8(Some(value.to_string()))),
+            (Self::Timestamp, Value::Timestamp(value)) => Ok(
+                ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())),
+            ),
             (Self::Blob, Value::Blob(value)) => Ok(ScalarValue::LargeBinary(Some(value.to_vec()))),
             (Self::Boolean, Value::Null) => Ok(ScalarValue::Boolean(None)),
             (Self::Integer, Value::Null) => Ok(ScalarValue::Int64(None)),
             (Self::Real, Value::Null) => Ok(ScalarValue::Float64(None)),
             (Self::Text | Self::Json, Value::Null) => Ok(ScalarValue::Utf8(None)),
+            (Self::Timestamp, Value::Null) => Ok(ScalarValue::TimestampMicrosecond(
+                None,
+                Some("UTC".into()),
+            )),
             (Self::Blob, Value::Null) => Ok(ScalarValue::LargeBinary(None)),
             _ => Err(LixError::unknown(
                 "heterogeneous SQL parameter column reached Arrow lowering",
@@ -306,6 +319,7 @@ fn scalar_parameter_value(scalar: ScalarValue, is_json: bool) -> Result<Value, L
         ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(value)),
         ScalarValue::Int64(Some(value)) => Ok(Value::Integer(value)),
         ScalarValue::Float64(Some(value)) => Ok(Value::Real(value)),
+        ScalarValue::TimestampMicrosecond(Some(value), _) => Ok(Value::Timestamp(value)),
         ScalarValue::Utf8(Some(value)) if is_json => serde_json::from_str(&value)
             .map(Value::Json)
             .map_err(|error| {
