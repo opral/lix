@@ -101,7 +101,7 @@ where
         return false;
     };
     let branch_id = leader.transaction.active_branch_id.as_str();
-    let mut unfiled_identities = BTreeSet::new();
+    let mut unfiled_identitys = BTreeSet::new();
     for member in members {
         let writes = &member.prepared_writes;
         if writes.commit_change_refs_by_branch.len() != 1
@@ -118,7 +118,7 @@ where
                 return false;
             }
             if row.file_id.is_none()
-                && !unfiled_identities.insert((
+                && !unfiled_identitys.insert((
                     row.branch_id.to_string(),
                     row.schema_key.to_string(),
                     row.row_pk.clone(),

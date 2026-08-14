@@ -2,7 +2,7 @@ use crate::LixError;
 use crate::common::LixTimestamp;
 #[cfg(test)]
 use crate::common::{ExactBatch, ExactValue};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::json_store::JsonSlot;
 use std::fmt;
 use std::str::FromStr;
@@ -344,7 +344,7 @@ pub(crate) struct ChangeRecord {
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) schema_key: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: JsonSlot,
     pub(crate) metadata: JsonSlot,
@@ -368,7 +368,7 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
     pub(crate) account_id: &'a str,
     pub(crate) schema_key: &'a str,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
     #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<&'a str>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
@@ -386,7 +386,7 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
     pub(crate) account_id: &'a str,
     pub(crate) schema_key: &'a str,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<String>,
     #[musli(with = crate::json_store::json_slot_storage)]
@@ -421,7 +421,7 @@ pub(crate) fn encode_forktree_change_payload(record: &ChangeRecord) -> Result<Ve
             format_version: record.format_version,
             account_id: &record.account_id,
             schema_key: &record.schema_key,
-            entity_pk: &record.entity_pk,
+            row_pk: &record.row_pk,
             file_id: record.file_id.as_deref(),
             snapshot: record.snapshot.as_ref_slot(),
             metadata: record.metadata.as_ref_slot(),
@@ -442,7 +442,7 @@ pub(crate) fn decode_forktree_change_payload(
         change_id,
         account_id: view.account_id.to_string(),
         schema_key: view.schema_key.to_string(),
-        entity_pk: view.entity_pk,
+        row_pk: view.row_pk,
         file_id: view.file_id,
         snapshot: view.snapshot,
         metadata: view.metadata,

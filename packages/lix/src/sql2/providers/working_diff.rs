@@ -9,7 +9,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::branch::BranchRefReader;
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
@@ -79,7 +79,7 @@ where
         if filter.column_refs().iter().any(|column| {
             matches!(
                 column.name.as_str(),
-                "entity_pk" | "schema_key" | "file_id" | "lixcol_branch_id"
+                "row_pk" | "schema_key" | "file_id" | "lixcol_branch_id"
             )
         }) {
             TableProviderFilterPushDown::Inexact
@@ -167,7 +167,7 @@ where
                                     entry.before.as_ref().map(|row| row.change_id),
                                     entry.after.as_ref().map(|row| row.change_id),
                                 ),
-                                entity_pk: identity.key.entity_pk.as_json_array_text(),
+                                row_pk: identity.key.row_pk.as_json_array_text(),
                                 schema_key: identity.key.schema_key.clone(),
                                 file_id: identity.key.file_id.clone(),
                                 diff_type: working_diff_kind(
@@ -208,8 +208,8 @@ impl WorkingDiffRoute {
             &conjuncts,
             "schema_key",
         )?);
-        let entity_pk_values = string_constraint_values(
-            exact_string_column_constraint_from_filters(&conjuncts, "entity_pk")?,
+        let row_pk_values = string_constraint_values(
+            exact_string_column_constraint_from_filters(&conjuncts, "row_pk")?,
         );
         let file_ids = string_constraint_values(exact_string_column_constraint_from_filters(
             &conjuncts, "file_id",
@@ -217,21 +217,21 @@ impl WorkingDiffRoute {
 
         let mut contradictory = matches!(branch_ids, FileIdConstraint::None)
             || schema_keys.as_ref().is_some_and(Vec::is_empty)
-            || entity_pk_values.as_ref().is_some_and(Vec::is_empty)
+            || row_pk_values.as_ref().is_some_and(Vec::is_empty)
             || file_ids.as_ref().is_some_and(Vec::is_empty);
-        let entity_pk_filter_is_explicit = entity_pk_values.is_some();
-        let entity_pks = entity_pk_values
+        let row_pk_filter_is_explicit = row_pk_values.is_some();
+        let row_pks = row_pk_values
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|entity_pk| EntityPk::from_json_array_text(&entity_pk).ok())
+            .filter_map(|row_pk| RowPk::from_json_array_text(&row_pk).ok())
             .collect::<Vec<_>>();
-        contradictory |= entity_pk_filter_is_explicit && entity_pks.is_empty();
+        contradictory |= row_pk_filter_is_explicit && row_pks.is_empty();
 
         Ok(Self {
             branch_ids,
             filter: StateFilter {
                 schema_keys: schema_keys.unwrap_or_default(),
-                entity_pks,
+                row_pks,
                 file_ids: file_ids
                     .unwrap_or_default()
                     .into_iter()
@@ -246,7 +246,7 @@ impl WorkingDiffRoute {
 
 fn diff_row_matches(row: &HistoricalStateRow, filter: &StateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
-        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
+        && (filter.row_pks.is_empty() || filter.row_pks.contains(&row.key.row_pk))
         && (filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|file_id| match file_id {
                 NullableKeyFilter::Any => true,
@@ -282,7 +282,7 @@ fn string_constraint_values(constraint: FileIdConstraint) -> Option<Vec<String>>
 pub(super) fn working_diff_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
-        json_field("entity_pk", false),
+        json_field("row_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         Field::new("diff_type", DataType::Utf8, false),
@@ -297,7 +297,7 @@ pub(super) fn working_diff_schema(by_branch: bool) -> SchemaRef {
 
 struct WorkingDiffSqlRow {
     diff_id: Result<String, LixError>,
-    entity_pk: Result<String, LixError>,
+    row_pk: Result<String, LixError>,
     schema_key: String,
     file_id: Option<String>,
     diff_type: &'static str,
@@ -313,8 +313,8 @@ static WORKING_DIFF_COLS: ColumnTable<WorkingDiffSqlRow> = ColumnTable {
             Col::Utf8Fallible(|row| row.diff_id.clone().map(Some)),
         ),
         (
-            "entity_pk",
-            Col::Utf8Fallible(|row| row.entity_pk.clone().map(Some)),
+            "row_pk",
+            Col::Utf8Fallible(|row| row.row_pk.clone().map(Some)),
         ),
         ("schema_key", Col::Utf8(|row| Some(&row.schema_key))),
         ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
@@ -356,7 +356,7 @@ mod tests {
         let route = WorkingDiffRoute::from_filters(&[
             col("lixcol_branch_id").eq(lit("01920000-0000-7000-8000-0000000000a1")),
             col("schema_key").eq(lit("acme_task")),
-            col("entity_pk").eq(lit("[\"task-a\"]")),
+            col("row_pk").eq(lit("[\"task-a\"]")),
             col("file_id").eq(lit("01920000-0000-7000-8000-0000000000a2")),
         ])
         .expect("exact working-diff filters should route");
@@ -367,9 +367,9 @@ mod tests {
         );
         assert_eq!(route.filter.schema_keys, vec!["acme_task".to_string()]);
         assert_eq!(
-            route.filter.entity_pks[0]
+            route.filter.row_pks[0]
                 .as_json_array_text()
-                .expect("entity pk should encode"),
+                .expect("row pk should encode"),
             "[\"task-a\"]"
         );
         assert_eq!(

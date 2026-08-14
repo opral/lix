@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::LixError;
 use crate::changelog::CommitId;
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::{Storage, StorageAdapterRead};
@@ -217,7 +217,7 @@ where
     for row in marker_delta.iter().filter(|row| !row.deleted) {
         match row.key.schema_key.as_str() {
             CHECKPOINT_MARKER_SCHEMA_KEY => has_checkpoint = true,
-            UNDO_REDO_MARKER_SCHEMA_KEY if row.key.entity_pk == keys[1].entity_pk => {
+            UNDO_REDO_MARKER_SCHEMA_KEY if row.key.row_pk == keys[1].row_pk => {
                 has_local_operation = true;
             }
             UNDO_REDO_MARKER_SCHEMA_KEY => has_foreign_operation = true,
@@ -242,7 +242,7 @@ where
 }
 
 fn semantic_keys(branch_id: &str) -> Result<[StateKey; 2], LixError> {
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+    let branch_pk = RowPk::uuid_from_canonical(branch_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PARAM,
             format!("undo branch id must be a canonical UUID: {error}"),
@@ -252,12 +252,12 @@ fn semantic_keys(branch_id: &str) -> Result<[StateKey; 2], LixError> {
         StateKey {
             schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
             file_id: None,
-            entity_pk: branch_pk.clone(),
+            row_pk: branch_pk.clone(),
         },
         StateKey {
             schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
             file_id: None,
-            entity_pk: branch_pk,
+            row_pk: branch_pk,
         },
     ])
 }
@@ -297,7 +297,7 @@ async fn semantic_state_for_record(
     let operation_key = StateKey {
         schema_key: keys[1].schema_key.clone(),
         file_id: keys[1].file_id.clone(),
-        entity_pk: keys[1].entity_pk.clone(),
+        row_pk: keys[1].row_pk.clone(),
     };
     if operation_row.key != operation_key {
         return Ok((SemanticState::default(), delta_rows));
@@ -329,12 +329,12 @@ async fn operation_marker_at(
     branch_id: &str,
     commit_id: CommitId,
 ) -> Result<Option<UndoRedoMarker>, LixError> {
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id)
+    let branch_pk = RowPk::uuid_from_canonical(branch_id)
         .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, error.to_string()))?;
     let key = StateKey {
         schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
         file_id: None,
-        entity_pk: branch_pk,
+        row_pk: branch_pk,
     };
     let rows = facade
         .load_state_rows_at_commit(&commit_id.to_string(), std::slice::from_ref(&key))
@@ -493,7 +493,7 @@ async fn descriptor_dependency_closure(
         for endpoint in [current, desired] {
             for row in facade.scan_state_rows_at_commit(endpoint).await? {
                 if row.key.schema_key == "lix_registered_schema" && !row.deleted {
-                    schema_keys.insert(row.key.entity_pk.as_single_string_owned().map_err(
+                    schema_keys.insert(row.key.row_pk.as_single_string_owned().map_err(
                         |error| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
@@ -533,7 +533,7 @@ fn descriptor_dependency_cascade_file_ids(
         }
         let file_id = row
             .key
-            .entity_pk
+            .row_pk
             .as_single_string_owned()
             .map_err(|error| {
                 LixError::new(
@@ -680,7 +680,7 @@ mod tests {
                     .await
             })
             .await
-            .expect_err("duplicate transition identities are rejected");
+            .expect_err("duplicate transition identitys are rejected");
         assert_eq!(duplicate.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert_eq!(value(&session, "typed").await.as_deref(), Some("after"));
 
@@ -934,7 +934,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("file identities read");
+            .expect("file identitys read");
         let file_id = |path: &str| {
             files
                 .rows()

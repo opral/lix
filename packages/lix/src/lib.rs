@@ -59,7 +59,7 @@ mod common;
 pub(crate) mod compression;
 pub(crate) mod domain;
 mod engine;
-pub(crate) mod entity_pk;
+pub(crate) mod row_pk;
 pub(crate) mod filesystem;
 pub(crate) mod forktree;
 pub(crate) mod functions;
@@ -69,6 +69,8 @@ pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
+#[cfg(not(target_family = "wasm"))]
+mod background_task;
 mod prepared_dml;
 mod schema;
 mod native_row;
@@ -124,7 +126,7 @@ pub use lix_schema as schema_v1;
 
 pub use common::LixError;
 pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
-pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
+pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

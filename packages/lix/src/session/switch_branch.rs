@@ -114,7 +114,7 @@ where
 #[expect(clippy::unnecessary_wraps)]
 fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, LixError> {
     Ok(TransactionWriteRow {
-        entity_pk: Some(crate::entity_pk::EntityPk::single(WORKSPACE_BRANCH_KEY)),
+        row_pk: Some(crate::row_pk::RowPk::single(WORKSPACE_BRANCH_KEY)),
         schema_key: KEY_VALUE_SCHEMA_KEY.into(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({

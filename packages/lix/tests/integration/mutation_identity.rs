@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use lix::common::{LixTimestamp, MutationIdentity};
-use lix::row_pk::RowPk;
 use lix::hot_state::MaterializedHotStateRow;
 use lix::plugin::runtime::{
     BoundCreateContext, PluginActorKey, reserve_create_row, validate_create_reservation,
 };
+use lix::row_pk::RowPk;
 use lix::{Lix, LixError, Memory, Value, open_lix};
 
 #[tokio::test]

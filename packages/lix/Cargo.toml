@@ -109,6 +109,7 @@ parking_lot = "0.12"
 uuid = { version = "1", features = ["v5", "v7", "std", "js", "fast-rng"] }
 web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-lite = "2"
 futures-core = { version = "0.3", optional = true }
 getrandom = { version = "0.3", optional = true }
 http = { version = "1", optional = true }

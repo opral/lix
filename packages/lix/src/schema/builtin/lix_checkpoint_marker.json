@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_checkpoint_marker",
-  "description": "Internal tracked marker identifying commits created by the checkpoint API. This schema is intentionally hidden from generated entity SQL surfaces.",
+  "description": "Internal tracked marker identifying commits created by the checkpoint API. This schema is intentionally hidden from generated row SQL surfaces.",
   "columns": [
     {
       "name": "branch_id",

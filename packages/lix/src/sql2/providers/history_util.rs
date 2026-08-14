@@ -1,14 +1,14 @@
 use crate::LixError;
 use crate::common::SharedStr;
 use crate::forktree::{HistoricalStateRow, StateKey};
-use crate::{NullableKeyFilter, entity_pk::EntityPk};
+use crate::{NullableKeyFilter, row_pk::RowPk};
 
 /// Native filter for historical ForkTree rows. This is local to the history
 /// providers and carries no reader/request or materialized-batch vocabulary.
 #[derive(Clone, Debug, Default)]
 pub(super) struct StateFilter {
     pub(super) schema_keys: Vec<String>,
-    pub(super) entity_pks: Vec<EntityPk>,
+    pub(super) row_pks: Vec<RowPk>,
     pub(super) file_ids: Vec<NullableKeyFilter<String>>,
     pub(super) include_tombstones: bool,
 }
@@ -159,7 +159,7 @@ impl ObservedStateRows {
     }
 
     #[cfg(test)]
-    pub(super) fn observed_commit_buffer_identities(&self) -> Vec<(*const u8, usize)> {
+    pub(super) fn observed_commit_buffer_identitys(&self) -> Vec<(*const u8, usize)> {
         self.batches
             .iter()
             .map(|batch| batch.observed_commit_id.retained_buffer_identity())
@@ -194,8 +194,8 @@ pub(super) struct HistoricalStateRowRef<'a> {
 }
 
 impl<'a> HistoricalStateRowRef<'a> {
-    pub(super) fn entity_pk(self) -> &'a crate::entity_pk::EntityPk {
-        &self.row.key.entity_pk
+    pub(super) fn row_pk(self) -> &'a crate::row_pk::RowPk {
+        &self.row.key.row_pk
     }
 
     pub(super) fn schema_key(self) -> &'a str {

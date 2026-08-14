@@ -85,8 +85,6 @@ macro_rules! simulation_test {
 mod checkpoint;
 mod delete_returning;
 mod diff_commands;
-mod schema_history;
-mod schema_view;
 mod errors;
 mod history_conformance;
 mod information_schema;
@@ -102,6 +100,8 @@ mod lix_key_value;
 mod lix_registered_schema;
 mod metadata;
 mod read_only;
+mod schema_history;
+mod schema_view;
 mod subquery_reads;
 mod subquery_writes;
 mod udfs;

@@ -1865,7 +1865,7 @@ where
                             // Keep the large statement executor behind a heap boundary. The
                             // lending transaction closure already carries the whole parsed batch;
                             // embedding this future in it makes debug poll stacks exceed the
-                            // standard 2 MiB worker stack for ordinary entity writes.
+                            // standard 2 MiB worker stack for ordinary row writes.
                             let operation = Box::pin(execute_transaction_statement(
                                 transaction,
                                 &sql,
@@ -3388,10 +3388,10 @@ where
 /// Returns true only when SQL directly delivers one file's bytes to the
 /// caller. Materializing `data` inside an aggregate, join, filter, or derived
 /// expression is not acknowledgement: the caller did not receive those bytes
-/// and must not gain the ability to delete entities that only existed there.
+/// and must not gain the ability to delete rows that only existed there.
 ///
 /// This intentionally recognizes a narrow, predictable MVP surface. False
-/// negatives merely preserve an omitted entity; false positives can lose one.
+/// negatives merely preserve an omitted row; false positives can lose one.
 fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
     let Some(point_read) = simple_point_read(statement) else {
         return false;
@@ -4239,7 +4239,7 @@ fn classify_execute_batch(
     // Distinct literal UPDATE statements have the same execution shape as a
     // homogeneous bound batch. Explicit transactions already normalize this
     // narrow SQL subset one statement at a time; recognize the complete batch
-    // here so the ordered mutation kernel can fold repeated identities and use
+    // here so the ordered mutation kernel can fold repeated identitys and use
     // the certified columnar route. Shapes that have not yet been lowered into
     // that mutation program retain their original sequential execution.
     if statements.len() >= 2

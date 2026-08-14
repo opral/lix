@@ -2527,7 +2527,7 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
-            if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
+            if matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk")
     )
 }
 
@@ -2544,14 +2544,14 @@ fn canonical_json_text(raw: &str) -> Result<String, LixError> {
 
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::Base {
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base {
             schema_key,
         }) if bound_predicate_contains_like(&plan.bound.predicate)
             || bound_update_contains_binary(plan) =>
         {
             Ok(schema_key.clone())
         }
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::ByBranch {
             schema_key,
         }) if bound_predicate_contains_like(&plan.bound.predicate)
             || bound_update_contains_binary(plan) =>
@@ -2574,9 +2574,9 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
             Ok("lix_create_checkpoint".to_string())
         }
-        BoundWriteTarget::Entity(_) => Err(LixError::new(
+        BoundWriteTarget::Row(_) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "sql2 DataFusion reference writer does not support this entity write",
+            "sql2 DataFusion reference writer does not support this row write",
         )),
     }
 }
@@ -2888,7 +2888,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "DDL statements are not supported by Lix SQL",
             )
             .with_hint(
-                "Use Lix entity surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
+                "Use Lix row surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
             ));
         }
         LogicalPlan::Statement(_) => {

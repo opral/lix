@@ -35,7 +35,7 @@ use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_ro
 use crate::commit_graph::CommitGraphStoreReader;
 use crate::common::{LixTimestamp, SharedStr, compose_directory_path, compose_file_path};
 use crate::domain::Domain;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::filesystem::{
     BlobRefPluginCheckpoint, BlobRefRowInput, FileDescriptorWriteIntent, FilesystemPathIndex,
     FilesystemPathIndexCache, FilesystemPathIndexReader, FilesystemPathIndexRequest,
@@ -53,14 +53,14 @@ use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall,
     PluginActorColdOpen, PluginActorKey, PluginActorLease, PluginActorStagedCheckpoint,
     PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentMatcher,
-    PluginEntityAuthorities, PluginEntityAuthorityRange, PluginFileOwner, PluginObservation,
+    PluginRowAuthorities, PluginRowAuthorityRange, PluginFileOwner, PluginObservation,
     PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost,
-    SchemaAllowlist, StateRowEntitySource, ValidatedConflictTransition, ValidatedFileTransition,
-    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
-    VecEntitySource, build_file_update_splices, canonicalize_snapshot,
-    drain_conflict_transition_resolutions, drain_entity_transition_edits,
-    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
-    host_entity_with_lazy_snapshot, is_plugin_storage_path, is_reservation_key,
+    SchemaAllowlist, StateRowRowSource, ValidatedConflictTransition, ValidatedFileTransition,
+    ValidatedSameLengthOutputSplice, VecRowChangeSource, VecRowConflictSource,
+    VecRowSource, build_file_update_splices, canonicalize_snapshot,
+    drain_conflict_transition_resolutions, drain_row_transition_edits,
+    drain_file_transition_changes, host_row_change_with_lazy_snapshot,
+    host_row_with_lazy_snapshot, is_plugin_storage_path, is_reservation_key,
     local_mutation_identity, materialize_keyless_creates, plugin_archive_file_id_matches,
     plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
     plugin_storage_wasm_file_id, require_existing_id_authorities, reservation_tombstone_row,
@@ -111,11 +111,11 @@ use crate::transaction::types::{
 use crate::transaction::validation::validate_prepared_writes_by_branch;
 
 use crate::plugin::runtime::{
-    WASM_COMPONENT_API_VERSION, WasmCertifiedEntityBatch, WasmChangeEffect, WasmColdFileUpdate,
+    WASM_COMPONENT_API_VERSION, WasmCertifiedRowBatch, WasmChangeEffect, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictTake,
     WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
-    WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor,
-    WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput,
+    WasmRowChange, WasmRowConflict, WasmRowKey, WasmRowUpdate, WasmFileDescriptor,
+    WasmFileUpdate, WasmHostBytes, WasmHostRow, WasmHostRowChanges, WasmOpenRowsInput,
     WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, SqlQueryResult, Value};
@@ -249,7 +249,7 @@ fn state_key_from_tracked(key: &StateKey) -> StateKey {
     StateKey {
         schema_key: key.schema_key.clone(),
         file_id: key.file_id.clone(),
-        entity_pk: key.entity_pk.clone(),
+        row_pk: key.row_pk.clone(),
     }
 }
 
@@ -258,7 +258,7 @@ fn plugin_wasm_state_key(_branch_id: &str, plugin_key: &str) -> StateKey {
     StateKey {
         schema_key: BLOB_REF_SCHEMA_KEY.to_owned(),
         file_id: Some(file_id.clone()),
-        entity_pk: EntityPk::uuid_from_canonical(&file_id)
+        row_pk: RowPk::uuid_from_canonical(&file_id)
             .expect("deterministic plugin WASM owner ID is a UUID"),
     }
 }
@@ -267,7 +267,7 @@ fn plugin_materialization_state_key(file_id: &str) -> StateKey {
     StateKey {
         schema_key: BLOB_REF_SCHEMA_KEY.to_owned(),
         file_id: Some(file_id.to_owned()),
-        entity_pk: EntityPk::uuid_from_canonical(file_id)
+        row_pk: RowPk::uuid_from_canonical(file_id)
             .expect("plugin materialization owner ID is a UUID"),
     }
 }
@@ -275,7 +275,7 @@ fn plugin_materialization_state_key(file_id: &str) -> StateKey {
 fn historical_row_matches_key(row: &HistoricalStateRow, key: &StateKey) -> bool {
     row.key.schema_key == key.schema_key
         && row.key.file_id == key.file_id
-        && row.key.entity_pk == key.entity_pk
+        && row.key.row_pk == key.row_pk
 }
 
 async fn load_historical_rows_at_commit<R>(
@@ -483,7 +483,7 @@ impl TransactionMutationJournal {
         let &(start, end) = self.identity_offsets.last()?;
         Some(
             std::str::from_utf8(&self.identity_arena[start..end])
-                .expect("transaction journal identities are appended from str"),
+                .expect("transaction journal identitys are appended from str"),
         )
     }
 
@@ -901,7 +901,7 @@ where
         };
 
         // A complete-set journal is certified against the coherent opening
-        // snapshot. If this branch advanced, expose its identities—with exact
+        // snapshot. If this branch advanced, expose its identitys—with exact
         // current predecessor lifecycle—to the established stale-write
         // classifier and generic reconciliation lane. Unchanged-head commits
         // retain the zero-reconstruction direct path.
@@ -917,7 +917,7 @@ where
                     &forktree,
                     &descriptor.schema_key,
                     &descriptor.branch_id,
-                    &descriptor.entity_pk_chunks,
+                    &descriptor.row_pk_chunks,
                 )
                 .await?;
                 predecessors_by_commit.insert(descriptor.commit_id, predecessors);
@@ -939,11 +939,11 @@ where
             .map(|row| StateKey {
                 schema_key: row.key.schema_key,
                 file_id: row.key.file_id,
-                entity_pk: row.key.entity_pk,
+                row_pk: row.key.row_pk,
             })
             .collect::<Vec<_>>();
         let concurrent_identity = facade
-            .touched_state_identities_between_commits(opening_head, current_head)
+            .touched_state_identitys_between_commits(opening_head, current_head)
             .instrument(tracing::debug_span!(
                 target: "lix_transaction",
                 "lix.transaction.stale.forktree_identity"
@@ -952,7 +952,7 @@ where
         concurrent_keys.extend(concurrent_identity.into_iter().map(|change| StateKey {
             schema_key: change.key.schema_key,
             file_id: change.key.file_id,
-            entity_pk: change.key.entity_pk,
+            row_pk: change.key.row_pk,
         }));
         concurrent_keys.sort();
         concurrent_keys.dedup();
@@ -970,7 +970,7 @@ where
                 concurrent_keys.iter().map(|key| StateKeyRef {
                     schema_key: key.schema_key.as_str(),
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 }),
             )
         };
@@ -1021,7 +1021,7 @@ where
             }
             StaleCommitPlan::Unsafe => {
                 return Err(conflict(
-                    "concurrent transaction changed an overlapping entity outside a stable plugin-owned file",
+                    "concurrent transaction changed an overlapping row outside a stable plugin-owned file",
                 ));
             }
         }
@@ -1045,7 +1045,7 @@ where
         let conflict_error = || {
             LixError::new(
                 LixError::CODE_TRANSACTION_CONFLICT,
-                "concurrent transaction changed an overlapping entity outside a stable plugin-owned file",
+                "concurrent transaction changed an overlapping row outside a stable plugin-owned file",
             )
             .with_hint("Retry the transaction against the latest committed state.")
         };
@@ -1059,13 +1059,13 @@ where
             .map(|file_id| StateKey {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
                 file_id: Some(file_id.clone()),
-                entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+                row_pk: RowPk::single(PLUGIN_OWNER_KEY),
             })
             .collect::<Vec<_>>();
         let registry_key = StateKey {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
             file_id: None,
-            entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+            row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
         };
         let base_owners = load_historical_rows_at_commit(facade, opening_head, &owner_keys).await?;
         let current_owners =
@@ -1157,7 +1157,7 @@ where
                 StateKey {
                     schema_key: row.schema_key.to_string(),
                     file_id: row.file_id.map(|file_id| file_id.to_string()),
-                    entity_pk: row.entity_pk.clone(),
+                    row_pk: row.row_pk.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1234,16 +1234,16 @@ where
                 .iter()
                 .enumerate()
                 .map(|(ordinal, conflict)| {
-                    Ok(WasmEntityConflict {
+                    Ok(WasmRowConflict {
                         ordinal: u32::try_from(ordinal).map_err(|_| {
                             LixError::new(
                                 LixError::CODE_INVALID_PLUGIN,
                                 "plugin conflict batch exceeds the u32 ordinal limit",
                             )
                         })?,
-                        key: WasmEntityKey::from_owned_parts(
+                        key: WasmRowKey::from_owned_parts(
                             conflict.key.schema_key.clone(),
-                            conflict.key.entity_pk.clone().into_parts(),
+                            conflict.key.row_pk.clone().into_parts(),
                         ),
                         base: stale_conflict_bytes(conflict.base.as_ref()),
                         a: stale_conflict_bytes(conflict.a.as_ref()),
@@ -1290,7 +1290,7 @@ where
                 .entry(file_id.to_owned())
                 .or_insert_with(RawWriteBatch::new)
                 .push_parts(
-                    Some(row.entity_pk.clone()),
+                    Some(row.row_pk.clone()),
                     row.schema_key.clone(),
                     row.file_id.cloned(),
                     row.snapshot.map(|snapshot| {
@@ -2003,7 +2003,7 @@ where
     /// Stages a certified dense replacement without re-entering plugin,
     /// storage-scope, or filesystem-path preparation for every logical SQL
     /// statement. The producer only issues this certificate for existing,
-    /// ordinary tracked, unfiled rows in one active-branch entity collection.
+    /// ordinary tracked, unfiled rows in one active-branch row collection.
     async fn stage_certified_parameter_batch_replace(
         &mut self,
         rows: RawWriteBatch,
@@ -2368,7 +2368,7 @@ where
                         if retain_payload {
                             return Some(write);
                         }
-                        if write.certified_entity_batches().is_empty() {
+                        if write.certified_row_batches().is_empty() {
                             return None;
                         }
                         write.retain_certified_batches_only();
@@ -2401,7 +2401,7 @@ where
                 encode_state_key(StateKeyRef {
                     schema_key: &key.schema_key,
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 })
             })
             .collect::<Vec<_>>();
@@ -2464,7 +2464,7 @@ where
                 branch_id,
                 &[StateKey {
                     schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                    entity_pk: validated_uuid_entity_pk(file_id)?,
+                    row_pk: validated_uuid_row_pk(file_id)?,
                     file_id: Some(file_id.to_owned()),
                 }],
                 false,
@@ -2521,7 +2521,7 @@ where
                     branch_id,
                     &[StateKey {
                         schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                        entity_pk: validated_uuid_entity_pk(&id)?,
+                        row_pk: validated_uuid_row_pk(&id)?,
                         file_id: None,
                     }],
                     false,
@@ -2690,7 +2690,7 @@ where
         let limits = WasmTransitionLimits::default();
         let mut actor = factory.instantiate_actor().await?;
         let cold_open_hydrates_without_render = actor.cold_open_hydrates_without_render();
-        let rows = if actor.cold_open_requires_entities() {
+        let rows = if actor.cold_open_requires_rows() {
             self.plugin_state_schema_rows(
                 &actor_key.branch_id,
                 plugin.schema_keys(),
@@ -2700,11 +2700,11 @@ where
         } else {
             Vec::<StateRow>::default()
         };
-        let entity_ordinals =
-            v2_host_entity_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
-        let entity_authorities =
-            plugin_entity_authorities_from_live_batch(plugin, &rows, &entity_ordinals);
-        let entity_count = entity_ordinals.len();
+        let row_ordinals =
+            v2_host_row_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
+        let row_authorities =
+            plugin_row_authorities_from_live_batch(plugin, &rows, &row_ordinals);
+        let row_count = row_ordinals.len();
         let VisibleMaterializationBytes::Blob { hash } = materialization.bytes;
         let materialized_bytes: crate::Blob = load_transaction_authenticated_plugin_bytes(
             &read,
@@ -2728,18 +2728,18 @@ where
                 ),
             )
         })?;
-        let source = StateRowEntitySource::new(
+        let source = StateRowRowSource::new(
             rows,
-            entity_ordinals,
+            row_ordinals,
             limits,
             actor_key.branch_id.clone(),
         )?;
         let transition = match actor
-            .open_entities(
+            .open_rows(
                 limits,
-                WasmOpenEntitiesInput {
+                WasmOpenRowsInput {
                     descriptor,
-                    entities: Box::new(source),
+                    rows: Box::new(source),
                     accepted: Some(Arc::new(ArcByteSource::new(materialized_bytes.clone()))),
                 },
             )
@@ -2751,7 +2751,7 @@ where
                 return Err(error);
             }
         };
-        let validated = match drain_entity_transition_edits(
+        let validated = match drain_row_transition_edits(
             actor.as_mut(),
             transition,
             materialized_bytes.as_ref(),
@@ -2771,7 +2771,7 @@ where
         let materialized_bytes_sha256 = validated.bytes_sha256;
         let mut counters = validated.counters;
         counters.full_state_semantic_rows_materialized =
-            u64::try_from(entity_count).unwrap_or(u64::MAX);
+            u64::try_from(row_count).unwrap_or(u64::MAX);
         counters.full_document_reparses = 1;
         counters.full_renderer_invocations = u64::from(!cold_open_hydrates_without_render);
         self.plugin_host.record_transition_counters(counters);
@@ -2784,7 +2784,7 @@ where
                 materialized_bytes,
                 materialized_bytes_sha256,
                 Arc::<str>::from(semantic_root),
-                entity_authorities,
+                row_authorities,
             )
             .await
     }
@@ -2832,26 +2832,26 @@ where
     }
 
     /// Drops `format-only` upserts that are semantically identical to the
-    /// currently accepted durable entity. The exact-row lookup keeps this
+    /// currently accepted durable row. The exact-row lookup keeps this
     /// proportional to the sparse format-only output instead of hydrating the
     /// complete file graph.
     async fn suppress_format_only_noops(
         &mut self,
         plugin: &PluginRegistryEntry,
-        changes: WasmHostEntityChanges,
+        changes: WasmHostRowChanges,
         file_key: &PluginFileWriteKey,
-    ) -> Result<(WasmHostEntityChanges, BTreeSet<WasmEntityKey>), LixError> {
+    ) -> Result<(WasmHostRowChanges, BTreeSet<WasmRowKey>), LixError> {
         let format_only_keys = changes
             .changes
             .iter()
             .filter_map(|change| match change {
-                WasmEntityChange::Upsert {
-                    entity,
+                WasmRowChange::Upsert {
+                    row,
                     effect: WasmChangeEffect::FormatOnly,
-                } => Some(entity.key.clone()),
-                WasmEntityChange::Create { .. }
-                | WasmEntityChange::Upsert { .. }
-                | WasmEntityChange::Delete(_) => None,
+                } => Some(row.key.clone()),
+                WasmRowChange::Create { .. }
+                | WasmRowChange::Upsert { .. }
+                | WasmRowChange::Delete(_) => None,
             })
             .collect::<Vec<_>>();
         if format_only_keys.is_empty() {
@@ -2863,7 +2863,7 @@ where
             .map(|key| {
                 Ok(StateKey {
                     schema_key: key.schema_key.to_string(),
-                    entity_pk: plugin_entity_pk(plugin, key)?,
+                    row_pk: plugin_row_pk(plugin, key)?,
                     file_id: Some(file_key.file_id.clone()),
                 })
             })
@@ -2889,16 +2889,16 @@ where
     }
 
     /// Materializes keyless creates and returns the one durable mutation
-    /// reservation row when this transition creates at least one entity.
+    /// reservation row when this transition creates at least one row.
     /// Existing keyed updates are checked with exact sparse authority reads.
     async fn v2_create_rows(
         &mut self,
         plugin: &PluginRegistryEntry,
-        changes: &mut WasmHostEntityChanges,
+        changes: &mut WasmHostRowChanges,
         bound: BoundCreateContext,
         file_key: &PluginFileWriteKey,
         existing_reservation: Option<&StateRow>,
-        known_existing_authorities: Option<&PluginEntityAuthorities>,
+        known_existing_authorities: Option<&PluginRowAuthorities>,
     ) -> Result<RawWriteBatch, LixError> {
         let mut validation = validate_create_changes(plugin, changes)?;
         if let Some(known) = known_existing_authorities {
@@ -2915,7 +2915,7 @@ where
             .existing_authorities
             .iter()
             .map(|key| {
-                let [id] = key.entity_pk.as_slice() else {
+                let [id] = key.row_pk.as_slice() else {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
@@ -2926,10 +2926,10 @@ where
                 };
                 Ok(StateKey {
                     schema_key: key.schema_key.to_string(),
-                    entity_pk: EntityPk::uuid_from_canonical(id).map_err(|error| {
+                    row_pk: RowPk::uuid_from_canonical(id).map_err(|error| {
                         LixError::new(
                             LixError::CODE_INVALID_PLUGIN,
-                            format!("component plugin emitted invalid entity_pk: {error}"),
+                            format!("component plugin emitted invalid row_pk: {error}"),
                         )
                     })?,
                     file_id: Some(file_key.file_id.clone()),
@@ -2988,7 +2988,7 @@ where
                     &file_key.branch_id,
                     &[StateKey {
                         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                        entity_pk: EntityPk::single(bound.reservation_key()),
+                        row_pk: RowPk::single(bound.reservation_key()),
                         file_id: Some(file_key.file_id.clone()),
                     }],
                     false,
@@ -3024,7 +3024,7 @@ where
         let mut tombstones = RawWriteBatch::with_capacity(rows.len());
         for row in rows.iter() {
             let state_key = crate::forktree::decode_state_key(&row.key)?;
-            let Ok(key) = state_key.entity_pk.as_single_string() else {
+            let Ok(key) = state_key.row_pk.as_single_string() else {
                 continue;
             };
             if is_reservation_key(key) {
@@ -3052,12 +3052,12 @@ where
         &mut self,
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
-        conflicts: Vec<WasmEntityConflict<WasmHostBytes>>,
+        conflicts: Vec<WasmRowConflict<WasmHostBytes>>,
     ) -> Result<ValidatedConflictTransition, LixError> {
         self.ensure_plugin_generation_read_guard().await;
         let expected_count = conflicts.len();
         let limits = conflict_resolution_limits(expected_count)?;
-        let source = VecEntityConflictSource::new(conflicts, limits)?;
+        let source = VecRowConflictSource::new(conflicts, limits)?;
         let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash())?;
         let factory = match self
             .plugin_host
@@ -3357,9 +3357,9 @@ where
                 .iter()
                 .map(|row| {
                     let schema_key = row
-                        .entity_pk
+                        .row_pk
                         .as_ref()
-                        .and_then(|entity_pk| entity_pk.as_single_string().ok())
+                        .and_then(|row_pk| row_pk.as_single_string().ok())
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
@@ -3410,9 +3410,9 @@ where
                 continue;
             }
             let Some(file_id) = row
-                .entity_pk
+                .row_pk
                 .as_ref()
-                .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
+                .and_then(|row_pk| row_pk.as_single_string_owned().ok())
             else {
                 continue;
             };
@@ -3466,7 +3466,7 @@ where
         // Ordinary semantic DML carries no filesystem payload. A tracked,
         // file-scoped row may nevertheless belong to an active plugin and
         // therefore needs the small branch registry lookup before the host can
-        // decide whether an entity-to-file transition is required.
+        // decide whether an row-to-file transition is required.
         for row in rows.iter().take(input_row_count) {
             if !row.global && !row.untracked && row.file_id.is_some() {
                 branch_ids.insert(row.branch_id.to_string());
@@ -3490,15 +3490,15 @@ where
         let read = self.opening_read();
 
         if !lifecycle_schema_rows.is_empty() {
-            let mut desired_schemas = BTreeMap::<(String, EntityPk), (String, JsonValue)>::new();
+            let mut desired_schemas = BTreeMap::<(String, RowPk), (String, JsonValue)>::new();
             for (lifecycle_key, row) in lifecycle_schema_keys
                 .iter()
                 .zip(lifecycle_schema_rows.iter())
             {
-                let entity_pk = row.entity_pk.cloned().ok_or_else(|| {
+                let row_pk = row.row_pk.cloned().ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "plugin schema row is missing its entity identity",
+                        "plugin schema row is missing its row identity",
                     )
                 })?;
                 let snapshot = row.snapshot.ok_or_else(|| {
@@ -3507,7 +3507,7 @@ where
                         "plugin schema row is missing its definition",
                     )
                 })?;
-                let identity = (row.branch_id.to_string(), entity_pk);
+                let identity = (row.branch_id.to_string(), row_pk);
                 let definition = snapshot.value().clone();
                 if let Some((other_plugin, other_definition)) = desired_schemas.get(&identity)
                     && other_definition != &definition
@@ -3521,24 +3521,24 @@ where
                 desired_schemas.insert(identity, (lifecycle_key.plugin_key.clone(), definition));
             }
 
-            let mut existing_schemas = BTreeMap::<(String, EntityPk), JsonValue>::new();
-            let mut desired_by_branch = BTreeMap::<String, Vec<EntityPk>>::new();
+            let mut existing_schemas = BTreeMap::<(String, RowPk), JsonValue>::new();
+            let mut desired_by_branch = BTreeMap::<String, Vec<RowPk>>::new();
             for branch_entity in desired_schemas.keys() {
                 desired_by_branch
                     .entry(branch_entity.0.clone())
                     .or_default()
                     .push(branch_entity.1.clone());
             }
-            for (branch_id, entity_pks) in desired_by_branch {
-                let keys = entity_pks
+            for (branch_id, row_pks) in desired_by_branch {
+                let keys = row_pks
                     .iter()
-                    .map(|entity_pk| StateKey {
+                    .map(|row_pk| StateKey {
                         schema_key: REGISTERED_SCHEMA_KEY.to_string(),
                         file_id: None,
-                        entity_pk: entity_pk.clone(),
+                        row_pk: row_pk.clone(),
                     })
                     .collect::<Vec<_>>();
-                for (entity_pk, row) in entity_pks
+                for (row_pk, row) in row_pks
                     .into_iter()
                     .zip(self.plugin_state_points(&branch_id, &keys, false).await?)
                 {
@@ -3547,7 +3547,7 @@ where
                         continue;
                     };
                     existing_schemas.insert(
-                        (branch_id.clone(), entity_pk),
+                        (branch_id.clone(), row_pk),
                         serde_json::from_str(snapshot.as_str()).map_err(|error| {
                             LixError::new(
                                 LixError::CODE_SCHEMA_DEFINITION,
@@ -3568,10 +3568,10 @@ where
                 {
                     continue;
                 }
-                let Some(entity_pk) = row.entity_pk.cloned() else {
+                let Some(row_pk) = row.row_pk.cloned() else {
                     continue;
                 };
-                let identity = (row.branch_id.to_string(), entity_pk);
+                let identity = (row.branch_id.to_string(), row_pk);
                 if !desired_schemas.contains_key(&identity) {
                     continue;
                 }
@@ -3603,7 +3603,7 @@ where
                     branch_id,
                     &[StateKey {
                         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+                        row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
                         file_id: None,
                     }],
                     false,
@@ -3659,9 +3659,9 @@ where
                 continue;
             }
             let Some(schema_key) = row
-                .entity_pk
+                .row_pk
                 .as_ref()
-                .and_then(|entity_pk| entity_pk.as_single_string().ok())
+                .and_then(|row_pk| row_pk.as_single_string().ok())
             else {
                 continue;
             };
@@ -3779,7 +3779,7 @@ where
                     &candidate.branch_id,
                     &[StateKey {
                         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                        entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+                        row_pk: RowPk::single(PLUGIN_OWNER_KEY),
                         file_id: Some(candidate.file_id.clone()),
                     }],
                     false,
@@ -3887,16 +3887,16 @@ where
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one write batch cannot mutate both bytes and semantic entities for component plugin file '{file_id}'"
+                        "one write batch cannot mutate both bytes and semantic rows for component plugin file '{file_id}'"
                     ),
                 )
-                .with_hint("submit either the byte mutation or the resolved entity mutations"));
+                .with_hint("submit either the byte mutation or the resolved row mutations"));
             }
             if deleted_file_keys.contains_key(&file_key) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one write batch cannot delete component plugin file '{file_id}' and mutate its semantic entities"
+                        "one write batch cannot delete component plugin file '{file_id}' and mutate its semantic rows"
                     ),
                 ));
             }
@@ -4058,7 +4058,7 @@ where
         for (key, owner) in &owners {
             // Descriptor deletion cascades file-scoped current state in the
             // head materializer. Avoid hydrating the full plugin graph only
-            // to persist one historical tombstone per semantic entity.
+            // to persist one historical tombstone per semantic row.
             if deleted_file_keys.contains_key(key) {
                 continue;
             }
@@ -4568,7 +4568,7 @@ where
                     pending.selected.schema_keys(),
                     Arc::clone(&self.sql_schema_snapshot),
                 )?;
-                append_certified_entity_changes(
+                append_certified_row_changes(
                     &mut changes,
                     &validated.certified_batches,
                     &schemas,
@@ -4583,20 +4583,20 @@ where
                         None,
                     )
                     .await?;
-                let entity_authorities = plugin_entity_authorities_from_transition(
+                let row_authorities = plugin_row_authorities_from_transition(
                     &pending.selected,
                     &changes,
                     &validated.certified_batches,
                 )?;
                 file_content[pending.file_index]
-                    .set_certified_entity_batches(validated.certified_batches);
+                    .set_certified_row_batches(validated.certified_batches);
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
                     .get(&pending.file_key)
                     .copied()
                     .unwrap_or(0);
                 counters.full_document_reparses = 1;
-                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
+                counters.durable_semantic_changes = u64::try_from(changes.row_change_count())
                     .unwrap_or(u64::MAX)
                     .saturating_add(certified_row_count);
                 self.plugin_host.record_transition_counters(counters);
@@ -4635,7 +4635,7 @@ where
                         document: validated.document,
                         bytes: pending.submitted_bytes,
                         semantic_root: Arc::from(pending.materialization_version),
-                        entity_authorities,
+                        row_authorities,
                         view: pending.view,
                     });
                 reconciled_file_keys.insert(pending.file_key);
@@ -5000,8 +5000,8 @@ where
                             };
                             let restored_checkpoint =
                                 decoded_checkpoint.is_some() || durable_document.is_some();
-                            let mut cold_base_authorities: PluginEntityAuthorities =
-                                PluginEntityAuthorities::empty();
+                            let mut cold_base_authorities: PluginRowAuthorities =
+                                PluginRowAuthorities::empty();
                             let transition_result = if let Some(checkpoint) = decoded_checkpoint {
                                 drop(read);
                                 let document = actor.restore_document(&checkpoint).await?;
@@ -5057,27 +5057,27 @@ where
                                     .await
                                     .map(|transition| (transition, 0))
                             } else {
-                                let entity_rows = self
+                                let row_rows = self
                                     .plugin_state_schema_rows(
                                         &actor_key.branch_id,
                                         selected.schema_keys(),
                                         Some(&actor_key.file_id),
                                     )
                                     .await?;
-                                let entity_ordinals = v2_host_entity_ordinals_from_live_batch(
-                                    &entity_rows,
+                                let row_ordinals = v2_host_row_ordinals_from_live_batch(
+                                    &row_rows,
                                     &file_key,
                                     selected.schema_keys(),
                                 )?;
-                                let entity_count = entity_ordinals.len();
-                                cold_base_authorities = plugin_entity_authorities_from_live_batch(
+                                let row_count = row_ordinals.len();
+                                cold_base_authorities = plugin_row_authorities_from_live_batch(
                                     selected,
-                                    &entity_rows,
-                                    &entity_ordinals,
+                                    &row_rows,
+                                    &row_ordinals,
                                 );
-                                let entity_source = StateRowEntitySource::new(
-                                    entity_rows,
-                                    entity_ordinals,
+                                let row_source = StateRowRowSource::new(
+                                    row_rows,
+                                    row_ordinals,
                                     cold_limits,
                                     actor_key.branch_id.clone(),
                                 )?;
@@ -5094,7 +5094,7 @@ where
                                                 submitted_bytes.clone(),
                                             )),
                                             creates,
-                                            entities: Box::new(entity_source),
+                                            rows: Box::new(row_source),
                                         },
                                     )
                                     .instrument(tracing::debug_span!(
@@ -5102,9 +5102,9 @@ where
                                         "lix.perf.plugin_cold_file_changed"
                                     ))
                                     .await
-                                    .map(|transition| (transition, entity_count))
+                                    .map(|transition| (transition, row_count))
                             };
-                            let (transition, entity_count) = match transition_result {
+                            let (transition, row_count) = match transition_result {
                                 Ok(transition) => transition,
                                 Err(error) => {
                                     let _ = actor.retire().await;
@@ -5135,11 +5135,11 @@ where
                                 .iter()
                                 .map(|batch| batch.row_count)
                                 .sum::<u64>();
-                            write.set_certified_entity_batches(validated.certified_batches);
+                            write.set_certified_row_batches(validated.certified_batches);
                             let mut changes = validated.changes;
-                            append_certified_entity_changes(
+                            append_certified_row_changes(
                                 &mut changes,
-                                write.certified_entity_batches(),
+                                write.certified_row_batches(),
                                 &schemas,
                             )?;
                             let (filtered, observed_existing_authorities) = self
@@ -5147,7 +5147,7 @@ where
                                 .await?;
                             changes = filtered;
                             let observed_existing_authorities =
-                                PluginEntityAuthorities::from_keys(observed_existing_authorities);
+                                PluginRowAuthorities::from_keys(observed_existing_authorities);
                             let create_rows = self
                                 .v2_create_rows(
                                     selected,
@@ -5158,11 +5158,11 @@ where
                                     Some(&observed_existing_authorities),
                                 )
                                 .await?;
-                            let entity_authorities = plugin_entity_authorities_after_transition(
+                            let row_authorities = plugin_row_authorities_after_transition(
                                 selected,
                                 &cold_base_authorities,
                                 &changes,
-                                write.certified_entity_batches(),
+                                write.certified_row_batches(),
                             )?;
                             let mut counters = validated.counters;
                             counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
@@ -5172,12 +5172,12 @@ where
                                     .copied()
                                     .unwrap_or(0);
                             counters.full_state_semantic_rows_materialized =
-                                u64::try_from(entity_count).unwrap_or(u64::MAX);
+                                u64::try_from(row_count).unwrap_or(u64::MAX);
                             counters.private_document_cache_hits = u64::from(restored_checkpoint);
                             counters.full_document_reparses = u64::from(!restored_checkpoint);
                             counters.full_renderer_invocations = 0;
                             counters.durable_semantic_changes =
-                                u64::try_from(changes.entity_change_count())
+                                u64::try_from(changes.row_change_count())
                                     .unwrap_or(u64::MAX)
                                     .saturating_add(certified_row_count);
                             self.plugin_host.record_transition_counters(counters);
@@ -5196,7 +5196,7 @@ where
                                     document: validated.document,
                                     bytes: submitted_bytes.clone(),
                                     semantic_root: Arc::from(materialization_version.clone()),
-                                    entity_authorities,
+                                    row_authorities,
                                     view,
                                 },
                                 submitted_bytes.clone(),
@@ -5356,12 +5356,12 @@ where
                         .iter()
                         .map(|batch| batch.row_count)
                         .sum::<u64>();
-                    write.set_certified_entity_batches(
+                    write.set_certified_row_batches(
                         detected_transition.certified_batches.clone(),
                     );
                     let detection_document = detected_transition.document;
                     let mut counters = detected_transition.counters;
-                    let accepted_entity_authorities = lease.accepted_entity_authorities().clone();
+                    let accepted_row_authorities = lease.accepted_row_authorities().clone();
                     let (mut changes, _observed_existing_authorities) = match self
                         .suppress_format_only_noops(
                             selected,
@@ -5384,7 +5384,7 @@ where
                             return Err(lease.handle_guest_call_error(error));
                         }
                     };
-                    append_certified_entity_changes(
+                    append_certified_row_changes(
                         &mut changes,
                         &detected_transition.certified_batches,
                         &schemas,
@@ -5396,7 +5396,7 @@ where
                             create_context,
                             &file_key,
                             existing_create_reservation.as_ref(),
-                            Some(&accepted_entity_authorities),
+                            Some(&accepted_row_authorities),
                         )
                         .instrument(tracing::debug_span!(
                             target: "lix_perf",
@@ -5414,9 +5414,9 @@ where
                             return Err(lease.handle_guest_call_error(error));
                         }
                     };
-                    let successor_entity_authorities = plugin_entity_authorities_after_transition(
+                    let successor_row_authorities = plugin_row_authorities_after_transition(
                         selected,
-                        &accepted_entity_authorities,
+                        &accepted_row_authorities,
                         &changes,
                         &detected_transition.certified_batches,
                     )?;
@@ -5444,7 +5444,7 @@ where
                             // Detection happened against a historical session
                             // document. Apply its sparse merge-resolved delta to
                             // the actor's current accepted document so concurrent
-                            // different-entity edits compose and same-entity edits
+                            // different-row edits compose and same-row edits
                             // obey transaction commit order.
                             if let Err(error) =
                                 lease.actor_mut().drop_document(detection_document).await
@@ -5454,7 +5454,7 @@ where
                             let current_document = lease.accepted_document();
                             let current_bytes = lease.accepted_bytes();
                             let change_source =
-                                match VecEntityChangeSource::new(changes.clone(), limits) {
+                                match VecRowChangeSource::new(changes.clone(), limits) {
                                     Ok(source) => source,
                                     Err(error) => {
                                         return Err(lease.handle_guest_call_error(error));
@@ -5467,10 +5467,10 @@ where
                                 };
                             let renderer_transition = match lease
                                 .actor_mut()
-                                .entities_changed(
+                                .rows_changed(
                                     renderer_input,
                                     limits,
-                                    WasmEntityUpdate {
+                                    WasmRowUpdate {
                                         before_descriptor,
                                         after_descriptor,
                                         before: Arc::new(ArcByteSource::new(current_bytes.clone())),
@@ -5482,7 +5482,7 @@ where
                                 Ok(transition) => transition,
                                 Err(error) => return Err(lease.handle_guest_call_error(error)),
                             };
-                            let rendered_transition = match drain_entity_transition_edits(
+                            let rendered_transition = match drain_row_transition_edits(
                                 lease.actor_mut(),
                                 renderer_transition,
                                 &current_bytes,
@@ -5515,7 +5515,7 @@ where
                         .unwrap_or(0);
                     counters.private_document_cache_hits = 1;
                     counters.durable_semantic_changes =
-                        u64::try_from(changes.entity_change_count())
+                        u64::try_from(changes.row_change_count())
                             .unwrap_or(u64::MAX)
                             .saturating_add(certified_row_count);
                     self.plugin_host.record_transition_counters(counters);
@@ -5534,7 +5534,7 @@ where
                         materialized_bytes_sha256,
                         materialization_version.clone(),
                     )?;
-                    lease.set_successor_entity_authorities(successor_entity_authorities)?;
+                    lease.set_successor_row_authorities(successor_row_authorities)?;
                     (
                         changes,
                         PendingPluginActorPublication::Existing {
@@ -5595,7 +5595,7 @@ where
                     .map(|batch| batch.row_count)
                     .sum::<u64>();
                 let mut changes = validated.changes;
-                append_certified_entity_changes(
+                append_certified_row_changes(
                     &mut changes,
                     &validated.certified_batches,
                     &schemas,
@@ -5614,19 +5614,19 @@ where
                         "lix.perf.plugin_create_rows"
                     ))
                     .await?;
-                let entity_authorities = plugin_entity_authorities_from_transition(
+                let row_authorities = plugin_row_authorities_from_transition(
                     selected,
                     &changes,
                     &validated.certified_batches,
                 )?;
-                write.set_certified_entity_batches(validated.certified_batches);
+                write.set_certified_row_batches(validated.certified_batches);
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
                     .get(&file_key)
                     .copied()
                     .unwrap_or(0);
                 counters.full_document_reparses = 1;
-                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
+                counters.durable_semantic_changes = u64::try_from(changes.row_change_count())
                     .unwrap_or(u64::MAX)
                     .saturating_add(certified_row_count);
                 self.plugin_host.record_transition_counters(counters);
@@ -5640,7 +5640,7 @@ where
                         document: validated.document,
                         bytes: submitted_bytes.clone(),
                         semantic_root: Arc::from(materialization_version.clone()),
-                        entity_authorities,
+                        row_authorities,
                         view,
                     },
                     submitted_bytes.clone(),
@@ -5785,10 +5785,10 @@ where
             }
             let limits = WasmTransitionLimits::default();
             let changes = v2_host_changes_from_prepared_rows(&prepared, limits)?;
-            if changes.entity_change_count() == 0 {
+            if changes.row_change_count() == 0 {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    "component semantic write batch must contain at least one entity change",
+                    "component semantic write batch must contain at least one row change",
                 ));
             }
             let view = PendingPluginActorView {
@@ -5825,11 +5825,11 @@ where
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "semantic entity writes cannot follow a byte or identity transition for component plugin file '{}' in the same transaction",
+                            "semantic row writes cannot follow a byte or identity transition for component plugin file '{}' in the same transaction",
                             file_key.file_id
                         ),
                     )
-                    .with_hint("commit the byte transition before editing semantic entities"));
+                    .with_hint("commit the byte transition before editing semantic rows"));
                 }
                 None => {
                     let cache = self.plugin_host.actor_cache().clone();
@@ -6455,7 +6455,7 @@ where
         debug_assert!(
             fallback_row
                 .as_ref()
-                .is_none_or(|row| row.entity_pk.as_single_string().ok() == Some(primary_key))
+                .is_none_or(|row| row.row_pk.as_single_string().ok() == Some(primary_key))
         );
         let origin_key = self.origin_key.clone();
         let functions = self.functions.clone();
@@ -6643,11 +6643,11 @@ where
             self.prepared_mutation_program
                 .as_ref()
                 .and_then(|(_, program)| program.primary_key(params).ok())
-                .is_none_or(|entity_pk| {
+                .is_none_or(|row_pk| {
                     self.mutation_journal
                         .as_ref()
                         .and_then(TransactionMutationJournal::last_identity)
-                        .is_none_or(|last| last < entity_pk)
+                        .is_none_or(|last| last < row_pk)
                 })
         } else {
             false
@@ -6739,7 +6739,7 @@ where
                 "non-empty transaction mutation journal has no lifecycle timestamp",
             )
         })?;
-        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identitys(
             journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),
@@ -6805,16 +6805,16 @@ where
         let schema_key = descriptor.schema_key().to_owned();
         let branch_id = descriptor.branch_id().to_owned();
         let row_count = descriptor
-            .entity_pk_chunks()
+            .row_pk_chunks()
             .iter()
             .map(|chunk| chunk.len())
             .sum();
         let mut predecessors = Vec::with_capacity(row_count);
         let forktree = self.forktree_read_facade();
-        for entity_pks in descriptor.entity_pk_chunks() {
+        for row_pks in descriptor.row_pk_chunks() {
             let current =
-                load_opening_state_points(&forktree, &schema_key, &branch_id, entity_pks).await?;
-            for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+                load_opening_state_points(&forktree, &schema_key, &branch_id, row_pks).await?;
+            for (slot, expected_row_pk) in row_pks.iter().enumerate() {
                 let row = current.get(slot).and_then(Option::as_ref).ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -6823,7 +6823,7 @@ where
                 })?;
                 let decoded_key = crate::forktree::decode_state_key(&row.key)?;
                 if decoded_key.schema_key != schema_key
-                    || decoded_key.entity_pk != *expected_entity_pk
+                    || decoded_key.row_pk != *expected_row_pk
                     || matches!(row.value.cell, StateCell::Tombstone)
                 {
                     return Err(LixError::new(
@@ -6843,17 +6843,17 @@ where
         &mut self,
         mut chunk: ImmutableMutationJournalChunk,
     ) -> Result<ImmutableMutationJournalChunk, LixError> {
-        let entity_pks = chunk.materialized_entity_pks();
+        let row_pks = chunk.materialized_row_pks();
         let forktree = self.forktree_read_facade();
         let current = load_opening_state_points(
             &forktree,
             chunk.schema_key(),
             chunk.branch_id(),
-            &entity_pks,
+            &row_pks,
         )
         .await?;
-        let mut predecessors = Vec::with_capacity(entity_pks.len());
-        for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+        let mut predecessors = Vec::with_capacity(row_pks.len());
+        for (slot, expected_row_pk) in row_pks.iter().enumerate() {
             let row = current.get(slot).and_then(Option::as_ref).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -6862,7 +6862,7 @@ where
             })?;
             let decoded_key = crate::forktree::decode_state_key(&row.key)?;
             if decoded_key.schema_key != chunk.schema_key()
-                || decoded_key.entity_pk != *expected_entity_pk
+                || decoded_key.row_pk != *expected_row_pk
                 || matches!(row.value.cell, StateCell::Tombstone)
             {
                 return Err(LixError::new(
@@ -7031,7 +7031,7 @@ where
     /// Applies a tracked-state transition resolved from two immutable commits.
     ///
     /// This is the internal counterpart to the public diff command. The
-    /// caller supplies typed identities instead of user-facing `diff_id`
+    /// caller supplies typed identitys instead of user-facing `diff_id`
     /// strings. The transaction's coherent opening head certifies the current
     /// side, so undo/redo does not need to reload visible live state after it
     /// has already read that exact historical root.
@@ -7086,7 +7086,7 @@ where
         if unique.len() != keys.len() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
-                "typed tracked-state transition contains more than one row for the same entity",
+                "typed tracked-state transition contains more than one row for the same row",
             ));
         }
 
@@ -7095,7 +7095,7 @@ where
             .map(|identity| StateKey {
                 schema_key: identity.schema_key.clone(),
                 file_id: identity.file_id.clone(),
-                entity_pk: identity.entity_pk.clone(),
+                row_pk: identity.row_pk.clone(),
             })
             .collect::<Vec<_>>();
         let current_rows = facade
@@ -7111,7 +7111,7 @@ where
             for row in [current, desired].into_iter().flatten() {
                 if row.key.schema_key != identity.schema_key
                     || row.key.file_id != identity.file_id
-                    || row.key.entity_pk != identity.entity_pk
+                    || row.key.row_pk != identity.row_pk
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -7190,7 +7190,7 @@ where
                 None => (None, None, false),
             };
             rows.push(TransactionWriteRow {
-                entity_pk: Some(transition.identity.entity_pk),
+                row_pk: Some(transition.identity.row_pk),
                 schema_key: transition.identity.schema_key.into(),
                 file_id: transition.identity.file_id.map(Into::into),
                 snapshot,
@@ -7251,7 +7251,7 @@ where
         drop(forktree_reader);
         drop(read);
         let branch_id = self.active_branch_id.clone();
-        let mut identities = BTreeSet::new();
+        let mut identitys = BTreeSet::new();
         let mut plans = Vec::with_capacity(selections.len());
         for (diff_id, sides) in selections {
             let before = sides
@@ -7273,13 +7273,13 @@ where
             {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    format!("diff_id '{diff_id}' joins changes for different entities"),
+                    format!("diff_id '{diff_id}' joins changes for different rows"),
                 ));
             }
-            if !identities.insert(identity.clone()) {
+            if !identitys.insert(identity.clone()) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "diff command selection contains more than one row for the same entity",
+                    "diff command selection contains more than one row for the same row",
                 ));
             }
             let (expected, target) = match command {
@@ -7291,11 +7291,11 @@ where
         }
         let state_keys = plans
             .iter()
-            .map(|(_, (schema_key, entity_pk, file_id), _, _)| {
+            .map(|(_, (schema_key, row_pk, file_id), _, _)| {
                 encode_state_key(StateKeyRef {
                     schema_key,
                     file_id: file_id.as_deref(),
-                    entity_pk,
+                    row_pk,
                 })
             })
             .collect::<Vec<_>>();
@@ -7311,7 +7311,7 @@ where
             })?;
         let mut target_change_ids = Vec::new();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
-        for ((diff_id, (schema_key, entity_pk, file_id), expected, target), current_tracked) in
+        for ((diff_id, (schema_key, row_pk, file_id), expected, target), current_tracked) in
             plans.into_iter().zip(current_tracked)
         {
             let current_matches = match expected {
@@ -7330,7 +7330,7 @@ where
                 target_change_ids.push(target);
             } else {
                 rows.push(TransactionWriteRow {
-                    entity_pk: Some(entity_pk),
+                    row_pk: Some(row_pk),
                     schema_key: schema_key.into(),
                     file_id: file_id.map(Into::into),
                     snapshot: None,
@@ -7361,7 +7361,7 @@ where
                     )
                 })?;
                 rows.push(TransactionWriteRow {
-                    entity_pk: Some(identity.entity_pk),
+                    row_pk: Some(identity.row_pk),
                     schema_key: identity.schema_key.into(),
                     file_id: identity.file_id.map(Into::into),
                     snapshot: parse_materialized_diff_json(
@@ -7566,14 +7566,14 @@ async fn load_immutable_mutation_predecessors(
     forktree: &ForkTreeReadFacade<impl StorageAdapterRead + Clone + 'static>,
     schema_key: &str,
     branch_id: &str,
-    entity_pk_chunks: &[Arc<[EntityPk]>],
+    row_pk_chunks: &[Arc<[RowPk]>],
 ) -> Result<Vec<CertifiedStatePredecessor>, LixError> {
-    let row_count = entity_pk_chunks.iter().map(|chunk| chunk.len()).sum();
+    let row_count = row_pk_chunks.iter().map(|chunk| chunk.len()).sum();
     let mut predecessors = Vec::with_capacity(row_count);
-    for entity_pks in entity_pk_chunks {
+    for row_pks in row_pk_chunks {
         let current =
-            load_opening_state_points(forktree, schema_key, branch_id, entity_pks).await?;
-        for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+            load_opening_state_points(forktree, schema_key, branch_id, row_pks).await?;
+        for (slot, expected_row_pk) in row_pks.iter().enumerate() {
             let row = current.get(slot).and_then(Option::as_ref).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -7582,7 +7582,7 @@ async fn load_immutable_mutation_predecessors(
             })?;
             let decoded_key = crate::forktree::decode_state_key(&row.key)?;
             if decoded_key.schema_key != schema_key
-                || decoded_key.entity_pk != *expected_entity_pk
+                || decoded_key.row_pk != *expected_row_pk
                 || matches!(row.value.cell, StateCell::Tombstone)
             {
                 return Err(LixError::new(
@@ -7693,26 +7693,26 @@ async fn load_opening_state_points(
     forktree: &ForkTreeReadFacade<impl StorageAdapterRead + Clone + 'static>,
     schema_key: &str,
     branch_id: &str,
-    entity_pks: &[EntityPk],
+    row_pks: &[RowPk],
 ) -> Result<Vec<Option<crate::state::StateRow>>, LixError> {
     let view = ForkTreeStateView::from_facade((*forktree).clone(), branch_id).await?;
-    let keys = entity_pks
+    let keys = row_pks
         .iter()
-        .map(|entity_pk| {
+        .map(|row_pk| {
             encode_state_key(StateKeyRef {
                 schema_key,
                 file_id: None,
-                entity_pk,
+                row_pk,
             })
         })
         .collect::<Vec<_>>();
     Ok(view.points(&keys, true).await?)
 }
 
-fn diff_record_identity(record: &ChangeRecord) -> (String, EntityPk, Option<String>) {
+fn diff_record_identity(record: &ChangeRecord) -> (String, RowPk, Option<String>) {
     (
         record.schema_key.clone(),
-        record.entity_pk.clone(),
+        record.row_pk.clone(),
         record.file_id.clone(),
     )
 }
@@ -8073,10 +8073,10 @@ fn plan_prepared_row_scalars(
         Some(created_at) => parse_prepared_timestamp("created_at", created_at)?,
         None => updated_at,
     };
-    if row.entity_pk.is_none() {
+    if row.row_pk.is_none() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "normalized transaction write row is missing entity_pk",
+            "normalized transaction write row is missing row_pk",
         ));
     }
     let addressable_change_id = row.change_id.is_none();
@@ -8127,9 +8127,9 @@ mod certified_change_id_tests {
         };
         CertifiedParameterReplacementBatch::new(
             vec![
-                EntityPk::single("row-a"),
-                EntityPk::single("row-b"),
-                EntityPk::single("row-c"),
+                RowPk::single("row-a"),
+                RowPk::single("row-b"),
+                RowPk::single("row-c"),
             ],
             ["a", "b", "c"]
                 .into_iter()
@@ -8178,7 +8178,7 @@ mod certified_change_id_tests {
         assert_eq!(
             prepared
                 .iter()
-                .map(|row| row.entity_pk.as_single_string().expect("single key"))
+                .map(|row| row.row_pk.as_single_string().expect("single key"))
                 .collect::<Vec<_>>(),
             vec!["row-a", "row-b", "row-c"]
         );
@@ -8244,16 +8244,16 @@ fn push_prepared_state_row_from_planned_parts(
         .take_metadata(row_index)
         .map(|value| stage_json_from_value(value, "prepared row metadata"))
         .transpose()?;
-    let entity_pk = rows.take_entity_pk(row_index).ok_or_else(|| {
+    let row_pk = rows.take_row_pk(row_index).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "normalized transaction write row is missing entity_pk",
+            "normalized transaction write row is missing row_pk",
         )
     })?;
     prepared.push_parts_with_change_addressability(
         scalar.schema_plan_id,
         scalar.facts,
-        entity_pk,
+        row_pk,
         schema_key,
         file_id,
         snapshot,
@@ -8276,7 +8276,7 @@ fn push_prepared_state_row_from_planned_parts(
 }
 
 /// Returns the sole schema-catalog scope for a straightforward statement
-/// batch. The SQL path normally reaches this with one entity schema and one
+/// batch. The SQL path normally reaches this with one row schema and one
 /// durability, so it can normalize rows in input order without allocating the
 /// generic scope/reordering maps. Schema registration stays on the generic
 /// path because registrations can change the catalog for later rows.
@@ -8502,9 +8502,9 @@ where
             return Ok(Some(generation.live_count));
         }
         let view = ForkTreeStateView::from_facade(self.forktree_read_facade(), branch_id).await?;
-        let bounds = crate::forktree::encode_state_entity_prefix_bounds(
+        let bounds = crate::forktree::encode_state_row_prefix_bounds(
             scope.schema_key,
-            &EntityPk::empty(),
+            &RowPk::empty(),
         );
         let rows = view
             .range(Some(&bounds.lower), bounds.upper.as_deref(), None, false)
@@ -8775,7 +8775,7 @@ where
         let expected_ordered_identity_digest = rows.expected_ordered_identity_digest;
         let schema_key = rows.schema_key.clone();
         let branch_id = rows.branch_id.clone();
-        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identitys(
             rows.schema_plan_id,
             rows.schema_key,
             rows.branch_id,
@@ -8991,7 +8991,7 @@ fn decode_visible_materialization_parts(
                     generation: checkpoint.generation,
                     semantic_root: checkpoint.semantic_root,
                     runtime: runtime.into(),
-                    authorities: PluginEntityAuthorities::decode_checkpoint(&authority)?,
+                    authorities: PluginRowAuthorities::decode_checkpoint(&authority)?,
                 })
             })
             .transpose()?
@@ -9068,7 +9068,7 @@ fn v2_actor_key_is_descriptor_successor(
 fn append_plugin_change_rows(
     rows: &mut RawWriteBatch,
     plugin: &PluginRegistryEntry,
-    changes: WasmHostEntityChanges,
+    changes: WasmHostRowChanges,
     file_id: &str,
     context: &FilesystemRowContext,
 ) -> Result<(), LixError> {
@@ -9077,7 +9077,7 @@ fn append_plugin_change_rows(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    rows.reserve(changes.entity_change_count());
+    rows.reserve(changes.row_change_count());
     let mut interned_schema_keys = BTreeMap::<SharedStr, SharedStr>::new();
     let file_id = SharedStr::from(file_id);
     let branch_id = SharedStr::from(context.branch_id.as_str());
@@ -9087,15 +9087,15 @@ fn append_plugin_change_rows(
     let format_only_metadata = v2_format_only_metadata();
     for change in changes.changes {
         let (key, snapshot_content, effect) = match change {
-            WasmEntityChange::Create { .. } => {
+            WasmRowChange::Create { .. } => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "keyless create was not materialized before transaction staging",
                 ));
             }
-            WasmEntityChange::Delete(key) => (key, None, WasmChangeEffect::Content),
-            WasmEntityChange::Upsert { entity, effect } => {
-                let snapshot = match entity.snapshot_content {
+            WasmRowChange::Delete(key) => (key, None, WasmChangeEffect::Content),
+            WasmRowChange::Upsert { row, effect } => {
+                let snapshot = match row.snapshot_content {
                     WasmHostBytes::CanonicalJson(json) => {
                         TransactionJson::from_canonical_batch(json)
                     }
@@ -9106,10 +9106,10 @@ fn append_plugin_change_rows(
                         ));
                     }
                 };
-                (entity.key, Some(snapshot), effect)
+                (row.key, Some(snapshot), effect)
             }
         };
-        let entity_pk = plugin_entity_pk(plugin, &key)?;
+        let row_pk = plugin_row_pk(plugin, &key)?;
         let schema_key = interned_schema_keys
             .entry(key.schema_key)
             .or_insert_with_key(|key| key.as_str().into())
@@ -9125,7 +9125,7 @@ fn append_plugin_change_rows(
             ));
         }
         rows.push_parts(
-            Some(entity_pk),
+            Some(row_pk),
             schema_key,
             Some(file_id.clone()),
             snapshot_content,
@@ -9143,29 +9143,29 @@ fn append_plugin_change_rows(
     Ok(())
 }
 
-fn append_certified_entity_changes(
-    changes: &mut WasmHostEntityChanges,
-    batches: &[WasmCertifiedEntityBatch],
+fn append_certified_row_changes(
+    changes: &mut WasmHostRowChanges,
+    batches: &[WasmCertifiedRowBatch],
     schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     for batch in batches {
         changes
             .changes
-            .extend(crate::plugin::materialize_certified_entity_batch(batch, schemas)?.changes);
+            .extend(crate::plugin::materialize_certified_row_batch(batch, schemas)?.changes);
     }
     changes.validate()
 }
 
-fn plugin_entity_pk(
+fn plugin_row_pk(
     plugin: &PluginRegistryEntry,
-    key: &WasmEntityKey,
-) -> Result<EntityPk, LixError> {
+    key: &WasmRowKey,
+) -> Result<RowPk, LixError> {
     let result = if plugin
         .create_schema_keys()
         .binary_search_by(|candidate| candidate.as_str().cmp(key.schema_key.as_str()))
         .is_ok()
     {
-        let [id] = key.entity_pk.as_slice() else {
+        let [id] = key.row_pk.as_slice() else {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
@@ -9174,14 +9174,14 @@ fn plugin_entity_pk(
                 ),
             ));
         };
-        EntityPk::uuid_from_canonical(id)
+        RowPk::uuid_from_canonical(id)
     } else {
-        EntityPk::from_shared_parts(key.entity_pk.iter().cloned())
+        RowPk::from_shared_parts(key.row_pk.iter().cloned())
     };
     result.map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
-            format!("component plugin emitted invalid entity_pk: {error}"),
+            format!("component plugin emitted invalid row_pk: {error}"),
         )
     })
 }
@@ -9193,55 +9193,55 @@ fn plugin_schema_is_creatable(plugin: &PluginRegistryEntry, schema_key: &str) ->
         .is_ok()
 }
 
-fn plugin_entity_authorities_after_changes(
+fn plugin_row_authorities_after_changes(
     plugin: &PluginRegistryEntry,
-    base: &PluginEntityAuthorities,
-    changes: &WasmHostEntityChanges,
-) -> PluginEntityAuthorities {
+    base: &PluginRowAuthorities,
+    changes: &WasmHostRowChanges,
+) -> PluginRowAuthorities {
     let mut inserted = BTreeSet::new();
     let mut removed = BTreeSet::new();
     for change in &changes.changes {
         match change {
-            WasmEntityChange::Upsert { entity, .. }
-                if plugin_schema_is_creatable(plugin, &entity.key.schema_key) =>
+            WasmRowChange::Upsert { row, .. }
+                if plugin_schema_is_creatable(plugin, &row.key.schema_key) =>
             {
-                removed.remove(&entity.key);
-                inserted.insert(entity.key.clone());
+                removed.remove(&row.key);
+                inserted.insert(row.key.clone());
             }
-            WasmEntityChange::Delete(key)
+            WasmRowChange::Delete(key)
                 if plugin_schema_is_creatable(plugin, &key.schema_key) =>
             {
                 inserted.remove(key);
                 removed.insert(key.clone());
             }
-            WasmEntityChange::Create { .. }
-            | WasmEntityChange::Upsert { .. }
-            | WasmEntityChange::Delete(_) => {}
+            WasmRowChange::Create { .. }
+            | WasmRowChange::Upsert { .. }
+            | WasmRowChange::Delete(_) => {}
         }
     }
     base.with_delta(inserted, removed)
 }
 
-fn plugin_entity_authorities_from_transition(
+fn plugin_row_authorities_from_transition(
     plugin: &PluginRegistryEntry,
-    changes: &WasmHostEntityChanges,
-    certified_batches: &[WasmCertifiedEntityBatch],
-) -> Result<PluginEntityAuthorities, LixError> {
-    plugin_entity_authorities_after_transition(
+    changes: &WasmHostRowChanges,
+    certified_batches: &[WasmCertifiedRowBatch],
+) -> Result<PluginRowAuthorities, LixError> {
+    plugin_row_authorities_after_transition(
         plugin,
-        &PluginEntityAuthorities::empty(),
+        &PluginRowAuthorities::empty(),
         changes,
         certified_batches,
     )
 }
 
-fn plugin_entity_authorities_after_transition(
+fn plugin_row_authorities_after_transition(
     plugin: &PluginRegistryEntry,
-    prior: &PluginEntityAuthorities,
-    changes: &WasmHostEntityChanges,
-    certified_batches: &[WasmCertifiedEntityBatch],
-) -> Result<PluginEntityAuthorities, LixError> {
-    let empty = PluginEntityAuthorities::empty();
+    prior: &PluginRowAuthorities,
+    changes: &WasmHostRowChanges,
+    certified_batches: &[WasmCertifiedRowBatch],
+) -> Result<PluginRowAuthorities, LixError> {
+    let empty = PluginRowAuthorities::empty();
     let base = if certified_batches
         .iter()
         .any(|batch| batch.complete_file_state)
@@ -9250,14 +9250,14 @@ fn plugin_entity_authorities_after_transition(
     } else {
         prior
     };
-    let base = plugin_entity_authorities_after_changes(plugin, base, changes);
+    let base = plugin_row_authorities_after_changes(plugin, base, changes);
     let mut ranges = Vec::new();
     for batch in certified_batches {
         for range in &batch.create_ranges {
             if !plugin_schema_is_creatable(plugin, &range.schema_key) {
                 continue;
             }
-            ranges.push(PluginEntityAuthorityRange::new(
+            ranges.push(PluginRowAuthorityRange::new(
                 range.schema_key.clone(),
                 batch.creates,
                 range.first_local_ref,
@@ -9268,32 +9268,32 @@ fn plugin_entity_authorities_after_transition(
     Ok(base.with_ranges(ranges))
 }
 
-fn plugin_entity_authorities_from_live_batch(
+fn plugin_row_authorities_from_live_batch(
     plugin: &PluginRegistryEntry,
     rows: &Vec<StateRow>,
     ordinals: &[u32],
-) -> PluginEntityAuthorities {
-    PluginEntityAuthorities::from_keys(
+) -> PluginRowAuthorities {
+    PluginRowAuthorities::from_keys(
         ordinals
             .iter()
             .filter_map(|ordinal| {
                 let row = rows.get(*ordinal as usize)?;
                 let key = decode_state_key(&row.key).ok()?;
                 plugin_schema_is_creatable(plugin, &key.schema_key).then(|| {
-                    WasmEntityKey::from_owned_parts(key.schema_key, key.entity_pk.into_parts())
+                    WasmRowKey::from_owned_parts(key.schema_key, key.row_pk.into_parts())
                 })
             })
             .collect(),
     )
 }
 
-fn v2_host_entities_from_live_batch_ordinals(
+fn v2_host_rows_from_live_batch_ordinals(
     rows: &Vec<StateRow>,
     ordinals: &[u32],
     limits: WasmTransitionLimits,
     branch_id: &str,
-) -> Result<Vec<WasmHostEntity>, LixError> {
-    let mut entities = Vec::with_capacity(ordinals.len());
+) -> Result<Vec<WasmHostRow>, LixError> {
+    let mut host_rows = Vec::with_capacity(ordinals.len());
     for ordinal in ordinals {
         let row = rows.get(*ordinal as usize).ok_or_else(|| {
             LixError::new(
@@ -9305,25 +9305,25 @@ fn v2_host_entities_from_live_batch_ordinals(
             continue;
         };
         let key = decode_state_key(&row.key)?;
-        entities.push(host_entity_with_lazy_snapshot(
-            WasmEntityKey::from_owned_parts(key.schema_key, key.entity_pk.into_parts()),
+        host_rows.push(host_row_with_lazy_snapshot(
+            WasmRowKey::from_owned_parts(key.schema_key, key.row_pk.into_parts()),
             snapshot_content.as_bytes().to_vec().into(),
             limits,
         )?);
     }
-    entities.sort_by(|left, right| left.key.cmp(&right.key));
-    for pair in entities.windows(2) {
+    host_rows.sort_by(|left, right| left.key.cmp(&right.key));
+    for pair in host_rows.windows(2) {
         if pair[0].key == pair[1].key {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "durable component entity hydration returned duplicate keys",
+                "durable component row hydration returned duplicate keys",
             ));
         }
     }
-    Ok(entities)
+    Ok(host_rows)
 }
 
-fn v2_host_entity_ordinals_from_live_batch(
+fn v2_host_row_ordinals_from_live_batch(
     rows: &Vec<StateRow>,
     file_key: &PluginFileWriteKey,
     schema_keys: &[String],
@@ -9356,15 +9356,15 @@ fn v2_host_entity_ordinals_from_live_batch(
             .expect("authenticated state key was decoded during selection");
         left.schema_key
             .cmp(&right.schema_key)
-            .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+            .then_with(|| left.row_pk.cmp(&right.row_pk))
     });
     for pair in ordinals.windows(2) {
         let left = decode_state_key(&rows[pair[0] as usize].key)?;
         let right = decode_state_key(&rows[pair[1] as usize].key)?;
-        if left.schema_key == right.schema_key && left.entity_pk == right.entity_pk {
+        if left.schema_key == right.schema_key && left.row_pk == right.row_pk {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "durable component entity hydration returned duplicate keys",
+                "durable component row hydration returned duplicate keys",
             ));
         }
     }
@@ -9372,11 +9372,11 @@ fn v2_host_entity_ordinals_from_live_batch(
 }
 
 fn suppress_format_only_noops_against_batch(
-    changes: WasmHostEntityChanges,
-    keys: &[WasmEntityKey],
+    changes: WasmHostRowChanges,
+    keys: &[WasmRowKey],
     accepted: &[Option<StateRow>],
     branch_id: &str,
-) -> Result<WasmHostEntityChanges, LixError> {
+) -> Result<WasmHostRowChanges, LixError> {
     if keys.len() != accepted.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -9387,11 +9387,11 @@ fn suppress_format_only_noops_against_batch(
     let mut effective = Vec::with_capacity(changes.changes.len());
     for change in changes.changes {
         let is_noop = match &change {
-            WasmEntityChange::Upsert {
-                entity,
+            WasmRowChange::Upsert {
+                row,
                 effect: WasmChangeEffect::FormatOnly,
             } => {
-                let Some(Some(base)) = accepted.get(&entity.key) else {
+                let Some(Some(base)) = accepted.get(&row.key) else {
                     effective.push(change);
                     continue;
                 };
@@ -9399,7 +9399,7 @@ fn suppress_format_only_noops_against_batch(
                     effective.push(change);
                     continue;
                 };
-                let canonical = match &entity.snapshot_content {
+                let canonical = match &row.snapshot_content {
                     WasmHostBytes::CanonicalJson(json) => json,
                     WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
                         return Err(LixError::new(
@@ -9413,21 +9413,21 @@ fn suppress_format_only_noops_against_batch(
                     || candidate.as_bytes()
                         == canonicalize_snapshot(base_snapshot.as_bytes())?.as_slice()
             }
-            WasmEntityChange::Create { .. }
-            | WasmEntityChange::Upsert { .. }
-            | WasmEntityChange::Delete(_) => false,
+            WasmRowChange::Create { .. }
+            | WasmRowChange::Upsert { .. }
+            | WasmRowChange::Delete(_) => false,
         };
         if !is_noop {
             effective.push(change);
         }
     }
-    Ok(WasmHostEntityChanges { changes: effective })
+    Ok(WasmHostRowChanges { changes: effective })
 }
 
 fn v2_host_changes_from_prepared_rows(
     rows: &PreparedStateBatch,
     limits: WasmTransitionLimits,
-) -> Result<WasmHostEntityChanges, LixError> {
+) -> Result<WasmHostRowChanges, LixError> {
     let mut changes = rows
         .iter()
         .map(|row| {
@@ -9437,9 +9437,9 @@ fn v2_host_changes_from_prepared_rows(
                     "component semantic rendering requires tracked, branch-local, file-scoped rows",
                 ));
             }
-            let key = WasmEntityKey::from_owned_parts(
+            let key = WasmRowKey::from_owned_parts(
                 row.schema_key.clone(),
-                row.entity_pk.clone().into_parts(),
+                row.row_pk.clone().into_parts(),
             );
             match row.snapshot {
                 Some(snapshot) => {
@@ -9451,27 +9451,27 @@ fn v2_host_changes_from_prepared_rows(
                     } else {
                         WasmChangeEffect::Content
                     };
-                    host_entity_change_with_lazy_snapshot(
+                    host_row_change_with_lazy_snapshot(
                         key,
                         snapshot.materialize_shared().into_bytes().into(),
                         effect,
                         limits,
                     )
                 }
-                None => Ok(WasmEntityChange::Delete(key)),
+                None => Ok(WasmRowChange::Delete(key)),
             }
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    changes.sort_by(|left, right| left.entity_key().cmp(&right.entity_key()));
+    changes.sort_by(|left, right| left.row_key().cmp(&right.row_key()));
     for pair in changes.windows(2) {
-        if pair[0].entity_key() == pair[1].entity_key() {
+        if pair[0].row_key() == pair[1].row_key() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
-                "one component semantic write batch cannot contain the same entity key more than once",
+                "one component semantic write batch cannot contain the same row key more than once",
             ));
         }
     }
-    Ok(WasmHostEntityChanges { changes })
+    Ok(WasmHostRowChanges { changes })
 }
 
 fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixError> {
@@ -9479,14 +9479,14 @@ fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixE
         if row.schema_key != KEY_VALUE_SCHEMA_KEY {
             continue;
         }
-        let entity_key = row
-            .entity_pk
-            .and_then(|entity_pk| entity_pk.as_single_string().ok());
+        let row_key = row
+            .row_pk
+            .and_then(|row_pk| row_pk.as_single_string().ok());
         let snapshot_key = row
             .snapshot
             .and_then(|snapshot| snapshot.get("key"))
             .and_then(JsonValue::as_str);
-        let reserved = [entity_key, snapshot_key]
+        let reserved = [row_key, snapshot_key]
             .into_iter()
             .flatten()
             .find(|key| {
@@ -9865,7 +9865,7 @@ struct DecodedDurablePluginCheckpoint {
     generation: String,
     semantic_root: String,
     runtime: crate::Blob,
-    authorities: PluginEntityAuthorities,
+    authorities: PluginRowAuthorities,
 }
 
 impl fmt::Debug for DecodedDurablePluginCheckpoint {
@@ -9963,7 +9963,7 @@ enum PendingPluginActorPublication {
         checkpoint: Option<WasmDocumentCheckpoint>,
         bytes: crate::Blob,
         semantic_root: Arc<str>,
-        entity_authorities: PluginEntityAuthorities,
+        row_authorities: PluginRowAuthorities,
         view: PendingPluginActorView,
     },
     /// The plugin transition has already produced its durable rows, but the
@@ -9977,7 +9977,7 @@ enum PendingPluginActorPublication {
         checkpoint: Option<PluginActorStagedCheckpoint>,
         semantic_root: Option<Arc<str>>,
         durable_checkpoint: Option<WasmDurableDocumentCheckpoint>,
-        entity_authorities: PluginEntityAuthorities,
+        row_authorities: PluginRowAuthorities,
     },
 }
 
@@ -9997,10 +9997,10 @@ impl PendingPluginActorPublication {
                 let semantic_root = successor_checkpoint
                     .as_ref()
                     .map(|(_, semantic_root, _)| Arc::clone(semantic_root));
-                let entity_authorities = lease
-                    .successor_entity_authorities()
+                let row_authorities = lease
+                    .successor_row_authorities()
                     .cloned()
-                    .unwrap_or_else(PluginEntityAuthorities::empty);
+                    .unwrap_or_else(PluginRowAuthorities::empty);
                 let checkpoint =
                     lease
                         .successor_checkpoint()
@@ -10014,7 +10014,7 @@ impl PendingPluginActorPublication {
                     checkpoint,
                     semantic_root,
                     durable_checkpoint,
-                    entity_authorities,
+                    row_authorities,
                 }
             }
             Self::New {
@@ -10024,7 +10024,7 @@ impl PendingPluginActorPublication {
                 document,
                 checkpoint,
                 semantic_root,
-                entity_authorities,
+                row_authorities,
                 view,
                 ..
             } => {
@@ -10041,7 +10041,7 @@ impl PendingPluginActorPublication {
                     checkpoint: staged_checkpoint,
                     semantic_root: Some(semantic_root),
                     durable_checkpoint,
-                    entity_authorities,
+                    row_authorities,
                 }
             }
             publication @ Self::Uncached { .. } => publication,
@@ -10087,7 +10087,7 @@ impl PendingPluginActorPublication {
                 checkpoint,
                 bytes,
                 semantic_root,
-                entity_authorities,
+                row_authorities,
                 view,
             } => {
                 let path = key.path.clone();
@@ -10099,7 +10099,7 @@ impl PendingPluginActorPublication {
                         document,
                         bytes,
                         semantic_root,
-                        entity_authorities,
+                        row_authorities,
                     )),
                     view,
                     path,
@@ -10145,7 +10145,7 @@ impl PendingPluginActorPublication {
         &str,
         Arc<str>,
         WasmDurableDocumentCheckpoint,
-        &PluginEntityAuthorities,
+        &PluginRowAuthorities,
     )> {
         match self {
             Self::Existing {
@@ -10156,7 +10156,7 @@ impl PendingPluginActorPublication {
                 let (_, semantic_root, checkpoint) = lease.successor_checkpoint()?;
                 checkpoint
                     .and_then(|checkpoint| checkpoint.durable_checkpoint())
-                    .zip(lease.successor_entity_authorities())
+                    .zip(lease.successor_row_authorities())
                     .map(|(bytes, authorities)| {
                         (
                             successor_key.branch_id.as_str(),
@@ -10172,7 +10172,7 @@ impl PendingPluginActorPublication {
                 key,
                 checkpoint,
                 semantic_root,
-                entity_authorities,
+                row_authorities,
                 ..
             } => checkpoint
                 .as_ref()
@@ -10184,14 +10184,14 @@ impl PendingPluginActorPublication {
                         key.plugin_generation.as_str(),
                         Arc::clone(semantic_root),
                         bytes,
-                        entity_authorities,
+                        row_authorities,
                     )
                 }),
             Self::Uncached {
                 key,
                 semantic_root,
                 durable_checkpoint,
-                entity_authorities,
+                row_authorities,
                 ..
             } => durable_checkpoint.clone().zip(semantic_root.clone()).map(
                 |(bytes, semantic_root)| {
@@ -10201,7 +10201,7 @@ impl PendingPluginActorPublication {
                         key.plugin_generation.as_str(),
                         semantic_root,
                         bytes,
-                        entity_authorities,
+                        row_authorities,
                     )
                 },
             ),
@@ -10277,7 +10277,7 @@ async fn render_semantic_changes_with_lease(
     successor_key: PluginActorKey,
     view: PendingPluginActorView,
     descriptor: WasmFileDescriptor,
-    changes: WasmHostEntityChanges,
+    changes: WasmHostRowChanges,
     visible_root: &str,
     materialization_version: &str,
     limits: WasmTransitionLimits,
@@ -10302,7 +10302,7 @@ async fn render_semantic_changes_with_lease(
             retain_large_import_actor: view.retain_large_import_actor,
         },
     };
-    let change_count = u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
+    let change_count = u64::try_from(changes.row_change_count()).unwrap_or(u64::MAX);
     let call = match lease.begin_pending_guest_call() {
         Ok(call) => call,
         Err(error) => return Err((error, publication(lease))),
@@ -10315,9 +10315,9 @@ async fn render_semantic_changes_with_lease(
         let error = lease.handle_pending_guest_call_error(call, error);
         return Err((error, publication(lease)));
     }
-    let successor_entity_authorities =
-        plugin_entity_authorities_after_changes(plugin, call.entity_authorities(), &changes);
-    let change_source = match VecEntityChangeSource::new(changes, limits) {
+    let successor_row_authorities =
+        plugin_row_authorities_after_changes(plugin, call.row_authorities(), &changes);
+    let change_source = match VecRowChangeSource::new(changes, limits) {
         Ok(source) => source,
         Err(error) => {
             let error = lease.handle_pending_guest_call_error(call, error);
@@ -10335,10 +10335,10 @@ async fn render_semantic_changes_with_lease(
     };
     let renderer_transition = match lease
         .actor_mut()
-        .entities_changed(
+        .rows_changed(
             renderer_input,
             limits,
-            WasmEntityUpdate {
+            WasmRowUpdate {
                 before_descriptor: descriptor.clone(),
                 after_descriptor: descriptor,
                 before: Arc::new(ArcByteSource::new(base_bytes.clone())),
@@ -10353,7 +10353,7 @@ async fn render_semantic_changes_with_lease(
             return Err((error, publication(lease)));
         }
     };
-    let rendered = match drain_entity_transition_edits(
+    let rendered = match drain_row_transition_edits(
         lease.actor_mut(),
         renderer_transition,
         &base_bytes,
@@ -10402,7 +10402,7 @@ async fn render_semantic_changes_with_lease(
     {
         return Err((error, publication(lease)));
     }
-    if let Err(error) = lease.set_successor_entity_authorities(successor_entity_authorities) {
+    if let Err(error) = lease.set_successor_row_authorities(successor_row_authorities) {
         return Err((error, publication(lease)));
     }
     Ok((
@@ -10474,7 +10474,7 @@ where
                 .filter_map(|row| {
                     let key = decode_state_key(&row.key).ok()?;
                     (key.file_id.is_some()
-                        && key.entity_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY))
+                        && key.row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY))
                     .then_some((branch_id.clone(), row))
                 }),
         );
@@ -10531,7 +10531,7 @@ where
         .flat_map(|(upgrade, _)| upgrade.previous.schema_keys().iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(EntityPk::single)
+        .map(RowPk::single)
         .collect::<Vec<_>>();
     let mut registered_schema_rows = Vec::new();
     let schema_branches = upgrades
@@ -10543,9 +10543,9 @@ where
     for branch_id in schema_branches {
         let keys = owned_schema_keys
             .iter()
-            .map(|entity_pk| StateKey {
+            .map(|row_pk| StateKey {
                 schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-                entity_pk: entity_pk.clone(),
+                row_pk: row_pk.clone(),
                 file_id: None,
             })
             .collect::<Vec<_>>();
@@ -10561,7 +10561,7 @@ where
     let mut registered_schema_definitions = BTreeMap::<(String, String), JsonValue>::new();
     for (branch_id, row) in &registered_schema_rows {
         let key = decode_state_key(&row.key)?;
-        let schema_key = key.entity_pk.as_single_string().map_err(|error| {
+        let schema_key = key.row_pk.as_single_string().map_err(|error| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!("active plugin schema has an invalid identity: {error}"),
@@ -10683,7 +10683,7 @@ where
             left.file_id
                 .cmp(&right.file_id)
                 .then_with(|| left.schema_key.cmp(&right.schema_key))
-                .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+                .then_with(|| left.row_pk.cmp(&right.row_pk))
         });
         let mut state_by_file = BTreeMap::<String, std::ops::Range<usize>>::new();
         let mut start = 0;
@@ -10709,7 +10709,7 @@ where
             .map(|file_id| {
                 Ok(StateKey {
                     schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: validated_uuid_entity_pk(file_id)?,
+                    row_pk: validated_uuid_row_pk(file_id)?,
                     file_id: Some(file_id.clone()),
                 })
             })
@@ -10841,7 +10841,7 @@ where
                     )
                 })?;
             let range = state_by_file.get(owner.file_id()).cloned().unwrap_or(0..0);
-            let entities = v2_host_entities_from_live_batch_ordinals(
+            let rows = v2_host_rows_from_live_batch_ordinals(
                 &state_rows,
                 &state_ordinals[range],
                 limits,
@@ -10865,7 +10865,7 @@ where
                         generation: upgrade.replacement.archive_blob_hash().to_string(),
                     },
                 },
-                entities,
+                rows,
                 expected,
                 limits,
             )
@@ -10882,23 +10882,23 @@ where
 async fn preflight_rendered_file(
     actor: &mut dyn WasmComponentActor,
     descriptor: WasmFileDescriptor,
-    entities: Vec<WasmHostEntity>,
+    rows: Vec<WasmHostRow>,
     expected: crate::Blob,
     limits: WasmTransitionLimits,
 ) -> Result<(), LixError> {
-    let source = VecEntitySource::new(entities, limits)?;
+    let source = VecRowSource::new(rows, limits)?;
     let accepted = Arc::new(ArcByteSource::new(expected.clone()));
     let transition = actor
-        .open_entities(
+        .open_rows(
             limits,
-            WasmOpenEntitiesInput {
+            WasmOpenRowsInput {
                 descriptor,
-                entities: Box::new(source),
+                rows: Box::new(source),
                 accepted: Some(accepted),
             },
         )
         .await?;
-    let validated = drain_entity_transition_edits(
+    let validated = drain_row_transition_edits(
         actor,
         transition,
         expected.as_ref(),
@@ -11008,10 +11008,10 @@ fn duplicate_plugin_lifecycle_mutation() -> LixError {
 
 fn plugin_schema_collision_error(
     plugin_key: &str,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     other_plugin: Option<&String>,
 ) -> LixError {
-    let schema_key = entity_pk
+    let schema_key = row_pk
         .as_single_string()
         .unwrap_or("<invalid schema identity>");
     let owner = other_plugin.map_or_else(
@@ -11063,7 +11063,7 @@ fn plugin_state_tombstone_batch(
         let key = decode_state_key(&row.key)
             .expect("authenticated plugin state key was decoded during selection");
         rows.push_parts(
-            Some(key.entity_pk),
+            Some(key.row_pk),
             key.schema_key.into(),
             Some(file_id.into()),
             None,
@@ -11118,8 +11118,8 @@ fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) ->
             row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
                 && row.snapshot.is_none()
                 && row
-                    .entity_pk
-                    .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
+                    .row_pk
+                    .and_then(|row_pk| row_pk.as_single_string_owned().ok())
                     .zip(
                         row.origin.and_then(|origin| {
                             plugin_key_from_archive_delete_origin(&origin.surface)
@@ -11243,8 +11243,8 @@ async fn resolve_active_branch_id(
     }
 }
 
-fn validated_uuid_entity_pk(value: &str) -> Result<EntityPk, LixError> {
-    EntityPk::uuid_from_canonical(value).map_err(|error| {
+fn validated_uuid_row_pk(value: &str) -> Result<RowPk, LixError> {
+    RowPk::uuid_from_canonical(value).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("validated identity is not a canonical UUID: {error}"),

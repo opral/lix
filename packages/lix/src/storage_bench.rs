@@ -248,12 +248,12 @@ pub fn take_verified_inline_blob_splice_accounting() -> VerifiedInlineBlobSplice
     }
 }
 
-pub(crate) fn record_certified_entity_insert_parameter_batch_certification() {
+pub(crate) fn record_certified_row_insert_parameter_batch_certification() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CertifiedEntityInsertParameterBatchCounters {
+pub struct CertifiedRowInsertParameterBatchCounters {
     pub certifications: u64,
     pub executions: u64,
 }
@@ -261,9 +261,9 @@ pub struct CertifiedEntityInsertParameterBatchCounters {
 /// Reads the cumulative certified parameter-batch INSERT phase counters
 /// without resetting them. Callers measuring one fixture/sample must subtract
 /// a pre-operation snapshot from a post-operation snapshot.
-pub fn certified_entity_insert_parameter_batch_counters()
--> CertifiedEntityInsertParameterBatchCounters {
-    CertifiedEntityInsertParameterBatchCounters {
+pub fn certified_row_insert_parameter_batch_counters()
+-> CertifiedRowInsertParameterBatchCounters {
+    CertifiedRowInsertParameterBatchCounters {
         certifications: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS
             .load(Ordering::Relaxed),
         executions: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
@@ -272,11 +272,11 @@ pub fn certified_entity_insert_parameter_batch_counters()
 
 /// Returns and resets the number of certified parameter-batch INSERT routes
 /// selected by the planner, before any physical staging occurs.
-pub fn take_certified_entity_insert_parameter_batch_certifications() -> u64 {
+pub fn take_certified_row_insert_parameter_batch_certifications() -> u64 {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.swap(0, Ordering::Relaxed)
 }
 
-pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
+pub(crate) fn record_certified_row_insert_parameter_batch_execution() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -285,7 +285,7 @@ pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
 ///
 /// Benchmark fixtures use this as a route certificate so a schema change
 /// cannot silently turn the measured bulk INSERT back into sequential writes.
-pub fn take_certified_entity_insert_parameter_batch_executions() -> u64 {
+pub fn take_certified_row_insert_parameter_batch_executions() -> u64 {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed)
 }
 
@@ -297,17 +297,17 @@ pub struct CrudCertificateAccounting {
     pub certified_rows: u64,
 }
 
-pub(crate) fn record_certified_entity_update_value_batch_attempt() {
+pub(crate) fn record_certified_row_update_value_batch_attempt() {
     CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_certified_entity_update_value_batch_hit(row_count: usize) {
+pub(crate) fn record_certified_row_update_value_batch_hit(row_count: usize) {
     CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.fetch_add(1, Ordering::Relaxed);
     CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.fetch_add(row_count as u64, Ordering::Relaxed);
 }
 
 /// Returns and resets generated UPDATE certificate hit/miss accounting.
-pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateAccounting {
+pub fn take_certified_row_update_value_batch_accounting() -> CrudCertificateAccounting {
     let attempts = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.swap(0, Ordering::Relaxed);
     let hits = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.swap(0, Ordering::Relaxed);
     let certified_rows = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.swap(0, Ordering::Relaxed);

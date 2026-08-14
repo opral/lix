@@ -17,7 +17,7 @@ use crate::commit_graph::{
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
 };
 use crate::common::ExactBatch;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{
     SELECTOR_SPACE, SnapshotSelectorV1, SnapshotTargetV1, load_object_bytes, snapshot_selector_key,
 };
@@ -42,7 +42,7 @@ where
     }
 }
 
-/// Commit-graph reader that resolves changelog entities at a commit head.
+/// Commit-graph reader that resolves changelog rows at a commit head.
 pub(crate) struct CommitGraphStoreReader<S>
 where
     S: StorageAdapterRead,
@@ -655,7 +655,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
     CommitGraphChange {
         id: change.change_id,
         account_id: change.account_id,
-        entity_pk: change.entity_pk,
+        row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot: change.snapshot,
@@ -751,7 +751,7 @@ fn change_matches_history_request(
     request: &CommitGraphChangeHistoryRequest,
 ) -> bool {
     (request.include_tombstones || change.snapshot.is_some())
-        && (request.entity_pks.is_empty() || request.entity_pks.contains(&change.entity_pk))
+        && (request.row_pks.is_empty() || request.row_pks.contains(&change.row_pk))
         && (request.schema_keys.is_empty() || request.schema_keys.contains(&change.schema_key))
         && (request.file_ids.is_empty()
             || change
@@ -762,12 +762,12 @@ fn change_matches_history_request(
 
 fn history_change_identity(
     change: &CommitGraphChange,
-) -> (ChangeId, String, Option<String>, EntityPk) {
+) -> (ChangeId, String, Option<String>, RowPk) {
     (
         change.id,
         change.schema_key.clone(),
         change.file_id.clone(),
-        change.entity_pk.clone(),
+        change.row_pk.clone(),
     )
 }
 
@@ -778,7 +778,7 @@ pub(crate) fn canonical_commit_change(record: &CommitRecord) -> CommitGraphChang
     CommitGraphChange {
         id: record.change_id,
         account_id: record.account_id.clone(),
-        entity_pk: EntityPk::uuid_from_canonical(&record.commit_id.to_string())
+        row_pk: RowPk::uuid_from_canonical(&record.commit_id.to_string())
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,

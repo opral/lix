@@ -2,9 +2,9 @@ use crate::LixError;
 use crate::branch::{
     BranchLifecycle, BranchOperation, BranchReferenceRole, branch_descriptor_stage_row,
 };
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{
-    StateCell, StateKeyRef, encode_state_entity_prefix_bounds, encode_state_key,
+    StateCell, StateKeyRef, encode_state_row_prefix_bounds, encode_state_key,
 };
 use crate::storage_adapter::Storage;
 use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
@@ -49,7 +49,7 @@ where
             let branch_id = options
                 .id
                 .unwrap_or_else(|| transaction.functions().call_uuid_v7().to_string());
-            let branch_pk = EntityPk::uuid_from_canonical(&branch_id).map_err(|error| {
+            let branch_pk = RowPk::uuid_from_canonical(&branch_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     format!("branch ID must be a canonical UUID: {error}"),
@@ -58,7 +58,7 @@ where
             let branch_key = encode_state_key(StateKeyRef {
                 schema_key: "lix_branch_descriptor",
                 file_id: None,
-                entity_pk: &branch_pk,
+                row_pk: &branch_pk,
             });
             let committed_state_view = transaction.committed_state_view().await?;
             if committed_state_view
@@ -69,20 +69,20 @@ where
                 .flatten()
                 .is_some()
             {
-                let entity_pk = branch_pk
+                let row_pk = branch_pk
                     .as_json_array_text()
-                    .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+                    .unwrap_or_else(|_| "<invalid row_pk>".to_string());
                 return Err(LixError::new(
                     LixError::CODE_UNIQUE,
                     format!(
-                        "primary-key constraint violation on schema 'lix_branch_descriptor': INSERT would duplicate entity_pk '{entity_pk}'"
+                        "primary-key constraint violation on schema 'lix_branch_descriptor': INSERT would duplicate row_pk '{row_pk}'"
                     ),
                 ));
             }
-            let empty_pk = EntityPk {
-                components: crate::entity_pk::EntityPkComponents::Empty,
+            let empty_pk = RowPk {
+                components: crate::row_pk::RowPkComponents::Empty,
             };
-            let bounds = encode_state_entity_prefix_bounds("lix_branch_descriptor", &empty_pk);
+            let bounds = encode_state_row_prefix_bounds("lix_branch_descriptor", &empty_pk);
             let existing_descriptors = committed_state_view
                 .range(
                     Some(&bounds.lower),

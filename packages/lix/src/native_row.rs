@@ -1,12 +1,12 @@
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::NativeRowCell;
 
 pub(crate) fn encode(
     schema: &lix_schema::Schema,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     global: bool,
     file_id: Option<&str>,
     snapshot: &JsonValue,
@@ -100,14 +100,14 @@ pub(crate) fn encode(
     .map_err(|error| LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string()))?;
     let canonical_values = lix_schema::value_layout::decode_body(&body_plan(schema), &body)
         .map_err(|error| LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string()))?;
-    let semantic_value = logical_value_from_body(schema, entity_pk, canonical_values)?;
+    let semantic_value = logical_value_from_body(schema, row_pk, canonical_values)?;
     Ok(NativeRowCell {
         layout_id,
         global,
-        owner_digest: crate::entity_pk::state_identity_digest(
+        owner_digest: crate::row_pk::state_identity_digest(
             global,
             &schema.key,
-            entity_pk,
+            row_pk,
             file_id,
         ),
         semantic_digest: semantic_digest(&semantic_value),
@@ -175,7 +175,7 @@ pub(crate) fn semantic_digest_text(value: &str) -> Result<[u8; 32], LixError> {
 
 pub(crate) fn decode(
     schema: &lix_schema::Schema,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     global: bool,
     file_id: Option<&str>,
     native: &NativeRowCell,
@@ -193,17 +193,17 @@ pub(crate) fn decode(
             ),
         ));
     }
-    let expected_owner = crate::entity_pk::state_identity_digest(
+    let expected_owner = crate::row_pk::state_identity_digest(
         native.global,
         &schema.key,
-        entity_pk,
+        row_pk,
         file_id,
     );
     if native.owner_digest != expected_owner {
         return Err(storage_error(
             schema,
             &format!(
-                "owner does not match its authenticated StateKey (global={global}, file_id={file_id:?}, entity_pk={entity_pk:?}, expected={expected_owner:02x?}, actual={:02x?})",
+                "owner does not match its authenticated StateKey (global={global}, file_id={file_id:?}, row_pk={row_pk:?}, expected={expected_owner:02x?}, actual={:02x?})",
                 native.owner_digest,
             ),
         ));
@@ -213,7 +213,7 @@ pub(crate) fn decode(
         &native.body,
     )
     .map_err(|error| storage_error(schema, &format!("is malformed: {error}")))?;
-    if semantic_digest_from_body(schema, entity_pk, &body)? != native.semantic_digest {
+    if semantic_digest_from_body(schema, row_pk, &body)? != native.semantic_digest {
         return Err(storage_error(
             schema,
             "body differs from its authenticated semantic digest",
@@ -223,19 +223,19 @@ pub(crate) fn decode(
 }
 
 enum SemanticRowCell<'a> {
-    PrimaryKey(&'a crate::entity_pk::EntityPkComponent),
+    PrimaryKey(&'a crate::row_pk::RowPkComponent),
     Body(&'a lix_schema::value_layout::BodyValue),
 }
 
 fn semantic_digest_from_body(
     schema: &lix_schema::Schema,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     body: &[lix_schema::value_layout::BodyValue],
 ) -> Result<[u8; 32], LixError> {
-    use crate::entity_pk::EntityPkComponent;
+    use crate::row_pk::RowPkComponent;
     use lix_schema::value_layout::BodyValue;
 
-    if entity_pk.components.len() != schema.primary_key.len() {
+    if row_pk.components.len() != schema.primary_key.len() {
         return Err(storage_error(schema, "primary key arity is invalid"));
     }
     let value_columns = schema
@@ -252,7 +252,7 @@ fn semantic_digest_from_body(
         schema
             .primary_key
             .iter()
-            .zip(&entity_pk.components)
+            .zip(&row_pk.components)
             .map(|(name, value)| (name.as_str(), SemanticRowCell::PrimaryKey(value))),
     );
     entries.extend(
@@ -270,7 +270,7 @@ fn semantic_digest_from_body(
     for (name, value) in entries {
         semantic_digest_field(&mut hash, name.as_bytes());
         match value {
-            SemanticRowCell::PrimaryKey(EntityPkComponent::Integer(value)) => {
+            SemanticRowCell::PrimaryKey(RowPkComponent::Integer(value)) => {
                 hash.update(&[2]);
                 semantic_digest_field(&mut hash, value.to_string().as_bytes());
             }
@@ -371,23 +371,23 @@ fn layout_id(schema: &lix_schema::Schema) -> [u8; 32] {
 
 pub(crate) fn logical_value(
     schema: &lix_schema::Schema,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     global: bool,
     file_id: Option<&str>,
     native: &NativeRowCell,
 ) -> Result<JsonValue, LixError> {
-    let body = decode(schema, entity_pk, global, file_id, native)?;
-    logical_value_from_body(schema, entity_pk, body)
+    let body = decode(schema, row_pk, global, file_id, native)?;
+    logical_value_from_body(schema, row_pk, body)
 }
 
 fn logical_value_from_body(
     schema: &lix_schema::Schema,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     body: Vec<lix_schema::value_layout::BodyValue>,
 ) -> Result<JsonValue, LixError> {
     use lix_schema::value_layout::BodyValue;
-    let JsonValue::Array(pk) = entity_pk.as_json_array_value()? else {
-        unreachable!("typed entity primary key always encodes as an array")
+    let JsonValue::Array(pk) = row_pk.as_json_array_value()? else {
+        unreachable!("typed row primary key always encodes as an array")
     };
     if pk.len() != schema.primary_key.len() {
         return Err(storage_error(schema, "primary key arity is invalid"));
@@ -430,13 +430,13 @@ fn logical_value_from_body(
 
 pub(crate) fn logical_text(
     schema: &lix_schema::Schema,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     global: bool,
     file_id: Option<&str>,
     native: &NativeRowCell,
 ) -> Result<crate::common::SharedStr, LixError> {
     serde_json::to_string(&logical_value(
-        schema, entity_pk, global, file_id, native,
+        schema, row_pk, global, file_id, native,
     )?)
     .map(crate::common::SharedStr::from)
     .map_err(|error| storage_error(schema, &format!("cannot materialize logical row: {error}")))
@@ -480,7 +480,7 @@ pub(crate) fn logical_text_for_seed(
 ) -> Result<crate::common::SharedStr, LixError> {
     logical_text(
         &seed_schema(&key.schema_key)?,
-        &key.entity_pk,
+        &key.row_pk,
         global,
         key.file_id.as_deref(),
         native,
@@ -527,7 +527,7 @@ mod tests {
             "primary_key": ["id"]
         }))
         .expect("canonical probe schema");
-        let key = EntityPk::single("row");
+        let key = RowPk::single("row");
         let encoded = encode(
             &schema,
             &key,
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn tuple_omits_pk_and_authenticates_layout_owner_and_semantics() {
-        let key = EntityPk::single("pk-must-not-appear-in-body");
+        let key = RowPk::single("pk-must-not-appear-in-body");
         let row = json!({"id":"pk-must-not-appear-in-body","payload":"body-only"});
         let encoded = encode(&schema(Some("first"), false), &key, false, None, &row)
             .expect("native tuple encodes");

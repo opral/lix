@@ -98,7 +98,7 @@ pub(crate) trait SqlExecutionContext: Sync {
             "authenticated ForkTree blob reader is unavailable for this SQL read context",
         ))
     }
-    /// Loads runtime-defined SQL entity metadata when provider selection could
+    /// Loads runtime-defined SQL row metadata when provider selection could
     /// not be satisfied entirely by compile-time system surfaces.
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 

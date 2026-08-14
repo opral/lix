@@ -22,9 +22,9 @@ use crate::branch::{
     branch_descriptor_tombstone_row,
 };
 use crate::changelog::CommitId;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{
-    StateCell, StateKeyRef, decode_state_key, encode_state_entity_prefix_bounds, encode_state_key,
+    StateCell, StateKeyRef, decode_state_key, encode_state_row_prefix_bounds, encode_state_key,
 };
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
@@ -840,7 +840,7 @@ where
         let keys = rows
             .iter()
             .map(|row| {
-                let entity_pk = EntityPk::uuid_from_canonical(&row.id).map_err(|error| {
+                let row_pk = RowPk::uuid_from_canonical(&row.id).map_err(|error| {
                     DataFusionError::Execution(format!(
                         "branch id must be a canonical UUID: {error}"
                     ))
@@ -848,7 +848,7 @@ where
                 Ok(encode_state_key(StateKeyRef {
                     schema_key: BRANCH_DESCRIPTOR_SCHEMA_KEY,
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -870,10 +870,10 @@ where
         }
     }
 
-    let empty_pk = EntityPk {
-        components: crate::entity_pk::EntityPkComponents::Empty,
+    let empty_pk = RowPk {
+        components: crate::row_pk::RowPkComponents::Empty,
     };
-    let bounds = encode_state_entity_prefix_bounds(BRANCH_DESCRIPTOR_SCHEMA_KEY, &empty_pk);
+    let bounds = encode_state_row_prefix_bounds(BRANCH_DESCRIPTOR_SCHEMA_KEY, &empty_pk);
     let existing_rows = write_ctx
         .state_view()
         .range(Some(&bounds.lower), bounds.upper.as_deref(), None, false)
@@ -883,7 +883,7 @@ where
     for row in existing_rows {
         let key = decode_state_key(&row.key).map_err(lix_error_to_datafusion_error)?;
         let id = key
-            .entity_pk
+            .row_pk
             .as_single_string_owned()
             .map_err(lix_error_to_datafusion_error)?;
         let descriptor = parse_descriptor(&row, &id).map_err(lix_error_to_datafusion_error)?;
@@ -963,7 +963,7 @@ where
         BranchDescriptorScope::Ids(ids) => {
             let mut heads = Vec::with_capacity(ids.len());
             for id in ids {
-                EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                RowPk::uuid_from_canonical(&id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         format!("branch id must be a canonical UUID: {error}"),
@@ -994,7 +994,7 @@ where
     let keys = heads
         .iter()
         .map(|head| {
-            let entity_pk = EntityPk::uuid_from_canonical(&head.branch_id).map_err(|error| {
+            let row_pk = RowPk::uuid_from_canonical(&head.branch_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
                     format!("authenticated branch id is not canonical: {error}"),
@@ -1003,7 +1003,7 @@ where
             Ok(encode_state_key(StateKeyRef {
                 schema_key: BRANCH_DESCRIPTOR_SCHEMA_KEY,
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             }))
         })
         .collect::<Result<Vec<_>, LixError>>()?;
@@ -1048,7 +1048,7 @@ fn exact_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
 fn exact_canonical_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
     let ids = exact_branch_ids_from_filters(filters)?;
     ids.iter()
-        .all(|id| EntityPk::uuid_from_canonical(id).is_ok())
+        .all(|id| RowPk::uuid_from_canonical(id).is_ok())
         .then_some(ids)
 }
 
@@ -1128,7 +1128,7 @@ struct BranchDescriptor {
 
 fn parse_descriptor(row: &StateRow, expected_id: &str) -> Result<BranchDescriptor, LixError> {
     let key = decode_state_key(&row.key)?;
-    let expected_pk = EntityPk::uuid_from_canonical(expected_id).map_err(|error| {
+    let expected_pk = RowPk::uuid_from_canonical(expected_id).map_err(|error| {
         LixError::new(
             LixError::CODE_STORAGE_ERROR,
             format!("requested branch descriptor id is not canonical: {error}"),
@@ -1136,7 +1136,7 @@ fn parse_descriptor(row: &StateRow, expected_id: &str) -> Result<BranchDescripto
     })?;
     if key.schema_key != BRANCH_DESCRIPTOR_SCHEMA_KEY
         || key.file_id.is_some()
-        || key.entity_pk != expected_pk
+        || key.row_pk != expected_pk
     {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
@@ -1391,7 +1391,7 @@ pub(crate) async fn execute_exact_branch_delete<R>(
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let Ok(entity_pk) = EntityPk::uuid_from_canonical(&branch_id) else {
+    let Ok(row_pk) = RowPk::uuid_from_canonical(&branch_id) else {
         // Preserve predicate semantics: a noncanonical text literal cannot
         // identify a public branch row, so exact deletion is a no-op rather
         // than a branch-ID API validation error.
@@ -1400,7 +1400,7 @@ where
     let key = encode_state_key(StateKeyRef {
         schema_key: BRANCH_DESCRIPTOR_SCHEMA_KEY,
         file_id: None,
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     let mut exact = write_ctx.state_view().points(&[key], false).await?;
     let Some(descriptor_row) = exact.pop().flatten() else {
@@ -1624,12 +1624,12 @@ mod tests {
     }
 
     fn descriptor_row(id: &str, name: &str) -> StateRow {
-        let entity_pk = EntityPk::uuid_from_canonical(id).expect("fixture branch ID");
+        let row_pk = RowPk::uuid_from_canonical(id).expect("fixture branch ID");
         StateRow {
             key: encode_state_key(StateKeyRef {
                 schema_key: BRANCH_DESCRIPTOR_SCHEMA_KEY,
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             }),
             value: StateValue {
                 change_id: crate::changelog::ChangeId::for_test_label(&format!("change-{id}")),

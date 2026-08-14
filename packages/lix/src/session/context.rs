@@ -14,7 +14,7 @@ use crate::branch::{
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot};
 use crate::commit_graph::{CommitGraphReader, CommitGraphStoreReader};
 use crate::domain::Domain;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::forktree::{StateCell, StateKeyRef, encode_state_key};
 use crate::functions::FunctionProviderHandle;
@@ -43,11 +43,11 @@ pub(crate) async fn load_workspace_branch_id_from_index(
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     let forktree = crate::forktree::ForkTreeReadFacade::new(reader);
-    let entity_pk = EntityPk::single(WORKSPACE_BRANCH_KEY);
+    let row_pk = RowPk::single(WORKSPACE_BRANCH_KEY);
     let key = encode_state_key(StateKeyRef {
         schema_key: "lix_key_value",
         file_id: None,
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     let view = ForkTreeStateView::from_facade(forktree, GLOBAL_BRANCH_ID).await?;
     let row = view

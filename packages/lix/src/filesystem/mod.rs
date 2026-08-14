@@ -10,7 +10,7 @@ mod visibility;
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::state::{StateRow, StateRowSource};
 
 /// Filesystem-owned projection of one authenticated state cell. This is a
@@ -18,7 +18,7 @@ use crate::state::{StateRow, StateRowSource};
 /// authority. The source row is always produced by a concrete state view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemStateRow {
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
@@ -71,7 +71,7 @@ impl FilesystemStateRows {
     /// Stable backing address used by provider tests to prove that the final
     /// preparation retains this native row batch rather than rebuilding a
     /// generic materialized batch.
-    pub(crate) fn entity_column_ptr(&self) -> *const FilesystemStateRow {
+    pub(crate) fn row_column_ptr(&self) -> *const FilesystemStateRow {
         self.0.as_ptr()
     }
 
@@ -94,7 +94,7 @@ pub(crate) fn merge_filesystem_state_rows(
             crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
                 schema_key: &row.schema_key,
                 file_id: row.file_id.as_deref(),
-                entity_pk: &row.entity_pk,
+                row_pk: &row.row_pk,
             }),
             row.branch_id.clone(),
         );
@@ -157,7 +157,7 @@ impl FilesystemStateRow {
     ) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
         Ok(Self {
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
             schema_key: key.schema_key,
             file_id: key.file_id,
             snapshot_content: None,
@@ -182,7 +182,7 @@ impl FilesystemStateRow {
         let deleted = row.value.cell.deleted();
         let snapshot_content = row.seed_logical_snapshot(branch_id)?;
         Ok(Self {
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
             schema_key: key.schema_key,
             file_id: key.file_id,
             snapshot_content,
@@ -246,8 +246,8 @@ impl FilesystemStateRow {
         self.deleted
     }
 
-    pub(crate) fn entity_pk(&self) -> &EntityPk {
-        &self.entity_pk
+    pub(crate) fn row_pk(&self) -> &RowPk {
+        &self.row_pk
     }
 }
 
@@ -287,12 +287,12 @@ pub(crate) async fn filesystem_state_rows_for_branch<R>(
 where
     R: crate::storage_adapter::StorageAdapterRead,
 {
-    let empty_pk = EntityPk {
-        components: crate::entity_pk::EntityPkComponents::Empty,
+    let empty_pk = RowPk {
+        components: crate::row_pk::RowPkComponents::Empty,
     };
     let mut rows = Vec::new();
     for schema_key in filesystem_schema_keys() {
-        let lower = crate::forktree::encode_state_entity_prefix(&schema_key, &empty_pk);
+        let lower = crate::forktree::encode_state_row_prefix(&schema_key, &empty_pk);
         let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
         rows.extend(
             state

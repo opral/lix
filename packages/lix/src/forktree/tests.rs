@@ -8,7 +8,7 @@ use crate::LixError;
 use crate::changelog::ChangeRecord;
 use crate::commit_graph::CommitGraphStoreReader;
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::json_store::JsonSlot;
 use crate::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
@@ -218,30 +218,30 @@ fn branch_ref_timestamp_is_authenticated_and_round_trips() {
 
 #[test]
 fn stale_state_key_merge_uses_encoded_order_and_deduplicates_overlay_keys() {
-    // StateKey's derived order places file_id before entity_pk, whereas the
-    // authenticated wire key is schema, entity_pk, file_id.  This pair makes
+    // StateKey's derived order places file_id before row_pk, whereas the
+    // authenticated wire key is schema, row_pk, file_id.  This pair makes
     // those orders disagree, and the common key appears from both roots.
     let file_first = StateKey {
         schema_key: "app.row".to_owned(),
         file_id: Some("a-file".to_owned()),
-        entity_pk: EntityPk::single("z-entity"),
+        row_pk: RowPk::single("z-row"),
     };
-    let entity_first = StateKey {
+    let row_first = StateKey {
         schema_key: "app.row".to_owned(),
         file_id: Some("z-file".to_owned()),
-        entity_pk: EntityPk::single("a-entity"),
+        row_pk: RowPk::single("a-row"),
     };
     let merged = super::view::merge_sorted_state_keys(
         vec![file_first.clone()],
         vec![
-            entity_first.clone(),
-            entity_first.clone(),
+            row_first.clone(),
+            row_first.clone(),
             file_first.clone(),
         ],
     );
     assert_eq!(merged.len(), 2, "one visible row per canonical key");
     assert_eq!(
-        merged[0], entity_first,
+        merged[0], row_first,
         "canonical encoded order is preserved"
     );
     assert_eq!(merged[1], file_first);
@@ -1078,11 +1078,11 @@ fn test_state_member(
     manifests: &[ObjectId],
     global: bool,
 ) -> (Vec<u8>, CommitMemberV1) {
-    let entity_pk = EntityPk::single(primary_key);
+    let row_pk = RowPk::single(primary_key);
     let key = encode_state_key(StateKeyRef {
         schema_key: "app.row",
         file_id: Some("file"),
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     let change_id = test_change_id(commit_byte, &key, global);
     let snapshot = match cell {
@@ -1103,7 +1103,7 @@ fn test_state_member(
         change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
         account_id: "forktree-test".to_owned(),
         schema_key: "app.row".to_owned(),
-        entity_pk,
+        row_pk,
         file_id: Some("file".to_owned()),
         snapshot,
         metadata: JsonSlot::None,
@@ -1131,11 +1131,11 @@ fn test_blob_ref_member(
     commit_byte: u8,
     manifest: ObjectId,
 ) -> (Vec<u8>, CommitMemberV1) {
-    let entity_pk = EntityPk::uuid_from_canonical(primary_key).expect("canonical blob-ref id");
+    let row_pk = RowPk::uuid_from_canonical(primary_key).expect("canonical blob-ref id");
     let key = encode_state_key(StateKeyRef {
         schema_key: "lix_binary_blob_ref",
         file_id: Some(primary_key),
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     let change_id = test_change_id(commit_byte, &key, false);
     let snapshot = serde_json::json!({
@@ -1149,7 +1149,7 @@ fn test_blob_ref_member(
         change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
         account_id: "forktree-test".to_owned(),
         schema_key: "lix_binary_blob_ref".to_owned(),
-        entity_pk,
+        row_pk,
         file_id: Some(primary_key.to_owned()),
         snapshot: JsonSlot::Inline(snapshot.into()),
         metadata: JsonSlot::None,
@@ -1212,7 +1212,7 @@ fn encode_test_state_entries(
                     StateCell::NativeRow(
                         crate::native_row::encode(
                             &schema,
-                            &key.entity_pk,
+                            &key.row_pk,
                             global,
                             key.file_id.as_deref(),
                             &snapshot,
@@ -1327,7 +1327,7 @@ fn test_state_payload(row: &VisibleStateRow) -> serde_json::Value {
     };
     crate::native_row::logical_value(
         &test_state_schema(),
-        &key.entity_pk,
+        &key.row_pk,
         row.source == StateSource::Global,
         key.file_id.as_deref(),
         native,
@@ -1342,11 +1342,11 @@ fn state_entry(
     commit_byte: u8,
     _manifests: &[ObjectId],
 ) -> (Vec<u8>, Vec<u8>) {
-    let entity_pk = EntityPk::single(primary_key);
+    let row_pk = RowPk::single(primary_key);
     let key = encode_state_key(StateKeyRef {
         schema_key: "app.row",
         file_id: Some("file"),
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     let value = encode_state_value(StateValueRef {
         pack_object_id: content_id(commit_byte),
@@ -1811,7 +1811,7 @@ fn chronology_checkpoint_members(
         change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(change_bytes)),
         account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
         schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY.to_owned(),
-        entity_pk: EntityPk::uuid_from_canonical(&branch_id).expect("checkpoint branch UUID"),
+        row_pk: RowPk::uuid_from_canonical(&branch_id).expect("checkpoint branch UUID"),
         file_id: None,
         snapshot: JsonSlot::Inline(
             serde_json::json!({ "branch_id": branch_id })
@@ -2600,11 +2600,11 @@ fn diff_state_rows(values: &[(usize, u8)]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rows = values
         .iter()
         .map(|(index, value)| {
-            let entity_pk = EntityPk::single(format!("row-{index:05}"));
+            let row_pk = RowPk::single(format!("row-{index:05}"));
             let key = encode_state_key(StateKeyRef {
                 schema_key: "diff.row",
                 file_id: Some("file"),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
             let value = encode_state_value(StateValueRef {
                 pack_object_id: content_id(value.saturating_add(1)),
@@ -2660,7 +2660,7 @@ fn encoded_state_keys(keys: &[StateKey]) -> Vec<Vec<u8>> {
             encode_state_key(StateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             })
         })
         .collect()
@@ -2948,8 +2948,8 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
     let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
-    let entity_pk = EntityPk::single("typed-key");
-    assert!(super::encode_state_entity_prefix("app.row", &entity_pk).len() < key.len());
+    let row_pk = RowPk::single("typed-key");
+    assert!(super::encode_state_row_prefix("app.row", &row_pk).len() < key.len());
     assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
 }
 
@@ -2966,19 +2966,19 @@ fn canonical_prefix_bounds_handle_carry_and_reject_invalid_untracked_bounds() {
         "an all-maximum prefix has an unbounded exclusive edge"
     );
 
-    let entity_pk = EntityPk::single("entity");
-    let bounds = super::encode_state_entity_prefix_bounds("app.row", &entity_pk);
+    let row_pk = RowPk::single("row");
+    let bounds = super::encode_state_row_prefix_bounds("app.row", &row_pk);
     let full_key = super::encode_state_key(StateKeyRef {
         schema_key: "app.row",
         file_id: Some("file"),
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     assert!(full_key.starts_with(&bounds.lower));
     assert!(bounds.upper.as_ref().is_some_and(|upper| full_key < *upper));
     let other_schema = super::encode_state_key(StateKeyRef {
         schema_key: "app.other",
         file_id: Some("file"),
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     assert!(!other_schema.starts_with(&bounds.lower));
 
@@ -2991,10 +2991,10 @@ fn canonical_prefix_bounds_handle_carry_and_reject_invalid_untracked_bounds() {
     );
     assert!(super::encode_untracked_branch_range_bounds(branch_id, Some(&[0xff]), None).is_err());
 
-    let schema_prefix = super::encode_state_entity_prefix(
+    let schema_prefix = super::encode_state_row_prefix(
         "app.row",
-        &EntityPk {
-            components: crate::entity_pk::EntityPkComponents::Empty,
+        &RowPk {
+            components: crate::row_pk::RowPkComponents::Empty,
         },
     );
     let schema_upper = super::exclusive_prefix_upper_bound(&schema_prefix);
@@ -3273,7 +3273,7 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     // may share the same copied leaf and ancestor path.
     assert!(edit.copied_nodes() >= 1);
 
-    let bounds = super::encode_state_entity_prefix_bounds("app.row", &EntityPk::empty());
+    let bounds = super::encode_state_row_prefix_bounds("app.row", &RowPk::empty());
     let range_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![StateTreeMutation::remove_range(bounds.lower, bounds.upper)],
@@ -3285,7 +3285,7 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     assert!(range_edit.copied_nodes() >= 1);
 
     let replacement_bounds =
-        super::encode_state_entity_prefix_bounds("app.row", &EntityPk::empty());
+        super::encode_state_row_prefix_bounds("app.row", &RowPk::empty());
     let (_, replacement_value) = state_entry("a", StateCellRef::Value("replacement-a"), 0x22, &[]);
     let replacement = view
         .replace_state_tree_range(
@@ -3329,7 +3329,7 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
     let key = encode_state_key(StateKeyRef {
         schema_key: "app.row",
         file_id: Some("file"),
-        entity_pk: &EntityPk::single("b"),
+        row_pk: &RowPk::single("b"),
     });
     let (masked_rows, masked_members, masked_page_objects, masked_pack_objects) =
         encode_test_state_entries(
@@ -3393,7 +3393,7 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
                 .before
                 .as_ref()
                 .or(entry.after.as_ref())
-                .is_some_and(|row| row.key.entity_pk == EntityPk::single("b"))
+                .is_some_and(|row| row.key.row_pk == RowPk::single("b"))
         })
         .expect("masked global row must remain in the structural diff");
     assert!(masked_row.before.as_ref().is_some_and(|row| row.deleted));
@@ -3447,7 +3447,7 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
                 .before
                 .as_ref()
                 .or(entry.after.as_ref())
-                .is_some_and(|row| row.key.entity_pk == EntityPk::single("b"))
+                .is_some_and(|row| row.key.row_pk == RowPk::single("b"))
         })
         .expect("unmasked global row must remain in the structural diff");
     let before = unmasked_row.before.expect("masked before endpoint");
@@ -3504,7 +3504,7 @@ async fn untracked_range_is_branch_bounded_ordered_and_limited() {
                 StateKeyRef {
                     schema_key: &decoded_key.schema_key,
                     file_id: decoded_key.file_id.as_deref(),
-                    entity_pk: &decoded_key.entity_pk,
+                    row_pk: &decoded_key.row_pk,
                 },
             ),
             encoded_value,
@@ -3538,7 +3538,7 @@ async fn untracked_range_is_branch_bounded_ordered_and_limited() {
             StateKeyRef {
                 schema_key: &decoded_key.schema_key,
                 file_id: decoded_key.file_id.as_deref(),
-                entity_pk: &decoded_key.entity_pk,
+                row_pk: &decoded_key.row_pk,
             },
         ),
         vec![0xff],
@@ -3572,7 +3572,7 @@ async fn historical_absence_requires_authenticated_commit_and_root() {
     let absent_key = encode_state_key(StateKeyRef {
         schema_key: "app.row",
         file_id: Some("file"),
-        entity_pk: &EntityPk::single("absent"),
+        row_pk: &RowPk::single("absent"),
     });
     assert!(
         facade
@@ -3612,7 +3612,7 @@ async fn historical_missing_commit_catalog_fails_for_point_and_batch() {
     let key = StateKey {
         schema_key: "app.row".to_owned(),
         file_id: Some("file".to_owned()),
-        entity_pk: EntityPk::single("a"),
+        row_pk: RowPk::single("a"),
     };
     assert!(
         facade
@@ -4562,8 +4562,8 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
     let seed = build_seed();
     let storage = CountingStorage::new();
     seed_storage(&storage, &seed).await;
-    let local_pk = EntityPk::single("local");
-    let global_pk = EntityPk::single("global-only");
+    let local_pk = RowPk::single("local");
+    let global_pk = RowPk::single("global-only");
     let global_branch_id = CanonicalBranchId::from_bytes(
         *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
             .expect("global branch UUID")
@@ -4583,7 +4583,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
             StateKeyRef {
                 schema_key: "app.exact",
                 file_id: None,
-                entity_pk: &local_pk,
+                row_pk: &local_pk,
             },
             UntrackedValueRef {
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
@@ -4601,7 +4601,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
             StateKeyRef {
                 schema_key: "app.exact",
                 file_id: None,
-                entity_pk: &local_pk,
+                row_pk: &local_pk,
             },
             UntrackedValueRef {
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(3),
@@ -4623,7 +4623,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
             StateKeyRef {
                 schema_key: "app.exact",
                 file_id: None,
-                entity_pk: &global_pk,
+                row_pk: &global_pk,
             },
             UntrackedValueRef {
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(5),
@@ -4646,7 +4646,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
     let local_key = encode_state_key(StateKeyRef {
         schema_key: "app.exact",
         file_id: None,
-        entity_pk: &local_pk,
+        row_pk: &local_pk,
     });
     storage.untracked_get_many.store(0, Ordering::Relaxed);
     let local = view
@@ -4665,7 +4665,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
             &encode_state_key(StateKeyRef {
                 schema_key: "app.exact",
                 file_id: None,
-                entity_pk: &local_pk,
+                row_pk: &local_pk,
             }),
         )
         .await
@@ -4688,7 +4688,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
     let global_key = encode_state_key(StateKeyRef {
         schema_key: "app.exact",
         file_id: None,
-        entity_pk: &global_pk,
+        row_pk: &global_pk,
     });
     storage.untracked_get_many.store(0, Ordering::Relaxed);
     let global = view
@@ -4697,7 +4697,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
         .expect("global fallback row");
     assert_eq!(storage.untracked_get_many.load(Ordering::Relaxed), 2);
     assert_eq!(
-        global[0].as_ref().map(|(_, key, _)| key.entity_pk.clone()),
+        global[0].as_ref().map(|(_, key, _)| key.row_pk.clone()),
         Some(global_pk)
     );
 }
@@ -5411,7 +5411,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
 
     // RefChange chronology is authenticated by the explicit predecessor edge
     // and the predecessor-after/successor-before head link. ChangeIds are
-    // independent identities and must not be ordered as UUIDs.
+    // independent identitys and must not be ordered as UUIDs.
     let mut out_of_uuid_order = build_seed();
     let next_commit = CommitObjectV1 {
         commit_id: CommitId::from_bytes(raw_id(0x21)),
@@ -6445,7 +6445,7 @@ async fn state_edit_rejects_unsorted_and_duplicate_encoded_keys() {
                 encode_state_key(StateKeyRef {
                     schema_key: "app.row",
                     file_id: Some("file"),
-                    entity_pk: &EntityPk::single("a"),
+                    row_pk: &RowPk::single("a"),
                 }),
                 duplicate_value,
             ),
@@ -7006,7 +7006,7 @@ async fn publish_untracked_manifest(
         .await
         .expect("untracked view");
     let (manifest_id, _) = build.manifest.encode().expect("manifest");
-    let entity_pk = EntityPk::single(primary_key);
+    let row_pk = RowPk::single(primary_key);
     let roots = [manifest_id];
     let mut publication = PreparedPublication::from_global_epoch(&view).expect("untracked put");
     publication
@@ -7018,7 +7018,7 @@ async fn publish_untracked_manifest(
             StateKeyRef {
                 schema_key: "app.untracked",
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             },
             UntrackedValueRef {
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
@@ -7042,7 +7042,7 @@ async fn delete_untracked(storage: &Memory, seed: &SeedData, primary_key: &str) 
     let view = open_coherent_view(storage, seed.branch_id)
         .await
         .expect("delete view");
-    let entity_pk = EntityPk::single(primary_key);
+    let row_pk = RowPk::single(primary_key);
     let mut publication = PreparedPublication::from_global_epoch(&view).expect("delete");
     publication
         .delete_untracked_row(
@@ -7050,7 +7050,7 @@ async fn delete_untracked(storage: &Memory, seed: &SeedData, primary_key: &str) 
             StateKeyRef {
                 schema_key: "app.untracked",
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             },
         )
         .expect("delete untracked");
@@ -8254,13 +8254,13 @@ async fn stale_reconciliation_authenticates_three_page_prefix_after_reopen() {
     let result = run_stale_reconciliation_fixture(&fixture.seed, fixture.after_commit_id)
         .await
         .expect("unequal-endpoint stale reconciliation should resolve the selected later page");
-    assert_eq!(result.identities.len(), 1);
+    assert_eq!(result.identitys.len(), 1);
     assert_eq!(
-        result.identities[0].key,
+        result.identitys[0].key,
         super::decode_state_key(&fixture.selected_key).expect("selected key decodes")
     );
     assert_eq!(
-        result.identities[0]
+        result.identitys[0]
             .after
             .as_ref()
             .expect("selected identity has an after row")
@@ -8301,7 +8301,7 @@ async fn stale_reconciliation_authenticates_three_page_prefix_after_reopen() {
         )
         .await
         .expect("cold reopen must preserve actual stale reconciliation");
-    assert_eq!(reopened_result.identities.len(), 1);
+    assert_eq!(reopened_result.identitys.len(), 1);
 
     // The remaining assertions deliberately exercise the public stale
     // reconciliation caller with unequal endpoints.  They must not be

@@ -3,13 +3,13 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId, CommitRecord};
 use crate::common::{ExactValue, LixTimestamp};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChange {
     pub(crate) id: ChangeId,
     pub(crate) account_id: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: crate::json_store::JsonSlot,
@@ -21,7 +21,7 @@ pub(crate) struct CommitGraphChange {
 /// One topology-first commit fact.
 ///
 /// Nodes contain exactly the manifest fields needed by graph algorithms and
-/// derived commit surfaces. Entity/change payloads are loaded separately only
+/// derived commit surfaces. Row/change payloads are loaded separately only
 /// by history APIs that explicitly request them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphNode {
@@ -46,7 +46,7 @@ pub(crate) struct ReachableCommitGraphNode {
 /// Filter for canonical change history from a chosen traversal start commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
-    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) row_pks: Vec<RowPk>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<u32>,
@@ -88,7 +88,7 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError>;
 
-    /// Returns commit identities pinned by authenticated ForkTree snapshot
+    /// Returns commit identitys pinned by authenticated ForkTree snapshot
     /// selectors. Recovery, checkpoint, undo, redo, and tombstone selectors
     /// are physical roots; no legacy checkpoint JSON row is consulted.
     async fn snapshot_roots(&mut self) -> Result<Vec<(String, CommitId)>, LixError>;

@@ -3,7 +3,7 @@ use serde_json::json;
 use crate::LixError;
 use crate::changelog::CommitId;
 use crate::common::SharedStr;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 
 pub(crate) const COLLECTION_GENERATION_SCHEMA_KEY: &str = "lix_collection_generation";
@@ -29,11 +29,11 @@ pub(crate) struct CollectionGeneration {
 }
 
 pub(crate) fn ordered_single_string_identity_digest<'a>(
-    entity_pks: impl IntoIterator<Item = &'a EntityPk>,
+    row_pks: impl IntoIterator<Item = &'a RowPk>,
 ) -> Option<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
-    for entity_pk in entity_pks {
-        let value = entity_pk.as_single_string().ok()?;
+    for row_pk in row_pks {
+        let value = row_pk.as_single_string().ok()?;
         hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
@@ -45,10 +45,10 @@ pub(crate) fn collection_scope_key(scope: CollectionScopeRef<'_>) -> String {
         .expect("serializing a collection scope tuple cannot fail")
 }
 
-pub(crate) fn collection_scope_from_entity_pk(
-    entity_pk: &EntityPk,
+pub(crate) fn collection_scope_from_row_pk(
+    row_pk: &RowPk,
 ) -> Result<(String, Option<String>), LixError> {
-    let scope_key = entity_pk.as_single_string()?;
+    let scope_key = row_pk.as_single_string()?;
     serde_json::from_str(scope_key).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -62,7 +62,7 @@ pub(crate) fn collection_delete_stage_row(
     scope: CollectionScopeRef<'_>,
 ) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: None,
+        row_pk: None,
         schema_key: SharedStr::from_static(COLLECTION_GENERATION_SCHEMA_KEY),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({

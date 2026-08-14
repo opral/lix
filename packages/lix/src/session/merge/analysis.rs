@@ -206,7 +206,7 @@ where
                         .and_then(|(_, plan)| {
                             crate::native_row::logical_value(
                                 &plan.relational_schema,
-                                &entry.key.entity_pk,
+                                &entry.key.row_pk,
                                 global,
                                 entry.key.file_id.as_deref(),
                                 native,
@@ -229,7 +229,7 @@ where
             };
             if record.schema_key != entry.key.schema_key
                 || record.file_id != entry.key.file_id
-                || record.entity_pk != entry.key.entity_pk
+                || record.row_pk != entry.key.row_pk
                 || record.created_at != state.created_at
                 || !snapshot_matches
                 || !metadata_matches

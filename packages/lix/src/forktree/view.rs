@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
     ReadOptions, ScanCursor, ScanOrder, Storage, StorageError,
@@ -582,7 +582,7 @@ where
                 super::state::encode_state_key(super::state::StateKeyRef {
                     schema_key: &key.schema_key,
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 })
             })
             .collect::<Vec<_>>();
@@ -752,11 +752,11 @@ where
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, crate::LixError> {
         let expected_scope = crate::collection_generation::collection_scope_key(scope);
-        let entity_pk = EntityPk::single(&expected_scope);
+        let row_pk = RowPk::single(&expected_scope);
         let key = super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY,
             file_id: None,
-            entity_pk: &entity_pk,
+            row_pk: &row_pk,
         });
         let row = self
             .branch(branch_id)
@@ -772,7 +772,7 @@ where
         let decoded = super::state::decode_state_key(&row.encoded_key)?;
         if decoded.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
             || decoded.file_id.is_some()
-            || decoded.entity_pk != entity_pk
+            || decoded.row_pk != row_pk
         {
             return Err(crate::LixError::new(
                 crate::LixError::CODE_STORAGE_ERROR,
@@ -911,7 +911,7 @@ where
     }
 
     /// Loads exact historical rows from the authenticated ForkTree state
-    /// owner. The transaction supplies the key identities; the returned
+    /// owner. The transaction supplies the key identitys; the returned
     /// ForkTree-owned row shape is a terminal merge-consumer value and never
     /// opens another reader or consults the superseded tracked-state reader.
     pub(crate) async fn load_state_rows_at_commit(
@@ -942,7 +942,7 @@ where
             let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             });
             let value = self
                 .load_state_value_at_commit(commit_id, &encoded_key, true)
@@ -990,7 +990,7 @@ where
             let key = super::state::StateKey {
                 schema_key: member.schema_key.clone(),
                 file_id: member.file_id.clone(),
-                entity_pk: member.entity_pk.clone(),
+                row_pk: member.row_pk.clone(),
             };
             if seen.insert(key.clone(), ()).is_some() {
                 return Err(crate::LixError::new(
@@ -1090,7 +1090,7 @@ where
     /// endpoint payload differences. Both scans use this facade's retained
     /// read and therefore inherit the same catalog, root, and member
     /// fail-closed validation as the payload path.
-    pub(crate) async fn touched_state_identities_between_commits(
+    pub(crate) async fn touched_state_identitys_between_commits(
         &self,
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
@@ -1098,7 +1098,7 @@ where
         Ok(
             stale_state_changes_between_commits_on_read(self, before, after, true)
                 .await?
-                .identities,
+                .identitys,
         )
     }
 
@@ -1223,7 +1223,7 @@ pub(crate) struct StaleStateChanges {
     /// Complete public historical changes, including authenticated write
     /// identity-only changes whose endpoint payloads are equal.
     pub(crate) complete: Vec<super::state::HistoricalStateDiffEntry>,
-    pub(crate) identities: Vec<super::state::HistoricalStateIdentityChange>,
+    pub(crate) identitys: Vec<super::state::HistoricalStateIdentityChange>,
 }
 
 async fn stale_state_changes_between_commits_on_read<R>(
@@ -1244,7 +1244,7 @@ where
         return Ok(StaleStateChanges {
             payload: Vec::new(),
             complete: Vec::new(),
-            identities: Vec::new(),
+            identitys: Vec::new(),
         });
     }
     let after_roots = view
@@ -1267,7 +1267,7 @@ where
         return Ok(StaleStateChanges {
             payload: Vec::new(),
             complete: Vec::new(),
-            identities: Vec::new(),
+            identitys: Vec::new(),
         });
     }
 
@@ -1277,7 +1277,7 @@ where
             super::state::encode_state_key(super::state::StateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             })
         })
         .collect::<Vec<_>>();
@@ -1302,7 +1302,7 @@ where
 
     let mut payload = Vec::new();
     let mut complete = Vec::new();
-    let mut identities = Vec::new();
+    let mut identitys = Vec::new();
     for ((key, before), after) in keys.into_iter().zip(before_rows).zip(after_rows) {
         let before = historical_state_row_from_point(key.clone(), before, include_global)?;
         let after = historical_state_row_from_point(key, after, include_global)?;
@@ -1327,7 +1327,7 @@ where
                     commit_id: row.commit_id,
                 }
             };
-            identities.push(super::state::HistoricalStateIdentityChange {
+            identitys.push(super::state::HistoricalStateIdentityChange {
                 key: row.key.clone(),
                 before: entry.before.as_ref().map(identity),
                 after: entry.after.as_ref().map(identity),
@@ -1337,7 +1337,7 @@ where
     Ok(StaleStateChanges {
         payload,
         complete,
-        identities,
+        identitys,
     })
 }
 
@@ -1382,8 +1382,8 @@ pub(super) fn merge_sorted_state_keys(
     right: Vec<super::state::StateKey>,
 ) -> Vec<super::state::StateKey> {
     // `diff_roots` returns keys in their canonical encoded byte order
-    // (schema, entity_pk, file_id), while `StateKey::Ord` follows the Rust
-    // field order (schema, file_id, entity_pk).  Merge the canonical bytes,
+    // (schema, row_pk, file_id), while `StateKey::Ord` follows the Rust
+    // field order (schema, file_id, row_pk).  Merge the canonical bytes,
     // not the incidental struct order, so local/global overlays stay ordered
     // and duplicate physical acquisition of one key is collapsed.
     let mut merged = left.into_iter().chain(right).collect::<Vec<_>>();
@@ -1391,23 +1391,23 @@ pub(super) fn merge_sorted_state_keys(
         super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: &left.schema_key,
             file_id: left.file_id.as_deref(),
-            entity_pk: &left.entity_pk,
+            row_pk: &left.row_pk,
         })
         .cmp(&super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: &right.schema_key,
             file_id: right.file_id.as_deref(),
-            entity_pk: &right.entity_pk,
+            row_pk: &right.row_pk,
         }))
     });
     merged.dedup_by(|left, right| {
         super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: &left.schema_key,
             file_id: left.file_id.as_deref(),
-            entity_pk: &left.entity_pk,
+            row_pk: &left.row_pk,
         }) == super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: &right.schema_key,
             file_id: right.file_id.as_deref(),
-            entity_pk: &right.entity_pk,
+            row_pk: &right.row_pk,
         })
     });
     merged
@@ -1467,7 +1467,7 @@ where
             super::state::encode_state_key(super::state::StateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             })
         })
         .collect::<Vec<_>>();
@@ -1894,7 +1894,7 @@ mod tests {
     };
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::state::{HistoricalStateRow, StateKey};
     use crate::forktree::{CanonicalBranchId, CheckpointCursorV1, ObjectId};
 
@@ -1908,7 +1908,7 @@ mod tests {
             key: StateKey {
                 schema_key: "plugin_entity".to_owned(),
                 file_id: Some("file-a".to_owned()),
-                entity_pk: EntityPk::single("row-a"),
+                row_pk: RowPk::single("row-a"),
             },
             global: false,
             change_id,

@@ -1533,7 +1533,7 @@ fn state_binding(state_key: &StateKey, manifest: &BlobManifestV1) -> [u8; 32] {
     let mut bytes = encode_state_key(StateKeyRef {
         schema_key: &state_key.schema_key,
         file_id: state_key.file_id.as_deref(),
-        entity_pk: &state_key.entity_pk,
+        row_pk: &state_key.row_pk,
     });
     bytes.extend_from_slice(manifest.root_object_id.as_bytes());
     bytes.extend_from_slice(manifest.canonical_blob_id.as_bytes());
@@ -1545,7 +1545,7 @@ fn state_binding(state_key: &StateKey, manifest: &BlobManifestV1) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
 
     fn authenticated_base(build: &BlobMerkleTreeBuild) -> AuthenticatedBlobMerkleBase {
         fn collect(
@@ -1612,7 +1612,7 @@ mod tests {
         StateKey {
             schema_key: "lix_file".to_owned(),
             file_id: Some("README.md".to_owned()),
-            entity_pk: EntityPk::single("row-7"),
+            row_pk: RowPk::single("row-7"),
         }
     }
 

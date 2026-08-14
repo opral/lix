@@ -6,10 +6,10 @@ use smallvec::SmallVec;
 use crate::LixError;
 use crate::common::{format_json_pointer, parse_json_pointer};
 use crate::domain::{Domain, DomainSchemaIdentity};
-use crate::entity_pk::{EntityPk, canonical_json_text};
+use crate::row_pk::{RowPk, canonical_json_text};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
-use crate::plugin::runtime::WasmEntityKey;
+use crate::plugin::runtime::WasmRowKey;
 
 #[derive(Default)]
 pub(crate) struct CatalogSnapshot {
@@ -384,14 +384,14 @@ pub(crate) struct SchemaPlan {
     fast_object_validation: Option<FastObjectValidationPlan>,
     pub(crate) defaults: DefaultPlan,
     pub(crate) primary_key: Option<PointerGroup>,
-    pub(crate) primary_key_component_types: Option<Vec<crate::entity_pk::EntityPkComponentType>>,
+    pub(crate) primary_key_component_types: Option<Vec<crate::row_pk::RowPkComponentType>>,
     pub(crate) uniques: Vec<PointerGroup>,
     pub(crate) foreign_keys: Vec<ForeignKeyPlan>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CertifiedPluginRow {
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     /// `None` retains the guest buffer because its spelling is already
     /// canonical. `Some` is the canonical spelling produced by the same
     /// structural parser pass that validated the row.
@@ -415,14 +415,14 @@ pub(crate) struct TypedJsonObjectLayoutCertificate<'a> {
     field_names: Vec<String>,
     field_validations: Vec<Option<&'a FastValueValidation>>,
     primary_key_field_indices: Vec<usize>,
-    primary_key_component_types: &'a [crate::entity_pk::EntityPkComponentType],
+    primary_key_component_types: &'a [crate::row_pk::RowPkComponentType],
 }
 
 impl TypedJsonObjectLayoutCertificate<'_> {
     pub(crate) fn certify_row(
         &self,
         values: &[TypedJsonScalarRef<'_>],
-        entity_pk: &[&str],
+        row_pk: &[&str],
     ) -> Result<(), LixError> {
         if values.len() != self.field_validations.len() {
             return Err(LixError::new(
@@ -443,13 +443,13 @@ impl TypedJsonObjectLayoutCertificate<'_> {
                 ));
             }
         }
-        if entity_pk.len() != self.primary_key_field_indices.len() {
+        if row_pk.len() != self.primary_key_field_indices.len() {
             return Err(typed_object_validation_error(
                 self.schema_key,
-                "snapshot primary-key component count does not match the emitted entity_pk",
+                "snapshot primary-key component count does not match the emitted row_pk",
             ));
         }
-        for (&field_index, expected) in self.primary_key_field_indices.iter().zip(entity_pk) {
+        for (&field_index, expected) in self.primary_key_field_indices.iter().zip(row_pk) {
             let actual = match values[field_index] {
                 TypedJsonScalarRef::String(value) => Some(value),
                 TypedJsonScalarRef::Null | TypedJsonScalarRef::Boolean => None,
@@ -458,18 +458,18 @@ impl TypedJsonObjectLayoutCertificate<'_> {
                 return Err(typed_object_validation_error(
                     self.schema_key,
                     &format!(
-                        "snapshot primary-key property '{}' does not match the emitted entity_pk",
+                        "snapshot primary-key property '{}' does not match the emitted row_pk",
                         self.field_names[field_index]
                     ),
                 ));
             }
         }
-        EntityPk::validate_external_parts(entity_pk, self.primary_key_component_types).map_err(
+        RowPk::validate_external_parts(row_pk, self.primary_key_component_types).map_err(
             |error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "typed entity_pk is invalid for schema '{}': {error}",
+                        "typed row_pk is invalid for schema '{}': {error}",
                         self.schema_key
                     ),
                 )
@@ -585,10 +585,10 @@ impl SchemaPlan {
     pub(crate) fn certify_or_normalize_plugin_row(
         &self,
         bytes: &[u8],
-        key: &WasmEntityKey,
+        key: &WasmRowKey,
     ) -> Result<Option<CertifiedPluginRow>, LixError> {
         let emitted = key
-            .entity_pk
+            .row_pk
             .iter()
             .map(|component| component.as_str())
             .collect::<SmallVec<[_; 2]>>();
@@ -601,10 +601,10 @@ impl SchemaPlan {
             .primary_key_component_types
             .as_deref()
             .expect("certificate eligibility requires typed primary-key components");
-        EntityPk::from_shared_external_parts(key.entity_pk.iter().cloned(), component_types)
-            .map(|entity_pk| {
+        RowPk::from_shared_external_parts(key.row_pk.iter().cloned(), component_types)
+            .map(|row_pk| {
                 Some(CertifiedPluginRow {
-                    entity_pk,
+                    row_pk,
                     normalized,
                 })
             })
@@ -612,7 +612,7 @@ impl SchemaPlan {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "plugin entity_pk is invalid for schema '{}': {error}",
+                        "plugin row_pk is invalid for schema '{}': {error}",
                         self.key.schema_key
                     ),
                 )
@@ -623,7 +623,7 @@ impl SchemaPlan {
         &self,
         bytes: &[u8],
         schema_key: &str,
-        entity_pk: &[&str],
+        row_pk: &[&str],
     ) -> Result<Option<Option<Vec<u8>>>, LixError> {
         if !self.accepts_canonical_certificate() {
             return Ok(None);
@@ -640,7 +640,7 @@ impl SchemaPlan {
             .primary_key_component_types
             .as_deref()
             .expect("certificate eligibility requires typed primary-key components");
-        if entity_pk.len() != primary_key_paths.len() {
+        if row_pk.len() != primary_key_paths.len() {
             return Ok(None);
         }
         if schema_key != self.key.schema_key {
@@ -654,7 +654,7 @@ impl SchemaPlan {
         }
 
         let mut parser = CanonicalPluginRowParser::new(bytes)?;
-        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, entity_pk);
+        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, row_pk);
         let normalized = match parser.parse_root_object(validation, &mut primary_key) {
             Ok(normalized) => normalized,
             Err(CanonicalPluginRowError::InvalidPlugin(message)) => {
@@ -671,13 +671,13 @@ impl SchemaPlan {
             }
         };
 
-        EntityPk::validate_external_parts(entity_pk, component_types)
+        RowPk::validate_external_parts(row_pk, component_types)
             .map(|()| Some(normalized))
             .map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "plugin entity_pk is invalid for schema '{}': {error}",
+                        "plugin row_pk is invalid for schema '{}': {error}",
                         self.key.schema_key
                     ),
                 )
@@ -755,7 +755,7 @@ impl SchemaPlan {
 fn primary_key_component_types(
     schema: &JsonValue,
     paths: &[Vec<String>],
-) -> Result<Vec<crate::entity_pk::EntityPkComponentType>, LixError> {
+) -> Result<Vec<crate::row_pk::RowPkComponentType>, LixError> {
     let schema = crate::schema::parse_lix_schema(schema)?;
     paths
         .iter()
@@ -778,9 +778,9 @@ fn primary_key_component_types(
                     )
                 })?;
             match column.data_type {
-                lix_schema::DataType::Int8 => Ok(crate::entity_pk::EntityPkComponentType::Integer),
-                lix_schema::DataType::Uuid => Ok(crate::entity_pk::EntityPkComponentType::Uuid),
-                lix_schema::DataType::Text => Ok(crate::entity_pk::EntityPkComponentType::String),
+                lix_schema::DataType::Int8 => Ok(crate::row_pk::RowPkComponentType::Integer),
+                lix_schema::DataType::Uuid => Ok(crate::row_pk::RowPkComponentType::Uuid),
+                lix_schema::DataType::Text => Ok(crate::row_pk::RowPkComponentType::String),
                 _ => Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!("primary-key column at index {index} must be bigint, text, or uuid"),
@@ -1610,7 +1610,7 @@ impl<'a> CanonicalPrimaryKeyMatcher<'a> {
             None
         } else {
             Some(format!(
-                "snapshot primary-key property '{}' does not match the emitted entity_pk",
+                "snapshot primary-key property '{}' does not match the emitted row_pk",
                 self.paths[index][0]
             ))
         }
@@ -1674,7 +1674,7 @@ impl<'a> CanonicalPluginRowParser<'a> {
         let leading_whitespace = self.skip_whitespace();
         if self.peek() != Some(b'{') {
             return Err(CanonicalPluginRowError::InvalidPlugin(
-                "v2 entity snapshots must be JSON objects".to_owned(),
+                "v2 row snapshots must be JSON objects".to_owned(),
             ));
         }
         let value = self.parse_object(Some(validation), Some(primary_key), 0)?;
@@ -3219,7 +3219,7 @@ mod tests {
         let plan =
             compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
         assert!(plan.accepts_canonical_certificate());
-        let key = WasmEntityKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
+        let key = WasmRowKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
         let certified = plan
             .certify_or_normalize_plugin_row(
                 br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
@@ -3228,8 +3228,8 @@ mod tests {
             .expect("canonical CSV row should validate")
             .expect("canonical CSV row should receive a certificate");
         assert_eq!(
-            certified.entity_pk,
-            EntityPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
+            certified.row_pk,
+            RowPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
         );
         assert!(
             certified.normalized.is_none(),
@@ -3246,7 +3246,7 @@ mod tests {
         )
         .expect("canonical parser");
         let emitted = key
-            .entity_pk
+            .row_pk
             .iter()
             .map(|component| component.as_str())
             .collect::<SmallVec<[_; 2]>>();
@@ -3351,7 +3351,7 @@ mod tests {
         )
         .expect("UUID schema should compile");
         assert!(plan.accepts_canonical_certificate());
-        let key = WasmEntityKey::from_owned_parts("uuid_format_row", vec!["row-1".to_owned()]);
+        let key = WasmRowKey::from_owned_parts("uuid_format_row", vec!["row-1".to_owned()]);
 
         let certified = plan
             .certify_or_normalize_plugin_row(
@@ -3378,7 +3378,7 @@ mod tests {
             table
                 .certify_or_normalize_plugin_row(
                     br#"{"dialect":{"delimiter":",","quote":"\"","terminator":"\n"},"id":"root"}"#,
-                    &WasmEntityKey::from_owned_parts("csv_table", vec!["root".to_owned()],),
+                    &WasmRowKey::from_owned_parts("csv_table", vec!["root".to_owned()],),
                 )
                 .expect("canonical CSV table")
                 .expect("eligible canonical row")
@@ -3394,7 +3394,7 @@ mod tests {
             json_root
                 .certify_or_normalize_plugin_row(
                     br#"{"id":"root","kind":"object"}"#,
-                    &WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+                    &WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
                 )
                 .expect("canonical JSON root")
                 .expect("eligible canonical row")
@@ -3410,7 +3410,7 @@ mod tests {
             object_member
                 .certify_or_normalize_plugin_row(
                     br#"{"key":"name","kind":"string","order_key":"01","parent_id":"root","scalar_json":"\"Lix\""}"#,
-                    &WasmEntityKey::from_owned_parts(
+                    &WasmRowKey::from_owned_parts(
                         "json_object_member",
                         vec!["root".to_owned(), "name".to_owned()],
                     ),
@@ -3429,7 +3429,7 @@ mod tests {
             array_item
                 .certify_or_normalize_plugin_row(
                     br#"{"id":"019a0000-0000-7000-8000-000000000001","kind":"null","order_key":"01","parent_id":"root","scalar_json":"null"}"#,
-                    &WasmEntityKey::from_owned_parts(
+                    &WasmRowKey::from_owned_parts(
                         "json_array_item",
                         vec![UUID_A.to_owned()],
                     ),
@@ -3445,7 +3445,7 @@ mod tests {
     fn canonical_plugin_row_certificate_rejects_hostile_rows() {
         let plan =
             compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
-        let key = WasmEntityKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
+        let key = WasmRowKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
 
         for bytes in [
             br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
@@ -3464,7 +3464,7 @@ mod tests {
                 br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"01"}"#,
                 &key,
             )
-            .expect_err("snapshot identity must match emitted entity key");
+            .expect_err("snapshot identity must match emitted row key");
         assert_eq!(wrong_identity.code, LixError::CODE_SCHEMA_VALIDATION);
 
         let invalid_order_key = plan

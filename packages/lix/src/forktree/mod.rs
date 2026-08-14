@@ -51,8 +51,8 @@ pub(crate) use serving::{
 pub(crate) use state::{
     HistoricalStateRow, NativeRowCell, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue,
     StateValueRef,
-    decode_state_key, decode_state_value, encode_state_entity_prefix,
-    encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
+    decode_state_key, decode_state_value, encode_state_row_prefix,
+    encode_state_row_prefix_bounds, encode_state_key, encode_state_value,
     exclusive_prefix_upper_bound,
 };
 pub(crate) use tree::diff_roots;

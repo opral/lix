@@ -24,10 +24,10 @@ pub(crate) fn stats_from_plan(
     plan: &MergePlan,
     source_diff: &MergeDiff,
 ) -> Result<MergeStats, LixError> {
-    if !identities_are_strictly_sorted(
+    if !identitys_are_strictly_sorted(
         plan.picks.iter().map(|pick| pick.identity(source_diff)),
         plan.picks.len(),
-    ) || !identities_are_strictly_sorted(
+    ) || !identitys_are_strictly_sorted(
         source_diff.entries.iter().map(|entry| &entry.identity),
         source_diff.entries.len(),
     ) {
@@ -67,17 +67,17 @@ fn stats_from_sorted_plan(
     Ok(stats)
 }
 
-fn identities_are_strictly_sorted<'a>(
-    mut identities: impl Iterator<Item = &'a crate::forktree::StateKey>,
+fn identitys_are_strictly_sorted<'a>(
+    mut identitys: impl Iterator<Item = &'a crate::forktree::StateKey>,
     len: usize,
 ) -> bool {
     if len < 2 {
         return true;
     }
-    let Some(mut previous) = identities.next() else {
+    let Some(mut previous) = identitys.next() else {
         return true;
     };
-    for identity in identities {
+    for identity in identitys {
         if identity_cmp(previous, identity) != Ordering::Less {
             return false;
         }
@@ -87,15 +87,15 @@ fn identities_are_strictly_sorted<'a>(
 }
 
 fn missing_source_entry(identity: &crate::forktree::StateKey) -> LixError {
-    let entity_pk = identity
-        .entity_pk
+    let row_pk = identity
+        .row_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row pk>".to_string());
     LixError::new(
         "LIX_ERROR_UNKNOWN",
         format!(
-            "merge analysis could not find source diff entry for source schema '{}' entity '{}'",
-            identity.schema_key, entity_pk
+            "merge analysis could not find source diff entry for source schema '{}' row '{}'",
+            identity.schema_key, row_pk
         ),
     )
 }
@@ -138,23 +138,23 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
 
     #[test]
     fn ten_thousand_sorted_merge_picks_have_linear_stats_scan() {
         const ROW_COUNT: usize = 10_000;
-        let identities = (0..ROW_COUNT)
+        let identitys = (0..ROW_COUNT)
             .map(|index| crate::forktree::StateKey {
                 schema_key: "shared_schema".to_string(),
                 file_id: Some("shared_file".to_string()),
-                entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                row_pk: RowPk::single(format!("row-{index:05}")),
             })
             .collect::<Vec<_>>();
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let change_id = ChangeId::for_test_label("stats-change");
         let commit_id = CommitId::for_test_label("stats-commit");
         let source_diff = MergeDiff::from_entries_with_payloads(
-            identities
+            identitys
                 .iter()
                 .enumerate()
                 .map(|(index, identity)| {

@@ -1,6 +1,6 @@
 use crate::changelog::ChangeRecord;
 use crate::common::SharedStr;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::ForkTreeReadFacade;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, parse_row_metadata};
@@ -41,7 +41,7 @@ where
 pub(crate) struct MaterializedChange {
     pub(crate) id: String,
     pub(crate) account_id: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
@@ -91,7 +91,7 @@ where
         crate::commit_graph::CommitGraphChange {
             id: change.change_id,
             account_id: change.account_id,
-            entity_pk: change.entity_pk,
+            row_pk: change.row_pk,
             schema_key: change.schema_key,
             file_id: change.file_id,
             snapshot: change.snapshot,
@@ -130,7 +130,7 @@ where
     Ok(MaterializedChange {
         id: change.id.to_string(),
         account_id: change.account_id,
-        entity_pk: change.entity_pk,
+        row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_content,

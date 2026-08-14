@@ -10,7 +10,7 @@ use crate::catalog::snapshot::{
 };
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
-use crate::entity_pk::{EntityPk, EntityPkComponents};
+use crate::row_pk::{RowPk, RowPkComponents};
 use crate::schema::schema_key_from_definition;
 use crate::state::{StateRow, TransactionStateView};
 
@@ -158,10 +158,10 @@ async fn scan_transaction_catalog_rows<R>(
 where
     R: crate::storage_adapter::StorageAdapterRead,
 {
-    let lower = crate::forktree::encode_state_entity_prefix(
+    let lower = crate::forktree::encode_state_row_prefix(
         REGISTERED_SCHEMA_KEY,
-        &EntityPk {
-            components: EntityPkComponents::Empty,
+        &RowPk {
+            components: RowPkComponents::Empty,
         },
     );
     let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);

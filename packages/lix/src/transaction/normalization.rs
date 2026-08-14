@@ -254,22 +254,22 @@ fn normalized_row_facts(
     let native = row
         .snapshot
         .map(|snapshot| {
-            let entity_pk = row.entity_pk.ok_or_else(|| {
+            let row_pk = row.row_pk.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "normalized native row is missing its entity identity",
+                    "normalized native row is missing its row identity",
                 )
             })?;
             let native = crate::native_row::encode(
                 relational_schema,
-                entity_pk,
+                row_pk,
                 row.global,
                 row.file_id.map(AsRef::as_ref),
                 snapshot.value(),
             )?;
             let canonical = crate::native_row::logical_value(
                 relational_schema,
-                entity_pk,
+                row_pk,
                 row.global,
                 row.file_id.map(AsRef::as_ref),
                 &native,

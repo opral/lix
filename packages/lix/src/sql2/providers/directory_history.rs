@@ -38,7 +38,7 @@ use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::history_util::{ObservedStateOrdinal, ObservedStateRows, entity_pk_json_array};
+use super::history_util::{ObservedStateOrdinal, ObservedStateRows, row_pk_json_array};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -342,10 +342,10 @@ where
         });
     }
     output.retain(|row| {
-        let entity_pk = entity_pk_json_array(&row.descriptor().id).ok();
+        let row_pk = row_pk_json_array(&row.descriptor().id).ok();
         route.matches_surface_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            entity_pk.as_deref().unwrap_or(&row.descriptor().id),
+            row_pk.as_deref().unwrap_or(&row.descriptor().id),
             None,
             row.event.depth,
         )
@@ -427,7 +427,7 @@ fn parse_directory_history_observed_records(
         .map(|observed| {
             let _ = observed.observed_commit_id();
             let row = observed.row();
-            let row_id = row.entity_pk().as_single_string_owned()?;
+            let row_id = row.row_pk().as_single_string_owned()?;
             let Some(snapshot_content) = row.snapshot_content() else {
                 if row.deleted() {
                     return Ok(DirectoryHistoryObservedRecord {
@@ -481,7 +481,7 @@ fn parse_directory_history_records(
         .iter()
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
-            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            let row_id = entry.change.row_pk.as_single_string_owned()?;
             if entry.change.snapshot_content.is_none() {
                 return Ok(DirectoryHistoryRecord {
                     id: row_id,
@@ -622,7 +622,7 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
         ("name", Col::Utf8(|row| row.descriptor().name.as_deref())),
         (
             HISTORY_COL_ENTITY_PK,
-            Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
+            Col::Utf8Fallible(|row| row_pk_json_array(&row.descriptor().id).map(Some)),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,

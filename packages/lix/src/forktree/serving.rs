@@ -1351,7 +1351,7 @@ where
     Ok(values.pop().flatten())
 }
 
-/// Loads exact historical state identities after authenticating the selected
+/// Loads exact historical state identitys after authenticating the selected
 /// commit envelope and retained member closure once. All tree lookups remain
 /// bound to the caller's retained read and preserve input order/duplicates.
 pub(crate) async fn load_state_values_at_commit<R>(
@@ -4157,7 +4157,7 @@ where
         if encode_state_key(super::state::StateKeyRef {
             schema_key: &record.schema_key,
             file_id: record.file_id.as_deref(),
-            entity_pk: &record.entity_pk,
+            row_pk: &record.row_pk,
         }) != *encoded_key
         {
             return Err(corruption(
@@ -4437,7 +4437,7 @@ where
         if encode_state_key(super::state::StateKeyRef {
             schema_key: &record.schema_key,
             file_id: record.file_id.as_deref(),
-            entity_pk: &record.entity_pk,
+            row_pk: &record.row_pk,
         }) != *encoded_key
         {
             return Err(corruption(
@@ -4818,7 +4818,7 @@ where
     }
     // This is an internal authenticated merge, not a public pagination
     // boundary.  A 64-row page repeatedly descended the same immutable tree
-    // (sixteen times for the common 1K entity scan), dominating broad reads
+    // (sixteen times for the common 1K row scan), dominating broad reads
     // after semantic payloads moved into compact change pages.  Keep the
     // working set bounded while amortizing one tree proof across a useful
     // OLTP batch.
@@ -5259,7 +5259,7 @@ where
             | StateTreeMutation::Update { key, value, audit } => (key, Some(value), audit.as_ref()),
             StateTreeMutation::Remove { key } => (key, None, None),
             StateTreeMutation::RemoveRange { lower, upper } => {
-                super::state::validate_state_entity_prefix(lower)
+                super::state::validate_state_row_prefix(lower)
                     .map_err(|error| corruption(error.to_string()))?;
                 if upper.as_ref().is_some_and(|upper| lower >= upper) {
                     return Err(corruption("state-tree delete range is empty or reversed"));
@@ -5346,7 +5346,7 @@ pub(crate) async fn replace_state_tree_range<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    super::state::validate_state_entity_prefix(&lower)
+    super::state::validate_state_row_prefix(&lower)
         .map_err(|error| corruption(error.to_string()))?;
     if upper.as_ref().is_some_and(|upper| lower >= *upper) {
         return Err(corruption(

@@ -95,9 +95,9 @@ where
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
                                 format!(
-                                    "working diff for schema '{}' entity {:?} has no target row",
+                                    "working diff for schema '{}' row {:?} has no target row",
                                     entry.key.schema_key.as_str(),
-                                    &entry.key.entity_pk,
+                                    &entry.key.row_pk,
                                 ),
                             )
                         })?;
@@ -209,7 +209,7 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::{StateCell, StateValue};
 
     #[test]
@@ -219,7 +219,7 @@ mod tests {
         let key = StateKey {
             schema_key: "test_schema".to_owned(),
             file_id: None,
-            entity_pk: EntityPk::single("entity"),
+            row_pk: RowPk::single("row"),
         };
         let value = StateValue {
             change_id: ChangeId::for_test_label("checkpoint-canonicalized-change"),

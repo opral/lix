@@ -9,7 +9,7 @@ pub(crate) const CHECKPOINT_MARKER_SCHEMA_KEY: &str = "lix_checkpoint_marker";
 
 pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: None,
+        row_pk: None,
         schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.into(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({

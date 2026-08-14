@@ -1,7 +1,7 @@
 //! Durable, branch-local plugin registry state.
 //!
-//! The registry is one tracked `lix_key_value` entity per branch. File
-//! ownership uses the same reserved entity key for every file and relies on
+//! The registry is one tracked `lix_key_value` row per branch. File
+//! ownership uses the same reserved row key for every file and relies on
 //! `file_id` for identity. That layout gives the transaction hot paths one
 //! exact registry read and one batched owner read instead of a filesystem
 //! scan.
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BlobId;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::state::StateRow;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
@@ -331,7 +331,7 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Decode the JSON held in the `value` field. A missing entity is the
+    /// Decode the JSON held in the `value` field. A missing row is the
     /// canonical empty registry and requires no filesystem discovery.
     pub(crate) fn from_optional_value(value: Option<&JsonValue>) -> Result<Self, LixError> {
         let Some(value) = value else {
@@ -463,7 +463,7 @@ where
 {
     let registry_key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
         schema_key: KEY_VALUE_SCHEMA_KEY,
-        entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
+        row_pk: &RowPk::single(PLUGIN_REGISTRY_KEY),
         file_id: None,
     });
     let value = view
@@ -587,7 +587,7 @@ impl PluginFileOwner {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
         if row.key.schema_key != KEY_VALUE_SCHEMA_KEY
-            || row.key.entity_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+            || row.key.row_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
         {
             return Err(invalid_registry(
                 "historical plugin owner row has an invalid storage identity",
@@ -1078,7 +1078,7 @@ fn tracked_key_value_write_row(
         .map(|snapshot| TransactionJson::from_value(snapshot, "plugin registry key-value row"))
         .transpose()?;
     Ok(TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(key)),
+        row_pk: Some(RowPk::single(key)),
         schema_key: KEY_VALUE_SCHEMA_KEY.into(),
         file_id: file_id.map(Into::into),
         snapshot,
@@ -1103,7 +1103,7 @@ fn validate_state_identity(
     validate_branch_local_scope(branch_id)?;
     let state_key = crate::forktree::decode_state_key(&row.key)?;
     if state_key.schema_key != KEY_VALUE_SCHEMA_KEY
-        || state_key.entity_pk.as_single_string().ok() != Some(key)
+        || state_key.row_pk.as_single_string().ok() != Some(key)
         || state_key.file_id.as_deref() != expected_file_id
         || branch_id.is_empty()
         || row.source != crate::state::StateRowSource::Branch
@@ -1409,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_rows_share_one_entity_key_and_use_file_id_identity() {
+    fn owner_rows_share_one_row_key_and_use_file_id_identity() {
         let owner = PluginFileOwner::new(
             "01920000-0000-7000-8000-0000000000a2",
             "plugin_a",
@@ -1418,7 +1418,7 @@ mod tests {
         .unwrap();
         let row = owner.write_row("main").unwrap();
         assert_eq!(
-            row.entity_pk.unwrap().as_single_string().unwrap(),
+            row.row_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_OWNER_KEY
         );
         assert_eq!(
@@ -1434,7 +1434,7 @@ mod tests {
         let registry_row = PluginRegistry::empty().write_row("main").unwrap();
         assert_eq!(registry_row.file_id, None);
         assert_eq!(
-            registry_row.entity_pk.unwrap().as_single_string().unwrap(),
+            registry_row.row_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_REGISTRY_KEY
         );
     }
@@ -1451,7 +1451,7 @@ mod tests {
             key: crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
-                entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
+                row_pk: &RowPk::single(PLUGIN_REGISTRY_KEY),
             }),
             value: crate::forktree::StateValue {
                 change_id: ChangeId::new(uuid::Uuid::from_u128(1)),

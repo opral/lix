@@ -427,9 +427,9 @@ mod tests {
         match probe {
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
                 name: "lix_registered_schema".to_string(),
-                sql: "SELECT lixcol_entity_pk, value, lixcol_metadata, lixcol_global \
+                sql: "SELECT lixcol_row_pk, value, lixcol_metadata, lixcol_global \
                  FROM lix_registered_schema \
-                 ORDER BY lixcol_entity_pk"
+                 ORDER BY lixcol_row_pk"
                     .to_string(),
                 params: Vec::new(),
                 branch_column_indexes: &[],
@@ -451,10 +451,10 @@ mod tests {
                 ProbeQuery {
                     name: format!("lix_registered_schema_by_branch:{branch_ids:?}"),
                     sql: format!(
-                        "SELECT lixcol_entity_pk, value, lixcol_branch_id, lixcol_metadata, lixcol_global \
+                        "SELECT lixcol_row_pk, value, lixcol_branch_id, lixcol_metadata, lixcol_global \
                          FROM lix_registered_schema_by_branch \
                          WHERE lixcol_branch_id IN ({placeholders}) \
-                         ORDER BY lixcol_entity_pk, lixcol_branch_id"
+                         ORDER BY lixcol_row_pk, lixcol_branch_id"
                     ),
                     params,
                     branch_column_indexes: &[2],

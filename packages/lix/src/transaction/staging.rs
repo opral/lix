@@ -20,7 +20,7 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{ObjectId, StateCell, StateKey, StateValue};
 #[cfg(test)]
 use crate::functions::FunctionProvider;
@@ -132,7 +132,7 @@ impl Eq for ImmutableMutationJournalChunk {}
 
 impl ImmutableMutationJournalChunk {
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn try_new_single_string_identities(
+    pub(crate) fn try_new_single_string_identitys(
         schema_plan_id: SchemaPlanId,
         schema_key: SharedStr,
         branch_id: SharedStr,
@@ -170,7 +170,7 @@ impl ImmutableMutationJournalChunk {
             if previous_identity.is_some_and(|previous| previous >= value) {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "immutable mutation journal identities are not strictly ordered",
+                    "immutable mutation journal identitys are not strictly ordered",
                 ));
             }
             offsets.push((
@@ -196,7 +196,7 @@ impl ImmutableMutationJournalChunk {
                 "immutable mutation identity offsets do not cover the arena",
             ));
         }
-        Self::try_new_validated_single_string_identities(
+        Self::try_new_validated_single_string_identitys(
             schema_plan_id,
             schema_key,
             branch_id,
@@ -211,7 +211,7 @@ impl ImmutableMutationJournalChunk {
     }
 
     #[expect(clippy::too_many_arguments)]
-    fn try_new_validated_single_string_identities(
+    fn try_new_validated_single_string_identitys(
         schema_plan_id: SchemaPlanId,
         schema_key: SharedStr,
         branch_id: SharedStr,
@@ -301,7 +301,7 @@ impl ImmutableMutationJournalChunk {
         self.identity_offsets.len()
     }
 
-    pub(crate) fn materialized_entity_pks(&self) -> Arc<[EntityPk]> {
+    pub(crate) fn materialized_row_pks(&self) -> Arc<[RowPk]> {
         self.identity_offsets
             .iter()
             .map(|&(start, end)| {
@@ -309,7 +309,7 @@ impl ImmutableMutationJournalChunk {
                     .expect("validated immutable mutation identity UTF-8");
                 let value = SharedStr::from_utf8_slice(self.identity_arena.clone(), value)
                     .expect("validated immutable mutation identity remains in its arena");
-                EntityPk::from_validated_shared_string(value)
+                RowPk::from_validated_shared_string(value)
             })
             .collect::<Vec<_>>()
             .into()
@@ -361,14 +361,14 @@ impl ImmutableMutationJournalChunk {
         self,
         allow_missing_predecessors: bool,
     ) -> Result<PreparedStateBatch, LixError> {
-        let entity_pks = self.materialized_entity_pks();
+        let row_pks = self.materialized_row_pks();
         let offsets = self
             .snapshot_offsets
             .iter()
             .map(|&(start, end)| (start as usize, end as usize))
             .collect();
         let mut rows = CertifiedParameterReplacementBatch::new(
-            entity_pks.iter().cloned().collect(),
+            row_pks.iter().cloned().collect(),
             TransactionJson::from_certified_row_content_arena(
                 self.snapshot_arena.to_vec(),
                 offsets,
@@ -421,7 +421,7 @@ pub(crate) struct OrderedMutationJournal {
 pub(crate) struct ProvisionalMutationJournalDescriptor {
     schema_key: SharedStr,
     branch_id: SharedStr,
-    entity_pk_chunks: Vec<Arc<[EntityPk]>>,
+    row_pk_chunks: Vec<Arc<[RowPk]>>,
     predecessors_complete: bool,
 }
 
@@ -439,8 +439,8 @@ impl ProvisionalMutationJournalDescriptor {
         self.branch_id.as_str()
     }
 
-    pub(crate) fn entity_pk_chunks(&self) -> &[Arc<[EntityPk]>] {
-        &self.entity_pk_chunks
+    pub(crate) fn row_pk_chunks(&self) -> &[Arc<[RowPk]>] {
+        &self.row_pk_chunks
     }
 
     pub(crate) fn predecessors_complete(&self) -> bool {
@@ -566,7 +566,7 @@ enum AppendOnlyStage {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PreparedStateRowIdentity {
     schema_key: SharedStr,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     file_id: Option<SharedStr>,
     branch_id: SharedStr,
 }
@@ -575,7 +575,7 @@ impl PreparedStateRowIdentity {
     fn from_staged_row(row: PreparedStateRowRef<'_>) -> Self {
         Self {
             schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.cloned(),
             branch_id: row.branch_id.clone(),
         }
@@ -587,7 +587,7 @@ impl From<&TestPreparedStateRow> for PreparedStateRowIdentity {
     fn from(row: &TestPreparedStateRow) -> Self {
         Self {
             schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.clone(),
             branch_id: row.branch_id.clone(),
         }
@@ -612,7 +612,7 @@ fn state_key_from_row(row: PreparedStateRowRef<'_>) -> StateKey {
     StateKey {
         schema_key: row.schema_key.to_string(),
         file_id: row.file_id.map(ToString::to_string),
-        entity_pk: row.entity_pk.clone(),
+        row_pk: row.row_pk.clone(),
     }
 }
 
@@ -675,7 +675,7 @@ pub(crate) struct DrainedMutationJournalDescriptor {
     pub(crate) commit_id: CommitId,
     pub(crate) schema_key: String,
     pub(crate) branch_id: String,
-    pub(crate) entity_pk_chunks: Vec<Arc<[EntityPk]>>,
+    pub(crate) row_pk_chunks: Vec<Arc<[RowPk]>>,
 }
 
 pub(crate) struct PreparedWriteValidationSet<'a> {
@@ -699,7 +699,7 @@ pub(crate) struct PreparedWriteValidationIndex<'a> {
 /// semantics after transaction-local coalescing. Original SQL origin metadata
 /// stays in one contiguous parallel column so an INSERT followed by an UPDATE
 /// retains the original primary-key error surface without cloning the row's
-/// schema, file, branch, or entity identity.
+/// schema, file, branch, or row identity.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparedInsertSelection {
     row_count: usize,
@@ -952,9 +952,9 @@ pub(crate) enum PreparedValidationRow<'a> {
 }
 
 impl<'a> PreparedValidationRow<'a> {
-    pub(crate) fn entity_pk(&self) -> &EntityPk {
+    pub(crate) fn row_pk(&self) -> &RowPk {
         match self {
-            Self::State(row) => row.entity_pk,
+            Self::State(row) => row.row_pk,
         }
     }
 
@@ -1049,7 +1049,7 @@ impl<'a> PreparedValidationRow<'a> {
         DomainRowIdentity::in_domain(
             self.domain(),
             self.schema_key().to_string(),
-            self.entity_pk().clone(),
+            self.row_pk().clone(),
         )
     }
 }
@@ -1160,10 +1160,10 @@ impl PreparedWriteSet {
                         commit_id: refs.commit_id,
                         schema_key: journal.schema_key().to_owned(),
                         branch_id: journal.branch_id().to_owned(),
-                        entity_pk_chunks: journal
+                        row_pk_chunks: journal
                             .chunks
                             .iter()
-                            .map(ImmutableMutationJournalChunk::materialized_entity_pks)
+                            .map(ImmutableMutationJournalChunk::materialized_row_pks)
                             .collect(),
                     })
             })
@@ -1452,12 +1452,12 @@ impl TransactionWriteBuffer {
             let key = StateKey {
                 schema_key: row.schema_key.to_string(),
                 file_id: row.file_id.map(ToString::to_string),
-                entity_pk: row.entity_pk.clone(),
+                row_pk: row.row_pk.clone(),
             };
             let encoded_key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             });
             if row.untracked {
                 return Err(LixError::new(
@@ -1742,10 +1742,10 @@ impl TransactionWriteBuffer {
             .map(|journal| ProvisionalMutationJournalDescriptor {
                 schema_key: journal.chunks[0].schema_key.clone(),
                 branch_id: journal.chunks[0].branch_id.clone(),
-                entity_pk_chunks: journal
+                row_pk_chunks: journal
                     .chunks
                     .iter()
-                    .map(ImmutableMutationJournalChunk::materialized_entity_pks)
+                    .map(ImmutableMutationJournalChunk::materialized_row_pks)
                     .collect(),
                 predecessors_complete: journal
                     .chunks
@@ -2363,7 +2363,7 @@ impl TransactionWriteBuffer {
         for index in 0..batch.len() {
             batch.set_commit_id(index, Some(commit_id));
         }
-        let identities = batch
+        let identitys = batch
             .iter()
             .map(PreparedStateRowIdentity::from)
             .collect::<Vec<_>>();
@@ -2382,7 +2382,7 @@ impl TransactionWriteBuffer {
         else {
             unreachable!("intermediate row staging requires the identity index");
         };
-        if identities
+        if identitys
             .iter()
             .any(|identity| by_identity.contains_key(identity))
         {
@@ -2398,7 +2398,7 @@ impl TransactionWriteBuffer {
             insert_selection.push_not_insert();
         }
         rows.append(batch);
-        for (offset, identity) in identities.into_iter().enumerate() {
+        for (offset, identity) in identitys.into_iter().enumerate() {
             by_identity.insert(identity, RowSlot::State(start + offset));
         }
         commit.change_refs.add_change_count(count);
@@ -2537,11 +2537,11 @@ impl TransactionWriteBuffer {
                 AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
             }
         }
-        let identities = rows
+        let identitys = rows
             .iter()
             .map(PreparedStateRowIdentity::from)
             .collect::<Vec<_>>();
-        let identities_are_unique = validate_batch_row_identities(&rows, &identities)?;
+        let identitys_are_unique = validate_batch_row_identitys(&rows, &identitys)?;
         self.ensure_identity_index(true)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -2587,23 +2587,23 @@ impl TransactionWriteBuffer {
                 .filter_map(|(index, row)| row_is_insert(mode, row).then_some(index))
                 .collect::<Vec<_>>();
             insert_order.sort_unstable_by(|&left, &right| {
-                identities[left]
-                    .cmp(&identities[right])
+                identitys[left]
+                    .cmp(&identitys[right])
                     .then(left.cmp(&right))
             });
             let duplicate_in_batch = insert_order
                 .windows(2)
-                .find(|pair| identities[pair[0]] == identities[pair[1]])
+                .find(|pair| identitys[pair[0]] == identitys[pair[1]])
                 .map(|pair| pair[1]);
             let duplicate_staged = insert_order
                 .iter()
                 .copied()
-                .find(|&index| by_identity.contains_key(&identities[index]));
+                .find(|&index| by_identity.contains_key(&identitys[index]));
             if let Some(index) = duplicate_in_batch.into_iter().chain(duplicate_staged).min() {
                 return Err(duplicate_insert_identity_error(rows.row(index)));
             }
         }
-        if identities_are_unique && staged_rows.is_empty() && by_identity.is_empty() {
+        if identitys_are_unique && staged_rows.is_empty() && by_identity.is_empty() {
             insert_selection.reserve_rows(rows.len(), insert_count != 0);
             for index in 0..rows.len() {
                 let row = rows.row(index);
@@ -2642,7 +2642,7 @@ impl TransactionWriteBuffer {
         let mut inserted_destinations = Vec::with_capacity(insert_count);
         let mut latest_incoming_source_by_destination =
             HashMap::<usize, usize>::with_capacity(rows.len());
-        for (source_index, identity) in identities.into_iter().enumerate() {
+        for (source_index, identity) in identitys.into_iter().enumerate() {
             let row = rows.row(source_index);
             let is_insert = row_is_insert(mode, row);
             let existing_slot = by_identity.get(&identity).copied();
@@ -3002,7 +3002,7 @@ impl TransactionWriteBuffer {
                 && row.snapshot.is_some()
         }) {
             let (target_schema_key, target_file_id) =
-                crate::collection_generation::collection_scope_from_entity_pk(row.entity_pk)?;
+                crate::collection_generation::collection_scope_from_row_pk(row.row_pk)?;
             if target_schema_key == schema_key
                 && (target_file_id.is_none() || target_file_id.as_deref() == file_id)
             {
@@ -3060,7 +3060,7 @@ mod staging_semantics_tests {
     use crate::common::LixTimestamp;
     use crate::forktree::{
         ForkTreeReadFacade, StateCell, StateKey, StateKeyRef, StateValue,
-        encode_state_entity_prefix, encode_state_key, exclusive_prefix_upper_bound,
+        encode_state_row_prefix, encode_state_key, exclusive_prefix_upper_bound,
     };
     use crate::storage::{Memory, MemoryRead};
     use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageReadOptions};
@@ -3119,7 +3119,7 @@ mod staging_semantics_tests {
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            entity_pk: EntityPk::single(key),
+            row_pk: RowPk::single(key),
             schema_key: "lix_key_value".into(),
             file_id: None,
             snapshot: Some(snapshot),
@@ -3167,7 +3167,7 @@ mod staging_semantics_tests {
             .iter()
             .map(|row| {
                 (
-                    row.entity_pk
+                    row.row_pk
                         .as_single_string_owned()
                         .expect("test identity is one string"),
                     row.snapshot.map(|value| value.normalized().to_owned()),
@@ -3191,12 +3191,12 @@ mod staging_semantics_tests {
         }
     }
 
-    fn native_key(entity: &str) -> Vec<u8> {
-        let entity_pk = EntityPk::single(entity);
+    fn native_key(row: &str) -> Vec<u8> {
+        let row_pk = RowPk::single(row);
         encode_state_key(StateKeyRef {
             schema_key: "lix_key_value",
             file_id: None,
-            entity_pk: &entity_pk,
+            row_pk: &row_pk,
         })
     }
 
@@ -3235,7 +3235,7 @@ mod staging_semantics_tests {
             drained
                 .state_rows
                 .row(0)
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
                 .unwrap(),
             "a"
@@ -3244,7 +3244,7 @@ mod staging_semantics_tests {
             drained
                 .state_rows
                 .row(1)
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
                 .unwrap(),
             "b"
@@ -3689,7 +3689,7 @@ mod staging_semantics_tests {
         let key = StateKey {
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("untracked"),
+            row_pk: RowPk::single("untracked"),
         };
         let value = UntrackedValue {
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
@@ -3708,7 +3708,7 @@ mod staging_semantics_tests {
         let encoded = encode_state_key(StateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         });
         assert_eq!(
             view.untracked_points(&[encoded.clone()], false)
@@ -3762,10 +3762,10 @@ mod staging_semantics_tests {
         );
         let tombstone = native_untracked_key("app.parity", "a");
         let visible = native_untracked_key("app.parity", "b");
-        let prefix = encode_state_entity_prefix(
+        let prefix = encode_state_row_prefix(
             "app.parity",
-            &EntityPk {
-                components: crate::entity_pk::EntityPkComponents::Empty,
+            &RowPk {
+                components: crate::row_pk::RowPkComponents::Empty,
             },
         );
         let upper = exclusive_prefix_upper_bound(&prefix);
@@ -3790,12 +3790,12 @@ mod staging_semantics_tests {
             encode_state_key(StateKeyRef {
                 schema_key: &tombstone.schema_key,
                 file_id: tombstone.file_id.as_deref(),
-                entity_pk: &tombstone.entity_pk,
+                row_pk: &tombstone.row_pk,
             }),
             encode_state_key(StateKeyRef {
                 schema_key: &visible.schema_key,
                 file_id: visible.file_id.as_deref(),
-                entity_pk: &visible.entity_pk,
+                row_pk: &visible.row_pk,
             }),
         ];
         let exact = view
@@ -3830,10 +3830,10 @@ mod staging_semantics_tests {
         );
         let in_schema = native_untracked_key("app.range", "inside");
         let outside_schema = native_untracked_key("zzz.other", "outside");
-        let prefix = encode_state_entity_prefix(
+        let prefix = encode_state_row_prefix(
             "app.range",
-            &EntityPk {
-                components: crate::entity_pk::EntityPkComponents::Empty,
+            &RowPk {
+                components: crate::row_pk::RowPkComponents::Empty,
             },
         );
         let upper = exclusive_prefix_upper_bound(&prefix);
@@ -3874,10 +3874,10 @@ mod staging_semantics_tests {
         );
         let tombstone = native_untracked_key("app.tombstones", "a");
         let visible = native_untracked_key("app.tombstones", "b");
-        let prefix = encode_state_entity_prefix(
+        let prefix = encode_state_row_prefix(
             "app.tombstones",
-            &EntityPk {
-                components: crate::entity_pk::EntityPkComponents::Empty,
+            &RowPk {
+                components: crate::row_pk::RowPkComponents::Empty,
             },
         );
         let upper = exclusive_prefix_upper_bound(&prefix);
@@ -4000,7 +4000,7 @@ fn compare_rows_by_tracked_key(
                 .map(|value| value.as_str())
                 .cmp(&right.file_id.map(SharedStr::as_str))
         })
-        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+        .then_with(|| left.row_pk.cmp(right.row_pk))
 }
 
 fn compare_tracked_key_to_row(
@@ -4015,7 +4015,7 @@ fn compare_tracked_key_to_row(
                 .as_deref()
                 .cmp(&right.file_id.map(SharedStr::as_str))
         })
-        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+        .then_with(|| left.row_pk.cmp(right.row_pk))
 }
 
 fn reorder_rows_by_source_permutation(
@@ -4058,13 +4058,13 @@ fn reorder_rows_by_source_permutation(
     }
 }
 
-fn validate_batch_row_identities(
+fn validate_batch_row_identitys(
     rows: &PreparedStateBatch,
-    identities: &[PreparedStateRowIdentity],
+    identitys: &[PreparedStateRowIdentity],
 ) -> Result<bool, LixError> {
-    debug_assert_eq!(rows.len(), identities.len());
-    if identities.windows(2).all(|pair| pair[0] <= pair[1]) {
-        return validate_rows_in_identity_order(rows, identities, 0..rows.len());
+    debug_assert_eq!(rows.len(), identitys.len());
+    if identitys.windows(2).all(|pair| pair[0] <= pair[1]) {
+        return validate_rows_in_identity_order(rows, identitys, 0..rows.len());
     }
 
     // Irregular frontend batches share one dense ordering buffer rather than
@@ -4072,11 +4072,11 @@ fn validate_batch_row_identities(
     // tiebreaker so equal-identity transitions retain their original order.
     let mut order = (0..rows.len()).collect::<Vec<_>>();
     order.sort_unstable_by(|&left, &right| {
-        identities[left]
-            .cmp(&identities[right])
+        identitys[left]
+            .cmp(&identitys[right])
             .then_with(|| left.cmp(&right))
     });
-    validate_rows_in_identity_order(rows, identities, order)
+    validate_rows_in_identity_order(rows, identitys, order)
 }
 
 enum BatchIdentityViolation<'a> {
@@ -4089,7 +4089,7 @@ enum BatchIdentityViolation<'a> {
 
 fn validate_rows_in_identity_order<'a>(
     rows: &'a PreparedStateBatch,
-    identities: &[PreparedStateRowIdentity],
+    identitys: &[PreparedStateRowIdentity],
     order: impl IntoIterator<Item = usize>,
 ) -> Result<bool, LixError> {
     let mut previous_identity = None::<&PreparedStateRowIdentity>;
@@ -4100,7 +4100,7 @@ fn validate_rows_in_identity_order<'a>(
 
     for index in order {
         let row = rows.row(index);
-        let identity = &identities[index];
+        let identity = &identitys[index];
         if previous_identity != Some(identity) {
             previous_identity = Some(identity);
             group_untracked = row.untracked;
@@ -4152,15 +4152,15 @@ fn retain_earliest_batch_identity_violation<'a>(
 }
 
 fn mixed_durability_error(row: PreparedStateRowRef<'_>) -> LixError {
-    let entity_pk = row
-        .entity_pk
+    let row_pk = row
+        .row_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_INVALID_PARAM,
         format!(
-            "cannot mix tracked and untracked writes for schema '{}' entity_pk '{}' in branch '{}' within one transaction; commit or roll back before changing durability",
-            row.schema_key, entity_pk, row.branch_id
+            "cannot mix tracked and untracked writes for schema '{}' row_pk '{}' in branch '{}' within one transaction; commit or roll back before changing durability",
+            row.schema_key, row_pk, row.branch_id
         ),
     )
 }
@@ -4172,12 +4172,12 @@ fn duplicate_staged_present_row_error(
     let message = logical_primary_key_violation_message(row.origin)
         .unwrap_or_else(|| {
             format!(
-                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_pk '{}' in branch '{}'",
+                "primary-key constraint violation on schema '{}': duplicate staged rows for row_pk '{}' in branch '{}'",
                 row.schema_key,
                 previous
-                    .entity_pk
+                    .row_pk
                     .as_json_array_text()
-                    .unwrap_or_else(|_| "<invalid entity_pk>".to_string()),
+                    .unwrap_or_else(|_| "<invalid row_pk>".to_string()),
                 row.branch_id
             )
         });
@@ -4186,22 +4186,22 @@ fn duplicate_staged_present_row_error(
 
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     branch_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
 ) -> String {
     if let Some(message) = logical_primary_key_violation_message(origin) {
         return message;
     }
-    let entity_pk = entity_pk
+    let row_pk = row_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     match branch_id {
         Some(branch_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}' in branch '{branch_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate row_pk '{row_pk}' in branch '{branch_id}'"
         ),
         None => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate row_pk '{row_pk}'"
         ),
     }
 }
@@ -4209,7 +4209,7 @@ pub(crate) fn duplicate_insert_identity_message(
 fn duplicate_insert_identity_error(row: PreparedStateRowRef<'_>) -> LixError {
     let message = duplicate_insert_identity_message(
         row.schema_key,
-        row.entity_pk,
+        row.row_pk,
         Some(row.branch_id),
         row.origin,
     );
@@ -4313,7 +4313,7 @@ mod transaction_overlay_tests {
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            entity_pk: EntityPk::single("row"),
+            row_pk: RowPk::single("row"),
             schema_key: schema_key.into(),
             file_id: None,
             snapshot: value.map(|value| {

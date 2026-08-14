@@ -125,17 +125,17 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::filesystem::FilesystemStateRow;
 
     fn row(
         schema_key: &str,
-        entity_pk: &str,
+        row_pk: &str,
         file_id: Option<&str>,
         value: Option<&str>,
     ) -> FilesystemStateRow {
         FilesystemStateRow {
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
             schema_key: schema_key.to_owned(),
             file_id: file_id.map(str::to_owned),
             snapshot_content: value.map(Into::into),
@@ -150,8 +150,8 @@ mod tests {
                 "2026-04-23T01:00:00Z",
             ),
             global: false,
-            change_id: Some(ChangeId::for_test_label(entity_pk)),
-            commit_id: Some(CommitId::for_test_label(entity_pk)),
+            change_id: Some(ChangeId::for_test_label(row_pk)),
+            commit_id: Some(CommitId::for_test_label(row_pk)),
             untracked: false,
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_owned(),
         }

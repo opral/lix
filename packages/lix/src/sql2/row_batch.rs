@@ -1,6 +1,6 @@
-//! Native entity request decoding and terminal projections.
+//! Native row request decoding and terminal projections.
 //!
-//! Entity providers consume concrete authenticated ForkTree state views.  The
+//! Row providers consume concrete authenticated ForkTree state views.  The
 //! module keeps `StateRow` as the only row shape before Arrow/DataFusion takes
 //! ownership.
 
@@ -9,85 +9,85 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::future::Future;
 
 use crate::LixError;
-use crate::entity_pk::{EntityPk, EntityPkComponents};
+use crate::row_pk::{RowPk, RowPkComponents};
 use crate::forktree::{StateCell, StateKeyRef, decode_state_key, encode_state_key};
 use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EntityScanRequest {
-    pub(crate) filter: EntityScanFilter,
-    pub(crate) projection: EntityProjection,
+pub(crate) struct RowScanRequest {
+    pub(crate) filter: RowScanFilter,
+    pub(crate) projection: RowProjection,
     pub(crate) limit: Option<usize>,
 }
 
-impl Default for EntityScanRequest {
+impl Default for RowScanRequest {
     fn default() -> Self {
         Self {
-            filter: EntityScanFilter::default(),
-            projection: EntityProjection::default(),
+            filter: RowScanFilter::default(),
+            projection: RowProjection::default(),
             limit: None,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EntityScanFilter {
+pub(crate) struct RowScanFilter {
     pub(crate) schema_keys: Vec<String>,
     pub(crate) branch_ids: Vec<String>,
     pub(crate) file_ids: Vec<crate::NullableKeyFilter<String>>,
-    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) row_pks: Vec<RowPk>,
     pub(crate) untracked: Option<bool>,
     pub(crate) include_tombstones: bool,
     pub(crate) constraints: Vec<()>,
-    pub(crate) rows: EntityRowSelection,
+    pub(crate) rows: RowRowSelection,
 }
 
-impl Default for EntityScanFilter {
+impl Default for RowScanFilter {
     fn default() -> Self {
         Self {
             schema_keys: Vec::new(),
             branch_ids: Vec::new(),
             file_ids: Vec::new(),
-            entity_pks: Vec::new(),
+            row_pks: Vec::new(),
             untracked: None,
             include_tombstones: false,
             constraints: Vec::new(),
-            rows: EntityRowSelection::All,
+            rows: RowRowSelection::All,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EntityRowSelection {
+pub(crate) enum RowRowSelection {
     All,
     None,
 }
 
-impl Default for EntityRowSelection {
+impl Default for RowRowSelection {
     fn default() -> Self {
         Self::All
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct EntityProjection {
+pub(crate) struct RowProjection {
     pub(crate) columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct EntityExactBatchRequest {
-    pub(crate) rows: Vec<EntityExactRowRequest>,
-    pub(crate) projection: EntityProjection,
+pub(crate) struct RowExactBatchRequest {
+    pub(crate) rows: Vec<RowExactRowRequest>,
+    pub(crate) projection: RowProjection,
     pub(crate) untracked: Option<bool>,
     pub(crate) include_tombstones: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EntityExactRowRequest {
+pub(crate) struct RowExactRowRequest {
     pub(crate) schema_key: String,
     pub(crate) branch_id: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -95,7 +95,7 @@ pub(crate) struct EntityExactRowRequest {
 /// `None`; present slots retain whether they came from tracked or untracked
 /// authenticated state so projection cannot silently change ownership.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum EntityStateSlot {
+pub(crate) enum RowStateSlot {
     Tracked(StateRow),
     /// A tracked row loaded from an explicit branch selector. The branch
     /// identity is retained for by-branch projection when one operation
@@ -112,8 +112,8 @@ pub(crate) enum EntityStateSlot {
 /// branch selectors share them.
 pub(crate) async fn scan_slots_forktree<S>(
     view: &ForkTreeStateView<S>,
-    request: &EntityScanRequest,
-) -> Result<Vec<EntityStateSlot>, LixError>
+    request: &RowScanRequest,
+) -> Result<Vec<RowStateSlot>, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -138,7 +138,7 @@ where
                 )
                 .await?
                 .into_iter()
-                .map(|row| EntityStateSlot::TrackedAt {
+                .map(|row| RowStateSlot::TrackedAt {
                     row,
                     branch_id: branch_id.to_string(),
                 })
@@ -155,8 +155,8 @@ where
 
 pub(crate) async fn scan_slots_transaction<S>(
     view: &TransactionStateView<S>,
-    request: &EntityScanRequest,
-) -> Result<Vec<EntityStateSlot>, LixError>
+    request: &RowScanRequest,
+) -> Result<Vec<RowStateSlot>, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -181,7 +181,7 @@ where
                 )
                 .await?
                 .into_iter()
-                .map(|row| EntityStateSlot::TrackedAt {
+                .map(|row| RowStateSlot::TrackedAt {
                     row,
                     branch_id: branch_id.to_string(),
                 })
@@ -196,7 +196,7 @@ where
     .await
 }
 
-fn range_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
+fn range_source_options(request: &RowScanRequest) -> (Option<usize>, bool) {
     (
         request
             .filter
@@ -209,9 +209,9 @@ fn range_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
 }
 
 fn filter_slots_by_file_id(
-    slots: Vec<EntityStateSlot>,
+    slots: Vec<RowStateSlot>,
     file_ids: &[crate::NullableKeyFilter<String>],
-) -> Result<Vec<EntityStateSlot>, LixError> {
+) -> Result<Vec<RowStateSlot>, LixError> {
     if file_ids.is_empty()
         || file_ids
             .iter()
@@ -223,7 +223,7 @@ fn filter_slots_by_file_id(
         .into_iter()
         .filter_map(|slot| {
             let key = match &slot {
-                EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
                     decode_state_key(&row.key)
                 }
             };
@@ -245,21 +245,21 @@ fn filter_slots_by_file_id(
 }
 
 async fn scan_slots_by_branches<F, Fut>(
-    request: &EntityScanRequest,
+    request: &RowScanRequest,
     active_branch_id: String,
     mut scan_branch: F,
-) -> Result<Vec<EntityStateSlot>, LixError>
+) -> Result<Vec<RowStateSlot>, LixError>
 where
     F: FnMut(String, Option<Vec<u8>>, Option<Vec<u8>>) -> Fut,
-    Fut: Future<Output = Result<Vec<EntityStateSlot>, LixError>>,
+    Fut: Future<Output = Result<Vec<RowStateSlot>, LixError>>,
 {
-    if request.limit == Some(0) || matches!(request.filter.rows, EntityRowSelection::None) {
+    if request.limit == Some(0) || matches!(request.filter.rows, RowRowSelection::None) {
         return Ok(Vec::new());
     }
     let mut bounds_request = request.clone();
-    bounds_request.filter.entity_pks.clear();
+    bounds_request.filter.row_pks.clear();
     let schema_bounds = schema_bounds(&bounds_request)?;
-    let mut bounds = if request.filter.entity_pks.is_empty() {
+    let mut bounds = if request.filter.row_pks.is_empty() {
         vec![schema_bounds]
     } else {
         let schema = bounds_request
@@ -269,10 +269,10 @@ where
             .expect("schema bounds validated");
         request
             .filter
-            .entity_pks
+            .row_pks
             .iter()
-            .map(|entity_pk| {
-                let bounds = crate::forktree::encode_state_entity_prefix_bounds(schema, entity_pk);
+            .map(|row_pk| {
+                let bounds = crate::forktree::encode_state_row_prefix_bounds(schema, row_pk);
                 (Some(bounds.lower), bounds.upper)
             })
             .collect()
@@ -332,8 +332,8 @@ where
             )));
         }
         let key = slot_sort_key(&slot);
-        let is_global = matches!(&slot, EntityStateSlot::Tracked(row) if row.source == crate::state::StateRowSource::Global)
-            || matches!(&slot, EntityStateSlot::TrackedAt { row, .. } if row.source == crate::state::StateRowSource::Global);
+        let is_global = matches!(&slot, RowStateSlot::Tracked(row) if row.source == crate::state::StateRowSource::Global)
+            || matches!(&slot, RowStateSlot::TrackedAt { row, .. } if row.source == crate::state::StateRowSource::Global);
         if is_global && !global_keys.insert((slot_branch_sort_key(&slot), key)) {
             continue;
         }
@@ -347,15 +347,15 @@ where
     Ok(visible)
 }
 
-fn slot_sort_key(slot: &EntityStateSlot) -> Vec<u8> {
+fn slot_sort_key(slot: &RowStateSlot) -> Vec<u8> {
     match slot {
-        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => row.key.clone(),
+        RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => row.key.clone(),
     }
 }
 
-fn slot_branch_sort_key(slot: &EntityStateSlot) -> String {
+fn slot_branch_sort_key(slot: &RowStateSlot) -> String {
     match slot {
-        EntityStateSlot::Tracked(row) => match row.source {
+        RowStateSlot::Tracked(row) => match row.source {
             crate::state::StateRowSource::Global => crate::GLOBAL_BRANCH_ID.to_string(),
             crate::state::StateRowSource::Branch
             | crate::state::StateRowSource::StagedBranch => {
@@ -363,16 +363,16 @@ fn slot_branch_sort_key(slot: &EntityStateSlot) -> String {
             }
             crate::state::StateRowSource::StagedGlobal => crate::GLOBAL_BRANCH_ID.to_string(),
         },
-        EntityStateSlot::TrackedAt { branch_id, .. } => branch_id.clone(),
+        RowStateSlot::TrackedAt { branch_id, .. } => branch_id.clone(),
     }
 }
 
 fn merge_range_slots(
-    tracked: Vec<EntityStateSlot>,
-    untracked: Vec<EntityStateSlot>,
+    tracked: Vec<RowStateSlot>,
+    untracked: Vec<RowStateSlot>,
     include_tombstones: bool,
     limit: Option<usize>,
-) -> Vec<EntityStateSlot> {
+) -> Vec<RowStateSlot> {
     if limit == Some(0) {
         return Vec::new();
     }
@@ -409,9 +409,9 @@ fn merge_range_slots(
     output
 }
 
-fn slot_is_deleted(slot: &EntityStateSlot) -> bool {
+fn slot_is_deleted(slot: &RowStateSlot) -> bool {
     match slot {
-        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+        RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
             row.value.cell.deleted()
         }
     }
@@ -419,8 +419,8 @@ fn slot_is_deleted(slot: &EntityStateSlot) -> bool {
 
 pub(crate) async fn exact_forktree<S>(
     view: &ForkTreeStateView<S>,
-    request: &EntityExactBatchRequest,
-) -> Result<Vec<Option<EntityStateSlot>>, LixError>
+    request: &RowExactBatchRequest,
+) -> Result<Vec<Option<RowStateSlot>>, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -429,8 +429,8 @@ where
 
 async fn exact_forktree_inner<S>(
     view: &ForkTreeStateView<S>,
-    request: &EntityExactBatchRequest,
-) -> Result<Vec<Option<EntityStateSlot>>, LixError>
+    request: &RowExactBatchRequest,
+) -> Result<Vec<Option<RowStateSlot>>, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -441,7 +441,7 @@ where
             encode_state_key(StateKeyRef {
                 schema_key: &row.schema_key,
                 file_id: row.file_id.as_deref(),
-                entity_pk: &row.entity_pk,
+                row_pk: &row.row_pk,
             })
         })
         .collect::<Vec<_>>();
@@ -471,8 +471,8 @@ where
 
 pub(crate) async fn exact_transaction<S>(
     view: &TransactionStateView<S>,
-    request: &EntityExactBatchRequest,
-) -> Result<Vec<Option<EntityStateSlot>>, LixError>
+    request: &RowExactBatchRequest,
+) -> Result<Vec<Option<RowStateSlot>>, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -483,7 +483,7 @@ where
             encode_state_key(StateKeyRef {
                 schema_key: &row.schema_key,
                 file_id: row.file_id.as_deref(),
-                entity_pk: &row.entity_pk,
+                row_pk: &row.row_pk,
             })
         })
         .collect::<Vec<_>>();
@@ -512,14 +512,14 @@ where
 }
 
 fn merge_exact_slots(
-    request: &EntityExactBatchRequest,
+    request: &RowExactBatchRequest,
     keys: Vec<Vec<u8>>,
     tracked: Vec<Option<StateRow>>,
-) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
+) -> Result<Vec<Option<RowStateSlot>>, LixError> {
     if tracked.len() != keys.len() {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
-            "native entity exact lookup returned the wrong slot count",
+            "native row exact lookup returned the wrong slot count",
         ));
     }
     let mut output = Vec::with_capacity(keys.len());
@@ -527,18 +527,18 @@ fn merge_exact_slots(
         let slot = if let Some(row) = tracked {
             let decoded = decode_state_key(&row.key)?;
             if decoded.schema_key != requested.schema_key
-                || decoded.entity_pk != requested.entity_pk
+                || decoded.row_pk != requested.row_pk
                 || decoded.file_id != requested.file_id
             {
                 return Err(LixError::new(
                     LixError::CODE_STORAGE_ERROR,
-                    "native tracked entity row identity mismatch",
+                    "native tracked row row identity mismatch",
                 ));
             }
             if !request.include_tombstones && row.value.cell.deleted() {
                 None
             } else {
-                Some(EntityStateSlot::TrackedAt {
+                Some(RowStateSlot::TrackedAt {
                     row,
                     branch_id: requested.branch_id.clone(),
                 })
@@ -552,47 +552,47 @@ fn merge_exact_slots(
 }
 
 pub(crate) fn schema_bounds(
-    request: &EntityScanRequest,
+    request: &RowScanRequest,
 ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), LixError> {
     let schema = request.filter.schema_keys.first().ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
-            "entity scan has no schema key",
+            "row scan has no schema key",
         )
     })?;
     if request.filter.schema_keys.iter().any(|key| key != schema) {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "one native entity scan cannot mix schema keys",
+            "one native row scan cannot mix schema keys",
         ));
     }
     // The native key codec exposes the schema prefix by encoding the empty
     // PK without the trailing file-id component.  This remains a bounded
     // ordered-tree range; it is never replaced by a full scan.
-    if !request.filter.entity_pks.is_empty() {
+    if !request.filter.row_pks.is_empty() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "entity-PK scans use exact native points",
+            "row-PK scans use exact native points",
         ));
     }
-    let empty_pk = EntityPk {
-        components: EntityPkComponents::Empty,
+    let empty_pk = RowPk {
+        components: RowPkComponents::Empty,
     };
-    let lower = crate::forktree::encode_state_entity_prefix(schema, &empty_pk);
+    let lower = crate::forktree::encode_state_row_prefix(schema, &empty_pk);
     let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
     Ok((Some(lower), upper))
 }
 
 #[cfg(test)]
-pub(crate) fn tracked_slot(row: &EntityStateSlot) -> Option<&StateRow> {
+pub(crate) fn tracked_slot(row: &RowStateSlot) -> Option<&StateRow> {
     match row {
-        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => Some(row),
+        RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => Some(row),
     }
 }
 
-pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
+pub(crate) fn slot_snapshot(row: &RowStateSlot) -> Option<&str> {
     match row {
-        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+        RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
             match &row.value.cell {
                 StateCell::Value(value) => Some(value.as_ref()),
                 StateCell::NativeRow(_) => None,
@@ -619,17 +619,17 @@ mod tests {
     use crate::forktree::{StateValue, encode_state_key};
     use crate::state::StateRowSource;
 
-    fn row(file_id: Option<&str>) -> EntityStateSlot {
-        let entity_pk = EntityPk::single("shared-plugin-row");
-        EntityStateSlot::Tracked(StateRow {
+    fn row(file_id: Option<&str>) -> RowStateSlot {
+        let row_pk = RowPk::single("shared-plugin-row");
+        RowStateSlot::Tracked(StateRow {
             key: encode_state_key(StateKeyRef {
                 schema_key: "plugin_row",
                 file_id,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             }),
             value: StateValue {
-                change_id: ChangeId::for_test_label("entity-file-filter-change"),
-                commit_id: CommitId::for_test_label("entity-file-filter-commit"),
+                change_id: ChangeId::for_test_label("row-file-filter-change"),
+                commit_id: CommitId::for_test_label("row-file-filter-commit"),
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
                 cell: StateCell::Value(SharedStr::from("{}")),
@@ -643,13 +643,13 @@ mod tests {
 
     #[test]
     fn file_filter_selects_one_owner_before_limit_for_shared_plugin_identity() {
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let request = RowScanRequest {
+            filter: RowScanFilter {
                 file_ids: vec![crate::NullableKeyFilter::Value("file-b".to_string())],
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
             limit: Some(1),
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
         assert_eq!(range_source_options(&request).0, None);
         let selected = filter_slots_by_file_id(
@@ -659,7 +659,7 @@ mod tests {
         .expect("authenticated file-owner filter");
         assert_eq!(selected.len(), 1);
         let key = match &selected[0] {
-            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+            RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
                 decode_state_key(&row.key).expect("typed state key")
             }
         };
@@ -670,7 +670,7 @@ mod tests {
     fn file_filter_rejects_malformed_authenticated_key() {
         let mut malformed = row(Some("file-a"));
         match &mut malformed {
-            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+            RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
                 row.key = vec![0xff];
             }
         }

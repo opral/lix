@@ -340,15 +340,15 @@ fn bind_state_blob_ref_parts(
         .file_id
         .as_deref()
         .ok_or_else(|| corruption("blob-reference owner has no file identity"))?;
-    let expected_entity_pk = crate::entity_pk::EntityPk::uuid_from_canonical(file_id)
+    let expected_row_pk = crate::row_pk::RowPk::uuid_from_canonical(file_id)
         .map_err(|_| corruption("blob-reference owner file identity is not a canonical UUID"))?;
-    if key.entity_pk != expected_entity_pk {
+    if key.row_pk != expected_row_pk {
         return Err(corruption("blob-reference key identity is inconsistent").into());
     }
     let value = match cell {
         StateCell::NativeRow(native) => crate::native_row::logical_text(
             &crate::native_row::seed_schema(&key.schema_key)?,
-            &key.entity_pk,
+            &key.row_pk,
             global,
             key.file_id.as_deref(),
             native,
@@ -431,7 +431,7 @@ where
         let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         });
         let row = super::serving::state_point(self, &encoded_key, false)
             .await
@@ -475,7 +475,7 @@ where
         let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         });
         let value = super::serving::state_point_at_root_on_read(
             root,
@@ -628,11 +628,11 @@ fn bind_historical_state_blob_ref(
         .file_id
         .as_deref()
         .ok_or_else(|| corruption("historical blob-reference owner has no file identity"))?;
-    let expected_entity_pk =
-        crate::entity_pk::EntityPk::uuid_from_canonical(file_id).map_err(|_| {
+    let expected_row_pk =
+        crate::row_pk::RowPk::uuid_from_canonical(file_id).map_err(|_| {
             corruption("historical blob-reference owner file identity is not a canonical UUID")
         })?;
-    if key.entity_pk != expected_entity_pk {
+    if key.row_pk != expected_row_pk {
         return Err(corruption("historical blob-reference key identity is inconsistent").into());
     }
     let snapshot = match &value.cell {
@@ -1472,7 +1472,7 @@ where
 mod historical_blob_binding_tests {
     use super::bind_historical_state_blob_ref;
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::ObjectId;
     use crate::forktree::state::{StateCell, StateKey, StateValue};
 
@@ -1480,7 +1480,7 @@ mod historical_blob_binding_tests {
         StateKey {
             schema_key: "lix_binary_blob_ref".to_owned(),
             file_id: Some(id.to_owned()),
-            entity_pk: EntityPk::uuid_from_canonical(id).expect("canonical historical blob id"),
+            row_pk: RowPk::uuid_from_canonical(id).expect("canonical historical blob id"),
         }
     }
 
@@ -1533,7 +1533,7 @@ mod historical_blob_binding_tests {
         let wrong_typed_key = StateKey {
             schema_key: "lix_binary_blob_ref".to_owned(),
             file_id: Some(id.to_owned()),
-            entity_pk: EntityPk::single(id),
+            row_pk: RowPk::single(id),
         };
         assert!(bind_historical_state_blob_ref(&wrong_typed_key, &value(id, live, 1)).is_err());
 

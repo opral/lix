@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, ObjectId, StateCell, StateKey, StateSource, StateValue,
     VisibleStateRow,
@@ -430,7 +430,7 @@ where
                 crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
                     schema_key: &key.schema_key,
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 })
             })
             .collect::<Vec<_>>();
@@ -464,14 +464,14 @@ where
 
 fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<StateKey> {
     // Native tree diffs are ordered by durable encoded bytes
-    // (schema, entity_pk, file_id). `StateKey::Ord` follows struct field order
-    // (schema, file_id, entity_pk), so it is not an authority for this merge.
+    // (schema, row_pk, file_id). `StateKey::Ord` follows struct field order
+    // (schema, file_id, row_pk), so it is not an authority for this merge.
     // Encode each input exactly once and preserve the two linear streams.
     let encode = |key: &StateKey| {
         crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         })
     };
     let mut left = left
@@ -506,13 +506,13 @@ fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<Sta
 #[cfg(test)]
 mod key_order_tests {
     use super::{StateKey, merge_sorted_state_keys};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
 
-    fn key(entity_pk: &str, file_id: &str) -> StateKey {
+    fn key(row_pk: &str, file_id: &str) -> StateKey {
         StateKey {
             schema_key: "app.row".to_owned(),
             file_id: Some(file_id.to_owned()),
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
         }
     }
 
@@ -553,7 +553,7 @@ where
     /// already-open session must not publish after its account is deleted or
     /// disabled by another operation.
     pub(crate) async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
-        let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
+        let account_pk = RowPk::uuid_from_canonical(account_id).map_err(|_| {
             LixError::new(
                 "LIX_INVALID_ACCOUNT_ID",
                 format!("active account id '{account_id}' is not a canonical UUID"),
@@ -562,7 +562,7 @@ where
         let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
             schema_key: "lix_account",
             file_id: None,
-            entity_pk: &account_pk,
+            row_pk: &account_pk,
         });
         let row = self
             .points(&[key], true)
@@ -856,12 +856,12 @@ fn collection_delete_ranges(
             continue;
         }
         let (schema_key, file_id) =
-            crate::collection_generation::collection_scope_from_entity_pk(&key.entity_pk)?;
+            crate::collection_generation::collection_scope_from_row_pk(&key.row_pk)?;
         if file_id.is_some() {
             continue;
         }
         let bounds =
-            crate::forktree::encode_state_entity_prefix_bounds(&schema_key, &EntityPk::empty());
+            crate::forktree::encode_state_row_prefix_bounds(&schema_key, &RowPk::empty());
         ranges.push((bounds.lower, bounds.upper));
     }
     ranges.sort_by(|left, right| left.0.cmp(&right.0));

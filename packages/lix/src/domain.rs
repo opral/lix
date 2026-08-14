@@ -1,4 +1,4 @@
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::state::{StateRow, StateRowSource};
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
@@ -128,7 +128,7 @@ impl Domain {
         // Registered schemas are authoritative tracked ForkTree state. The
         // untracked state domain no longer exists, so projecting a caller's
         // legacy domain bit into two catalog domains would read the same
-        // tracked branch twice and manufacture duplicate schema identities.
+        // tracked branch twice and manufacture duplicate schema identitys.
         vec![Self::schema_catalog(self.branch_id.clone(), false)]
     }
 
@@ -174,15 +174,15 @@ pub(crate) enum DomainFileScope {
 pub(crate) struct DomainRowIdentity {
     domain: Domain,
     schema_key: String,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
 }
 
 impl DomainRowIdentity {
-    pub(crate) fn new(domain: Domain, schema_key: impl Into<String>, entity_pk: EntityPk) -> Self {
+    pub(crate) fn new(domain: Domain, schema_key: impl Into<String>, row_pk: RowPk) -> Self {
         Self {
             domain,
             schema_key: schema_key.into(),
-            entity_pk,
+            row_pk,
         }
     }
 
@@ -192,16 +192,16 @@ impl DomainRowIdentity {
         Self::new(
             Domain::for_state_row(row, branch_id, untracked),
             key.schema_key,
-            key.entity_pk,
+            key.row_pk,
         )
     }
 
     pub(crate) fn in_domain(
         domain: Domain,
         schema_key: impl Into<String>,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
     ) -> Self {
-        Self::new(domain, schema_key, entity_pk)
+        Self::new(domain, schema_key, row_pk)
     }
 
     #[cfg(test)]
@@ -210,12 +210,12 @@ impl DomainRowIdentity {
         untracked: bool,
         file_id: Option<String>,
         schema_key: impl Into<String>,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
     ) -> Self {
         Self::new(
             Domain::exact_file(branch_id, untracked, file_id),
             schema_key,
-            entity_pk,
+            row_pk,
         )
     }
 
@@ -231,12 +231,12 @@ impl DomainRowIdentity {
         self.schema_key.clone()
     }
 
-    pub(crate) fn entity_pk(&self) -> &EntityPk {
-        &self.entity_pk
+    pub(crate) fn row_pk(&self) -> &RowPk {
+        &self.row_pk
     }
 
-    pub(crate) fn entity_pk_owned(&self) -> EntityPk {
-        self.entity_pk.clone()
+    pub(crate) fn row_pk_owned(&self) -> RowPk {
+        self.row_pk.clone()
     }
 }
 

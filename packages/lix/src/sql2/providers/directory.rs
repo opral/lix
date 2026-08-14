@@ -29,7 +29,7 @@ use crate::filesystem::{
 #[cfg(test)]
 use crate::forktree::StateCell;
 use crate::forktree::{
-    encode_state_entity_prefix, encode_state_entity_prefix_bounds, exclusive_prefix_upper_bound,
+    encode_state_row_prefix, encode_state_row_prefix_bounds, exclusive_prefix_upper_bound,
 };
 use crate::functions::FunctionProviderHandle;
 use crate::plugin::{is_plugin_storage_path, reject_normal_plugin_storage_mutation};
@@ -80,13 +80,13 @@ use super::upsert::{
     StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertReturningRow, UpsertSupport,
     materialize_omitted_column, materialize_omitted_insert_default, validate_target_columns,
 };
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 /// Physical-identity column the upsert driver matches conflicting rows on.
 /// A directory's identity is its `id`; the underlying live state keys on the
-/// directory id as a single-element entity primary key.
+/// directory id as a single-element row primary key.
 const LIX_DIRECTORY_IDENTITY: &[&str] = &["id"];
 const LIX_DIRECTORY_PATH_IDENTITY: &[&str] = &["path"];
 const LIX_DIRECTORY_BY_BRANCH_PATH_IDENTITY: &[&str] = &["path", "lixcol_branch_id"];
@@ -362,7 +362,7 @@ struct DirectoryReturningKey {
 #[derive(Clone, Debug, Default)]
 struct DirectoryScanFilter {
     branch_ids: Vec<String>,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -424,13 +424,13 @@ where
         };
         let mut rows = Vec::new();
         for branch_id in branch_ids {
-            if request.filter.entity_pks.is_empty() {
-                let first = EntityPk::uuid_from_canonical("00000000-0000-0000-0000-000000000000")
+            if request.filter.row_pks.is_empty() {
+                let first = RowPk::uuid_from_canonical("00000000-0000-0000-0000-000000000000")
                     .expect("minimum UUID is canonical");
-                let last = EntityPk::uuid_from_canonical("ffffffff-ffff-ffff-ffff-ffffffffffff")
+                let last = RowPk::uuid_from_canonical("ffffffff-ffff-ffff-ffff-ffffffffffff")
                     .expect("maximum UUID is canonical");
-                let lower = encode_state_entity_prefix(DIRECTORY_SCHEMA_KEY, &first);
-                let upper = exclusive_prefix_upper_bound(&encode_state_entity_prefix(
+                let lower = encode_state_row_prefix(DIRECTORY_SCHEMA_KEY, &first);
+                let upper = exclusive_prefix_upper_bound(&encode_state_row_prefix(
                     DIRECTORY_SCHEMA_KEY,
                     &last,
                 ));
@@ -446,8 +446,8 @@ where
                     .map_err(lix_error_to_datafusion_error)?,
                 );
             } else {
-                for entity_pk in &request.filter.entity_pks {
-                    let bounds = encode_state_entity_prefix_bounds(DIRECTORY_SCHEMA_KEY, entity_pk);
+                for row_pk in &request.filter.row_pks {
+                    let bounds = encode_state_row_prefix_bounds(DIRECTORY_SCHEMA_KEY, row_pk);
                     rows.extend(
                         FilesystemStateRows::from_view_rows(
                             self.state
@@ -678,7 +678,7 @@ where
     /// paths and audit fields are derived during staging, so applying SQL
     /// assignments to the pre-image would produce stale `RETURNING *` values.
     /// Scan the complete directory graph for the relevant branch scope, then
-    /// select the requested identities in write-row order.
+    /// select the requested identitys in write-row order.
     async fn returning_post_image(
         &self,
         write_ctx: &SqlWriteContext<R>,
@@ -1383,8 +1383,8 @@ where
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        request.filter.entity_pks = match target.kind() {
-            UpsertConflictKind::Id => proposed_directory_entity_pks(proposed)?,
+        request.filter.row_pks = match target.kind() {
+            UpsertConflictKind::Id => proposed_directory_row_pks(proposed)?,
             UpsertConflictKind::Path => {
                 validate_required_paths(proposed, "lix_directory")?;
                 Vec::new()
@@ -1397,7 +1397,7 @@ where
             // lane for each path (tracked, untracked, and global), so retain
             // those rows for the generic matcher and its lane validation.
             // Primary-key conflict targets intentionally retain the generic
-            // entity-PK scan below. An index-build failure also falls through
+            // row-PK scan below. An index-build failure also falls through
             // to that generic directory-only scan.
             let index = self
                 .filesystem_path_index
@@ -1461,22 +1461,22 @@ where
     }
 }
 
-/// The proposed directory ids as single-element entity primary keys, used to
+/// The proposed directory ids as single-element row primary keys, used to
 /// narrow the conflict-candidate live-state scan. Rows without an explicit
 /// `id` (defaulted ids) contribute nothing — a generated id cannot collide
 /// with an existing row.
-fn proposed_directory_entity_pks(proposed: &RecordBatch) -> Result<Vec<EntityPk>> {
-    let mut entity_pks = Vec::new();
+fn proposed_directory_row_pks(proposed: &RecordBatch) -> Result<Vec<RowPk>> {
+    let mut row_pks = Vec::new();
     for row_index in 0..proposed.num_rows() {
         if let Some(id) = optional_string_value(proposed, row_index, "id")? {
-            entity_pks.push(EntityPk::uuid_from_canonical(&id).map_err(|error| {
+            row_pks.push(RowPk::uuid_from_canonical(&id).map_err(|error| {
                 DataFusionError::Execution(format!(
                     "lix_directory id must be a canonical UUID: {error}"
                 ))
             })?);
         }
     }
-    Ok(entity_pks)
+    Ok(row_pks)
 }
 
 /// The finite, exact directory paths whose existing rows can conflict with a
@@ -1537,7 +1537,7 @@ fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
 }
 
 trait DirectoryLiveRow {
-    fn entity_pk_json(&self) -> Result<String, LixError>;
+    fn row_pk_json(&self) -> Result<String, LixError>;
     fn schema_key(&self) -> &str;
     fn file_id(&self) -> Option<&str>;
     fn global(&self) -> bool;
@@ -1551,8 +1551,8 @@ trait DirectoryLiveRow {
 }
 
 impl DirectoryLiveRow for FilesystemStateRow {
-    fn entity_pk_json(&self) -> Result<String, LixError> {
-        self.entity_pk().as_json_array_text()
+    fn row_pk_json(&self) -> Result<String, LixError> {
+        self.row_pk().as_json_array_text()
     }
 
     fn schema_key(&self) -> &str {
@@ -1838,7 +1838,7 @@ fn is_user_visible_filesystem_delete_row(row: RawWriteRowRef<'_>) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct StateRowDedupeKey {
-    entity_pk: String,
+    row_pk: String,
     schema_key: String,
     file_id: Option<String>,
     branch_id: String,
@@ -1849,11 +1849,11 @@ struct StateRowDedupeKey {
 impl From<RawWriteRowRef<'_>> for StateRowDedupeKey {
     fn from(row: RawWriteRowRef<'_>) -> Self {
         Self {
-            entity_pk: row
-                .entity_pk
-                .expect("directory provider staged row should carry entity_pk")
+            row_pk: row
+                .row_pk
+                .expect("directory provider staged row should carry row_pk")
                 .as_single_string_owned()
-                .expect("directory provider staged row entity primary key should project"),
+                .expect("directory provider staged row row primary key should project"),
             schema_key: row.schema_key.to_string(),
             file_id: row.file_id.map(ToString::to_string),
             branch_id: row.branch_id.to_string(),
@@ -1894,7 +1894,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows().saturating_mul(3));
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_entity_pk")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_row_pk")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_created_at")?;
@@ -2034,8 +2034,8 @@ fn attach_lix_directory_insert_origin(
             let row = rows.row(index);
             row.schema_key == DIRECTORY_SCHEMA_KEY
                 && row
-                    .entity_pk
-                    .and_then(|entity_pk| entity_pk.as_single_string().ok())
+                    .row_pk
+                    .and_then(|row_pk| row_pk.as_single_string().ok())
                     == Some(directory_id)
         };
         if matches {
@@ -2259,7 +2259,7 @@ where
     let mut paths = Vec::new();
     let mut parent_ids = Vec::new();
     let mut names = Vec::new();
-    let mut entity_pks = Vec::new();
+    let mut row_pks = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
     let mut globals = Vec::new();
@@ -2275,7 +2275,7 @@ where
         paths.push(path);
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
-        entity_pks.push(Some(directory.live.entity_pk_json()?));
+        row_pks.push(Some(directory.live.row_pk_json()?));
         schema_keys.push(Some(directory.live.schema_key().to_owned()));
         file_ids.push(directory.live.file_id().map(str::to_owned));
         globals.push(Some(directory.live.global()));
@@ -2299,7 +2299,7 @@ where
             "path" => Arc::new(StringArray::from(paths.clone())),
             "parent_id" => Arc::new(StringArray::from(parent_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "lixcol_entity_pk" => Arc::new(StringArray::from(entity_pks.clone())),
+            "lixcol_row_pk" => Arc::new(StringArray::from(row_pks.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
@@ -2340,7 +2340,7 @@ fn lix_directory_scan_request(
             branch_ids: branch_binding
                 .map(|branch_id| vec![branch_id.to_string()])
                 .unwrap_or_default(),
-            entity_pks: Vec::new(),
+            row_pks: Vec::new(),
         },
         limit,
     }
@@ -2549,7 +2549,7 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        json_field("lixcol_entity_pk", false),
+        json_field("lixcol_row_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -2703,16 +2703,16 @@ mod tests {
     #[test]
     fn directory_visible_rows_untracked_value_and_tombstone_shadow_tracked() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
-        let entity_id = "01920000-0000-7000-8000-0000000000d3";
+        let row_id = "01920000-0000-7000-8000-0000000000d3";
         let tracked = live_filesystem_row(
-            entity_id,
+            row_id,
             super::DIRECTORY_SCHEMA_KEY,
             None,
             branch_id,
             r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"tracked"}"#,
         );
         let mut untracked = live_filesystem_row(
-            entity_id,
+            row_id,
             super::DIRECTORY_SCHEMA_KEY,
             None,
             branch_id,
@@ -2932,9 +2932,9 @@ mod tests {
         }
     }
 
-    fn live_row(entity_pk: &str, branch_id: &str, snapshot_content: &str) -> FilesystemStateRow {
+    fn live_row(row_pk: &str, branch_id: &str, snapshot_content: &str) -> FilesystemStateRow {
         live_filesystem_row(
-            entity_pk,
+            row_pk,
             super::DIRECTORY_SCHEMA_KEY,
             None,
             branch_id,
@@ -2943,14 +2943,14 @@ mod tests {
     }
 
     fn live_filesystem_row(
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         file_id: Option<&str>,
         branch_id: &str,
         snapshot_content: &str,
     ) -> FilesystemStateRow {
         FilesystemStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture filesystem ID should be a UUID"),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
@@ -2958,8 +2958,8 @@ mod tests {
             metadata: Some(json!({"source": "test"}).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -2973,7 +2973,7 @@ mod tests {
                 let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
+                    row_pk: &row.row_pk,
                 });
                 let cell = if row.deleted {
                     StateCell::Tombstone
@@ -3359,8 +3359,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![TransactionWriteRow {
-                entity_pk: Some(
-                    crate::entity_pk::EntityPk::uuid_from_canonical(
+                row_pk: Some(
+                    crate::row_pk::RowPk::uuid_from_canonical(
                         "01920000-0000-7000-8000-0000000000d3",
                     )
                     .expect("fixture directory ID"),
@@ -3477,11 +3477,11 @@ mod tests {
                 .map(|row| {
                     (
                         row.schema_key.as_str(),
-                        row.entity_pk
+                        row.row_pk
                             .as_ref()
-                            .expect("planned delete row should carry entity_pk")
+                            .expect("planned delete row should carry row_pk")
                             .as_single_string_owned()
-                            .expect("planned delete row should project entity_pk"),
+                            .expect("planned delete row should project row_pk"),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -3532,18 +3532,18 @@ mod tests {
         .expect("recursive directory delete should plan");
 
         assert_eq!(count, 4);
-        let identities = rows
+        let identitys = rows
             .iter()
             .map(|row| {
                 (
                     row.schema_key.clone(),
-                    row.entity_pk.clone(),
+                    row.row_pk.clone(),
                     row.file_id.clone(),
                     row.branch_id.clone(),
                 )
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(identities.len(), rows.len());
+        assert_eq!(identitys.len(), rows.len());
         assert_eq!(rows.len(), 5);
     }
 
@@ -3562,8 +3562,8 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: RawWriteBatch::from_test_rows(vec![TransactionWriteRow {
-                    entity_pk: Some(
-                        crate::entity_pk::EntityPk::uuid_from_canonical(
+                    row_pk: Some(
+                        crate::row_pk::RowPk::uuid_from_canonical(
                             "01920000-0000-7000-8000-0000000000d3",
                         )
                         .expect("fixture directory ID"),
@@ -3808,7 +3808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_id_conflict_candidates_keep_generic_entity_pk_scan() {
+    async fn directory_id_conflict_candidates_keep_generic_row_pk_scan() {
         let indexed = live_row(
             "01920000-0000-7000-8000-000000000373",
             "01920000-0000-7000-8000-0000000000a1",
@@ -3847,7 +3847,7 @@ mod tests {
                 &UpsertConflictTarget::id(&["id"]),
             )
             .await
-            .expect("id conflicts should use the entity-primary-key scan")
+            .expect("id conflicts should use the row-primary-key scan")
         };
 
         let ids = candidates

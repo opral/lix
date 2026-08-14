@@ -11,7 +11,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::common::{LixPath, compose_file_path};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::state::ForkTreeStateView;
 
 use super::keys::{
@@ -648,7 +648,7 @@ impl DirectoryPathResolver {
                             return Err(LixError::new(
                                 LixError::CODE_UNIQUE,
                                 format!(
-                                    "cannot insert tracked row for schema 'lix_directory_descriptor' entity_pk \"{existing_id}\": a canonical untracked row already exists; delete it first"
+                                    "cannot insert tracked row for schema 'lix_directory_descriptor' row_pk \"{existing_id}\": a canonical untracked row already exists; delete it first"
                                 ),
                             ));
                         }
@@ -1630,35 +1630,35 @@ impl DirectoryPathRecord for DirectoryDescriptorSeed {
 
 fn append_state_row(
     rows: &mut RawWriteBatch,
-    entity_pk: String,
+    row_pk: String,
     schema_key: &str,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) {
-    append_partial_state_row(rows, Some(entity_pk), schema_key, snapshot, context);
+    append_partial_state_row(rows, Some(row_pk), schema_key, snapshot, context);
 }
 
 fn append_partial_state_row(
     rows: &mut RawWriteBatch,
-    entity_pk: Option<String>,
+    row_pk: Option<String>,
     schema_key: &str,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) {
-    let derived_entity_pk = entity_pk.map(|value| {
+    let derived_row_pk = row_pk.map(|value| {
         if snapshot.is_none() {
-            EntityPk::uuid_from_canonical(&value)
-                .expect("filesystem tombstones target validated UUID identities")
+            RowPk::uuid_from_canonical(&value)
+                .expect("filesystem tombstones target validated UUID identitys")
         } else {
             // These builders are schema-aware: filesystem descriptor and
             // materialization IDs are declared UUID primary keys. Preserve an
             // invalid caller value only until normalization can return the
             // public schema-validation error instead of panicking.
-            EntityPk::uuid_from_canonical(&value).unwrap_or_else(|_| EntityPk::single(value))
+            RowPk::uuid_from_canonical(&value).unwrap_or_else(|_| RowPk::single(value))
         }
     });
     rows.push_parts(
-        derived_entity_pk,
+        derived_row_pk,
         schema_key.into(),
         context.file_id.map(Into::into),
         snapshot.map(TransactionJson::from_value_unchecked),
@@ -1676,11 +1676,11 @@ fn append_partial_state_row(
 
 fn append_tombstone_row(
     rows: &mut RawWriteBatch,
-    entity_pk: String,
+    row_pk: String,
     schema_key: &str,
     context: FilesystemRowContext,
 ) {
-    append_state_row(rows, entity_pk, schema_key, None, context);
+    append_state_row(rows, row_pk, schema_key, None, context);
 }
 
 fn collect_recursive_directory_delete(
@@ -1751,7 +1751,7 @@ mod tests {
         plan_file_descriptor_write,
     };
     use crate::common::LixPath;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::filesystem::VisibleFilesystem;
     use crate::filesystem::{FilesystemStateRow, FilesystemStateRows};
 
@@ -1760,8 +1760,8 @@ mod tests {
         move || ids.next().expect("test id should exist").to_string()
     }
 
-    fn uuid_pk(value: &str) -> EntityPk {
-        EntityPk::uuid_from_canonical(value).expect("fixture ID should be a canonical UUID")
+    fn uuid_pk(value: &str) -> RowPk {
+        RowPk::uuid_from_canonical(value).expect("fixture ID should be a canonical UUID")
     }
 
     #[test]
@@ -1792,12 +1792,12 @@ mod tests {
         );
         assert_eq!(rows.shared_origin_count(), 0);
         assert_eq!(
-            rows.row(0).entity_pk,
+            rows.row(0).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-000000000000")),
             "the first directory identity must remain a typed UUID"
         );
         assert_eq!(
-            rows.row(ROW_COUNT - 1).entity_pk,
+            rows.row(ROW_COUNT - 1).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-00000000270f")),
             "the last directory identity must remain a typed UUID"
         );
@@ -1889,7 +1889,7 @@ mod tests {
         });
 
         assert_eq!(
-            row.entity_pk,
+            row.row_pk,
             Some(uuid_pk("01920000-0000-7000-8000-0000000000d3"))
         );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
@@ -1910,7 +1910,7 @@ mod tests {
         });
 
         assert_eq!(
-            row.entity_pk,
+            row.row_pk,
             Some(uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(row.schema_key, "lix_file_descriptor");
@@ -1934,7 +1934,7 @@ mod tests {
         .expect("blob ref row should build");
 
         assert_eq!(
-            row.entity_pk,
+            row.row_pk,
             Some(uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -2506,7 +2506,7 @@ mod tests {
             name: "docs".to_string(),
             context: context.clone(),
         });
-        assert_eq!(directory_row.entity_pk, None);
+        assert_eq!(directory_row.row_pk, None);
         assert_eq!(directory_row.schema_key, "lix_directory_descriptor");
         assert!(
             directory_row
@@ -2528,7 +2528,7 @@ mod tests {
             name: "readme.md".to_string(),
             context: context.clone(),
         });
-        assert_eq!(file_row.entity_pk, None);
+        assert_eq!(file_row.row_pk, None);
         assert_eq!(file_row.schema_key, "lix_file_descriptor");
         assert!(
             file_row
@@ -2812,7 +2812,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be planned");
         assert_eq!(
-            descriptor.entity_pk,
+            descriptor.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -2827,7 +2827,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be planned");
         assert_eq!(
-            blob_ref.entity_pk,
+            blob_ref.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -2861,7 +2861,7 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(
-            plan.rows.row(0).entity_pk,
+            plan.rows.row(0).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d3"))
         );
         assert_eq!(plan.rows.row(0).schema_key, "lix_directory_descriptor");
@@ -2881,7 +2881,7 @@ mod tests {
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows.row(0).schema_key, "lix_directory_descriptor");
         assert_eq!(
-            plan.rows.row(0).entity_pk,
+            plan.rows.row(0).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000e3"))
         );
         assert_eq!(plan.rows.row(0).snapshot, None);
@@ -2937,11 +2937,11 @@ mod tests {
                 .map(|row| {
                     (
                         row.schema_key.as_str(),
-                        row.entity_pk
+                        row.row_pk
                             .as_ref()
-                            .expect("planned recursive delete row should carry entity_pk")
+                            .expect("planned recursive delete row should carry row_pk")
                             .as_single_string_owned()
-                            .expect("planned recursive delete row should project entity_pk"),
+                            .expect("planned recursive delete row should project row_pk"),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -2972,15 +2972,15 @@ mod tests {
     }
 
     fn live_directory_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
     ) -> FilesystemStateRow {
-        live_directory_row_with_scope(entity_pk, branch_id, false, false, None, snapshot_content)
+        live_directory_row_with_scope(row_pk, branch_id, false, false, None, snapshot_content)
     }
 
     fn live_directory_row_with_scope(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         global: bool,
         untracked: bool,
@@ -2988,15 +2988,15 @@ mod tests {
         snapshot_content: &str,
     ) -> FilesystemStateRow {
         FilesystemStateRow {
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id,
             snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global,
             untracked,
             created_at: LixTimestamp::expect_parse(

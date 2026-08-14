@@ -20,22 +20,22 @@ use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchRefReader};
 use crate::changelog::CommitRecord;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::LixTimestamp;
-use crate::entity_pk::{EntityPk, EntityPkComponent};
+use crate::row_pk::{RowPk, RowPkComponent};
 use crate::forktree::{StateCell, StateKeyRef, StateValue, decode_state_key, encode_state_key};
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
-    EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
-    entity_surface_schema,
+    SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec, PublicCatalog, PublicSurfaceKind,
+    schema_surface_schema,
 };
 #[cfg(test)]
-use crate::sql2::entity_batch::row_snapshot;
-use crate::sql2::entity_batch::{
-    EntityExactBatchRequest, EntityExactRowRequest, EntityProjection, EntityRowSelection,
-    EntityScanFilter, EntityScanRequest, EntityStateSlot, exact_forktree, exact_transaction,
+use crate::sql2::row_batch::row_snapshot;
+use crate::sql2::row_batch::{
+    RowExactBatchRequest, RowExactRowRequest, RowProjection, RowRowSelection,
+    RowScanFilter, RowScanRequest, RowStateSlot, exact_forktree, exact_transaction,
     scan_slots_forktree, scan_slots_transaction,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::read_only::reject_read_only_entity_surface;
+use crate::sql2::read_only::reject_read_only_schema_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
 use crate::state::{ForkTreeStateView, StateRow, StateRowSource};
@@ -47,7 +47,7 @@ use crate::transaction::types::{
 };
 
 use super::ProviderSelection;
-use super::entity_history::register_entity_history_surface;
+use super::schema_history::register_row_history_surface;
 use datafusion::physical_plan::ExecutionPlan;
 
 use super::spec::{
@@ -59,7 +59,7 @@ use super::values::{
 };
 use crate::storage_adapter::StorageAdapterRead;
 
-pub(crate) async fn register_entity_providers<S>(
+pub(crate) async fn register_row_providers<S>(
     ctx: &SessionContext,
     active_branch_id: &str,
     state_view: ForkTreeStateView<S>,
@@ -79,8 +79,8 @@ where
             continue;
         }
         match &surface.kind {
-            PublicSurfaceKind::EntityBase { schema_key } if include_write_surfaces => {
-                let spec = catalog_entity_spec(catalog, schema_key)?;
+            PublicSurfaceKind::SchemaBase { schema_key } if include_write_surfaces => {
+                let spec = catalog_schema_spec(catalog, schema_key)?;
                 let provider = if matches!(schema_key.as_str(), "lix_commit" | "lix_commit_edge") {
                     let commit_graph = commit_graph.as_ref().ok_or_else(|| {
                         LixError::new(
@@ -88,13 +88,13 @@ where
                             "commit projection is missing its retained ForkTree graph",
                         )
                     })?;
-                    EntitySpec::active_commit(
+                    RowSpec::active_commit(
                         spec,
                         Arc::clone(&branch_ref),
                         Arc::clone(commit_graph),
                     )
                 } else {
-                    EntitySpec::active(
+                    RowSpec::active(
                         spec,
                         state_view.clone(),
                         Arc::clone(&branch_ref),
@@ -108,8 +108,8 @@ where
                     WriteAccess::read_only(),
                 )?;
             }
-            PublicSurfaceKind::EntityByBranch { schema_key } if include_write_surfaces => {
-                let spec = catalog_entity_spec(catalog, schema_key)?;
+            PublicSurfaceKind::SchemaByBranch { schema_key } if include_write_surfaces => {
+                let spec = catalog_schema_spec(catalog, schema_key)?;
                 let provider = if matches!(schema_key.as_str(), "lix_commit" | "lix_commit_edge") {
                     let commit_graph = commit_graph.as_ref().ok_or_else(|| {
                         LixError::new(
@@ -117,13 +117,13 @@ where
                             "commit projection is missing its retained ForkTree graph",
                         )
                     })?;
-                    EntitySpec::by_branch_commit(
+                    RowSpec::by_branch_commit(
                         spec,
                         Arc::clone(&branch_ref),
                         Arc::clone(commit_graph),
                     )
                 } else {
-                    EntitySpec::by_branch(spec, state_view.clone(), Arc::clone(&branch_ref))
+                    RowSpec::by_branch(spec, state_view.clone(), Arc::clone(&branch_ref))
                 };
                 register_spec_table(
                     ctx,
@@ -132,17 +132,17 @@ where
                     WriteAccess::read_only(),
                 )?;
             }
-            PublicSurfaceKind::EntityHistory { schema_key } => {
+            PublicSurfaceKind::SchemaHistory { schema_key } => {
                 let (Some(commit_graph), Some(query_source)) =
                     (commit_graph.as_ref(), query_source.as_ref())
                 else {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "selected entity history provider is missing its history context",
+                        "selected row history provider is missing its history context",
                     ));
                 };
-                let spec = catalog_entity_spec(catalog, schema_key)?;
-                register_entity_history_surface(
+                let spec = catalog_schema_spec(catalog, schema_key)?;
+                register_row_history_surface(
                     ctx,
                     &surface.name,
                     spec,
@@ -151,7 +151,7 @@ where
                     default_as_of_commit_id.clone().ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "selected entity history provider is missing its pinned commit anchor",
+                            "selected row history provider is missing its pinned commit anchor",
                         )
                     })?,
                 )?;
@@ -163,7 +163,7 @@ where
     Ok(())
 }
 
-pub(crate) async fn register_entity_write_providers<R>(
+pub(crate) async fn register_row_write_providers<R>(
     ctx: &SessionContext,
     write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
@@ -178,12 +178,12 @@ where
             continue;
         }
         match &surface.kind {
-            PublicSurfaceKind::EntityBase { schema_key } => {
-                let spec = catalog_entity_spec(catalog, schema_key)?;
+            PublicSurfaceKind::SchemaBase { schema_key } => {
+                let spec = catalog_schema_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,
                     &surface.name,
-                    Arc::new(EntitySpec::active_with_write(
+                    Arc::new(RowSpec::active_with_write(
                         spec,
                         write_ctx.clone(),
                         Arc::clone(&branch_ref),
@@ -191,12 +191,12 @@ where
                     WriteAccess::write(write_ctx.clone()),
                 )?;
             }
-            PublicSurfaceKind::EntityByBranch { schema_key } => {
-                let spec = catalog_entity_spec(catalog, schema_key)?;
+            PublicSurfaceKind::SchemaByBranch { schema_key } => {
+                let spec = catalog_schema_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,
                     &surface.name,
-                    Arc::new(EntitySpec::by_branch_with_write(
+                    Arc::new(RowSpec::by_branch_with_write(
                         spec,
                         write_ctx.clone(),
                         Arc::clone(&branch_ref),
@@ -211,32 +211,32 @@ where
     Ok(())
 }
 
-fn catalog_entity_spec(
+fn catalog_schema_spec(
     catalog: &PublicCatalog,
     schema_key: &str,
-) -> Result<Arc<EntitySurfaceSpec>, LixError> {
+) -> Result<Arc<SchemaSurfaceSpec>, LixError> {
     catalog
-        .entity_spec(schema_key)
+        .schema_spec(schema_key)
         .cloned()
         .map(Arc::new)
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!("catalog entity surface '{schema_key}' is missing its surface spec"),
+                format!("catalog row surface '{schema_key}' is missing its surface spec"),
             )
         })
 }
 
-/// One spec type covers every registered entity schema: the runtime
-/// [`EntitySurfaceSpec`] carries the per-schema column layout, and the
+/// One spec type covers every registered row schema: the runtime
+/// [`SchemaSurfaceSpec`] carries the per-schema column layout, and the
 /// surface name follows the catalog naming for the base/by-branch shapes.
 #[derive(Clone)]
-struct EntitySpec<R>
+struct RowSpec<R>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     surface_name: String,
-    spec: Arc<EntitySurfaceSpec>,
+    spec: Arc<SchemaSurfaceSpec>,
     state_view: Option<ForkTreeStateView<R>>,
     write_ctx: Option<SqlWriteContext<R>>,
     branch_ref: Arc<dyn BranchRefReader>,
@@ -245,19 +245,19 @@ where
     commit_graph: Option<super::SharedCommitGraph>,
 }
 
-impl<R> EntitySpec<R>
+impl<R> RowSpec<R>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn active(
-        spec: Arc<EntitySurfaceSpec>,
+        spec: Arc<SchemaSurfaceSpec>,
         state_view: ForkTreeStateView<R>,
         branch_ref: Arc<dyn BranchRefReader>,
         active_branch_id: String,
     ) -> Self {
         Self {
             surface_name: spec.schema_key.clone(),
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema: schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             spec,
             state_view: Some(state_view),
             write_ctx: None,
@@ -268,14 +268,14 @@ where
     }
 
     fn active_with_write(
-        spec: Arc<EntitySurfaceSpec>,
+        spec: Arc<SchemaSurfaceSpec>,
         write_ctx: SqlWriteContext<R>,
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
         Self {
             surface_name: spec.schema_key.clone(),
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema: schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             spec,
             state_view: None,
             write_ctx: Some(write_ctx),
@@ -286,13 +286,13 @@ where
     }
 
     fn by_branch(
-        spec: Arc<EntitySurfaceSpec>,
+        spec: Arc<SchemaSurfaceSpec>,
         state_view: ForkTreeStateView<R>,
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         Self {
             surface_name: format!("{}_by_branch", spec.schema_key),
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
+            schema: schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch),
             spec,
             state_view: Some(state_view),
             write_ctx: None,
@@ -303,13 +303,13 @@ where
     }
 
     fn by_branch_with_write(
-        spec: Arc<EntitySurfaceSpec>,
+        spec: Arc<SchemaSurfaceSpec>,
         write_ctx: SqlWriteContext<R>,
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         Self {
             surface_name: format!("{}_by_branch", spec.schema_key),
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
+            schema: schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch),
             spec,
             state_view: None,
             write_ctx: Some(write_ctx),
@@ -320,13 +320,13 @@ where
     }
 
     fn active_commit(
-        spec: Arc<EntitySurfaceSpec>,
+        spec: Arc<SchemaSurfaceSpec>,
         branch_ref: Arc<dyn BranchRefReader>,
         commit_graph: super::SharedCommitGraph,
     ) -> Self {
         Self {
             surface_name: spec.schema_key.clone(),
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema: schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             spec,
             state_view: None,
             write_ctx: None,
@@ -337,13 +337,13 @@ where
     }
 
     fn by_branch_commit(
-        spec: Arc<EntitySurfaceSpec>,
+        spec: Arc<SchemaSurfaceSpec>,
         branch_ref: Arc<dyn BranchRefReader>,
         commit_graph: super::SharedCommitGraph,
     ) -> Self {
         Self {
             surface_name: format!("{}_by_branch", spec.schema_key),
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
+            schema: schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch),
             spec,
             state_view: None,
             write_ctx: None,
@@ -355,8 +355,8 @@ where
 
     async fn scan_rows(
         &self,
-        request: &EntityScanRequest,
-    ) -> Result<Vec<EntityStateSlot>, LixError> {
+        request: &RowScanRequest,
+    ) -> Result<Vec<RowStateSlot>, LixError> {
         if self.spec.schema_key == BRANCH_REF_SCHEMA_KEY {
             return self.scan_branch_ref_slots(request).await;
         }
@@ -367,15 +367,15 @@ where
         } else {
             Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "entity provider has no retained native state view",
+                "row provider has no retained native state view",
             ))
         }
     }
 
     async fn exact_slots(
         &self,
-        request: &EntityExactBatchRequest,
-    ) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
+        request: &RowExactBatchRequest,
+    ) -> Result<Vec<Option<RowStateSlot>>, LixError> {
         if self.spec.schema_key == BRANCH_REF_SCHEMA_KEY {
             return self.exact_branch_ref_slots(request).await;
         }
@@ -386,21 +386,21 @@ where
         } else {
             Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "entity provider has no retained native state view",
+                "row provider has no retained native state view",
             ))
         }
     }
 
     /// Branch refs are selector/control-plane facts, not tracked or untracked
     /// state rows. Project the authenticated selector + RefChange metadata
-    /// through the native entity surface instead of scanning a state root that
+    /// through the native row surface instead of scanning a state root that
     /// cannot contain these rows. The synthetic StateRow is only an Arrow
     /// boundary carrier; its IDs, timestamps, and head are all sourced from
     /// the same retained BranchRefReader batch.
     async fn scan_branch_ref_slots(
         &self,
-        request: &EntityScanRequest,
-    ) -> Result<Vec<EntityStateSlot>, LixError> {
+        request: &RowScanRequest,
+    ) -> Result<Vec<RowStateSlot>, LixError> {
         let rows = if let Some(ids) = branch_ref_ids_from_request(request) {
             self.branch_ref.load_head_metadata_batch(&ids).await?
         } else {
@@ -416,12 +416,12 @@ where
 
     async fn exact_branch_ref_slots(
         &self,
-        request: &EntityExactBatchRequest,
-    ) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
+        request: &RowExactBatchRequest,
+    ) -> Result<Vec<Option<RowStateSlot>>, LixError> {
         let ids = request
             .rows
             .iter()
-            .map(|row| branch_ref_id_from_entity_pk(&row.entity_pk))
+            .map(|row| branch_ref_id_from_row_pk(&row.row_pk))
             .collect::<Vec<_>>();
         let requested_ids = ids.iter().flatten().cloned().collect::<Vec<_>>();
         let candidates = self
@@ -442,7 +442,7 @@ where
             .collect())
     }
 
-    async fn commit_slots(&self) -> Result<Vec<EntityStateSlot>, LixError> {
+    async fn commit_slots(&self) -> Result<Vec<RowStateSlot>, LixError> {
         let commit_graph = self.commit_graph.as_ref().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -544,25 +544,25 @@ where
             let commit_snapshot =
                 crate::changelog::commit_row_snapshot_json(&record.commit_id.to_string())?;
             if self.spec.schema_key == "lix_commit" {
-                let entity_pk = EntityPk::uuid_from_canonical(&record.commit_id.to_string())
+                let row_pk = RowPk::uuid_from_canonical(&record.commit_id.to_string())
                     .map_err(|error| {
                         LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())
                     })?;
                 let row = commit_projection_row(
                     &self.spec.native_schema,
-                    entity_pk,
+                    row_pk,
                     commit_snapshot,
                     record,
                 )?;
                 if by_branch {
                     for branch_id in &branch_ids {
-                        slots.push(EntityStateSlot::TrackedAt {
+                        slots.push(RowStateSlot::TrackedAt {
                             row: row.clone(),
                             branch_id: branch_id.clone(),
                         });
                     }
                 } else {
-                    slots.push(EntityStateSlot::Tracked(row));
+                    slots.push(RowStateSlot::Tracked(row));
                 }
                 continue;
             }
@@ -573,7 +573,7 @@ where
                     "child_id": record.commit_id.to_string(),
                     "parent_order": parent_order as i64,
                 });
-                let entity_pk = EntityPk::from_primary_key_plan(
+                let row_pk = RowPk::from_primary_key_plan(
                     &snapshot,
                     &self.spec.primary_key_paths,
                     &self.spec.primary_key_component_types,
@@ -581,7 +581,7 @@ where
                 .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
                 let row = commit_projection_row(
                     &self.spec.native_schema,
-                    entity_pk,
+                    row_pk,
                     serde_json::to_string(&snapshot).map_err(|error| {
                         LixError::new(
                             LixError::CODE_STORAGE_ERROR,
@@ -592,13 +592,13 @@ where
                 )?;
                 if by_branch {
                     for branch_id in &branch_ids {
-                        slots.push(EntityStateSlot::TrackedAt {
+                        slots.push(RowStateSlot::TrackedAt {
                             row: row.clone(),
                             branch_id: branch_id.clone(),
                         });
                     }
                 } else {
-                    slots.push(EntityStateSlot::Tracked(row));
+                    slots.push(RowStateSlot::Tracked(row));
                 }
             }
         }
@@ -635,7 +635,7 @@ where
                             .commit_slots()
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
-                        let batch = entity_record_batch_from_slots(
+                        let batch = row_record_batch_from_slots(
                             &provider.spec,
                             source_schema,
                             &slots,
@@ -662,10 +662,10 @@ where
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<(SchemaRef, EntityScanRequest, Vec<EntityRowFilter>)> {
+    ) -> Result<(SchemaRef, RowScanRequest, Vec<RowRowFilter>)> {
         let projected_schema = projected_schema(&self.schema, projection);
-        let row_filters = EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(filters)?;
-        let mut request = entity_state_scan_request(
+        let row_filters = RowRowFilterAnalyzer::new(&self.spec).analyze_filters(filters)?;
+        let mut request = row_state_scan_request(
             &self.spec.schema_key,
             self.branch_binding.active_branch_id(),
             Some(projected_schema.as_ref()),
@@ -698,7 +698,7 @@ where
             request.filter.branch_ids = vec![GLOBAL_BRANCH_ID.to_string()];
         }
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
-        apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
+        apply_exact_row_pk_filters(&mut request, &self.spec, filters)?;
         apply_exact_file_id_filters(&mut request, filters)?;
         Ok((projected_schema, request, row_filters))
     }
@@ -707,16 +707,16 @@ where
         &self,
         batch: &RecordBatch,
         row_index: usize,
-    ) -> Result<EntityReturningKey> {
-        let entity_pk = EntityPk::from_json_array_text(&required_string_value(
+    ) -> Result<RowReturningKey> {
+        let row_pk = RowPk::from_json_array_text(&required_string_value(
             batch,
             row_index,
-            "lixcol_entity_pk",
-            "UPDATE entity surface RETURNING",
+            "lixcol_row_pk",
+            "UPDATE row surface RETURNING",
         )?)
         .map_err(|error| {
             DataFusionError::Execution(format!(
-                "UPDATE entity surface RETURNING has invalid lixcol_entity_pk: {error}"
+                "UPDATE row surface RETURNING has invalid lixcol_row_pk: {error}"
             ))
         })?;
         let branch_id = match self.branch_binding {
@@ -729,17 +729,17 @@ where
                 batch,
                 row_index,
                 "lixcol_branch_id",
-                "UPDATE entity surface RETURNING",
+                "UPDATE row surface RETURNING",
             )?,
         };
-        Ok(EntityReturningKey {
-            entity_pk,
+        Ok(RowReturningKey {
+            row_pk,
             branch_id,
             file_id: optional_string_value(
                 batch,
                 row_index,
                 "lixcol_file_id",
-                "UPDATE entity surface RETURNING",
+                "UPDATE row surface RETURNING",
             )?,
         })
     }
@@ -747,25 +747,25 @@ where
     async fn returning_post_image(
         &self,
         write_ctx: &SqlWriteContext<R>,
-        keys: &[EntityReturningKey],
+        keys: &[RowReturningKey],
     ) -> Result<RecordBatch> {
         if keys.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
-        let request = entity_state_scan_request(
+        let request = row_state_scan_request(
             &self.spec.schema_key,
             self.branch_binding.active_branch_id(),
             Some(self.schema.as_ref()),
             None,
             false,
         );
-        let exact_request = EntityExactBatchRequest {
+        let exact_request = RowExactBatchRequest {
             rows: keys
                 .iter()
-                .map(|key| EntityExactRowRequest {
+                .map(|key| RowExactRowRequest {
                     schema_key: self.spec.schema_key.clone(),
                     branch_id: key.branch_id.clone(),
-                    entity_pk: key.entity_pk.clone(),
+                    row_pk: key.row_pk.clone(),
                     file_id: key.file_id.clone(),
                 })
                 .collect(),
@@ -781,12 +781,12 @@ where
             .map(|slot| {
                 slot.ok_or_else(|| {
                     DataFusionError::Execution(
-                        "entity UPDATE RETURNING post-image is missing an updated row".into(),
+                        "row UPDATE RETURNING post-image is missing an updated row".into(),
                     )
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let batch = entity_record_batch_from_slots(
+        let batch = row_record_batch_from_slots(
             &self.spec,
             Arc::clone(&self.schema),
             &slots,
@@ -796,12 +796,12 @@ where
         for row_index in 0..batch.num_rows() {
             let key = self.returning_key_from_batch(&batch, row_index)?;
             let index = u32::try_from(row_index).map_err(|_| {
-                DataFusionError::Execution("entity UPDATE RETURNING row index overflow".into())
+                DataFusionError::Execution("row UPDATE RETURNING row index overflow".into())
             })?;
             if post_rows.insert(key.clone(), index).is_some() {
                 return Err(DataFusionError::Execution(format!(
-                    "entity UPDATE RETURNING post-image contains duplicate row for identity {:?}",
-                    key.entity_pk
+                    "row UPDATE RETURNING post-image contains duplicate row for identity {:?}",
+                    key.row_pk
                 )));
             }
         }
@@ -810,8 +810,8 @@ where
             .map(|key| {
                 post_rows.get(key).copied().ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "entity UPDATE RETURNING post-image is missing updated row {:?}",
-                        key.entity_pk
+                        "row UPDATE RETURNING post-image is missing updated row {:?}",
+                        key.row_pk
                     ))
                 })
             })
@@ -826,9 +826,9 @@ where
         filters: &[Expr],
         returning: Option<DmlReturning>,
     ) -> Result<PlannedDml> {
-        reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
+        reject_read_only_schema_surface(&self.spec.schema_key, "UPDATE")?;
         let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
-        let exact_request = exact_entity_batch_request(&request);
+        let exact_request = exact_row_batch_request(&request);
         let provider = self.clone();
         let source = row_source(
             (provider, schema, request, exact_request, row_filters),
@@ -841,7 +841,7 @@ where
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
                     let slots = slots.into_iter().flatten().collect::<Vec<_>>();
-                    let batch = entity_record_batch_from_slots(
+                    let batch = row_record_batch_from_slots(
                         &provider.spec,
                         schema,
                         &slots,
@@ -854,13 +854,13 @@ where
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
                 let active_branch_id = provider.branch_binding.active_branch_id();
-                let filtered = apply_entity_state_slot_filters(
+                let filtered = apply_row_state_slot_filters(
                     &provider.spec,
                     slots,
                     &row_filters,
                     active_branch_id,
                 )?;
-                entity_record_batch_from_slots(
+                row_record_batch_from_slots(
                     &provider.spec,
                     schema,
                     &filtered,
@@ -894,7 +894,7 @@ where
                         .transpose()?;
                     let assignment_values =
                         UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
-                    let rows = entity_update_stage_rows_from_batch(
+                    let rows = row_update_stage_rows_from_batch(
                         &matched_batch,
                         &assignment_values,
                         spec.as_ref(),
@@ -927,15 +927,15 @@ where
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct EntityReturningKey {
-    entity_pk: EntityPk,
+struct RowReturningKey {
+    row_pk: RowPk,
     branch_id: String,
     file_id: Option<String>,
 }
 
 fn commit_projection_row(
     schema: &lix_schema::Schema,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     snapshot: String,
     record: &CommitRecord,
 ) -> Result<StateRow, LixError> {
@@ -948,7 +948,7 @@ fn commit_projection_row(
     let key = encode_state_key(StateKeyRef {
         schema_key: &schema.key,
         file_id: None,
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     Ok(StateRow {
         key,
@@ -959,7 +959,7 @@ fn commit_projection_row(
             updated_at: record.created_at,
             cell: StateCell::NativeRow(crate::native_row::encode(
                 schema,
-                &entity_pk,
+                &row_pk,
                 true,
                 None,
                 &snapshot,
@@ -972,21 +972,21 @@ fn commit_projection_row(
     })
 }
 
-fn branch_ref_id_from_entity_pk(entity_pk: &EntityPk) -> Option<String> {
-    let id = entity_pk.as_single_string_owned().ok()?;
-    EntityPk::uuid_from_canonical(&id).ok().map(|_| id)
+fn branch_ref_id_from_row_pk(row_pk: &RowPk) -> Option<String> {
+    let id = row_pk.as_single_string_owned().ok()?;
+    RowPk::uuid_from_canonical(&id).ok().map(|_| id)
 }
 
-fn branch_ref_ids_from_request(request: &EntityScanRequest) -> Option<Vec<String>> {
-    if request.filter.entity_pks.is_empty() {
+fn branch_ref_ids_from_request(request: &RowScanRequest) -> Option<Vec<String>> {
+    if request.filter.row_pks.is_empty() {
         return None;
     }
     Some(
         request
             .filter
-            .entity_pks
+            .row_pks
             .iter()
-            .filter_map(branch_ref_id_from_entity_pk)
+            .filter_map(branch_ref_id_from_row_pk)
             .collect(),
     )
 }
@@ -995,13 +995,13 @@ fn branch_ref_state_slot(
     branch_id: &str,
     commit_id: crate::changelog::CommitId,
     metadata: crate::branch::BranchRefMetadata,
-) -> EntityStateSlot {
-    let entity_pk = EntityPk::uuid_from_canonical(branch_id)
+) -> RowStateSlot {
+    let row_pk = RowPk::uuid_from_canonical(branch_id)
         .expect("authenticated branch ref IDs are canonical UUIDs");
     let key = encode_state_key(StateKeyRef {
         schema_key: BRANCH_REF_SCHEMA_KEY,
         file_id: None,
-        entity_pk: &entity_pk,
+        row_pk: &row_pk,
     });
     let snapshot = serde_json::json!({
         "id": branch_id,
@@ -1009,7 +1009,7 @@ fn branch_ref_state_slot(
     });
     let schema = crate::native_row::seed_schema(BRANCH_REF_SCHEMA_KEY)
         .expect("built-in branch-ref native schema");
-    EntityStateSlot::Tracked(StateRow {
+    RowStateSlot::Tracked(StateRow {
         key,
         value: StateValue {
             change_id: metadata.change_id,
@@ -1022,7 +1022,7 @@ fn branch_ref_state_slot(
             cell: StateCell::NativeRow(
                 crate::native_row::encode(
                     &schema,
-                    &entity_pk,
+                    &row_pk,
                     true,
                     None,
                     &snapshot,
@@ -1038,7 +1038,7 @@ fn branch_ref_state_slot(
 }
 
 #[async_trait]
-impl<R> TableSpec<R> for EntitySpec<R>
+impl<R> TableSpec<R> for RowSpec<R>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -1054,8 +1054,8 @@ where
         if self.commit_graph.is_some() {
             return TableProviderFilterPushDown::Exact;
         }
-        let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
-        let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
+        let primary_key_analyzer = RowPrimaryKeyFilterAnalyzer::new(&self.spec);
+        let row_filter_analyzer = RowRowFilterAnalyzer::new(&self.spec);
         if ExactBranchIdFilterAnalyzer.supports(filter)
             || ExactFileIdFilterAnalyzer.supports(filter)
             || primary_key_analyzer.supports(filter)
@@ -1088,7 +1088,7 @@ where
             self.plan_scan_parts(projection, filters, limit).await?;
         let spec = Arc::clone(&self.spec);
         let provider = self.clone();
-        let exact_request = exact_entity_batch_request(&request);
+        let exact_request = exact_row_batch_request(&request);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -1106,7 +1106,7 @@ where
                                 .map_err(lix_error_to_datafusion_error)?,
                             request.limit,
                         );
-                        let batch = entity_record_batch_from_slots(
+                        let batch = row_record_batch_from_slots(
                             &spec,
                             schema,
                             &slots,
@@ -1119,13 +1119,13 @@ where
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                         let active_branch_id = provider.branch_binding.active_branch_id();
-                        let filtered = apply_entity_state_slot_filters(
+                        let filtered = apply_row_state_slot_filters(
                             &spec,
                             slots,
                             &row_filters,
                             active_branch_id,
                         )?;
-                        entity_record_batch_from_slots(
+                        row_record_batch_from_slots(
                             &spec,
                             schema,
                             &filtered,
@@ -1154,7 +1154,7 @@ where
         write_ctx: SqlWriteContext<R>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
-        reject_read_only_entity_surface(&self.spec.schema_key, "DELETE")?;
+        reject_read_only_schema_surface(&self.spec.schema_key, "DELETE")?;
         if self.spec.schema_key == "lix_registered_schema" {
             return Err(lix_error_to_datafusion_error(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -1176,13 +1176,13 @@ where
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
                 let active_branch_id = provider.branch_binding.active_branch_id();
-                let filtered = apply_entity_state_slot_filters(
+                let filtered = apply_row_state_slot_filters(
                     &provider.spec,
                     slots,
                     &row_filters,
                     active_branch_id,
                 )?;
-                entity_record_batch_from_slots(
+                row_record_batch_from_slots(
                     &provider.spec,
                     schema,
                     &filtered,
@@ -1199,7 +1199,7 @@ where
                 let spec = Arc::clone(&spec);
                 let branch_binding = branch_binding.clone();
                 async move {
-                    let rows = entity_delete_stage_rows_from_batch(
+                    let rows = row_delete_stage_rows_from_batch(
                         &matched_batch,
                         spec.as_ref(),
                         &branch_binding,
@@ -1255,9 +1255,9 @@ fn contains_like_filter(expr: &Expr) -> bool {
     }
 }
 
-fn entity_delete_stage_rows_from_batch(
+fn row_delete_stage_rows_from_batch(
     batch: &RecordBatch,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     branch_binding: &BranchBinding,
 ) -> Result<RawWriteBatch> {
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows());
@@ -1266,21 +1266,21 @@ fn entity_delete_stage_rows_from_batch(
             batch,
             row_index,
             "lixcol_global",
-            "DELETE FROM entity surface",
+            "DELETE FROM row surface",
         )?
         .unwrap_or(false);
         let source_branch_id = optional_string_value(
             batch,
             row_index,
             "lixcol_branch_id",
-            "DELETE FROM entity surface",
+            "DELETE FROM row surface",
         )?;
         if matches!(branch_binding, BranchBinding::Explicit)
             && global
             && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
         {
             return Err(DataFusionError::Execution(
-                "DELETE through an entity by-branch surface cannot mutate a projected global row"
+                "DELETE through an row by-branch surface cannot mutate a projected global row"
                     .to_string(),
             ));
         }
@@ -1291,26 +1291,26 @@ fn entity_delete_stage_rows_from_batch(
                 .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
                 .ok_or_else(|| {
                     DataFusionError::Execution(
-                        "DELETE FROM entity by-branch requires lixcol_branch_id".to_string(),
+                        "DELETE FROM row by-branch requires lixcol_branch_id".to_string(),
                     )
                 })?
         };
-        let entity_pk = EntityPk::from_json_array_text(&required_string_value(
+        let row_pk = RowPk::from_json_array_text(&required_string_value(
             batch,
             row_index,
-            "lixcol_entity_pk",
-            "DELETE FROM entity surface",
+            "lixcol_row_pk",
+            "DELETE FROM row surface",
         )?)
         .map_err(|error| {
             DataFusionError::Execution(format!(
-                "DELETE FROM entity surface has invalid lixcol_entity_pk: {error}"
+                "DELETE FROM row surface has invalid lixcol_row_pk: {error}"
             ))
         })?;
         let metadata = optional_string_value(
             batch,
             row_index,
             "lixcol_metadata",
-            "DELETE FROM entity surface",
+            "DELETE FROM row surface",
         )?
         .map(|value| {
             let metadata = parse_row_metadata_value(&value, &spec.schema_key)
@@ -1323,11 +1323,11 @@ fn entity_delete_stage_rows_from_batch(
             batch,
             row_index,
             "lixcol_file_id",
-            "DELETE FROM entity surface",
+            "DELETE FROM row surface",
         )?
         .map(Into::into);
         rows.push_parts(
-            Some(entity_pk),
+            Some(row_pk),
             spec.schema_key.as_str().into(),
             file_id,
             None,
@@ -1345,29 +1345,29 @@ fn entity_delete_stage_rows_from_batch(
     Ok(rows)
 }
 
-fn entity_update_stage_rows_from_batch(
+fn row_update_stage_rows_from_batch(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     branch_binding: &BranchBinding,
 ) -> Result<RawWriteBatch> {
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows());
     for row_index in 0..batch.num_rows() {
         let global =
-            optional_bool_value(batch, row_index, "lixcol_global", "UPDATE entity surface")?
+            optional_bool_value(batch, row_index, "lixcol_global", "UPDATE row surface")?
                 .unwrap_or(false);
         let source_branch_id = optional_string_value(
             batch,
             row_index,
             "lixcol_branch_id",
-            "UPDATE entity surface",
+            "UPDATE row surface",
         )?;
         if matches!(branch_binding, BranchBinding::Explicit)
             && global
             && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
         {
             return Err(DataFusionError::Execution(
-                "UPDATE through an entity by-branch surface cannot mutate a projected global row"
+                "UPDATE through an row by-branch surface cannot mutate a projected global row"
                     .to_string(),
             ));
         }
@@ -1378,35 +1378,35 @@ fn entity_update_stage_rows_from_batch(
                 .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
                 .ok_or_else(|| {
                     DataFusionError::Execution(
-                        "UPDATE entity by-branch requires lixcol_branch_id".to_string(),
+                        "UPDATE row by-branch requires lixcol_branch_id".to_string(),
                     )
                 })?
         };
-        let entity_pk = EntityPk::from_json_array_text(&required_string_value(
+        let row_pk = RowPk::from_json_array_text(&required_string_value(
             batch,
             row_index,
-            "lixcol_entity_pk",
-            "UPDATE entity surface",
+            "lixcol_row_pk",
+            "UPDATE row surface",
         )?)
         .map_err(|error| {
             DataFusionError::Execution(format!(
-                "UPDATE entity surface has invalid lixcol_entity_pk: {error}"
+                "UPDATE row surface has invalid lixcol_row_pk: {error}"
             ))
         })?;
         let mut snapshot = parse_snapshot_value(&required_string_value(
             batch,
             row_index,
             "lixcol_snapshot_content",
-            "UPDATE entity surface",
+            "UPDATE row surface",
         )?)
         .map_err(|error| {
             DataFusionError::Execution(format!(
-                "UPDATE entity surface has invalid lixcol_snapshot_content: {error}"
+                "UPDATE row surface has invalid lixcol_snapshot_content: {error}"
             ))
         })?;
         let object = snapshot.as_object_mut().ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "UPDATE entity surface expected object snapshot for schema '{}'",
+                "UPDATE row surface expected object snapshot for schema '{}'",
                 spec.schema_key
             ))
         })?;
@@ -1418,26 +1418,26 @@ fn entity_update_stage_rows_from_batch(
             };
             object.insert(
                 column.name.clone(),
-                entity_update_json_value(cell, column.column_type, spec, &column.name)?,
+                row_update_json_value(cell, column.column_type, spec, &column.name)?,
             );
         }
         let metadata = match assignment_values.assigned_cell(row_index, "lixcol_metadata")? {
             UpdateCell::Unassigned => {
-                optional_string_value(batch, row_index, "lixcol_metadata", "UPDATE entity surface")?
-                    .map(|value| entity_update_metadata(&value, spec))
+                optional_string_value(batch, row_index, "lixcol_metadata", "UPDATE row surface")?
+                    .map(|value| row_update_metadata(&value, spec))
                     .transpose()?
             }
             UpdateCell::Assigned(SqlCell::Null) => None,
             UpdateCell::Assigned(SqlCell::Value(value)) => {
                 let raw = scalar_utf8(value, "lixcol_metadata", spec)?;
-                Some(entity_update_metadata(&raw, spec)?)
+                Some(row_update_metadata(&raw, spec)?)
             }
         };
         let file_id =
-            optional_string_value(batch, row_index, "lixcol_file_id", "UPDATE entity surface")?
+            optional_string_value(batch, row_index, "lixcol_file_id", "UPDATE row surface")?
                 .map(Into::into);
         rows.push_parts(
-            Some(entity_pk),
+            Some(row_pk),
             spec.schema_key.as_str().into(),
             file_id,
             Some(
@@ -1461,18 +1461,18 @@ fn entity_update_stage_rows_from_batch(
     Ok(rows)
 }
 
-fn entity_update_json_value(
+fn row_update_json_value(
     cell: SqlCell,
-    column_type: EntityColumnType,
-    spec: &EntitySurfaceSpec,
+    column_type: SchemaColumnType,
+    spec: &SchemaSurfaceSpec,
     column_name: &str,
 ) -> Result<JsonValue> {
     let SqlCell::Value(value) = cell else {
         return Ok(JsonValue::Null);
     };
     match column_type {
-        EntityColumnType::String => scalar_utf8(value, column_name, spec).map(JsonValue::String),
-        EntityColumnType::Json => {
+        SchemaColumnType::String => scalar_utf8(value, column_name, spec).map(JsonValue::String),
+        SchemaColumnType::Json => {
             let raw = scalar_utf8(value, column_name, spec)?;
             serde_json::from_str(&raw).map_err(|error| {
                 DataFusionError::Execution(format!(
@@ -1481,16 +1481,16 @@ fn entity_update_json_value(
                 ))
             })
         }
-        EntityColumnType::Integer => match value {
+        SchemaColumnType::Integer => match value {
             ScalarValue::Int64(Some(value)) => Ok(JsonValue::from(value)),
-            other => Err(entity_update_type_error(
+            other => Err(row_update_type_error(
                 spec,
                 column_name,
                 "BIGINT",
                 &other,
             )),
         },
-        EntityColumnType::Number => match value {
+        SchemaColumnType::Number => match value {
             ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
                 .map(JsonValue::Number)
                 .ok_or_else(|| {
@@ -1499,23 +1499,23 @@ fn entity_update_json_value(
                         spec.schema_key
                     ))
                 }),
-            other => Err(entity_update_type_error(
+            other => Err(row_update_type_error(
                 spec,
                 column_name,
                 "DOUBLE PRECISION",
                 &other,
             )),
         },
-        EntityColumnType::Boolean => match value {
+        SchemaColumnType::Boolean => match value {
             ScalarValue::Boolean(Some(value)) => Ok(JsonValue::Bool(value)),
-            other => Err(entity_update_type_error(
+            other => Err(row_update_type_error(
                 spec,
                 column_name,
                 "BOOLEAN",
                 &other,
             )),
         },
-        EntityColumnType::Timestamptz => match value {
+        SchemaColumnType::Timestamptz => match value {
             ScalarValue::TimestampMicrosecond(Some(value), _) => {
                 chrono::DateTime::from_timestamp_micros(value)
                     .map(|timestamp| {
@@ -1524,7 +1524,7 @@ fn entity_update_json_value(
                         )
                     })
                     .ok_or_else(|| {
-                        entity_update_type_error(
+                        row_update_type_error(
                             spec,
                             column_name,
                             "TIMESTAMPTZ",
@@ -1532,7 +1532,7 @@ fn entity_update_json_value(
                         )
                     })
             }
-            other => Err(entity_update_type_error(
+            other => Err(row_update_type_error(
                 spec,
                 column_name,
                 "TIMESTAMPTZ",
@@ -1542,17 +1542,17 @@ fn entity_update_json_value(
     }
 }
 
-fn scalar_utf8(value: ScalarValue, column_name: &str, spec: &EntitySurfaceSpec) -> Result<String> {
+fn scalar_utf8(value: ScalarValue, column_name: &str, spec: &SchemaSurfaceSpec) -> Result<String> {
     match value {
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
         | ScalarValue::LargeUtf8(Some(value)) => Ok(value),
-        other => Err(entity_update_type_error(spec, column_name, "TEXT", &other)),
+        other => Err(row_update_type_error(spec, column_name, "TEXT", &other)),
     }
 }
 
-fn entity_update_type_error(
-    spec: &EntitySurfaceSpec,
+fn row_update_type_error(
+    spec: &SchemaSurfaceSpec,
     column_name: &str,
     expected: &str,
     actual: &ScalarValue,
@@ -1563,19 +1563,19 @@ fn entity_update_type_error(
     ))
 }
 
-fn entity_update_metadata(raw: &str, spec: &EntitySurfaceSpec) -> Result<TransactionJson> {
+fn row_update_metadata(raw: &str, spec: &SchemaSurfaceSpec) -> Result<TransactionJson> {
     let metadata =
         parse_row_metadata_value(raw, &spec.schema_key).map_err(lix_error_to_datafusion_error)?;
     TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
         .map_err(lix_error_to_datafusion_error)
 }
 
-pub(super) fn entity_pks_from_primary_key_filters(
-    spec: &EntitySurfaceSpec,
+pub(super) fn row_pks_from_primary_key_filters(
+    spec: &SchemaSurfaceSpec,
     filters: &[Expr],
-) -> Result<Option<Vec<EntityPk>>> {
-    let analyzer = EntityPrimaryKeyFilterAnalyzer::new(spec);
-    let mut constraint: Option<EntityPkConstraint> = None;
+) -> Result<Option<Vec<RowPk>>> {
+    let analyzer = RowPrimaryKeyFilterAnalyzer::new(spec);
+    let mut constraint: Option<RowPkConstraint> = None;
     for filter in filters {
         let Some(filter_constraint) = analyzer.analyze_conjunctive_constraint(filter)? else {
             continue;
@@ -1588,7 +1588,7 @@ pub(super) fn entity_pks_from_primary_key_filters(
 
     Ok(constraint
         .and_then(|constraint| {
-            constraint.into_entity_pks(
+            constraint.into_row_pks(
                 &analyzer.primary_key_columns,
                 &analyzer.primary_key_component_types,
             )
@@ -1596,16 +1596,16 @@ pub(super) fn entity_pks_from_primary_key_filters(
         .map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_entity_pk_filters(
-    request: &mut EntityScanRequest,
-    spec: &EntitySurfaceSpec,
+fn apply_exact_row_pk_filters(
+    request: &mut RowScanRequest,
+    spec: &SchemaSurfaceSpec,
     filters: &[Expr],
 ) -> Result<()> {
-    if let Some(entity_pks) = entity_pks_from_primary_key_filters(spec, filters)? {
-        if entity_pks.is_empty() {
-            request.filter.rows = EntityRowSelection::None;
+    if let Some(row_pks) = row_pks_from_primary_key_filters(spec, filters)? {
+        if row_pks.is_empty() {
+            request.filter.rows = RowRowSelection::None;
         }
-        request.filter.entity_pks = entity_pks;
+        request.filter.row_pks = row_pks;
     }
     Ok(())
 }
@@ -1625,10 +1625,10 @@ fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<Option<Str
     Ok(file_ids.map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_file_id_filters(request: &mut EntityScanRequest, filters: &[Expr]) -> Result<()> {
+fn apply_exact_file_id_filters(request: &mut RowScanRequest, filters: &[Expr]) -> Result<()> {
     if let Some(file_ids) = exact_file_ids_from_filters(filters)? {
         if file_ids.is_empty() {
-            request.filter.rows = EntityRowSelection::None;
+            request.filter.rows = RowRowSelection::None;
         }
         if let [file_id] = file_ids.as_slice() {
             request.filter.file_ids = vec![
@@ -1641,10 +1641,10 @@ fn apply_exact_file_id_filters(request: &mut EntityScanRequest, filters: &[Expr]
     Ok(())
 }
 
-fn exact_entity_batch_request(request: &EntityScanRequest) -> Option<EntityExactBatchRequest> {
-    if !matches!(request.filter.rows, EntityRowSelection::All)
+fn exact_row_batch_request(request: &RowScanRequest) -> Option<RowExactBatchRequest> {
+    if !matches!(request.filter.rows, RowRowSelection::All)
         || !request.filter.constraints.is_empty()
-        || request.filter.entity_pks.is_empty()
+        || request.filter.row_pks.is_empty()
     {
         return None;
     }
@@ -1664,17 +1664,17 @@ fn exact_entity_batch_request(request: &EntityScanRequest) -> Option<EntityExact
     };
     let rows = request
         .filter
-        .entity_pks
+        .row_pks
         .iter()
         .cloned()
-        .map(|entity_pk| EntityExactRowRequest {
+        .map(|row_pk| RowExactRowRequest {
             schema_key: schema_key.clone(),
             branch_id: branch_id.clone(),
-            entity_pk,
+            row_pk,
             file_id: file_id.clone(),
         })
         .collect::<Vec<_>>();
-    Some(EntityExactBatchRequest {
+    Some(RowExactBatchRequest {
         rows,
         projection: request.projection.clone(),
         untracked: request.filter.untracked,
@@ -1697,22 +1697,22 @@ fn exact_branch_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>
     Ok(branch_ids.map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_branch_id_filter(request: &mut EntityScanRequest, branch_ids: Option<Vec<String>>) {
+fn apply_exact_branch_id_filter(request: &mut RowScanRequest, branch_ids: Option<Vec<String>>) {
     if let Some(branch_ids) = branch_ids {
         if branch_ids.is_empty() {
-            request.filter.rows = EntityRowSelection::None;
+            request.filter.rows = RowRowSelection::None;
         }
         request.filter.branch_ids = branch_ids;
     }
 }
 
-pub(super) struct EntityPrimaryKeyFilterAnalyzer<'a> {
+pub(super) struct RowPrimaryKeyFilterAnalyzer<'a> {
     primary_key_columns: Vec<&'a str>,
-    primary_key_component_types: Vec<crate::entity_pk::EntityPkComponentType>,
+    primary_key_component_types: Vec<crate::row_pk::RowPkComponentType>,
 }
 
-struct EntityRowFilterAnalyzer<'a> {
-    spec: &'a EntitySurfaceSpec,
+struct RowRowFilterAnalyzer<'a> {
+    spec: &'a SchemaSurfaceSpec,
 }
 
 struct ExactBranchIdFilterAnalyzer;
@@ -1887,8 +1887,8 @@ fn branch_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr)
     string_expr_literal(literal_expr)
 }
 
-impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
-    pub(super) fn new(spec: &'a EntitySurfaceSpec) -> Self {
+impl<'a> RowPrimaryKeyFilterAnalyzer<'a> {
+    pub(super) fn new(spec: &'a SchemaSurfaceSpec) -> Self {
         Self {
             primary_key_columns: top_level_primary_key_columns(spec),
             primary_key_component_types: spec.primary_key_component_types.clone(),
@@ -1905,7 +1905,7 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
             .is_ok_and(|constraint| constraint.is_some())
     }
 
-    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<EntityPk>>> {
+    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<RowPk>>> {
         if self.primary_key_columns.is_empty() {
             return Ok(None);
         }
@@ -1914,7 +1914,7 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
         };
         Ok(
             constraint
-                .into_entity_pks(&self.primary_key_columns, &self.primary_key_component_types),
+                .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types),
         )
     }
 
@@ -1922,7 +1922,7 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
     /// refusing to partially route a disjunction. This lets DataFusion pass
     /// separately planned composite-key terms without turning a payload
     /// predicate into identity semantics.
-    fn analyze_conjunctive_constraint(&self, expr: &Expr) -> Result<Option<EntityPkConstraint>> {
+    fn analyze_conjunctive_constraint(&self, expr: &Expr) -> Result<Option<RowPkConstraint>> {
         if self.primary_key_columns.is_empty() {
             return Ok(None);
         }
@@ -1942,7 +1942,7 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
         })
     }
 
-    fn analyze_constraint(&self, expr: &Expr) -> Result<Option<EntityPkConstraint>> {
+    fn analyze_constraint(&self, expr: &Expr) -> Result<Option<RowPkConstraint>> {
         match expr {
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
                 let Some(left) = self.analyze_constraint(&binary_expr.left)? else {
@@ -1961,24 +1961,24 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
                     return Ok(None);
                 };
                 let Some(left_ids) = left
-                    .into_entity_pks(&self.primary_key_columns, &self.primary_key_component_types)
+                    .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
                 else {
                     return Ok(None);
                 };
                 let Some(mut right_ids) = right
-                    .into_entity_pks(&self.primary_key_columns, &self.primary_key_component_types)
+                    .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
                 else {
                     return Ok(None);
                 };
                 right_ids.extend(left_ids);
-                Ok(Some(EntityPkConstraint::Full(right_ids)))
+                Ok(Some(RowPkConstraint::Full(right_ids)))
             }
-            Expr::BinaryExpr(binary_expr) => Ok(entity_pk_constraint_from_binary_filter(
+            Expr::BinaryExpr(binary_expr) => Ok(row_pk_constraint_from_binary_filter(
                 binary_expr,
                 &self.primary_key_columns,
                 &self.primary_key_component_types,
             )),
-            Expr::InList(in_list) => Ok(entity_pk_constraint_from_in_list_filter(
+            Expr::InList(in_list) => Ok(row_pk_constraint_from_in_list_filter(
                 in_list,
                 &self.primary_key_columns,
                 &self.primary_key_component_types,
@@ -1989,12 +1989,12 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EntityPkConstraint {
-    Full(BTreeSet<EntityPk>),
+enum RowPkConstraint {
+    Full(BTreeSet<RowPk>),
     Parts(BTreeMap<String, BTreeSet<String>>),
 }
 
-impl EntityPkConstraint {
+impl RowPkConstraint {
     fn intersect(self, other: Self, primary_key_columns: &[&str]) -> Self {
         match (self, other) {
             (Self::Full(left), Self::Full(right)) => {
@@ -2023,22 +2023,22 @@ impl EntityPkConstraint {
         }
     }
 
-    fn into_entity_pks(
+    fn into_row_pks(
         self,
         primary_key_columns: &[&str],
-        component_types: &[crate::entity_pk::EntityPkComponentType],
-    ) -> Option<BTreeSet<EntityPk>> {
+        component_types: &[crate::row_pk::RowPkComponentType],
+    ) -> Option<BTreeSet<RowPk>> {
         match self {
             Self::Full(ids) => Some(ids),
             Self::Parts(parts) => {
-                entity_pks_from_primary_key_parts(primary_key_columns, component_types, parts)
+                row_pks_from_primary_key_parts(primary_key_columns, component_types, parts)
             }
         }
     }
 }
 
-impl<'a> EntityRowFilterAnalyzer<'a> {
-    fn new(spec: &'a EntitySurfaceSpec) -> Self {
+impl<'a> RowRowFilterAnalyzer<'a> {
+    fn new(spec: &'a SchemaSurfaceSpec) -> Self {
         Self { spec }
     }
 
@@ -2047,35 +2047,35 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
     }
 
     #[expect(clippy::unnecessary_wraps)]
-    fn analyze_filters(&self, filters: &[Expr]) -> Result<Vec<EntityRowFilter>> {
+    fn analyze_filters(&self, filters: &[Expr]) -> Result<Vec<RowRowFilter>> {
         Ok(filters
             .iter()
             .filter_map(|filter| self.analyze(filter))
             .collect())
     }
 
-    fn analyze(&self, expr: &Expr) -> Option<EntityRowFilter> {
+    fn analyze(&self, expr: &Expr) -> Option<RowRowFilter> {
         match expr {
             Expr::Column(column) => {
                 let column_name = self.filterable_column_name(&column.name)?;
                 let column = self.spec.visible_column(column_name)?;
-                (column.column_type == EntityColumnType::Boolean).then(|| {
-                    EntityRowFilter::ColumnEq {
+                (column.column_type == SchemaColumnType::Boolean).then(|| {
+                    RowRowFilter::ColumnEq {
                         column: column_name.to_string(),
-                        column_type: EntityColumnType::Boolean,
-                        value: EntityFilterValue::Boolean(true),
+                        column_type: SchemaColumnType::Boolean,
+                        value: RowFilterValue::Boolean(true),
                     }
                 })
             }
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
                 let left = self.analyze(&binary_expr.left)?;
                 let right = self.analyze(&binary_expr.right)?;
-                Some(EntityRowFilter::And(Box::new(left), Box::new(right)))
+                Some(RowRowFilter::And(Box::new(left), Box::new(right)))
             }
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
                 let left = self.analyze(&binary_expr.left)?;
                 let right = self.analyze(&binary_expr.right)?;
-                Some(EntityRowFilter::Or(Box::new(left), Box::new(right)))
+                Some(RowRowFilter::Or(Box::new(left), Box::new(right)))
             }
             Expr::BinaryExpr(binary_expr) => self.analyze_binary(binary_expr),
             Expr::InList(in_list) => self.analyze_in_list(in_list),
@@ -2083,7 +2083,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
         }
     }
 
-    fn analyze_binary(&self, binary_expr: &BinaryExpr) -> Option<EntityRowFilter> {
+    fn analyze_binary(&self, binary_expr: &BinaryExpr) -> Option<RowRowFilter> {
         if binary_expr.op != Operator::Eq {
             return None;
         }
@@ -2091,7 +2091,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
             .or_else(|| self.analyze_column_literal(&binary_expr.right, &binary_expr.left))
     }
 
-    fn analyze_in_list(&self, in_list: &InList) -> Option<EntityRowFilter> {
+    fn analyze_in_list(&self, in_list: &InList) -> Option<RowRowFilter> {
         if in_list.negated {
             return None;
         }
@@ -2107,12 +2107,12 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
         let values = in_list
             .list
             .iter()
-            .map(|expr| entity_filter_value_literal(expr, column_type))
+            .map(|expr| row_filter_value_literal(expr, column_type))
             .collect::<Option<Vec<_>>>()?;
         if values.is_empty() {
             return None;
         }
-        Some(EntityRowFilter::ColumnIn {
+        Some(RowRowFilter::ColumnIn {
             column: column_name.to_string(),
             column_type,
             values,
@@ -2123,7 +2123,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
         &self,
         column_expr: &Expr,
         literal_expr: &Expr,
-    ) -> Option<EntityRowFilter> {
+    ) -> Option<RowRowFilter> {
         let Expr::Column(column) = column_expr else {
             return None;
         };
@@ -2133,27 +2133,27 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
             .visible_column(column_name)
             .expect("filterable column should exist")
             .column_type;
-        Some(EntityRowFilter::ColumnEq {
+        Some(RowRowFilter::ColumnEq {
             column: column_name.to_string(),
             column_type,
-            value: entity_filter_value_literal(literal_expr, column_type)?,
+            value: row_filter_value_literal(literal_expr, column_type)?,
         })
     }
 
     fn filterable_column_name(&self, column_name: &str) -> Option<&str> {
         let column = self.spec.visible_column(column_name)?;
         match column.column_type {
-            EntityColumnType::String
-            | EntityColumnType::Boolean
-            | EntityColumnType::Integer
-            | EntityColumnType::Number => Some(column.name.as_str()),
-            EntityColumnType::Json | EntityColumnType::Timestamptz => None,
+            SchemaColumnType::String
+            | SchemaColumnType::Boolean
+            | SchemaColumnType::Integer
+            | SchemaColumnType::Number => Some(column.name.as_str()),
+            SchemaColumnType::Json | SchemaColumnType::Timestamptz => None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum EntityFilterValue {
+enum RowFilterValue {
     Boolean(bool),
     Integer(i64),
     Number(f64),
@@ -2161,22 +2161,22 @@ enum EntityFilterValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum EntityRowFilter {
+enum RowRowFilter {
     ColumnEq {
         column: String,
-        column_type: EntityColumnType,
-        value: EntityFilterValue,
+        column_type: SchemaColumnType,
+        value: RowFilterValue,
     },
     ColumnIn {
         column: String,
-        column_type: EntityColumnType,
-        values: Vec<EntityFilterValue>,
+        column_type: SchemaColumnType,
+        values: Vec<RowFilterValue>,
     },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
-impl EntityRowFilter {
+impl RowRowFilter {
     fn matches_snapshot(&self, snapshot: Option<&JsonValue>, schema_key: &str) -> Result<bool> {
         match self {
             Self::ColumnEq {
@@ -2184,18 +2184,18 @@ impl EntityRowFilter {
                 column_type,
                 value,
             } => Ok(
-                entity_snapshot_value(snapshot, schema_key, column, *column_type)?
-                    .is_some_and(|actual| entity_filter_values_equal(&actual, value, *column_type)),
+                row_snapshot_value(snapshot, schema_key, column, *column_type)?
+                    .is_some_and(|actual| row_filter_values_equal(&actual, value, *column_type)),
             ),
             Self::ColumnIn {
                 column,
                 column_type,
                 values,
             } => Ok(
-                entity_snapshot_value(snapshot, schema_key, column, *column_type)?.is_some_and(
+                row_snapshot_value(snapshot, schema_key, column, *column_type)?.is_some_and(
                     |actual| {
                         values.iter().any(|expected| {
-                            entity_filter_values_equal(&actual, expected, *column_type)
+                            row_filter_values_equal(&actual, expected, *column_type)
                         })
                     },
                 ),
@@ -2209,26 +2209,26 @@ impl EntityRowFilter {
 
     fn matches_native(
         &self,
-        spec: &EntitySurfaceSpec,
-        row: Option<&DecodedNativeEntitySlot>,
+        spec: &SchemaSurfaceSpec,
+        row: Option<&DecodedNativeRowSlot>,
     ) -> Result<bool> {
         match self {
             Self::ColumnEq {
                 column,
                 column_type,
                 value,
-            } => Ok(native_entity_filter_value(spec, row, column, *column_type)?
+            } => Ok(native_row_filter_value(spec, row, column, *column_type)?
                 .is_some_and(|actual| {
-                    entity_filter_values_equal(&actual, value, *column_type)
+                    row_filter_values_equal(&actual, value, *column_type)
                 })),
             Self::ColumnIn {
                 column,
                 column_type,
                 values,
-            } => Ok(native_entity_filter_value(spec, row, column, *column_type)?
+            } => Ok(native_row_filter_value(spec, row, column, *column_type)?
                 .is_some_and(|actual| {
                     values.iter().any(|expected| {
-                        entity_filter_values_equal(&actual, expected, *column_type)
+                        row_filter_values_equal(&actual, expected, *column_type)
                     })
                 })),
             Self::And(left, right) => Ok(left.matches_native(spec, row)?
@@ -2239,97 +2239,97 @@ impl EntityRowFilter {
     }
 }
 
-fn entity_filter_value_literal(
+fn row_filter_value_literal(
     expr: &Expr,
-    column_type: EntityColumnType,
-) -> Option<EntityFilterValue> {
+    column_type: SchemaColumnType,
+) -> Option<RowFilterValue> {
     let Expr::Literal(literal, _) = expr else {
         return None;
     };
     let value = match literal {
-        ScalarValue::Boolean(Some(value)) => Some(EntityFilterValue::Boolean(*value)),
-        ScalarValue::Int8(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
-        ScalarValue::Int16(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
-        ScalarValue::Int32(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
-        ScalarValue::Int64(Some(value)) => Some(EntityFilterValue::Integer(*value)),
-        ScalarValue::UInt8(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
-        ScalarValue::UInt16(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
-        ScalarValue::UInt32(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
+        ScalarValue::Boolean(Some(value)) => Some(RowFilterValue::Boolean(*value)),
+        ScalarValue::Int8(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
+        ScalarValue::Int16(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
+        ScalarValue::Int32(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
+        ScalarValue::Int64(Some(value)) => Some(RowFilterValue::Integer(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
+        ScalarValue::UInt16(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
+        ScalarValue::UInt32(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
         ScalarValue::UInt64(Some(value)) => {
-            i64::try_from(*value).ok().map(EntityFilterValue::Integer)
+            i64::try_from(*value).ok().map(RowFilterValue::Integer)
         }
-        ScalarValue::Float32(Some(value)) => Some(EntityFilterValue::Number(f64::from(*value))),
-        ScalarValue::Float64(Some(value)) => Some(EntityFilterValue::Number(*value)),
+        ScalarValue::Float32(Some(value)) => Some(RowFilterValue::Number(f64::from(*value))),
+        ScalarValue::Float64(Some(value)) => Some(RowFilterValue::Number(*value)),
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Some(EntityFilterValue::String(value.clone())),
+        | ScalarValue::LargeUtf8(Some(value)) => Some(RowFilterValue::String(value.clone())),
         _ => None,
     }?;
     match (&value, column_type) {
-        (EntityFilterValue::Boolean(_), EntityColumnType::Boolean)
-        | (EntityFilterValue::Integer(_), EntityColumnType::Integer)
+        (RowFilterValue::Boolean(_), SchemaColumnType::Boolean)
+        | (RowFilterValue::Integer(_), SchemaColumnType::Integer)
         | (
-            EntityFilterValue::Integer(_) | EntityFilterValue::Number(_),
-            EntityColumnType::Number,
+            RowFilterValue::Integer(_) | RowFilterValue::Number(_),
+            SchemaColumnType::Number,
         )
         | (
-            EntityFilterValue::String(_),
-            EntityColumnType::String | EntityColumnType::Timestamptz,
+            RowFilterValue::String(_),
+            SchemaColumnType::String | SchemaColumnType::Timestamptz,
         ) => Some(value),
         _ => None,
     }
 }
 
-fn entity_snapshot_value(
+fn row_snapshot_value(
     snapshot: Option<&JsonValue>,
     schema_key: &str,
     column: &str,
-    column_type: EntityColumnType,
-) -> Result<Option<EntityFilterValue>> {
+    column_type: SchemaColumnType,
+) -> Result<Option<RowFilterValue>> {
     let Some(value) = snapshot.and_then(|snapshot| snapshot.get(column)) else {
         return Ok(None);
     };
     Ok(match column_type {
-        EntityColumnType::String => match value {
-            JsonValue::String(value) => Some(EntityFilterValue::String(value.clone())),
+        SchemaColumnType::String => match value {
+            JsonValue::String(value) => Some(RowFilterValue::String(value.clone())),
             _ => None,
         },
-        EntityColumnType::Integer => {
-            entity_i64_value(Some(value), schema_key, column)?.map(EntityFilterValue::Integer)
+        SchemaColumnType::Integer => {
+            row_i64_value(Some(value), schema_key, column)?.map(RowFilterValue::Integer)
         }
-        EntityColumnType::Number => {
-            entity_f64_value(Some(value), schema_key, column)?.map(EntityFilterValue::Number)
+        SchemaColumnType::Number => {
+            row_f64_value(Some(value), schema_key, column)?.map(RowFilterValue::Number)
         }
-        EntityColumnType::Boolean => value.as_bool().map(EntityFilterValue::Boolean),
-        EntityColumnType::Json => None,
-        EntityColumnType::Timestamptz => value
+        SchemaColumnType::Boolean => value.as_bool().map(RowFilterValue::Boolean),
+        SchemaColumnType::Json => None,
+        SchemaColumnType::Timestamptz => value
             .as_str()
-            .map(|value| EntityFilterValue::String(value.to_owned())),
+            .map(|value| RowFilterValue::String(value.to_owned())),
     })
 }
 
 #[expect(clippy::cast_precision_loss, clippy::float_cmp)]
-fn entity_filter_values_equal(
-    actual: &EntityFilterValue,
-    expected: &EntityFilterValue,
-    column_type: EntityColumnType,
+fn row_filter_values_equal(
+    actual: &RowFilterValue,
+    expected: &RowFilterValue,
+    column_type: SchemaColumnType,
 ) -> bool {
     match (column_type, actual, expected) {
         (
-            EntityColumnType::Number,
-            EntityFilterValue::Number(actual),
-            EntityFilterValue::Integer(expected),
+            SchemaColumnType::Number,
+            RowFilterValue::Number(actual),
+            RowFilterValue::Integer(expected),
         ) => *actual == *expected as f64,
         (
-            EntityColumnType::Number,
-            EntityFilterValue::Integer(actual),
-            EntityFilterValue::Number(expected),
+            SchemaColumnType::Number,
+            RowFilterValue::Integer(actual),
+            RowFilterValue::Number(expected),
         ) => *actual as f64 == *expected,
         _ => actual == expected,
     }
 }
 
-fn top_level_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
+fn top_level_primary_key_columns(spec: &SchemaSurfaceSpec) -> Vec<&str> {
     spec.primary_key_paths
         .iter()
         .map(|path| {
@@ -2343,22 +2343,22 @@ fn top_level_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-fn entity_pk_constraint_from_binary_filter(
+fn row_pk_constraint_from_binary_filter(
     binary_expr: &BinaryExpr,
     primary_key_columns: &[&str],
-    component_types: &[crate::entity_pk::EntityPkComponentType],
-) -> Option<EntityPkConstraint> {
+    component_types: &[crate::row_pk::RowPkComponentType],
+) -> Option<RowPkConstraint> {
     if binary_expr.op != Operator::Eq {
         return None;
     }
-    entity_pk_constraint_from_column_literal_filter(
+    row_pk_constraint_from_column_literal_filter(
         &binary_expr.left,
         &binary_expr.right,
         primary_key_columns,
         component_types,
     )
     .or_else(|| {
-        entity_pk_constraint_from_column_literal_filter(
+        row_pk_constraint_from_column_literal_filter(
             &binary_expr.right,
             &binary_expr.left,
             primary_key_columns,
@@ -2367,11 +2367,11 @@ fn entity_pk_constraint_from_binary_filter(
     })
 }
 
-fn entity_pk_constraint_from_in_list_filter(
+fn row_pk_constraint_from_in_list_filter(
     in_list: &InList,
     primary_key_columns: &[&str],
-    component_types: &[crate::entity_pk::EntityPkComponentType],
-) -> Option<EntityPkConstraint> {
+    component_types: &[crate::row_pk::RowPkComponentType],
+) -> Option<RowPkConstraint> {
     if in_list.negated {
         return None;
     }
@@ -2382,18 +2382,18 @@ fn entity_pk_constraint_from_in_list_filter(
         return None;
     }
     match column.name.as_str() {
-        "lixcol_entity_pk" => in_list
+        "lixcol_row_pk" => in_list
             .list
             .iter()
             .map(string_expr_literal)
             .collect::<Option<Vec<_>>>()?
             .into_iter()
             .map(|value| {
-                let parts = EntityPk::from_json_array_text(&value).ok()?.into_parts();
-                EntityPk::from_external_parts(parts, component_types).ok()
+                let parts = RowPk::from_json_array_text(&value).ok()?.into_parts();
+                RowPk::from_external_parts(parts, component_types).ok()
             })
             .collect::<Option<BTreeSet<_>>>()
-            .map(EntityPkConstraint::Full),
+            .map(RowPkConstraint::Full),
         column_name if primary_key_columns.contains(&column_name) => {
             let component_type =
                 primary_key_component_type(column_name, primary_key_columns, component_types)?;
@@ -2402,7 +2402,7 @@ fn entity_pk_constraint_from_in_list_filter(
                 .iter()
                 .map(|expr| primary_key_expr_literal(expr, component_type))
                 .collect::<Option<BTreeSet<_>>>()?;
-            Some(EntityPkConstraint::Parts(BTreeMap::from([(
+            Some(RowPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
                 values,
             )])))
@@ -2411,27 +2411,27 @@ fn entity_pk_constraint_from_in_list_filter(
     }
 }
 
-fn entity_pk_constraint_from_column_literal_filter(
+fn row_pk_constraint_from_column_literal_filter(
     column_expr: &Expr,
     literal_expr: &Expr,
     primary_key_columns: &[&str],
-    component_types: &[crate::entity_pk::EntityPkComponentType],
-) -> Option<EntityPkConstraint> {
+    component_types: &[crate::row_pk::RowPkComponentType],
+) -> Option<RowPkConstraint> {
     let Expr::Column(column) = column_expr else {
         return None;
     };
     match column.name.as_str() {
-        "lixcol_entity_pk" => EntityPk::from_json_array_text(&string_expr_literal(literal_expr)?)
+        "lixcol_row_pk" => RowPk::from_json_array_text(&string_expr_literal(literal_expr)?)
             .ok()
             .and_then(|identity| {
-                EntityPk::from_external_parts(identity.into_parts(), component_types).ok()
+                RowPk::from_external_parts(identity.into_parts(), component_types).ok()
             })
-            .map(|identity| EntityPkConstraint::Full(BTreeSet::from([identity]))),
+            .map(|identity| RowPkConstraint::Full(BTreeSet::from([identity]))),
         column_name if primary_key_columns.contains(&column_name) => {
             let component_type =
                 primary_key_component_type(column_name, primary_key_columns, component_types)?;
             let value = primary_key_expr_literal(literal_expr, component_type)?;
-            Some(EntityPkConstraint::Parts(BTreeMap::from([(
+            Some(RowPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
                 BTreeSet::from([value]),
             )])))
@@ -2443,8 +2443,8 @@ fn entity_pk_constraint_from_column_literal_filter(
 fn primary_key_component_type(
     column_name: &str,
     primary_key_columns: &[&str],
-    component_types: &[crate::entity_pk::EntityPkComponentType],
-) -> Option<crate::entity_pk::EntityPkComponentType> {
+    component_types: &[crate::row_pk::RowPkComponentType],
+) -> Option<crate::row_pk::RowPkComponentType> {
     primary_key_columns
         .iter()
         .position(|candidate| *candidate == column_name)
@@ -2454,11 +2454,11 @@ fn primary_key_component_type(
 
 fn primary_key_expr_literal(
     expr: &Expr,
-    component_type: crate::entity_pk::EntityPkComponentType,
+    component_type: crate::row_pk::RowPkComponentType,
 ) -> Option<String> {
-    use crate::entity_pk::EntityPkComponentType;
+    use crate::row_pk::RowPkComponentType;
 
-    if !matches!(component_type, EntityPkComponentType::Integer) {
+    if !matches!(component_type, RowPkComponentType::Integer) {
         return string_expr_literal(expr);
     }
     let Expr::Literal(literal, _) = expr else {
@@ -2479,11 +2479,11 @@ fn primary_key_expr_literal(
     }
 }
 
-fn entity_pks_from_primary_key_parts(
+fn row_pks_from_primary_key_parts(
     primary_key_columns: &[&str],
-    component_types: &[crate::entity_pk::EntityPkComponentType],
+    component_types: &[crate::row_pk::RowPkComponentType],
     parts: BTreeMap<String, BTreeSet<String>>,
-) -> Option<BTreeSet<EntityPk>> {
+) -> Option<BTreeSet<RowPk>> {
     if primary_key_columns
         .iter()
         .any(|column| !parts.contains_key(*column))
@@ -2491,10 +2491,10 @@ fn entity_pks_from_primary_key_parts(
         return None;
     }
 
-    let mut identities = BTreeSet::from([Vec::<String>::new()]);
+    let mut identitys = BTreeSet::from([Vec::<String>::new()]);
     for column in primary_key_columns {
         let values = parts.get(*column)?;
-        identities = identities
+        identitys = identitys
             .into_iter()
             .flat_map(|prefix| {
                 values.iter().map(move |value| {
@@ -2505,15 +2505,15 @@ fn entity_pks_from_primary_key_parts(
             })
             .collect();
     }
-    identities
+    identitys
         .into_iter()
-        .map(|parts| EntityPk::from_external_parts(parts, component_types))
+        .map(|parts| RowPk::from_external_parts(parts, component_types))
         .collect::<std::result::Result<BTreeSet<_>, _>>()
         .ok()
 }
 
 fn identity_matches_parts(
-    identity: &EntityPk,
+    identity: &RowPk,
     primary_key_columns: &[&str],
     parts: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
@@ -2531,9 +2531,9 @@ fn identity_matches_parts(
 }
 
 #[cfg(test)]
-fn apply_entity_state_filters(
+fn apply_row_state_filters(
     rows: Vec<StateRow>,
-    filters: &[EntityRowFilter],
+    filters: &[RowRowFilter],
 ) -> Result<Vec<StateRow>> {
     if filters.is_empty() {
         return Ok(rows);
@@ -2548,8 +2548,8 @@ fn apply_entity_state_filters(
             DataFusionError::External(Box::new(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "entity scan filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
-                    key.schema_key, key.entity_pk
+                    "row scan filter could not parse snapshot_content for schema '{}' row_pk '{:?}': {error}",
+                    key.schema_key, key.row_pk
                 ),
             )))
         })?;
@@ -2566,18 +2566,18 @@ fn apply_entity_state_filters(
     Ok(filtered)
 }
 
-fn apply_entity_state_slot_filters(
-    spec: &EntitySurfaceSpec,
-    slots: Vec<EntityStateSlot>,
-    filters: &[EntityRowFilter],
+fn apply_row_state_slot_filters(
+    spec: &SchemaSurfaceSpec,
+    slots: Vec<RowStateSlot>,
+    filters: &[RowRowFilter],
     branch_id: Option<&str>,
-) -> Result<Vec<EntityStateSlot>> {
+) -> Result<Vec<RowStateSlot>> {
     if filters.is_empty() {
         return Ok(slots);
     }
     let mut filtered = Vec::with_capacity(slots.len());
     for slot in slots {
-        let decoded = decode_native_entity_slot(spec, &slot, branch_id)?;
+        let decoded = decode_native_row_slot(spec, &slot, branch_id)?;
         let Some(decoded) = decoded.as_ref() else {
             continue;
         };
@@ -2594,41 +2594,41 @@ fn apply_entity_state_slot_filters(
     Ok(filtered)
 }
 
-fn entity_state_scan_request(
+fn row_state_scan_request(
     schema_key: &str,
     active_branch_id: Option<&str>,
     projected_schema: Option<&Schema>,
     limit: Option<usize>,
     force_snapshot_content: bool,
-) -> EntityScanRequest {
-    EntityScanRequest {
-        filter: EntityScanFilter {
+) -> RowScanRequest {
+    RowScanRequest {
+        filter: RowScanFilter {
             schema_keys: vec![schema_key.to_string()],
             branch_ids: active_branch_id
                 .map(|branch_id| vec![branch_id.to_string()])
                 .unwrap_or_default(),
-            ..EntityScanFilter::default()
+            ..RowScanFilter::default()
         },
-        projection: entity_state_projection(projected_schema, force_snapshot_content),
+        projection: row_state_projection(projected_schema, force_snapshot_content),
         limit,
     }
 }
 
-fn entity_state_projection(
+fn row_state_projection(
     projected_schema: Option<&Schema>,
     force_snapshot_content: bool,
-) -> EntityProjection {
+) -> RowProjection {
     let Some(schema) = projected_schema else {
-        return EntityProjection::default();
+        return RowProjection::default();
     };
     let mut columns = projection_column_names(schema);
-    // Native entity values are typed tuples. Ordinary SQL fields never need a
+    // Native row values are typed tuples. Ordinary SQL fields never need a
     // synthesized whole-row snapshot; only the explicit system column asks
     // for that API-boundary materialization.
     if force_snapshot_content && !columns.iter().any(|column| column == "snapshot_content") {
         columns.push("snapshot_content".to_string());
     }
-    EntityProjection { columns }
+    RowProjection { columns }
 }
 
 fn projection_column_names(schema: &Schema) -> Vec<String> {
@@ -2641,13 +2641,13 @@ fn projection_column_names(schema: &Schema) -> Vec<String> {
 }
 
 #[cfg(test)]
-fn direct_entity_batch_eligible(
+fn direct_row_batch_eligible(
     schema: &Schema,
-    request: &EntityScanRequest,
-    row_filters: &[EntityRowFilter],
+    request: &RowScanRequest,
+    row_filters: &[RowRowFilter],
 ) -> bool {
     !schema.fields().is_empty()
-        && matches!(request.filter.rows, EntityRowSelection::All)
+        && matches!(request.filter.rows, RowRowSelection::All)
         && !request.filter.include_tombstones
         && request.filter.file_ids.is_empty()
         && row_filters.is_empty()
@@ -2664,13 +2664,13 @@ fn direct_entity_batch_eligible(
 /// scan; the provider merely avoids JSON decoding to reproduce identity data.
 #[cfg(test)]
 fn direct_primary_key_projection_eligible(
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     schema: &Schema,
-    request: &EntityScanRequest,
-    row_filters: &[EntityRowFilter],
+    request: &RowScanRequest,
+    row_filters: &[RowRowFilter],
 ) -> bool {
-    direct_entity_batch_eligible(schema, request, row_filters)
-        && request.filter.entity_pks.is_empty()
+    direct_row_batch_eligible(schema, request, row_filters)
+        && request.filter.row_pks.is_empty()
         && !schema.fields().is_empty()
         && schema
             .fields()
@@ -2683,9 +2683,9 @@ fn direct_primary_key_projection_eligible(
 /// consume the limit.  This is deliberately a terminal projection step after
 /// the authenticated point lookup.
 fn visible_exact_slots(
-    slots: Vec<Option<EntityStateSlot>>,
+    slots: Vec<Option<RowStateSlot>>,
     limit: Option<usize>,
-) -> Vec<EntityStateSlot> {
+) -> Vec<RowStateSlot> {
     slots
         .into_iter()
         .flatten()
@@ -2694,22 +2694,22 @@ fn visible_exact_slots(
 }
 
 #[cfg(test)]
-fn simple_string_primary_key_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option<usize> {
+fn simple_string_primary_key_index(spec: &SchemaSurfaceSpec, column_name: &str) -> Option<usize> {
     spec.primary_key_paths
         .iter()
         .position(|path| matches!(path.as_slice(), [name] if name == column_name))
         .filter(|index| {
             spec.primary_key_component_types.get(*index)
-                == Some(&crate::entity_pk::EntityPkComponentType::String)
+                == Some(&crate::row_pk::RowPkComponentType::String)
                 && spec
                     .visible_column(column_name)
-                    .is_some_and(|column| column.column_type == EntityColumnType::String)
+                    .is_some_and(|column| column.column_type == SchemaColumnType::String)
         })
 }
 
 #[cfg(test)]
-fn entity_record_batch_from_state_rows(
-    spec: &EntitySurfaceSpec,
+fn row_record_batch_from_state_rows(
+    spec: &SchemaSurfaceSpec,
     schema: SchemaRef,
     rows: &[StateRow],
 ) -> Result<RecordBatch> {
@@ -2725,15 +2725,15 @@ fn entity_record_batch_from_state_rows(
     let columns = schema
         .fields()
         .iter()
-        .map(|field| entity_column_array(spec, field.name(), rows, &snapshots))
+        .map(|field| row_column_array(spec, field.name(), rows, &snapshots))
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
-fn entity_record_batch_from_slots(
-    spec: &EntitySurfaceSpec,
+fn row_record_batch_from_slots(
+    spec: &SchemaSurfaceSpec,
     schema: SchemaRef,
-    slots: &[EntityStateSlot],
+    slots: &[RowStateSlot],
     branch_id: Option<&str>,
 ) -> Result<RecordBatch> {
     // Authentication is independent of projection. COUNT(*) and other
@@ -2741,7 +2741,7 @@ fn entity_record_batch_from_slots(
     // visible scalar projection.
     let decoded = slots
         .iter()
-        .map(|slot| decode_native_entity_slot(spec, slot, branch_id))
+        .map(|slot| decode_native_row_slot(spec, slot, branch_id))
         .collect::<Result<Vec<_>>>()?;
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(slots.len()));
@@ -2752,7 +2752,7 @@ fn entity_record_batch_from_slots(
         .fields()
         .iter()
         .map(|field| {
-            native_entity_slot_column_array(
+            native_row_slot_column_array(
                 spec,
                 field.name(),
                 slots,
@@ -2764,12 +2764,12 @@ fn entity_record_batch_from_slots(
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
-struct DecodedNativeEntitySlot {
+struct DecodedNativeRowSlot {
     key: crate::forktree::StateKey,
     body: Vec<lix_schema::value_layout::BodyValue>,
 }
 
-fn native_body_column_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option<usize> {
+fn native_body_column_index(spec: &SchemaSurfaceSpec, column_name: &str) -> Option<usize> {
     spec.native_schema
         .columns
         .iter()
@@ -2777,7 +2777,7 @@ fn native_body_column_index(spec: &EntitySurfaceSpec, column_name: &str) -> Opti
         .position(|column| column.name == column_name)
 }
 
-fn native_pk_column_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option<usize> {
+fn native_pk_column_index(spec: &SchemaSurfaceSpec, column_name: &str) -> Option<usize> {
     spec.native_schema
         .primary_key
         .iter()
@@ -2785,36 +2785,36 @@ fn native_pk_column_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option
 }
 
 fn native_projection_error(
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     column_name: &str,
     expected: &str,
 ) -> DataFusionError {
     DataFusionError::Execution(format!(
-        "native entity projection for '{}.{}' expected {expected}",
+        "native row projection for '{}.{}' expected {expected}",
         spec.schema_key, column_name
     ))
 }
 
-fn native_entity_filter_value(
-    spec: &EntitySurfaceSpec,
-    row: Option<&DecodedNativeEntitySlot>,
+fn native_row_filter_value(
+    spec: &SchemaSurfaceSpec,
+    row: Option<&DecodedNativeRowSlot>,
     column_name: &str,
-    column_type: EntityColumnType,
-) -> Result<Option<EntityFilterValue>> {
+    column_type: SchemaColumnType,
+) -> Result<Option<RowFilterValue>> {
     let Some(row) = row else { return Ok(None) };
     if let Some(index) = native_pk_column_index(spec, column_name) {
-        let component = row.key.entity_pk.components.get(index).ok_or_else(|| {
+        let component = row.key.row_pk.components.get(index).ok_or_else(|| {
             native_projection_error(spec, column_name, "a primary-key component")
         })?;
         return Ok(match (column_type, component) {
-            (EntityColumnType::String, EntityPkComponent::Uuid(value)) => Some(
-                EntityFilterValue::String(uuid::Uuid::from_bytes(*value).to_string()),
+            (SchemaColumnType::String, RowPkComponent::Uuid(value)) => Some(
+                RowFilterValue::String(uuid::Uuid::from_bytes(*value).to_string()),
             ),
-            (EntityColumnType::String, EntityPkComponent::String(value)) => {
-                Some(EntityFilterValue::String(value.to_string()))
+            (SchemaColumnType::String, RowPkComponent::String(value)) => {
+                Some(RowFilterValue::String(value.to_string()))
             }
-            (EntityColumnType::Integer, EntityPkComponent::Integer(value)) => {
-                Some(EntityFilterValue::Integer(*value))
+            (SchemaColumnType::Integer, RowPkComponent::Integer(value)) => {
+                Some(RowFilterValue::Integer(*value))
             }
             _ => return Err(native_projection_error(spec, column_name, "its declared PK type")),
         });
@@ -2827,23 +2827,23 @@ fn native_entity_filter_value(
     })?;
     Ok(match (column_type, value) {
         (_, lix_schema::value_layout::BodyValue::Null) => None,
-        (EntityColumnType::String, lix_schema::value_layout::BodyValue::Text(value)) => {
-            Some(EntityFilterValue::String(value.clone()))
+        (SchemaColumnType::String, lix_schema::value_layout::BodyValue::Text(value)) => {
+            Some(RowFilterValue::String(value.clone()))
         }
-        (EntityColumnType::String, lix_schema::value_layout::BodyValue::Uuid(value)) => {
-            Some(EntityFilterValue::String(value.to_string()))
+        (SchemaColumnType::String, lix_schema::value_layout::BodyValue::Uuid(value)) => {
+            Some(RowFilterValue::String(value.to_string()))
         }
-        (EntityColumnType::Integer, lix_schema::value_layout::BodyValue::Int8(value)) => {
-            Some(EntityFilterValue::Integer(*value))
+        (SchemaColumnType::Integer, lix_schema::value_layout::BodyValue::Int8(value)) => {
+            Some(RowFilterValue::Integer(*value))
         }
-        (EntityColumnType::Number, lix_schema::value_layout::BodyValue::Float8(value)) => {
-            Some(EntityFilterValue::Number(*value))
+        (SchemaColumnType::Number, lix_schema::value_layout::BodyValue::Float8(value)) => {
+            Some(RowFilterValue::Number(*value))
         }
-        (EntityColumnType::Boolean, lix_schema::value_layout::BodyValue::Boolean(value)) => {
-            Some(EntityFilterValue::Boolean(*value))
+        (SchemaColumnType::Boolean, lix_schema::value_layout::BodyValue::Boolean(value)) => {
+            Some(RowFilterValue::Boolean(*value))
         }
-        (EntityColumnType::Timestamptz, lix_schema::value_layout::BodyValue::Timestamptz(value)) => {
-            Some(EntityFilterValue::String(
+        (SchemaColumnType::Timestamptz, lix_schema::value_layout::BodyValue::Timestamptz(value)) => {
+            Some(RowFilterValue::String(
                 chrono::DateTime::from_timestamp_micros(*value)
                     .ok_or_else(|| native_projection_error(spec, column_name, "valid UTC microseconds"))?
                     .to_rfc3339(),
@@ -2853,21 +2853,21 @@ fn native_entity_filter_value(
     })
 }
 
-fn native_entity_slot_column_array(
-    spec: &EntitySurfaceSpec,
+fn native_row_slot_column_array(
+    spec: &SchemaSurfaceSpec,
     column_name: &str,
-    slots: &[EntityStateSlot],
-    decoded: &[Option<DecodedNativeEntitySlot>],
+    slots: &[RowStateSlot],
+    decoded: &[Option<DecodedNativeRowSlot>],
     branch_id: Option<&str>,
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
-        return entity_slot_system_column_array(spec, property_name, slots, branch_id);
+        return row_slot_system_column_array(spec, property_name, slots, branch_id);
     }
     let column_type = spec
         .visible_column(column_name)
         .ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "sql2 entity provider '{}' does not expose column '{}'",
+                "sql2 row provider '{}' does not expose column '{}'",
                 spec.schema_key, column_name
             ))
         })?
@@ -2879,17 +2879,17 @@ fn native_entity_slot_column_array(
     }
 
     let array: ArrayRef = match column_type {
-        EntityColumnType::String => Arc::new(StringArray::from(
+        SchemaColumnType::String => Arc::new(StringArray::from(
             decoded
                 .iter()
                 .map(|row| {
                     let Some(row) = row else { return Ok(None) };
                     if let Some(index) = pk_index {
-                        return match row.key.entity_pk.components.get(index) {
-                            Some(EntityPkComponent::Uuid(value)) => {
+                        return match row.key.row_pk.components.get(index) {
+                            Some(RowPkComponent::Uuid(value)) => {
                                 Ok(Some(uuid::Uuid::from_bytes(*value).to_string()))
                             }
-                            Some(EntityPkComponent::String(value)) => Ok(Some(value.to_string())),
+                            Some(RowPkComponent::String(value)) => Ok(Some(value.to_string())),
                             _ => Err(native_projection_error(spec, column_name, "text or uuid PK")),
                         };
                     }
@@ -2906,7 +2906,7 @@ fn native_entity_slot_column_array(
                 })
                 .collect::<Result<Vec<_>>>()?,
         )),
-        EntityColumnType::Json => Arc::new(StringArray::from(
+        SchemaColumnType::Json => Arc::new(StringArray::from(
             decoded
                 .iter()
                 .map(|row| {
@@ -2926,14 +2926,14 @@ fn native_entity_slot_column_array(
                 })
                 .collect::<Result<Vec<_>>>()?,
         )),
-        EntityColumnType::Integer => Arc::new(Int64Array::from(
+        SchemaColumnType::Integer => Arc::new(Int64Array::from(
             decoded
                 .iter()
                 .map(|row| {
                     let Some(row) = row else { return Ok(None) };
                     if let Some(index) = pk_index {
-                        return match row.key.entity_pk.components.get(index) {
-                            Some(EntityPkComponent::Integer(value)) => Ok(Some(*value)),
+                        return match row.key.row_pk.components.get(index) {
+                            Some(RowPkComponent::Integer(value)) => Ok(Some(*value)),
                             _ => Err(native_projection_error(spec, column_name, "int8 PK")),
                         };
                     }
@@ -2945,7 +2945,7 @@ fn native_entity_slot_column_array(
                 })
                 .collect::<Result<Vec<_>>>()?,
         )),
-        EntityColumnType::Number => Arc::new(Float64Array::from(
+        SchemaColumnType::Number => Arc::new(Float64Array::from(
             decoded
                 .iter()
                 .map(|row| {
@@ -2958,7 +2958,7 @@ fn native_entity_slot_column_array(
                 })
                 .collect::<Result<Vec<_>>>()?,
         )),
-        EntityColumnType::Boolean => Arc::new(BooleanArray::from(
+        SchemaColumnType::Boolean => Arc::new(BooleanArray::from(
             decoded
                 .iter()
                 .map(|row| {
@@ -2971,7 +2971,7 @@ fn native_entity_slot_column_array(
                 })
                 .collect::<Result<Vec<_>>>()?,
         )),
-        EntityColumnType::Timestamptz => Arc::new(
+        SchemaColumnType::Timestamptz => Arc::new(
             TimestampMicrosecondArray::from(
                 decoded
                     .iter()
@@ -2991,46 +2991,46 @@ fn native_entity_slot_column_array(
     Ok(array)
 }
 
-fn decode_native_entity_slot(
-    spec: &EntitySurfaceSpec,
-    slot: &EntityStateSlot,
+fn decode_native_row_slot(
+    spec: &SchemaSurfaceSpec,
+    slot: &RowStateSlot,
     active_branch_id: Option<&str>,
-) -> Result<Option<DecodedNativeEntitySlot>> {
+) -> Result<Option<DecodedNativeRowSlot>> {
     let (row, explicit_branch_id) = match slot {
-        EntityStateSlot::Tracked(row) => (row, None),
-        EntityStateSlot::TrackedAt { row, branch_id } => (row, Some(branch_id.as_str())),
+        RowStateSlot::Tracked(row) => (row, None),
+        RowStateSlot::TrackedAt { row, branch_id } => (row, Some(branch_id.as_str())),
     };
     let key = decode_state_key(&row.key).map_err(lix_error_to_datafusion_error)?;
     if key.schema_key != spec.schema_key {
         return Err(lix_error_to_datafusion_error(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             format!(
-                "native entity row schema '{}' does not match selected schema '{}'",
+                "native row row schema '{}' does not match selected schema '{}'",
                 key.schema_key, spec.schema_key
             ),
         )));
     }
-    if key.entity_pk.components.len() != spec.primary_key_component_types.len()
+    if key.row_pk.components.len() != spec.primary_key_component_types.len()
         || key
-            .entity_pk
+            .row_pk
             .components
             .iter()
             .zip(&spec.primary_key_component_types)
             .any(|(component, expected)| {
                 !matches!(
                     (component, expected),
-                    (EntityPkComponent::Uuid(_), crate::entity_pk::EntityPkComponentType::Uuid)
+                    (RowPkComponent::Uuid(_), crate::row_pk::RowPkComponentType::Uuid)
                         | (
-                            EntityPkComponent::Integer(_),
-                            crate::entity_pk::EntityPkComponentType::Integer
+                            RowPkComponent::Integer(_),
+                            crate::row_pk::RowPkComponentType::Integer
                         )
                         | (
-                            EntityPkComponent::String(_),
-                            crate::entity_pk::EntityPkComponentType::String
+                            RowPkComponent::String(_),
+                            crate::row_pk::RowPkComponentType::String
                         )
                         | (
-                            EntityPkComponent::Bytes(_),
-                            crate::entity_pk::EntityPkComponentType::Bytes
+                            RowPkComponent::Bytes(_),
+                            crate::row_pk::RowPkComponentType::Bytes
                         )
                 )
             })
@@ -3038,7 +3038,7 @@ fn decode_native_entity_slot(
         return Err(lix_error_to_datafusion_error(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             format!(
-                "native entity row for schema '{}' has an invalid primary-key arity or scalar type",
+                "native row row for schema '{}' has an invalid primary-key arity or scalar type",
                 spec.schema_key
             ),
         )));
@@ -3049,25 +3049,25 @@ fn decode_native_entity_slot(
             if !global {
                 explicit_branch_id.or(active_branch_id).ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "entity provider '{}' has no authenticated branch owner",
+                        "row provider '{}' has no authenticated branch owner",
                         spec.schema_key
                     ))
                 })?;
             }
             let body = crate::native_row::decode(
                 spec.native_schema.as_ref(),
-                &key.entity_pk,
+                &key.row_pk,
                 global,
                 key.file_id.as_deref(),
                 native,
             )
             .map_err(lix_error_to_datafusion_error)?;
-            Ok(Some(DecodedNativeEntitySlot { key, body }))
+            Ok(Some(DecodedNativeRowSlot { key, body }))
         }
         StateCell::Value(_) => Err(lix_error_to_datafusion_error(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             format!(
-                "Schema-v1 entity '{}' uses the removed JSON current-state representation",
+                "Schema-v1 row '{}' uses the removed JSON current-state representation",
                 spec.schema_key
             ),
         ))),
@@ -3075,22 +3075,22 @@ fn decode_native_entity_slot(
     }
 }
 
-fn slot_state_key(slot: &EntityStateSlot) -> Result<crate::forktree::StateKey, LixError> {
+fn slot_state_key(slot: &RowStateSlot) -> Result<crate::forktree::StateKey, LixError> {
     match slot {
-        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+        RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
             decode_state_key(&row.key)
         }
     }
 }
 
-fn entity_slot_logical_value(
-    spec: &EntitySurfaceSpec,
-    slot: &EntityStateSlot,
+fn row_slot_logical_value(
+    spec: &SchemaSurfaceSpec,
+    slot: &RowStateSlot,
     active_branch_id: Option<&str>,
 ) -> Result<Option<JsonValue>> {
     let (row, historical_branch_id) = match slot {
-        EntityStateSlot::Tracked(row) => (row, None),
-        EntityStateSlot::TrackedAt { row, branch_id } => (row, Some(branch_id.as_str())),
+        RowStateSlot::Tracked(row) => (row, None),
+        RowStateSlot::TrackedAt { row, branch_id } => (row, Some(branch_id.as_str())),
     };
     let key = decode_state_key(&row.key).map_err(lix_error_to_datafusion_error)?;
     match &row.value.cell {
@@ -3099,14 +3099,14 @@ fn entity_slot_logical_value(
             if !global {
                 historical_branch_id.or(active_branch_id).ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "entity provider '{}' has no authenticated branch owner",
+                        "row provider '{}' has no authenticated branch owner",
                         spec.schema_key
                     ))
                 })?;
             }
             crate::native_row::logical_value(
                 spec.native_schema.as_ref(),
-                &key.entity_pk,
+                &key.row_pk,
                 global,
                 key.file_id.as_deref(),
                 native,
@@ -3117,7 +3117,7 @@ fn entity_slot_logical_value(
         StateCell::Value(_) => Err(lix_error_to_datafusion_error(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             format!(
-                "Schema-v1 entity '{}' uses the removed JSON current-state representation",
+                "Schema-v1 row '{}' uses the removed JSON current-state representation",
                 spec.schema_key
             ),
         ))),
@@ -3126,7 +3126,7 @@ fn entity_slot_logical_value(
 }
 
 fn slot_value(
-    slot: &EntityStateSlot,
+    slot: &RowStateSlot,
 ) -> Result<
     (
         &crate::forktree::StateCell,
@@ -3139,7 +3139,7 @@ fn slot_value(
     LixError,
 > {
     match slot {
-        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => Ok((
+        RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => Ok((
             &row.value.cell,
             row.value.metadata.as_deref(),
             Some(row.value.change_id),
@@ -3150,10 +3150,10 @@ fn slot_value(
     }
 }
 
-fn entity_slot_system_column_array(
-    spec: &EntitySurfaceSpec,
+fn row_slot_system_column_array(
+    spec: &SchemaSurfaceSpec,
     column_name: &str,
-    slots: &[EntityStateSlot],
+    slots: &[RowStateSlot],
     branch_id: Option<&str>,
 ) -> Result<ArrayRef> {
     let keys = slots
@@ -3165,22 +3165,22 @@ fn entity_slot_system_column_array(
         .iter()
         .map(|slot| {
             Ok(match slot {
-                EntityStateSlot::Tracked(row) => match row.source {
+                RowStateSlot::Tracked(row) => match row.source {
                     StateRowSource::Global => Some(GLOBAL_BRANCH_ID.to_string()),
                     StateRowSource::Branch | StateRowSource::StagedBranch => {
                         branch_id.map(str::to_string)
                     }
                     StateRowSource::StagedGlobal => Some(GLOBAL_BRANCH_ID.to_string()),
                 },
-                EntityStateSlot::TrackedAt { branch_id, .. } => Some(branch_id.clone()),
+                RowStateSlot::TrackedAt { branch_id, .. } => Some(branch_id.clone()),
             })
         })
         .collect::<Result<Vec<Option<String>>, LixError>>()
         .map_err(lix_error_to_datafusion_error)?;
     let array: ArrayRef = match column_name {
-        "entity_pk" => Arc::new(StringArray::from(
+        "row_pk" => Arc::new(StringArray::from(
             keys.iter()
-                .map(|key| key.entity_pk.as_json_array_text().map(Some))
+                .map(|key| key.row_pk.as_json_array_text().map(Some))
                 .collect::<Result<Vec<_>, LixError>>()
                 .map_err(lix_error_to_datafusion_error)?
                 .into_iter()
@@ -3196,12 +3196,12 @@ fn entity_slot_system_column_array(
             slots
                 .iter()
                 .map(|slot| {
-                    entity_slot_logical_value(spec, slot, branch_id).and_then(|value| {
+                    row_slot_logical_value(spec, slot, branch_id).and_then(|value| {
                         value
                             .map(|value| {
                                 serde_json::to_string(&value).map_err(|error| {
                                     DataFusionError::Execution(format!(
-                                        "failed to materialize native entity snapshot: {error}"
+                                        "failed to materialize native row snapshot: {error}"
                                     ))
                                 })
                             })
@@ -3221,14 +3221,14 @@ fn entity_slot_system_column_array(
         )),
         "created_at" => Arc::new(StringArray::from_iter(slots.iter().map(
             |slot| match slot {
-                EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
                     Some(row.value.created_at.to_string())
                 }
             },
         ))),
         "updated_at" => Arc::new(StringArray::from_iter(slots.iter().map(
             |slot| match slot {
-                EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                RowStateSlot::Tracked(row) | RowStateSlot::TrackedAt { row, .. } => {
                     Some(row.value.updated_at.to_string())
                 }
             },
@@ -3248,7 +3248,7 @@ fn entity_slot_system_column_array(
                     // expose their unpublished change identity through the
                     // staged post-image. The commit identity remains visible
                     // and the change id becomes durable at publication.
-                    EntityStateSlot::Tracked(row)
+                    RowStateSlot::Tracked(row)
                         if matches!(
                             row.source,
                             StateRowSource::StagedGlobal | StateRowSource::StagedBranch
@@ -3256,7 +3256,7 @@ fn entity_slot_system_column_array(
                     {
                         Ok(None)
                     }
-                    EntityStateSlot::TrackedAt { row, .. }
+                    RowStateSlot::TrackedAt { row, .. }
                         if matches!(
                             row.source,
                             StateRowSource::StagedGlobal | StateRowSource::StagedBranch
@@ -3279,7 +3279,7 @@ fn entity_slot_system_column_array(
         "branch_id" => Arc::new(StringArray::from_iter(branch_ids)),
         _ => {
             return Err(DataFusionError::Execution(format!(
-                "sql2 entity provider does not support system column 'lixcol_{column_name}'"
+                "sql2 row provider does not support system column 'lixcol_{column_name}'"
             )));
         }
     };
@@ -3287,10 +3287,10 @@ fn entity_slot_system_column_array(
 }
 
 #[cfg(test)]
-fn entity_primary_key_record_batch(
-    spec: &EntitySurfaceSpec,
+fn row_primary_key_record_batch(
+    spec: &SchemaSurfaceSpec,
     schema: SchemaRef,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
 ) -> Result<RecordBatch> {
     let columns = schema
         .fields()
@@ -3298,16 +3298,16 @@ fn entity_primary_key_record_batch(
         .map(|field| {
             let component_index = simple_string_primary_key_index(spec, field.name()).ok_or_else(|| {
                 DataFusionError::Execution(format!(
-                    "entity primary-key projection cannot serve column '{}' for schema '{}'",
+                    "row primary-key projection cannot serve column '{}' for schema '{}'",
                     field.name(), spec.schema_key
                 ))
             })?;
-            let values = entity_pks
+            let values = row_pks
                 .iter()
-                .map(|entity_pk| match entity_pk.components.as_slice().get(component_index) {
-                    Some(crate::entity_pk::EntityPkComponent::String(value)) => Ok(Some(value.as_ref())),
+                .map(|row_pk| match row_pk.components.as_slice().get(component_index) {
+                    Some(crate::row_pk::RowPkComponent::String(value)) => Ok(Some(value.as_ref())),
                     _ => Err(DataFusionError::Execution(format!(
-                        "entity primary-key projection found an invalid key component for schema '{}' column '{}'",
+                        "row primary-key projection found an invalid key component for schema '{}' column '{}'",
                         spec.schema_key, field.name()
                     ))),
                 })
@@ -3321,21 +3321,21 @@ fn entity_primary_key_record_batch(
 
 #[cfg(test)]
 #[expect(trivial_casts)]
-fn entity_column_array(
-    spec: &EntitySurfaceSpec,
+fn row_column_array(
+    spec: &SchemaSurfaceSpec,
     column_name: &str,
     rows: &[StateRow],
     snapshots: &[Option<JsonValue>],
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
-        return entity_state_system_column_array(property_name, rows);
+        return row_state_system_column_array(property_name, rows);
     }
 
     let column_type = spec
         .visible_column(column_name)
         .ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "sql2 entity provider '{}' does not expose column '{}'",
+                "sql2 row provider '{}' does not expose column '{}'",
                 spec.schema_key, column_name
             ))
         })?
@@ -3346,31 +3346,31 @@ fn entity_column_array(
         .map(|snapshot| snapshot.as_ref().and_then(|value| value.get(column_name)))
         .collect::<Vec<_>>();
     Ok(match column_type {
-        EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
+        SchemaColumnType::String | SchemaColumnType::Json => Arc::new(StringArray::from(
             values
                 .iter()
-                .map(|value| entity_json_text_value(*value, column_type))
+                .map(|value| row_json_text_value(*value, column_type))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
-        EntityColumnType::Integer => Arc::new(Int64Array::from(
+        SchemaColumnType::Integer => Arc::new(Int64Array::from(
             values
                 .iter()
-                .map(|value| entity_i64_value(*value, &spec.schema_key, column_name))
+                .map(|value| row_i64_value(*value, &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
-        EntityColumnType::Number => Arc::new(Float64Array::from(
+        SchemaColumnType::Number => Arc::new(Float64Array::from(
             values
                 .iter()
-                .map(|value| entity_f64_value(*value, &spec.schema_key, column_name))
+                .map(|value| row_f64_value(*value, &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
-        EntityColumnType::Boolean => Arc::new(BooleanArray::from(
+        SchemaColumnType::Boolean => Arc::new(BooleanArray::from(
             values
                 .iter()
                 .map(|value| value.and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
-        EntityColumnType::Timestamptz => Arc::new(
+        SchemaColumnType::Timestamptz => Arc::new(
             TimestampMicrosecondArray::from(
                 values
                     .iter()
@@ -3405,14 +3405,14 @@ fn entity_column_array(
 
 /// Materialize `lixcol_*` only at the Arrow boundary from native rows.
 #[cfg(test)]
-fn entity_state_system_column_array(column_name: &str, rows: &[StateRow]) -> Result<ArrayRef> {
+fn row_state_system_column_array(column_name: &str, rows: &[StateRow]) -> Result<ArrayRef> {
     #[expect(trivial_casts)]
     let array = match column_name {
-        "entity_pk" => Arc::new(StringArray::from(
+        "row_pk" => Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| {
                     decode_state_key(&row.key)
-                        .and_then(|key| key.entity_pk.as_json_array_text())
+                        .and_then(|key| key.row_pk.as_json_array_text())
                         .map(Some)
                 })
                 .collect::<std::result::Result<Vec<_>, LixError>>()
@@ -3467,7 +3467,7 @@ fn entity_state_system_column_array(column_name: &str, rows: &[StateRow]) -> Res
         ))) as ArrayRef,
         _ => {
             return Err(DataFusionError::Execution(format!(
-                "sql2 entity provider does not support system column 'lixcol_{column_name}'"
+                "sql2 row provider does not support system column 'lixcol_{column_name}'"
             )));
         }
     };
@@ -3479,7 +3479,7 @@ pub(super) fn parse_snapshot(snapshot_content: Option<&str>) -> Result<Option<Js
         .map(|snapshot| {
             parse_snapshot_value(snapshot).map_err(|error| {
                 DataFusionError::Execution(format!(
-                    "sql2 entity provider expected valid snapshot_content JSON: {error}"
+                    "sql2 row provider expected valid snapshot_content JSON: {error}"
                 ))
             })
         })
@@ -3500,34 +3500,34 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_entity_snapshot_parse_count() {
+fn reset_row_snapshot_parse_count() {
     ENTITY_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn entity_snapshot_parse_count() -> usize {
+fn row_snapshot_parse_count() -> usize {
     ENTITY_SNAPSHOT_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
-pub(super) fn entity_json_text_value(
+pub(super) fn row_json_text_value(
     value: Option<&JsonValue>,
-    column_type: EntityColumnType,
+    column_type: SchemaColumnType,
 ) -> Result<Option<String>> {
     Ok(match (column_type, value) {
         (_, None | Some(JsonValue::Null)) => None,
-        (EntityColumnType::String, Some(JsonValue::Bool(value))) => Some(if *value {
+        (SchemaColumnType::String, Some(JsonValue::Bool(value))) => Some(if *value {
             "true".to_string()
         } else {
             "false".to_string()
         }),
-        (EntityColumnType::String, Some(JsonValue::String(value))) => Some(value.clone()),
-        (EntityColumnType::String, Some(other)) => Some(json_to_string(other)?),
-        (EntityColumnType::Json, Some(other)) => Some(json_to_string(other)?),
+        (SchemaColumnType::String, Some(JsonValue::String(value))) => Some(value.clone()),
+        (SchemaColumnType::String, Some(other)) => Some(json_to_string(other)?),
+        (SchemaColumnType::Json, Some(other)) => Some(json_to_string(other)?),
         _ => None,
     })
 }
 
-pub(super) fn entity_i64_value(
+pub(super) fn row_i64_value(
     value: Option<&JsonValue>,
     schema_key: &str,
     column_name: &str,
@@ -3535,7 +3535,7 @@ pub(super) fn entity_i64_value(
     json_bigint_value(value, schema_key, column_name).map_err(lix_error_to_datafusion_error)
 }
 
-pub(super) fn entity_f64_value(
+pub(super) fn row_f64_value(
     value: Option<&JsonValue>,
     schema_key: &str,
     column_name: &str,
@@ -3556,7 +3556,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
     use crate::forktree::{StateCell, StateKeyRef, StateValue, decode_state_key, encode_state_key};
-    use crate::sql2::entity_batch::row_snapshot;
+    use crate::sql2::row_batch::row_snapshot;
     use crate::state::{StagedStateRow, StateRow, StateRowSource, TransactionStateView};
     use crate::storage_adapter::{Memory, StorageAdapter};
     use datafusion::arrow::array::Array;
@@ -3570,20 +3570,20 @@ mod tests {
         LixTimestamp::from_unix_millis_utc_lossy(value)
     }
 
-    fn tracked_row(source: StateRowSource, schema_key: &str, entity: &str) -> StateRow {
-        let entity_pk = EntityPk::single(entity);
+    fn tracked_row(source: StateRowSource, schema_key: &str, row: &str) -> StateRow {
+        let row_pk = RowPk::single(row);
         StateRow {
             key: encode_state_key(StateKeyRef {
                 schema_key,
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             }),
             value: StateValue {
-                change_id: ChangeId::for_test_label("entity-change"),
-                commit_id: CommitId::for_test_label("entity-commit"),
+                change_id: ChangeId::for_test_label("row-change"),
+                commit_id: CommitId::for_test_label("row-commit"),
                 created_at: timestamp(1),
                 updated_at: timestamp(2),
-                cell: StateCell::Value(SharedStr::from(format!(r#"{{"body":"{entity}"}}"#))),
+                cell: StateCell::Value(SharedStr::from(format!(r#"{{"body":"{row}"}}"#))),
                 metadata: None,
                 origin_key: None,
                 blob_manifest_object_ids: Vec::new(),
@@ -3595,20 +3595,20 @@ mod tests {
     fn tracked_row_with_file(
         source: StateRowSource,
         schema_key: &str,
-        entity: &str,
+        row: &str,
         file_id: Option<&str>,
         cell: StateCell,
     ) -> StateRow {
-        let entity_pk = EntityPk::single(entity);
+        let row_pk = RowPk::single(row);
         StateRow {
             key: encode_state_key(StateKeyRef {
                 schema_key,
                 file_id,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             }),
             value: StateValue {
-                change_id: ChangeId::for_test_label("entity-file-change"),
-                commit_id: CommitId::for_test_label("entity-file-commit"),
+                change_id: ChangeId::for_test_label("row-file-change"),
+                commit_id: CommitId::for_test_label("row-file-commit"),
                 created_at: timestamp(1),
                 updated_at: timestamp(2),
                 cell,
@@ -3620,9 +3620,9 @@ mod tests {
         }
     }
 
-    fn entity_insert_spec_with_primary_key() -> Arc<EntitySurfaceSpec> {
+    fn row_insert_spec_with_primary_key() -> Arc<SchemaSurfaceSpec> {
         Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
                 "x-lix-primary-key": ["/id"],
                 "type": "object",
@@ -3632,13 +3632,13 @@ mod tests {
                 },
                 "required": ["id", "body"]
             }))
-            .expect("schema should derive entity surface spec"),
+            .expect("schema should derive row surface spec"),
         )
     }
 
-    fn path_value_entity_spec() -> Arc<EntitySurfaceSpec> {
+    fn path_value_schema_spec() -> Arc<SchemaSurfaceSpec> {
         Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "json_pointer",
                 "x-lix-primary-key": ["/path"],
                 "type": "object",
@@ -3707,12 +3707,12 @@ mod tests {
         .expect("open canonical state view")
     }
 
-    async fn native_entity_spec(
-        spec: Arc<EntitySurfaceSpec>,
-    ) -> EntitySpec<
+    async fn native_schema_spec(
+        spec: Arc<SchemaSurfaceSpec>,
+    ) -> RowSpec<
         crate::storage_adapter::SharedStorageAdapterRead<crate::storage_adapter::MemoryRead>,
     > {
-        EntitySpec::by_branch(
+        RowSpec::by_branch(
             spec,
             native_state_view().await,
             Arc::new(NativeBranchRefReader),
@@ -3722,8 +3722,8 @@ mod tests {
     #[cfg(any())]
     #[test]
     fn exact_state_system_projection_preserves_native_identity_and_owner() {
-        let spec = entity_insert_spec_with_primary_key();
-        let tracked = EntityStateSlot::Tracked(tracked_row(
+        let spec = row_insert_spec_with_primary_key();
+        let tracked = RowStateSlot::Tracked(tracked_row(
             StateRowSource::Branch,
             "app.message",
             "tracked",
@@ -3731,16 +3731,16 @@ mod tests {
         let untracked = untracked_row("app.message", "untracked");
         let slots = vec![tracked, untracked];
 
-        let entity_pk =
-            entity_slot_system_column_array(spec.as_ref(), "entity_pk", &slots, Some("branch-a"))
-                .expect("entity pk projection");
+        let row_pk =
+            row_slot_system_column_array(spec.as_ref(), "row_pk", &slots, Some("branch-a"))
+                .expect("row pk projection");
         let untracked_flag =
-            entity_slot_system_column_array(spec.as_ref(), "untracked", &slots, Some("branch-a"))
+            row_slot_system_column_array(spec.as_ref(), "untracked", &slots, Some("branch-a"))
                 .expect("untracked projection");
         let branch_ids =
-            entity_slot_system_column_array(spec.as_ref(), "branch_id", &slots, Some("branch-a"))
+            row_slot_system_column_array(spec.as_ref(), "branch_id", &slots, Some("branch-a"))
                 .expect("branch projection");
-        assert_eq!(entity_pk.len(), 2);
+        assert_eq!(row_pk.len(), 2);
         assert_eq!(untracked_flag.len(), 2);
         assert_eq!(branch_ids.len(), 2);
         assert_eq!(
@@ -3767,7 +3767,7 @@ mod tests {
             key: encode_state_key(StateKeyRef {
                 schema_key: "app.message",
                 file_id: None,
-                entity_pk: &EntityPk::single("broken"),
+                row_pk: &RowPk::single("broken"),
             }),
             value: StateValue {
                 change_id: ChangeId::for_test_label("malformed-change"),
@@ -3781,63 +3781,63 @@ mod tests {
             },
             source: StateRowSource::Branch,
         };
-        let filter = EntityRowFilter::ColumnEq {
+        let filter = RowRowFilter::ColumnEq {
             column: "body".to_string(),
-            column_type: EntityColumnType::String,
-            value: EntityFilterValue::String("ok".to_string()),
+            column_type: SchemaColumnType::String,
+            value: RowFilterValue::String("ok".to_string()),
         };
-        assert!(apply_entity_state_filters(vec![row], &[filter]).is_err());
+        assert!(apply_row_state_filters(vec![row], &[filter]).is_err());
     }
 
     #[test]
     fn exact_request_requires_complete_file_owner_identity() {
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let request = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["app.message".to_string()],
                 branch_ids: vec!["branch-a".to_string()],
-                entity_pks: vec![EntityPk::single("one")],
+                row_pks: vec![RowPk::single("one")],
                 file_ids: vec![NullableKeyFilter::Null],
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            projection: EntityProjection::default(),
+            projection: RowProjection::default(),
             limit: Some(1),
         };
-        let exact = exact_entity_batch_request(&request).expect("complete owner is exact");
+        let exact = exact_row_batch_request(&request).expect("complete owner is exact");
         assert_eq!(exact.rows.len(), 1);
         assert_eq!(exact.rows[0].file_id, None);
 
         let mut without_file = request;
         without_file.filter.file_ids.clear();
-        assert!(exact_entity_batch_request(&without_file).is_none());
+        assert!(exact_row_batch_request(&without_file).is_none());
     }
 
     #[test]
     fn bounded_scan_rejects_mixed_schema_or_branch_selectors() {
-        let mixed_schema = EntityScanRequest {
-            filter: EntityScanFilter {
+        let mixed_schema = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["a".to_string(), "b".to_string()],
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
-        assert!(crate::sql2::entity_batch::schema_bounds(&mixed_schema).is_err());
+        assert!(crate::sql2::row_batch::schema_bounds(&mixed_schema).is_err());
 
-        let mixed_branch = EntityScanRequest {
-            filter: EntityScanFilter {
+        let mixed_branch = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["a".to_string()],
                 branch_ids: vec!["one".to_string(), "two".to_string()],
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
         // Branch selectors are now routed by the native grouped scan. The
         // schema bound itself remains valid; rejecting this shape here would
         // silently reintroduce the old active-branch-only behavior.
-        assert!(crate::sql2::entity_batch::schema_bounds(&mixed_branch).is_ok());
+        assert!(crate::sql2::row_batch::schema_bounds(&mixed_branch).is_ok());
     }
 
     #[tokio::test]
-    async fn native_entity_fixtures_use_one_retained_memory_view() {
+    async fn native_row_fixtures_use_one_retained_memory_view() {
         let storage = StorageAdapter::new(Memory::new());
         crate::forktree::initialize_empty_repository(storage.clone())
             .await
@@ -3854,13 +3854,13 @@ mod tests {
         .await
         .expect("open canonical state view");
 
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let request = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["app.message".to_string()],
                 untracked: Some(false),
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
         let committed_rows = scan_slots_forktree(&committed, &request)
             .await
@@ -3882,7 +3882,7 @@ mod tests {
             .expect("scan staged native view");
         assert_eq!(
             staged_rows,
-            vec![EntityStateSlot::TrackedAt {
+            vec![RowStateSlot::TrackedAt {
                 row: staged,
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
             }]
@@ -3895,7 +3895,7 @@ mod tests {
         let workspace_key = encode_state_key(StateKeyRef {
             schema_key: "lix_key_value",
             file_id: None,
-            entity_pk: &EntityPk::single("lix_workspace_branch_id"),
+            row_pk: &RowPk::single("lix_workspace_branch_id"),
         });
         let workspace_row = committed
             .points(&[workspace_key], true)
@@ -3912,14 +3912,14 @@ mod tests {
             .as_str()
             .expect("workspace branch UUID")
             .to_owned();
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let request = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
                 branch_ids: vec![GLOBAL_BRANCH_ID.to_string(), main_branch_id.clone()],
                 untracked: Some(false),
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
         let slots = scan_slots_forktree(&committed, &request)
             .await
@@ -3927,7 +3927,7 @@ mod tests {
         let tracked_branches = slots
             .iter()
             .filter_map(|slot| match slot {
-                EntityStateSlot::TrackedAt { branch_id, .. } => Some(branch_id.as_str()),
+                RowStateSlot::TrackedAt { branch_id, .. } => Some(branch_id.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -3942,25 +3942,25 @@ mod tests {
             "each of the three authenticated bootstrap keys is emitted once for the raw global branch, not once per selected branch"
         );
 
-        let exact = crate::sql2::entity_batch::exact_forktree(
+        let exact = crate::sql2::row_batch::exact_forktree(
             &committed,
-            &EntityExactBatchRequest {
+            &RowExactBatchRequest {
                 rows: vec![
-                    EntityExactRowRequest {
+                    RowExactRowRequest {
                         schema_key: "lix_key_value".to_string(),
                         branch_id: GLOBAL_BRANCH_ID.to_string(),
-                        entity_pk: EntityPk::single("lix_workspace_branch_id"),
+                        row_pk: RowPk::single("lix_workspace_branch_id"),
                         file_id: None,
                     },
-                    EntityExactRowRequest {
+                    RowExactRowRequest {
                         schema_key: "lix_key_value".to_string(),
                         branch_id: main_branch_id.clone(),
-                        entity_pk: EntityPk::single("lix_workspace_branch_id"),
+                        row_pk: RowPk::single("lix_workspace_branch_id"),
                         file_id: None,
                     },
                 ],
                 untracked: Some(false),
-                ..EntityExactBatchRequest::default()
+                ..RowExactBatchRequest::default()
             },
         )
         .await
@@ -3968,31 +3968,31 @@ mod tests {
         assert_eq!(exact.len(), 2);
         assert!(matches!(
             exact[0],
-            Some(EntityStateSlot::TrackedAt { ref branch_id, .. })
+            Some(RowStateSlot::TrackedAt { ref branch_id, .. })
                 if branch_id == GLOBAL_BRANCH_ID
         ));
         assert!(matches!(
             exact[1],
-            Some(EntityStateSlot::TrackedAt { ref branch_id, .. })
+            Some(RowStateSlot::TrackedAt { ref branch_id, .. })
                 if branch_id == &main_branch_id
         ));
     }
 
     #[tokio::test]
-    async fn native_pk_only_scan_uses_bounded_entity_prefix_for_both_views() {
+    async fn native_pk_only_scan_uses_bounded_row_prefix_for_both_views() {
         let committed = native_state_view().await;
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let request = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["app.message".to_string()],
-                entity_pks: vec![EntityPk::single("pk-only")],
+                row_pks: vec![RowPk::single("pk-only")],
                 file_ids: Vec::new(),
                 untracked: Some(false),
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
         assert!(
-            exact_entity_batch_request(&request).is_none(),
+            exact_row_batch_request(&request).is_none(),
             "PK-only requests must use the native range route rather than an incomplete exact request"
         );
         assert!(
@@ -4015,14 +4015,14 @@ mod tests {
     async fn native_branch_grouped_scan_rejects_missing_branch_instead_of_using_active() {
         let committed = native_state_view().await;
         let foreign_branch = "11111111-1111-4111-8111-111111111111".to_string();
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let request = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["app.message".to_string()],
                 branch_ids: vec![foreign_branch.clone()],
                 untracked: Some(false),
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
         assert!(
             scan_slots_forktree(&committed, &request).await.is_err(),
@@ -4039,8 +4039,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_schema_contract_preserves_surface_and_identity_columns() {
-        let spec = crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+    fn row_schema_contract_preserves_surface_and_identity_columns() {
+        let spec = crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
             "x-lix-primary-key": ["/id"],
             "type": "object",
@@ -4049,7 +4049,7 @@ mod tests {
                 "body": { "type": "string" },
                 "rating": { "type": "number" },
                 "meta": { "type": "object" },
-                "lixcol_entity_pk": { "type": "string" }
+                "lixcol_row_pk": { "type": "string" }
             }
         }))
         .expect("schema should derive");
@@ -4057,10 +4057,10 @@ mod tests {
             spec.visible_column_names().collect::<Vec<_>>(),
             vec!["body", "id", "meta", "rating"]
         );
-        assert!(spec.visible_column("lixcol_entity_pk").is_none());
-        let active = entity_surface_schema(&spec, EntitySurfaceShape::Active);
-        let by_branch = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
-        assert!(active.field_with_name("lixcol_entity_pk").is_ok());
+        assert!(spec.visible_column("lixcol_row_pk").is_none());
+        let active = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
+        let by_branch = schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch);
+        assert!(active.field_with_name("lixcol_row_pk").is_ok());
         assert!(active.field_with_name("lixcol_branch_id").is_err());
         assert!(by_branch.field_with_name("lixcol_branch_id").is_ok());
         assert!(
@@ -4074,7 +4074,7 @@ mod tests {
     #[test]
     fn native_projection_preserves_payload_and_system_identity_columns() {
         let spec = Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
                 "type": "object",
                 "properties": {
@@ -4085,11 +4085,11 @@ mod tests {
             }))
             .expect("schema should derive"),
         );
-        let row = tracked_row(StateRowSource::Branch, "project_message", "entity-1");
-        let batch = entity_record_batch_from_slots(
+        let row = tracked_row(StateRowSource::Branch, "project_message", "row-1");
+        let batch = row_record_batch_from_slots(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
-            &[EntityStateSlot::Tracked(row)],
+            schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch),
+            &[RowStateSlot::Tracked(row)],
             Some("branch-a"),
         )
         .expect("native Arrow projection");
@@ -4102,17 +4102,17 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .expect("body string")
                 .value(0),
-            "entity-1"
+            "row-1"
         );
         assert_eq!(
             batch
-                .column_by_name("lixcol_entity_pk")
-                .expect("entity pk")
+                .column_by_name("lixcol_row_pk")
+                .expect("row pk")
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .expect("entity pk string")
+                .expect("row pk string")
                 .value(0),
-            "[\"entity-1\"]"
+            "[\"row-1\"]"
         );
         assert_eq!(
             batch
@@ -4128,17 +4128,17 @@ mod tests {
 
     #[test]
     fn borrowed_path_value_projection_matches_dom_null_duplicates_and_canonical_json() {
-        let spec = path_value_entity_spec();
+        let spec = path_value_schema_spec();
         assert!(spec.certifies_path_value_replacement);
         let slots = vec![
-            EntityStateSlot::Tracked(tracked_row_with_file(
+            RowStateSlot::Tracked(tracked_row_with_file(
                 StateRowSource::Branch,
                 "json_pointer",
                 "/null",
                 None,
                 StateCell::Value(SharedStr::from(r#"{"path":"/null","value":null}"#)),
             )),
-            EntityStateSlot::Tracked(tracked_row_with_file(
+            RowStateSlot::Tracked(tracked_row_with_file(
                 StateRowSource::Branch,
                 "json_pointer",
                 "/last",
@@ -4147,7 +4147,7 @@ mod tests {
                     r#"{"path":"bad","value":{"z":0},"path":"/last","value":{"z":2,"a":1}}"#,
                 )),
             )),
-            EntityStateSlot::Tracked(tracked_row_with_file(
+            RowStateSlot::Tracked(tracked_row_with_file(
                 StateRowSource::Branch,
                 "json_pointer",
                 "/fallback",
@@ -4155,8 +4155,8 @@ mod tests {
                 StateCell::Value(SharedStr::from(r#"{"value":"text"}"#)),
             )),
         ];
-        let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
-        let batch = entity_record_batch_from_slots(&spec, schema, &slots, Some("branch-a"))
+        let schema = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
+        let batch = row_record_batch_from_slots(&spec, schema, &slots, Some("branch-a"))
             .expect("borrowed path/value projection");
         let paths = batch
             .column_by_name("path")
@@ -4184,22 +4184,22 @@ mod tests {
 
     #[test]
     fn borrowed_path_value_projection_retains_execution_error_for_malformed_or_trailing_json() {
-        let spec = path_value_entity_spec();
+        let spec = path_value_schema_spec();
         for snapshot in [
             r#"{"path":"/bad","value":}"#,
             r#"{"path":"/bad","value":1} trailing"#,
             r#"["/bad",1]"#,
         ] {
-            let slot = EntityStateSlot::Tracked(tracked_row_with_file(
+            let slot = RowStateSlot::Tracked(tracked_row_with_file(
                 StateRowSource::Branch,
                 "json_pointer",
                 "/bad",
                 None,
                 StateCell::Value(SharedStr::from(snapshot)),
             ));
-            let error = entity_record_batch_from_slots(
+            let error = row_record_batch_from_slots(
                 &spec,
-                entity_surface_schema(&spec, EntitySurfaceShape::Active),
+                schema_surface_schema(&spec, SchemaSurfaceShape::Active),
                 &[slot],
                 Some("branch-a"),
             )
@@ -4213,9 +4213,9 @@ mod tests {
 
     #[test]
     fn native_projection_keeps_zero_column_row_count_and_malformed_json_fail_closed() {
-        let spec = entity_insert_spec_with_primary_key();
-        let row = tracked_row(StateRowSource::Branch, "project_message", "entity-1");
-        let empty = entity_record_batch_from_state_rows(
+        let spec = row_insert_spec_with_primary_key();
+        let row = tracked_row(StateRowSource::Branch, "project_message", "row-1");
+        let empty = row_record_batch_from_state_rows(
             &spec,
             Schema::empty().into(),
             std::slice::from_ref(&row),
@@ -4231,9 +4231,9 @@ mod tests {
             },
             ..row
         };
-        let error = entity_record_batch_from_state_rows(
+        let error = row_record_batch_from_state_rows(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             &[malformed],
         )
         .expect_err("malformed native snapshot must fail");
@@ -4246,19 +4246,19 @@ mod tests {
 
     #[test]
     fn native_primary_key_and_file_filters_preserve_exact_identity_rules() {
-        let spec = entity_insert_spec_with_primary_key();
+        let spec = row_insert_spec_with_primary_key();
         let filters = vec![
-            eq_filter("id", "entity-a"),
+            eq_filter("id", "row-a"),
             Expr::InList(InList::new(
                 Box::new(column("id")),
-                vec![string_literal("entity-b"), string_literal("entity-a")],
+                vec![string_literal("row-b"), string_literal("row-a")],
                 false,
             )),
         ];
-        let ids = entity_pks_from_primary_key_filters(&spec, &filters)
+        let ids = row_pks_from_primary_key_filters(&spec, &filters)
             .expect("primary-key filters analyze")
             .expect("complete identity filter");
-        assert_eq!(ids, vec![EntityPk::single("entity-a")]);
+        assert_eq!(ids, vec![RowPk::single("row-a")]);
         assert_eq!(
             exact_file_ids_from_filters(&[Expr::IsNull(Box::new(column("lixcol_file_id")))])
                 .expect("NULL file filter analyzes"),
@@ -4279,17 +4279,17 @@ mod tests {
 
     #[test]
     fn native_primary_key_analyzer_preserves_typed_and_boolean_semantics() {
-        let spec = entity_insert_spec_with_primary_key();
-        let analyzer = EntityPrimaryKeyFilterAnalyzer::new(&spec);
+        let spec = row_insert_spec_with_primary_key();
+        let analyzer = RowPrimaryKeyFilterAnalyzer::new(&spec);
         let disjunction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "entity-a")),
+            Box::new(eq_filter("id", "row-a")),
             Operator::Or,
-            Box::new(eq_filter("id", "entity-b")),
+            Box::new(eq_filter("id", "row-b")),
         ));
         let contradiction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "entity-a")),
+            Box::new(eq_filter("id", "row-a")),
             Operator::And,
-            Box::new(eq_filter("id", "entity-b")),
+            Box::new(eq_filter("id", "row-b")),
         ));
         assert_eq!(
             analyzer
@@ -4298,7 +4298,7 @@ mod tests {
                 .expect("OR identity set")
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![EntityPk::single("entity-a"), EntityPk::single("entity-b")]
+            vec![RowPk::single("row-a"), RowPk::single("row-b")]
         );
         assert!(
             analyzer
@@ -4308,7 +4308,7 @@ mod tests {
                 .is_empty()
         );
 
-        let integer = crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+        let integer = crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
             "x-lix-key": "integer_note",
             "x-lix-primary-key": ["/id"],
             "type": "object",
@@ -4316,7 +4316,7 @@ mod tests {
         }))
         .expect("integer schema");
         assert!(
-            entity_pks_from_primary_key_filters(&integer, &[eq_filter("id", "42")])
+            row_pks_from_primary_key_filters(&integer, &[eq_filter("id", "42")])
                 .expect("mismatched integer literal is ignored")
                 .is_none()
         );
@@ -4327,14 +4327,14 @@ mod tests {
         for (raw, expected) in [("1.0", 1_i64), ("-0.0", 0_i64)] {
             let value = serde_json::from_str::<serde_json::Value>(raw).expect("number");
             assert_eq!(
-                entity_i64_value(Some(&value), "integer_contract", "count")
+                row_i64_value(Some(&value), "integer_contract", "count")
                     .expect("integral BIGINT"),
                 Some(expected)
             );
         }
         for raw in ["1.5", "9223372036854775808", "\"1\""] {
             let value = serde_json::from_str::<serde_json::Value>(raw).expect("value");
-            let error = entity_i64_value(Some(&value), "integer_contract", "count")
+            let error = row_i64_value(Some(&value), "integer_contract", "count")
                 .expect_err("invalid BIGINT must fail");
             let error = crate::sql2::error::datafusion_error_to_lix_error(error);
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
@@ -4342,20 +4342,20 @@ mod tests {
         for (raw, expected) in [("1", 1.0), ("1.5", 1.5)] {
             let value = serde_json::from_str::<serde_json::Value>(raw).expect("number");
             assert_eq!(
-                entity_f64_value(Some(&value), "number_contract", "ratio").expect("DOUBLE"),
+                row_f64_value(Some(&value), "number_contract", "ratio").expect("DOUBLE"),
                 Some(expected)
             );
         }
         for raw in ["\"1\"", "true"] {
             let value = serde_json::from_str::<serde_json::Value>(raw).expect("value");
-            assert!(entity_f64_value(Some(&value), "number_contract", "ratio").is_err());
+            assert!(row_f64_value(Some(&value), "number_contract", "ratio").is_err());
         }
     }
 
     #[test]
     fn native_exact_projection_preserves_order_duplicate_and_tombstone_slots() {
         let spec = Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
                 "type": "object",
                 "properties": { "body": { "type": "string" } }
@@ -4363,21 +4363,21 @@ mod tests {
             .expect("schema should derive"),
         );
         let slots = vec![
-            EntityStateSlot::Tracked(tracked_row_with_file(
+            RowStateSlot::Tracked(tracked_row_with_file(
                 StateRowSource::Branch,
                 "project_message",
                 "a",
                 None,
                 StateCell::Value(SharedStr::from(r#"{"body":"first"}"#)),
             )),
-            EntityStateSlot::Tracked(tracked_row_with_file(
+            RowStateSlot::Tracked(tracked_row_with_file(
                 StateRowSource::Branch,
                 "project_message",
                 "b",
                 Some("file-b"),
                 StateCell::Tombstone,
             )),
-            EntityStateSlot::Tracked(tracked_row_with_file(
+            RowStateSlot::Tracked(tracked_row_with_file(
                 StateRowSource::Branch,
                 "project_message",
                 "a",
@@ -4385,9 +4385,9 @@ mod tests {
                 StateCell::Value(SharedStr::from(r#"{"body":"last"}"#)),
             )),
         ];
-        let batch = entity_record_batch_from_slots(
+        let batch = row_record_batch_from_slots(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
+            schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch),
             &slots,
             Some("branch-a"),
         )
@@ -4416,7 +4416,7 @@ mod tests {
     #[test]
     fn native_residual_filters_run_before_projection() {
         let spec = Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
                 "type": "object",
                 "properties": { "body": { "type": "string" } }
@@ -4439,15 +4439,15 @@ mod tests {
                 StateCell::Value(SharedStr::from(r#"{"body":"keep"}"#)),
             ),
         ];
-        let filters = vec![EntityRowFilter::ColumnEq {
+        let filters = vec![RowRowFilter::ColumnEq {
             column: "body".to_string(),
-            column_type: EntityColumnType::String,
-            value: EntityFilterValue::String("keep".to_string()),
+            column_type: SchemaColumnType::String,
+            value: RowFilterValue::String("keep".to_string()),
         }];
-        let filtered = apply_entity_state_filters(rows, &filters).expect("filter rows");
-        let batch = entity_record_batch_from_state_rows(
+        let filtered = apply_row_state_filters(rows, &filters).expect("filter rows");
+        let batch = row_record_batch_from_state_rows(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             &filtered,
         )
         .expect("project filtered native rows");
@@ -4465,63 +4465,63 @@ mod tests {
     }
 
     #[test]
-    fn native_direct_entity_batch_accepts_payload_and_rejects_unbounded_shapes() {
+    fn native_direct_row_batch_accepts_payload_and_rejects_unbounded_shapes() {
         let payload_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
-        let system_schema = Schema::new(vec![Field::new("lixcol_entity_pk", DataType::Utf8, true)]);
-        let mut request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let system_schema = Schema::new(vec![Field::new("lixcol_row_pk", DataType::Utf8, true)]);
+        let mut request = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["project_message".to_string()],
                 untracked: Some(false),
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
-        assert!(direct_entity_batch_eligible(&payload_schema, &request, &[]));
-        request.filter.entity_pks.push(EntityPk::single("row"));
-        assert!(direct_entity_batch_eligible(&payload_schema, &request, &[]));
-        request.filter.entity_pks.clear();
+        assert!(direct_row_batch_eligible(&payload_schema, &request, &[]));
+        request.filter.row_pks.push(RowPk::single("row"));
+        assert!(direct_row_batch_eligible(&payload_schema, &request, &[]));
+        request.filter.row_pks.clear();
         request.filter.file_ids.push(NullableKeyFilter::Null);
-        assert!(!direct_entity_batch_eligible(
+        assert!(!direct_row_batch_eligible(
             &payload_schema,
             &request,
             &[]
         ));
         request.filter.file_ids.clear();
-        request.filter.rows = EntityRowSelection::None;
-        assert!(!direct_entity_batch_eligible(
+        request.filter.rows = RowRowSelection::None;
+        assert!(!direct_row_batch_eligible(
             &payload_schema,
             &request,
             &[]
         ));
-        request.filter.rows = EntityRowSelection::All;
-        assert!(!direct_entity_batch_eligible(&system_schema, &request, &[]));
-        assert!(!direct_entity_batch_eligible(
+        request.filter.rows = RowRowSelection::All;
+        assert!(!direct_row_batch_eligible(&system_schema, &request, &[]));
+        assert!(!direct_row_batch_eligible(
             &Schema::empty(),
             &request,
             &[]
         ));
-        assert!(!direct_entity_batch_eligible(
+        assert!(!direct_row_batch_eligible(
             &payload_schema,
             &request,
-            &[EntityRowFilter::ColumnEq {
+            &[RowRowFilter::ColumnEq {
                 column: "body".to_string(),
-                column_type: EntityColumnType::String,
-                value: EntityFilterValue::String("hello".to_string()),
+                column_type: SchemaColumnType::String,
+                value: RowFilterValue::String("hello".to_string()),
             }],
         ));
     }
 
     #[test]
     fn native_primary_key_projection_uses_identity_without_snapshot_decode() {
-        let spec = entity_insert_spec_with_primary_key();
+        let spec = row_insert_spec_with_primary_key();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
+        let request = RowScanRequest {
+            filter: RowScanFilter {
                 schema_keys: vec!["project_message".to_string()],
                 untracked: Some(false),
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
         assert!(direct_primary_key_projection_eligible(
             &spec,
@@ -4529,10 +4529,10 @@ mod tests {
             &request,
             &[]
         ));
-        let batch = entity_primary_key_record_batch(
+        let batch = row_primary_key_record_batch(
             &spec,
             Arc::clone(&schema),
-            vec![EntityPk::single("identity-1")],
+            vec![RowPk::single("identity-1")],
         )
         .expect("identity projection");
         assert_eq!(
@@ -4547,8 +4547,8 @@ mod tests {
         let mut exact_request = request;
         exact_request
             .filter
-            .entity_pks
-            .push(EntityPk::single("identity-1"));
+            .row_pks
+            .push(RowPk::single("identity-1"));
         assert!(!direct_primary_key_projection_eligible(
             &spec,
             schema.as_ref(),
@@ -4559,7 +4559,7 @@ mod tests {
 
     #[test]
     fn native_schema_surface_rejects_unprojectable_properties() {
-        let error = crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+        let error = crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
             "x-lix-primary-key": ["/id"],
             "type": "object",
@@ -4577,7 +4577,7 @@ mod tests {
 
     #[test]
     fn native_schema_shapes_preserve_identity_and_branch_global_columns() {
-        let spec = crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+        let spec = crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
             "x-lix-primary-key": ["/id"],
             "type": "object",
@@ -4585,7 +4585,7 @@ mod tests {
                 "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
                 "body": { "type": "string" },
                 "rating": { "type": "number" },
-                "lixcol_entity_pk": { "type": "string" }
+                "lixcol_row_pk": { "type": "string" }
             }
         }))
         .expect("schema should derive");
@@ -4593,15 +4593,15 @@ mod tests {
             spec.visible_column_names().collect::<Vec<_>>(),
             vec!["body", "id", "rating"]
         );
-        let active = entity_surface_schema(&spec, EntitySurfaceShape::Active);
-        let by_branch = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
-        assert!(active.field_with_name("lixcol_entity_pk").is_ok());
+        let active = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
+        let by_branch = schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch);
+        assert!(active.field_with_name("lixcol_row_pk").is_ok());
         assert!(active.field_with_name("lixcol_branch_id").is_err());
         assert!(by_branch.field_with_name("lixcol_branch_id").is_ok());
         assert!(!active.field_with_name("id").expect("id").is_nullable());
         assert!(
             by_branch
-                .field_with_name("lixcol_entity_pk")
+                .field_with_name("lixcol_row_pk")
                 .expect("pk")
                 .is_nullable()
         );
@@ -4610,7 +4610,7 @@ mod tests {
     #[test]
     fn native_record_batch_preserves_payload_and_system_identity() {
         let spec = Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
                 "type": "object",
                 "properties": {
@@ -4626,16 +4626,16 @@ mod tests {
         let row = tracked_row_with_file(
             StateRowSource::Global,
             "project_message",
-            "entity-1",
+            "row-1",
             Some("file-1"),
             StateCell::Value(SharedStr::from(
                 r#"{"body":"hello","rating":4.5,"count":7,"enabled":true,"meta":{"z":2,"a":1}}"#,
             )),
         );
-        let batch = entity_record_batch_from_slots(
+        let batch = row_record_batch_from_slots(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
-            &[EntityStateSlot::Tracked(row)],
+            schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch),
+            &[RowStateSlot::Tracked(row)],
             Some("branch-a"),
         )
         .expect("native record batch");
@@ -4675,7 +4675,7 @@ mod tests {
     #[test]
     fn native_exact_primary_key_projection_keeps_json_and_scalar_contracts() {
         let spec = Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
                 "x-lix-primary-key": ["/body"],
                 "type": "object",
@@ -4697,9 +4697,9 @@ mod tests {
                 r#"{"body":"hello","rating":4.5,"count":7,"meta":{"z":2,"a":1}}"#,
             )),
         );
-        let batch = entity_record_batch_from_state_rows(
+        let batch = row_record_batch_from_state_rows(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             &[row],
         )
         .expect("parsed native exact batch");
@@ -4729,7 +4729,7 @@ mod tests {
     #[test]
     fn native_untracked_projection_preserves_duplicate_json_last_value() {
         let spec = Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
                 "x-lix-primary-key": ["/id"],
                 "type": "object",
@@ -4740,27 +4740,27 @@ mod tests {
                 },
                 "required": ["id", "body", "count"]
             }))
-            .expect("schema should derive entity surface spec"),
+            .expect("schema should derive row surface spec"),
         );
-        let tracked = tracked_row(StateRowSource::Branch, "project_message", "entity-1");
+        let tracked = tracked_row(StateRowSource::Branch, "project_message", "row-1");
         let key = decode_state_key(&tracked.key).expect("fixture key");
-        let slot = EntityStateSlot::Untracked(UntrackedStateRow {
+        let slot = RowStateSlot::Untracked(UntrackedStateRow {
             owner: CanonicalBranchId::from_bytes([7; 16]),
             key,
             value: UntrackedValue {
                 created_at: timestamp(3),
                 updated_at: timestamp(4),
                 cell: StateCell::Value(SharedStr::from(
-                    r#"{"id":"entity-1","body":"ok","count":"bad","count":7}"#,
+                    r#"{"id":"row-1","body":"ok","count":"bad","count":7}"#,
                 )),
                 metadata: None,
                 origin_key: None,
                 blob_manifest_object_ids: Vec::new(),
             },
         });
-        let batch = entity_record_batch_from_slots(
+        let batch = row_record_batch_from_slots(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             &[slot],
             Some("branch-a"),
         )
@@ -4779,7 +4779,7 @@ mod tests {
 
     #[test]
     fn native_malformed_raw_projection_fails_closed() {
-        let spec = entity_insert_spec_with_primary_key();
+        let spec = row_insert_spec_with_primary_key();
         let row = tracked_row_with_file(
             StateRowSource::Branch,
             "project_message",
@@ -4787,9 +4787,9 @@ mod tests {
             None,
             StateCell::Value(SharedStr::from("{not-json")),
         );
-        let error = entity_record_batch_from_state_rows(
+        let error = row_record_batch_from_state_rows(
             &spec,
-            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
             &[row],
         )
         .expect_err("malformed native payload must fail");
@@ -4802,12 +4802,12 @@ mod tests {
 
     #[tokio::test]
     async fn native_provider_schema_is_backed_by_a_forktree_view() {
-        let spec = entity_insert_spec_with_primary_key();
-        let provider = native_entity_spec(spec).await;
+        let spec = row_insert_spec_with_primary_key();
+        let provider = native_schema_spec(spec).await;
         assert!(
             provider
                 .schema()
-                .field_with_name("lixcol_entity_pk")
+                .field_with_name("lixcol_row_pk")
                 .is_ok()
         );
         let (_schema, request, filters) = provider
@@ -4820,25 +4820,25 @@ mod tests {
 
     #[test]
     fn native_exact_request_requires_and_preserves_correlated_file_owner() {
-        let request = EntityScanRequest {
-            filter: EntityScanFilter {
-                schema_keys: vec!["entity".to_string()],
+        let request = RowScanRequest {
+            filter: RowScanFilter {
+                schema_keys: vec!["row".to_string()],
                 branch_ids: vec!["branch-a".to_string()],
-                entity_pks: vec![EntityPk::single("b"), EntityPk::single("a")],
+                row_pks: vec![RowPk::single("b"), RowPk::single("a")],
                 file_ids: vec![NullableKeyFilter::Null],
                 untracked: Some(false),
-                ..EntityScanFilter::default()
+                ..RowScanFilter::default()
             },
             limit: Some(1),
-            ..EntityScanRequest::default()
+            ..RowScanRequest::default()
         };
-        let exact = exact_entity_batch_request(&request).expect("correlated exact request");
-        assert_eq!(exact.rows[0].entity_pk, EntityPk::single("b"));
-        assert_eq!(exact.rows[1].entity_pk, EntityPk::single("a"));
+        let exact = exact_row_batch_request(&request).expect("correlated exact request");
+        assert_eq!(exact.rows[0].row_pk, RowPk::single("b"));
+        assert_eq!(exact.rows[1].row_pk, RowPk::single("a"));
         assert!(exact.rows.iter().all(|row| row.file_id.is_none()));
         let mut without_file = request;
         without_file.filter.file_ids.clear();
-        assert!(exact_entity_batch_request(&without_file).is_none());
+        assert!(exact_row_batch_request(&without_file).is_none());
     }
 
     #[test]
@@ -4847,29 +4847,29 @@ mod tests {
         let slots = vec![
             None,
             None,
-            Some(EntityStateSlot::Tracked(visible.clone())),
-            Some(EntityStateSlot::Tracked(visible)),
+            Some(RowStateSlot::Tracked(visible.clone())),
+            Some(RowStateSlot::Tracked(visible)),
         ];
         let limited = visible_exact_slots(slots, Some(1));
         assert_eq!(limited.len(), 1);
         assert_eq!(
             decode_state_key(
-                &crate::sql2::entity_batch::tracked_slot(&limited[0])
+                &crate::sql2::row_batch::tracked_slot(&limited[0])
                     .expect("visible slot is tracked")
                     .key,
             )
             .unwrap()
-            .entity_pk,
-            EntityPk::single("visible")
+            .row_pk,
+            RowPk::single("visible")
         );
         let duplicates = visible_exact_slots(
             vec![
-                Some(EntityStateSlot::Tracked(tracked_row(
+                Some(RowStateSlot::Tracked(tracked_row(
                     StateRowSource::Branch,
                     "project_message",
                     "duplicate",
                 ))),
-                Some(EntityStateSlot::Tracked(tracked_row(
+                Some(RowStateSlot::Tracked(tracked_row(
                     StateRowSource::Branch,
                     "project_message",
                     "duplicate",
@@ -4898,38 +4898,38 @@ mod tests {
             false,
         ));
         assert!(!ExactFileIdFilterAnalyzer.supports(&multi));
-        let mut request = EntityScanRequest::default();
+        let mut request = RowScanRequest::default();
         apply_exact_file_id_filters(&mut request, &[multi]).expect("residual owner filter");
         assert!(request.filter.file_ids.is_empty());
     }
 
     #[test]
     fn native_primary_key_filters_route_typed_identity_and_boolean_semantics() {
-        let spec = entity_insert_spec_with_primary_key();
+        let spec = row_insert_spec_with_primary_key();
         let filters = vec![
-            eq_filter("id", "entity-a"),
+            eq_filter("id", "row-a"),
             Expr::InList(InList::new(
                 Box::new(column("id")),
-                vec![string_literal("entity-b"), string_literal("entity-a")],
+                vec![string_literal("row-b"), string_literal("row-a")],
                 false,
             )),
         ];
         assert_eq!(
-            entity_pks_from_primary_key_filters(&spec, &filters)
+            row_pks_from_primary_key_filters(&spec, &filters)
                 .expect("identity filters")
                 .expect("complete identity"),
-            vec![EntityPk::single("entity-a")]
+            vec![RowPk::single("row-a")]
         );
-        let analyzer = EntityPrimaryKeyFilterAnalyzer::new(&spec);
+        let analyzer = RowPrimaryKeyFilterAnalyzer::new(&spec);
         let disjunction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "entity-a")),
+            Box::new(eq_filter("id", "row-a")),
             Operator::Or,
-            Box::new(eq_filter("id", "entity-b")),
+            Box::new(eq_filter("id", "row-b")),
         ));
         let contradiction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "entity-a")),
+            Box::new(eq_filter("id", "row-a")),
             Operator::And,
-            Box::new(eq_filter("id", "entity-b")),
+            Box::new(eq_filter("id", "row-b")),
         ));
         assert_eq!(
             analyzer
@@ -4938,7 +4938,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![EntityPk::single("entity-a"), EntityPk::single("entity-b")]
+            vec![RowPk::single("row-a"), RowPk::single("row-b")]
         );
         assert!(
             analyzer
@@ -4951,7 +4951,7 @@ mod tests {
 
     #[test]
     fn native_composite_primary_key_filters_use_declared_order_and_types() {
-        let spec = crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+        let spec = crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
             "x-lix-key": "localized_message",
             "x-lix-primary-key": ["/locale", "/revision"],
             "type": "object",
@@ -4971,10 +4971,10 @@ mod tests {
             )),
             eq_filter("locale", "en"),
         ];
-        let actual = entity_pks_from_primary_key_filters(&spec, &filters)
+        let actual = row_pks_from_primary_key_filters(&spec, &filters)
             .expect("composite filters")
             .expect("complete composite identity");
-        let expected = EntityPk::from_external_parts(
+        let expected = RowPk::from_external_parts(
             vec!["en".to_string(), "7".to_string()],
             &spec.primary_key_component_types,
         )
@@ -4982,7 +4982,7 @@ mod tests {
         assert_eq!(actual, vec![expected]);
 
         assert!(
-            entity_pks_from_primary_key_filters(&spec, &[eq_filter("revision", "7")])
+            row_pks_from_primary_key_filters(&spec, &[eq_filter("revision", "7")])
                 .expect("incomplete composite filter")
                 .is_none()
         );
@@ -4990,22 +4990,22 @@ mod tests {
 
     #[test]
     fn native_primary_key_filters_ignore_non_key_and_negated_predicates() {
-        let spec = entity_insert_spec_with_primary_key();
+        let spec = row_insert_spec_with_primary_key();
         let filters = vec![
             eq_filter("body", "hello"),
             Expr::InList(InList::new(
                 Box::new(column("id")),
-                vec![string_literal("entity-a")],
+                vec![string_literal("row-a")],
                 true,
             )),
         ];
         assert!(
-            entity_pks_from_primary_key_filters(&spec, &filters)
+            row_pks_from_primary_key_filters(&spec, &filters)
                 .expect("ignored filters")
                 .unwrap_or_default()
                 .is_empty()
         );
-        let integer = crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+        let integer = crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
             "x-lix-key": "integer_note",
             "x-lix-primary-key": ["/id"],
             "type": "object",
@@ -5013,7 +5013,7 @@ mod tests {
         }))
         .expect("integer schema");
         assert!(
-            entity_pks_from_primary_key_filters(&integer, &[eq_filter("id", "42")])
+            row_pks_from_primary_key_filters(&integer, &[eq_filter("id", "42")])
                 .expect("mismatched integer literal")
                 .is_none()
         );
@@ -5022,7 +5022,7 @@ mod tests {
     #[tokio::test]
     async fn native_payload_filter_planning_preserves_snapshot_and_limit_rules() {
         let spec = Arc::new(
-            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&json!({
                 "x-lix-key": "pushdown_note",
                 "x-lix-primary-key": ["/id"],
                 "type": "object",
@@ -5036,12 +5036,12 @@ mod tests {
             }))
             .expect("filter schema"),
         );
-        let provider = native_entity_spec(spec).await;
-        let entity_pk_index = provider
+        let provider = native_schema_spec(spec).await;
+        let row_pk_index = provider
             .schema
-            .index_of("lixcol_entity_pk")
-            .expect("entity pk column");
-        let projection = vec![entity_pk_index];
+            .index_of("lixcol_row_pk")
+            .expect("row pk column");
+        let projection = vec![row_pk_index];
         let (_schema, request, filters) = provider
             .plan_scan_parts(Some(&projection), &[eq_filter("kind", "todo")], Some(5))
             .await
@@ -5086,12 +5086,12 @@ mod tests {
             },
             ..malformed
         };
-        let filter = EntityRowFilter::ColumnEq {
+        let filter = RowRowFilter::ColumnEq {
             column: "body".to_string(),
-            column_type: EntityColumnType::String,
-            value: EntityFilterValue::String("hello".to_string()),
+            column_type: SchemaColumnType::String,
+            value: RowFilterValue::String("hello".to_string()),
         };
-        assert!(apply_entity_state_filters(vec![malformed], &[filter]).is_err());
+        assert!(apply_row_state_filters(vec![malformed], &[filter]).is_err());
 
         let out_of_range = tracked_row_with_file(
             StateRowSource::Branch,
@@ -5100,12 +5100,12 @@ mod tests {
             None,
             StateCell::Value(SharedStr::from(r#"{"count":9223372036854775808}"#)),
         );
-        let filter = EntityRowFilter::ColumnEq {
+        let filter = RowRowFilter::ColumnEq {
             column: "count".to_string(),
-            column_type: EntityColumnType::Integer,
-            value: EntityFilterValue::Integer(1),
+            column_type: SchemaColumnType::Integer,
+            value: RowFilterValue::Integer(1),
         };
-        let error = apply_entity_state_filters(vec![out_of_range], &[filter])
+        let error = apply_row_state_filters(vec![out_of_range], &[filter])
             .expect_err("out-of-range BIGINT must fail closed");
         let error = crate::sql2::error::datafusion_error_to_lix_error(error);
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);

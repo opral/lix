@@ -46,7 +46,7 @@ pub(super) fn classify_stale_commit<'a>(
                     StateKeyRef {
                         schema_key: row.schema_key.as_str(),
                         file_id: row.file_id.map(SharedStr::as_str),
-                        entity_pk: row.entity_pk,
+                        row_pk: row.row_pk,
                     },
                 )
             }),
@@ -117,7 +117,7 @@ mod tests {
     use super::*;
     use crate::catalog::SchemaPlanId;
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::StateKey;
     use crate::transaction::types::{PreparedRowFacts, PreparedStateBatch};
 
@@ -125,7 +125,7 @@ mod tests {
         StateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         }
     }
 
@@ -134,14 +134,14 @@ mod tests {
             .map(|index| StateKey {
                 schema_key: "plugin_entity".to_owned(),
                 file_id: Some("hot-file".to_owned()),
-                entity_pk: EntityPk::single(format!("row-{index}")),
+                row_pk: RowPk::single(format!("row-{index}")),
             })
             .collect::<Vec<_>>();
         let concurrent = (0..rows)
             .map(|index| StateKey {
                 schema_key: "plugin_entity".to_owned(),
                 file_id: Some("hot-file".to_owned()),
-                entity_pk: EntityPk::single(if index.is_multiple_of(2) {
+                row_pk: RowPk::single(if index.is_multiple_of(2) {
                     format!("row-{index}")
                 } else {
                     format!("other-{index}")
@@ -181,7 +181,7 @@ mod tests {
         state_rows.push_parts_with_change_addressability(
             SchemaPlanId::for_test(0),
             PreparedRowFacts::default(),
-            EntityPk::single("row-a"),
+            RowPk::single("row-a"),
             "plugin_entity".to_owned().into(),
             Some("file-a".to_owned().into()),
             None,
@@ -212,7 +212,7 @@ mod tests {
         let unrelated = StateKey {
             schema_key: "plugin_entity".to_owned(),
             file_id: Some("file-b".to_owned()),
-            entity_pk: EntityPk::single("row-a"),
+            row_pk: RowPk::single("row-a"),
         };
 
         assert_eq!(

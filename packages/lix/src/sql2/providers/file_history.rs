@@ -19,15 +19,15 @@ use crate::binary_cas::BlobId;
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
-use crate::entity_pk::EntityPk;
-use crate::forktree::{ForkTreeReadFacade, StateKey, encode_state_entity_prefix_bounds};
+use crate::row_pk::RowPk;
+use crate::forktree::{ForkTreeReadFacade, StateKey, encode_state_row_prefix_bounds};
 use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
-    ObservedStateOrdinal, ObservedStateRows, StateFilter, entity_pk_json_array,
+    ObservedStateOrdinal, ObservedStateRows, StateFilter, row_pk_json_array,
 };
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::SqlChangelogQuerySource;
@@ -441,7 +441,7 @@ impl FileHistoryPublicPredicate {
 }
 
 /// A conservative exact public `id` constraint that can be translated to the
-/// canonical descriptor/blob entity primary key. Unlike
+/// canonical descriptor/blob row primary key. Unlike
 /// [`FileHistoryPublicPredicate`], this deliberately declines disjunctions and
 /// non-literal `id` expressions: those retain the existing complete traversal
 /// and DataFusion residual evaluation.
@@ -456,8 +456,8 @@ impl FileHistoryLookupIds {
             .map(Self)
     }
 
-    fn entity_pks(&self) -> Result<Vec<String>, LixError> {
-        self.0.iter().map(|id| entity_pk_json_array(id)).collect()
+    fn row_pks(&self) -> Result<Vec<String>, LixError> {
+        self.0.iter().map(|id| row_pk_json_array(id)).collect()
     }
 }
 
@@ -873,10 +873,10 @@ fn prepare_file_history_rows(
         if !public_predicate.matches(&id, path.as_deref()) {
             continue;
         }
-        let entity_pk = entity_pk_json_array(&descriptor.id).ok();
+        let row_pk = row_pk_json_array(&descriptor.id).ok();
         if !route.matches_surface_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            entity_pk.as_deref().unwrap_or(&descriptor.id),
+            row_pk.as_deref().unwrap_or(&descriptor.id),
             Some(&descriptor.id),
             event.depth,
         ) {
@@ -1203,7 +1203,7 @@ where
         observed_commit_id,
         StateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-            entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
+            row_pks: vec![RowPk::single(PLUGIN_OWNER_KEY)],
             file_ids: lookup_ids
                 .map(|lookup_ids| {
                     lookup_ids
@@ -1228,11 +1228,11 @@ async fn load_selected_file_history_observed_rows<S>(
 where
     S: StorageAdapterRead,
 {
-    let entity_pks = lookup_ids
+    let row_pks = lookup_ids
         .0
         .iter()
         .map(|file_id| {
-            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+            RowPk::uuid_from_canonical(file_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history id must be a canonical UUID: {error}"),
@@ -1249,7 +1249,7 @@ where
                 FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 BLOB_REF_SCHEMA_KEY.to_string(),
             ],
-            entity_pks,
+            row_pks,
             file_ids: file_ids.clone(),
             include_tombstones: true,
         },
@@ -1302,10 +1302,10 @@ where
             observed_commit_id,
             StateFilter {
                 schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                entity_pks: ids
+                row_pks: ids
                     .iter()
                     .map(|directory_id| {
-                        EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+                        RowPk::uuid_from_canonical(directory_id).map_err(|error| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
                                 format!(
@@ -1342,18 +1342,18 @@ where
 {
     let commit_id = CommitId::parse_lix(observed_commit_id, "file history observed commit")?;
     let rows = if !filter.schema_keys.is_empty()
-        && !filter.entity_pks.is_empty()
+        && !filter.row_pks.is_empty()
         && let Some(file_ids) = exact_file_id_values(&filter.file_ids)
     {
         let keys = filter
             .schema_keys
             .iter()
             .flat_map(|schema_key| {
-                filter.entity_pks.iter().flat_map(|entity_pk| {
+                filter.row_pks.iter().flat_map(|row_pk| {
                     file_ids.iter().map(|file_id| StateKey {
                         schema_key: schema_key.clone(),
                         file_id: file_id.clone(),
-                        entity_pk: entity_pk.clone(),
+                        row_pk: row_pk.clone(),
                     })
                 })
             })
@@ -1364,11 +1364,11 @@ where
             .into_iter()
             .flatten()
             .collect()
-    } else if !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
+    } else if !filter.schema_keys.is_empty() && !filter.row_pks.is_empty() {
         let mut rows = Vec::new();
         for schema_key in &filter.schema_keys {
-            for entity_pk in &filter.entity_pks {
-                let bounds = encode_state_entity_prefix_bounds(schema_key, entity_pk);
+            for row_pk in &filter.row_pks {
+                let bounds = encode_state_row_prefix_bounds(schema_key, row_pk);
                 rows.extend(
                     historical
                         .scan_state_rows_at_commit_range(
@@ -1388,7 +1388,7 @@ where
         .into_iter()
         .filter(|row| {
             (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
-                && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
+                && (filter.row_pks.is_empty() || filter.row_pks.contains(&row.key.row_pk))
                 && (filter.file_ids.is_empty()
                     || filter.file_ids.iter().any(|file_id| match file_id {
                         NullableKeyFilter::Any => true,
@@ -1430,7 +1430,7 @@ where
         observed_commit_id,
         StateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-            entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+            row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
             file_ids: vec![NullableKeyFilter::Null],
             include_tombstones: true,
         },
@@ -1578,22 +1578,22 @@ fn file_history_directory_route(
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
     route.file_ids.clear();
-    route.entity_pks = directory_ids
+    route.row_pks = directory_ids
         .iter()
         .map(|directory_id| {
-            let entity_pk = EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+            let row_pk = RowPk::uuid_from_canonical(directory_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history directory ID must be a canonical UUID: {error}"),
                 )
             })?;
-            entity_pk.as_json_array_text()
+            row_pk.as_json_array_text()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    route.resolved_entity_pks = directory_ids
+    route.resolved_row_pks = directory_ids
         .iter()
         .map(|directory_id| {
-            EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+            RowPk::uuid_from_canonical(directory_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history directory ID must be a canonical UUID: {error}"),
@@ -1610,12 +1610,12 @@ fn file_history_descriptor_blob_route(
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
     route.file_ids = lookup_ids.0.iter().cloned().collect();
-    route.entity_pks = lookup_ids.entity_pks()?;
-    route.resolved_entity_pks = lookup_ids
+    route.row_pks = lookup_ids.row_pks()?;
+    route.resolved_row_pks = lookup_ids
         .0
         .iter()
         .map(|file_id| {
-            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+            RowPk::uuid_from_canonical(file_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history id must be a canonical UUID: {error}"),
@@ -1684,9 +1684,9 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let mut owner_route = file_history_plugin_route(event_route, lookup_ids);
-    let owner_pk = EntityPk::single(PLUGIN_OWNER_KEY);
-    owner_route.entity_pks = vec![owner_pk.as_json_array_text()?];
-    owner_route.resolved_entity_pks = vec![owner_pk];
+    let owner_pk = RowPk::single(PLUGIN_OWNER_KEY);
+    owner_route.row_pks = vec![owner_pk.as_json_array_text()?];
+    owner_route.resolved_row_pks = vec![owner_pk];
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
@@ -1899,9 +1899,9 @@ where
     }
 
     let mut registry_route = event_route.clone();
-    let registry_pk = EntityPk::single(PLUGIN_REGISTRY_KEY);
-    registry_route.entity_pks = vec![registry_pk.as_json_array_text()?];
-    registry_route.resolved_entity_pks = vec![registry_pk];
+    let registry_pk = RowPk::single(PLUGIN_REGISTRY_KEY);
+    registry_route.row_pks = vec![registry_pk.as_json_array_text()?];
+    registry_route.resolved_row_pks = vec![registry_pk];
     let registry_events = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
@@ -2091,10 +2091,10 @@ fn parse_file_history_descriptors(
         .iter()
         .filter(|entry| entry.change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
-            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            let row_id = entry.change.row_pk.as_single_string_owned()?;
             if entry.change.file_id.as_deref() != Some(row_id.as_str()) {
                 return Err(invalid_file_history_state(format!(
-                    "file descriptor row file_id does not match authenticated entity key '{}'",
+                    "file descriptor row file_id does not match authenticated row key '{}'",
                     row_id
                 )));
             }
@@ -2137,7 +2137,7 @@ fn parse_file_history_directories(
         .iter()
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
-            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            let row_id = entry.change.row_pk.as_single_string_owned()?;
             if entry.change.file_id.is_some() {
                 return Err(invalid_file_history_state(format!(
                     "directory descriptor row '{}' has a non-NULL file_id",
@@ -2187,7 +2187,7 @@ fn parse_file_history_blobs(
         .iter()
         .filter(|entry| entry.change.schema_key == BLOB_REF_SCHEMA_KEY)
         .map(|entry| {
-            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            let row_id = entry.change.row_pk.as_single_string_owned()?;
             let file_id = entry.change.file_id.clone().ok_or_else(|| {
                 invalid_file_history_state(format!(
                     "blob reference history row '{row_id}' is missing file_id"
@@ -2271,7 +2271,7 @@ fn parse_file_history_plugin_owners(
         .iter()
         .filter(|entry| {
             entry.change.schema_key == KEY_VALUE_SCHEMA_KEY
-                && entry.change.entity_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && entry.change.row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
         })
         .map(|entry| {
             let file_id = entry.change.file_id.clone().ok_or_else(|| {
@@ -2296,10 +2296,10 @@ fn parse_file_history_observed_descriptors(
         .map(|observed| {
             let _ = observed.observed_commit_id();
             let row = observed.row();
-            let row_id = row.entity_pk().as_single_string_owned()?;
+            let row_id = row.row_pk().as_single_string_owned()?;
             if row.file_id().as_deref() != Some(row_id.as_str()) {
                 return Err(invalid_file_history_state(format!(
-                    "observed file descriptor row file_id does not match authenticated entity key '{}'",
+                    "observed file descriptor row file_id does not match authenticated row key '{}'",
                     row_id
                 )));
             }
@@ -2352,7 +2352,7 @@ fn parse_file_history_observed_directories(
         .filter(|observed| observed.row().schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|observed| {
             let row = observed.row();
-            let row_id = row.entity_pk().as_single_string_owned()?;
+            let row_id = row.row_pk().as_single_string_owned()?;
             if row.file_id().is_some() {
                 return Err(invalid_file_history_state(format!(
                     "observed directory descriptor row '{}' has a non-NULL file_id",
@@ -2408,7 +2408,7 @@ fn parse_file_history_observed_blobs(
         .filter(|observed| observed.row().schema_key() == BLOB_REF_SCHEMA_KEY)
         .map(|observed| {
             let row = observed.row();
-            let row_id = row.entity_pk().as_single_string_owned()?;
+            let row_id = row.row_pk().as_single_string_owned()?;
             let file_id = row.file_id().map(str::to_owned).ok_or_else(|| {
                 invalid_file_history_state(format!(
                     "observed blob reference row '{row_id}' is missing file_id"
@@ -2470,7 +2470,7 @@ fn parse_file_history_observed_plugin_owners(
         .filter(|observed| {
             let row = observed.row();
             row.schema_key() == KEY_VALUE_SCHEMA_KEY
-                && row.entity_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && row.row_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
         })
         .map(|observed| {
             let row = observed.row();
@@ -2536,12 +2536,12 @@ fn file_history_event_affects_observed_file(
                         .as_deref()
                         .is_some_and(|file_id| file_id == descriptor.id)
                         || change
-                            .entity_pk
+                            .row_pk
                             .as_single_string_owned()
-                            .is_ok_and(|entity_id| entity_id == descriptor.id)
+                            .is_ok_and(|row_id| row_id == descriptor.id)
                 }
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                    let Ok(changed_directory_id) = change.entity_pk.as_single_string_owned() else {
+                    let Ok(changed_directory_id) = change.row_pk.as_single_string_owned() else {
                         return Ok(false);
                     };
                     let Some(directory_id) = descriptor.directory_id.as_deref() else {
@@ -2550,7 +2550,7 @@ fn file_history_event_affects_observed_file(
                     directory_tree.has_ancestor_including(directory_id, &changed_directory_id)?
                 }
                 KEY_VALUE_SCHEMA_KEY
-                    if change.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
+                    if change.row_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
                 {
                     event.file_id == descriptor.id
                 }
@@ -2600,7 +2600,7 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
         ("content", Col::Binary(|row| row.data.clone())),
         (
             HISTORY_COL_ENTITY_PK,
-            Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
+            Col::Utf8Fallible(|row| row_pk_json_array(&row.descriptor().id).map(Some)),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,
@@ -2682,7 +2682,7 @@ mod tests {
     use crate::binary_cas::BlobId;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::{HistoricalStateRow, StateKey};
     use crate::plugin::{
         PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
@@ -2709,7 +2709,7 @@ mod tests {
             change: MaterializedChange {
                 id: format!("change-{file_id}-{depth}"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                entity_pk: EntityPk::single(file_id),
+                row_pk: RowPk::single(file_id),
                 schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: Some(file_id.to_string()),
                 snapshot_content: snapshot_content.map(Into::into),
@@ -2741,7 +2741,7 @@ mod tests {
 
     fn observed_row(
         schema_key: &str,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         file_id: Option<&str>,
         deleted: bool,
         ordinal: u128,
@@ -2750,7 +2750,7 @@ mod tests {
             LixTimestamp::expect_parse("test historical row timestamp", "2026-01-01T00:00:00Z");
         HistoricalStateRow {
             key: StateKey {
-                entity_pk,
+                row_pk,
                 schema_key: schema_key.to_string(),
                 file_id: file_id.map(str::to_owned),
             },
@@ -2849,7 +2849,7 @@ mod tests {
                     LixTimestamp::expect_parse("test history updated_at", &change.created_at);
                 HistoricalStateRow {
                     key: StateKey {
-                        entity_pk: change.entity_pk,
+                        row_pk: change.row_pk,
                         schema_key: change.schema_key,
                         file_id: change.file_id,
                     },
@@ -2916,7 +2916,7 @@ mod tests {
         assert_eq!(state.descriptors.len(), ROW_COUNT);
         assert_eq!(state.rows.iter().len(), ROW_COUNT);
         assert_eq!(state.rows.retained_batch_count(), 1);
-        let commit_buffers = state.rows.observed_commit_buffer_identities();
+        let commit_buffers = state.rows.observed_commit_buffer_identitys();
         assert_eq!(commit_buffers.len(), 1);
         let first_commit_ptr = state
             .rows
@@ -2943,7 +2943,7 @@ mod tests {
         let mut entry = history_entry(file_id, 0, Some(snapshot_content));
         entry.observed_commit_id = observed_commit_id.to_string();
         entry.change.id = format!("owner-{file_id}-{observed_commit_id}");
-        entry.change.entity_pk = EntityPk::single(super::PLUGIN_OWNER_KEY);
+        entry.change.row_pk = RowPk::single(super::PLUGIN_OWNER_KEY);
         entry.change.schema_key = super::KEY_VALUE_SCHEMA_KEY.to_string();
         FileHistoryPluginOwnerRecord {
             file_id: file_id.to_string(),
@@ -2959,7 +2959,7 @@ mod tests {
         let mut entry = history_entry(file_id, 0, None);
         entry.observed_commit_id = observed_commit_id.to_string();
         entry.change.id = format!("plugin-state-{schema_key}-{observed_commit_id}");
-        entry.change.entity_pk = EntityPk::single("plugin-state");
+        entry.change.row_pk = RowPk::single("plugin-state");
         entry.change.schema_key = schema_key.to_string();
         FileHistoryPluginStateRecord {
             file_id: file_id.to_string(),
@@ -3116,7 +3116,7 @@ mod tests {
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
-                EntityPk::single(file_id),
+                RowPk::single(file_id),
                 Some(file_id),
                 true,
                 1,
@@ -3132,7 +3132,7 @@ mod tests {
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-                EntityPk::single(directory_id),
+                RowPk::single(directory_id),
                 None,
                 true,
                 2,
@@ -3147,7 +3147,7 @@ mod tests {
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::BLOB_REF_SCHEMA_KEY,
-                EntityPk::single(file_id),
+                RowPk::single(file_id),
                 Some(file_id),
                 true,
                 3,
@@ -3162,7 +3162,7 @@ mod tests {
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::KEY_VALUE_SCHEMA_KEY,
-                EntityPk::single(super::PLUGIN_OWNER_KEY),
+                RowPk::single(super::PLUGIN_OWNER_KEY),
                 Some(file_id),
                 true,
                 4,
@@ -3177,7 +3177,7 @@ mod tests {
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
-                EntityPk::single(file_id),
+                RowPk::single(file_id),
                 Some(file_id),
                 false,
                 5,
@@ -3192,7 +3192,7 @@ mod tests {
         let file_id = "01920000-0000-7000-8000-0000000000a2";
         let mut file_tombstone = observed_row(
             super::FILE_DESCRIPTOR_SCHEMA_KEY,
-            EntityPk::single(file_id),
+            RowPk::single(file_id),
             Some(file_id),
             true,
             6,
@@ -3208,7 +3208,7 @@ mod tests {
         );
         let mut directory_tombstone = observed_row(
             super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            EntityPk::single("01920000-0000-7000-8000-0000000000b2"),
+            RowPk::single("01920000-0000-7000-8000-0000000000b2"),
             None,
             true,
             7,
@@ -3224,7 +3224,7 @@ mod tests {
         );
         let mut owner_tombstone = observed_row(
             super::KEY_VALUE_SCHEMA_KEY,
-            EntityPk::single(super::PLUGIN_OWNER_KEY),
+            RowPk::single(super::PLUGIN_OWNER_KEY),
             Some(file_id),
             true,
             8,
@@ -3488,8 +3488,8 @@ mod tests {
             assert_eq!(event.file_id, format!("file-{index:04}"));
             assert_eq!(event.source_changes.len(), 1);
             assert_eq!(
-                event.source_changes[0].entity_pk,
-                EntityPk::single(format!("directory-{index:04}"))
+                event.source_changes[0].row_pk,
+                RowPk::single(format!("directory-{index:04}"))
             );
         }
 
@@ -3631,10 +3631,10 @@ mod tests {
             },
             &ids,
         )
-        .expect("file IDs should encode as canonical entity keys");
+        .expect("file IDs should encode as canonical row keys");
 
         assert_eq!(
-            route.entity_pks,
+            route.row_pks,
             vec![
                 r#"["01920000-0000-7000-8000-0000000000a2"]"#.to_string(),
                 r#"["01920000-0000-7000-8000-0000000000b2"]"#.to_string()

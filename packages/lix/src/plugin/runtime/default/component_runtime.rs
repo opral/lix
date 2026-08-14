@@ -1861,7 +1861,7 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
 
 struct ValidatedCreatedPacketPage {
     schemas: Vec<String>,
-    identities: Vec<ValidatedPacketIdentity>,
+    identitys: Vec<ValidatedPacketIdentity>,
 }
 
 enum ValidatedPacketIdentity {
@@ -2123,12 +2123,9 @@ fn validate_new_certified_packet_keys(
     page: ValidatedCreatedPacketPage,
     existing: &CertifiedPacketRowKeys,
 ) -> Result<(std::collections::BTreeSet<String>, CertifiedPacketRowKeys), LixError> {
-    let ValidatedCreatedPacketPage {
-        schemas,
-        identities,
-    } = page;
+    let ValidatedCreatedPacketPage { schemas, identitys } = page;
     let mut page_keys = CertifiedPacketRowKeys::default();
-    for identity in identities {
+    for identity in identitys {
         page_keys.insert_validated(identity, &schemas, existing)?;
     }
     Ok((schemas.into_iter().collect(), page_keys))
@@ -2171,7 +2168,7 @@ fn validate_created_packet_page(
     }
     let mut input = PacketSliceReader { payload, offset: 0 };
     let mut schemas = Vec::<String>::new();
-    let mut identities = Vec::with_capacity(record_count as usize);
+    let mut identitys = Vec::with_capacity(record_count as usize);
     let mut previous_local_ref = None;
     for _ in 0..record_count {
         let record_len = input.u32()? as usize;
@@ -2223,7 +2220,7 @@ fn validate_created_packet_page(
                 if record.u8()? > 1 {
                     return Err("packet upsert has an invalid effect".to_owned());
                 }
-                identities.push(ValidatedPacketIdentity::Explicit {
+                identitys.push(ValidatedPacketIdentity::Explicit {
                     schema_index,
                     fingerprint: *fingerprint.finalize().as_bytes(),
                     generated_local_ref: only_component.and_then(|component| {
@@ -2240,7 +2237,7 @@ fn validate_created_packet_page(
                     return Err("packet create local refs must be strictly increasing".to_owned());
                 }
                 previous_local_ref = Some(local_ref);
-                identities.push(ValidatedPacketIdentity::Create {
+                identitys.push(ValidatedPacketIdentity::Create {
                     schema_index,
                     local_ref,
                 });
@@ -2260,10 +2257,7 @@ fn validate_created_packet_page(
     if input.offset != payload.len() {
         return Err("packet page has trailing bytes".to_owned());
     }
-    Ok(Some(ValidatedCreatedPacketPage {
-        schemas,
-        identities,
-    }))
+    Ok(Some(ValidatedCreatedPacketPage { schemas, identitys }))
 }
 
 struct PacketSliceReader<'a> {

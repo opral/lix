@@ -26,7 +26,7 @@ where
     let Some(row) = rows.iter().find(|row| {
         !row.value.cell.deleted()
             && state_row_key(row).ok().is_some_and(|key| {
-                key.entity_pk
+                key.row_pk
                     .as_single_string()
                     .ok()
                     .is_some_and(|value| value == DETERMINISTIC_MODE_KEY)
@@ -52,7 +52,7 @@ where
     let sequence = rows.iter().find(|row| {
         !row.value.cell.deleted()
             && state_row_key(row).ok().is_some_and(|key| {
-                key.entity_pk
+                key.row_pk
                     .as_single_string()
                     .ok()
                     .is_some_and(|value| value == DETERMINISTIC_SEQUENCE_KEY)
@@ -64,7 +64,7 @@ where
 
     let initialized = rows.iter().find(|row| {
         state_row_key(row).ok().is_some_and(|key| {
-            key.entity_pk
+            key.row_pk
                 .as_single_string()
                 .ok()
                 .is_some_and(|value| value == DETERMINISTIC_SEQUENCE_INITIALIZED_KEY)
@@ -96,10 +96,10 @@ async fn load_key_value_rows<R>(state: &ForkTreeStateView<R>) -> Result<Vec<Stat
 where
     R: StorageAdapterRead,
 {
-    let empty_entity_pk = crate::entity_pk::EntityPk {
-        components: crate::entity_pk::EntityPkComponents::Empty,
+    let empty_row_pk = crate::row_pk::RowPk {
+        components: crate::row_pk::RowPkComponents::Empty,
     };
-    let lower = crate::forktree::encode_state_entity_prefix(KEY_VALUE_SCHEMA_KEY, &empty_entity_pk);
+    let lower = crate::forktree::encode_state_row_prefix(KEY_VALUE_SCHEMA_KEY, &empty_row_pk);
     let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
     let rows = state
         .branch_range(
@@ -111,7 +111,7 @@ where
         )
         .await
         .map_err(LixError::from)?;
-    let mut identities = std::collections::BTreeSet::new();
+    let mut identitys = std::collections::BTreeSet::new();
     for row in &rows {
         let state_key = state_row_key(row)?;
         if state_key.schema_key != KEY_VALUE_SCHEMA_KEY || state_key.file_id.is_some() {
@@ -120,13 +120,13 @@ where
                 "deterministic key-value scan returned a row outside its authenticated owner",
             ));
         }
-        let key = state_key.entity_pk.as_single_string().map_err(|error| {
+        let key = state_key.row_pk.as_single_string().map_err(|error| {
             LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 format!("deterministic key-value row has an invalid identity: {error}"),
             )
         })?;
-        if !identities.insert(key.to_owned()) {
+        if !identitys.insert(key.to_owned()) {
             return Err(LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 format!("deterministic key-value row '{key}' has a duplicate identity"),

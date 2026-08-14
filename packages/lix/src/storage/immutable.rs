@@ -282,7 +282,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn segment_identity_depends_on_ordered_identities_and_lengths() {
+    fn segment_identity_depends_on_ordered_identitys_and_lengths() {
         let mut left = ImmutableSegmentWriter::default();
         left.insert(Key(Bytes::from_static(b"a")), Bytes::from_static(b"AA"))
             .expect("insert a");

@@ -14,7 +14,7 @@ use crate::LixError;
 use crate::branch::BranchRefStoreReader;
 use crate::changelog::{ChangeRecord, CommitId, CommitRecord};
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::transaction::staging::{
@@ -29,7 +29,7 @@ use crate::forktree::{
     CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
     PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCell, StateKey,
     StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValue, StateValueRef,
-    encode_current_state_packs, encode_state_entity_prefix_bounds, encode_state_key,
+    encode_current_state_packs, encode_state_row_prefix_bounds, encode_state_key,
     encode_state_value, introduced_checkpoint_marker, load_commit, load_commit_summary,
     open_coherent_view_on_read, select_historical_commit_members, state_points,
 };
@@ -285,7 +285,7 @@ where
             if proof.replay_bytes == 0
                 || proof.ordered_identity_digest
                     != crate::collection_generation::ordered_single_string_identity_digest(
-                        tracked_rows.iter().map(|row| row.entity_pk),
+                        tracked_rows.iter().map(|row| row.row_pk),
                     )
                     .ok_or_else(|| {
                         writer_error("complete replacement has a non-string primary key")
@@ -304,7 +304,7 @@ where
                 ));
             }
             let bounds =
-                encode_state_entity_prefix_bounds(first.schema_key.as_str(), &EntityPk::empty());
+                encode_state_row_prefix_bounds(first.schema_key.as_str(), &RowPk::empty());
             Ok((bounds.lower, bounds.upper))
         })
         .transpose()?;
@@ -343,7 +343,7 @@ where
             encode_state_key(StateKeyRef {
                 schema_key: row.schema_key.as_str(),
                 file_id: row.file_id.map(|value| value.as_str()),
-                entity_pk: row.entity_pk,
+                row_pk: row.row_pk,
             })
         })
         .collect::<Vec<_>>();
@@ -396,7 +396,7 @@ where
             change_id,
             account_id: active_account_id.to_string(),
             schema_key: row.schema_key.to_string(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.map(ToString::to_string),
             snapshot,
             metadata,
@@ -591,7 +591,7 @@ where
         change_id: change_refs.branch_ref_change_id,
         account_id: active_account_id.to_string(),
         schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
-        entity_pk: EntityPk::uuid_from_canonical(&branch_id).map_err(|error| {
+        row_pk: RowPk::uuid_from_canonical(&branch_id).map_err(|error| {
             writer_error(format!("transaction branch identity is invalid: {error}"))
         })?,
         file_id: None,
@@ -1064,7 +1064,7 @@ where
                 encode_state_key(StateKeyRef {
                     schema_key: selected.schema_key(),
                     file_id: selected.file_id(),
-                    entity_pk: selected.entity_pk(),
+                    row_pk: selected.row_pk(),
                 }),
             )
         })
@@ -1097,7 +1097,7 @@ where
     }
 
     let mut touched_presence = BTreeMap::<Vec<u8>, bool>::new();
-    // Fresh identities are the only new catalog members in ordered history;
+    // Fresh identitys are the only new catalog members in ordered history;
     // selected historical members already own catalog entries. Build the
     // unique authenticated key set before any fresh object is encoded.
     let mut catalog_change_ids = Vec::new();
@@ -1123,7 +1123,7 @@ where
 
     let mut contents = Vec::with_capacity(drafts.len());
     for draft in drafts {
-        let mut seen_identities = BTreeSet::<Vec<u8>>::new();
+        let mut seen_identitys = BTreeSet::<Vec<u8>>::new();
         let mut pending_mutations = Vec::new();
         let mut members = Vec::new();
         let mut max_selected_source_generation: Option<u64> = None;
@@ -1157,9 +1157,9 @@ where
             let key = encode_state_key(StateKeyRef {
                 schema_key: row.schema_key.as_str(),
                 file_id: row.file_id.map(|value| value.as_str()),
-                entity_pk: row.entity_pk,
+                row_pk: row.row_pk,
             });
-            if !seen_identities.insert(key.clone()) {
+            if !seen_identitys.insert(key.clone()) {
                 return Err(writer_error(
                     "ordered history repeats one logical state identity",
                 ));
@@ -1180,7 +1180,7 @@ where
                 change_id,
                 account_id: active_account_id.to_string(),
                 schema_key: row.schema_key.to_string(),
-                entity_pk: row.entity_pk.clone(),
+                row_pk: row.row_pk.clone(),
                 file_id: row.file_id.map(ToString::to_string),
                 snapshot,
                 metadata,
@@ -1245,9 +1245,9 @@ where
                 let identity = encode_state_key(StateKeyRef {
                     schema_key: selected.schema_key(),
                     file_id: selected.file_id(),
-                    entity_pk: selected.entity_pk(),
+                    row_pk: selected.row_pk(),
                 });
-                if !seen_identities.insert(identity.clone()) {
+                if !seen_identitys.insert(identity.clone()) {
                     return Err(writer_error(
                         "ordered history repeats one fresh/selected logical identity",
                     ));
@@ -1281,7 +1281,7 @@ where
                     crate::changelog::decode_forktree_change_payload(&payload, selected.change_id)?;
                 if record.schema_key != selected.schema_key()
                     || record.file_id.as_deref() != selected.file_id()
-                    || record.entity_pk != *selected.entity_pk()
+                    || record.row_pk != *selected.row_pk()
                     || record.snapshot.is_none() != selected.deleted
                 {
                     return Err(writer_error(
@@ -1544,7 +1544,7 @@ where
         change_id: final_content.draft.branch_ref_change_id,
         account_id: active_account_id.to_string(),
         schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
-        entity_pk: EntityPk::uuid_from_canonical(&branch_id).map_err(|error| {
+        row_pk: RowPk::uuid_from_canonical(&branch_id).map_err(|error| {
             writer_error(format!("transaction branch identity is invalid: {error}"))
         })?,
         file_id: None,
@@ -1786,7 +1786,7 @@ where
                 let state_key = StateKey {
                     schema_key: "lix_binary_blob_ref".to_owned(),
                     file_id: Some(file_id.clone()),
-                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    row_pk: RowPk::uuid_from_canonical(file_id).map_err(|error| {
                         writer_error(format!(
                             "verified blob splice file identity is not a canonical UUID: {error}"
                         ))
@@ -1806,7 +1806,7 @@ where
                 let state_key = StateKey {
                     schema_key: "lix_binary_blob_ref".to_owned(),
                     file_id: Some(file_id.clone()),
-                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    row_pk: RowPk::uuid_from_canonical(file_id).map_err(|error| {
                         writer_error(format!(
                             "verified blob edit file identity is not a canonical UUID: {error}"
                         ))
@@ -1826,7 +1826,7 @@ where
                 let state_key = StateKey {
                     schema_key: "lix_binary_blob_ref".to_owned(),
                     file_id: Some(file_id.clone()),
-                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    row_pk: RowPk::uuid_from_canonical(file_id).map_err(|error| {
                         writer_error(format!(
                             "verified request blob splice file identity is not a canonical UUID: {error}"
                         ))
@@ -1981,7 +1981,7 @@ fn blob_manifest_object_ids_for_row(
     let state_key = StateKey {
         schema_key: row.schema_key.to_string(),
         file_id: Some(file_id.to_string()),
-        entity_pk: row.entity_pk.clone(),
+        row_pk: row.row_pk.clone(),
     };
     let owner = if row.global {
         crate::GLOBAL_BRANCH_ID
@@ -2025,7 +2025,7 @@ fn canonical_snapshot_for_row<'a>(
         let state_key = StateKey {
             schema_key: row.schema_key.to_string(),
             file_id: Some(file_id.to_string()),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
         };
         let owner = if row.global {
             crate::GLOBAL_BRANCH_ID
@@ -2184,11 +2184,11 @@ fn collection_delete_range(
         return Ok(None);
     }
     let (schema_key, file_id) =
-        crate::collection_generation::collection_scope_from_entity_pk(row.entity_pk)?;
+        crate::collection_generation::collection_scope_from_row_pk(row.row_pk)?;
     if file_id.is_some() {
         return Ok(None);
     }
-    let bounds = encode_state_entity_prefix_bounds(&schema_key, &EntityPk::empty());
+    let bounds = encode_state_row_prefix_bounds(&schema_key, &RowPk::empty());
     Ok(Some((bounds.lower, bounds.upper)))
 }
 
@@ -2247,7 +2247,7 @@ fn next_ordered_commit_generation(
 mod intent_tests {
     use super::*;
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::StateKey;
     use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
     use crate::transaction::types::{
@@ -2375,7 +2375,7 @@ mod intent_tests {
             StateKey {
                 schema_key: "app.row".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single("selected"),
+                row_pk: RowPk::single("selected"),
             },
             CommitId::for_test_label("selected-source"),
             crate::changelog::ChangeId::for_test_label("selected-change"),

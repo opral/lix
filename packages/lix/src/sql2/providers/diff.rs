@@ -10,7 +10,7 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
@@ -115,7 +115,7 @@ where
         if filter
             .column_refs()
             .iter()
-            .any(|column| matches!(column.name.as_str(), "entity_pk" | "schema_key" | "file_id"))
+            .any(|column| matches!(column.name.as_str(), "row_pk" | "schema_key" | "file_id"))
         {
             TableProviderFilterPushDown::Inexact
         } else {
@@ -202,7 +202,7 @@ where
                                 before.as_ref().map(|row| row.change_id),
                                 after.as_ref().map(|row| row.change_id),
                             ),
-                            entity_pk: identity.entity_pk.as_json_array_text(),
+                            row_pk: identity.row_pk.as_json_array_text(),
                             schema_key: identity.schema_key,
                             file_id: identity.file_id,
                             diff_type: kind,
@@ -246,22 +246,22 @@ impl DiffRoute {
     fn from_filters(filters: &[Expr]) -> Self {
         let conjuncts = filter_conjuncts(filters);
         let schema_keys = optional_values(&conjuncts, "schema_key");
-        let entity_pk_values = optional_values(&conjuncts, "entity_pk");
+        let row_pk_values = optional_values(&conjuncts, "row_pk");
         let file_ids = optional_values(&conjuncts, "file_id");
         let mut contradictory = schema_keys.as_ref().is_some_and(Vec::is_empty)
-            || entity_pk_values.as_ref().is_some_and(Vec::is_empty)
+            || row_pk_values.as_ref().is_some_and(Vec::is_empty)
             || file_ids.as_ref().is_some_and(Vec::is_empty);
-        let explicit_entity_filter = entity_pk_values.is_some();
-        let entity_pks = entity_pk_values
+        let explicit_row_filter = row_pk_values.is_some();
+        let row_pks = row_pk_values
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|value| EntityPk::from_json_array_text(&value).ok())
+            .filter_map(|value| RowPk::from_json_array_text(&value).ok())
             .collect::<Vec<_>>();
-        contradictory |= explicit_entity_filter && entity_pks.is_empty();
+        contradictory |= explicit_row_filter && row_pks.is_empty();
         Self {
             filter: StateFilter {
                 schema_keys: schema_keys.unwrap_or_default(),
-                entity_pks,
+                row_pks,
                 file_ids: file_ids
                     .unwrap_or_default()
                     .into_iter()
@@ -276,7 +276,7 @@ impl DiffRoute {
 
 fn diff_row_matches(row: &HistoricalStateRow, filter: &StateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
-        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
+        && (filter.row_pks.is_empty() || filter.row_pks.contains(&row.key.row_pk))
         && (filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|file_id| match file_id {
                 NullableKeyFilter::Any => true,
@@ -303,7 +303,7 @@ fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<Strin
 fn diff_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("diff_id", DataType::Utf8, false),
-        json_field("entity_pk", false),
+        json_field("row_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         Field::new("diff_type", DataType::Utf8, false),
@@ -314,7 +314,7 @@ fn diff_schema() -> SchemaRef {
 
 struct DiffSqlRow {
     diff_id: Result<String, LixError>,
-    entity_pk: Result<String, LixError>,
+    row_pk: Result<String, LixError>,
     schema_key: String,
     file_id: Option<String>,
     diff_type: &'static str,
@@ -329,8 +329,8 @@ static DIFF_COLS: ColumnTable<DiffSqlRow> = ColumnTable {
             Col::Utf8Fallible(|row| row.diff_id.clone().map(Some)),
         ),
         (
-            "entity_pk",
-            Col::Utf8Fallible(|row| row.entity_pk.clone().map(Some)),
+            "row_pk",
+            Col::Utf8Fallible(|row| row.row_pk.clone().map(Some)),
         ),
         ("schema_key", Col::Utf8(|row| Some(&row.schema_key))),
         ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
@@ -364,7 +364,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
     use crate::common::{LixTimestamp, SharedStr};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::{HistoricalStateRow, ObjectId, StateKey};
     use crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY;
 
@@ -373,7 +373,7 @@ mod tests {
             key: StateKey {
                 schema_key: "test".to_owned(),
                 file_id: Some("file".to_owned()),
-                entity_pk: EntityPk::single("row"),
+                row_pk: RowPk::single("row"),
             },
             global: false,
             change_id: ChangeId::for_test_label("change"),
@@ -404,7 +404,7 @@ mod tests {
             ),
             (
                 "key",
-                Box::new(|row| row.key.entity_pk = EntityPk::single("other-row")),
+                Box::new(|row| row.key.row_pk = RowPk::single("other-row")),
             ),
             (
                 "created_at",

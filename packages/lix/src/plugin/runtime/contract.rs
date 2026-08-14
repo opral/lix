@@ -1881,7 +1881,7 @@ pub struct WasmCertifiedRowBatch {
     pub schema_keys: Vec<String>,
     pub row_count: u64,
     pub creates: WasmCreateContext,
-    /// Host-validated compact identities created by this batch. Keeping ranges
+    /// Host-validated compact identitys created by this batch. Keeping ranges
     /// here avoids reparsing or expanding certified packet payloads merely to
     /// establish successor authority.
     pub create_ranges: Vec<WasmCertifiedCreateRange>,

@@ -36,7 +36,7 @@ pub(crate) struct MaterializedChangePayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedChangeIdentity {
     pub(crate) schema_key: String,
-    pub(crate) entity_pk: crate::entity_pk::EntityPk,
+    pub(crate) row_pk: crate::row_pk::RowPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -90,7 +90,7 @@ where
 
 /// Hydrates retained change records without collapsing repeated change ids.
 ///
-/// Eager plugin materialization can produce multiple semantic identities from
+/// Eager plugin materialization can produce multiple semantic identitys from
 /// one source change. Lifecycle operations such as checkpoints must preserve
 /// each identity-specific payload even though those rows share a change id.
 pub(crate) async fn materialize_known_change_payloads_in_order<S>(
@@ -142,7 +142,7 @@ where
             MaterializedChangePayload {
                 identity: Some(MaterializedChangeIdentity {
                     schema_key: change.schema_key,
-                    entity_pk: change.entity_pk,
+                    row_pk: change.row_pk,
                     file_id: change.file_id,
                 }),
                 snapshot_content,
@@ -220,7 +220,7 @@ mod tests {
         let first = test_change_record();
         let mut second = first.clone();
         second.schema_key = "derived-row".to_owned();
-        second.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
+        second.row_pk = crate::row_pk::RowPk::single("row-2");
 
         let payloads = materialize_known_change_payloads_in_order(
             &mut reader,

@@ -28,7 +28,7 @@ mod storage;
 pub(crate) use actor::{
     DEFAULT_MAX_LIVE_PLUGIN_STORES, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
     PluginActorKey, PluginActorLease, PluginActorStagedCheckpoint, PluginActorStore,
-    PluginActorStorePermit, PluginEntityAuthorities, PluginEntityAuthorityRange, PluginObservation,
+    PluginActorStorePermit, PluginObservation, PluginRowAuthorities, PluginRowAuthorityRange,
 };
 pub(crate) use archive::{ParsedPluginArchive, parse_plugin_archive_for_install};
 pub(crate) use component::{DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost};
@@ -39,14 +39,13 @@ pub(crate) use create_context::{
     validate_create_changes, validate_create_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, FileBytesSha256, SchemaAllowlist, StateRowEntitySource,
+    ArcByteSource, FileBytesSha256, SchemaAllowlist, StateRowRowSource,
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
-    VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
+    VecRowChangeSource, VecRowConflictSource, VecRowSource, build_file_update_splices,
     canonicalize_snapshot, certify_dense_fresh_file, drain_conflict_transition_resolutions,
-    drain_entity_transition_edits, drain_file_transition_changes,
-    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
-    materialize_certified_entity_batch, transport_splice_preserves_prefix_exclusion,
-    transport_splice_preserves_utf8,
+    drain_file_transition_changes, drain_row_transition_edits, host_row_change_with_lazy_snapshot,
+    host_row_with_lazy_snapshot, materialize_certified_row_batch,
+    transport_splice_preserves_prefix_exclusion, transport_splice_preserves_utf8,
 };
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{

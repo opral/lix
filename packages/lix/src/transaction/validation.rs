@@ -16,9 +16,9 @@ use crate::LixError;
 use crate::catalog::{CatalogSnapshot, SchemaPlan};
 use crate::common::{SharedStr, json_pointer_get, validate_row_metadata};
 use crate::domain::Domain;
-use crate::entity_pk::{EntityPk, EntityPkComponents};
+use crate::row_pk::{RowPk, RowPkComponents};
 use crate::forktree::{
-    StateKey, StateKeyRef, decode_state_key, encode_state_entity_prefix, encode_state_key,
+    StateKey, StateKeyRef, decode_state_key, encode_state_row_prefix, encode_state_key,
     exclusive_prefix_upper_bound,
 };
 use crate::state::{StateRow, StateRowSource, TransactionStateView};
@@ -101,8 +101,8 @@ impl NativeValidationRow {
         &self.key.schema_key
     }
 
-    fn entity_pk(&self) -> &EntityPk {
-        &self.key.entity_pk
+    fn row_pk(&self) -> &RowPk {
+        &self.key.row_pk
     }
 
     fn file_id(&self) -> Option<&str> {
@@ -136,7 +136,7 @@ impl NativeValidationRows {
 
 type PropertyGroupKey = Vec<Vec<String>>;
 type PropertyValueKey = (String, PropertyGroupKey, Vec<String>);
-type InsertIdentityKey = (String, bool, Option<String>, String, EntityPk);
+type InsertIdentityKey = (String, bool, Option<String>, String, RowPk);
 type NamespaceKey = (String, bool, Option<String>, String);
 
 /// One-pass indexes over the authenticated committed rows used by validation.
@@ -148,7 +148,7 @@ struct NativeValidationIndex {
     rows: NativeValidationRows,
     property_values: BTreeMap<PropertyValueKey, Vec<usize>>,
     file_owners: BTreeMap<String, Vec<usize>>,
-    insert_identities: BTreeMap<InsertIdentityKey, Vec<usize>>,
+    insert_identitys: BTreeMap<InsertIdentityKey, Vec<usize>>,
     namespace_paths: BTreeMap<NamespaceKey, Vec<usize>>,
 }
 
@@ -176,19 +176,19 @@ impl NativeValidationIndex {
 
         let mut property_values = BTreeMap::<PropertyValueKey, Vec<usize>>::new();
         let mut file_owners = BTreeMap::<String, Vec<usize>>::new();
-        let mut insert_identities = BTreeMap::<InsertIdentityKey, Vec<usize>>::new();
+        let mut insert_identitys = BTreeMap::<InsertIdentityKey, Vec<usize>>::new();
         let mut namespace_paths = BTreeMap::<NamespaceKey, Vec<usize>>::new();
         for (index, row) in rows.rows.iter().enumerate() {
             if row.deleted {
                 continue;
             }
-            insert_identities
+            insert_identitys
                 .entry((
                     row.branch_id.clone(),
                     row.global,
                     row.file_id().map(str::to_owned),
                     row.schema_key().to_owned(),
-                    row.entity_pk().clone(),
+                    row.row_pk().clone(),
                 ))
                 .or_default()
                 .push(index);
@@ -199,7 +199,7 @@ impl NativeValidationIndex {
                         .entry(file_id.to_owned())
                         .or_default()
                         .push(index);
-                } else if let Ok(file_id) = row.entity_pk().as_single_string() {
+                } else if let Ok(file_id) = row.row_pk().as_single_string() {
                     file_owners
                         .entry(file_id.to_owned())
                         .or_default()
@@ -239,7 +239,7 @@ impl NativeValidationIndex {
             rows,
             property_values,
             file_owners,
-            insert_identities,
+            insert_identitys,
             namespace_paths,
         })
     }
@@ -268,7 +268,7 @@ impl NativeValidationIndex {
     }
 
     fn insert_identity_candidates(&self, key: &InsertIdentityKey) -> &[usize] {
-        self.insert_identities
+        self.insert_identitys
             .get(key)
             .map(Vec::as_slice)
             .unwrap_or_default()
@@ -315,10 +315,10 @@ where
     R: StorageAdapterRead,
 {
     let mut output = NativeValidationRows::default();
-    let prefix = encode_state_entity_prefix(
+    let prefix = encode_state_row_prefix(
         schema_key,
-        &EntityPk {
-            components: EntityPkComponents::Empty,
+        &RowPk {
+            components: RowPkComponents::Empty,
         },
     );
     let upper = exclusive_prefix_upper_bound(&prefix);
@@ -349,7 +349,7 @@ struct ExactVisibleRequest {
 fn exact_visible_request(
     domain: &Domain,
     schema_key: &str,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     include_tombstones: bool,
 ) -> Result<ExactVisibleRequest, LixError> {
     let key = encode_state_key(StateKeyRef {
@@ -365,7 +365,7 @@ fn exact_visible_request(
                 ));
             }
         },
-        entity_pk,
+        row_pk,
     });
     Ok(ExactVisibleRequest {
         key,
@@ -483,18 +483,18 @@ fn validate_primary_key_identity(
                 format!("schema '{}' primary key is missing", row.schema_key()),
             )
         })?;
-    let expected = row.entity_pk().as_json_array_text()?;
+    let expected = row.row_pk().as_json_array_text()?;
     let expected: JsonValue = serde_json::from_str(&expected).map_err(|error| {
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!("prepared entity identity is invalid: {error}"),
+            format!("prepared row identity is invalid: {error}"),
         )
     })?;
     if actual != expected.as_array().cloned().unwrap_or_default() {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "snapshot primary key does not match entity identity for schema '{}'",
+                "snapshot primary key does not match row identity for schema '{}'",
                 row.schema_key()
             ),
         ));
@@ -506,7 +506,7 @@ fn stable_unique_value(value: &JsonValue) -> Option<String> {
     if value.is_null() {
         None
     } else {
-        crate::entity_pk::canonical_json_text(value).ok()
+        crate::row_pk::canonical_json_text(value).ok()
     }
 }
 
@@ -531,7 +531,7 @@ fn foreign_key_constraint_error(message: impl Into<String>) -> LixError {
 
 fn same_identity(row: PreparedValidationRow<'_>, current: &NativeValidationRow) -> bool {
     row.schema_key() == current.schema_key()
-        && row.entity_pk() == current.entity_pk()
+        && row.row_pk() == current.row_pk()
         && row.file_id() == current.file_id()
         && row.untracked() == current.untracked
         && row.branch_id() == current.branch_id
@@ -539,7 +539,7 @@ fn same_identity(row: PreparedValidationRow<'_>, current: &NativeValidationRow) 
 
 fn same_insert_identity(row: PreparedValidationRow<'_>, current: &NativeValidationRow) -> bool {
     row.schema_key() == current.schema_key()
-        && row.entity_pk() == current.entity_pk()
+        && row.row_pk() == current.row_pk()
         && row.file_id() == current.file_id()
         && row.branch_id() == current.branch_id
         && prepared_row_is_global(row) == current.global
@@ -567,7 +567,7 @@ fn same_scope(left: &NativeValidationRow, right: PreparedValidationRow<'_>) -> b
 
 fn staged_identity_matches(left: &NativeValidationRow, right: PreparedValidationRow<'_>) -> bool {
     left.schema_key() == right.schema_key()
-        && left.entity_pk() == right.entity_pk()
+        && left.row_pk() == right.row_pk()
         && left.file_id() == right.file_id()
         && left.untracked == right.untracked()
         && left.branch_id == right.branch_id()
@@ -630,7 +630,7 @@ where
                             key: StateKey {
                                 schema_key: row.schema_key().to_owned(),
                                 file_id: row.file_id().map(str::to_owned),
-                                entity_pk: row.entity_pk().clone(),
+                                row_pk: row.row_pk().clone(),
                             },
                             branch_id: row.branch_id().to_owned(),
                             global: false,
@@ -739,7 +739,7 @@ where
                 !row_is_tombstone(candidate)
                     && candidate.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
                     && ((candidate.file_id().is_none()
-                        && candidate.entity_pk().as_single_string().ok() == Some(file_id))
+                        && candidate.row_pk().as_single_string().ok() == Some(file_id))
                         || candidate.file_id() == Some(file_id))
             });
         if !present {
@@ -862,7 +862,7 @@ where
             .any(|candidate| {
                 candidate.schema_key() != row.schema_key()
                     && same_scope(candidate, row)
-                    && candidate.entity_pk() != row.entity_pk()
+                    && candidate.row_pk() != row.row_pk()
                     && !staged_rows
                         .iter()
                         .copied()
@@ -883,7 +883,7 @@ where
                 )
                 && other.branch_id() == row.branch_id()
                 && other.untracked() == row.untracked()
-                && other.entity_pk() != row.entity_pk()
+                && other.row_pk() != row.row_pk()
                 && prepared_descriptor_namespace_parts(other)
                     .ok()
                     .flatten()
@@ -924,7 +924,7 @@ where
             exact_visible_request(
                 &prepared_row_domain(*tombstone),
                 tombstone.schema_key(),
-                tombstone.entity_pk(),
+                tombstone.row_pk(),
                 false,
             )
         })
@@ -1083,7 +1083,7 @@ where
     });
     if !needs_committed_state {
         if has_inserts {
-            validate_insert_identities_by_point(&input).await?;
+            validate_insert_identitys_by_point(&input).await?;
         }
         return Ok(());
     }
@@ -1140,7 +1140,7 @@ where
         .copied()
         .filter(|row| row.schema_key() == "lix_account")
     {
-        let account_id = row.entity_pk().as_single_string_owned()?;
+        let account_id = row.row_pk().as_single_string_owned()?;
         let disables_builtin = row_is_tombstone(row)
             || prepared_snapshot(row)?
                 .as_ref()
@@ -1164,7 +1164,7 @@ where
         .copied()
         .filter(|row| row_is_tombstone(*row) && row.schema_key() == "lix_account")
     {
-        let account_id = tombstone.entity_pk().as_single_string_owned()?;
+        let account_id = tombstone.row_pk().as_single_string_owned()?;
         if input.state_view.has_authored_change(&account_id).await? {
             return Err(LixError::new(
                 "LIX_FOREIGN_KEY_VIOLATION",
@@ -1173,14 +1173,14 @@ where
         }
     }
     validate_delete_restrictions(&input, &staged_rows, &validation_index).await?;
-    validate_insert_identities(&input, &validation_index).await?;
+    validate_insert_identitys(&input, &validation_index).await?;
     Ok(())
 }
 
 /// Validate only exact primary-key slots for an unconstrained insert batch.
 /// This retains duplicate detection without materializing a schema-wide
 /// committed validation index.
-async fn validate_insert_identities_by_point<R>(
+async fn validate_insert_identitys_by_point<R>(
     input: &TransactionValidationInput<'_, R>,
 ) -> Result<(), LixError>
 where
@@ -1196,7 +1196,7 @@ where
             row.global,
             row.file_id.map(ToString::to_string),
             row.schema_key.to_string(),
-            row.entity_pk.clone(),
+            row.row_pk.clone(),
         );
         if !seen.insert(identity) {
             return Err(LixError::new(
@@ -1207,7 +1207,7 @@ where
         requests.push(exact_visible_request(
             &prepared_row_domain(PreparedValidationRow::State(insert.row)),
             row.schema_key,
-            row.entity_pk,
+            row.row_pk,
             true,
         )?);
     }
@@ -1222,7 +1222,7 @@ where
             return Err(unique_constraint_error(
                 crate::transaction::duplicate_insert_identity_message(
                     row.schema_key,
-                    row.entity_pk,
+                    row.row_pk,
                     Some(row.branch_id),
                     insert.origin.or(row.origin),
                 ),
@@ -1232,7 +1232,7 @@ where
     Ok(())
 }
 
-async fn validate_insert_identities<R>(
+async fn validate_insert_identitys<R>(
     input: &TransactionValidationInput<'_, R>,
     all_rows: &NativeValidationIndex,
 ) -> Result<(), LixError>
@@ -1247,7 +1247,7 @@ where
             row.global,
             row.file_id.map(ToString::to_string),
             row.schema_key.to_string(),
-            row.entity_pk.clone(),
+            row.row_pk.clone(),
         );
         if !seen.insert(identity) {
             return Err(LixError::new(
@@ -1260,7 +1260,7 @@ where
             row.global,
             row.file_id.map(ToString::to_string),
             row.schema_key.to_string(),
-            row.entity_pk.clone(),
+            row.row_pk.clone(),
         );
         if all_rows
             .insert_identity_candidates(&key)
@@ -1273,7 +1273,7 @@ where
             return Err(unique_constraint_error(
                 crate::transaction::duplicate_insert_identity_message(
                     row.schema_key,
-                    row.entity_pk,
+                    row.row_pk,
                     Some(row.branch_id),
                     insert.origin.or(row.origin),
                 ),
@@ -1325,13 +1325,13 @@ mod tests {
     ) -> StateRow {
         let schema = crate::native_row::seed_schema("lix_key_value")
             .expect("built-in key-value schema must compile");
-        let entity_pk = EntityPk::single(key);
+        let row_pk = RowPk::single(key);
         let snapshot = serde_json::json!({"key": key, "value": value});
         StateRow {
             key: encode_state_key(StateKeyRef {
                 schema_key: "lix_key_value",
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             }),
             value: crate::forktree::StateValue {
                 change_id: crate::changelog::ChangeId::default(),
@@ -1347,7 +1347,7 @@ mod tests {
                 cell: crate::forktree::StateCell::NativeRow(
                     crate::native_row::encode(
                         &schema,
-                        &entity_pk,
+                        &row_pk,
                         global,
                         None,
                         &snapshot,
@@ -1367,7 +1367,7 @@ mod tests {
             key: StateKey {
                 schema_key: schema_key.to_owned(),
                 file_id: None,
-                entity_pk: EntityPk::single("id"),
+                row_pk: RowPk::single("id"),
             },
             branch_id: "branch".to_owned(),
             global: false,

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::ForkTreeReadFacade;
 use crate::state::{ForkTreeStateView, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
@@ -73,7 +73,7 @@ impl FilesystemPathEntry {
             }),
         };
         FilesystemStateRow {
-            entity_pk: EntityPk::uuid_from_canonical(self.id())
+            row_pk: RowPk::uuid_from_canonical(self.id())
                 .expect("filesystem descriptor IDs are validated canonical UUIDs"),
             schema_key: match self.kind {
                 FilesystemPathKind::File => FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -140,7 +140,7 @@ impl FilesystemPathEntry {
             + self.updated_at.capacity()
             + self.blob_ref.as_ref().map_or(0, |row| {
                 row.schema_key.capacity()
-                    + row.entity_pk.estimated_heap_bytes()
+                    + row.row_pk.estimated_heap_bytes()
                     + row.file_id.as_ref().map_or(0, String::capacity)
                     + row
                         .snapshot_content
@@ -569,7 +569,7 @@ impl FilesystemPathIndex {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             })
-            .unwrap_or(row.entity_pk.as_single_string_owned()?);
+            .unwrap_or(row.row_pk.as_single_string_owned()?);
         let blob_ref_key = FilesystemBlobRefKey::from_state_row(row, descriptor_id.clone());
         let entry = self
             .entries_by_descriptor_id
@@ -607,7 +607,7 @@ impl FilesystemPathIndex {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             })
-            .unwrap_or(row.entity_pk.as_single_string_owned()?);
+            .unwrap_or(row.row_pk.as_single_string_owned()?);
         let same_id = self
             .entries_by_descriptor_id
             .values_equal_by(descriptor_id.as_str(), |key| key.id.as_str())
@@ -670,7 +670,7 @@ impl FilesystemPathIndex {
         if let Some(prior) = prior.as_ref() {
             // Descriptor writes in the transaction overlay carry the current
             // change timestamp. Replacing the same identity must retain the
-            // entity's first visible timestamp.
+            // row's first visible timestamp.
             entry.created_at.clone_from(&prior.created_at);
         }
         entry.blob_ref = prior_blob_ref;
@@ -1034,13 +1034,13 @@ where
         // separate until the canonical filesystem-key merge below so an
         // untracked tombstone can shadow a tracked row without resurrection.
         let mut rows = Vec::new();
-        let empty_pk = crate::entity_pk::EntityPk {
-            components: crate::entity_pk::EntityPkComponents::Empty,
+        let empty_pk = crate::row_pk::RowPk {
+            components: crate::row_pk::RowPkComponents::Empty,
         };
         for branch_id in &request.branch_ids {
             let mut tracked_rows = Vec::new();
             for schema_key in crate::filesystem::filesystem_schema_keys() {
-                let lower = crate::forktree::encode_state_entity_prefix(&schema_key, &empty_pk);
+                let lower = crate::forktree::encode_state_row_prefix(&schema_key, &empty_pk);
                 let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
                 tracked_rows.extend(
                     self.branch_range(
@@ -1380,7 +1380,7 @@ struct FileRecord {
 mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
 
     fn path_index_from_rows(
         rows: Vec<FilesystemStateRow>,
@@ -1885,7 +1885,7 @@ mod tests {
         global: bool,
     ) -> FilesystemStateRow {
         FilesystemStateRow {
-            entity_pk: EntityPk::single(id),
+            row_pk: RowPk::single(id),
             schema_key: schema_key.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.into()),

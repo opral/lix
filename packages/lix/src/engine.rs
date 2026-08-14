@@ -4,7 +4,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::BranchRefStoreReader;
 use crate::catalog::{CatalogContext, CatalogFingerprint};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{StateCell, StateKeyRef, encode_state_key};
 use crate::init::InitReceipt;
 use crate::observe_coordinator::ObserveCoordinator;
@@ -272,7 +272,7 @@ where
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
-        let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
+        let account_pk = RowPk::uuid_from_canonical(account_id).map_err(|_| {
             LixError::new(
                 "LIX_INVALID_ACCOUNT_ID",
                 format!("active account id '{account_id}' is not a canonical UUID"),
@@ -286,7 +286,7 @@ where
         let key = encode_state_key(StateKeyRef {
             schema_key: "lix_account",
             file_id: None,
-            entity_pk: &account_pk,
+            row_pk: &account_pk,
         });
         let view = ForkTreeStateView::from_facade(
             crate::forktree::ForkTreeReadFacade::new(read),
@@ -343,11 +343,11 @@ where
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
         crate::init::RepositoryProtocolStatus::Current => {
-            let entity_pk = EntityPk::single("lix_id");
+            let row_pk = RowPk::single("lix_id");
             let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
                 schema_key: "lix_key_value",
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
             let view = ForkTreeStateView::from_facade(
                 crate::forktree::ForkTreeReadFacade::new(read),

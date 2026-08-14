@@ -38,9 +38,7 @@ simulation_test!(create_branch_rejects_existing_id, |sim| async move {
 
     assert_eq!(error.code, "LIX_ERROR_UNIQUE");
     assert!(
-        error
-            .to_string()
-            .contains("INSERT would duplicate row_pk"),
+        error.to_string().contains("INSERT would duplicate row_pk"),
         "error should explain the duplicate branch id: {error:?}"
     );
     assert_branch_descriptor(&main, "01930000-0000-7000-8000-000000000001", "Draft").await;

@@ -19,8 +19,8 @@ mod directory;
 mod directory_history;
 pub(crate) use diff::register_diff_function;
 mod diff_command;
-mod entity;
-mod entity_history;
+mod schema;
+mod schema_history;
 mod file;
 mod file_history;
 
@@ -144,7 +144,7 @@ impl ProviderSelection {
     /// Runtime registration rejects schema keys whose generated table names
     /// would shadow these fixed providers.
     /// `All` and every unknown name remain conservative: they load the full
-    /// visible catalog so information-schema, custom entities, and normal
+    /// visible catalog so information-schema, custom rows, and normal
     /// unknown-table errors keep their current semantics.
     fn requires_visible_schemas(&self) -> bool {
         match self {
@@ -248,7 +248,7 @@ where
                 &surface.kind,
                 PublicSurfaceKind::FileHistory
                     | PublicSurfaceKind::DirectoryHistory
-                    | PublicSurfaceKind::EntityHistory { .. }
+                    | PublicSurfaceKind::SchemaHistory { .. }
                     | PublicSurfaceKind::WorkingDiff
                     | PublicSurfaceKind::WorkingDiffByBranch
                     | PublicSurfaceKind::FileWorkingDiff
@@ -446,32 +446,32 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::EntityBase { .. }
-            | PublicSurfaceKind::EntityByBranch { .. }
-            | PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaBase { .. }
+            | PublicSurfaceKind::SchemaByBranch { .. }
+            | PublicSurfaceKind::SchemaHistory { .. }
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => {}
         }
     }
-    let needs_entity_history = catalog.surfaces().any(|surface| {
+    let needs_row_history = catalog.surfaces().any(|surface| {
         scope.includes(surface)
             && selection.includes(surface)
-            && matches!(&surface.kind, PublicSurfaceKind::EntityHistory { .. })
+            && matches!(&surface.kind, PublicSurfaceKind::SchemaHistory { .. })
     });
-    entity::register_entity_providers(
+    schema::register_row_providers(
         session,
         ctx.active_branch_id(),
         ctx.state_view().clone(),
         Arc::clone(&branch_ref),
-        (needs_entity_history
+        (needs_row_history
             || catalog.surfaces().any(|surface| {
                 scope.includes(surface)
                     && selection.includes(surface)
                     && matches!(
                         &surface.kind,
-                        PublicSurfaceKind::EntityBase { schema_key }
-                            | PublicSurfaceKind::EntityByBranch { schema_key }
+                        PublicSurfaceKind::SchemaBase { schema_key }
+                            | PublicSurfaceKind::SchemaByBranch { schema_key }
                                 if matches!(
                                     schema_key.as_str(),
                                     "lix_commit"
@@ -481,12 +481,12 @@ where
                     )
             }))
         .then(|| Arc::clone(&commit_graph)),
-        if needs_entity_history {
+        if needs_row_history {
             Some(query_source_for_provider()?)
         } else {
             None
         },
-        if needs_entity_history {
+        if needs_row_history {
             Some(history_anchor_for_provider()?)
         } else {
             None
@@ -659,12 +659,12 @@ where
             | PublicSurfaceKind::DirectoryWorkingDiffByBranch
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
-            PublicSurfaceKind::EntityBase { .. }
-            | PublicSurfaceKind::EntityByBranch { .. }
-            | PublicSurfaceKind::EntityHistory { .. } => {}
+            PublicSurfaceKind::SchemaBase { .. }
+            | PublicSurfaceKind::SchemaByBranch { .. }
+            | PublicSurfaceKind::SchemaHistory { .. } => {}
         }
     }
-    entity::register_entity_write_providers(session, write_ctx, branch_ref, catalog, selection)
+    schema::register_row_write_providers(session, write_ctx, branch_ref, catalog, selection)
         .await?;
     Ok(())
 }
@@ -707,11 +707,11 @@ mod tests {
              SELECT left_side.id \
              FROM shadowed AS left_side \
              JOIN (\
-                 SELECT entity_pk FROM lix_change \
+                 SELECT row_pk FROM lix_change \
                  UNION ALL \
-                 SELECT entity_pk FROM lix_change\
+                 SELECT row_pk FROM lix_change\
              ) AS right_side \
-               ON left_side.id = right_side.entity_pk \
+               ON left_side.id = right_side.row_pk \
              JOIN public.\"lix_directory\" AS directory_a ON true \
              JOIN public.\"lix_directory\" AS directory_b ON true"]);
 
@@ -851,7 +851,7 @@ mod tests {
                 "lix_file_working_diff_by_branch",
                 "lix_working_diff",
                 "lix_working_diff_by_branch",
-                "phase8_entity_history",
+                "phase8_row_history",
             ]
         );
         assert_eq!(
@@ -866,7 +866,7 @@ mod tests {
                 "lix_file_by_branch",
                 "lix_revert",
                 "phase8_entity",
-                "phase8_entity_by_branch",
+                "phase8_row_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
@@ -1012,7 +1012,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
         let history_surface = matches!(
             surface.kind,
-            PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaHistory { .. }
                 | PublicSurfaceKind::FileHistory
                 | PublicSurfaceKind::DirectoryHistory
         );

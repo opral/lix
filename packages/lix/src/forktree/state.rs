@@ -4,7 +4,7 @@ use super::model::AUTHENTICATED_EDGE_PAGE_ENTRIES;
 use super::object::ObjectId;
 use crate::LixError;
 use crate::common::{LixTimestamp, SharedStr};
-use crate::entity_pk::{EntityPk, EntityPkComponent};
+use crate::row_pk::{RowPk, RowPkComponent};
 
 const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x02";
 const CURRENT_STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFCV\0\x02";
@@ -25,14 +25,14 @@ const ENTITY_PK_BYTES: u8 = 0x03;
 pub(crate) struct StateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct StateKey {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
 }
 
 /// Half-open bounds for a canonical byte prefix. `upper == None` means that
@@ -173,22 +173,22 @@ pub(crate) fn encode_state_key(key: StateKeyRef<'_>) -> Vec<u8> {
         key.schema_key.len()
             + key.file_id.map_or(0, str::len)
             + 6
-            + key.entity_pk.components.len() * 18,
+            + key.row_pk.components.len() * 18,
     );
     write_key_string(&mut output, key.schema_key, KEY_PART_FINAL);
-    write_entity_pk(&mut output, key.entity_pk);
+    write_row_pk(&mut output, key.row_pk);
     write_file_id(&mut output, key.file_id);
     output
 }
 
-/// Encodes the canonical contiguous lookup prefix for one entity identity.
-/// File ownership is the final key component, so a SQL entity-PK predicate
+/// Encodes the canonical contiguous lookup prefix for one row identity.
+/// File ownership is the final key component, so a SQL row-PK predicate
 /// can authenticate every matching file/global row without scanning unrelated
-/// identities or maintaining a second index.
-pub(crate) fn encode_state_entity_prefix(schema_key: &str, entity_pk: &EntityPk) -> Vec<u8> {
-    let mut output = Vec::with_capacity(schema_key.len() + 4 + entity_pk.components.len() * 18);
+/// identitys or maintaining a second index.
+pub(crate) fn encode_state_row_prefix(schema_key: &str, row_pk: &RowPk) -> Vec<u8> {
+    let mut output = Vec::with_capacity(schema_key.len() + 4 + row_pk.components.len() * 18);
     write_key_string(&mut output, schema_key, KEY_PART_FINAL);
-    write_entity_pk(&mut output, entity_pk);
+    write_row_pk(&mut output, row_pk);
     output
 }
 
@@ -206,26 +206,26 @@ pub(crate) fn exclusive_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-pub(crate) fn encode_state_entity_prefix_bounds(
+pub(crate) fn encode_state_row_prefix_bounds(
     schema_key: &str,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
 ) -> CanonicalPrefixBounds {
-    let lower = encode_state_entity_prefix(schema_key, entity_pk);
+    let lower = encode_state_row_prefix(schema_key, row_pk);
     let upper = exclusive_prefix_upper_bound(&lower);
     CanonicalPrefixBounds { lower, upper }
 }
 
-/// Accepts the strict successor emitted for a canonical entity prefix. The
+/// Accepts the strict successor emitted for a canonical row prefix. The
 /// successor is a valid storage boundary, but it is intentionally not itself
 /// decodable as a state key/prefix because the increment truncates the
 /// terminal key-part byte.
-fn canonical_state_entity_prefix_upper_bound(bytes: &[u8]) -> Result<(), LixError> {
+fn canonical_state_row_prefix_upper_bound(bytes: &[u8]) -> Result<(), LixError> {
     let Some(last) = bytes.last().copied() else {
-        return Err(state_error("state entity prefix upper bound is empty"));
+        return Err(state_error("state row prefix upper bound is empty"));
     };
     if last == 0 {
         return Err(state_error(
-            "state entity prefix upper bound has no predecessor",
+            "state row prefix upper bound has no predecessor",
         ));
     }
     let mut predecessor = bytes.to_vec();
@@ -234,17 +234,17 @@ fn canonical_state_entity_prefix_upper_bound(bytes: &[u8]) -> Result<(), LixErro
         .expect("non-empty upper bound has a last byte") -= 1;
     if exclusive_prefix_upper_bound(&predecessor).as_deref() != Some(bytes) {
         return Err(state_error(
-            "state entity prefix upper bound is not canonical",
+            "state row prefix upper bound is not canonical",
         ));
     }
-    canonical_state_entity_prefix(&predecessor).map(|_| ())
+    canonical_state_row_prefix(&predecessor).map(|_| ())
 }
 
 /// Canonicalizes the state-key prefix emitted by
-/// `encode_state_entity_prefix`.  Prefixes intentionally stop before the
+/// `encode_state_row_prefix`.  Prefixes intentionally stop before the
 /// file-id component, and the empty-PK form stops after the codec version;
 /// neither is a complete `StateKey` accepted by `decode_state_key`.
-fn canonical_state_entity_prefix(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
+fn canonical_state_row_prefix(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
     let mut offset = 0_usize;
     let (schema_key, terminator) = read_key_string(bytes, &mut offset, "state schema key")?;
     if terminator != KEY_PART_FINAL {
@@ -252,72 +252,72 @@ fn canonical_state_entity_prefix(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
     }
     let version = *bytes
         .get(offset)
-        .ok_or_else(|| state_error("state entity primary key prefix is truncated"))?;
+        .ok_or_else(|| state_error("state row primary key prefix is truncated"))?;
     offset += 1;
     if version != ENTITY_PK_CODEC_V1 {
         return Err(state_error(format!(
-            "state entity primary key has unsupported codec version {version}"
+            "state row primary key has unsupported codec version {version}"
         )));
     }
     if offset == bytes.len() {
-        return Ok(encode_state_entity_prefix(
+        return Ok(encode_state_row_prefix(
             &schema_key,
-            &EntityPk {
-                components: crate::entity_pk::EntityPkComponents::Empty,
+            &RowPk {
+                components: crate::row_pk::RowPkComponents::Empty,
             },
         ));
     }
 
     let mut components = smallvec::SmallVec::new();
     loop {
-        let (component, terminator) = read_entity_pk_part(bytes, &mut offset)?;
+        let (component, terminator) = read_row_pk_part(bytes, &mut offset)?;
         components.push(component);
         if terminator == KEY_PART_FINAL {
             if offset != bytes.len() {
                 return Err(state_error(
-                    "state entity primary key prefix has trailing bytes",
+                    "state row primary key prefix has trailing bytes",
                 ));
             }
-            let entity_pk = EntityPk::from_components(components).map_err(|error| {
-                state_error(format!("state entity primary key is invalid: {error}"))
+            let row_pk = RowPk::from_components(components).map_err(|error| {
+                state_error(format!("state row primary key is invalid: {error}"))
             })?;
-            return Ok(encode_state_entity_prefix(&schema_key, &entity_pk));
+            return Ok(encode_state_row_prefix(&schema_key, &row_pk));
         }
         if offset == bytes.len() {
-            return Err(state_error("state entity primary key prefix is truncated"));
+            return Err(state_error("state row primary key prefix is truncated"));
         }
     }
 }
 
-pub(crate) fn validate_state_entity_prefix(bytes: &[u8]) -> Result<(), LixError> {
-    canonical_state_entity_prefix(bytes).map(|_| ())
+pub(crate) fn validate_state_row_prefix(bytes: &[u8]) -> Result<(), LixError> {
+    canonical_state_row_prefix(bytes).map(|_| ())
 }
 
-fn write_entity_pk(output: &mut Vec<u8>, entity_pk: &EntityPk) {
+fn write_row_pk(output: &mut Vec<u8>, row_pk: &RowPk) {
     output.push(ENTITY_PK_CODEC_V1);
-    for (index, component) in entity_pk.components.iter().enumerate() {
-        let terminator = if index + 1 == entity_pk.components.len() {
+    for (index, component) in row_pk.components.iter().enumerate() {
+        let terminator = if index + 1 == row_pk.components.len() {
             KEY_PART_FINAL
         } else {
             KEY_PART_MORE
         };
         match component {
-            EntityPkComponent::Uuid(bytes) => {
+            RowPkComponent::Uuid(bytes) => {
                 output.push(ENTITY_PK_UUID);
                 output.extend_from_slice(bytes);
                 output.push(terminator);
             }
-            EntityPkComponent::Integer(value) => {
+            RowPkComponent::Integer(value) => {
                 output.push(ENTITY_PK_INTEGER);
                 let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
                 output.extend_from_slice(&ordered.to_be_bytes());
                 output.push(terminator);
             }
-            EntityPkComponent::String(value) => {
+            RowPkComponent::String(value) => {
                 output.push(ENTITY_PK_STRING);
                 write_key_bytes(output, value.as_bytes(), terminator);
             }
-            EntityPkComponent::Bytes(value) => {
+            RowPkComponent::Bytes(value) => {
                 output.push(ENTITY_PK_BYTES);
                 write_key_bytes(output, value, terminator);
             }
@@ -331,7 +331,7 @@ pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
     if terminator != KEY_PART_FINAL {
         return Err(state_error("state schema key has an invalid terminator"));
     }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    let row_pk = read_row_pk(bytes, &mut offset)?;
     let file_id = read_file_id(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(state_error("state key has trailing bytes"));
@@ -339,7 +339,7 @@ pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
     Ok(StateKey {
         schema_key,
         file_id,
-        entity_pk,
+        row_pk,
     })
 }
 
@@ -530,42 +530,42 @@ fn read_file_id(bytes: &[u8], offset: &mut usize) -> Result<Option<String>, LixE
     }
 }
 
-fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError> {
+fn read_row_pk(bytes: &[u8], offset: &mut usize) -> Result<RowPk, LixError> {
     let version = bytes
         .get(*offset)
         .copied()
-        .ok_or_else(|| state_error("state entity primary key is truncated"))?;
+        .ok_or_else(|| state_error("state row primary key is truncated"))?;
     *offset += 1;
     if version != ENTITY_PK_CODEC_V1 {
         return Err(state_error(format!(
-            "state entity primary key has unsupported codec version {version}"
+            "state row primary key has unsupported codec version {version}"
         )));
     }
     let mut components = smallvec::SmallVec::new();
     loop {
-        let (component, terminator) = read_entity_pk_part(bytes, offset)?;
+        let (component, terminator) = read_row_pk_part(bytes, offset)?;
         components.push(component);
         if terminator == KEY_PART_FINAL {
             break;
         }
     }
-    EntityPk::from_components(components)
-        .map_err(|error| state_error(format!("state entity primary key is invalid: {error}")))
+    RowPk::from_components(components)
+        .map_err(|error| state_error(format!("state row primary key is invalid: {error}")))
 }
 
-fn read_entity_pk_part(
+fn read_row_pk_part(
     bytes: &[u8],
     offset: &mut usize,
-) -> Result<(EntityPkComponent, u8), LixError> {
+) -> Result<(RowPkComponent, u8), LixError> {
     let tag = *bytes
         .get(*offset)
-        .ok_or_else(|| state_error("state entity primary-key part tag is truncated"))?;
+        .ok_or_else(|| state_error("state row primary-key part tag is truncated"))?;
     *offset += 1;
     match tag {
         ENTITY_PK_STRING => read_key_string(bytes, offset, "state string primary-key part")
-            .map(|(value, terminator)| (EntityPkComponent::String(value.into()), terminator)),
+            .map(|(value, terminator)| (RowPkComponent::String(value.into()), terminator)),
         ENTITY_PK_BYTES => read_key_bytes(bytes, offset, "state bytes primary-key part")
-            .map(|(value, terminator)| (EntityPkComponent::Bytes(value.into()), terminator)),
+            .map(|(value, terminator)| (RowPkComponent::Bytes(value.into()), terminator)),
         ENTITY_PK_UUID => {
             let end = offset
                 .checked_add(16)
@@ -577,7 +577,7 @@ fn read_entity_pk_part(
                 .expect("UUID slice has fixed length");
             let terminator = read_terminator(bytes, end, "state UUID primary-key part")?;
             *offset = end + 1;
-            Ok((EntityPkComponent::Uuid(value), terminator))
+            Ok((RowPkComponent::Uuid(value), terminator))
         }
         ENTITY_PK_INTEGER => {
             let end = offset
@@ -593,14 +593,14 @@ fn read_entity_pk_part(
             let terminator = read_terminator(bytes, end, "state integer primary-key part")?;
             *offset = end + 1;
             Ok((
-                EntityPkComponent::Integer(i64::from_be_bytes(
+                RowPkComponent::Integer(i64::from_be_bytes(
                     (ordered ^ (1_u64 << 63)).to_be_bytes(),
                 )),
                 terminator,
             ))
         }
         other => Err(state_error(format!(
-            "state entity primary-key part has unknown tag {other}"
+            "state row primary-key part has unknown tag {other}"
         ))),
     }
 }

@@ -287,15 +287,15 @@ mod tests {
     use crate::common::LixTimestamp;
 
     use super::*;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::forktree::state::{StateCell, StateKeyRef, encode_state_key};
 
     fn row(label: &str, byte: u8, history_byte: u8, history_ordinal: u32) -> CurrentStatePackRowV1 {
-        let entity_pk = EntityPk::single(label);
+        let row_pk = RowPk::single(label);
         let schema = crate::native_row::seed_schema("lix_key_value").expect("key-value schema");
         let native = crate::native_row::encode(
             &schema,
-            &entity_pk,
+            &row_pk,
             false,
             None,
             &serde_json::json!({"key": label, "value": format!("value-{byte}")}),
@@ -305,7 +305,7 @@ mod tests {
             encoded_key: encode_state_key(StateKeyRef {
                 schema_key: "lix_key_value",
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             }),
             value: StateValue {
                 change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes([byte; 16])),

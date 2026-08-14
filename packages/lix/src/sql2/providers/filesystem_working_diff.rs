@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::common::{compose_directory_path, compose_file_path};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
@@ -254,12 +254,12 @@ where
         }
         match key.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(&key.entity_pk) {
+                if let Some(id) = single_row_pk_value(&key.row_pk) {
                     file_ids.insert(id);
                 }
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(&key.entity_pk) {
+                if let Some(id) = single_row_pk_value(&key.row_pk) {
                     directory_ids.insert(id);
                 }
             }
@@ -313,8 +313,8 @@ where
     Ok(rows)
 }
 
-fn single_entity_pk_value(entity_pk: &EntityPk) -> Option<String> {
-    entity_pk.as_single_string_owned().ok()
+fn single_row_pk_value(row_pk: &RowPk) -> Option<String> {
+    row_pk.as_single_string_owned().ok()
 }
 
 async fn load_logical_snapshot<S>(
@@ -326,12 +326,12 @@ async fn load_logical_snapshot<S>(
 where
     S: StorageAdapterRead,
 {
-    let file_entity_pks = if load_all_files {
+    let file_row_pks = if load_all_files {
         Vec::new()
     } else {
         selected_file_ids
             .iter()
-            .map(|file_id| filesystem_descriptor_entity_pk(file_id, "file"))
+            .map(|file_id| filesystem_descriptor_row_pk(file_id, "file"))
             .collect::<Result<Vec<_>, _>>()?
     };
     let files = if !load_all_files && selected_file_ids.is_empty() {
@@ -341,7 +341,7 @@ where
             historical,
             commit_id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            file_entity_pks,
+            file_row_pks,
         )
         .await?
     };
@@ -428,7 +428,7 @@ where
             commit_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             ids.iter()
-                .map(|directory_id| filesystem_descriptor_entity_pk(directory_id, "directory"))
+                .map(|directory_id| filesystem_descriptor_row_pk(directory_id, "directory"))
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
@@ -453,8 +453,8 @@ where
     Ok(directories)
 }
 
-fn filesystem_descriptor_entity_pk(id: &str, kind: &str) -> Result<EntityPk, LixError> {
-    EntityPk::uuid_from_canonical(id).map_err(|error| {
+fn filesystem_descriptor_row_pk(id: &str, kind: &str) -> Result<RowPk, LixError> {
+    RowPk::uuid_from_canonical(id).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("validated {kind} ID is not a canonical UUID: {error}"),
@@ -466,7 +466,7 @@ async fn scan_descriptors<S, T>(
     historical: &ForkTreeReadFacade<S>,
     commit_id: &str,
     schema_key: &str,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
 ) -> Result<Vec<T>, LixError>
 where
     S: StorageAdapterRead,
@@ -481,10 +481,10 @@ where
     rows.into_iter()
         .filter(|row| {
             row.key.schema_key == schema_key
-                && (entity_pks.is_empty() || entity_pks.contains(&row.key.entity_pk))
+                && (row_pks.is_empty() || row_pks.contains(&row.key.row_pk))
         })
         .map(|row| {
-            let row_id = row.key.entity_pk.as_single_string_owned()?;
+            let row_id = row.key.row_pk.as_single_string_owned()?;
             validate_descriptor_row_identity(&row, schema_key, &row_id)?;
             if row.deleted {
                 // An authenticated tombstone is logical absence, not a malformed descriptor.
@@ -661,19 +661,19 @@ fn batch_error(error: ColumnTableError) -> datafusion::common::DataFusionError {
 
 #[cfg(test)]
 mod tests {
-    use super::single_entity_pk_value;
-    use crate::entity_pk::EntityPk;
+    use super::single_row_pk_value;
+    use crate::row_pk::RowPk;
 
     #[test]
-    fn composite_entity_pk_is_not_reduced_to_its_first_component() {
-        let composite = EntityPk::from_json_array_text(r#"["file-like","other"]"#)
-            .expect("composite entity key should decode");
-        assert_eq!(single_entity_pk_value(&composite), None);
+    fn composite_row_pk_is_not_reduced_to_its_first_component() {
+        let composite = RowPk::from_json_array_text(r#"["file-like","other"]"#)
+            .expect("composite row key should decode");
+        assert_eq!(single_row_pk_value(&composite), None);
 
-        let single = EntityPk::from_json_array_text(r#"["file-like"]"#)
-            .expect("single entity key should decode");
+        let single = RowPk::from_json_array_text(r#"["file-like"]"#)
+            .expect("single row key should decode");
         assert_eq!(
-            single_entity_pk_value(&single).as_deref(),
+            single_row_pk_value(&single).as_deref(),
             Some("file-like")
         );
     }

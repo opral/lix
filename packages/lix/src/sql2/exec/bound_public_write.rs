@@ -11,20 +11,20 @@ use crate::changelog::CommitId;
 use crate::common::{
     ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
 };
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::StateCell;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundWriteInput,
-    BoundWriteOp, BoundWriteTarget, EntityWriteSurface, FileWriteSurface,
+    BoundWriteOp, BoundWriteTarget, RowWriteSurface, FileWriteSurface,
 };
-use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
-use crate::sql2::catalog::{EntityColumnType, EntitySurfaceSpec};
+use crate::sql2::catalog::schema_surface::SchemaSurfaceColumn;
+use crate::sql2::catalog::{SchemaColumnType, SchemaSurfaceSpec};
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
-use crate::sql2::read_only::reject_read_only_entity_surface;
+use crate::sql2::read_only::reject_read_only_schema_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
 use crate::state::{StateRow, StateRowSource};
@@ -34,7 +34,7 @@ use crate::transaction::types::{
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
     TypedMutationJournalBatch,
 };
-use crate::plugin::runtime::WasmEntityKey;
+use crate::plugin::runtime::WasmRowKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 
@@ -62,7 +62,7 @@ impl NativeStateBatch {
 
 #[derive(Clone, Debug)]
 struct NativeStateRow {
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: String,
     file_id: Option<String>,
     snapshot_content: Option<SharedStr>,
@@ -80,8 +80,8 @@ struct NativeStateRow {
 struct NativeStateRowRef<'a>(&'a NativeStateRow);
 
 impl NativeStateRow {
-    fn entity_pk(&self) -> &EntityPk {
-        &self.entity_pk
+    fn row_pk(&self) -> &RowPk {
+        &self.row_pk
     }
     fn schema_key(&self) -> &str {
         &self.schema_key
@@ -120,13 +120,13 @@ impl NativeStateRow {
     fn from_state_row(
         row: StateRow,
         branch_id: &str,
-        spec: &EntitySurfaceSpec,
+        spec: &SchemaSurfaceSpec,
     ) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
         let snapshot_content = match row.value.cell {
             StateCell::NativeRow(native) => Some(crate::native_row::logical_text(
                 spec.native_schema.as_ref(),
-                &key.entity_pk,
+                &key.row_pk,
                 row.source == StateRowSource::Global,
                 key.file_id.as_deref(),
                 &native,
@@ -140,7 +140,7 @@ impl NativeStateRow {
             StateCell::Null | StateCell::Tombstone => None,
         };
         Ok(Self {
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
             schema_key: key.schema_key,
             file_id: key.file_id,
             snapshot_content,
@@ -167,8 +167,8 @@ impl NativeStateRow {
 }
 
 impl<'a> NativeStateRowRef<'a> {
-    fn entity_pk(self) -> &'a EntityPk {
-        &self.0.entity_pk
+    fn row_pk(self) -> &'a RowPk {
+        &self.0.row_pk
     }
     fn schema_key(self) -> &'a str {
         &self.0.schema_key
@@ -224,7 +224,7 @@ std::thread_local! {
 #[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
-        BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
+        BoundWriteTarget::Row(_) => bound_public_write_shape_supported(plan),
         BoundWriteTarget::File(surface) => {
             fast_file_path_write_shape(plan, surface).is_some()
                 || fast_file_content_update_shape(plan, surface).is_some()
@@ -239,13 +239,13 @@ pub(crate) enum BoundPublicWriteExecution {
 }
 
 #[derive(Clone, Copy)]
-enum EntityInsertParameterBatch<'a> {
+enum RowInsertParameterBatch<'a> {
     Arrow(&'a RecordBatch),
     Values(&'a [&'a [Value]]),
     Prepared(&'a PreparedDmlParameterBatch),
 }
 
-enum CertifiedEntityInsertParameterBatch {
+enum CertifiedRowInsertParameterBatch {
     Typed(CertifiedParameterInsertBatch),
     Raw(RawWriteBatch),
 }
@@ -256,7 +256,7 @@ fn use_typed_certified_insert(row_count: usize) -> bool {
     row_count >= TYPED_CERTIFIED_INSERT_MIN_ROWS
 }
 
-impl CertifiedEntityInsertParameterBatch {
+impl CertifiedRowInsertParameterBatch {
     fn into_raw(self) -> Result<RawWriteBatch, LixError> {
         match self {
             Self::Typed(rows) => rows.into_raw(),
@@ -272,7 +272,7 @@ enum DirectParameterValue<'a> {
     Boolean(bool),
 }
 
-impl<'a> EntityInsertParameterBatch<'a> {
+impl<'a> RowInsertParameterBatch<'a> {
     fn num_rows(self) -> usize {
         match self {
             Self::Arrow(batch) => batch.num_rows(),
@@ -289,7 +289,7 @@ impl<'a> EntityInsertParameterBatch<'a> {
         }
     }
 
-    fn column_matches(self, parameter_index: usize, column_type: EntityColumnType) -> bool {
+    fn column_matches(self, parameter_index: usize, column_type: SchemaColumnType) -> bool {
         match self {
             Self::Arrow(batch) => {
                 let Some(array) = batch.columns().get(parameter_index) else {
@@ -301,20 +301,20 @@ impl<'a> EntityInsertParameterBatch<'a> {
                     return false;
                 }
                 match column_type {
-                    EntityColumnType::String => {
+                    SchemaColumnType::String => {
                         array.as_any().is::<StringArray>()
                             || array.as_any().is::<LargeStringArray>()
                     }
-                    EntityColumnType::Boolean => array.as_any().is::<BooleanArray>(),
+                    SchemaColumnType::Boolean => array.as_any().is::<BooleanArray>(),
                     _ => false,
                 }
             }
             Self::Values(rows) => rows.iter().all(|row| {
                 matches!(
                     (column_type, row.get(parameter_index)),
-                    (EntityColumnType::String, Some(Value::Text(_) | Value::Null))
+                    (SchemaColumnType::String, Some(Value::Text(_) | Value::Null))
                         | (
-                            EntityColumnType::Boolean,
+                            SchemaColumnType::Boolean,
                             Some(Value::Boolean(_) | Value::Null)
                         )
                 )
@@ -323,10 +323,10 @@ impl<'a> EntityInsertParameterBatch<'a> {
                 matches!(
                     (column_type, batch.value(row, parameter_index)),
                     (
-                        EntityColumnType::String,
+                        SchemaColumnType::String,
                         PreparedDmlValueRef::Text(_) | PreparedDmlValueRef::Null
                     ) | (
-                        EntityColumnType::Boolean,
+                        SchemaColumnType::Boolean,
                         PreparedDmlValueRef::Boolean(_) | PreparedDmlValueRef::Null
                     )
                 )
@@ -367,33 +367,33 @@ impl<'a> EntityInsertParameterBatch<'a> {
     }
 }
 
-/// Executes independent parameterized entity INSERT statements as one dense
+/// Executes independent parameterized row INSERT statements as one dense
 /// transaction write. The public batch still returns one affected-row result
 /// per logical statement, while parsing, binding, and transaction staging
 /// happen once for the homogeneous batch.
-pub(crate) async fn try_execute_entity_insert_parameter_batch(
+pub(crate) async fn try_execute_row_insert_parameter_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_entity_insert_batch(
+    try_execute_row_insert_batch(
         ctx,
         plan,
-        EntityInsertParameterBatch::Arrow(parameter_batch),
+        RowInsertParameterBatch::Arrow(parameter_batch),
         true,
     )
     .await
 }
 
-pub(crate) async fn try_execute_entity_insert_prepared_batch(
+pub(crate) async fn try_execute_row_insert_prepared_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &PreparedDmlParameterBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_entity_insert_batch(
+    try_execute_row_insert_batch(
         ctx,
         plan,
-        EntityInsertParameterBatch::Prepared(parameter_batch),
+        RowInsertParameterBatch::Prepared(parameter_batch),
         true,
     )
     .await
@@ -463,27 +463,27 @@ pub(crate) async fn try_execute_file_prepared_batch(
     ))
 }
 
-pub(crate) async fn try_execute_entity_insert_value_batch<'a>(
+pub(crate) async fn try_execute_row_insert_value_batch<'a>(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_rows: &'a [&'a [Value]],
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_entity_insert_batch(
+    try_execute_row_insert_batch(
         ctx,
         plan,
-        EntityInsertParameterBatch::Values(parameter_rows),
+        RowInsertParameterBatch::Values(parameter_rows),
         false,
     )
     .await
 }
 
-async fn try_execute_entity_insert_batch(
+async fn try_execute_row_insert_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    parameter_batch: EntityInsertParameterBatch<'_>,
+    parameter_batch: RowInsertParameterBatch<'_>,
     allow_generic_fallback: bool,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target
     else {
         return Ok(None);
     };
@@ -499,7 +499,7 @@ async fn try_execute_entity_insert_batch(
         return Ok(None);
     }
 
-    let spec = entity_spec(ctx, schema_key)?;
+    let spec = schema_spec(ctx, schema_key)?;
     if spec.has_inter_row_constraints {
         return Ok(None);
     }
@@ -519,10 +519,10 @@ async fn try_execute_entity_insert_batch(
     }
     let certification_span = tracing::debug_span!(
         target: "lix_perf",
-        "lix.perf.entity_insert_parameter_batch.certify"
+        "lix.perf.row_insert_parameter_batch.certify"
     )
     .entered();
-    let Some(mut write_rows) = certified_entity_insert_parameter_batch(
+    let Some(mut write_rows) = certified_row_insert_parameter_batch(
         ctx,
         plan,
         &spec,
@@ -541,23 +541,23 @@ async fn try_execute_entity_insert_batch(
         None
     } else {
         let raw_rows = write_rows.into_raw()?;
-        let committed = scan_entity_conflict_candidates(ctx, &spec, &raw_rows)
+        let committed = scan_row_conflict_candidates(ctx, &spec, &raw_rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
-                "lix.perf.entity_insert_parameter_batch.conflict_scan"
+                "lix.perf.row_insert_parameter_batch.conflict_scan"
             ))
             .await?;
         let conflict_attribution_span = tracing::debug_span!(
             target: "lix_perf",
-            "lix.perf.entity_insert_parameter_batch.conflict_attribution"
+            "lix.perf.row_insert_parameter_batch.conflict_attribution"
         )
         .entered();
-        let committed_identities = committed
+        let committed_identitys = committed
             .iter()
             .map(|row| {
                 (
                     (
-                        row.entity_pk().clone(),
+                        row.row_pk().clone(),
                         row.file_id().map(SharedStr::from),
                         SharedStr::from(row.branch_id()),
                         row.global(),
@@ -568,16 +568,16 @@ async fn try_execute_entity_insert_batch(
             .collect::<std::collections::HashMap<_, _>>();
         let mut conflict = None;
         for (row_index, row) in raw_rows.iter().enumerate() {
-            let entity_pk = row
-                .entity_pk
-                .expect("certified parameter INSERT rows have explicit identities");
+            let row_pk = row
+                .row_pk
+                .expect("certified parameter INSERT rows have explicit identitys");
             let identity = (
-                entity_pk.clone(),
+                row_pk.clone(),
                 row.file_id.cloned(),
                 row.branch_id.clone(),
                 row.global,
             );
-            let Some(existing_untracked) = committed_identities.get(&identity).copied() else {
+            let Some(existing_untracked) = committed_identitys.get(&identity).copied() else {
                 continue;
             };
             let error = if existing_untracked != row.untracked {
@@ -594,8 +594,8 @@ async fn try_execute_entity_insert_batch(
                 LixError::new(
                     LixError::CODE_UNIQUE,
                     format!(
-                        "cannot insert {requested} row for schema '{}' entity_pk {:?}: a canonical {existing} row already exists; delete it first",
-                        row.schema_key, entity_pk,
+                        "cannot insert {requested} row for schema '{}' row_pk {:?}: a canonical {existing} row already exists; delete it first",
+                        row.schema_key, row_pk,
                     ),
                 )
             } else {
@@ -603,7 +603,7 @@ async fn try_execute_entity_insert_batch(
                     LixError::CODE_UNIQUE,
                     crate::transaction::duplicate_insert_identity_message(
                         row.schema_key,
-                        entity_pk,
+                        row_pk,
                         Some(row.branch_id),
                         row.origin,
                     ),
@@ -614,23 +614,23 @@ async fn try_execute_entity_insert_batch(
         }
         drop(conflict_attribution_span);
         drop(committed);
-        write_rows = CertifiedEntityInsertParameterBatch::Raw(raw_rows);
+        write_rows = CertifiedRowInsertParameterBatch::Raw(raw_rows);
         conflict
     };
     match write_rows {
-        CertifiedEntityInsertParameterBatch::Typed(rows) => {
+        CertifiedRowInsertParameterBatch::Typed(rows) => {
             ctx.stage_certified_parameter_batch_insert(rows)
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
-                    "lix.perf.entity_insert_parameter_batch.stage_rows"
+                    "lix.perf.row_insert_parameter_batch.stage_rows"
                 ))
                 .await?;
         }
-        CertifiedEntityInsertParameterBatch::Raw(rows) => {
+        CertifiedRowInsertParameterBatch::Raw(rows) => {
             ctx.stage_parameter_batch_insert(rows)
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
-                    "lix.perf.entity_insert_parameter_batch.stage_rows"
+                    "lix.perf.row_insert_parameter_batch.stage_rows"
                 ))
                 .await?;
         }
@@ -644,7 +644,7 @@ async fn try_execute_entity_insert_batch(
             executions.set(executions.get().saturating_add(1));
         });
         #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_certified_entity_insert_parameter_batch_execution();
+        crate::storage_bench::record_certified_row_insert_parameter_batch_execution();
     }
     Ok(Some(
         (0..parameter_batch.num_rows())
@@ -675,9 +675,9 @@ async fn collection_is_certifiably_empty(
 /// scan/stage operation.
 ///
 /// `executeBatch` remains ordered at its public boundary. This route folds
-/// repeated identities in statement order and lowers the resulting unique,
+/// repeated identitys in statement order and lowers the resulting unique,
 /// identity-sorted replacements in one physical scan/stage operation.
-pub(crate) async fn try_execute_entity_update_value_batch<'a>(
+pub(crate) async fn try_execute_row_update_value_batch<'a>(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_rows: &'a [&'a [Value]],
@@ -685,28 +685,28 @@ pub(crate) async fn try_execute_entity_update_value_batch<'a>(
     try_execute_direct_path_value_replacement_batch(
         ctx,
         plan,
-        EntityInsertParameterBatch::Values(parameter_rows),
+        RowInsertParameterBatch::Values(parameter_rows),
     )
     .await
 }
 
-pub(crate) async fn try_execute_entity_update_parameter_batch(
+pub(crate) async fn try_execute_row_update_parameter_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_entity_update_batch(
+    try_execute_row_update_batch(
         ctx,
         plan,
-        EntityInsertParameterBatch::Arrow(parameter_batch),
+        RowInsertParameterBatch::Arrow(parameter_batch),
     )
     .await
 }
 
-async fn try_execute_entity_update_batch(
+async fn try_execute_row_update_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    parameter_batch: EntityInsertParameterBatch<'_>,
+    parameter_batch: RowInsertParameterBatch<'_>,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
     if let Some(results) =
         try_execute_direct_path_value_replacement_batch(ctx, plan, parameter_batch).await?
@@ -714,7 +714,7 @@ async fn try_execute_entity_update_batch(
         return Ok(Some(results));
     }
 
-    let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target
     else {
         return Ok(None);
     };
@@ -731,7 +731,7 @@ async fn try_execute_entity_update_batch(
         return Ok(None);
     }
 
-    let spec = entity_spec(ctx, schema_key)?;
+    let spec = schema_spec(ctx, schema_key)?;
     if spec.has_inter_row_constraints
         || plan.bound.assignments.iter().any(|assignment| {
             spec.primary_key_paths
@@ -747,7 +747,7 @@ async fn try_execute_entity_update_batch(
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
     let direct_replacement = direct_path_value_replacement(&spec, plan, direct_primary_key_param);
     let borrowed_direct_parameters = match parameter_batch {
-        EntityInsertParameterBatch::Arrow(batch) => {
+        RowInsertParameterBatch::Arrow(batch) => {
             direct_replacement.as_ref().and_then(|replacement| {
                 direct_replacement_text_columns(
                     batch,
@@ -756,76 +756,76 @@ async fn try_execute_entity_update_batch(
                 )
             })
         }
-        EntityInsertParameterBatch::Values(_) | EntityInsertParameterBatch::Prepared(_) => None,
+        RowInsertParameterBatch::Values(_) | RowInsertParameterBatch::Prepared(_) => None,
     };
     let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
-    let mut entity_pks = Vec::<EntityPk>::with_capacity(parameter_batch.num_rows());
-    let mut entity_pks_strictly_ordered = true;
+    let mut row_pks = Vec::<RowPk>::with_capacity(parameter_batch.num_rows());
+    let mut row_pks_strictly_ordered = true;
     for row_index in 0..parameter_batch.num_rows() {
-        let entity_pk = if let Some(columns) = borrowed_direct_parameters {
+        let row_pk = if let Some(columns) = borrowed_direct_parameters {
             if columns.primary_keys.is_null(row_index) {
                 return Ok(None);
             }
-            let Ok(entity_pk) = EntityPk::from_external_parts(
+            let Ok(row_pk) = RowPk::from_external_parts(
                 vec![columns.primary_keys.value(row_index).to_owned()],
                 &spec.primary_key_component_types,
             ) else {
                 return Ok(None);
             };
-            entity_pk
+            row_pk
         } else {
             let params = parameter_batch_row_values(parameter_batch, row_index)
                 .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
-            let entity_pk = if let Some(param_index) = direct_primary_key_param {
+            let row_pk = if let Some(param_index) = direct_primary_key_param {
                 let Some(Value::Text(value)) = params.get(param_index) else {
                     return Ok(None);
                 };
-                let Ok(entity_pk) = EntityPk::from_external_parts(
+                let Ok(row_pk) = RowPk::from_external_parts(
                     vec![value.clone()],
                     &spec.primary_key_component_types,
                 ) else {
                     return Ok(None);
                 };
-                entity_pk
+                row_pk
             } else {
-                let Some(mut row_entity_pks) = bound_entity_pks_from_primary_key_predicate(
+                let Some(mut row_row_pks) = bound_row_pks_from_primary_key_predicate(
                     &spec,
                     &plan.bound.predicate,
                     &params,
                 ) else {
                     return Ok(None);
                 };
-                if row_entity_pks.len() != 1 {
+                if row_row_pks.len() != 1 {
                     return Ok(None);
                 }
-                row_entity_pks.pop().expect("one point-update identity")
+                row_row_pks.pop().expect("one point-update identity")
             };
             parameter_rows.push(params);
-            entity_pk
+            row_pk
         };
-        if let Some(previous) = entity_pks.last() {
-            match previous.cmp(&entity_pk) {
+        if let Some(previous) = row_pks.last() {
+            match previous.cmp(&row_pk) {
                 Ordering::Less => {}
                 Ordering::Equal => {
-                    // Repeated identities observe earlier staged writes and
+                    // Repeated identitys observe earlier staged writes and
                     // are not independent statements.
                     return Ok(None);
                 }
-                Ordering::Greater => entity_pks_strictly_ordered = false,
+                Ordering::Greater => row_pks_strictly_ordered = false,
             }
         }
-        entity_pks.push(entity_pk);
+        row_pks.push(row_pk);
     }
-    if !entity_pks_strictly_ordered {
-        let mut unique_entity_pks = std::collections::BTreeSet::new();
-        if entity_pks
+    if !row_pks_strictly_ordered {
+        let mut unique_row_pks = std::collections::BTreeSet::new();
+        if row_pks
             .iter()
-            .any(|entity_pk| !unique_entity_pks.insert(entity_pk))
+            .any(|row_pk| !unique_row_pks.insert(row_pk))
         {
             return Ok(None);
         }
     }
-    if borrowed_direct_parameters.is_some() && !entity_pks_strictly_ordered {
+    if borrowed_direct_parameters.is_some() && !row_pks_strictly_ordered {
         for row_index in 0..parameter_batch.num_rows() {
             parameter_rows.push(
                 parameter_batch_row_values(parameter_batch, row_index)
@@ -834,17 +834,17 @@ async fn try_execute_entity_update_batch(
         }
     }
 
-    let direct_ordered = entity_pks_strictly_ordered && direct_replacement.is_some();
-    let scan_entity_pks = if direct_ordered {
-        std::mem::take(&mut entity_pks)
+    let direct_ordered = row_pks_strictly_ordered && direct_replacement.is_some();
+    let scan_row_pks = if direct_ordered {
+        std::mem::take(&mut row_pks)
     } else {
-        entity_pks.clone()
+        row_pks.clone()
     };
-    let candidates = scan_entity_candidates_for_pks(
+    let candidates = scan_row_candidates_for_pks(
         ctx,
         plan,
         &spec,
-        scan_entity_pks,
+        scan_row_pks,
         direct_replacement.is_some(),
     )
     .await?;
@@ -855,13 +855,13 @@ async fn try_execute_entity_update_batch(
     {
         // Retention and plugin-owned file rows retain the canonical semantic
         // preparation path. This certificate is only for ordinary tracked
-        // entity replacements.
+        // row replacements.
         return Ok(None);
     }
     let mut affected_by_statement = Vec::with_capacity(parameter_rows.len());
     let mut write_rows = RawWriteBatch::with_capacity(parameter_rows.len());
     if direct_ordered && let Some(replacement) = direct_replacement.as_ref() {
-        // Exact scans return physical entity order. Merge the ordered request
+        // Exact scans return physical row order. Merge the ordered request
         // and result streams directly instead of cloning every identity into
         // a second B-tree and allocating one candidate vector per row.
         let mut candidates = candidates.iter().peekable();
@@ -871,7 +871,7 @@ async fn try_execute_entity_update_batch(
         let mut offsets = Vec::with_capacity(parameter_rows.len());
         let mut matched_candidates = Vec::with_capacity(parameter_rows.len());
         for row_index in 0..parameter_batch.num_rows() {
-            let (expected_entity_pk, borrowed_value, params) = if let Some(columns) =
+            let (expected_row_pk, borrowed_value, params) = if let Some(columns) =
                 borrowed_direct_parameters
             {
                 (
@@ -881,26 +881,26 @@ async fn try_execute_entity_update_batch(
                 )
             } else {
                 let params = &parameter_rows[row_index];
-                let expected_entity_pk = match params.get(primary_key_param_index) {
+                let expected_row_pk = match params.get(primary_key_param_index) {
                     Some(Value::Text(value)) => value.as_str(),
                     _ => unreachable!("direct replacement primary key was validated as text"),
                 };
-                (expected_entity_pk, None, Some(params.as_slice()))
+                (expected_row_pk, None, Some(params.as_slice()))
             };
             let mut affected = 0;
             while let Some(candidate) = candidates.peek().copied() {
                 if candidate
-                    .entity_pk()
+                    .row_pk()
                     .as_single_string()
                     .map_err(|error| with_parameter_batch_statement_index(error, row_index))?
-                    != expected_entity_pk
+                    != expected_row_pk
                 {
                     break;
                 }
-                let candidate = EntityLiveRowRef::from(
+                let candidate = RowLiveRowRef::from(
                     candidates
                         .next()
-                        .expect("peeked exact entity candidate remains available"),
+                        .expect("peeked exact row candidate remains available"),
                 );
                 let start = normalized.len();
                 let result = if borrowed_direct_parameters.is_some() {
@@ -935,18 +935,18 @@ async fn try_execute_entity_update_batch(
             .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
         }
     } else {
-        let mut candidates_by_pk = std::collections::BTreeMap::<EntityPk, Vec<_>>::new();
+        let mut candidates_by_pk = std::collections::BTreeMap::<RowPk, Vec<_>>::new();
         for candidate in candidates.iter() {
             candidates_by_pk
-                .entry(candidate.entity_pk().clone())
+                .entry(candidate.row_pk().clone())
                 .or_default()
                 .push(candidate);
         }
-        for (row_index, (entity_pk, params)) in
-            entity_pks.into_iter().zip(&parameter_rows).enumerate()
+        for (row_index, (row_pk, params)) in
+            row_pks.into_iter().zip(&parameter_rows).enumerate()
         {
             let mut affected = 0;
-            for candidate in candidates_by_pk.remove(&entity_pk).unwrap_or_default() {
+            for candidate in candidates_by_pk.remove(&row_pk).unwrap_or_default() {
                 let appended = match direct_replacement.as_ref() {
                     Some(replacement) => append_direct_path_value_replacement_row(
                         &mut write_rows,
@@ -956,7 +956,7 @@ async fn try_execute_entity_update_batch(
                         replacement,
                     )
                     .map(|()| true),
-                    None => append_entity_update_row(
+                    None => append_row_update_row(
                         &mut write_rows,
                         ctx,
                         plan,
@@ -994,27 +994,27 @@ async fn try_execute_entity_update_batch(
     ))
 }
 
-pub(crate) async fn try_execute_entity_update_prepared_batch(
+pub(crate) async fn try_execute_row_update_prepared_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &PreparedDmlParameterBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_entity_update_batch(
+    try_execute_row_update_batch(
         ctx,
         plan,
-        EntityInsertParameterBatch::Prepared(parameter_batch),
+        RowInsertParameterBatch::Prepared(parameter_batch),
     )
     .await
 }
 
 fn parameter_batch_row_values(
-    parameter_batch: EntityInsertParameterBatch<'_>,
+    parameter_batch: RowInsertParameterBatch<'_>,
     row_index: usize,
 ) -> Result<Vec<Value>, LixError> {
     match parameter_batch {
-        EntityInsertParameterBatch::Arrow(batch) => super::write::parameter_row(batch, row_index),
-        EntityInsertParameterBatch::Prepared(batch) => batch.row_values(row_index),
-        EntityInsertParameterBatch::Values(rows) => {
+        RowInsertParameterBatch::Arrow(batch) => super::write::parameter_row(batch, row_index),
+        RowInsertParameterBatch::Prepared(batch) => batch.row_values(row_index),
+        RowInsertParameterBatch::Values(rows) => {
             rows.get(row_index).map(|row| row.to_vec()).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -1028,16 +1028,16 @@ fn parameter_batch_row_values(
 /// Lowers the dominant JSON-pointer replacement shape directly from borrowed
 /// public parameters into one canonical row-content arena.
 ///
-/// Statement order is preserved even when identities repeat or arrive out of
+/// Statement order is preserved even when identitys repeat or arrive out of
 /// order: each live identity reports every matching statement as affected and
 /// the last statement supplies the staged replacement. The canonical write
 /// batch itself remains identity-sorted and contains one row per identity.
 async fn try_execute_direct_path_value_replacement_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    parameter_batch: EntityInsertParameterBatch<'_>,
+    parameter_batch: RowInsertParameterBatch<'_>,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target
     else {
         return Ok(None);
     };
@@ -1045,10 +1045,10 @@ async fn try_execute_direct_path_value_replacement_batch(
         return Ok(None);
     }
     #[cfg(feature = "storage-benches")]
-    let record_value_certificate = matches!(parameter_batch, EntityInsertParameterBatch::Values(_));
+    let record_value_certificate = matches!(parameter_batch, RowInsertParameterBatch::Values(_));
     #[cfg(feature = "storage-benches")]
     if record_value_certificate {
-        crate::storage_bench::record_certified_entity_update_value_batch_attempt();
+        crate::storage_bench::record_certified_row_update_value_batch_attempt();
     }
     if !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
@@ -1060,7 +1060,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         return Ok(None);
     }
 
-    let spec = entity_spec(ctx, schema_key)?;
+    let spec = schema_spec(ctx, schema_key)?;
     if spec.has_inter_row_constraints
         || plan.bound.assignments.iter().any(|assignment| {
             spec.primary_key_paths
@@ -1081,8 +1081,8 @@ async fn try_execute_direct_path_value_replacement_batch(
     else {
         return Ok(None);
     };
-    if !parameter_batch.column_matches(primary_key_param_index, EntityColumnType::String)
-        || !parameter_batch.column_matches(replacement.value_param_index, EntityColumnType::String)
+    if !parameter_batch.column_matches(primary_key_param_index, SchemaColumnType::String)
+        || !parameter_batch.column_matches(replacement.value_param_index, SchemaColumnType::String)
     {
         return Ok(None);
     }
@@ -1206,7 +1206,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         ctx.stage_typed_mutation_journal_replace(journal)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
-                "lix.perf.entity_update_value_batch.stage_typed_journal",
+                "lix.perf.row_update_value_batch.stage_typed_journal",
                 row_count
             ))
             .await?;
@@ -1224,7 +1224,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
         #[cfg(feature = "storage-benches")]
         if record_value_certificate {
-            crate::storage_bench::record_certified_entity_update_value_batch_hit(row_count);
+            crate::storage_bench::record_certified_row_update_value_batch_hit(row_count);
         }
         return Ok(Some(
             (0..row_count)
@@ -1234,10 +1234,10 @@ async fn try_execute_direct_path_value_replacement_batch(
     }
     let primary_key_arena = SharedStr::from_utf8(bytes::Bytes::from(primary_key_arena))
         .map_err(|_| LixError::unknown("certified replacement primary-key arena is not UTF-8"))?;
-    let entity_pks = primary_key_offsets
+    let row_pks = primary_key_offsets
         .into_iter()
         .map(|(start, end)| {
-            EntityPk::from_validated_shared_string(
+            RowPk::from_validated_shared_string(
                 primary_key_arena
                     .slice(start..end)
                     .expect("certified replacement primary-key offsets preserve UTF-8"),
@@ -1253,31 +1253,31 @@ async fn try_execute_direct_path_value_replacement_batch(
     } else {
         let mut ordinals = (0..row_count).collect::<Vec<_>>();
         ordinals.sort_unstable_by(|left, right| {
-            entity_pks[*left]
-                .cmp(&entity_pks[*right])
+            row_pks[*left]
+                .cmp(&row_pks[*right])
                 .then_with(|| left.cmp(right))
         });
         Some(ordinals)
     };
-    let deduplicated_entity_pks = if let Some(ordinals) = &sorted_statement_ordinals {
+    let deduplicated_row_pks = if let Some(ordinals) = &sorted_statement_ordinals {
         let mut unique = Vec::with_capacity(row_count);
         for &statement_index in ordinals {
-            let entity_pk = &entity_pks[statement_index];
-            if unique.last() != Some(entity_pk) {
-                unique.push(entity_pk.clone());
+            let row_pk = &row_pks[statement_index];
+            if unique.last() != Some(row_pk) {
+                unique.push(row_pk.clone());
             }
         }
         Some(unique)
     } else {
         None
     };
-    let unique_entity_pks = deduplicated_entity_pks
+    let unique_row_pks = deduplicated_row_pks
         .as_deref()
-        .unwrap_or(entity_pks.as_slice());
-    let unique_row_count = unique_entity_pks.len();
+        .unwrap_or(row_pks.as_slice());
+    let unique_row_count = unique_row_pks.len();
     let ordered_identity_digest =
         crate::collection_generation::ordered_single_string_identity_digest(
-            unique_entity_pks.iter(),
+            unique_row_pks.iter(),
         );
     let certified_generation_identity = !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
@@ -1295,10 +1295,10 @@ async fn try_execute_direct_path_value_replacement_batch(
         NativeStateBatch::default()
     } else {
         let candidates =
-            scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.to_vec(), true)
+            scan_row_candidates_for_pks(ctx, plan, &spec, unique_row_pks.to_vec(), true)
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
-                    "lix.perf.entity_update_value_batch.candidate_scan",
+                    "lix.perf.row_update_value_batch.candidate_scan",
                     row_count,
                     unique_row_count
                 ))
@@ -1313,34 +1313,34 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
         candidates
     };
-    // Sorting identities changes expression evaluation order. Once this route
+    // Sorting identitys changes expression evaluation order. Once this route
     // is fully certified, validate JSON arguments for live rows in original
     // statement order so a later replacement cannot hide an earlier error.
     // Missing-row UPDATEs do not evaluate SET expressions, so first derive
     // liveness from the certified generation or the exact candidate scan.
     if !primary_keys_strictly_ordered {
-        let live_unique_identities = if certified_generation_identity {
+        let live_unique_identitys = if certified_generation_identity {
             None
         } else {
             let mut live = vec![false; unique_row_count];
             let mut candidate_index = 0;
-            for (identity_index, entity_pk) in unique_entity_pks.iter().enumerate() {
+            for (identity_index, row_pk) in unique_row_pks.iter().enumerate() {
                 while candidate_index < candidates.len()
-                    && candidates.row(candidate_index).entity_pk() < entity_pk
+                    && candidates.row(candidate_index).row_pk() < row_pk
                 {
                     candidate_index += 1;
                 }
                 live[identity_index] = candidate_index < candidates.len()
-                    && candidates.row(candidate_index).entity_pk() == entity_pk;
+                    && candidates.row(candidate_index).row_pk() == row_pk;
             }
             Some(live)
         };
         let mut scratch = Vec::new();
-        for (statement_index, entity_pk) in entity_pks.iter().enumerate() {
-            let identity_index = unique_entity_pks
-                .binary_search(entity_pk)
+        for (statement_index, row_pk) in row_pks.iter().enumerate() {
+            let identity_index = unique_row_pks
+                .binary_search(row_pk)
                 .expect("every statement identity belongs to the unique identity set");
-            if live_unique_identities
+            if live_unique_identitys
                 .as_ref()
                 .is_some_and(|live| !live[identity_index])
             {
@@ -1380,19 +1380,19 @@ async fn try_execute_direct_path_value_replacement_batch(
             && collection_generation
                 .is_some_and(|generation| generation.live_count == unique_row_count as u64));
 
-    let (estimated_row_bytes, replacement_identity_replay_bytes) = unique_entity_pks
+    let (estimated_row_bytes, replacement_identity_replay_bytes) = unique_row_pks
         .iter()
-        .try_fold((0_usize, 0_usize), |(estimated, replay), entity_pk| {
+        .try_fold((0_usize, 0_usize), |(estimated, replay), row_pk| {
             Some((
                 estimated.checked_add(
-                    entity_pk
+                    row_pk
                         .as_single_string()
                         .map_or(32, |path| path.len().saturating_add(32)),
                 )?,
                 replay.checked_add(
                     spec.schema_key
                         .len()
-                        .checked_add(entity_pk.estimated_heap_bytes())?
+                        .checked_add(row_pk.estimated_heap_bytes())?
                         .checked_add(128)?,
                 )?,
             ))
@@ -1405,17 +1405,17 @@ async fn try_execute_direct_path_value_replacement_batch(
         candidates.len()
     };
     let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
-    let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
+    let mut replacement_row_pks = Vec::with_capacity(replacement_capacity);
     let mut affected_by_statement =
         (!certified_generation_identity).then(|| vec![0_u64; row_count]);
     let mut candidate_index = 0;
     let mut ordinal_index = 0;
-    for (identity_index, entity_pk) in unique_entity_pks.iter().enumerate() {
+    for (identity_index, row_pk) in unique_row_pks.iter().enumerate() {
         let (first_statement_index, last_statement_index) =
             if let Some(ordinals) = &sorted_statement_ordinals {
                 let first = ordinal_index;
                 while ordinal_index < ordinals.len()
-                    && entity_pks[ordinals[ordinal_index]] == *entity_pk
+                    && row_pks[ordinals[ordinal_index]] == *row_pk
                 {
                     ordinal_index += 1;
                 }
@@ -1425,12 +1425,12 @@ async fn try_execute_direct_path_value_replacement_batch(
             };
         if !certified_generation_identity {
             while candidate_index < candidates.len()
-                && candidates.row(candidate_index).entity_pk() < entity_pk
+                && candidates.row(candidate_index).row_pk() < row_pk
             {
                 candidate_index += 1;
             }
             if candidate_index == candidates.len()
-                || candidates.row(candidate_index).entity_pk() != entity_pk
+                || candidates.row(candidate_index).row_pk() != row_pk
             {
                 continue;
             }
@@ -1444,7 +1444,7 @@ async fn try_execute_direct_path_value_replacement_batch(
 
         let start = normalized.len();
         normalized.extend_from_slice(b"{\"path\":");
-        append_canonical_json_string(&mut normalized, entity_pk.as_single_string()?)
+        append_canonical_json_string(&mut normalized, row_pk.as_single_string()?)
             .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
         normalized.extend_from_slice(b",\"value\":");
         match parameter_batch.value(replacement.value_param_index, statement_index) {
@@ -1460,7 +1460,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
         normalized.push(b'}');
         snapshot_offsets.push((start, normalized.len()));
-        replacement_entity_pks.push(entity_pk.clone());
+        replacement_row_pks.push(row_pk.clone());
         if let Some(ordinals) = &sorted_statement_ordinals {
             for &affected_statement in &ordinals[first_statement_index..=last_statement_index] {
                 if let Some(affected_by_statement) = &mut affected_by_statement {
@@ -1475,7 +1475,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
     }
     let uniform_created_at = if replaces_complete_collection
-        && candidates.len() == replacement_entity_pks.len()
+        && candidates.len() == replacement_row_pks.len()
         && candidates.len() == unique_row_count
         && candidates.iter().all(|candidate| {
             !candidate.untracked()
@@ -1497,9 +1497,9 @@ async fn try_execute_direct_path_value_replacement_batch(
     };
     if let Some(created_at) = uniform_created_at {
         let mut identity_arena = Vec::new();
-        let mut identity_offsets = Vec::with_capacity(replacement_entity_pks.len());
-        for entity_pk in &replacement_entity_pks {
-            let identity = entity_pk.as_single_string()?;
+        let mut identity_offsets = Vec::with_capacity(replacement_row_pks.len());
+        for row_pk in &replacement_row_pks {
+            let identity = row_pk.as_single_string()?;
             let start = identity_arena.len();
             identity_arena.extend_from_slice(identity.as_bytes());
             identity_offsets.push((start, identity_arena.len()));
@@ -1520,13 +1520,13 @@ async fn try_execute_direct_path_value_replacement_batch(
         ctx.stage_typed_mutation_journal_replace(journal)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
-                "lix.perf.entity_update_value_batch.stage_root_transition_journal",
+                "lix.perf.row_update_value_batch.stage_root_transition_journal",
                 row_count
             ))
             .await?;
         #[cfg(feature = "storage-benches")]
         if record_value_certificate {
-            crate::storage_bench::record_certified_entity_update_value_batch_hit(row_count);
+            crate::storage_bench::record_certified_row_update_value_batch_hit(row_count);
         }
         return Ok(Some(
             affected_by_statement
@@ -1536,12 +1536,12 @@ async fn try_execute_direct_path_value_replacement_batch(
                 .collect(),
         ));
     }
-    if !replacement_entity_pks.is_empty() {
+    if !replacement_row_pks.is_empty() {
         let normalized_len = normalized.len();
         let snapshots =
             TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
         let rows = CertifiedParameterReplacementBatch::new(
-            replacement_entity_pks,
+            replacement_row_pks,
             snapshots,
             spec.schema_key.as_str().into(),
             active_branch_id.into(),
@@ -1568,7 +1568,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         ctx.stage_certified_parameter_batch_replace(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
-                "lix.perf.entity_update_value_batch.stage_rows",
+                "lix.perf.row_update_value_batch.stage_rows",
                 row_count
             ))
             .await?;
@@ -1585,7 +1585,7 @@ async fn try_execute_direct_path_value_replacement_batch(
     }
     #[cfg(feature = "storage-benches")]
     if record_value_certificate {
-        crate::storage_bench::record_certified_entity_update_value_batch_hit(row_count);
+        crate::storage_bench::record_certified_row_update_value_batch_hit(row_count);
     }
     Ok(Some(if certified_generation_identity {
         (0..row_count)
@@ -1658,16 +1658,16 @@ fn direct_replacement_text_columns<'a>(
 }
 
 #[derive(Clone, Copy)]
-enum EntityLiveRowRef<'a> {
+enum RowLiveRowRef<'a> {
     Owned(&'a NativeStateRow),
     Batch(NativeStateRowRef<'a>),
 }
 
-impl<'a> EntityLiveRowRef<'a> {
-    fn entity_pk(self) -> &'a EntityPk {
+impl<'a> RowLiveRowRef<'a> {
+    fn row_pk(self) -> &'a RowPk {
         match self {
-            Self::Owned(row) => &row.entity_pk,
-            Self::Batch(row) => row.entity_pk(),
+            Self::Owned(row) => &row.row_pk,
+            Self::Batch(row) => row.row_pk(),
         }
     }
 
@@ -1749,20 +1749,20 @@ impl<'a> EntityLiveRowRef<'a> {
     }
 }
 
-impl<'a> From<&'a NativeStateRow> for EntityLiveRowRef<'a> {
+impl<'a> From<&'a NativeStateRow> for RowLiveRowRef<'a> {
     fn from(row: &'a NativeStateRow) -> Self {
         Self::Owned(row)
     }
 }
 
-impl<'a> From<NativeStateRowRef<'a>> for EntityLiveRowRef<'a> {
+impl<'a> From<NativeStateRowRef<'a>> for RowLiveRowRef<'a> {
     fn from(row: NativeStateRowRef<'a>) -> Self {
         Self::Batch(row)
     }
 }
 
 fn direct_path_value_replacement(
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     plan: &LogicalWritePlan,
     primary_key_param_index: Option<usize>,
 ) -> Option<DirectPathValueReplacement> {
@@ -1777,7 +1777,7 @@ fn direct_path_value_replacement(
     if assignment.column.name != "value"
         || spec
             .visible_column("value")
-            .is_none_or(|column| column.column_type != EntityColumnType::Json)
+            .is_none_or(|column| column.column_type != SchemaColumnType::Json)
     {
         return None;
     }
@@ -1794,8 +1794,8 @@ fn direct_path_value_replacement(
 
 fn append_direct_path_value_replacement_row<'a>(
     rows: &mut RawWriteBatch,
-    spec: &EntitySurfaceSpec,
-    candidate: impl Into<EntityLiveRowRef<'a>>,
+    spec: &SchemaSurfaceSpec,
+    candidate: impl Into<RowLiveRowRef<'a>>,
     params: &[Value],
     replacement: &DirectPathValueReplacement,
 ) -> Result<(), LixError> {
@@ -1818,7 +1818,7 @@ fn append_direct_path_value_replacement_row<'a>(
 
 fn append_direct_path_value_replacement_json(
     normalized: &mut Vec<u8>,
-    candidate: EntityLiveRowRef<'_>,
+    candidate: RowLiveRowRef<'_>,
     params: &[Value],
     replacement: &DirectPathValueReplacement,
 ) -> Result<(), LixError> {
@@ -1846,11 +1846,11 @@ fn append_direct_path_value_replacement_json(
 
 fn append_direct_path_value_replacement_json_text(
     normalized: &mut Vec<u8>,
-    candidate: EntityLiveRowRef<'_>,
+    candidate: RowLiveRowRef<'_>,
     raw: Option<&str>,
 ) -> Result<(), LixError> {
     normalized.extend_from_slice(br#"{"path":"#);
-    append_canonical_json_string(normalized, candidate.entity_pk().as_single_string()?)?;
+    append_canonical_json_string(normalized, candidate.row_pk().as_single_string()?)?;
     normalized.extend_from_slice(br#","value":"#);
     match raw {
         None => normalized.extend_from_slice(b"null"),
@@ -2232,13 +2232,13 @@ impl<'a> CanonicalJsonText<'a> {
 
 fn append_direct_path_value_replacement_prepared_row(
     rows: &mut RawWriteBatch,
-    spec: &EntitySurfaceSpec,
-    candidate: EntityLiveRowRef<'_>,
+    spec: &SchemaSurfaceSpec,
+    candidate: RowLiveRowRef<'_>,
     snapshot: TransactionJson,
 ) -> Result<(), LixError> {
     let metadata = inherited_metadata(candidate, spec)?;
     rows.push_parts(
-        Some(candidate.entity_pk().clone()),
+        Some(candidate.row_pk().clone()),
         spec.schema_key.as_str().into(),
         candidate.file_id().map(Into::into),
         Some(snapshot),
@@ -2262,7 +2262,7 @@ fn append_direct_path_value_replacement_prepared_row(
 }
 
 fn bound_single_text_primary_key_param(
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     predicate: &BoundPredicate,
 ) -> Option<usize> {
     let [path] = spec.primary_key_paths.as_slice() else {
@@ -2272,7 +2272,7 @@ fn bound_single_text_primary_key_param(
         return None;
     };
     spec.visible_column(primary_key_column)
-        .filter(|column| column.column_type == EntityColumnType::String)?;
+        .filter(|column| column.column_type == SchemaColumnType::String)?;
     let BoundPredicate::Eq(left, right) = predicate else {
         return None;
     };
@@ -2321,8 +2321,8 @@ pub(crate) async fn try_execute_bound_public_write(
                 .map(SqlWriteResult::affected)
                 .map(BoundPublicWriteExecution::Executed)
         }
-        BoundWriteTarget::Entity(surface) if bound_public_write_shape_supported(plan) => {
-            execute_entity_write(ctx, plan, surface, params)
+        BoundWriteTarget::Row(surface) if bound_public_write_shape_supported(plan) => {
+            execute_row_write(ctx, plan, surface, params)
                 .await
                 .map(BoundPublicWriteExecution::Executed)
         }
@@ -2513,18 +2513,18 @@ fn fast_file_blob_expr_supported(expr: &BoundExpr) -> bool {
     }
 }
 
-async fn execute_entity_write(
+async fn execute_row_write(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    surface: &EntityWriteSurface,
+    surface: &RowWriteSurface,
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
     let schema_key = match surface {
-        EntityWriteSurface::Base { schema_key } | EntityWriteSurface::ByBranch { schema_key } => {
+        RowWriteSurface::Base { schema_key } | RowWriteSurface::ByBranch { schema_key } => {
             schema_key
         }
     };
-    reject_read_only_entity_surface(schema_key, entity_action(&plan.bound.op))
+    reject_read_only_schema_surface(schema_key, row_action(&plan.bound.op))
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
 
     if schema_key == "lix_registered_schema" && plan.bound.op == BoundWriteOp::Delete {
@@ -2535,15 +2535,15 @@ async fn execute_entity_write(
     }
 
     let catalog = ctx.public_catalog()?;
-    let spec = catalog.entity_spec(schema_key).ok_or_else(|| {
+    let spec = catalog.schema_spec(schema_key).ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
-            format!("entity surface '{schema_key}' is not visible"),
+            format!("row surface '{schema_key}' is not visible"),
         )
     })?;
     validate_bound_write_supported(plan, spec)?;
     // Only `lix_active_branch_commit_id()` needs the current branch head.
-    // Normal entity mutations already stage against the transaction's active
+    // Normal row mutations already stage against the transaction's active
     // branch, so eagerly opening another read here makes the common write
     // path pay for a value it never observes.
     let active_branch_commit_id = if plan_references_active_branch_commit_id(plan) {
@@ -2556,40 +2556,40 @@ async fn execute_entity_write(
     match plan.bound.op {
         BoundWriteOp::Insert => {
             if no_op {
-                entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id.as_ref())?;
-                return Ok(empty_entity_returning_result(plan));
+                row_insert_batch(ctx, plan, spec, params, active_branch_commit_id.as_ref())?;
+                return Ok(empty_row_returning_result(plan));
             }
             if plan.bound.conflict.is_some() {
-                entity_upsert(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
+                row_upsert(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
             } else {
-                entity_insert(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
+                row_insert(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
             }
         }
         BoundWriteOp::Update => {
             if no_op {
-                return Ok(empty_entity_returning_result(plan));
+                return Ok(empty_row_returning_result(plan));
             }
-            entity_update(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
+            row_update(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
         }
         BoundWriteOp::Delete => {
             if no_op {
-                return Ok(empty_entity_returning_result(plan));
+                return Ok(empty_row_returning_result(plan));
             }
-            if matches!(surface, EntityWriteSurface::Base { .. })
+            if matches!(surface, RowWriteSurface::Base { .. })
                 && matches!(plan.bound.predicate, BoundPredicate::True)
                 && plan.bound.returning.is_none()
-                && let Some(result) = entity_delete_collection(ctx, &spec).await?
+                && let Some(result) = row_delete_collection(ctx, &spec).await?
             {
                 return Ok(result);
             }
-            entity_delete(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
+            row_delete(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
         }
     }
 }
 
-async fn entity_delete_collection(
+async fn row_delete_collection(
     ctx: &mut impl SqlWriteExecutionContext,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<Option<SqlWriteResult>, LixError> {
     use crate::collection_generation::{CollectionScopeRef, collection_delete_stage_row};
 
@@ -2717,7 +2717,7 @@ mod active_branch_commit_id_reference_tests {
     use crate::sql2::bind::expr::BoundColumnRef;
     use crate::sql2::bind::write::{
         BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp, BoundWriteTarget,
-        EntityWriteSurface,
+        RowWriteSurface,
     };
     use crate::sql2::plan::branch_scope::BranchScope;
     use crate::sql2::plan::write::PlannedWriteFilters;
@@ -2774,7 +2774,7 @@ mod active_branch_commit_id_reference_tests {
     fn update_plan(predicate: BoundPredicate, assignment_value: BoundExpr) -> LogicalWritePlan {
         LogicalWritePlan {
             bound: BoundWrite {
-                target: BoundWriteTarget::Entity(EntityWriteSurface::Base {
+                target: BoundWriteTarget::Row(RowWriteSurface::Base {
                     schema_key: "json_pointer".to_string(),
                 }),
                 op: BoundWriteOp::Update,
@@ -3113,15 +3113,15 @@ fn eval_fast_file_metadata(
     TransactionJson::from_value(value, "lix_file metadata").map(Some)
 }
 
-async fn entity_insert(
+async fn row_insert(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
-    let write_rows = entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
-    stage_entity_rows_with_postimage_returning(
+    let write_rows = row_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
+    stage_row_rows_with_postimage_returning(
         ctx,
         plan,
         spec,
@@ -3133,35 +3133,35 @@ async fn entity_insert(
     .await
 }
 
-async fn entity_upsert(
+async fn row_upsert(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
     let conflict = plan.bound.conflict.as_ref().ok_or_else(|| {
         LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "entity upsert requires an INSERT ON CONFLICT clause",
+            "row upsert requires an INSERT ON CONFLICT clause",
         )
     })?;
     validate_insert_conflict_target(plan, spec, conflict)?;
 
-    let mut insert_rows = entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
-    let candidates = scan_entity_conflict_candidates(ctx, spec, &insert_rows).await?;
+    let mut insert_rows = row_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
+    let candidates = scan_row_conflict_candidates(ctx, spec, &insert_rows).await?;
     let mut write_rows = RawWriteBatch::with_capacity(insert_rows.len());
 
     for index in 0..insert_rows.len() {
         let insert_row = insert_rows.row(index);
-        let inserted_entity_pk = insert_row_entity_pk(insert_row, spec)?;
+        let inserted_row_pk = insert_row_row_pk(insert_row, spec)?;
         let matching_candidate =
-            find_conflict_candidate(insert_row, &inserted_entity_pk, &candidates);
+            find_conflict_candidate(insert_row, &inserted_row_pk, &candidates);
         match (matching_candidate, &conflict.action) {
             // DO NOTHING on a conflicting row: leave the existing row untouched.
             (Some(_), BoundConflictAction::DoNothing) => {}
             (Some(candidate), BoundConflictAction::DoUpdate { assignments }) => {
-                append_entity_conflict_update_row(
+                append_row_conflict_update_row(
                     &mut write_rows,
                     ctx,
                     spec,
@@ -3176,7 +3176,7 @@ async fn entity_upsert(
         }
     }
 
-    stage_entity_rows_with_postimage_returning(
+    stage_row_rows_with_postimage_returning(
         ctx,
         plan,
         spec,
@@ -3188,21 +3188,21 @@ async fn entity_upsert(
     .await
 }
 
-fn entity_insert_batch(
+fn row_insert_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<RawWriteBatch, LixError> {
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity INSERT supports VALUES only",
+            "bound row INSERT supports VALUES only",
         ));
     };
     let layout = InsertRowLayout::from_values(spec, values)?;
-    if let Some(rows) = certified_entity_insert_batch(
+    if let Some(rows) = certified_row_insert_batch(
         ctx,
         plan,
         spec,
@@ -3215,7 +3215,7 @@ fn entity_insert_batch(
     }
     let mut write_rows = RawWriteBatch::with_capacity(values.rows.len());
     for row in &values.rows {
-        append_entity_insert_row(
+        append_row_insert_row(
             &mut write_rows,
             ctx,
             plan,
@@ -3229,10 +3229,10 @@ fn entity_insert_batch(
     Ok(write_rows)
 }
 
-async fn entity_update(
+async fn row_update(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
@@ -3241,7 +3241,7 @@ async fn entity_update(
         return Ok(result);
     }
     let constraints_unchanged = update_assignments_preserve_constraints(ctx, plan, spec);
-    let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
+    let candidates = scan_row_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     for candidate in candidates.iter() {
         // The workspace selector has one mutable owner: the authenticated
@@ -3250,11 +3250,11 @@ async fn entity_update(
         // not stage that historical copy into a second branch publication.
         if spec.schema_key == "lix_key_value"
             && !candidate.untracked()
-            && candidate.entity_pk() == &EntityPk::single("lix_workspace_branch_id")
+            && candidate.row_pk() == &RowPk::single("lix_workspace_branch_id")
         {
             continue;
         }
-        let appended = append_entity_update_row(
+        let appended = append_row_update_row(
             &mut write_rows,
             ctx,
             plan,
@@ -3267,7 +3267,7 @@ async fn entity_update(
             write_rows.mark_last_constraints_unchanged();
         }
     }
-    stage_entity_rows_with_postimage_returning(
+    stage_row_rows_with_postimage_returning(
         ctx,
         plan,
         spec,
@@ -3283,7 +3283,7 @@ async fn entity_update(
 /// the same canonical certificate used by dense parameter batches.
 ///
 /// Explicit SQL transactions commonly issue one UPDATE per row because each
-/// call must report its affected-row count immediately. The generic entity
+/// call must report its affected-row count immediately. The generic row
 /// route re-enters plugin reconciliation, schema normalization, and constraint
 /// preparation for every such call even though this exact schema and plan
 /// prove those passes redundant. A visible-row lookup still preserves
@@ -3292,7 +3292,7 @@ async fn entity_update(
 async fn try_execute_direct_path_value_replacement(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
 ) -> Result<Option<SqlWriteResult>, LixError> {
     let Some(program) = prepare_path_value_replacement_program(ctx, plan, spec) else {
@@ -3316,7 +3316,7 @@ pub(crate) struct PreparedPathValueReplacementProgram {
 }
 
 pub(crate) struct PreparedPathValueReplacementRow {
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) snapshot: TransactionJson,
     pub(crate) created_at: crate::common::LixTimestamp,
 }
@@ -3337,26 +3337,26 @@ pub(crate) fn prepare_path_value_replacement_program_from_logical(
     ctx: &impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
 ) -> Option<PreparedPathValueReplacementProgram> {
-    let BoundWriteTarget::Entity(surface) = &plan.bound.target else {
+    let BoundWriteTarget::Row(surface) = &plan.bound.target else {
         return None;
     };
     let schema_key = match surface {
-        EntityWriteSurface::Base { schema_key } | EntityWriteSurface::ByBranch { schema_key } => {
+        RowWriteSurface::Base { schema_key } | RowWriteSurface::ByBranch { schema_key } => {
             schema_key
         }
     };
     let catalog = ctx.public_catalog().ok()?;
-    let spec = catalog.entity_spec(schema_key)?;
+    let spec = catalog.schema_spec(schema_key)?;
     prepare_path_value_replacement_program(ctx, plan, spec)
 }
 
 pub(crate) fn prepare_path_value_replacement_program(
     ctx: &impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Option<PreparedPathValueReplacementProgram> {
     if spec.primary_key_component_types.as_slice()
-        != [crate::entity_pk::EntityPkComponentType::String]
+        != [crate::row_pk::RowPkComponentType::String]
         || spec.has_inter_row_constraints
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
@@ -3410,7 +3410,7 @@ pub(crate) async fn execute_prepared_path_value_replacement(
     };
     let mut rows = RawWriteBatch::with_capacity(1);
     rows.push_parts(
-        Some(row.entity_pk),
+        Some(row.row_pk),
         program.schema_key.as_str().into(),
         None,
         Some(row.snapshot),
@@ -3434,19 +3434,19 @@ pub(crate) async fn prepare_path_value_replacement_row(
     params: &[Value],
 ) -> Result<Option<PreparedPathValueReplacementRow>, LixError> {
     let primary_key = program.primary_key(params)?;
-    let entity_pk = EntityPk::single(primary_key.to_owned());
+    let row_pk = RowPk::single(primary_key.to_owned());
     let branch_id = ctx.active_branch_id().to_owned();
     let catalog = ctx.public_catalog()?;
-    let spec = catalog.entity_spec(program.schema_key.as_str()).ok_or_else(|| {
+    let spec = catalog.schema_spec(program.schema_key.as_str()).ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
-            format!("entity schema '{}' is not registered", program.schema_key),
+            format!("row schema '{}' is not registered", program.schema_key),
         )
     })?;
-    let candidates = scan_native_entity_ranges(
+    let candidates = scan_native_row_ranges(
         ctx,
         spec,
-        vec![entity_pk.clone()],
+        vec![row_pk.clone()],
         false,
         std::slice::from_ref(&branch_id),
     )
@@ -3483,7 +3483,7 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
     params: &[Value],
 ) -> Result<PreparedPathValueReplacementRow, LixError> {
     let primary_key = program.primary_key(params)?;
-    let entity_pk = EntityPk::single(primary_key.to_owned());
+    let row_pk = RowPk::single(primary_key.to_owned());
     let mut normalized = Vec::with_capacity(primary_key.len().saturating_add(32));
     let (start, end) =
         append_path_value_replacement_snapshot(program, primary_key, params, &mut normalized)?;
@@ -3492,7 +3492,7 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
             .pop()
             .expect("one certified replacement snapshot");
     Ok(PreparedPathValueReplacementRow {
-        entity_pk,
+        row_pk,
         snapshot,
         created_at: crate::common::LixTimestamp::expect_parse(
             "prepared path replacement created_at",
@@ -3542,7 +3542,7 @@ pub(crate) fn append_path_value_replacement_snapshot(
     Ok((start, normalized.len()))
 }
 
-/// Stage entity INSERT/UPDATE rows and, when requested, retain their final
+/// Stage row INSERT/UPDATE rows and, when requested, retain their final
 /// write images for `RETURNING`.  The post-image is evaluated from the
 /// normalized write row rather than the input expression so schema defaults
 /// (including generated IDs) and conflict updates are visible to callers.
@@ -3551,10 +3551,10 @@ pub(crate) fn append_path_value_replacement_snapshot(
 /// the query result is only constructed after the write is accepted. This
 /// matches the existing DELETE path's all-or-error behavior while avoiding a
 /// second lookup through the transaction overlay.
-async fn stage_entity_rows_with_postimage_returning(
+async fn stage_row_rows_with_postimage_returning(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
     mode: TransactionWriteMode,
@@ -3570,7 +3570,7 @@ async fn stage_entity_rows_with_postimage_returning(
     let returning_rows = if returning_requires_staged_postimage {
         None
     } else {
-        entity_postimage_returning_rows(
+        row_postimage_returning_rows(
             plan,
             spec,
             ctx,
@@ -3587,7 +3587,7 @@ async fn stage_entity_rows_with_postimage_returning(
     let rows_affected = stage_rows(ctx, mode, write_rows).await?;
     let returning_rows = match staged_postimage_rows {
         Some(write_rows) => {
-            entity_staged_postimage_returning_rows(
+            row_staged_postimage_returning_rows(
                 plan,
                 spec,
                 ctx,
@@ -3599,12 +3599,12 @@ async fn stage_entity_rows_with_postimage_returning(
         }
         None => returning_rows,
     };
-    Ok(entity_returning_result(plan, rows_affected, returning_rows))
+    Ok(row_returning_result(plan, rows_affected, returning_rows))
 }
 
-fn entity_postimage_returning_rows(
+fn row_postimage_returning_rows(
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
@@ -3620,11 +3620,11 @@ fn entity_postimage_returning_rows(
         // those rows, so materialize the normalized representation here.
         let snapshot = row
             .snapshot
-            .map(|snapshot| transaction_json_returning_value(snapshot, "entity post-image"))
+            .map(|snapshot| transaction_json_returning_value(snapshot, "row post-image"))
             .transpose()?
             .unwrap_or(JsonValue::Null);
-        let context = EntityEvalContext::staged(&snapshot, row, spec);
-        rows.push(entity_returning_row(
+        let context = RowEvalContext::staged(&snapshot, row, spec);
+        rows.push(row_returning_row(
             returning,
             &context,
             spec,
@@ -3648,9 +3648,9 @@ fn transaction_json_returning_value(
     })
 }
 
-async fn entity_staged_postimage_returning_rows(
+async fn row_staged_postimage_returning_rows(
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
@@ -3662,7 +3662,7 @@ async fn entity_staged_postimage_returning_rows(
     if write_rows.is_empty() {
         return Ok(Some(Vec::new()));
     }
-    let candidates = scan_entity_conflict_candidates(ctx, spec, write_rows).await?;
+    let candidates = scan_row_conflict_candidates(ctx, spec, write_rows).await?;
     // A staged audit projection needs the transaction-visible row, but it
     // must not look through every candidate again for every write row. Aside
     // from making large `RETURNING *` writes quadratic, that repeated search
@@ -3670,12 +3670,12 @@ async fn entity_staged_postimage_returning_rows(
     // and retain the previous ambiguity check.
     let mut candidates_by_identity = std::collections::HashMap::with_capacity(candidates.len());
     for candidate in candidates.iter() {
-        let identity = entity_live_returning_identity(NativeStateRowRef(candidate));
+        let identity = row_live_returning_identity(NativeStateRowRef(candidate));
         if candidates_by_identity.insert(identity, candidate).is_some() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "staged entity post-image for schema '{}' is ambiguous in the transaction overlay",
+                    "staged row post-image for schema '{}' is ambiguous in the transaction overlay",
                     spec.schema_key
                 ),
             ));
@@ -3683,12 +3683,12 @@ async fn entity_staged_postimage_returning_rows(
     }
     let mut rows = Vec::with_capacity(write_rows.len());
     for write_row in write_rows.iter() {
-        let identity = entity_staged_returning_identity(write_row, spec)?;
+        let identity = row_staged_returning_identity(write_row, spec)?;
         let candidate = candidates_by_identity.get(&identity).copied().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "staged entity post-image for schema '{}' is missing from the transaction overlay",
+                    "staged row post-image for schema '{}' is missing from the transaction overlay",
                     spec.schema_key
                 ),
             )
@@ -3697,13 +3697,13 @@ async fn entity_staged_postimage_returning_rows(
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "staged entity post-image for schema '{}' is unexpectedly a tombstone",
+                    "staged row post-image for schema '{}' is unexpectedly a tombstone",
                     spec.schema_key
                 ),
             )
         })?;
-        let context = EntityEvalContext::live(&snapshot, candidate, spec);
-        rows.push(entity_returning_row(
+        let context = RowEvalContext::live(&snapshot, candidate, spec);
+        rows.push(row_returning_row(
             returning,
             &context,
             spec,
@@ -3715,30 +3715,30 @@ async fn entity_staged_postimage_returning_rows(
     Ok(Some(rows))
 }
 
-type EntityReturningIdentity = (EntityPk, Option<String>, String, bool);
+type RowReturningIdentity = (RowPk, Option<String>, String, bool);
 
-fn entity_staged_returning_identity(
+fn row_staged_returning_identity(
     row: RawWriteRowRef<'_>,
-    spec: &EntitySurfaceSpec,
-) -> Result<EntityReturningIdentity, LixError> {
+    spec: &SchemaSurfaceSpec,
+) -> Result<RowReturningIdentity, LixError> {
     Ok((
-        insert_row_entity_pk(row, spec)?,
+        insert_row_row_pk(row, spec)?,
         row.file_id.map(|file_id| file_id.as_str().to_owned()),
         row.branch_id.as_str().to_owned(),
         row.global,
     ))
 }
 
-fn entity_live_returning_identity(row: NativeStateRowRef<'_>) -> EntityReturningIdentity {
+fn row_live_returning_identity(row: NativeStateRowRef<'_>) -> RowReturningIdentity {
     (
-        row.entity_pk().clone(),
+        row.row_pk().clone(),
         row.file_id().map(ToOwned::to_owned),
         row.branch_id().to_owned(),
         row.global(),
     )
 }
 
-fn entity_returning_result(
+fn row_returning_result(
     plan: &LogicalWritePlan,
     rows_affected: u64,
     rows: Option<Vec<Vec<Value>>>,
@@ -3763,7 +3763,7 @@ fn entity_returning_result(
 fn update_assignments_preserve_constraints(
     ctx: &impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> bool {
     let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
         return false;
@@ -3805,12 +3805,12 @@ fn assigned_columns_preserve_constraints(
             .any(|path| touches(path))
 }
 
-fn append_entity_update_row<'a>(
+fn append_row_update_row<'a>(
     rows: &mut RawWriteBatch,
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
-    candidate: impl Into<EntityLiveRowRef<'a>>,
+    spec: &SchemaSurfaceSpec,
+    candidate: impl Into<RowLiveRowRef<'a>>,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<bool, LixError> {
@@ -3818,7 +3818,7 @@ fn append_entity_update_row<'a>(
     let Some(snapshot) = candidate_snapshot(candidate)? else {
         return Ok(false);
     };
-    let original_context = EntityEvalContext::live(&snapshot, candidate, spec);
+    let original_context = RowEvalContext::live(&snapshot, candidate, spec);
     if !predicate_matches(
         &plan.bound.predicate,
         &original_context,
@@ -3844,7 +3844,7 @@ fn append_entity_update_row<'a>(
             )?;
             visible_assignments.push((
                 column.name.clone(),
-                entity_json_value(
+                row_json_value(
                     &assignment.value,
                     value,
                     column.column_type,
@@ -3858,7 +3858,7 @@ fn append_entity_update_row<'a>(
             return Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
                 format!(
-                    "bound entity UPDATE does not support assignment to '{}'",
+                    "bound row UPDATE does not support assignment to '{}'",
                     assignment.column.name
                 ),
             ));
@@ -3867,7 +3867,7 @@ fn append_entity_update_row<'a>(
     for (column_name, value) in visible_assignments {
         updated[&column_name] = value;
     }
-    append_entity_replace_row_from_live(
+    append_row_replace_row_from_live(
         rows,
         ctx,
         spec,
@@ -3880,21 +3880,21 @@ fn append_entity_update_row<'a>(
     Ok(true)
 }
 
-async fn entity_delete(
+async fn row_delete(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
-    let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
+    let candidates = scan_row_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     let mut returning_rows = plan.bound.returning.as_ref().map(|_| Vec::new());
     for candidate in candidates.iter() {
         let Some(snapshot) = candidate_snapshot(candidate)? else {
             continue;
         };
-        let context = EntityEvalContext::live(&snapshot, candidate, spec);
+        let context = RowEvalContext::live(&snapshot, candidate, spec);
         if predicate_matches(
             &plan.bound.predicate,
             &context,
@@ -3907,7 +3907,7 @@ async fn entity_delete(
             if let (Some(returning), Some(rows)) =
                 (plan.bound.returning.as_ref(), returning_rows.as_mut())
             {
-                rows.push(entity_returning_row(
+                rows.push(row_returning_row(
                     returning,
                     &context,
                     spec,
@@ -3916,7 +3916,7 @@ async fn entity_delete(
                     active_branch_commit_id,
                 )?);
             }
-            append_entity_replace_row_from_live(
+            append_row_replace_row_from_live(
                 &mut write_rows,
                 ctx,
                 spec,
@@ -3946,14 +3946,14 @@ async fn entity_delete(
     }
 }
 
-fn empty_entity_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
-    entity_returning_result(plan, 0, plan.bound.returning.as_ref().map(|_| Vec::new()))
+fn empty_row_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
+    row_returning_result(plan, 0, plan.bound.returning.as_ref().map(|_| Vec::new()))
 }
 
-fn entity_returning_row(
+fn row_returning_row(
     returning: &crate::sql2::bind::write::BoundReturning,
-    context: &EntityEvalContext<'_>,
-    spec: &EntitySurfaceSpec,
+    context: &RowEvalContext<'_>,
+    spec: &SchemaSurfaceSpec,
     ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
@@ -3962,7 +3962,7 @@ fn entity_returning_row(
         .items
         .iter()
         .map(|item| {
-            entity_returning_value(
+            row_returning_value(
                 &item.expr,
                 context,
                 spec,
@@ -3974,10 +3974,10 @@ fn entity_returning_row(
         .collect()
 }
 
-fn entity_returning_value(
+fn row_returning_value(
     expr: &BoundExpr,
-    context: &EntityEvalContext<'_>,
-    spec: &EntitySurfaceSpec,
+    context: &RowEvalContext<'_>,
+    spec: &SchemaSurfaceSpec,
     ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
@@ -4002,61 +4002,61 @@ fn entity_returning_value(
     let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
     if bound_expr_is_json(expr, spec) {
         return Ok(match value {
-            EntityEvalValue::SqlNull => Value::Null,
-            EntityEvalValue::Json(JsonValue::Null)
-                if visible_entity_column(expr, spec)
-                    .is_some_and(|column| column.column_type == EntityColumnType::Json) =>
+            RowEvalValue::SqlNull => Value::Null,
+            RowEvalValue::Json(JsonValue::Null)
+                if visible_row_column(expr, spec)
+                    .is_some_and(|column| column.column_type == SchemaColumnType::Json) =>
             {
                 Value::Null
             }
-            EntityEvalValue::SqlText(value) => Value::Text(value),
-            EntityEvalValue::Json(value) => Value::Json(value.into()),
+            RowEvalValue::SqlText(value) => Value::Text(value),
+            RowEvalValue::Json(value) => Value::Json(value.into()),
         });
     }
-    if let Some(column) = visible_entity_column(expr, spec) {
-        if column.column_type == EntityColumnType::Integer {
+    if let Some(column) = visible_row_column(expr, spec) {
+        if column.column_type == SchemaColumnType::Integer {
             let value = value.into_json();
             return json_bigint_value(Some(&value), &spec.schema_key, &column.name)
                 .map(|value| value.map_or(Value::Null, Value::Integer));
         }
-        if column.column_type == EntityColumnType::Number {
+        if column.column_type == SchemaColumnType::Number {
             let value = value.into_json();
             return json_double_value(Some(&value), &spec.schema_key, &column.name)
                 .map(|value| value.map_or(Value::Null, Value::Real));
         }
     }
     Ok(match value {
-        EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null) => Value::Null,
-        EntityEvalValue::SqlText(value) | EntityEvalValue::Json(JsonValue::String(value)) => {
+        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => Value::Null,
+        RowEvalValue::SqlText(value) | RowEvalValue::Json(JsonValue::String(value)) => {
             Value::Text(value)
         }
-        EntityEvalValue::Json(JsonValue::Bool(value)) => Value::Boolean(value),
-        EntityEvalValue::Json(JsonValue::Number(value)) => value
+        RowEvalValue::Json(JsonValue::Bool(value)) => Value::Boolean(value),
+        RowEvalValue::Json(JsonValue::Number(value)) => value
             .as_i64()
             .map(Value::Integer)
             .or_else(|| value.as_f64().map(Value::Real))
             .unwrap_or_else(|| Value::Text(value.to_string())),
-        EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
+        RowEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
             Value::Json(value.into())
         }
     })
 }
 
-fn visible_entity_column<'a>(
+fn visible_row_column<'a>(
     expr: &BoundExpr,
-    spec: &'a EntitySurfaceSpec,
-) -> Option<&'a EntitySurfaceColumn> {
+    spec: &'a SchemaSurfaceSpec,
+) -> Option<&'a SchemaSurfaceColumn> {
     let (BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)) = expr else {
         return None;
     };
     spec.visible_column(&column.name)
 }
 
-fn append_entity_conflict_update_row<'a>(
+fn append_row_conflict_update_row<'a>(
     rows: &mut RawWriteBatch,
     ctx: &mut impl SqlWriteExecutionContext,
-    spec: &EntitySurfaceSpec,
-    candidate: impl Into<EntityLiveRowRef<'a>>,
+    spec: &SchemaSurfaceSpec,
+    candidate: impl Into<RowLiveRowRef<'a>>,
     insert_row: RawWriteRowRef<'_>,
     assignments: &[BoundAssignment],
     params: &[Value],
@@ -4074,7 +4074,7 @@ fn append_entity_conflict_update_row<'a>(
         .map(TransactionJson::value)
         .unwrap_or(&JsonValue::Null);
     let context =
-        EntityEvalContext::conflict(&snapshot, candidate, insert_snapshot, insert_row, spec);
+        RowEvalContext::conflict(&snapshot, candidate, insert_snapshot, insert_row, spec);
     let mut updated = snapshot.clone();
     let mut visible_assignments = Vec::new();
     for assignment in assignments {
@@ -4089,7 +4089,7 @@ fn append_entity_conflict_update_row<'a>(
             )?;
             visible_assignments.push((
                 column.name.clone(),
-                entity_json_value(
+                row_json_value(
                     &assignment.value,
                     value,
                     column.column_type,
@@ -4098,12 +4098,12 @@ fn append_entity_conflict_update_row<'a>(
                 )?,
             ));
         } else if assignment.column.name == "lixcol_metadata" {
-            // handled by append_entity_replace_row_from_live from the assignment list
+            // handled by append_row_replace_row_from_live from the assignment list
         } else {
             return Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
                 format!(
-                    "bound entity INSERT ON CONFLICT does not support assignment to '{}'",
+                    "bound row INSERT ON CONFLICT does not support assignment to '{}'",
                     assignment.column.name
                 ),
             ));
@@ -4113,7 +4113,7 @@ fn append_entity_conflict_update_row<'a>(
         updated[&column_name] = value;
     }
 
-    append_entity_replace_row_from_live(
+    append_row_replace_row_from_live(
         rows,
         ctx,
         spec,
@@ -4141,7 +4141,7 @@ async fn stage_rows(
 
 fn validate_insert_conflict_target(
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     conflict: &BoundInsertConflict,
 ) -> Result<(), LixError> {
     if spec.primary_key_paths.is_empty() {
@@ -4166,7 +4166,7 @@ fn validate_insert_conflict_target(
         .collect::<Result<std::collections::BTreeSet<_>, LixError>>()?;
     if matches!(
         plan.bound.target,
-        BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
+        BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
     ) {
         expected.insert("lixcol_branch_id".to_string());
     }
@@ -4180,7 +4180,7 @@ fn validate_insert_conflict_target(
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             format!(
-                "INSERT ON CONFLICT target must match entity identity columns ({})",
+                "INSERT ON CONFLICT target must match row identity columns ({})",
                 expected.into_iter().collect::<Vec<_>>().join(", ")
             ),
         ));
@@ -4188,12 +4188,12 @@ fn validate_insert_conflict_target(
     Ok(())
 }
 
-fn insert_row_entity_pk(
+fn insert_row_row_pk(
     row: RawWriteRowRef<'_>,
-    spec: &EntitySurfaceSpec,
-) -> Result<EntityPk, LixError> {
-    if let Some(entity_pk) = row.entity_pk {
-        return Ok(entity_pk.clone());
+    spec: &SchemaSurfaceSpec,
+) -> Result<RowPk, LixError> {
+    if let Some(row_pk) = row.row_pk {
+        return Ok(row_pk.clone());
     }
     let snapshot = row.snapshot.ok_or_else(|| {
         LixError::new(
@@ -4204,11 +4204,11 @@ fn insert_row_entity_pk(
             ),
         )
     })?;
-    EntityPk::from_primary_key_paths(snapshot.value(), &spec.primary_key_paths).map_err(|error| {
+    RowPk::from_primary_key_paths(snapshot.value(), &spec.primary_key_paths).map_err(|error| {
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "INSERT ON CONFLICT failed to derive entity primary key for schema '{}': {error}",
+                "INSERT ON CONFLICT failed to derive row primary key for schema '{}': {error}",
                 spec.schema_key
             ),
         )
@@ -4217,38 +4217,38 @@ fn insert_row_entity_pk(
 
 fn find_conflict_candidate<'a>(
     insert_row: RawWriteRowRef<'_>,
-    inserted_entity_pk: &EntityPk,
+    inserted_row_pk: &RowPk,
     candidates: &'a NativeStateBatch,
 ) -> Option<NativeStateRowRef<'a>> {
     candidates
         .iter()
         .find(|candidate| {
-            candidate_matches_insert_identity(*candidate, insert_row, inserted_entity_pk)
+            candidate_matches_insert_identity(*candidate, insert_row, inserted_row_pk)
         })
         .map(NativeStateRowRef)
 }
 
 fn candidate_matches_insert_identity<'a>(
-    candidate: impl Into<EntityLiveRowRef<'a>>,
+    candidate: impl Into<RowLiveRowRef<'a>>,
     insert_row: RawWriteRowRef<'_>,
-    inserted_entity_pk: &EntityPk,
+    inserted_row_pk: &RowPk,
 ) -> bool {
     let candidate = candidate.into();
-    candidate.entity_pk() == inserted_entity_pk
+    candidate.row_pk() == inserted_row_pk
         && candidate.file_id() == insert_row.file_id.map(SharedStr::as_str)
         && candidate.branch_id() == insert_row.branch_id.as_str()
         && candidate.global() == insert_row.global
 }
 
-async fn scan_entity_conflict_candidates(
+async fn scan_row_conflict_candidates(
     ctx: &mut impl SqlWriteExecutionContext,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     insert_rows: &RawWriteBatch,
 ) -> Result<NativeStateBatch, LixError> {
-    let mut entity_pks = std::collections::BTreeSet::new();
+    let mut row_pks = std::collections::BTreeSet::new();
     let mut file_ids = std::collections::BTreeSet::new();
     for row in insert_rows.iter() {
-        entity_pks.insert(insert_row_entity_pk(row, spec)?);
+        row_pks.insert(insert_row_row_pk(row, spec)?);
         file_ids.insert(row.file_id.cloned());
     }
     let file_ids = file_ids
@@ -4261,12 +4261,12 @@ async fn scan_entity_conflict_candidates(
         .collect::<Vec<NullableKeyFilter<SharedStr>>>();
 
     // Retention is an attribute of the one canonical live identity, not part
-    // of SQL conflict identity. Resolve exact entity prefixes through the
+    // of SQL conflict identity. Resolve exact row prefixes through the
     // transaction's retained native view, then apply SQL identity predicates.
-    let mut candidates = scan_native_entity_ranges(
+    let mut candidates = scan_native_row_ranges(
         ctx,
         spec,
-        entity_pks.into_iter().collect(),
+        row_pks.into_iter().collect(),
         false,
         &insert_rows
             .iter()
@@ -4286,28 +4286,28 @@ async fn scan_entity_conflict_candidates(
     Ok(candidates)
 }
 
-async fn scan_entity_candidates(
+async fn scan_row_candidates(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     params: &[Value],
 ) -> Result<NativeStateBatch, LixError> {
     let _ = scan_branch_ids(&plan.bound.branch_scope)?;
-    let entity_pks =
-        bound_entity_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params);
-    let mut rows = match entity_pks {
-        Some(entity_pks) => {
-            scan_native_entity_ranges(
+    let row_pks =
+        bound_row_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params);
+    let mut rows = match row_pks {
+        Some(row_pks) => {
+            scan_native_row_ranges(
                 ctx,
                 spec,
-                entity_pks,
+                row_pks,
                 false,
                 &scan_branch_ids(&plan.bound.branch_scope)?,
             )
             .await?
         }
         None => {
-            scan_native_entity_ranges(
+            scan_native_row_ranges(
                 ctx,
                 spec,
                 Vec::new(),
@@ -4321,18 +4321,18 @@ async fn scan_entity_candidates(
     Ok(rows)
 }
 
-async fn scan_entity_candidates_for_pks(
+async fn scan_row_candidates_for_pks(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
-    entity_pks: Vec<EntityPk>,
+    spec: &SchemaSurfaceSpec,
+    row_pks: Vec<RowPk>,
     metadata_only: bool,
 ) -> Result<NativeStateBatch, LixError> {
     let _ = (scan_branch_ids(&plan.bound.branch_scope)?, metadata_only);
-    let mut rows = scan_native_entity_ranges(
+    let mut rows = scan_native_row_ranges(
         ctx,
         spec,
-        entity_pks,
+        row_pks,
         false,
         &scan_branch_ids(&plan.bound.branch_scope)?,
     )
@@ -4341,28 +4341,28 @@ async fn scan_entity_candidates_for_pks(
     Ok(rows)
 }
 
-async fn scan_native_entity_ranges(
+async fn scan_native_row_ranges(
     ctx: &mut impl SqlWriteExecutionContext,
-    spec: &EntitySurfaceSpec,
-    mut entity_pks: Vec<EntityPk>,
+    spec: &SchemaSurfaceSpec,
+    mut row_pks: Vec<RowPk>,
     include_tombstones: bool,
     branch_ids: &[String],
 ) -> Result<NativeStateBatch, LixError> {
     let schema_key = spec.schema_key.as_str();
     let mut rows = Vec::new();
-    entity_pks.sort();
-    entity_pks.dedup();
+    row_pks.sort();
+    row_pks.dedup();
     let branch_ids = if branch_ids.is_empty() {
         vec![ctx.active_branch_id().to_owned()]
     } else {
         branch_ids.to_vec()
     };
     for branch_id in &branch_ids {
-        if entity_pks.is_empty() {
-            let lower = crate::forktree::encode_state_entity_prefix(
+        if row_pks.is_empty() {
+            let lower = crate::forktree::encode_state_row_prefix(
                 schema_key,
-                &EntityPk {
-                    components: crate::entity_pk::EntityPkComponents::Empty,
+                &RowPk {
+                    components: crate::row_pk::RowPkComponents::Empty,
                 },
             );
             let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
@@ -4383,11 +4383,11 @@ async fn scan_native_entity_ranges(
                 }
             }
         } else {
-            let ranges = entity_pks
+            let ranges = row_pks
                 .iter()
-                .map(|entity_pk| {
+                .map(|row_pk| {
                     let bounds =
-                        crate::forktree::encode_state_entity_prefix_bounds(schema_key, entity_pk);
+                        crate::forktree::encode_state_row_prefix_bounds(schema_key, row_pk);
                     (bounds.lower, bounds.upper)
                 })
                 .collect::<Vec<_>>();
@@ -4408,11 +4408,11 @@ async fn scan_native_entity_ranges(
     Ok(NativeStateBatch { rows })
 }
 
-fn bound_entity_pks_from_primary_key_predicate(
-    spec: &EntitySurfaceSpec,
+fn bound_row_pks_from_primary_key_predicate(
+    spec: &SchemaSurfaceSpec,
     predicate: &BoundPredicate,
     params: &[Value],
-) -> Option<Vec<EntityPk>> {
+) -> Option<Vec<RowPk>> {
     let primary_key_columns = spec
         .primary_key_paths
         .iter()
@@ -4434,22 +4434,22 @@ fn bound_entity_pks_from_primary_key_predicate(
     };
     analyzer
         .analyze_conjunctive_constraint(predicate)?
-        .into_entity_pks(
+        .into_row_pks(
             &analyzer.primary_key_columns,
             analyzer.primary_key_component_types,
         )
-        .map(|entity_pks| entity_pks.into_iter().collect())
+        .map(|row_pks| row_pks.into_iter().collect())
 }
 
 struct BoundPrimaryKeyAnalyzer<'a> {
     primary_key_columns: Vec<&'a str>,
-    primary_key_component_types: &'a [crate::entity_pk::EntityPkComponentType],
+    primary_key_component_types: &'a [crate::row_pk::RowPkComponentType],
     params: &'a [Value],
 }
 
 #[derive(Clone)]
 enum BoundPrimaryKeyConstraint {
-    Full(std::collections::BTreeSet<EntityPk>),
+    Full(std::collections::BTreeSet<RowPk>),
     Parts(std::collections::BTreeMap<String, std::collections::BTreeSet<String>>),
 }
 
@@ -4475,17 +4475,17 @@ impl BoundPrimaryKeyAnalyzer<'_> {
                 constraint
             }
             BoundPredicate::Or(predicates) => {
-                let mut entity_pks = std::collections::BTreeSet::new();
+                let mut row_pks = std::collections::BTreeSet::new();
                 for predicate in predicates {
-                    entity_pks.extend(
+                    row_pks.extend(
                         self.analyze_conjunctive_constraint(predicate)?
-                            .into_entity_pks(
+                            .into_row_pks(
                                 &self.primary_key_columns,
                                 self.primary_key_component_types,
                             )?,
                     );
                 }
-                Some(BoundPrimaryKeyConstraint::Full(entity_pks))
+                Some(BoundPrimaryKeyConstraint::Full(row_pks))
             }
             BoundPredicate::Eq(left, right) => self
                 .column_value_constraint(left, right)
@@ -4541,7 +4541,7 @@ impl BoundPrimaryKeyAnalyzer<'_> {
     fn primary_key_component_type(
         &self,
         column: &str,
-    ) -> Option<crate::entity_pk::EntityPkComponentType> {
+    ) -> Option<crate::row_pk::RowPkComponentType> {
         self.primary_key_columns
             .iter()
             .position(|candidate| *candidate == column)
@@ -4589,13 +4589,13 @@ impl BoundPrimaryKeyConstraint {
         }
     }
 
-    fn into_entity_pks(
+    fn into_row_pks(
         self,
         primary_key_columns: &[&str],
-        component_types: &[crate::entity_pk::EntityPkComponentType],
-    ) -> Option<std::collections::BTreeSet<EntityPk>> {
+        component_types: &[crate::row_pk::RowPkComponentType],
+    ) -> Option<std::collections::BTreeSet<RowPk>> {
         match self {
-            Self::Full(entity_pks) => Some(entity_pks),
+            Self::Full(row_pks) => Some(row_pks),
             Self::Parts(parts) => {
                 let mut combinations = vec![Vec::new()];
                 for column in primary_key_columns {
@@ -4612,7 +4612,7 @@ impl BoundPrimaryKeyConstraint {
                 }
                 combinations
                     .into_iter()
-                    .map(|parts| EntityPk::from_external_parts(parts, component_types))
+                    .map(|parts| RowPk::from_external_parts(parts, component_types))
                     .collect::<Result<std::collections::BTreeSet<_>, _>>()
                     .ok()
             }
@@ -4623,12 +4623,12 @@ impl BoundPrimaryKeyConstraint {
 fn bound_primary_key_external(
     expr: &BoundExpr,
     params: &[Value],
-    component_type: crate::entity_pk::EntityPkComponentType,
+    component_type: crate::row_pk::RowPkComponentType,
 ) -> Option<String> {
-    use crate::entity_pk::EntityPkComponentType;
+    use crate::row_pk::RowPkComponentType;
 
     match component_type {
-        EntityPkComponentType::Integer => match expr {
+        RowPkComponentType::Integer => match expr {
             BoundExpr::Literal(BoundLiteral::Integer(value)) => Some(value.to_string()),
             BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
                 Some(Value::Integer(value)) => Some(value.to_string()),
@@ -4636,9 +4636,9 @@ fn bound_primary_key_external(
             },
             _ => None,
         },
-        EntityPkComponentType::String
-        | EntityPkComponentType::Uuid
-        | EntityPkComponentType::Bytes => match expr {
+        RowPkComponentType::String
+        | RowPkComponentType::Uuid
+        | RowPkComponentType::Bytes => match expr {
             BoundExpr::Literal(BoundLiteral::Text(value)) => Some(value.clone()),
             BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
                 Some(Value::Text(value)) => Some(value.clone()),
@@ -4651,7 +4651,7 @@ fn bound_primary_key_external(
 
 struct InsertRowLayout {
     schema_key: String,
-    visible_columns: Vec<EntitySurfaceColumn>,
+    visible_columns: Vec<SchemaSurfaceColumn>,
     snapshot_context: String,
     snapshot_capacity: usize,
     columns: Vec<InsertColumnTarget>,
@@ -4661,10 +4661,10 @@ struct InsertRowLayout {
 enum InsertColumnTarget {
     Visible {
         name: String,
-        column_type: EntityColumnType,
+        column_type: SchemaColumnType,
         read_nullable: bool,
     },
-    EntityPk,
+    RowPk,
     FileId,
     Metadata,
     Global,
@@ -4672,7 +4672,7 @@ enum InsertColumnTarget {
 }
 
 impl InsertRowLayout {
-    fn from_values(spec: &EntitySurfaceSpec, values: &BoundInsertValues) -> Result<Self, LixError> {
+    fn from_values(spec: &SchemaSurfaceSpec, values: &BoundInsertValues) -> Result<Self, LixError> {
         let mut snapshot_capacity = 0;
         let mut seen_columns = std::collections::BTreeSet::new();
         let columns = values
@@ -4682,7 +4682,7 @@ impl InsertRowLayout {
                 if !seen_columns.insert(column.name.clone()) {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
-                        format!("duplicate entity INSERT column '{}'", column.name),
+                        format!("duplicate row INSERT column '{}'", column.name),
                     ));
                 }
                 if let Some(surface_column) = spec.visible_column(&column.name) {
@@ -4694,7 +4694,7 @@ impl InsertRowLayout {
                     });
                 }
                 Ok(match column.name.as_str() {
-                    "lixcol_entity_pk" => InsertColumnTarget::EntityPk,
+                    "lixcol_row_pk" => InsertColumnTarget::RowPk,
                     "lixcol_file_id" => InsertColumnTarget::FileId,
                     "lixcol_metadata" => InsertColumnTarget::Metadata,
                     "lixcol_global" => InsertColumnTarget::Global,
@@ -4703,7 +4703,7 @@ impl InsertRowLayout {
                         return Err(LixError::new(
                             LixError::CODE_UNSUPPORTED_SQL,
                             format!(
-                                "bound entity INSERT does not support column '{}'",
+                                "bound row INSERT does not support column '{}'",
                                 column.name
                             ),
                         ));
@@ -4748,16 +4748,16 @@ struct CertifiedInsertInput<'a> {
     statement_index: Option<usize>,
 }
 
-fn certified_entity_insert_batch(
+fn certified_row_insert_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     layout: &InsertRowLayout,
     values: &BoundInsertValues,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Option<RawWriteBatch>, LixError> {
-    certified_entity_insert_rows(
+    certified_row_insert_rows(
         ctx,
         plan,
         spec,
@@ -4774,16 +4774,16 @@ fn certified_entity_insert_batch(
     )
 }
 
-fn certified_entity_insert_parameter_batch(
+fn certified_row_insert_parameter_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     layout: &InsertRowLayout,
     values: &BoundInsertValues,
-    parameter_batch: EntityInsertParameterBatch<'_>,
+    parameter_batch: RowInsertParameterBatch<'_>,
     allow_generic_fallback: bool,
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<Option<CertifiedEntityInsertParameterBatch>, LixError> {
+) -> Result<Option<CertifiedRowInsertParameterBatch>, LixError> {
     let [row] = values.rows.as_slice() else {
         return Ok(None);
     };
@@ -4791,17 +4791,17 @@ fn certified_entity_insert_parameter_batch(
         certified_direct_parameter_insert_batch(ctx, plan, spec, layout, row, parameter_batch)?
     {
         #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_certified_entity_insert_parameter_batch_certification();
+        crate::storage_bench::record_certified_row_insert_parameter_batch_certification();
         return Ok(Some(if use_typed_certified_insert(rows.len()) {
-            CertifiedEntityInsertParameterBatch::Typed(rows)
+            CertifiedRowInsertParameterBatch::Typed(rows)
         } else {
-            CertifiedEntityInsertParameterBatch::Raw(rows.into_raw()?)
+            CertifiedRowInsertParameterBatch::Raw(rows.into_raw()?)
         }));
     }
     if !allow_generic_fallback {
         return Ok(None);
     }
-    certified_entity_insert_rows(
+    certified_row_insert_rows(
         ctx,
         plan,
         spec,
@@ -4809,11 +4809,11 @@ fn certified_entity_insert_parameter_batch(
         parameter_batch.num_rows(),
         (0..parameter_batch.num_rows()).map(|statement_index| {
             let params = match parameter_batch {
-                EntityInsertParameterBatch::Arrow(batch) => {
+                RowInsertParameterBatch::Arrow(batch) => {
                     super::write::parameter_row(batch, statement_index)
                 }
-                EntityInsertParameterBatch::Prepared(batch) => batch.row_values(statement_index),
-                EntityInsertParameterBatch::Values(rows) => rows
+                RowInsertParameterBatch::Prepared(batch) => batch.row_values(statement_index),
+                RowInsertParameterBatch::Values(rows) => rows
                     .get(statement_index)
                     .map(|row| row.to_vec())
                     .ok_or_else(|| {
@@ -4833,7 +4833,7 @@ fn certified_entity_insert_parameter_batch(
         }),
         active_branch_commit_id,
     )
-    .map(|rows| rows.map(CertifiedEntityInsertParameterBatch::Raw))
+    .map(|rows| rows.map(CertifiedRowInsertParameterBatch::Raw))
 }
 
 struct DirectParameterInsertColumn {
@@ -4841,7 +4841,7 @@ struct DirectParameterInsertColumn {
     parameter_index: usize,
     name: String,
     name_prefix: Vec<u8>,
-    column_type: EntityColumnType,
+    column_type: SchemaColumnType,
     read_nullable: bool,
 }
 
@@ -4866,10 +4866,10 @@ fn append_canonical_json_string(output: &mut Vec<u8>, value: &str) -> Result<(),
 fn certified_direct_parameter_insert_batch(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     layout: &InsertRowLayout,
     row: &[BoundExpr],
-    parameter_batch: EntityInsertParameterBatch<'_>,
+    parameter_batch: RowInsertParameterBatch<'_>,
 ) -> Result<Option<CertifiedParameterInsertBatch>, LixError> {
     if plan.bound.conflict.is_some()
         || !spec.defaults.is_empty()
@@ -4914,7 +4914,7 @@ fn certified_direct_parameter_insert_batch(
         };
         if !matches!(
             column_type,
-            EntityColumnType::String | EntityColumnType::Boolean
+            SchemaColumnType::String | SchemaColumnType::Boolean
         ) {
             return Ok(None);
         }
@@ -4968,7 +4968,7 @@ fn certified_direct_parameter_insert_batch(
                     &layout.columns[column.layout_index],
                     InsertColumnTarget::Visible {
                         name: candidate,
-                        column_type: EntityColumnType::String,
+                        column_type: SchemaColumnType::String,
                         ..
                     } if candidate == name
                 )
@@ -4990,14 +4990,14 @@ fn certified_direct_parameter_insert_batch(
             LixError::unknown("certified parameter INSERT batch size overflowed")
         })?);
     let mut offsets = Vec::with_capacity(row_count);
-    let mut entity_pks = Vec::with_capacity(row_count);
+    let mut row_pks = Vec::with_capacity(row_count);
     let shared_string_primary_keys =
         spec.primary_key_component_types
             .iter()
             .all(|component_type| {
                 matches!(
                     component_type,
-                    crate::entity_pk::EntityPkComponentType::String
+                    crate::row_pk::RowPkComponentType::String
                 )
             });
     let mut primary_key_arena = Vec::with_capacity(
@@ -5008,7 +5008,7 @@ fn certified_direct_parameter_insert_batch(
     let mut primary_key_ranges =
         Vec::<(u32, u32)>::with_capacity(row_count.saturating_mul(primary_key_columns.len()));
     let mut previous_primary_key_row = None;
-    let mut unordered_entity_pks = None::<std::collections::HashSet<EntityPk>>;
+    let mut unordered_row_pks = None::<std::collections::HashSet<RowPk>>;
     let mut primary_key_parts = Vec::with_capacity(primary_key_columns.len());
     let field_names = columns
         .iter()
@@ -5050,11 +5050,11 @@ fn certified_direct_parameter_insert_batch(
                     continue;
                 }
                 match (column.column_type, parameter_value) {
-                    (EntityColumnType::String, DirectParameterValue::String(value)) => {
+                    (SchemaColumnType::String, DirectParameterValue::String(value)) => {
                         append_canonical_json_string(&mut normalized, value)?;
                         typed_values.push(TypedJsonScalarRef::String(value));
                     }
-                    (EntityColumnType::Boolean, DirectParameterValue::Boolean(value)) => {
+                    (SchemaColumnType::Boolean, DirectParameterValue::Boolean(value)) => {
                         normalized.extend_from_slice(if value {
                             b"true".as_slice()
                         } else {
@@ -5076,7 +5076,7 @@ fn certified_direct_parameter_insert_batch(
                         return Err(LixError::new(
                             LixError::CODE_SCHEMA_VALIDATION,
                             format!(
-                                "INSERT failed to derive entity primary key for schema '{}': missing primary-key value",
+                                "INSERT failed to derive row primary key for schema '{}': missing primary-key value",
                                 layout.schema_key
                             ),
                         ));
@@ -5086,11 +5086,11 @@ fn certified_direct_parameter_insert_batch(
                     }
                 }
             }
-            let derived_entity_pk = if shared_string_primary_keys {
+            let derived_row_pk = if shared_string_primary_keys {
                 None
             } else {
                 Some(
-                    EntityPk::from_shared_external_parts(
+                    RowPk::from_shared_external_parts(
                         primary_key_parts.iter().map(|part| SharedStr::from(*part)),
                         &spec.primary_key_component_types,
                     )
@@ -5098,7 +5098,7 @@ fn certified_direct_parameter_insert_batch(
                         LixError::new(
                             LixError::CODE_SCHEMA_VALIDATION,
                             format!(
-                                "INSERT failed to derive entity primary key for schema '{}': {error}",
+                                "INSERT failed to derive row primary key for schema '{}': {error}",
                                 layout.schema_key
                             ),
                         )
@@ -5143,14 +5143,14 @@ fn certified_direct_parameter_insert_batch(
                     primary_key_ranges.push((start, end));
                 }
             } else {
-                let entity_pk =
-                    derived_entity_pk.expect("non-string primary key was materialized above");
-                if let Some(unique) = &mut unordered_entity_pks {
-                    if !unique.insert(entity_pk.clone()) {
+                let row_pk =
+                    derived_row_pk.expect("non-string primary key was materialized above");
+                if let Some(unique) = &mut unordered_row_pks {
+                    if !unique.insert(row_pk.clone()) {
                         return Ok(false);
                     }
-                } else if let Some(previous) = entity_pks.last()
-                    && previous >= &entity_pk
+                } else if let Some(previous) = row_pks.last()
+                    && previous >= &row_pk
                 {
                     // Ordered parameter batches prove uniqueness by adjacency
                     // and need no hash table. On the first disorder, seed the
@@ -5158,13 +5158,13 @@ fn certified_direct_parameter_insert_batch(
                     // so duplicate detection and later validation retain
                     // statement order.
                     let mut unique = std::collections::HashSet::with_capacity(row_count);
-                    unique.extend(entity_pks.iter().cloned());
-                    if !unique.insert(entity_pk.clone()) {
+                    unique.extend(row_pks.iter().cloned());
+                    if !unique.insert(row_pk.clone()) {
                         return Ok(false);
                     }
-                    unordered_entity_pks = Some(unique);
+                    unordered_row_pks = Some(unique);
                 }
-                entity_pks.push(entity_pk);
+                row_pks.push(row_pk);
             }
             offsets.push((start, normalized.len()));
             Ok(true)
@@ -5178,16 +5178,16 @@ fn certified_direct_parameter_insert_batch(
     if shared_string_primary_keys {
         let primary_key_arena = SharedStr::from_utf8(bytes::Bytes::from(primary_key_arena))
             .map_err(|_| LixError::unknown("certified primary-key arena is not valid UTF-8"))?;
-        entity_pks.reserve(row_count);
+        row_pks.reserve(row_count);
         for ranges in primary_key_ranges.chunks_exact(primary_key_columns.len()) {
             if let [(start, end)] = ranges {
-                entity_pks.push(EntityPk::from_validated_shared_string(
+                row_pks.push(RowPk::from_validated_shared_string(
                     primary_key_arena
                         .slice(*start as usize..*end as usize)
                         .expect("certified primary-key ranges preserve UTF-8 boundaries"),
                 ));
             } else {
-                entity_pks.push(EntityPk::from_validated_shared_string_parts(
+                row_pks.push(RowPk::from_validated_shared_string_parts(
                     ranges.iter().map(|&(start, end)| {
                         primary_key_arena
                             .slice(start as usize..end as usize)
@@ -5198,7 +5198,7 @@ fn certified_direct_parameter_insert_batch(
         }
     }
     let tracked_keys_strictly_ordered =
-        shared_string_primary_keys || unordered_entity_pks.is_none();
+        shared_string_primary_keys || unordered_row_pks.is_none();
     let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
     let schema_key: SharedStr = layout.schema_key.as_str().into();
     let branch_id: SharedStr = ctx.active_branch_id().into();
@@ -5212,7 +5212,7 @@ fn certified_direct_parameter_insert_batch(
         complete_collection_replacement: None,
     };
     let rows = CertifiedParameterInsertBatch::new(
-        entity_pks,
+        row_pks,
         snapshots,
         schema_key,
         branch_id,
@@ -5223,10 +5223,10 @@ fn certified_direct_parameter_insert_batch(
 
 fn certified_direct_path_value_insert_batch(
     ctx: &mut impl SqlWriteExecutionContext,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     layout: &InsertRowLayout,
     row: &[BoundExpr],
-    parameter_batch: EntityInsertParameterBatch<'_>,
+    parameter_batch: RowInsertParameterBatch<'_>,
     schema_plan_id: SchemaPlanId,
 ) -> Result<Option<CertifiedParameterInsertBatch>, LixError> {
     if !spec.certifies_path_value_replacement
@@ -5243,7 +5243,7 @@ fn certified_direct_path_value_insert_batch(
                 BoundExpr::Param(param),
                 InsertColumnTarget::Visible {
                     name,
-                    column_type: EntityColumnType::String,
+                    column_type: SchemaColumnType::String,
                     ..
                 },
             ) if name == "path" => path_param_index = Some(param.index.saturating_sub(1)),
@@ -5251,7 +5251,7 @@ fn certified_direct_path_value_insert_batch(
                 BoundExpr::Function { name, args },
                 InsertColumnTarget::Visible {
                     name: column_name,
-                    column_type: EntityColumnType::Json,
+                    column_type: SchemaColumnType::Json,
                     ..
                 },
             ) if name == "lix_json" && column_name == "value" => {
@@ -5267,8 +5267,8 @@ fn certified_direct_path_value_insert_batch(
     else {
         return Ok(None);
     };
-    if !parameter_batch.column_matches(path_param_index, EntityColumnType::String)
-        || !parameter_batch.column_matches(value_param_index, EntityColumnType::String)
+    if !parameter_batch.column_matches(path_param_index, SchemaColumnType::String)
+        || !parameter_batch.column_matches(value_param_index, SchemaColumnType::String)
     {
         return Ok(None);
     }
@@ -5336,10 +5336,10 @@ fn certified_direct_path_value_insert_batch(
 
     let path_arena = SharedStr::from_utf8(bytes::Bytes::from(path_arena))
         .map_err(|_| LixError::unknown("certified INSERT path arena is not UTF-8"))?;
-    let entity_pks = path_offsets
+    let row_pks = path_offsets
         .into_iter()
         .map(|(start, end)| {
-            EntityPk::from_validated_shared_string(
+            RowPk::from_validated_shared_string(
                 path_arena
                     .slice(start..end)
                     .expect("certified INSERT path offsets preserve UTF-8"),
@@ -5349,7 +5349,7 @@ fn certified_direct_path_value_insert_batch(
     let snapshots =
         TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
     let rows = CertifiedParameterInsertBatch::new_with_lane(
-        entity_pks,
+        row_pks,
         snapshots,
         layout.schema_key.as_str().into(),
         ctx.active_branch_id().into(),
@@ -5367,10 +5367,10 @@ fn certified_direct_path_value_insert_batch(
     Ok(Some(rows))
 }
 
-fn certified_entity_insert_rows<'a>(
+fn certified_row_insert_rows<'a>(
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     layout: &InsertRowLayout,
     row_count: usize,
     inputs: impl IntoIterator<Item = Result<CertifiedInsertInput<'a>, LixError>>,
@@ -5384,9 +5384,9 @@ fn certified_entity_insert_rows<'a>(
             target,
             InsertColumnTarget::FileId
                 | InsertColumnTarget::Visible {
-                    column_type: EntityColumnType::Json
-                        | EntityColumnType::Integer
-                        | EntityColumnType::Number,
+                    column_type: SchemaColumnType::Json
+                        | SchemaColumnType::Integer
+                        | SchemaColumnType::Number,
                     ..
                 }
         )
@@ -5451,13 +5451,13 @@ fn certified_entity_insert_rows<'a>(
         .ok_or_else(|| LixError::unknown("certified INSERT batch size overflowed"))?;
     let mut normalized = Vec::with_capacity(estimated_batch_bytes);
     let mut offsets = Vec::with_capacity(row_count);
-    let mut entity_pks = Vec::with_capacity(row_count);
+    let mut row_pks = Vec::with_capacity(row_count);
     let mut row_parts = Vec::with_capacity(row_count);
-    let mut unique_identities = std::collections::HashSet::with_capacity(row_count);
+    let mut unique_identitys = std::collections::HashSet::with_capacity(row_count);
     let mut row_values = (0..layout.columns.len())
         .map(|_| None)
         .collect::<Vec<Option<JsonValue>>>();
-    let context = EntityEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
+    let context = RowEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
 
     for input in inputs {
         let input = input?;
@@ -5468,11 +5468,11 @@ fn certified_entity_insert_rows<'a>(
             if row.len() != layout.columns.len() {
                 return Err(LixError::new(
                     LixError::CODE_UNSUPPORTED_SQL,
-                    "entity INSERT rows must have a consistent column layout",
+                    "row INSERT rows must have a consistent column layout",
                 ));
             }
 
-            let mut explicit_entity_pk = None;
+            let mut explicit_row_pk = None;
             let mut file_id = None;
             let mut metadata = None;
             let mut global = None;
@@ -5484,7 +5484,7 @@ fn certified_entity_insert_rows<'a>(
                 let eval_value =
                     eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
                 if matches!(target, InsertColumnTarget::Global)
-                    && entity_eval_value_is_null(&eval_value)
+                    && row_eval_value_is_null(&eval_value)
                 {
                     let column_name = match target {
                         InsertColumnTarget::Global => "lixcol_global",
@@ -5512,7 +5512,7 @@ fn certified_entity_insert_rows<'a>(
                     read_nullable,
                 } = target
                 {
-                    if !read_nullable && entity_eval_value_is_null(&eval_value) {
+                    if !read_nullable && row_eval_value_is_null(&eval_value) {
                         return Err(LixError::new(
                             LixError::CODE_SCHEMA_VALIDATION,
                             format!(
@@ -5521,7 +5521,7 @@ fn certified_entity_insert_rows<'a>(
                             ),
                         ));
                     }
-                    row_values[index] = Some(entity_json_value(
+                    row_values[index] = Some(row_json_value(
                         expr,
                         eval_value,
                         *column_type,
@@ -5535,9 +5535,9 @@ fn certified_entity_insert_rows<'a>(
                     InsertColumnTarget::Visible { .. } => {
                         unreachable!("visible columns handled above")
                     }
-                    InsertColumnTarget::EntityPk => {
-                        explicit_entity_pk =
-                            Some(entity_pk_from_value(&value, "lixcol_entity_pk")?);
+                    InsertColumnTarget::RowPk => {
+                        explicit_row_pk =
+                            Some(row_pk_from_value(&value, "lixcol_row_pk")?);
                     }
                     InsertColumnTarget::FileId => {
                         file_id = text_value(value, "lixcol_file_id")?;
@@ -5561,14 +5561,14 @@ fn certified_entity_insert_rows<'a>(
                     LixError::new(
                         LixError::CODE_SCHEMA_VALIDATION,
                         format!(
-                            "INSERT failed to derive entity primary key for schema '{}': missing primary-key value",
+                            "INSERT failed to derive row primary key for schema '{}': missing primary-key value",
                             layout.schema_key
                         ),
                     )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-            let derived_entity_pk = EntityPk::from_json_values(
+            let derived_row_pk = RowPk::from_json_values(
                 &primary_key_values
                     .iter()
                     .map(|value| (*value).clone())
@@ -5579,18 +5579,18 @@ fn certified_entity_insert_rows<'a>(
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "INSERT failed to derive entity primary key for schema '{}': {error}",
+                        "INSERT failed to derive row primary key for schema '{}': {error}",
                         layout.schema_key
                     ),
                 )
             })?;
-            if explicit_entity_pk.as_ref().is_some_and(|explicit| {
-                explicit.clone().into_parts() != derived_entity_pk.clone().into_parts()
+            if explicit_row_pk.as_ref().is_some_and(|explicit| {
+                explicit.clone().into_parts() != derived_row_pk.clone().into_parts()
             }) {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "INSERT into {} has lixcol_entity_pk that does not match its public primary-key columns",
+                        "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
                         layout.schema_key
                     ),
                 ));
@@ -5621,9 +5621,9 @@ fn certified_entity_insert_rows<'a>(
                 })?;
             }
             normalized.push(b'}');
-            let key = WasmEntityKey::from_owned_parts(
+            let key = WasmRowKey::from_owned_parts(
                 layout.schema_key.clone(),
-                derived_entity_pk.clone().into_parts(),
+                derived_row_pk.clone().into_parts(),
             );
             let certified = schema_plan
                 .certify_or_normalize_plugin_row(&normalized[start..], &key)?
@@ -5642,10 +5642,10 @@ fn certified_entity_insert_rows<'a>(
                 file_id: file_id.map(Into::into),
                 metadata,
                 global,
-                branch_id: entity_row_branch_id(plan, explicit_branch_id, global)?.into(),
+                branch_id: row_row_branch_id(plan, explicit_branch_id, global)?.into(),
             };
-            if !unique_identities.insert((
-                certified.entity_pk.clone(),
+            if !unique_identitys.insert((
+                certified.row_pk.clone(),
                 row_parts_entry.file_id.clone(),
                 row_parts_entry.branch_id.clone(),
                 global,
@@ -5653,7 +5653,7 @@ fn certified_entity_insert_rows<'a>(
                 return Ok(false);
             }
             offsets.push((start, end));
-            entity_pks.push(certified.entity_pk);
+            row_pks.push(certified.row_pk);
             row_parts.push(row_parts_entry);
             for value in &mut row_values {
                 *value = None;
@@ -5672,9 +5672,9 @@ fn certified_entity_insert_rows<'a>(
     let row_count = offsets.len();
     let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
     let mut rows = RawWriteBatch::with_capacity(row_count);
-    for ((entity_pk, snapshot), row) in entity_pks.into_iter().zip(snapshots).zip(row_parts) {
+    for ((row_pk, snapshot), row) in row_pks.into_iter().zip(snapshots).zip(row_parts) {
         rows.push_parts(
-            Some(entity_pk),
+            Some(row_pk),
             layout.schema_key.as_str().into(),
             row.file_id,
             Some(snapshot),
@@ -5696,11 +5696,11 @@ fn certified_entity_insert_rows<'a>(
     Ok(Some(rows))
 }
 
-fn append_entity_insert_row(
+fn append_row_insert_row(
     rows: &mut RawWriteBatch,
     ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
     layout: &InsertRowLayout,
     row: &[BoundExpr],
     params: &[Value],
@@ -5709,24 +5709,24 @@ fn append_entity_insert_row(
     if row.len() != layout.columns.len() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "entity INSERT rows must have a consistent column layout",
+            "row INSERT rows must have a consistent column layout",
         ));
     }
 
     let mut snapshot = serde_json::Map::with_capacity(layout.snapshot_capacity);
-    let mut entity_pk = None;
+    let mut row_pk = None;
     let mut file_id = None;
     let mut metadata = None;
     let mut global = None;
     let mut explicit_branch_id = None;
-    let context = EntityEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
+    let context = RowEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
 
     for (expr, target) in row.iter().zip(layout.columns.iter()) {
         if let InsertColumnTarget::Visible { column_type, .. } = target {
             reject_direct_blob_json_value(expr, *column_type, params)?;
         }
         let eval_value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
-        if matches!(target, InsertColumnTarget::Global) && entity_eval_value_is_null(&eval_value) {
+        if matches!(target, InsertColumnTarget::Global) && row_eval_value_is_null(&eval_value) {
             let column_name = match target {
                 InsertColumnTarget::Global => "lixcol_global",
                 _ => unreachable!("matched defaulted boolean system column"),
@@ -5753,7 +5753,7 @@ fn append_entity_insert_row(
             read_nullable,
         } = target
         {
-            if !read_nullable && entity_eval_value_is_null(&eval_value) {
+            if !read_nullable && row_eval_value_is_null(&eval_value) {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
@@ -5764,15 +5764,15 @@ fn append_entity_insert_row(
             }
             snapshot.insert(
                 name.clone(),
-                entity_json_value(expr, eval_value, *column_type, &layout.schema_key, name)?,
+                row_json_value(expr, eval_value, *column_type, &layout.schema_key, name)?,
             );
             continue;
         }
         let value = eval_value.into_json();
         match target {
             InsertColumnTarget::Visible { .. } => unreachable!("visible columns handled above"),
-            InsertColumnTarget::EntityPk => {
-                entity_pk = Some(entity_pk_from_value(&value, "lixcol_entity_pk")?);
+            InsertColumnTarget::RowPk => {
+                row_pk = Some(row_pk_from_value(&value, "lixcol_row_pk")?);
             }
             InsertColumnTarget::FileId => {
                 file_id = text_value(value, "lixcol_file_id")?;
@@ -5799,7 +5799,7 @@ fn append_entity_insert_row(
     )?;
     let snapshot = JsonValue::Object(snapshot);
     if !spec.primary_key_paths.is_empty() {
-        let derived_entity_pk = EntityPk::from_primary_key_plan(
+        let derived_row_pk = RowPk::from_primary_key_plan(
             &snapshot,
             &spec.primary_key_paths,
             &spec.primary_key_component_types,
@@ -5808,29 +5808,29 @@ fn append_entity_insert_row(
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "INSERT failed to derive entity primary key for schema '{}': {error}",
+                    "INSERT failed to derive row primary key for schema '{}': {error}",
                     layout.schema_key
                 ),
             )
         })?;
-        if entity_pk
+        if row_pk
             .as_ref()
-            .is_some_and(|explicit_entity_pk| explicit_entity_pk != &derived_entity_pk)
+            .is_some_and(|explicit_row_pk| explicit_row_pk != &derived_row_pk)
         {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "INSERT into {} has lixcol_entity_pk that does not match its public primary-key columns",
+                    "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
                     layout.schema_key
                 ),
             ));
         }
-        entity_pk = Some(derived_entity_pk);
+        row_pk = Some(derived_row_pk);
     }
     let global = global.unwrap_or(false);
-    let branch_id = entity_row_branch_id(plan, explicit_branch_id, global)?;
+    let branch_id = row_row_branch_id(plan, explicit_branch_id, global)?;
     rows.push_parts(
-        entity_pk,
+        row_pk,
         layout.schema_key.as_str().into(),
         file_id.map(Into::into),
         Some(TransactionJson::from_value(
@@ -5852,30 +5852,30 @@ fn append_entity_insert_row(
 
 fn reject_projected_global_write<'a>(
     plan: &LogicalWritePlan,
-    row: impl Into<EntityLiveRowRef<'a>>,
+    row: impl Into<RowLiveRowRef<'a>>,
     action: &str,
 ) -> Result<(), LixError> {
     let row = row.into();
     let target_is_by_branch = matches!(
         &plan.bound.target,
-        BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
+        BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
     );
     if target_is_by_branch && row.global() && row.branch_id() != crate::GLOBAL_BRANCH_ID {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             format!(
-                "{action} through an entity by-branch surface cannot mutate a projected global row"
+                "{action} through an row by-branch surface cannot mutate a projected global row"
             ),
         ));
     }
     Ok(())
 }
 
-fn append_entity_replace_row_from_live<'a>(
+fn append_row_replace_row_from_live<'a>(
     rows: &mut RawWriteBatch,
     ctx: &mut impl SqlWriteExecutionContext,
-    spec: &EntitySurfaceSpec,
-    row: impl Into<EntityLiveRowRef<'a>>,
+    spec: &SchemaSurfaceSpec,
+    row: impl Into<RowLiveRowRef<'a>>,
     snapshot: Option<JsonValue>,
     assignments: &[BoundAssignment],
     params: &[Value],
@@ -5884,7 +5884,7 @@ fn append_entity_replace_row_from_live<'a>(
     let row = row.into();
     let metadata = if let Some(expr) = assignment_value(assignments, "lixcol_metadata") {
         let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
-        let context = EntityEvalContext::live(&snapshot_for_eval, row, spec);
+        let context = RowEvalContext::live(&snapshot_for_eval, row, spec);
         let value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
         optional_metadata_from_eval_value(value, "lixcol_metadata", &spec.schema_key)?
     } else {
@@ -5901,7 +5901,7 @@ fn append_entity_replace_row_from_live<'a>(
         })
         .transpose()?;
     rows.push_parts(
-        Some(row.entity_pk().clone()),
+        Some(row.row_pk().clone()),
         spec.schema_key.as_str().into(),
         row.file_id().map(Into::into),
         snapshot,
@@ -5924,18 +5924,18 @@ fn append_entity_replace_row_from_live<'a>(
 
 fn complete_untracked_primary_key_fields(
     snapshot: &mut JsonValue,
-    row: EntityLiveRowRef<'_>,
-    spec: &EntitySurfaceSpec,
+    row: RowLiveRowRef<'_>,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<(), LixError> {
     if !row.untracked() || spec.primary_key_paths.is_empty() {
         return Ok(());
     }
-    let entity_pk = row.entity_pk().as_json_array_value()?;
-    let Some(values) = entity_pk.as_array() else {
+    let row_pk = row.row_pk().as_json_array_value()?;
+    let Some(values) = row_pk.as_array() else {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "untracked entity '{}' has a non-array primary-key identity",
+                "untracked row '{}' has a non-array primary-key identity",
                 spec.schema_key
             ),
         ));
@@ -5945,7 +5945,7 @@ fn complete_untracked_primary_key_fields(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "untracked entity '{}' is missing primary-key component {index}",
+                    "untracked row '{}' is missing primary-key component {index}",
                     spec.schema_key
                 ),
             ));
@@ -5964,13 +5964,13 @@ fn insert_missing_json_path(
     if path.is_empty() {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!("entity '{schema_key}' has an empty primary-key path"),
+            format!("row '{schema_key}' has an empty primary-key path"),
         ));
     }
     let Some(object) = target.as_object_mut() else {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!("entity '{schema_key}' snapshot must be a JSON object"),
+            format!("row '{schema_key}' snapshot must be a JSON object"),
         ));
     };
     let mut object = object;
@@ -5981,7 +5981,7 @@ fn insert_missing_json_path(
         object = child.as_object_mut().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
-                format!("entity '{schema_key}' primary-key path has a non-object parent"),
+                format!("row '{schema_key}' primary-key path has a non-object parent"),
             )
         })?;
     }
@@ -5990,8 +5990,8 @@ fn insert_missing_json_path(
 }
 
 fn inherited_metadata<'a>(
-    row: impl Into<EntityLiveRowRef<'a>>,
-    spec: &EntitySurfaceSpec,
+    row: impl Into<RowLiveRowRef<'a>>,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<Option<TransactionJson>, LixError> {
     row.into()
         .metadata()
@@ -6002,26 +6002,26 @@ fn inherited_metadata<'a>(
         .transpose()
 }
 
-struct EntityEvalContext<'a> {
+struct RowEvalContext<'a> {
     snapshot: &'a JsonValue,
-    row: Option<EntityEvalRowRef<'a>>,
+    row: Option<RowEvalRowRef<'a>>,
     excluded_snapshot: Option<&'a JsonValue>,
     excluded_row: Option<RawWriteRowRef<'a>>,
-    visible_columns: &'a [EntitySurfaceColumn],
+    visible_columns: &'a [SchemaSurfaceColumn],
     primary_key_paths: Option<&'a [Vec<String>]>,
 }
 
 #[derive(Clone, Copy)]
-enum EntityEvalRowRef<'a> {
-    Live(EntityLiveRowRef<'a>),
+enum RowEvalRowRef<'a> {
+    Live(RowLiveRowRef<'a>),
     Staged(RawWriteRowRef<'a>),
 }
 
-impl<'a> EntityEvalRowRef<'a> {
-    fn entity_pk(self) -> Option<&'a EntityPk> {
+impl<'a> RowEvalRowRef<'a> {
+    fn row_pk(self) -> Option<&'a RowPk> {
         match self {
-            Self::Live(row) => Some(row.entity_pk()),
-            Self::Staged(row) => row.entity_pk,
+            Self::Live(row) => Some(row.row_pk()),
+            Self::Staged(row) => row.row_pk,
         }
     }
 
@@ -6047,7 +6047,7 @@ impl<'a> EntityEvalRowRef<'a> {
                 .transpose(),
             Self::Staged(row) => row
                 .metadata
-                .map(|metadata| transaction_json_returning_value(metadata, "entity metadata"))
+                .map(|metadata| transaction_json_returning_value(metadata, "row metadata"))
                 .transpose(),
         }
     }
@@ -6102,8 +6102,8 @@ impl<'a> EntityEvalRowRef<'a> {
     }
 }
 
-impl<'a> EntityEvalContext<'a> {
-    fn insert(snapshot: &'a JsonValue, visible_columns: &'a [EntitySurfaceColumn]) -> Self {
+impl<'a> RowEvalContext<'a> {
+    fn insert(snapshot: &'a JsonValue, visible_columns: &'a [SchemaSurfaceColumn]) -> Self {
         Self {
             snapshot,
             row: None,
@@ -6116,12 +6116,12 @@ impl<'a> EntityEvalContext<'a> {
 
     fn live(
         snapshot: &'a JsonValue,
-        row: impl Into<EntityLiveRowRef<'a>>,
-        spec: &'a EntitySurfaceSpec,
+        row: impl Into<RowLiveRowRef<'a>>,
+        spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
             snapshot,
-            row: Some(EntityEvalRowRef::Live(row.into())),
+            row: Some(RowEvalRowRef::Live(row.into())),
             excluded_snapshot: None,
             excluded_row: None,
             visible_columns: &spec.columns,
@@ -6132,11 +6132,11 @@ impl<'a> EntityEvalContext<'a> {
     fn staged(
         snapshot: &'a JsonValue,
         row: RawWriteRowRef<'a>,
-        spec: &'a EntitySurfaceSpec,
+        spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
             snapshot,
-            row: Some(EntityEvalRowRef::Staged(row)),
+            row: Some(RowEvalRowRef::Staged(row)),
             excluded_snapshot: None,
             excluded_row: None,
             visible_columns: &spec.columns,
@@ -6146,14 +6146,14 @@ impl<'a> EntityEvalContext<'a> {
 
     fn conflict(
         snapshot: &'a JsonValue,
-        row: impl Into<EntityLiveRowRef<'a>>,
+        row: impl Into<RowLiveRowRef<'a>>,
         excluded_snapshot: &'a JsonValue,
         excluded_row: RawWriteRowRef<'a>,
-        spec: &'a EntitySurfaceSpec,
+        spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
             snapshot,
-            row: Some(EntityEvalRowRef::Live(row.into())),
+            row: Some(RowEvalRowRef::Live(row.into())),
             excluded_snapshot: Some(excluded_snapshot),
             excluded_row: Some(excluded_row),
             visible_columns: &spec.columns,
@@ -6162,29 +6162,29 @@ impl<'a> EntityEvalContext<'a> {
     }
 }
 
-fn entity_spec(
+fn schema_spec(
     ctx: &impl SqlWriteExecutionContext,
     schema_key: &str,
-) -> Result<EntitySurfaceSpec, LixError> {
+) -> Result<SchemaSurfaceSpec, LixError> {
     ctx.public_catalog()?
-        .entity_spec(schema_key)
+        .schema_spec(schema_key)
         .cloned()
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!("entity surface '{schema_key}' is not visible"),
+                format!("row surface '{schema_key}' is not visible"),
             )
         })
 }
 
 #[derive(Clone, Debug)]
-enum EntityEvalValue {
+enum RowEvalValue {
     SqlNull,
     SqlText(String),
     Json(JsonValue),
 }
 
-impl EntityEvalValue {
+impl RowEvalValue {
     fn into_json(self) -> JsonValue {
         match self {
             Self::SqlNull => JsonValue::Null,
@@ -6194,33 +6194,33 @@ impl EntityEvalValue {
     }
 }
 
-fn entity_eval_value_is_null(value: &EntityEvalValue) -> bool {
+fn row_eval_value_is_null(value: &RowEvalValue) -> bool {
     matches!(
         value,
-        EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null)
+        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null)
     )
 }
 
-fn cast_entity_eval_value(
-    value: EntityEvalValue,
+fn cast_row_eval_value(
+    value: RowEvalValue,
     cast_type: BoundCastType,
-) -> Result<EntityEvalValue, LixError> {
+) -> Result<RowEvalValue, LixError> {
     if cast_type == BoundCastType::Binary {
         return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             "BYTEA casts require a binary SQL column",
         )
         .with_hint(
-            "Use BYTEA for lix_file.content; registered entity schemas expose no binary column type.",
+            "Use BYTEA for lix_file.content; registered row schemas expose no binary column type.",
         ));
     }
 
     if cast_type == BoundCastType::Jsonb {
         return match value {
-            EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
-            EntityEvalValue::Json(value) => Ok(EntityEvalValue::Json(value)),
-            EntityEvalValue::SqlText(value) => serde_json::from_str(&value)
-                .map(EntityEvalValue::Json)
+            RowEvalValue::SqlNull => Ok(RowEvalValue::SqlNull),
+            RowEvalValue::Json(value) => Ok(RowEvalValue::Json(value)),
+            RowEvalValue::SqlText(value) => serde_json::from_str(&value)
+                .map(RowEvalValue::Json)
                 .map_err(|error| {
                     LixError::new(
                         LixError::CODE_TYPE_MISMATCH,
@@ -6235,27 +6235,27 @@ fn cast_entity_eval_value(
         BoundCastType::BigInt => DataType::Int64,
         BoundCastType::Double => DataType::Float64,
         BoundCastType::Boolean => DataType::Boolean,
-        BoundCastType::Binary => unreachable!("binary entity casts rejected above"),
-        BoundCastType::Jsonb => unreachable!("JSONB entity casts handled above"),
+        BoundCastType::Binary => unreachable!("binary row casts rejected above"),
+        BoundCastType::Jsonb => unreachable!("JSONB row casts handled above"),
     };
-    let scalar = scalar_from_entity_eval_value(value);
+    let scalar = scalar_from_row_eval_value(value);
     let casted = scalar.cast_to(&target_type).map_err(|error| {
         LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             format!("CAST AS {} failed: {error}", cast_type.canonical_sql_name()),
         )
     })?;
-    entity_eval_value_from_cast_scalar(casted, cast_type)
+    row_eval_value_from_cast_scalar(casted, cast_type)
 }
 
-fn scalar_from_entity_eval_value(value: EntityEvalValue) -> ScalarValue {
+fn scalar_from_row_eval_value(value: RowEvalValue) -> ScalarValue {
     match value {
-        EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null) => ScalarValue::Null,
-        EntityEvalValue::SqlText(value) | EntityEvalValue::Json(JsonValue::String(value)) => {
+        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => ScalarValue::Null,
+        RowEvalValue::SqlText(value) | RowEvalValue::Json(JsonValue::String(value)) => {
             ScalarValue::Utf8(Some(value))
         }
-        EntityEvalValue::Json(JsonValue::Bool(value)) => ScalarValue::Boolean(Some(value)),
-        EntityEvalValue::Json(JsonValue::Number(value)) => value.as_i64().map_or_else(
+        RowEvalValue::Json(JsonValue::Bool(value)) => ScalarValue::Boolean(Some(value)),
+        RowEvalValue::Json(JsonValue::Number(value)) => value.as_i64().map_or_else(
             || {
                 value.as_u64().map_or_else(
                     || ScalarValue::Float64(value.as_f64()),
@@ -6264,36 +6264,36 @@ fn scalar_from_entity_eval_value(value: EntityEvalValue) -> ScalarValue {
             },
             |value| ScalarValue::Int64(Some(value)),
         ),
-        EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
+        RowEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
             ScalarValue::Utf8(Some(value.to_string()))
         }
     }
 }
 
-fn entity_eval_value_from_cast_scalar(
+fn row_eval_value_from_cast_scalar(
     value: ScalarValue,
     cast_type: BoundCastType,
-) -> Result<EntityEvalValue, LixError> {
+) -> Result<RowEvalValue, LixError> {
     if value.is_null() {
-        return Ok(EntityEvalValue::SqlNull);
+        return Ok(RowEvalValue::SqlNull);
     }
     match value {
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Ok(EntityEvalValue::SqlText(value)),
+        | ScalarValue::LargeUtf8(Some(value)) => Ok(RowEvalValue::SqlText(value)),
         ScalarValue::Int64(Some(value)) => {
-            Ok(EntityEvalValue::Json(JsonValue::Number(value.into())))
+            Ok(RowEvalValue::Json(JsonValue::Number(value.into())))
         }
         ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
             .map(JsonValue::Number)
-            .map(EntityEvalValue::Json)
+            .map(RowEvalValue::Json)
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
                     "DOUBLE PRECISION cast produced a non-finite number",
                 )
             }),
-        ScalarValue::Boolean(Some(value)) => Ok(EntityEvalValue::Json(JsonValue::Bool(value))),
+        ScalarValue::Boolean(Some(value)) => Ok(RowEvalValue::Json(JsonValue::Bool(value))),
         other => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -6306,28 +6306,28 @@ fn entity_eval_value_from_cast_scalar(
 
 fn eval_expr(
     expr: &BoundExpr,
-    context: &EntityEvalContext<'_>,
+    context: &RowEvalContext<'_>,
     ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<JsonValue, LixError> {
     eval_expr_value(expr, context, ctx, params, active_branch_commit_id)
-        .map(EntityEvalValue::into_json)
+        .map(RowEvalValue::into_json)
 }
 
 fn eval_expr_value(
     expr: &BoundExpr,
-    context: &EntityEvalContext<'_>,
+    context: &RowEvalContext<'_>,
     ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<EntityEvalValue, LixError> {
+) -> Result<RowEvalValue, LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Null) => Ok(EntityEvalValue::SqlNull),
+        BoundExpr::Literal(BoundLiteral::Null) => Ok(RowEvalValue::SqlNull),
         BoundExpr::Literal(BoundLiteral::Text(value)) => {
-            Ok(EntityEvalValue::SqlText(value.clone()))
+            Ok(RowEvalValue::SqlText(value.clone()))
         }
-        BoundExpr::Literal(literal) => Ok(EntityEvalValue::Json(literal_json(literal))),
+        BoundExpr::Literal(literal) => Ok(RowEvalValue::Json(literal_json(literal))),
         BoundExpr::Param(param) => params
             .get(param.index.saturating_sub(1))
             .map(value_eval)
@@ -6341,14 +6341,14 @@ fn eval_expr_value(
         BoundExpr::ExcludedColumn(column) => excluded_column_eval_value(context, &column.name),
         BoundExpr::Cast { expr, data_type } => {
             let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
-            cast_entity_eval_value(value, *data_type)
+            cast_row_eval_value(value, *data_type)
         }
         BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
             let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let raw = match raw {
-                EntityEvalValue::SqlNull => return Ok(EntityEvalValue::Json(JsonValue::Null)),
-                EntityEvalValue::SqlText(value) => JsonValue::String(value),
-                EntityEvalValue::Json(value) => value,
+                RowEvalValue::SqlNull => return Ok(RowEvalValue::Json(JsonValue::Null)),
+                RowEvalValue::SqlText(value) => JsonValue::String(value),
+                RowEvalValue::Json(value) => value,
             };
             let JsonValue::String(raw) = raw else {
                 return Err(LixError::new(
@@ -6363,37 +6363,37 @@ fn eval_expr_value(
                         format!("lix_json argument is not valid JSON: {error}"),
                     )
                 })
-                .map(EntityEvalValue::Json)
+                .map(RowEvalValue::Json)
         }
         BoundExpr::Function { name, args } if name == "lix_uuid_v7" && args.is_empty() => Ok(
-            EntityEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
+            RowEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
         ),
         BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => Ok(
-            EntityEvalValue::SqlText(ctx.functions().call_timestamp().to_string()),
+            RowEvalValue::SqlText(ctx.functions().call_timestamp().to_string()),
         ),
         BoundExpr::Function { name, args } if name == "lix_active_branch_id" && args.is_empty() => {
-            Ok(EntityEvalValue::SqlText(ctx.active_branch_id().to_string()))
+            Ok(RowEvalValue::SqlText(ctx.active_branch_id().to_string()))
         }
         BoundExpr::Function { name, args }
             if name == "lix_active_branch_commit_id" && args.is_empty() =>
         {
             Ok(active_branch_commit_id
-                .map(|commit_id| EntityEvalValue::SqlText(commit_id.to_string()))
-                .unwrap_or(EntityEvalValue::SqlNull))
+                .map(|commit_id| RowEvalValue::SqlText(commit_id.to_string()))
+                .unwrap_or(RowEvalValue::SqlNull))
         }
         BoundExpr::Function { name, args } if name == "__lix_jsonb" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             match value {
-                EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
-                EntityEvalValue::SqlText(raw) => crate::sql2::udfs::common::parse_jsonb(&raw)
-                    .map(EntityEvalValue::Json)
+                RowEvalValue::SqlNull => Ok(RowEvalValue::SqlNull),
+                RowEvalValue::SqlText(raw) => crate::sql2::udfs::common::parse_jsonb(&raw)
+                    .map(RowEvalValue::Json)
                     .map_err(|error| {
                         LixError::new(
                             LixError::CODE_TYPE_MISMATCH,
                             format!("invalid JSONB value: {error}"),
                         )
                     }),
-                EntityEvalValue::Json(value) => {
+                RowEvalValue::Json(value) => {
                     let raw = serde_json::to_string(&value).map_err(|error| {
                         LixError::new(
                             LixError::CODE_TYPE_MISMATCH,
@@ -6401,7 +6401,7 @@ fn eval_expr_value(
                         )
                     })?;
                     crate::sql2::udfs::common::parse_jsonb(&raw)
-                        .map(EntityEvalValue::Json)
+                        .map(RowEvalValue::Json)
                         .map_err(|error| {
                             LixError::new(
                                 LixError::CODE_TYPE_MISMATCH,
@@ -6416,8 +6416,8 @@ fn eval_expr_value(
         {
             let root = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let mut current = match root {
-                EntityEvalValue::SqlNull => return Ok(EntityEvalValue::SqlNull),
-                EntityEvalValue::SqlText(raw) => {
+                RowEvalValue::SqlNull => return Ok(RowEvalValue::SqlNull),
+                RowEvalValue::SqlText(raw) => {
                     serde_json::from_str::<JsonValue>(&raw).map_err(|error| {
                         LixError::new(
                             LixError::CODE_TYPE_MISMATCH,
@@ -6427,42 +6427,42 @@ fn eval_expr_value(
                         )
                     })?
                 }
-                EntityEvalValue::Json(root) => match root {
-                    JsonValue::Null => return Ok(EntityEvalValue::SqlNull),
+                RowEvalValue::Json(root) => match root {
+                    JsonValue::Null => return Ok(RowEvalValue::SqlNull),
                     value => value,
                 },
             };
             for arg in &args[1..] {
                 let segment = eval_expr(arg, context, ctx, params, active_branch_commit_id)?;
                 let Some(next) = json_path_get(&current, &segment, name)? else {
-                    return Ok(EntityEvalValue::SqlNull);
+                    return Ok(RowEvalValue::SqlNull);
                 };
                 current = next;
             }
             if name == "lix_json_get_text" {
                 if current.is_null() {
-                    return Ok(EntityEvalValue::SqlNull);
+                    return Ok(RowEvalValue::SqlNull);
                 }
-                Ok(EntityEvalValue::SqlText(json_text_value(&current)?))
+                Ok(RowEvalValue::SqlText(json_text_value(&current)?))
             } else {
-                Ok(EntityEvalValue::Json(current))
+                Ok(RowEvalValue::Json(current))
             }
         }
         BoundExpr::Function { name, .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            format!("bound entity write does not support function '{name}' yet"),
+            format!("bound row write does not support function '{name}' yet"),
         )),
         BoundExpr::Binary { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity write evaluates binary expressions through DataFusion",
+            "bound row write evaluates binary expressions through DataFusion",
         )),
     }
 }
 
 fn predicate_matches(
     predicate: &BoundPredicate,
-    context: &EntityEvalContext<'_>,
-    spec: &EntitySurfaceSpec,
+    context: &RowEvalContext<'_>,
+    spec: &SchemaSurfaceSpec,
     ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
@@ -6508,7 +6508,7 @@ fn predicate_matches(
         }
         BoundPredicate::Like { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity writes do not support LIKE predicates",
+            "bound row writes do not support LIKE predicates",
         )),
         BoundPredicate::IsNull(expr) => {
             let value = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
@@ -6546,7 +6546,7 @@ fn comparison_values_equal(
     mut left_value: JsonValue,
     right_expr: &BoundExpr,
     mut right_value: JsonValue,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<bool, LixError> {
     normalize_bigint_comparison_literal(left_expr, right_expr, &mut right_value, spec)?;
     normalize_bigint_comparison_literal(right_expr, left_expr, &mut left_value, spec)?;
@@ -6568,12 +6568,12 @@ fn normalize_bigint_comparison_literal(
     column_expr: &BoundExpr,
     value_expr: &BoundExpr,
     value: &mut JsonValue,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<(), LixError> {
-    let Some(column) = visible_entity_column(column_expr, spec) else {
+    let Some(column) = visible_row_column(column_expr, spec) else {
         return Ok(());
     };
-    if column.column_type != EntityColumnType::Integer {
+    if column.column_type != SchemaColumnType::Integer {
         return Ok(());
     }
     if let Some(exact) = bigint_number_literal(value_expr, &spec.schema_key, &column.name)? {
@@ -6585,22 +6585,22 @@ fn normalize_bigint_comparison_literal(
 fn numeric_comparison_value(
     expr: &BoundExpr,
     value: &JsonValue,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<Option<NumericComparisonValue>, LixError> {
-    if let Some(column) = visible_entity_column(expr, spec) {
+    if let Some(column) = visible_row_column(expr, spec) {
         return match column.column_type {
-            EntityColumnType::Integer => {
+            SchemaColumnType::Integer => {
                 json_bigint_value(Some(value), &spec.schema_key, &column.name)
                     .map(|value| value.map(NumericComparisonValue::Signed))
             }
-            EntityColumnType::Number => {
+            SchemaColumnType::Number => {
                 json_double_value(Some(value), &spec.schema_key, &column.name)
                     .map(|value| value.map(NumericComparisonValue::Double))
             }
-            EntityColumnType::String
-            | EntityColumnType::Json
-            | EntityColumnType::Boolean
-            | EntityColumnType::Timestamptz => {
+            SchemaColumnType::String
+            | SchemaColumnType::Json
+            | SchemaColumnType::Boolean
+            | SchemaColumnType::Timestamptz => {
                 Ok(None)
             }
         };
@@ -6654,7 +6654,7 @@ fn normalize_comparison_operands(
     left_value: JsonValue,
     right_expr: &BoundExpr,
     right_value: JsonValue,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<(JsonValue, JsonValue), LixError> {
     let left_is_json = bound_expr_is_json(left_expr, spec);
     let right_is_json = bound_expr_is_json(right_expr, spec);
@@ -6702,7 +6702,7 @@ fn normalize_json_comparison_value(
 
 fn validate_bound_write_supported(
     plan: &LogicalWritePlan,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<(), LixError> {
     validate_predicate_supported(&plan.bound.predicate)?;
     validate_json_predicate_types(&plan.bound.predicate, spec)?;
@@ -6732,18 +6732,18 @@ fn validate_bound_write_supported(
     Ok(())
 }
 
-/// Whether a direct entity `RETURNING` projection is fully evaluated before
+/// Whether a direct row `RETURNING` projection is fully evaluated before
 /// staging. The explicit-transaction boundary uses this to avoid snapshotting
 /// a large journal for the common `RETURNING id, ...` case; audit fields still
 /// require a rollback checkpoint because they are populated by staging.
-pub(crate) fn entity_returning_projects_before_stage(plan: &LogicalWritePlan) -> bool {
-    if !matches!(plan.bound.target, BoundWriteTarget::Entity(_))
+pub(crate) fn row_returning_projects_before_stage(plan: &LogicalWritePlan) -> bool {
+    if !matches!(plan.bound.target, BoundWriteTarget::Row(_))
         || !bound_public_write_shape_supported(plan)
     {
         return false;
     }
     match plan.bound.op {
-        // Entity DELETE captures the preimage before it stages tombstones.
+        // Row DELETE captures the preimage before it stages tombstones.
         BoundWriteOp::Delete => true,
         BoundWriteOp::Insert | BoundWriteOp::Update => {
             plan.bound.returning.as_ref().is_some_and(|returning| {
@@ -6827,12 +6827,12 @@ fn validate_predicate_supported(predicate: &BoundPredicate) -> Result<(), LixErr
             validate_expr_supported(left)?;
             validate_expr_supported(right)
         }
-        // Entity deletes with LIKE use the generic DataFusion write path so
+        // Row deletes with LIKE use the generic DataFusion write path so
         // the predicate has exactly the same Arrow/DataFusion semantics as
         // every other writable surface.
         BoundPredicate::Like { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity writes do not support LIKE predicates",
+            "bound row writes do not support LIKE predicates",
         )),
         BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
             validate_expr_supported(expr)
@@ -6849,7 +6849,7 @@ fn validate_predicate_supported(predicate: &BoundPredicate) -> Result<(), LixErr
 
 fn validate_json_predicate_types(
     predicate: &BoundPredicate,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<(), LixError> {
     use crate::sql2::plan::predicate::BoundPredicate;
     match predicate {
@@ -6890,7 +6890,7 @@ fn validate_json_predicate_types(
 fn validate_json_comparison_operands(
     left: &BoundExpr,
     right: &BoundExpr,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<(), LixError> {
     if bound_expr_is_json(left, spec) {
         if is_identity_json_expr(left) && is_parseable_json_text_literal(right) {
@@ -6909,7 +6909,7 @@ fn validate_json_comparison_operands(
 
 fn require_json_comparison_operand(
     expr: &BoundExpr,
-    spec: &EntitySurfaceSpec,
+    spec: &SchemaSurfaceSpec,
 ) -> Result<(), LixError> {
     if bound_expr_is_json(expr, spec)
         || matches!(expr, BoundExpr::Param(_))
@@ -6928,7 +6928,7 @@ fn is_identity_json_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
-            if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
+            if matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk")
     )
 }
 
@@ -6941,14 +6941,14 @@ fn is_parseable_json_text_literal(expr: &BoundExpr) -> bool {
     }
 }
 
-fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
+fn bound_expr_is_json(expr: &BoundExpr, spec: &SchemaSurfaceSpec) -> bool {
     match expr {
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => {
             spec.visible_column(&column.name)
-                .is_some_and(|column| column.column_type == EntityColumnType::Json)
+                .is_some_and(|column| column.column_type == SchemaColumnType::Json)
                 || matches!(
                     column.name.as_str(),
-                    "lixcol_entity_pk" | "lixcol_metadata" | "lixcol_snapshot_content"
+                    "lixcol_row_pk" | "lixcol_metadata" | "lixcol_snapshot_content"
                 )
         }
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
@@ -6966,7 +6966,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         BoundExpr::Cast { expr, .. } => validate_expr_supported(expr),
         BoundExpr::Binary { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity write evaluates binary expressions through DataFusion",
+            "bound row write evaluates binary expressions through DataFusion",
         )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
@@ -6980,7 +6980,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
-                        format!("bound entity write does not support function '{name}' yet"),
+                        format!("bound row write does not support function '{name}' yet"),
                     ));
                 }
             }
@@ -6993,7 +6993,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
 }
 
 fn candidate_snapshot<'a>(
-    row: impl Into<EntityLiveRowRef<'a>>,
+    row: impl Into<RowLiveRowRef<'a>>,
 ) -> Result<Option<JsonValue>, LixError> {
     row.into()
         .snapshot_content()
@@ -7001,57 +7001,57 @@ fn candidate_snapshot<'a>(
             serde_json::from_str(snapshot).map_err(|error| {
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    format!("entity row snapshot_content is not valid JSON: {error}"),
+                    format!("row row snapshot_content is not valid JSON: {error}"),
                 )
             })
         })
         .transpose()
 }
 
-fn entity_json_value(
+fn row_json_value(
     expr: &BoundExpr,
-    value: EntityEvalValue,
-    column_type: EntityColumnType,
+    value: RowEvalValue,
+    column_type: SchemaColumnType,
     schema_key: &str,
     column_name: &str,
 ) -> Result<JsonValue, LixError> {
-    let exact_bigint_literal = if column_type == EntityColumnType::Integer {
+    let exact_bigint_literal = if column_type == SchemaColumnType::Integer {
         bigint_number_literal(expr, schema_key, column_name)?
     } else {
         None
     };
     let value = exact_bigint_literal.map_or_else(
         || match (value, column_type) {
-            (EntityEvalValue::SqlNull, _) => JsonValue::Null,
-            (EntityEvalValue::SqlText(value), EntityColumnType::Json) => {
+            (RowEvalValue::SqlNull, _) => JsonValue::Null,
+            (RowEvalValue::SqlText(value), SchemaColumnType::Json) => {
                 serde_json::from_str(&value).unwrap_or(JsonValue::String(value))
             }
-            (EntityEvalValue::SqlText(value), _) => JsonValue::String(value),
-            (EntityEvalValue::Json(JsonValue::String(value)), EntityColumnType::String) => {
+            (RowEvalValue::SqlText(value), _) => JsonValue::String(value),
+            (RowEvalValue::Json(JsonValue::String(value)), SchemaColumnType::String) => {
                 JsonValue::String(value)
             }
             (
-                EntityEvalValue::Json(JsonValue::Number(value)),
-                EntityColumnType::Number | EntityColumnType::Integer,
+                RowEvalValue::Json(JsonValue::Number(value)),
+                SchemaColumnType::Number | SchemaColumnType::Integer,
             ) => JsonValue::Number(value),
-            (EntityEvalValue::Json(JsonValue::Bool(value)), EntityColumnType::Boolean) => {
+            (RowEvalValue::Json(JsonValue::Bool(value)), SchemaColumnType::Boolean) => {
                 JsonValue::Bool(value)
             }
-            (EntityEvalValue::Json(value), _) => value,
+            (RowEvalValue::Json(value), _) => value,
         },
         JsonValue::from,
     );
     match column_type {
-        EntityColumnType::Integer => {
+        SchemaColumnType::Integer => {
             json_bigint_value(Some(&value), schema_key, column_name)?;
         }
-        EntityColumnType::Number => {
+        SchemaColumnType::Number => {
             json_double_value(Some(&value), schema_key, column_name)?;
         }
-        EntityColumnType::String
-        | EntityColumnType::Json
-        | EntityColumnType::Boolean
-        | EntityColumnType::Timestamptz => {}
+        SchemaColumnType::String
+        | SchemaColumnType::Json
+        | SchemaColumnType::Boolean
+        | SchemaColumnType::Timestamptz => {}
     }
     Ok(value)
 }
@@ -7198,10 +7198,10 @@ fn non_integral_magnitude_is_in_bigint_range(magnitude: &str, negative: bool) ->
 
 fn reject_direct_blob_json_value(
     expr: &BoundExpr,
-    column_type: EntityColumnType,
+    column_type: SchemaColumnType,
     params: &[Value],
 ) -> Result<(), LixError> {
-    if column_type != EntityColumnType::Json {
+    if column_type != SchemaColumnType::Json {
         return Ok(());
     }
     let is_blob = match expr {
@@ -7213,7 +7213,7 @@ fn reject_direct_blob_json_value(
     if is_blob {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            "cannot store blob values directly in JSON entity columns",
+            "cannot store blob values directly in JSON row columns",
         ));
     }
     Ok(())
@@ -7230,11 +7230,11 @@ fn literal_json(literal: &BoundLiteral) -> JsonValue {
     }
 }
 
-fn value_eval(value: &Value) -> EntityEvalValue {
+fn value_eval(value: &Value) -> RowEvalValue {
     match value {
-        Value::Null => EntityEvalValue::SqlNull,
-        Value::Text(value) => EntityEvalValue::SqlText(value.clone()),
-        _ => EntityEvalValue::Json(value_json(value)),
+        Value::Null => RowEvalValue::SqlNull,
+        Value::Text(value) => RowEvalValue::SqlText(value.clone()),
+        _ => RowEvalValue::Json(value_json(value)),
     }
 }
 
@@ -7316,9 +7316,9 @@ fn json_text_value(value: &JsonValue) -> Result<String, LixError> {
 }
 
 fn column_eval_value(
-    context: &EntityEvalContext<'_>,
+    context: &RowEvalContext<'_>,
     column_name: &str,
-) -> Result<EntityEvalValue, LixError> {
+) -> Result<RowEvalValue, LixError> {
     if let Some(value) = context.snapshot.get(column_name) {
         return Ok(visible_column_eval_value(
             context
@@ -7329,14 +7329,14 @@ fn column_eval_value(
         ));
     }
     let Some(row) = context.row else {
-        return Ok(EntityEvalValue::SqlNull);
+        return Ok(RowEvalValue::SqlNull);
     };
     if let Some(primary_key_paths) = context.primary_key_paths {
         if let Some((index, _)) = primary_key_paths.iter().enumerate().find(|(_, path)| {
             path.len() == 1 && path.first().is_some_and(|path| path == column_name)
         }) {
-            if let Some(entity_pk) = row.entity_pk() {
-                let values = entity_pk.as_json_array_value()?;
+            if let Some(row_pk) = row.row_pk() {
+                let values = row_pk.as_json_array_value()?;
                 if let Some(value) = values.as_array().and_then(|values| values.get(index)) {
                     return Ok(visible_column_eval_value(
                         context
@@ -7350,55 +7350,55 @@ fn column_eval_value(
         }
     }
     match column_name {
-        "lixcol_entity_pk" => row
-            .entity_pk()
-            .map(EntityPk::as_json_array_value)
+        "lixcol_row_pk" => row
+            .row_pk()
+            .map(RowPk::as_json_array_value)
             .transpose()
             .map(|value| {
                 value
-                    .map(EntityEvalValue::Json)
-                    .unwrap_or(EntityEvalValue::SqlNull)
+                    .map(RowEvalValue::Json)
+                    .unwrap_or(RowEvalValue::SqlNull)
             }),
-        "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
+        "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
             row.schema_key().to_string(),
         ))),
         "lixcol_file_id" => Ok(row
             .file_id()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
-            .unwrap_or(EntityEvalValue::SqlNull)),
+            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_metadata" => row.metadata().map(|metadata| {
             metadata
-                .map(EntityEvalValue::Json)
-                .unwrap_or(EntityEvalValue::SqlNull)
+                .map(RowEvalValue::Json)
+                .unwrap_or(RowEvalValue::SqlNull)
         }),
         "lixcol_change_id" => Ok(row
             .change_id()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
-            .unwrap_or(EntityEvalValue::SqlNull)),
+            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_created_at" => Ok(row
             .created_at()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value)))
-            .unwrap_or(EntityEvalValue::SqlNull)),
+            .map(|value| RowEvalValue::Json(JsonValue::String(value)))
+            .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_updated_at" => Ok(row
             .updated_at()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value)))
-            .unwrap_or(EntityEvalValue::SqlNull)),
+            .map(|value| RowEvalValue::Json(JsonValue::String(value)))
+            .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_commit_id" => Ok(row
             .commit_id()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
-            .unwrap_or(EntityEvalValue::SqlNull)),
-        "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global()))),
-        "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
+            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .unwrap_or(RowEvalValue::SqlNull)),
+        "lixcol_global" => Ok(RowEvalValue::Json(JsonValue::Bool(row.global()))),
+        "lixcol_branch_id" => Ok(RowEvalValue::Json(JsonValue::String(
             row.branch_id().to_string(),
         ))),
-        _ => Ok(EntityEvalValue::SqlNull),
+        _ => Ok(RowEvalValue::SqlNull),
     }
 }
 
 fn excluded_column_eval_value(
-    context: &EntityEvalContext<'_>,
+    context: &RowEvalContext<'_>,
     column_name: &str,
-) -> Result<EntityEvalValue, LixError> {
+) -> Result<RowEvalValue, LixError> {
     let Some(excluded_snapshot) = context.excluded_snapshot else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -7415,43 +7415,43 @@ fn excluded_column_eval_value(
         ));
     }
     let Some(row) = context.excluded_row else {
-        return Ok(EntityEvalValue::SqlNull);
+        return Ok(RowEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_entity_pk" => row
-            .entity_pk
-            .map(|entity_pk| entity_pk.as_json_array_value().map(EntityEvalValue::Json))
+        "lixcol_row_pk" => row
+            .row_pk
+            .map(|row_pk| row_pk.as_json_array_value().map(RowEvalValue::Json))
             .transpose()
-            .map(|value| value.unwrap_or(EntityEvalValue::SqlNull)),
-        "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
+            .map(|value| value.unwrap_or(RowEvalValue::SqlNull)),
+        "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
             row.schema_key.to_string(),
         ))),
         "lixcol_file_id" => Ok(row
             .file_id
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
-            .unwrap_or(EntityEvalValue::SqlNull)),
+            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_metadata" => row
             .metadata
-            .map(|metadata| Ok(EntityEvalValue::Json(metadata.value().clone())))
+            .map(|metadata| Ok(RowEvalValue::Json(metadata.value().clone())))
             .transpose()
-            .map(|metadata| metadata.unwrap_or(EntityEvalValue::SqlNull)),
-        "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
-        "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
+            .map(|metadata| metadata.unwrap_or(RowEvalValue::SqlNull)),
+        "lixcol_global" => Ok(RowEvalValue::Json(JsonValue::Bool(row.global))),
+        "lixcol_branch_id" => Ok(RowEvalValue::Json(JsonValue::String(
             row.branch_id.to_string(),
         ))),
-        _ => Ok(EntityEvalValue::SqlNull),
+        _ => Ok(RowEvalValue::SqlNull),
     }
 }
 
 fn visible_column_eval_value(
-    column: Option<&EntitySurfaceColumn>,
+    column: Option<&SchemaSurfaceColumn>,
     value: &JsonValue,
-) -> EntityEvalValue {
+) -> RowEvalValue {
     match (column.map(|column| column.column_type), value) {
-        (Some(EntityColumnType::String), JsonValue::String(value)) => {
-            EntityEvalValue::SqlText(value.clone())
+        (Some(SchemaColumnType::String), JsonValue::String(value)) => {
+            RowEvalValue::SqlText(value.clone())
         }
-        _ => EntityEvalValue::Json(value.clone()),
+        _ => RowEvalValue::Json(value.clone()),
     }
 }
 
@@ -7472,7 +7472,7 @@ fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
     })
 }
 
-fn entity_row_branch_id(
+fn row_row_branch_id(
     plan: &LogicalWritePlan,
     explicit_branch_id: Option<String>,
     global: bool,
@@ -7481,7 +7481,7 @@ fn entity_row_branch_id(
         let target_branch_ids = insert_target_branch_ids(&plan.bound.branch_scope);
         let target_is_by_branch = matches!(
             &plan.bound.target,
-            BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
+            BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
         );
         if explicit_branch_id
             .as_deref()
@@ -7489,7 +7489,7 @@ fn entity_row_branch_id(
         {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "entity INSERT cannot combine lixcol_global = true with a non-global lixcol_branch_id",
+                "row INSERT cannot combine lixcol_global = true with a non-global lixcol_branch_id",
             ));
         }
         if target_is_by_branch
@@ -7501,7 +7501,7 @@ fn entity_row_branch_id(
         {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "entity INSERT cannot combine lixcol_global = true with a non-global target branch",
+                "row INSERT cannot combine lixcol_global = true with a non-global target branch",
             ));
         }
         return Ok(crate::GLOBAL_BRANCH_ID.to_string());
@@ -7509,17 +7509,17 @@ fn entity_row_branch_id(
     if explicit_branch_id.as_deref() == Some(crate::GLOBAL_BRANCH_ID) {
         return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
-            "entity INSERT with lixcol_branch_id = 'global' must also set lixcol_global = true",
+            "row INSERT with lixcol_branch_id = 'global' must also set lixcol_global = true",
         ));
     }
     let target_is_by_branch = matches!(
         &plan.bound.target,
-        BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
+        BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
     );
     if target_is_by_branch && matches!(plan.bound.branch_scope, BranchScope::Global) {
         return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
-            "entity INSERT into the global scope must set lixcol_global = true",
+            "row INSERT into the global scope must set lixcol_global = true",
         ));
     }
     if let Some(branch_id) = explicit_branch_id {
@@ -7530,14 +7530,14 @@ fn entity_row_branch_id(
                     return Err(LixError::new(
                         LixError::CODE_TYPE_MISMATCH,
                         format!(
-                            "entity INSERT lixcol_branch_id '{branch_id}' does not match the target branch scope"
+                            "row INSERT lixcol_branch_id '{branch_id}' does not match the target branch scope"
                         ),
                     ));
                 }
             } else {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    "entity INSERT has no target branch scope",
+                    "row INSERT has no target branch scope",
                 ));
             }
         }
@@ -7559,7 +7559,7 @@ fn entity_row_branch_id(
         BranchScope::Global | BranchScope::Empty => Ok(crate::GLOBAL_BRANCH_ID.to_string()),
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "entity write requires exactly one target branch",
+            "row write requires exactly one target branch",
         )),
     }
 }
@@ -7587,14 +7587,14 @@ fn assignment_value<'a>(
 }
 
 fn optional_metadata_from_eval_value(
-    value: EntityEvalValue,
+    value: RowEvalValue,
     column_name: &str,
     context: &str,
 ) -> Result<Option<TransactionJson>, LixError> {
     let metadata = match value {
-        EntityEvalValue::SqlNull => return Ok(None),
-        EntityEvalValue::SqlText(value) => parse_row_metadata_value(&value, context)?,
-        EntityEvalValue::Json(value) => {
+        RowEvalValue::SqlNull => return Ok(None),
+        RowEvalValue::SqlText(value) => parse_row_metadata_value(&value, context)?,
+        RowEvalValue::Json(value) => {
             validate_row_metadata(&value, context)?;
             value
         }
@@ -7608,7 +7608,7 @@ fn text_value(value: JsonValue, column_name: &str) -> Result<Option<String>, Lix
         JsonValue::String(value) => Ok(Some(value)),
         other => Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
-            format!("entity write expected text-compatible column '{column_name}', got {other}"),
+            format!("row write expected text-compatible column '{column_name}', got {other}"),
         )),
     }
 }
@@ -7619,33 +7619,33 @@ fn bool_value(value: JsonValue, column_name: &str) -> Result<Option<bool>, LixEr
         JsonValue::Bool(value) => Ok(Some(value)),
         other => Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
-            format!("entity write expected boolean column '{column_name}', got {other}"),
+            format!("row write expected boolean column '{column_name}', got {other}"),
         )),
     }
 }
 
-fn entity_pk_from_value(value: &JsonValue, column_name: &str) -> Result<EntityPk, LixError> {
+fn row_pk_from_value(value: &JsonValue, column_name: &str) -> Result<RowPk, LixError> {
     match value {
-        JsonValue::String(value) => EntityPk::from_json_array_text(value).map_err(|error| {
+        JsonValue::String(value) => RowPk::from_json_array_text(value).map_err(|error| {
             LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                format!("entity write has invalid {column_name}: {error}"),
+                format!("row write has invalid {column_name}: {error}"),
             )
         }),
-        value => EntityPk::from_json_array_value(value).map_err(|error| {
+        value => RowPk::from_json_array_value(value).map_err(|error| {
             LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                format!("entity write has invalid {column_name}: {error}"),
+                format!("row write has invalid {column_name}: {error}"),
             )
         }),
     }
 }
 
-fn entity_action(op: &BoundWriteOp) -> &'static str {
+fn row_action(op: &BoundWriteOp) -> &'static str {
     match op {
-        BoundWriteOp::Insert => "INSERT into entity surface",
-        BoundWriteOp::Update => "UPDATE entity surface",
-        BoundWriteOp::Delete => "DELETE from entity surface",
+        BoundWriteOp::Insert => "INSERT into row surface",
+        BoundWriteOp::Update => "UPDATE row surface",
+        BoundWriteOp::Delete => "DELETE from row surface",
     }
 }
 
@@ -7764,9 +7764,9 @@ mod primary_key_route_tests {
 
     #[test]
     fn compiles_single_text_primary_key_parameter_once() {
-        let spec = crate::sql2::catalog::derive_entity_surface_spec_from_schema(
+        let spec = crate::sql2::catalog::derive_schema_surface_spec_from_schema(
             &serde_json::json!({
-                "x-lix-key": "entity",
+                "x-lix-key": "row",
                 "x-lix-primary-key": ["/id"],
                 "type": "object",
                 "required": ["id", "value"],
@@ -7779,7 +7779,7 @@ mod primary_key_route_tests {
                 "additionalProperties": false
             }),
         )
-        .expect("entity surface schema should compile");
+        .expect("row surface schema should compile");
         assert_eq!(
             bound_single_text_primary_key_param(
                 &spec,
@@ -7803,7 +7803,7 @@ mod primary_key_route_tests {
     fn routes_literal_and_parameter_primary_keys() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
-            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::String],
+            primary_key_component_types: &[crate::row_pk::RowPkComponentType::String],
             params: &[Value::Text("from-param".to_string())],
         };
         let predicate = BoundPredicate::Or(vec![
@@ -7815,21 +7815,21 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&predicate)
                 .expect("identity predicate should route")
-                .into_entity_pks(
+                .into_row_pks(
                     &analyzer.primary_key_columns,
                     analyzer.primary_key_component_types,
                 )
                 .expect("identity predicate should be complete"),
             std::collections::BTreeSet::from([
-                EntityPk::single("from-param"),
-                EntityPk::single("literal"),
+                RowPk::single("from-param"),
+                RowPk::single("literal"),
             ])
         );
     }
 
     #[test]
     fn routes_typed_integer_primary_key_literals_and_parameters() {
-        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
+        let component_types = [crate::row_pk::RowPkComponentType::Integer];
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
             primary_key_component_types: &component_types,
@@ -7845,7 +7845,7 @@ mod primary_key_route_tests {
         let expected = ["7", "42"]
             .into_iter()
             .map(|value| {
-                EntityPk::from_external_parts(vec![value.to_string()], &component_types)
+                RowPk::from_external_parts(vec![value.to_string()], &component_types)
                     .expect("integer identity should encode")
             })
             .collect();
@@ -7854,7 +7854,7 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&predicate)
                 .expect("typed integer predicate should route")
-                .into_entity_pks(
+                .into_row_pks(
                     &analyzer.primary_key_columns,
                     analyzer.primary_key_component_types,
                 )
@@ -7867,7 +7867,7 @@ mod primary_key_route_tests {
     fn integer_primary_key_rejects_text_parameter_pushdown() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
-            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::Integer],
+            primary_key_component_types: &[crate::row_pk::RowPkComponentType::Integer],
             params: &[Value::Text("42".to_string())],
         };
 
@@ -7885,27 +7885,27 @@ mod primary_key_route_tests {
     fn routes_guaranteed_conjunct_but_not_partial_disjunction() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
-            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::String],
+            primary_key_component_types: &[crate::row_pk::RowPkComponentType::String],
             params: &[],
         };
         let conjunct = BoundPredicate::And(vec![
-            equals(column("id"), text("entity-a")),
+            equals(column("id"), text("row-a")),
             equals(column("kind"), text("note")),
         ]);
         assert_eq!(
             analyzer
                 .analyze_conjunctive_constraint(&conjunct)
                 .expect("guaranteed identity conjunct should route")
-                .into_entity_pks(
+                .into_row_pks(
                     &analyzer.primary_key_columns,
                     analyzer.primary_key_component_types,
                 )
                 .expect("identity conjunct should be complete"),
-            std::collections::BTreeSet::from([EntityPk::single("entity-a")])
+            std::collections::BTreeSet::from([RowPk::single("row-a")])
         );
 
         let disjunction = BoundPredicate::Or(vec![
-            equals(column("id"), text("entity-a")),
+            equals(column("id"), text("row-a")),
             equals(column("kind"), text("note")),
         ]);
         assert!(
@@ -7921,8 +7921,8 @@ mod primary_key_route_tests {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["namespace", "id"],
             primary_key_component_types: &[
-                crate::entity_pk::EntityPkComponentType::String,
-                crate::entity_pk::EntityPkComponentType::String,
+                crate::row_pk::RowPkComponentType::String,
+                crate::row_pk::RowPkComponentType::String,
             ],
             params: &[],
         };
@@ -7938,16 +7938,16 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&predicate)
                 .expect("composite predicate should route")
-                .into_entity_pks(
+                .into_row_pks(
                     &analyzer.primary_key_columns,
                     analyzer.primary_key_component_types,
                 )
                 .expect("composite predicate should be complete"),
             std::collections::BTreeSet::from([
-                EntityPk::from_parts(vec!["docs".to_string(), "one".to_string()])
-                    .expect("valid entity pk"),
-                EntityPk::from_parts(vec!["docs".to_string(), "two".to_string()])
-                    .expect("valid entity pk"),
+                RowPk::from_parts(vec!["docs".to_string(), "one".to_string()])
+                    .expect("valid row pk"),
+                RowPk::from_parts(vec!["docs".to_string(), "two".to_string()])
+                    .expect("valid row pk"),
             ])
         );
     }
@@ -7956,7 +7956,7 @@ mod primary_key_route_tests {
     fn contradictory_primary_key_conjunct_routes_empty() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
-            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::String],
+            primary_key_component_types: &[crate::row_pk::RowPkComponentType::String],
             params: &[],
         };
         let predicate = BoundPredicate::And(vec![
@@ -7968,7 +7968,7 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&predicate)
                 .expect("contradictory identity should still route")
-                .into_entity_pks(
+                .into_row_pks(
                     &analyzer.primary_key_columns,
                     analyzer.primary_key_component_types,
                 )
@@ -8030,7 +8030,7 @@ mod primary_key_route_tests {
 
     fn column(name: &str) -> BoundExpr {
         BoundExpr::Column(BoundColumnRef {
-            table: "entity".to_string(),
+            table: "row".to_string(),
             column_id: 0,
             name: name.to_string(),
         })

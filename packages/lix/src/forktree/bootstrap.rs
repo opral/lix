@@ -14,12 +14,12 @@ use crate::LixError;
 use crate::changelog::{
     ChangeId as ChangelogChangeId, ChangeRecord, CommitId as ChangelogCommitId,
 };
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonSlot;
 use crate::plugin::{PLUGIN_REGISTRY_KEY, PluginRegistry};
 use crate::schema::{
-    registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
+    registered_schema_row_pk, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage_adapter::{
     PointReadPlan, Storage, StorageAdapter, StorageGetOptions, StorageWriteOptions, StorageWriteSet,
@@ -49,7 +49,7 @@ struct SeedRow {
     change_id: ChangelogChangeId,
     local_change_id: Option<ChangelogChangeId>,
     schema_key: String,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     file_id: Option<String>,
     native_snapshot: serde_json::Value,
     snapshot: JsonSlot,
@@ -92,17 +92,17 @@ where
     let mut rows = Vec::new();
     let mut add_row = |schema_key: &str,
                        file_id: Option<&str>,
-                       entity_pk: EntityPk,
+                       row_pk: RowPk,
                        mut snapshot: serde_json::Value|
      -> Result<(), LixError> {
         let change_uuid = functions.call_uuid_v7();
         let change_id = ChangelogChangeId::new(change_uuid);
         let local = schema_key == crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
             || (schema_key == KEY_VALUE_SCHEMA_KEY
-                && entity_pk.as_single_string().is_ok_and(|key| key == PLUGIN_REGISTRY_KEY));
+                && row_pk.as_single_string().is_ok_and(|key| key == PLUGIN_REGISTRY_KEY));
         let schema = crate::native_row::seed_schema(schema_key)?;
-        let serde_json::Value::Array(primary_key) = entity_pk.as_json_array_value()? else {
-            unreachable!("typed entity primary key always encodes as an array")
+        let serde_json::Value::Array(primary_key) = row_pk.as_json_array_value()? else {
+            unreachable!("typed row primary key always encodes as an array")
         };
         let object = snapshot.as_object_mut().ok_or_else(|| {
             LixError::new(
@@ -117,14 +117,14 @@ where
         let key = encode_state_key(StateKeyRef {
             schema_key,
             file_id,
-            entity_pk: &entity_pk,
+            row_pk: &row_pk,
         });
         rows.push(SeedRow {
             key,
             change_id,
             local_change_id: local.then(|| ChangelogChangeId::new(functions.call_uuid_v7())),
             schema_key: schema_key.to_owned(),
-            entity_pk,
+            row_pk,
             file_id: file_id.map(str::to_owned),
             native_snapshot: snapshot,
             snapshot: encoded_snapshot,
@@ -138,20 +138,20 @@ where
         add_row(
             "lix_registered_schema",
             None,
-            registered_schema_entity_pk(&schema_key)?,
+            registered_schema_row_pk(&schema_key)?,
             json!({ "value": schema }),
         )?;
     }
     add_row(
         KEY_VALUE_SCHEMA_KEY,
         None,
-        EntityPk::single(LIX_ID_KEY),
+        RowPk::single(LIX_ID_KEY),
         json!({ "key": LIX_ID_KEY, "value": lix_id.to_string() }),
     )?;
     add_row(
         KEY_VALUE_SCHEMA_KEY,
         None,
-        EntityPk::single(WORKSPACE_BRANCH_KEY),
+        RowPk::single(WORKSPACE_BRANCH_KEY),
         json!({ "key": WORKSPACE_BRANCH_KEY, "value": main_branch.to_string() }),
     )?;
     // Registry absence is corruption, not an implicit empty authority. Seed
@@ -161,20 +161,20 @@ where
     add_row(
         KEY_VALUE_SCHEMA_KEY,
         None,
-        EntityPk::single(PLUGIN_REGISTRY_KEY),
+        RowPk::single(PLUGIN_REGISTRY_KEY),
         PluginRegistry::empty().to_snapshot()?,
     )?;
     add_row(
         "lix_branch_descriptor",
         None,
-        EntityPk::uuid_from_canonical(GLOBAL_BRANCH_ID)
+        RowPk::uuid_from_canonical(GLOBAL_BRANCH_ID)
             .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?,
         json!({ "id": GLOBAL_BRANCH_ID, "name": "global", "hidden": true }),
     )?;
     add_row(
         "lix_branch_descriptor",
         None,
-        EntityPk::uuid_from_canonical(&main_branch.to_string())
+        RowPk::uuid_from_canonical(&main_branch.to_string())
             .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?,
         json!({ "id": main_branch.to_string(), "name": "main", "hidden": false }),
     )?;
@@ -185,7 +185,7 @@ where
         add_row(
             "lix_account",
             None,
-            EntityPk::uuid_from_canonical(id)
+            RowPk::uuid_from_canonical(id)
                 .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?,
             json!({ "id": id, "name": name, "kind": kind, "status": "active" }),
         )?;
@@ -193,7 +193,7 @@ where
     add_row(
         "lix_checkpoint_marker",
         None,
-        EntityPk::uuid_from_canonical(&main_branch.to_string())
+        RowPk::uuid_from_canonical(&main_branch.to_string())
             .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?,
         json!({ "branch_id": main_branch.to_string() }),
     )?;
@@ -212,7 +212,7 @@ where
                 change_id: public_change_id,
                 account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
                 schema_key: row.schema_key.clone(),
-                entity_pk: row.entity_pk.clone(),
+                row_pk: row.row_pk.clone(),
                 file_id: row.file_id.clone(),
                 snapshot: row.snapshot.clone(),
                 metadata: row.metadata.clone(),
@@ -237,7 +237,7 @@ where
             change_id: public_change_id,
             account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
             schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.clone(),
             snapshot: row.snapshot.clone(),
             metadata: row.metadata.clone(),
@@ -273,7 +273,7 @@ where
                     let cell = match &row.snapshot {
                         JsonSlot::Inline(_) => StateCell::NativeRow(crate::native_row::encode(
                             &crate::native_row::seed_schema(&row.schema_key)?,
-                            &row.entity_pk,
+                            &row.row_pk,
                             branch_id == crate::GLOBAL_BRANCH_ID,
                             row.file_id.as_deref(),
                             &row.native_snapshot,

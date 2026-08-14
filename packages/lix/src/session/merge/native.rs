@@ -173,7 +173,7 @@ pub(crate) struct MergeConflict {
 pub(crate) trait MergeKeyExt {
     fn schema_key(&self) -> &str;
     fn file_id(&self) -> Option<&str>;
-    fn entity_pk(&self) -> &crate::entity_pk::EntityPk;
+    fn row_pk(&self) -> &crate::row_pk::RowPk;
     fn schema_key_shared(&self) -> SharedStr;
     fn file_id_shared(&self) -> Option<SharedStr>;
     fn shares_key_with(&self, other: &StateKey) -> bool;
@@ -188,8 +188,8 @@ impl MergeKeyExt for StateKey {
         self.file_id.as_deref()
     }
 
-    fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
-        &self.entity_pk
+    fn row_pk(&self) -> &crate::row_pk::RowPk {
+        &self.row_pk
     }
 
     fn schema_key_shared(&self) -> SharedStr {
@@ -269,9 +269,9 @@ fn ensure_strictly_sorted(entries: &[MergeDiffEntry]) -> Result<(), LixError> {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "merge received duplicate diff entry for schema '{}' entity '{}'",
+                        "merge received duplicate diff entry for schema '{}' row '{}'",
                         pair[1].identity.schema_key,
-                        pair[1].identity.entity_pk.as_json_array_text()?
+                        pair[1].identity.row_pk.as_json_array_text()?
                     ),
                 ));
             }
@@ -291,9 +291,9 @@ fn source_pick(entry: &MergeDiffEntry, source_index: usize) -> Result<MergePick,
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "merge cannot pick source removal for schema '{}' entity '{}' without a tombstone row",
+                "merge cannot pick source removal for schema '{}' row '{}' without a tombstone row",
                 entry.identity.schema_key,
-                entry.identity.entity_pk.as_json_array_text()?
+                entry.identity.row_pk.as_json_array_text()?
             ),
         ));
     };
@@ -347,13 +347,13 @@ fn row_payload_eq(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
 
-    fn key(entity: &str) -> StateKey {
+    fn key(row: &str) -> StateKey {
         StateKey {
             schema_key: "test_schema".to_owned(),
             file_id: None,
-            entity_pk: EntityPk::single(entity),
+            row_pk: RowPk::single(row),
         }
     }
 
@@ -372,13 +372,13 @@ mod tests {
     }
 
     fn entry(
-        entity: &str,
+        row: &str,
         kind: MergeDiffKind,
         before: Option<MergeRow>,
         after: Option<MergeRow>,
     ) -> MergeDiffEntry {
         MergeDiffEntry {
-            identity: key(entity),
+            identity: key(row),
             kind,
             before,
             after,
@@ -399,27 +399,27 @@ mod tests {
         )
     }
 
-    fn pick_entities(plan: &MergePlan, source: &MergeDiff) -> Vec<String> {
+    fn pick_rows(plan: &MergePlan, source: &MergeDiff) -> Vec<String> {
         plan.picks
             .iter()
             .map(|pick| {
                 pick.identity(source)
-                    .entity_pk
+                    .row_pk
                     .as_single_string_owned()
-                    .expect("single-string entity key")
+                    .expect("single-string row key")
             })
             .collect()
     }
 
-    fn conflict_entities(plan: &MergePlan) -> Vec<String> {
+    fn conflict_rows(plan: &MergePlan) -> Vec<String> {
         plan.conflicts
             .iter()
             .map(|conflict| {
                 conflict
                     .identity
-                    .entity_pk
+                    .row_pk
                     .as_single_string_owned()
-                    .expect("single-string entity key")
+                    .expect("single-string row key")
             })
             .collect()
     }
@@ -427,14 +427,14 @@ mod tests {
     #[test]
     fn source_add_applies() {
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Added,
             None,
             Some(row("source", false)),
         )]);
         let plan = plan_merge(&MergeDiff::default(), &source).expect("merge should plan");
 
-        assert_eq!(pick_entities(&plan, &source), vec!["entity-a"]);
+        assert_eq!(pick_rows(&plan, &source), vec!["row-a"]);
         assert_eq!(plan.picks[0].change_id, ChangeId::for_test_label("source"));
         assert!(plan.conflicts.is_empty());
     }
@@ -442,14 +442,14 @@ mod tests {
     #[test]
     fn source_modify_applies() {
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Modified,
             Some(row("base", false)),
             Some(row("source", false)),
         )]);
         let plan = plan_merge(&MergeDiff::default(), &source).expect("merge should plan");
 
-        assert_eq!(pick_entities(&plan, &source), vec!["entity-a"]);
+        assert_eq!(pick_rows(&plan, &source), vec!["row-a"]);
         assert_eq!(
             plan.picks[0].selected_row(&source).change_id,
             ChangeId::for_test_label("source")
@@ -460,14 +460,14 @@ mod tests {
     #[test]
     fn source_delete_applies_tombstone() {
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Removed,
             Some(row("base", false)),
             Some(row("source-delete", true)),
         )]);
         let plan = plan_merge(&MergeDiff::default(), &source).expect("merge should plan");
 
-        assert_eq!(pick_entities(&plan, &source), vec!["entity-a"]);
+        assert_eq!(pick_rows(&plan, &source), vec!["row-a"]);
         assert!(plan.picks[0].selected_row(&source).deleted);
         assert_eq!(
             plan.picks[0].change_id,
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn target_only_change_is_noop() {
         let target = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Modified,
             Some(row("base", false)),
             Some(row("target", false)),
@@ -496,7 +496,7 @@ mod tests {
         let same_snapshot = JsonSlot::Inline(r#"{"value":"same"}"#.into());
         let target = diff_with_payloads(
             vec![entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Modified,
                 Some(row("base", false)),
                 Some(row("target", false)),
@@ -505,7 +505,7 @@ mod tests {
         );
         let source = diff_with_payloads(
             vec![entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Modified,
                 Some(row("base", false)),
                 Some(row("source", false)),
@@ -521,13 +521,13 @@ mod tests {
     #[test]
     fn both_sides_delete_is_convergent_noop() {
         let target = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Removed,
             Some(row("base", false)),
             Some(row("target-delete", true)),
         )]);
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Removed,
             Some(row("base", false)),
             Some(row("source-delete", true)),
@@ -541,13 +541,13 @@ mod tests {
     #[test]
     fn different_modifications_conflict() {
         let target = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Modified,
             Some(row("base", false)),
             Some(row("target", false)),
         )]);
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Modified,
             Some(row("base", false)),
             Some(row("source", false)),
@@ -555,51 +555,51 @@ mod tests {
 
         let plan = plan_merge(&target, &source).expect("merge should plan");
         assert!(plan.picks.is_empty());
-        assert_eq!(conflict_entities(&plan), vec!["entity-a"]);
+        assert_eq!(conflict_rows(&plan), vec!["row-a"]);
     }
 
     #[test]
     fn delete_modify_conflicts() {
         let target = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Removed,
             Some(row("base", false)),
             Some(row("target-delete", true)),
         )]);
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Modified,
             Some(row("base", false)),
             Some(row("source", false)),
         )]);
 
         let plan = plan_merge(&target, &source).expect("merge should plan");
-        assert_eq!(conflict_entities(&plan), vec!["entity-a"]);
+        assert_eq!(conflict_rows(&plan), vec!["row-a"]);
     }
 
     #[test]
     fn modify_delete_conflicts() {
         let target = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Modified,
             Some(row("base", false)),
             Some(row("target", false)),
         )]);
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Removed,
             Some(row("base", false)),
             Some(row("source-delete", true)),
         )]);
 
         let plan = plan_merge(&target, &source).expect("merge should plan");
-        assert_eq!(conflict_entities(&plan), vec!["entity-a"]);
+        assert_eq!(conflict_rows(&plan), vec!["row-a"]);
     }
 
     #[test]
     fn source_removal_without_tombstone_errors() {
         let source = diff(vec![entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Removed,
             Some(row("base", false)),
             None,
@@ -613,26 +613,26 @@ mod tests {
     #[test]
     fn pick_and_conflict_order_is_deterministic_by_identity() {
         let target = diff(vec![entry(
-            "entity-b",
+            "row-b",
             MergeDiffKind::Modified,
             Some(row("base", false)),
             Some(row("target", false)),
         )]);
         let source = diff(vec![
             entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Added,
                 None,
                 Some(row("source-a", false)),
             ),
             entry(
-                "entity-b",
+                "row-b",
                 MergeDiffKind::Modified,
                 Some(row("base", false)),
                 Some(row("source-b", false)),
             ),
             entry(
-                "entity-c",
+                "row-c",
                 MergeDiffKind::Added,
                 None,
                 Some(row("source-c", false)),
@@ -640,8 +640,8 @@ mod tests {
         ]);
 
         let plan = plan_merge(&target, &source).expect("ordered merge should plan");
-        assert_eq!(pick_entities(&plan, &source), vec!["entity-a", "entity-c"]);
-        assert_eq!(conflict_entities(&plan), vec!["entity-b"]);
+        assert_eq!(pick_rows(&plan, &source), vec!["row-a", "row-c"]);
+        assert_eq!(conflict_rows(&plan), vec!["row-b"]);
     }
 
     #[test]
@@ -650,9 +650,9 @@ mod tests {
         let source = diff(
             (0..ROW_COUNT)
                 .map(|index| {
-                    let entity = format!("entity-{index:05}");
+                    let row_key = format!("row-{index:05}");
                     entry(
-                        &entity,
+                        &row_key,
                         MergeDiffKind::Added,
                         None,
                         Some(row(&format!("source-{index:05}"), false)),
@@ -666,12 +666,12 @@ mod tests {
         assert_eq!(plan.picks.len(), ROW_COUNT);
         assert!(plan.conflicts.is_empty());
         assert_eq!(
-            pick_entities(&plan, &source).first().unwrap(),
-            "entity-00000"
+            pick_rows(&plan, &source).first().unwrap(),
+            "row-00000"
         );
         assert_eq!(
-            pick_entities(&plan, &source).last().unwrap(),
-            "entity-09999"
+            pick_rows(&plan, &source).last().unwrap(),
+            "row-09999"
         );
     }
 
@@ -681,9 +681,9 @@ mod tests {
         let target = diff(
             (0..CONVERGENT_ROW_COUNT)
                 .map(|index| {
-                    let entity = format!("entity-{index:05}");
+                    let row_key = format!("row-{index:05}");
                     entry(
-                        &entity,
+                        &row_key,
                         MergeDiffKind::Modified,
                         Some(row(&format!("base-{index:05}"), false)),
                         Some(row(&format!("target-{index:05}"), false)),
@@ -693,13 +693,13 @@ mod tests {
         );
         let source = diff(vec![
             entry(
-                "entity-00000",
+                "row-00000",
                 MergeDiffKind::Modified,
                 Some(row("base-00000", false)),
                 Some(row("target-00000", false)),
             ),
             entry(
-                "entity-10000",
+                "row-10000",
                 MergeDiffKind::Added,
                 None,
                 Some(row("source-10000", false)),
@@ -707,7 +707,7 @@ mod tests {
         ]);
 
         let plan = plan_merge(&target, &source).expect("sparse native merge should plan");
-        assert_eq!(pick_entities(&plan, &source), vec!["entity-10000"]);
+        assert_eq!(pick_rows(&plan, &source), vec!["row-10000"]);
         assert!(plan.conflicts.is_empty());
     }
 
@@ -717,9 +717,9 @@ mod tests {
         let target = diff(
             (0..ROW_COUNT)
                 .map(|index| {
-                    let entity = format!("entity-{index:05}");
+                    let row_key = format!("row-{index:05}");
                     entry(
-                        &entity,
+                        &row_key,
                         MergeDiffKind::Modified,
                         Some(row(&format!("base-{index:05}"), false)),
                         Some(row(&format!("target-{index:05}"), false)),
@@ -730,9 +730,9 @@ mod tests {
         let source = diff(
             (0..ROW_COUNT)
                 .map(|index| {
-                    let entity = format!("entity-{index:05}");
+                    let row_key = format!("row-{index:05}");
                     entry(
-                        &entity,
+                        &row_key,
                         MergeDiffKind::Modified,
                         Some(row(&format!("base-{index:05}"), false)),
                         Some(row(&format!("source-{index:05}"), false)),
@@ -744,8 +744,8 @@ mod tests {
         let plan = plan_merge(&target, &source).expect("large conflict merge should plan");
         assert!(plan.picks.is_empty());
         assert_eq!(plan.conflicts.len(), ROW_COUNT);
-        assert_eq!(conflict_entities(&plan).first().unwrap(), "entity-00000");
-        assert_eq!(conflict_entities(&plan).last().unwrap(), "entity-09999");
+        assert_eq!(conflict_rows(&plan).first().unwrap(), "row-00000");
+        assert_eq!(conflict_rows(&plan).last().unwrap(), "row-09999");
         assert!(plan.conflicts.iter().all(|conflict| {
             conflict.target.after.is_some() && conflict.source.after.is_some()
         }));
@@ -756,7 +756,7 @@ mod tests {
         let same = JsonSlot::Inline(r#"{"same":true}"#.into());
         let target = diff_with_payloads(
             vec![entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Modified,
                 Some(row("base-a", false)),
                 Some(row("target-a", false)),
@@ -769,7 +769,7 @@ mod tests {
         );
         let source = diff_with_payloads(
             vec![entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Modified,
                 Some(row("base-a", false)),
                 Some(row("source-a", false)),
@@ -786,13 +786,13 @@ mod tests {
     fn unsorted_native_merge_is_rejected_instead_of_sorting_a_second_authority() {
         let source = diff(vec![
             entry(
-                "entity-b",
+                "row-b",
                 MergeDiffKind::Added,
                 None,
                 Some(row("b", false)),
             ),
             entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Added,
                 None,
                 Some(row("a", false)),
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn unsorted_non_adjacent_duplicate_identity_is_rejected() {
         let duplicate = entry(
-            "entity-a",
+            "row-a",
             MergeDiffKind::Added,
             None,
             Some(row("a", false)),
@@ -815,7 +815,7 @@ mod tests {
         let source = diff(vec![
             duplicate.clone(),
             entry(
-                "entity-b",
+                "row-b",
                 MergeDiffKind::Added,
                 None,
                 Some(row("b", false)),
@@ -832,13 +832,13 @@ mod tests {
     fn adjacent_duplicate_identity_is_rejected() {
         let source = diff(vec![
             entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Added,
                 None,
                 Some(row("a1", false)),
             ),
             entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Added,
                 None,
                 Some(row("a2", false)),
@@ -857,7 +857,7 @@ mod tests {
             (change_id, JsonSlot::None, JsonSlot::None),
             (change_id, JsonSlot::None, JsonSlot::None),
         ])
-        .expect_err("duplicate payload identities must fail closed");
+        .expect_err("duplicate payload identitys must fail closed");
 
         assert!(error.message.contains("duplicate change id"));
     }
@@ -866,7 +866,7 @@ mod tests {
     fn native_tombstone_endpoint_is_removed_and_not_a_pick_without_after_row() {
         let source = MergeDiff {
             entries: vec![entry(
-                "entity-a",
+                "row-a",
                 MergeDiffKind::Removed,
                 Some(row("base", false)),
                 None,

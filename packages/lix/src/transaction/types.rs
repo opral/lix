@@ -13,10 +13,10 @@ use crate::binary_cas::{
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::forktree::{NativeRowCell, StateKey};
 use crate::state::CertifiedStatePredecessor;
-use crate::plugin::runtime::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
+use crate::plugin::runtime::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedRowBatch};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
@@ -399,14 +399,14 @@ impl<'de> Deserialize<'de> for TransactionJson {
 /// `PreparedStateBatch` without serializing already-normalized JSON again.
 ///
 /// SQL providers stage semantic rows, not final storage rows. INSERT providers
-/// may omit defaulted snapshot fields and leave `entity_pk` unset when the
+/// may omit defaulted snapshot fields and leave `row_pk` unset when the
 /// target schema has an `x-lix-primary-key`; transaction normalization applies
 /// schema defaults and derives the final identity. Typed UPDATE providers must
 /// stage full rewritten snapshots after applying column assignments to the
 /// existing row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TransactionWriteRow {
-    pub(crate) entity_pk: Option<EntityPk>,
+    pub(crate) row_pk: Option<RowPk>,
     pub(crate) schema_key: SharedStr,
     pub(crate) file_id: Option<SharedStr>,
     pub(crate) snapshot: Option<TransactionJson>,
@@ -446,7 +446,7 @@ struct RawWriteSlot {
 
 /// Mutable Arrow-style ingress representation shared by SQL and plugin writes.
 ///
-/// Entity identities and JSON payloads are aligned typed columns because
+/// Row identitys and JSON payloads are aligned typed columns because
 /// normalization mutates them in place. Repeated strings and origins use
 /// dictionary ordinals. `TransactionJson` values retain canonical page arenas,
 /// so moving, selecting, or extracting rows clones neither parsed snapshots
@@ -454,7 +454,7 @@ struct RawWriteSlot {
 #[derive(Debug, Clone)]
 pub(crate) struct RawWriteBatch {
     slots: Vec<RawWriteSlot>,
-    entity_pks: Vec<Option<EntityPk>>,
+    row_pks: Vec<Option<RowPk>>,
     snapshots: Vec<Option<TransactionJson>>,
     metadata: Vec<Option<TransactionJson>>,
     durable_predecessors: Vec<Option<CertifiedStatePredecessor>>,
@@ -563,7 +563,7 @@ impl TypedMutationJournalBatch {
 /// explicitly converts them to raw rows when a transaction-local schema
 /// change invalidates the certificate.
 pub(crate) struct CertifiedParameterBatch {
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
     snapshots: Vec<TransactionJson>,
     schema_key: SharedStr,
     branch_id: SharedStr,
@@ -573,14 +573,14 @@ pub(crate) struct CertifiedParameterBatch {
 
 impl CertifiedParameterBatch {
     pub(crate) fn new(
-        entity_pks: Vec<EntityPk>,
+        row_pks: Vec<RowPk>,
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         Self::new_with_lane(
-            entity_pks,
+            row_pks,
             snapshots,
             schema_key,
             branch_id,
@@ -590,27 +590,27 @@ impl CertifiedParameterBatch {
     }
 
     pub(crate) fn new_with_lane(
-        entity_pks: Vec<EntityPk>,
+        row_pks: Vec<RowPk>,
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
         untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
-        if entity_pks.len() != snapshots.len() {
+        if row_pks.len() != snapshots.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "certified replacement columns are not aligned",
             ));
         }
-        if entity_pks.len() >= RAW_WRITE_NONE as usize {
+        if row_pks.len() >= RAW_WRITE_NONE as usize {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "certified replacement row count exceeds u32",
             ));
         }
         Ok(Self {
-            entity_pks,
+            row_pks,
             snapshots,
             schema_key,
             branch_id,
@@ -620,7 +620,7 @@ impl CertifiedParameterBatch {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.entity_pks.len()
+        self.row_pks.len()
     }
 
     pub(crate) fn schema_scope_branch_id(&self) -> &str {
@@ -637,7 +637,7 @@ impl CertifiedParameterBatch {
 
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
         RawWriteBatch::from_certified_parameter_rows(
-            self.entity_pks,
+            self.row_pks,
             self.snapshots,
             self.schema_key,
             self.branch_id,
@@ -660,14 +660,14 @@ impl CertifiedParameterBatch {
         timestamps: DenseParameterTimestamps,
     ) -> Result<PreparedStateBatch, LixError> {
         let Self {
-            entity_pks,
+            row_pks,
             snapshots,
             schema_key,
             branch_id,
             untracked,
             certificate,
         } = self;
-        let row_count = entity_pks.len();
+        let row_count = row_pks.len();
         let (mut strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
             (vec![schema_key], 0_u32, 0_u32)
         } else {
@@ -715,7 +715,7 @@ impl CertifiedParameterBatch {
                 branch_id: branch_id_ordinal,
                 untracked,
             }),
-            entity_pks,
+            row_pks,
             native_rows: vec![None; row_count],
             strings,
             string_index,
@@ -736,7 +736,7 @@ pub(crate) type CertifiedParameterReplacementBatch = CertifiedParameterBatch;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RawWriteRowRef<'a> {
-    pub(crate) entity_pk: Option<&'a EntityPk>,
+    pub(crate) row_pk: Option<&'a RowPk>,
     pub(crate) schema_key: &'a SharedStr,
     pub(crate) file_id: Option<&'a SharedStr>,
     pub(crate) snapshot: Option<&'a TransactionJson>,
@@ -764,7 +764,7 @@ impl RawWriteRowRef<'_> {
 
 #[cfg(feature = "storage-benches")]
 fn record_raw_row_ownership(
-    entity_pk: Option<&EntityPk>,
+    row_pk: Option<&RowPk>,
     schema_key: &SharedStr,
     file_id: Option<&SharedStr>,
     snapshot: Option<&TransactionJson>,
@@ -775,7 +775,7 @@ fn record_raw_row_ownership(
     commit_id: Option<&SharedStr>,
     branch_id: &SharedStr,
 ) {
-    let key_bytes = entity_pk.map_or(0, EntityPk::estimated_heap_bytes)
+    let key_bytes = row_pk.map_or(0, RowPk::estimated_heap_bytes)
         + schema_key.len()
         + file_id.map_or(0, |value| value.len())
         + created_at.map_or(0, |value| value.len())
@@ -803,7 +803,7 @@ fn record_raw_row_ownership(
 
 #[cfg(feature = "storage-benches")]
 fn record_prepared_row_ownership(
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     schema_key: &SharedStr,
     file_id: Option<&SharedStr>,
     snapshot: Option<&StageJson>,
@@ -812,7 +812,7 @@ fn record_prepared_row_ownership(
     branch_id: &SharedStr,
     stage: usize,
 ) {
-    let key_bytes = entity_pk.estimated_heap_bytes()
+    let key_bytes = row_pk.estimated_heap_bytes()
         + schema_key.len()
         + file_id.map_or(0, |value| value.len())
         + origin_key.map_or(0, |value| value.len())
@@ -844,7 +844,7 @@ impl RawWriteBatch {
         const INLINE_DICTIONARY_LIMIT: usize = 32;
         Self {
             slots: Vec::with_capacity(row_capacity),
-            entity_pks: Vec::with_capacity(row_capacity),
+            row_pks: Vec::with_capacity(row_capacity),
             snapshots: Vec::with_capacity(row_capacity),
             metadata: Vec::with_capacity(row_capacity),
             durable_predecessors: Vec::with_capacity(row_capacity),
@@ -865,20 +865,20 @@ impl RawWriteBatch {
     }
 
     fn from_certified_parameter_rows(
-        entity_pks: Vec<EntityPk>,
+        row_pks: Vec<RowPk>,
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
         untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
-        if entity_pks.len() != snapshots.len() {
+        if row_pks.len() != snapshots.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "certified parameter row columns are not aligned",
             ));
         }
-        let row_count = entity_pks.len();
+        let row_count = row_pks.len();
         if row_count >= RAW_WRITE_NONE as usize {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -889,9 +889,9 @@ impl RawWriteBatch {
         crate::storage_bench::record_crud_ownership(
             crate::storage_bench::CRUD_OWNERSHIP_RAW_BATCH,
             row_count,
-            entity_pks
+            row_pks
                 .iter()
-                .map(EntityPk::estimated_heap_bytes)
+                .map(RowPk::estimated_heap_bytes)
                 .sum::<usize>()
                 + schema_key.len()
                 + branch_id.len(),
@@ -921,7 +921,7 @@ impl RawWriteBatch {
         };
         Ok(Self {
             slots: vec![slot; row_count],
-            entity_pks: entity_pks.into_iter().map(Some).collect(),
+            row_pks: row_pks.into_iter().map(Some).collect(),
             snapshots: snapshots.into_iter().map(Some).collect(),
             metadata: std::iter::repeat_with(|| None).take(row_count).collect(),
             durable_predecessors: std::iter::repeat_with(|| None).take(row_count).collect(),
@@ -963,7 +963,7 @@ impl RawWriteBatch {
     pub(crate) fn get(&self, index: usize) -> Option<RawWriteRowRef<'_>> {
         let slot = self.slots.get(index)?;
         Some(RawWriteRowRef {
-            entity_pk: self.entity_pks[index].as_ref(),
+            row_pk: self.row_pks[index].as_ref(),
             schema_key: &self.strings[slot.schema_key as usize],
             file_id: self.optional_string(slot.file_id),
             snapshot: self.snapshots[index].as_ref(),
@@ -990,7 +990,7 @@ impl RawWriteBatch {
     pub(crate) fn push(&mut self, row: TransactionWriteRow) {
         self.certified_preparation = None;
         self.push_parts(
-            row.entity_pk,
+            row.row_pk,
             row.schema_key,
             row.file_id,
             row.snapshot,
@@ -1019,7 +1019,7 @@ impl RawWriteBatch {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn push_parts(
         &mut self,
-        entity_pk: Option<EntityPk>,
+        row_pk: Option<RowPk>,
         schema_key: SharedStr,
         file_id: Option<SharedStr>,
         snapshot: Option<TransactionJson>,
@@ -1035,7 +1035,7 @@ impl RawWriteBatch {
     ) {
         #[cfg(feature = "storage-benches")]
         record_raw_row_ownership(
-            entity_pk.as_ref(),
+            row_pk.as_ref(),
             &schema_key,
             file_id.as_ref(),
             snapshot.as_ref(),
@@ -1072,7 +1072,7 @@ impl RawWriteBatch {
             branch_id,
             flags,
         });
-        self.entity_pks.push(entity_pk);
+        self.row_pks.push(row_pk);
         self.snapshots.push(snapshot);
         self.metadata.push(metadata);
         self.durable_predecessors.push(None);
@@ -1115,7 +1115,7 @@ impl RawWriteBatch {
     ///
     /// A certified producer has already established row shape, identity, and
     /// current-plan semantics. Re-reading every row through the generic
-    /// preparation API only clones identities, re-interns the same schema and
+    /// preparation API only clones identitys, re-interns the same schema and
     /// branch strings, and keeps both dense batches live at once. This lowering
     /// transfers the ingress dictionaries and aligned owners directly while
     /// constructing only the final fixed-width slots and staged JSON handles.
@@ -1133,7 +1133,7 @@ impl RawWriteBatch {
         }
         let RawWriteBatch {
             slots,
-            entity_pks,
+            row_pks,
             snapshots,
             metadata,
             durable_predecessors,
@@ -1149,7 +1149,7 @@ impl RawWriteBatch {
                 origin_promotions: _,
         } = self;
         let row_count = slots.len();
-        if entity_pks.len() != row_count
+        if row_pks.len() != row_count
             || snapshots.len() != row_count
             || metadata.len() != row_count
             || durable_predecessors.len() != row_count
@@ -1192,11 +1192,11 @@ impl RawWriteBatch {
         });
 
         let mut prepared_slots = Vec::with_capacity(row_count);
-        let mut prepared_entity_pks = Vec::with_capacity(row_count);
+        let mut prepared_row_pks = Vec::with_capacity(row_count);
         let mut json = Vec::with_capacity(row_count);
-        for (row_index, (((slot, entity_pk), snapshot), metadata)) in slots
+        for (row_index, (((slot, row_pk), snapshot), metadata)) in slots
             .into_iter()
-            .zip(entity_pks)
+            .zip(row_pks)
             .zip(snapshots)
             .zip(metadata)
             .enumerate()
@@ -1215,10 +1215,10 @@ impl RawWriteBatch {
                     "certified transaction batch contains unsupported system columns",
                 ));
             }
-            let entity_pk = entity_pk.ok_or_else(|| {
+            let row_pk = row_pk.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "certified transaction row is missing entity_pk",
+                    "certified transaction row is missing row_pk",
                 )
             })?;
             let snapshot = snapshot.ok_or_else(|| {
@@ -1229,12 +1229,12 @@ impl RawWriteBatch {
             })?;
             let snapshot =
                 stage_json_from_value(snapshot, "certified prepared row snapshot_content")?;
-            prepared_entity_pks.push(entity_pk);
+            prepared_row_pks.push(row_pk);
             json.push(snapshot);
             prepared_slots.push(PreparedStateSlot {
                 schema_plan_id: certificate.schema_plan_id,
                 facts: certificate.facts,
-                entity_pk: u32::try_from(row_index)
+                row_pk: u32::try_from(row_index)
                     .expect("certified transaction row ordinal must fit u32"),
                 schema_key: slot.schema_key,
                 file_id: None,
@@ -1259,7 +1259,7 @@ impl RawWriteBatch {
         Ok(PreparedStateBatch {
             slots: prepared_slots,
             dense_certified_parameter: None,
-            entity_pks: prepared_entity_pks,
+            row_pks: prepared_row_pks,
             native_rows: vec![None; row_count],
             strings,
             string_index,
@@ -1291,7 +1291,7 @@ impl RawWriteBatch {
             .expected_rows
             .max(self.len().saturating_add(additional));
         self.slots.reserve(additional);
-        self.entity_pks.reserve(additional);
+        self.row_pks.reserve(additional);
         self.snapshots.reserve(additional);
         self.metadata.reserve(additional);
         self.durable_predecessors.reserve(additional);
@@ -1312,13 +1312,13 @@ impl RawWriteBatch {
         }
     }
 
-    pub(crate) fn entity_pk_mut(&mut self, index: usize) -> &mut Option<EntityPk> {
+    pub(crate) fn row_pk_mut(&mut self, index: usize) -> &mut Option<RowPk> {
         self.certified_preparation = None;
-        &mut self.entity_pks[index]
+        &mut self.row_pks[index]
     }
 
-    pub(crate) fn take_entity_pk(&mut self, index: usize) -> Option<EntityPk> {
-        self.entity_pks[index].take()
+    pub(crate) fn take_row_pk(&mut self, index: usize) -> Option<RowPk> {
+        self.row_pks[index].take()
     }
 
     pub(crate) fn take_snapshot(&mut self, index: usize) -> Option<TransactionJson> {
@@ -1398,7 +1398,7 @@ impl RawWriteBatch {
             }
             if destination != source {
                 self.slots.swap(destination, source);
-                self.entity_pks.swap(destination, source);
+                self.row_pks.swap(destination, source);
                 self.snapshots.swap(destination, source);
                 self.metadata.swap(destination, source);
                 self.durable_predecessors.swap(destination, source);
@@ -1406,7 +1406,7 @@ impl RawWriteBatch {
             destination += 1;
         }
         self.slots.truncate(destination);
-        self.entity_pks.truncate(destination);
+        self.row_pks.truncate(destination);
         self.snapshots.truncate(destination);
         self.metadata.truncate(destination);
         self.durable_predecessors.truncate(destination);
@@ -1439,7 +1439,7 @@ impl RawWriteBatch {
     fn take_owned_row(&mut self, index: usize) -> TransactionWriteRow {
         let slot = self.slots[index];
         TransactionWriteRow {
-            entity_pk: self.entity_pks[index].take(),
+            row_pk: self.row_pks[index].take(),
             schema_key: self.strings[slot.schema_key as usize].clone(),
             file_id: self.optional_string(slot.file_id).cloned(),
             snapshot: self.snapshots[index].take(),
@@ -1468,7 +1468,7 @@ impl RawWriteBatch {
         let slot = self.slots[index];
         let durable_predecessor = self.durable_predecessors[index].take();
         destination.push_parts(
-            self.entity_pks[index].take(),
+            self.row_pks[index].take(),
             self.strings[slot.schema_key as usize].clone(),
             self.optional_string(slot.file_id).cloned(),
             self.snapshots[index].take(),
@@ -1597,7 +1597,7 @@ impl RawWriteBatch {
     }
 
     fn debug_assert_aligned(&self) {
-        debug_assert_eq!(self.entity_pks.len(), self.slots.len());
+        debug_assert_eq!(self.row_pks.len(), self.slots.len());
         debug_assert_eq!(self.snapshots.len(), self.slots.len());
         debug_assert_eq!(self.metadata.len(), self.slots.len());
         debug_assert_eq!(self.durable_predecessors.len(), self.slots.len());
@@ -1617,7 +1617,7 @@ impl RawWriteBatch {
     pub(crate) fn aligned_owner_allocation_ptrs(&self) -> [*const (); 4] {
         [
             self.slots.as_ptr().cast(),
-            self.entity_pks.as_ptr().cast(),
+            self.row_pks.as_ptr().cast(),
             self.snapshots.as_ptr().cast(),
             self.metadata.as_ptr().cast(),
         ]
@@ -1627,7 +1627,7 @@ impl RawWriteBatch {
     pub(crate) fn aligned_owner_capacities(&self) -> [usize; 4] {
         [
             self.slots.capacity(),
-            self.entity_pks.capacity(),
+            self.row_pks.capacity(),
             self.snapshots.capacity(),
             self.metadata.capacity(),
         ]
@@ -1706,7 +1706,7 @@ impl Eq for RawWriteBatch {}
 
 impl PartialEq for RawWriteRowRef<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.entity_pk == other.entity_pk
+        self.row_pk == other.row_pk
             && self.schema_key == other.schema_key
             && self.file_id == other.file_id
             && self.snapshot == other.snapshot
@@ -1914,7 +1914,7 @@ pub(crate) struct TransactionFileContent {
     /// through the ordinary plugin path.
     stage_payload_at_commit: bool,
     /// Certified v3 semantic owners which remain encoded through commit.
-    certified_entity_batches: Vec<WasmCertifiedEntityBatch>,
+    certified_row_batches: Vec<WasmCertifiedRowBatch>,
 }
 
 impl TransactionFileContent {
@@ -1944,7 +1944,7 @@ impl TransactionFileContent {
             auxiliary_payloads: Vec::new(),
             plugin_checkpoint: None,
             stage_payload_at_commit: true,
-            certified_entity_batches: Vec::new(),
+            certified_row_batches: Vec::new(),
         }
     }
 
@@ -2002,12 +2002,12 @@ impl TransactionFileContent {
         self.plugin_checkpoint.as_ref()
     }
 
-    pub(crate) fn set_certified_entity_batches(&mut self, batches: Vec<WasmCertifiedEntityBatch>) {
-        self.certified_entity_batches = batches;
+    pub(crate) fn set_certified_row_batches(&mut self, batches: Vec<WasmCertifiedRowBatch>) {
+        self.certified_row_batches = batches;
     }
 
-    pub(crate) fn certified_entity_batches(&self) -> &[WasmCertifiedEntityBatch] {
-        &self.certified_entity_batches
+    pub(crate) fn certified_row_batches(&self) -> &[WasmCertifiedRowBatch] {
+        &self.certified_row_batches
     }
 
     pub(crate) fn retain_certified_batches_only(&mut self) {
@@ -2204,7 +2204,7 @@ enum StageJsonStorage {
     },
     /// Row-owned certified bytes retained after transaction validation.
     ///
-    /// Direct entity writes already arrive in an `Arc<str>`. Keeping that
+    /// Direct row writes already arrive in an `Arc<str>`. Keeping that
     /// owner avoids allocating and copying the full JSON payload merely to
     /// discard an empty (or no-longer-needed) decoded-value cache.
     #[cfg(test)]
@@ -2690,7 +2690,7 @@ pub(crate) struct PreparedRowFacts {
 pub(crate) struct TestPreparedStateRow {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: SharedStr,
     pub(crate) file_id: Option<SharedStr>,
     pub(crate) snapshot: Option<StageJson>,
@@ -2715,7 +2715,7 @@ impl TestPreparedStateRow {
         PreparedStateRowRef {
             schema_plan_id: self.schema_plan_id,
             facts: self.facts,
-            entity_pk: &self.entity_pk,
+            row_pk: &self.row_pk,
             native_row: None,
             schema_key: &self.schema_key,
             file_id: self.file_id.as_ref(),
@@ -2750,7 +2750,7 @@ pub(crate) struct PreparedStateBatch {
     /// derive identity/JSON ordinals from row position. Any operation that
     /// needs row-local topology expands this representation into `slots`.
     dense_certified_parameter: Option<DenseCertifiedParameterSlots>,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
     /// Native current-state payloads aligned one-for-one with logical rows.
     /// Canonical JSON remains a semantic/history input, never a second
     /// committed-state representation.
@@ -2775,7 +2775,7 @@ pub(crate) struct PreparedStateBatch {
 struct PreparedStateSlot {
     schema_plan_id: SchemaPlanId,
     facts: PreparedRowFacts,
-    entity_pk: u32,
+    row_pk: u32,
     schema_key: u32,
     file_id: Option<u32>,
     snapshot: Option<u32>,
@@ -2854,7 +2854,7 @@ impl DenseParameterTimestamps {
 pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
     pub(crate) native_row: Option<&'a NativeRowCell>,
     pub(crate) schema_key: &'a SharedStr,
     pub(crate) file_id: Option<&'a SharedStr>,
@@ -2907,7 +2907,7 @@ impl PreparedStateBatch {
         Self {
             slots: Vec::with_capacity(row_capacity),
             dense_certified_parameter: None,
-            entity_pks: Vec::with_capacity(row_capacity),
+            row_pks: Vec::with_capacity(row_capacity),
             native_rows: Vec::with_capacity(row_capacity),
             // Most bulk batches share schema, branch, and origin descriptors;
             // file ids are the only commonly row-cardinal string. Reserving
@@ -2962,7 +2962,7 @@ impl PreparedStateBatch {
         }
         let Some(actual_digest) =
             crate::collection_generation::ordered_single_string_identity_digest(
-                self.iter().map(|row| row.entity_pk),
+                self.iter().map(|row| row.row_pk),
             )
         else {
             return false;
@@ -2985,7 +2985,7 @@ impl PreparedStateBatch {
             let row_bytes = row
                 .schema_key
                 .len()
-                .checked_add(row.entity_pk.estimated_heap_bytes())?
+                .checked_add(row.row_pk.estimated_heap_bytes())?
                 .checked_add(128)?
                 .checked_add(row.snapshot?.normalized().len())?;
             bytes.checked_add(u64::try_from(row_bytes).ok()?)
@@ -3036,7 +3036,7 @@ impl PreparedStateBatch {
             rows.push_parts_with_change_addressability(
                 row.schema_plan_id,
                 row.facts,
-                row.entity_pk.clone(),
+                row.row_pk.clone(),
                 row.schema_key.clone(),
                 row.file_id.cloned(),
                 row.snapshot.cloned(),
@@ -3072,7 +3072,7 @@ impl PreparedStateBatch {
             return Some(PreparedStateRowRef {
                 schema_plan_id: dense.schema_plan_id,
                 facts: dense.facts,
-                entity_pk: &self.entity_pks[index],
+                row_pk: &self.row_pks[index],
                 native_row: self.native_rows[index].as_ref(),
                 schema_key: &self.strings[dense.schema_key as usize],
                 file_id: None,
@@ -3095,7 +3095,7 @@ impl PreparedStateBatch {
         Some(PreparedStateRowRef {
             schema_plan_id: slot.schema_plan_id,
             facts: slot.facts,
-            entity_pk: &self.entity_pks[slot.entity_pk as usize],
+            row_pk: &self.row_pks[slot.row_pk as usize],
             native_row: self.native_rows[index].as_ref(),
             schema_key: &self.strings[slot.schema_key as usize],
             file_id: slot.file_id.map(|index| &self.strings[index as usize]),
@@ -3130,7 +3130,7 @@ impl PreparedStateBatch {
         self.push_parts(
             row.schema_plan_id,
             row.facts,
-            row.entity_pk,
+            row.row_pk,
             row.schema_key,
             row.file_id,
             row.snapshot,
@@ -3162,7 +3162,7 @@ impl PreparedStateBatch {
         &mut self,
         schema_plan_id: SchemaPlanId,
         facts: PreparedRowFacts,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         schema_key: SharedStr,
         file_id: Option<SharedStr>,
         snapshot: Option<StageJson>,
@@ -3180,7 +3180,7 @@ impl PreparedStateBatch {
         self.push_parts_with_change_addressability(
             schema_plan_id,
             facts,
-            entity_pk,
+            row_pk,
             schema_key,
             file_id,
             snapshot,
@@ -3203,7 +3203,7 @@ impl PreparedStateBatch {
         &mut self,
         schema_plan_id: SchemaPlanId,
         facts: PreparedRowFacts,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         schema_key: SharedStr,
         file_id: Option<SharedStr>,
         snapshot: Option<StageJson>,
@@ -3221,7 +3221,7 @@ impl PreparedStateBatch {
     ) {
         #[cfg(feature = "storage-benches")]
         record_prepared_row_ownership(
-            &entity_pk,
+            &row_pk,
             &schema_key,
             file_id.as_ref(),
             snapshot.as_ref(),
@@ -3231,7 +3231,7 @@ impl PreparedStateBatch {
             crate::storage_bench::CRUD_OWNERSHIP_PREPARED_BATCH,
         );
         self.expand_dense_certified_parameter();
-        let entity_pk = self.push_entity_pk(entity_pk);
+        let row_pk = self.push_row_pk(row_pk);
         let schema_key = self.intern_string(schema_key);
         let file_id = file_id.map(|value| self.intern_string(value));
         let snapshot = snapshot.map(|value| self.push_json(value));
@@ -3242,7 +3242,7 @@ impl PreparedStateBatch {
         self.slots.push(PreparedStateSlot {
             schema_plan_id,
             facts,
-            entity_pk,
+            row_pk,
             schema_key,
             file_id,
             snapshot,
@@ -3267,7 +3267,7 @@ impl PreparedStateBatch {
             return;
         };
         debug_assert!(self.slots.is_empty());
-        debug_assert_eq!(self.entity_pks.len(), dense.len);
+        debug_assert_eq!(self.row_pks.len(), dense.len);
         debug_assert_eq!(self.json.len(), dense.len);
         self.slots.reserve(dense.len);
         for row_index in 0..dense.len {
@@ -3276,7 +3276,7 @@ impl PreparedStateBatch {
             self.slots.push(PreparedStateSlot {
                 schema_plan_id: dense.schema_plan_id,
                 facts: dense.facts,
-                entity_pk: ordinal,
+                row_pk: ordinal,
                 schema_key: dense.schema_key,
                 file_id: None,
                 snapshot: Some(ordinal),
@@ -3349,9 +3349,9 @@ impl PreparedStateBatch {
                     && self.certified_tracked_keys_strictly_ordered
                     && other.certified_tracked_keys_strictly_ordered
                     && self
-                        .entity_pks
+                        .row_pks
                         .last()
-                        .zip(other.entity_pks.first())
+                        .zip(other.row_pks.first())
                         .is_some_and(|(left, right)| left < right)
             }
             (None, _) | (_, None) => false,
@@ -3374,7 +3374,7 @@ impl PreparedStateBatch {
             .len
             .checked_add(right.len)
             .expect("prepared dense parameter row count overflowed");
-        self.entity_pks.append(&mut other.entity_pks);
+        self.row_pks.append(&mut other.row_pks);
         self.native_rows.append(&mut other.native_rows);
         self.json.append(&mut other.json);
         self.complete_collection_replacement = None;
@@ -3407,13 +3407,13 @@ impl PreparedStateBatch {
         other.expand_dense_certified_parameter();
         self.certified_tracked_keys_strictly_ordered = false;
         self.complete_collection_replacement = None;
-        let entity_base =
-            u32::try_from(self.entity_pks.len()).expect("prepared entity column must fit u32");
+        let row_base =
+            u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
         let json_base = u32::try_from(self.json.len()).expect("prepared JSON column must fit u32");
         let predecessor_base = u32::try_from(self.durable_predecessors.len())
             .expect("prepared predecessor column must fit u32");
         self.slots.reserve(other.slots.len());
-        self.entity_pks.reserve(other.entity_pks.len());
+        self.row_pks.reserve(other.row_pks.len());
         self.json.reserve(other.json.len());
         self.durable_predecessors
             .reserve(other.durable_predecessors.len());
@@ -3435,7 +3435,7 @@ impl PreparedStateBatch {
             .drain(..)
             .map(|value| self.intern_origin(value))
             .collect::<Vec<_>>();
-        self.entity_pks.append(&mut other.entity_pks);
+        self.row_pks.append(&mut other.row_pks);
         self.native_rows.append(&mut other.native_rows);
         self.json.append(&mut other.json);
         self.durable_predecessors
@@ -3443,10 +3443,10 @@ impl PreparedStateBatch {
         self.slots.extend(other.slots.into_iter().map(|slot| {
             let remap_string = |index: u32| string_remap[index as usize];
             PreparedStateSlot {
-                entity_pk: slot
-                    .entity_pk
-                    .checked_add(entity_base)
-                    .expect("prepared entity ordinal overflowed"),
+                row_pk: slot
+                    .row_pk
+                    .checked_add(row_base)
+                    .expect("prepared row ordinal overflowed"),
                 schema_key: remap_string(slot.schema_key),
                 file_id: slot.file_id.map(remap_string),
                 snapshot: slot.snapshot.map(|index| {
@@ -3730,10 +3730,10 @@ impl PreparedStateBatch {
         self.slots[index].facts.requires_transaction_validation = requires_transaction_validation;
     }
 
-    fn push_entity_pk(&mut self, value: EntityPk) -> u32 {
+    fn push_row_pk(&mut self, value: RowPk) -> u32 {
         let index =
-            u32::try_from(self.entity_pks.len()).expect("prepared entity column must fit u32");
-        self.entity_pks.push(value);
+            u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
+        self.row_pks.push(value);
         index
     }
 
@@ -3806,13 +3806,13 @@ impl PreparedStateBatch {
     }
 
     fn should_compact_owner_columns(&self, retained_len: usize) -> bool {
-        retained_len == 0 || self.entity_pks.len() > retained_len.saturating_mul(2)
+        retained_len == 0 || self.row_pks.len() > retained_len.saturating_mul(2)
     }
 
     fn push_borrowed_row(&mut self, row: PreparedStateRowRef<'_>) {
         #[cfg(feature = "storage-benches")]
         record_prepared_row_ownership(
-            row.entity_pk,
+            row.row_pk,
             row.schema_key,
             row.file_id,
             row.snapshot,
@@ -3824,7 +3824,7 @@ impl PreparedStateBatch {
         self.push_parts_with_change_addressability(
             row.schema_plan_id,
             row.facts,
-            row.entity_pk.clone(),
+            row.row_pk.clone(),
             row.schema_key.clone(),
             row.file_id.cloned(),
             row.snapshot.cloned(),
@@ -3897,7 +3897,7 @@ impl PartialEq for PreparedStateRowRef<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.schema_plan_id == other.schema_plan_id
             && self.facts == other.facts
-            && self.entity_pk == other.entity_pk
+            && self.row_pk == other.row_pk
             && self.native_row == other.native_row
             && self.schema_key == other.schema_key
             && self.file_id == other.file_id
@@ -3940,7 +3940,7 @@ pub(crate) struct StagedCommitChangeRefs {
     ///
     /// A branch normally owns exactly one batch. Multiple batches remain
     /// separate so staging/finalization clones only `Arc` owners rather than
-    /// copying schema/file/entity or metadata columns.
+    /// copying schema/file/row or metadata columns.
     selected_change_batches: Vec<StagedCommitChangeBatch>,
     /// Certified immutable mutation columns for this commit. This owner is
     /// attached only at drain, after complete-replacement certification, and
@@ -3981,13 +3981,13 @@ impl StagedCommitChangeRefs {
 
 /// Immutable typed columns for historical changes selected into a new commit.
 ///
-/// Identities retain the diff batch owner, so schema keys, file ids, and
-/// entity primary keys are never lowered into row-owned transaction strings.
+/// Identitys retain the diff batch owner, so schema keys, file ids, and
+/// row primary keys are never lowered into row-owned transaction strings.
 /// All remaining metadata is stored in fixed typed columns allocated once per
 /// batch. Cloning this batch through transaction staging is O(1).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct StagedCommitChangeColumns {
-    identities: Vec<StateKey>,
+    identitys: Vec<StateKey>,
     source_commit_ids: Vec<CommitId>,
     change_ids: Vec<ChangeId>,
     deleted: Vec<bool>,
@@ -4001,7 +4001,7 @@ pub(crate) struct StagedCommitChangeBatch {
     /// Every `(source_commit_id, change_id, identity)` tuple was produced by
     /// the tracked diff reader from immutable commit authority.
     source_membership_certified: bool,
-    /// Present only when duplicate identities were filtered while combining
+    /// Present only when duplicate identitys were filtered while combining
     /// independently supplied batches. The normal merge/checkpoint path views
     /// every row directly and allocates no selection column.
     selection: Option<Arc<[u32]>>,
@@ -4026,7 +4026,7 @@ impl StagedCommitChangeBatchBuilder {
     pub(crate) fn with_capacity(row_count: usize) -> Self {
         Self {
             columns: StagedCommitChangeColumns {
-                identities: Vec::with_capacity(row_count),
+                identitys: Vec::with_capacity(row_count),
                 source_commit_ids: Vec::with_capacity(row_count),
                 change_ids: Vec::with_capacity(row_count),
                 deleted: Vec::with_capacity(row_count),
@@ -4045,7 +4045,7 @@ impl StagedCommitChangeBatchBuilder {
         created_at: LixTimestamp,
         updated_at: LixTimestamp,
     ) {
-        self.columns.identities.push(identity);
+        self.columns.identitys.push(identity);
         self.columns.source_commit_ids.push(source_commit_id);
         self.columns.change_ids.push(change_id);
         self.columns.deleted.push(deleted);
@@ -4094,7 +4094,7 @@ impl StagedCommitChangeBatch {
     pub(crate) fn len(&self) -> usize {
         self.selection
             .as_ref()
-            .map_or(self.columns.identities.len(), |selection| selection.len())
+            .map_or(self.columns.identitys.len(), |selection| selection.len())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -4111,7 +4111,7 @@ impl StagedCommitChangeBatch {
             .as_ref()
             .map_or(row_index, |selection| selection[row_index] as usize);
         StagedCommitChangeRef {
-            identity: &self.columns.identities[column_index],
+            identity: &self.columns.identitys[column_index],
             source_commit_id: self.columns.source_commit_ids[column_index],
             change_id: self.columns.change_ids[column_index],
             deleted: self.columns.deleted[column_index],
@@ -4121,7 +4121,7 @@ impl StagedCommitChangeBatch {
     }
 
     fn select(self, selection: Vec<u32>) -> Self {
-        if selection.len() == self.columns.identities.len() {
+        if selection.len() == self.columns.identitys.len() {
             self
         } else {
             Self {
@@ -4143,7 +4143,7 @@ impl StagedCommitChangeBatch {
 
     #[cfg(test)]
     pub(crate) fn large_buffer_count(&self) -> usize {
-        usize::from(!self.columns.identities.is_empty())
+        usize::from(!self.columns.identitys.is_empty())
             + usize::from(!self.columns.source_commit_ids.is_empty())
             + usize::from(!self.columns.change_ids.is_empty())
             + usize::from(!self.columns.deleted.is_empty())
@@ -4167,8 +4167,8 @@ impl<'a> StagedCommitChangeRef<'a> {
         self.identity.file_id.as_deref()
     }
 
-    pub(crate) fn entity_pk(&self) -> &'a EntityPk {
-        &self.identity.entity_pk
+    pub(crate) fn row_pk(&self) -> &'a RowPk {
+        &self.identity.row_pk
     }
 }
 
@@ -4236,21 +4236,21 @@ impl StagedCommitChangeRefs {
             return;
         }
 
-        // Deduplicate logical identities only while batches are combined,
+        // Deduplicate logical identitys only while batches are combined,
         // then drop the index. Eager plugin rows may legitimately share one
         // source change id.
         // Unlike the former BTreeSet retained for the transaction lifetime,
         // this is one temporary contiguous table rather than one allocation
         // per selected mutation.
-        let mut identities =
+        let mut identitys =
             HashSet::with_capacity(self.selected_change_count().saturating_add(batch.len()));
-        identities.extend(
+        identitys.extend(
             self.selected_changes()
-                .map(|change| (change.schema_key(), change.file_id(), change.entity_pk())),
+                .map(|change| (change.schema_key(), change.file_id(), change.row_pk())),
         );
         let mut selected: Option<Vec<u32>> = None;
         for (row_index, change) in batch.iter().enumerate() {
-            if identities.insert((change.schema_key(), change.file_id(), change.entity_pk())) {
+            if identitys.insert((change.schema_key(), change.file_id(), change.row_pk())) {
                 if let Some(selected) = selected.as_mut() {
                     selected.push(
                         u32::try_from(row_index)
@@ -4328,7 +4328,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut prepared = CertifiedParameterReplacementBatch::new(
-            vec![EntityPk::single("a"), EntityPk::single("b")],
+            vec![RowPk::single("a"), RowPk::single("b")],
             snapshots,
             "dense_replacement".into(),
             "main".into(),
@@ -4369,7 +4369,7 @@ mod tests {
         assert!(!prepared.is_dense_certified_parameter());
         assert_eq!(prepared.complete_collection_replacement_proof(), None);
         assert!(!prepared.certified_tracked_keys_strictly_ordered());
-        assert_eq!(prepared.row(0).entity_pk, &EntityPk::single("a"));
+        assert_eq!(prepared.row(0).row_pk, &RowPk::single("a"));
     }
 
     #[test]
@@ -4385,7 +4385,7 @@ mod tests {
         };
         let prepare = |key: &str, timestamp| {
             CertifiedParameterReplacementBatch::new(
-                vec![EntityPk::single(key)],
+                vec![RowPk::single(key)],
                 vec![
                     TransactionJson::from_certified_shared_normalized_row_content(
                         format!(r#"{{"id":"{key}"}}"#).into(),
@@ -4418,9 +4418,9 @@ mod tests {
         assert!(prepared.certified_tracked_keys_strictly_ordered());
         let ordered_identity_digest =
             crate::collection_generation::ordered_single_string_identity_digest(
-                prepared.iter().map(|row| row.entity_pk),
+                prepared.iter().map(|row| row.row_pk),
             )
-            .expect("single-string identities should hash");
+            .expect("single-string identitys should hash");
         assert!(prepared.certify_complete_collection_replacement(
             "dense_replacement",
             "main",
@@ -4448,7 +4448,7 @@ mod tests {
         };
         let prepare = |schema_key: &str, key: &str, timestamp| {
             CertifiedParameterReplacementBatch::new(
-                vec![EntityPk::single(key)],
+                vec![RowPk::single(key)],
                 vec![
                     TransactionJson::from_certified_shared_normalized_row_content(
                         format!(r#"{{"id":"{key}"}}"#).into(),
@@ -4468,9 +4468,9 @@ mod tests {
         prepared.append(prepare("target_schema", "b", second_timestamp));
         let ordered_identity_digest =
             crate::collection_generation::ordered_single_string_identity_digest(
-                prepared.iter().map(|row| row.entity_pk),
+                prepared.iter().map(|row| row.row_pk),
             )
-            .expect("single-string identities should hash");
+            .expect("single-string identitys should hash");
 
         assert!(!prepared.certify_complete_collection_replacement(
             "target_schema",
@@ -4486,16 +4486,16 @@ mod tests {
     #[test]
     fn ten_thousand_selected_changes_retain_one_shared_typed_batch() {
         const ROW_COUNT: usize = 10_000;
-        let identities = (0..ROW_COUNT)
+        let identitys = (0..ROW_COUNT)
             .map(|index| StateKey {
                 schema_key: "shared_schema".to_string(),
                 file_id: Some("shared_file".to_string()),
-                entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                row_pk: RowPk::single(format!("row-{index:05}")),
             })
             .collect::<Vec<_>>();
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let mut builder = StagedCommitChangeBatchBuilder::with_capacity(ROW_COUNT);
-        for (index, identity) in identities.iter().enumerate() {
+        for (index, identity) in identitys.iter().enumerate() {
             builder.push(
                 identity.clone(),
                 CommitId::for_test_label(&format!("selected-owner-{index}")),
@@ -4512,7 +4512,7 @@ mod tests {
         assert!(
             batch
                 .iter()
-                .zip(&identities)
+                .zip(&identitys)
                 .all(|(change, identity)| change.identity() == identity),
             "selected changes must retain the exact native identity"
         );
@@ -4538,18 +4538,18 @@ mod tests {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let source_commit = CommitId::for_test_label("shared-source");
         let shared_change = ChangeId::for_test_label("shared-change");
-        let identities = ["entity-a", "entity-b"]
+        let identitys = ["row-a", "row-b"]
             .into_iter()
-            .map(|entity| StateKey {
+            .map(|row| StateKey {
                 schema_key: "schema".to_string(),
                 file_id: Some("file".to_string()),
-                entity_pk: EntityPk::single(entity),
+                row_pk: RowPk::single(row),
             })
             .collect::<Vec<_>>();
 
         let mut first = StagedCommitChangeBatchBuilder::with_capacity(1);
         first.push(
-            identities[0].clone(),
+            identitys[0].clone(),
             source_commit,
             shared_change,
             false,
@@ -4558,7 +4558,7 @@ mod tests {
         );
         let mut second = StagedCommitChangeBatchBuilder::with_capacity(2);
         second.push(
-            identities[1].clone(),
+            identitys[1].clone(),
             source_commit,
             shared_change,
             false,
@@ -4566,7 +4566,7 @@ mod tests {
             timestamp,
         );
         second.push(
-            identities[0].clone(),
+            identitys[0].clone(),
             source_commit,
             ChangeId::for_test_label("duplicate-identity"),
             false,
@@ -4588,7 +4588,7 @@ mod tests {
     }
 
     fn prepared_fixture_row(
-        entity: &str,
+        row: &str,
         snapshot: Option<StageJson>,
         operation: TransactionWriteOperation,
         origin_key: &SharedStr,
@@ -4597,7 +4597,7 @@ mod tests {
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            entity_pk: EntityPk::single(entity),
+            row_pk: RowPk::single(row),
             schema_key: "shared_schema".into(),
             file_id: Some("shared_file".into()),
             snapshot,
@@ -4611,7 +4611,7 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
             global: false,
-            change_id: Some(ChangeId::for_test_label(entity)),
+            change_id: Some(ChangeId::for_test_label(row)),
             commit_id: None,
             untracked: false,
             branch_id: "shared_branch".into(),
@@ -4650,7 +4650,7 @@ mod tests {
         };
         for (index, snapshot) in canonical.into_iter().enumerate() {
             rows.push_parts(
-                Some(EntityPk::single(index.to_string())),
+                Some(RowPk::single(index.to_string())),
                 schema_key.clone(),
                 Some(file_id.clone()),
                 Some(TransactionJson::from_canonical_batch(snapshot)),
@@ -4701,7 +4701,7 @@ mod tests {
         assert_eq!(rows.aligned_owner_capacities(), owner_capacities);
         for (destination, row) in rows.iter().enumerate() {
             assert_eq!(
-                row.entity_pk
+                row.row_pk
                     .expect("retained raw identity")
                     .as_single_string()
                     .expect("single raw identity"),
@@ -4729,7 +4729,7 @@ mod tests {
         let branch_id = SharedStr::from("bulk_branch");
         for index in 0..ROW_COUNT {
             source.push_parts(
-                Some(EntityPk::single(index.to_string())),
+                Some(RowPk::single(index.to_string())),
                 schema_key.clone(),
                 Some(SharedStr::from(format!("file-{index:05}"))),
                 None,
@@ -4905,7 +4905,7 @@ mod tests {
             ]));
             batch.select_rows(&[2, 1]);
             assert_eq!(batch.len(), 2);
-            assert!(batch.entity_pks.len() <= 4);
+            assert!(batch.row_pks.len() <= 4);
             assert!(batch.json.len() <= 4);
             assert!(batch.strings.len() <= 8);
             assert!(batch.origins.len() <= 2);
@@ -4922,7 +4922,7 @@ mod tests {
         assert_eq!(
             batch
                 .row(1)
-                .entity_pk
+                .row_pk
                 .as_single_string()
                 .expect("scalar pk"),
             "b"
@@ -4972,12 +4972,12 @@ mod tests {
         let mut batch = PreparedStateBatch::with_capacity(row_count);
         let initial_dense_capacities = (
             batch.slots.capacity(),
-            batch.entity_pks.capacity(),
+            batch.row_pks.capacity(),
             batch.json.capacity(),
         );
         let initial_dense_pointers = (
             batch.slots.as_ptr(),
-            batch.entity_pks.as_ptr(),
+            batch.row_pks.as_ptr(),
             batch.json.as_ptr(),
         );
         assert!(batch.strings.capacity() >= row_count);
@@ -4992,7 +4992,7 @@ mod tests {
             let timestamp = LixTimestamp::expect_parse("timestamp", "2026-07-28T00:00:00.000Z");
             let snapshot = stage_json_from_value(
                 TransactionJson::from_certified_shared_normalized_row_content(
-                    format!(r#"{{"id":"entity-{index}"}}"#).into(),
+                    format!(r#"{{"id":"row-{index}"}}"#).into(),
                 ),
                 "capacity snapshot",
             )
@@ -5007,7 +5007,7 @@ mod tests {
             batch.push_test_row(TestPreparedStateRow {
                 schema_plan_id: SchemaPlanId::for_test(0),
                 facts: PreparedRowFacts::default(),
-                entity_pk: EntityPk::single(format!("entity-{index}")),
+                row_pk: RowPk::single(format!("row-{index}")),
                 schema_key: format!("schema-{index}").into(),
                 file_id: Some(format!("file-{index}").into()),
                 snapshot: Some(snapshot),
@@ -5030,7 +5030,7 @@ mod tests {
         assert_eq!(
             (
                 batch.slots.capacity(),
-                batch.entity_pks.capacity(),
+                batch.row_pks.capacity(),
                 batch.json.capacity(),
             ),
             initial_dense_capacities
@@ -5038,7 +5038,7 @@ mod tests {
         assert_eq!(
             (
                 batch.slots.as_ptr(),
-                batch.entity_pks.as_ptr(),
+                batch.row_pks.as_ptr(),
                 batch.json.as_ptr(),
             ),
             initial_dense_pointers
@@ -5055,7 +5055,7 @@ mod tests {
         let origin_surface = SharedStr::from("bulk_surface");
         let logical_primary_key = Arc::new(LogicalPrimaryKey {
             columns: vec!["id".to_string()].into(),
-            values: vec!["logical-entity-1".to_string()],
+            values: vec!["logical-row-1".to_string()],
         });
         let origin = TransactionWriteOrigin {
             surface: origin_surface.clone(),
@@ -5063,7 +5063,7 @@ mod tests {
             primary_key: Some(Arc::clone(&logical_primary_key)),
         };
         let row = TransactionWriteRow {
-            entity_pk: Some(EntityPk::single("entity-1")),
+            row_pk: Some(RowPk::single("row-1")),
             schema_key: schema_key.clone(),
             file_id: Some(file_id.clone()),
             snapshot: None,
@@ -5139,10 +5139,10 @@ mod tests {
 
     #[test]
     fn canonical_batch_row_stays_shared_at_the_prepared_boundary() {
-        let normalized = br#"{"id":"entity-1","value":"hello"}"#.to_vec();
+        let normalized = br#"{"id":"row-1","value":"hello"}"#.to_vec();
         let end = u32::try_from(normalized.len()).expect("fixture length");
         let mut batch = WasmCanonicalJson::from_batch_parts(
-            vec![serde_json::json!({"id": "entity-1", "value": "hello"})],
+            vec![serde_json::json!({"id": "row-1", "value": "hello"})],
             normalized,
             vec![(0, end)],
             1,
@@ -5158,7 +5158,7 @@ mod tests {
             .canonical_batch_row()
             .expect("staging must retain canonical batch ownership");
         assert!(batch_row.shares_batch_with(staged_batch_row));
-        assert_eq!(staged.normalized(), r#"{"id":"entity-1","value":"hello"}"#);
+        assert_eq!(staged.normalized(), r#"{"id":"row-1","value":"hello"}"#);
         assert_eq!(staged.value(), batch_row.value());
         assert_eq!(staged_batch_row.validation_counts(), (1, 1));
         let source = batch_row.normalized_shared();
@@ -5172,10 +5172,10 @@ mod tests {
 
     #[test]
     fn validated_stage_releases_the_parsed_column_and_keeps_the_canonical_arena() {
-        let normalized = br#"{"id":"entity-1","value":"hello"}"#.to_vec();
+        let normalized = br#"{"id":"row-1","value":"hello"}"#.to_vec();
         let end = u32::try_from(normalized.len()).expect("fixture length");
         let mut batch = WasmCanonicalJson::from_batch_parts(
-            vec![serde_json::json!({"id": "entity-1", "value": "hello"})],
+            vec![serde_json::json!({"id": "row-1", "value": "hello"})],
             normalized,
             vec![(0, end)],
             1,
@@ -5193,19 +5193,19 @@ mod tests {
         assert!(staged.release_validated_canonical_value_column());
         assert!(!staged.release_validated_canonical_value_column());
         assert!(staged.canonical_batch_row().is_none());
-        assert_eq!(staged.normalized(), r#"{"id":"entity-1","value":"hello"}"#);
+        assert_eq!(staged.normalized(), r#"{"id":"row-1","value":"hello"}"#);
         let materialized = staged.materialize_shared();
         assert!(source.shares_buffer_with(&materialized));
     }
 
     #[test]
     fn validated_stage_releases_a_parsed_shared_canonical_value() {
-        let source: SharedStr = r#"{"id":"entity-1","value":"hello"}"#.into();
+        let source: SharedStr = r#"{"id":"row-1","value":"hello"}"#.into();
         let transaction_json =
             TransactionJson::from_unvalidated_shared_normalized_content(source.clone());
         assert_eq!(
             transaction_json.value(),
-            &serde_json::json!({"id": "entity-1", "value": "hello"})
+            &serde_json::json!({"id": "row-1", "value": "hello"})
         );
         let mut staged = stage_json_from_value(transaction_json, "shared canonical row")
             .expect("shared canonical JSON should stage");
@@ -5227,7 +5227,7 @@ mod tests {
         let sources = (0..ROW_COUNT)
             .map(|index| {
                 Arc::<str>::from(format!(
-                    r#"{{"id":"entity-{index}","padding":"{}"}}"#,
+                    r#"{{"id":"row-{index}","padding":"{}"}}"#,
                     "x".repeat(128)
                 ))
             })
@@ -5239,7 +5239,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, source)| {
                     prepared_fixture_row(
-                        &format!("entity-{index}"),
+                        &format!("row-{index}"),
                         Some(
                             stage_json_from_value(
                                 TransactionJson::from_certified_normalized_row_content(Arc::clone(
@@ -5289,7 +5289,7 @@ mod tests {
             let start = normalized.len();
             serde_json::to_writer(
                 &mut normalized,
-                &serde_json::json!({"id": format!("entity-{index}")}),
+                &serde_json::json!({"id": format!("row-{index}")}),
             )
             .expect("fixture should serialize");
             offsets.push((start, normalized.len()));
@@ -5304,7 +5304,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, snapshot)| {
                     prepared_fixture_row(
-                        &format!("entity-{index}"),
+                        &format!("row-{index}"),
                         Some(
                             stage_json_from_value(snapshot, "certified transaction arena")
                                 .expect("certified JSON should stage"),
@@ -5341,7 +5341,7 @@ mod tests {
 
     #[test]
     fn certified_row_content_remains_decodable_until_validation_release() {
-        let normalized = br#"{"id":"entity-1"}"#.to_vec();
+        let normalized = br#"{"id":"row-1"}"#.to_vec();
         let normalized_len = normalized.len();
         let snapshot = TransactionJson::from_certified_row_content_arena(
             normalized,
@@ -5354,11 +5354,11 @@ mod tests {
             stage_json_from_value(snapshot, "certified transaction arena").expect("staged JSON");
 
         assert!(!staged.retains_decoded_value_for_tests());
-        assert_eq!(staged.value()["id"], "entity-1");
+        assert_eq!(staged.value()["id"], "row-1");
         assert!(staged.retains_decoded_value_for_tests());
         assert!(staged.release_validated_canonical_value_column());
         assert!(!staged.retains_decoded_value_for_tests());
-        assert_eq!(staged.normalized(), r#"{"id":"entity-1"}"#);
+        assert_eq!(staged.normalized(), r#"{"id":"row-1"}"#);
     }
 
     #[test]
@@ -5369,7 +5369,7 @@ mod tests {
         let mut offsets = Vec::with_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
             let value = serde_json::json!({
-                "id": format!("entity-{index}"),
+                "id": format!("row-{index}"),
                 "padding": "x".repeat(256),
             });
             let encoded = serde_json::to_vec(&value).expect("fixture should serialize");
@@ -5390,7 +5390,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, value)| {
                     prepared_fixture_row(
-                        &format!("entity-{index}"),
+                        &format!("row-{index}"),
                         Some(
                             stage_json_from_value(
                                 TransactionJson::from_canonical_batch(value),
@@ -5470,7 +5470,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, value)| {
                     prepared_fixture_row(
-                        &format!("entity-{index}"),
+                        &format!("row-{index}"),
                         Some(
                             stage_json_from_value(
                                 TransactionJson::from_canonical_batch(value),
