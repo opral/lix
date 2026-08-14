@@ -424,6 +424,7 @@ pub(crate) struct HistoryViewDescriptor<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HistoryMetadataProjection {
     commit_created_at: bool,
+    snapshot_content: bool,
     native_entity_rows: bool,
 }
 
@@ -437,10 +438,25 @@ impl HistoryMetadataProjection {
                     .iter()
                     .any(|column| column.name == column_name)
             });
+        let snapshot_content = projected_schema
+            .field_with_name(HISTORY_COL_SNAPSHOT_CONTENT)
+            .is_ok()
+            || filters.iter().any(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .any(|column| column.name == HISTORY_COL_SNAPSHOT_CONTENT)
+            });
         Self {
             commit_created_at,
+            snapshot_content,
             native_entity_rows: false,
         }
+    }
+
+    pub(crate) fn with_snapshot_content(mut self) -> Self {
+        self.snapshot_content = true;
+        self
     }
 
     pub(crate) fn with_native_entity_rows(mut self) -> Self {
@@ -451,6 +467,11 @@ impl HistoryMetadataProjection {
     #[cfg(test)]
     fn commit_created_at(self) -> bool {
         self.commit_created_at
+    }
+
+    #[cfg(test)]
+    fn snapshot_content(self) -> bool {
+        self.snapshot_content
     }
 }
 
@@ -972,7 +993,11 @@ where
                 if !existing_change_ids.insert(change_id.clone()) {
                     continue;
                 }
-                let snapshot_content = row.seed_snapshot_content()?;
+                let snapshot_content = if metadata_projection.snapshot_content {
+                    row.seed_snapshot_content()?
+                } else {
+                    None
+                };
                 rows.push(HistoryEntry {
                     change: MaterializedChange {
                         id: change_id,
@@ -1421,8 +1446,8 @@ mod tests {
 
     use super::{
         HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-        HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-        parse_history_filter,
+        HISTORY_COL_SNAPSHOT_CONTENT, HistoryMetadataProjection, HistoryRoute,
+        HistoryViewDescriptor, load_history_entries, parse_history_filter,
     };
 
     #[test]
@@ -1511,6 +1536,18 @@ mod tests {
         assert!(
             HistoryMetadataProjection::from_scan(&unrelated_schema, &[residual_filter])
                 .commit_created_at()
+        );
+
+        let snapshot_schema = Arc::new(Schema::new(vec![Field::new(
+            HISTORY_COL_SNAPSHOT_CONTENT,
+            DataType::Utf8,
+            true,
+        )]));
+        assert!(
+            HistoryMetadataProjection::from_scan(&snapshot_schema, &[]).snapshot_content()
+        );
+        assert!(
+            !HistoryMetadataProjection::from_scan(&unrelated_schema, &[]).snapshot_content()
         );
     }
 

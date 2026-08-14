@@ -117,7 +117,8 @@ where
         let schema = projected_schema(&self.schema, projection);
         let mut route = HistoryRoute::from_filters(filters);
         route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
-        let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
+        let metadata_projection =
+            HistoryMetadataProjection::from_scan(&schema, filters).with_snapshot_content();
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
