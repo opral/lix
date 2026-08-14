@@ -814,6 +814,7 @@ fn profile_sql_session_operation(
             lix::storage_bench::begin_crud_ownership_accounting();
         }
         let _ = lix::storage_bench::take_crud_current_state_scoped_range_accounting();
+        let _ = lix::storage_bench::take_point_read_call_trace();
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
             let _ = lix::storage_bench::take_crud_physical_write_accounting();
             let _ = lix::storage_bench::take_crud_commit_state_manifest_bytes();
@@ -822,6 +823,23 @@ fn profile_sql_session_operation(
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
         samples.push(start.elapsed());
         black_box(result);
+        if lix::storage_bench::plan_load_trace_enabled() {
+            for (index, call) in lix::storage_bench::take_point_read_call_trace()
+                .into_iter()
+                .enumerate()
+            {
+                println!(
+                    "tracked_state_crud point read: call={index} owner={}:{} spaces={} keys={}",
+                    call.caller_file,
+                    call.caller_line,
+                    call.spaces.join(","),
+                    call.keys,
+                );
+                if let Some(backtrace) = call.backtrace {
+                    println!("tracked_state_crud point read backtrace: {backtrace}");
+                }
+            }
+        }
         maybe_print_profile_rss_phase("after_operation");
         print_allocation_accounting("operation");
         if ownership_accounting {

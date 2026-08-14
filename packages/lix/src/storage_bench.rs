@@ -1531,6 +1531,55 @@ pub(crate) fn record_plan_load_plan(members_decoded: u64, members_kept: u64, pay
     plan_load_trace::record_plan(members_decoded, members_kept, payload_bytes);
 }
 
+/// One exact point-read invocation observed by the opt-in profiling build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointReadCallTrace {
+    pub caller_file: &'static str,
+    pub caller_line: u32,
+    pub spaces: Vec<&'static str>,
+    pub keys: usize,
+    pub backtrace: Option<String>,
+}
+
+#[cfg(feature = "root-replay-trace")]
+static POINT_READ_CALL_TRACE: std::sync::Mutex<Vec<PointReadCallTrace>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_point_read_call(
+    caller: &'static std::panic::Location<'static>,
+    requests: &[crate::storage::GetManyRequest<'_>],
+) {
+    let spaces = requests.iter().map(|request| request.space.name).collect();
+    let keys = requests.iter().map(|request| request.keys.len()).sum();
+    let backtrace = std::env::var_os("LIX_POINT_READ_BACKTRACE")
+        .is_some()
+        .then(|| format!("{:?}", std::backtrace::Backtrace::force_capture()));
+    POINT_READ_CALL_TRACE
+        .lock()
+        .expect("point-read call trace mutex poisoned")
+        .push(PointReadCallTrace {
+            caller_file: caller.file(),
+            caller_line: caller.line(),
+            spaces,
+            keys,
+            backtrace,
+        });
+}
+
+pub fn take_point_read_call_trace() -> Vec<PointReadCallTrace> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        return std::mem::take(
+            &mut *POINT_READ_CALL_TRACE
+                .lock()
+                .expect("point-read call trace mutex poisoned"),
+        );
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    Vec::new()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BinaryCasWriteAccounting {
     pub chunk_lookup_count: u64,

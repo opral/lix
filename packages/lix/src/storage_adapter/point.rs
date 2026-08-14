@@ -16,30 +16,37 @@ type FastHashBuilder = RandomState;
 /// Every consumer that interprets `get_many` slots must pass through this
 /// boundary so malformed backends cannot turn short reads into misses or
 /// shift extra values into a later logical request.
-pub(crate) async fn exact_get_many<R>(
-    read: &R,
-    requests: &[GetManyRequest<'_>],
-) -> Result<GetManyResult, StorageError>
+#[track_caller]
+pub(crate) fn exact_get_many<'a, R>(
+    read: &'a R,
+    requests: &'a [GetManyRequest<'a>],
+) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send + 'a
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let expected = requests.iter().try_fold(0usize, |total, request| {
-        total.checked_add(request.keys.len())
-    });
-    let Some(expected) = expected else {
-        return Err(StorageError::Corruption(
-            "exact point-read request cardinality overflowed usize".to_string(),
-        ));
-    };
-    let result = read.get_many(requests).await?;
-    if result.values.len() != expected {
-        return Err(StorageError::Corruption(format!(
-            "exact point read returned {} values for {expected} requested keys in a {}-request batch",
-            result.values.len(),
-            requests.len()
-        )));
+    #[cfg(feature = "root-replay-trace")]
+    let caller = std::panic::Location::caller();
+    async move {
+        #[cfg(feature = "root-replay-trace")]
+        crate::storage_bench::record_point_read_call(caller, requests);
+        let expected = requests.iter().try_fold(0usize, |total, request| {
+            total.checked_add(request.keys.len())
+        });
+        let Some(expected) = expected else {
+            return Err(StorageError::Corruption(
+                "exact point-read request cardinality overflowed usize".to_string(),
+            ));
+        };
+        let result = read.get_many(requests).await?;
+        if result.values.len() != expected {
+            return Err(StorageError::Corruption(format!(
+                "exact point read returned {} values for {expected} requested keys in a {}-request batch",
+                result.values.len(),
+                requests.len()
+            )));
+        }
+        Ok(result)
     }
-    Ok(result)
 }
 
 #[derive(Clone, Debug)]

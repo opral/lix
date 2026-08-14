@@ -23,12 +23,87 @@ use tracing::Instrument as _;
 
 use crate::storage_adapter::{
     BufferRange, DeferredFinalPutPage, DeferredFinalPutSource, EncodedMutationBatch, EncodedPut,
-    PutBatch, PutEntry,
+    PutBatch, PutEntry, StorageGetManyRequest,
 };
 use crate::tracked_state::TrackedStateReadColumns;
 use crate::plugin::runtime::WasmCertifiedRowBatch;
 
 use super::*;
+
+/// Same-view results of one operation-local exact point-read plan.
+///
+/// This is deliberately not a persistent cache. The plan is built only after
+/// branch control has fixed `(branch, generation)`, is consumed by one nested
+/// reader, and cannot outlive the retained storage read it borrows. Consumers
+/// still decode and authenticate every value through their existing paths.
+struct OperationPointReadPlan<'a, S: ?Sized> {
+    store: &'a S,
+    values: BTreeMap<(StorageSpace, StorageKey), Option<StorageProjectedValue>>,
+}
+
+impl<'a, S: ?Sized> OperationPointReadPlan<'a, S> {
+    fn new(
+        store: &'a S,
+        requests: &[StorageGetManyRequest<'_>],
+        result: crate::storage_adapter::StorageGetManyResult,
+    ) -> Self {
+        let mut values = BTreeMap::new();
+        let mut slots = result.values.into_iter();
+        for request in requests {
+            for key in request.keys {
+                values.insert((request.space, key.clone()), slots.next().flatten());
+            }
+        }
+        debug_assert!(slots.next().is_none());
+        Self { store, values }
+    }
+}
+
+impl<S> StorageAdapterRead for OperationPointReadPlan<'_, S>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.store.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[StorageGetManyRequest<'_>],
+    ) -> impl Future<Output = Result<crate::storage_adapter::StorageGetManyResult, crate::storage::StorageError>> + Send {
+        let cached = requests
+            .iter()
+            .flat_map(|request| {
+                request.keys.iter().map(move |key| {
+                    self.values
+                        .get(&(request.space, key.clone()))
+                        .map(|value| match (request.opts.projection, value) {
+                            (_, None) => None,
+                            (StorageCoreProjection::KeyOnly, Some(_)) => {
+                                Some(StorageProjectedValue::KeyOnly)
+                            }
+                            (StorageCoreProjection::FullValue, Some(value)) => Some(value.clone()),
+                        })
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        async move {
+            match cached {
+                Some(values) => Ok(crate::storage_adapter::StorageGetManyResult { values }),
+                None => self.store.get_many(requests).await,
+            }
+        }
+    }
+
+    fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: crate::storage::KeyRange,
+        opts: StorageBeginScanOptions,
+    ) -> impl Future<Output = Result<crate::storage::ScanCursor<'_>, crate::storage::StorageError>> + Send {
+        self.store.begin_scan(space, range, opts)
+    }
+}
 
 pub(crate) const ROW_NAMESPACE: &str = "hot_state.row.v21";
 pub(crate) const FILE_NAMESPACE: &str = "hot_state.file_schema.v18";
@@ -6779,27 +6854,130 @@ where
         if matches!(limit, Some(0)) {
             return Ok(Vec::new());
         }
-        let rows = self
-            .scan_live_batch_for_generation(
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                row_pks: row_pks.to_vec(),
+                include_tombstones: false,
+                ..TrackedStateFilter::default()
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["snapshot_content".to_owned()],
+            },
+            limit,
+        };
+        let rows = if row_pks.is_empty() {
+            self.scan_live_batch_for_generation(
                 branch_id,
                 generation,
                 active_checkpoint_commit_id,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec![schema_key.to_owned()],
-                        row_pks: row_pks.to_vec(),
-                        include_tombstones: false,
-                        ..TrackedStateFilter::default()
-                    },
-                    read_columns: TrackedStateReadColumns {
-                        columns: vec!["snapshot_content".to_owned()],
-                    },
-                    limit,
-                },
+                &request,
+            )
+            .await?
+        } else {
+            let prefetched = prepare_operation_point_read_plan(
+                &self.store,
+                branch_id,
+                generation,
+                schema_key,
+                row_pks,
             )
             .await?;
+            let reader = HotStateStoreReader {
+                store: prefetched,
+                transaction_cache: self.transaction_cache.clone(),
+                root_base_cache: self.root_base_cache.clone(),
+            };
+            reader
+                .scan_live_batch_for_generation(
+                    branch_id,
+                    generation,
+                    active_checkpoint_commit_id,
+                    &request,
+                )
+                .await?
+        };
         Ok(rows.into_identity_ordered_snapshots())
     }
+}
+
+/// Preloads the widest independent current-state frontier for one exact row
+/// lookup. All five physical keys are derivable from the already-authenticated
+/// branch control plus the public schema/PK filter:
+///
+/// * collection-generation fence;
+/// * conservative file-membership marker;
+/// * null-file HOT row(s);
+/// * packed-current-base marker;
+/// * immutable root-base pointer.
+///
+/// Their values decide which later authenticated traversal is needed, but no
+/// value supplies another key in this batch. The nested reader above consumes
+/// these slots and forwards every derived read unchanged.
+async fn prepare_operation_point_read_plan<'a, S>(
+    store: &'a S,
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    row_pks: &[RowPk],
+) -> Result<OperationPointReadPlan<'a, S>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let scope = hot_scope_prefix(branch_id, generation);
+    let collection_keys = [StorageKey(Bytes::from(hot_collection_control_key(
+        branch_id,
+        generation,
+        crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id: None,
+        },
+    )))];
+    let file_keys = [StorageKey(Bytes::from(encode_hot_file_schema_key(
+        &scope, schema_key,
+    )))];
+    let mut unique_row_pks = row_pks.iter().collect::<Vec<_>>();
+    unique_row_pks.sort_unstable();
+    unique_row_pks.dedup();
+    let row_keys = unique_row_pks
+        .into_iter()
+        .map(|row_pk| {
+            StorageKey(Bytes::from(encode_hot_row_key_parts(
+                branch_id, generation, schema_key, row_pk, None,
+            )))
+        })
+        .collect::<Vec<_>>();
+    let base_control_keys = [StorageKey(Bytes::copy_from_slice(&scope))];
+    let root_keys = [StorageKey(Bytes::from(scope))];
+    let requests = [
+        StorageGetManyRequest {
+            space: COLLECTION_CONTROL_SPACE,
+            keys: &collection_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: FILE_SPACE,
+            keys: &file_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: ROW_SPACE,
+            keys: &row_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: PACKED_CURRENT_BASE_CONTROL_SPACE,
+            keys: &base_control_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: ROOT_CURRENT_BASE_SPACE,
+            keys: &root_keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let result = crate::storage_adapter::exact_get_many(store, &requests).await?;
+    Ok(OperationPointReadPlan::new(store, &requests, result))
 }
 
 type HotRowMap = BTreeMap<HeadRowIdentity, Bytes>;
