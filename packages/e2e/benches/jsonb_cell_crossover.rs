@@ -468,7 +468,7 @@ fn print_result(
 ) {
     println!(
         "jsonb_cell_crossover,backend={backend},encoding={},shape={},rows={rows},changes={changes},warmups={warmups},samples={samples},update_p50_us={:.3},update_p95_us={:.3},update_cpu_p50_us={:.3},update_cpu_p95_us={:.3},exact_p50_us={:.3},exact_p95_us={:.3},exact_cpu_p50_us={:.3},exact_cpu_p95_us={:.3},scan_p50_us={:.3},scan_p95_us={:.3},scan_cpu_p50_us={:.3},scan_cpu_p95_us={:.3},peak_rss_bytes={},cold_reopen_us={:.3},logical_rows={},logical_bytes={},settled_bytes={settled_bytes},slate_read_objects={},slate_read_bytes={},slate_write_objects={},slate_write_bytes={},digest={},verified=true",
-        option_env!("LIX_JSONB_CELL_ENCODING").unwrap_or("canonical-text-v1"),
+        env("LIX_JSONB_CELL_ENCODING", "canonical-text-v1"),
         shape.label(),
         micros(hot.update.wall.p50),
         micros(hot.update.wall.p95),

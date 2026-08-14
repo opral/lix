@@ -33,6 +33,7 @@ for backend in rocksdb slatedb; do
           LIX_JSONB_CELL_ROWS="$rows" \
           LIX_JSONB_CELL_CHANGES="$changes" \
           LIX_JSONB_CELL_SHAPE="$shape" \
+          LIX_JSONB_CELL_ENCODING="$encoding" \
           LIX_JSONB_CELL_WARMUPS="${LIX_JSONB_CELL_WARMUPS:-3}" \
           LIX_JSONB_CELL_SAMPLES="${LIX_JSONB_CELL_SAMPLES:-11}" \
           "$binary" | tee "$root/logs/$cell.log"
