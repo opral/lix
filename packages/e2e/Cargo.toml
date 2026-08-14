@@ -44,6 +44,10 @@ plugin-tests = ["lix/default_wasm_runtime", "lix/storage-benches"]
 # remains comparable with the existing benchmark. This feature removes that
 # allocator entirely so heap profilers and RSS controls use libc directly.
 system-allocation-profiler = []
+# Benchmark-only adapter selector. Both arms use public SDK APIs; the second
+# arm is reserved for compiling this byte-identical workload on the carrier
+# integration without putting setup differences inside timed regions.
+parsed-markdown-future-adapter = []
 
 [dependencies]
 lix = { workspace = true }
@@ -217,6 +221,11 @@ required-features = ["storage-benches", "slatedb"]
 name = "expW_hot_row_anatomy"
 path = "examples/expW_hot_row_anatomy.rs"
 required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "parsed_markdown_qualification"
+path = "benches/parsed_markdown_qualification.rs"
+required-features = ["storage-benches", "slatedb", "sdk-tests"]
 
 [[test]]
 name = "exact_file_read_benchmark"
