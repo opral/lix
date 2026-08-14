@@ -1,9 +1,19 @@
-#![recursion_limit = "256"]
-
 use lix::{ExecuteBatchStatement, Lix, SwitchBranchOptions, open_lix};
 
 fn assert_send<T: Send>(_: T) {}
 fn assert_send_sync<T: Send + Sync>() {}
+
+#[test]
+fn composed_open_execute_close_spawns_on_a_non_tokio_multithreaded_executor() {
+    let executor = async_executor::Executor::new();
+    executor
+        .spawn(async move {
+            let lix = open_lix().await.expect("open Lix");
+            lix.execute("SELECT 1", &[]).await.expect("execute query");
+            lix.close().await.expect("close Lix");
+        })
+        .detach();
+}
 
 #[tokio::test]
 async fn public_execution_and_observation_futures_are_send() {

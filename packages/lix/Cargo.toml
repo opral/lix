@@ -165,6 +165,7 @@ wasmtime = { version = "45", default-features = false, features = ["cache", "com
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
 [dev-dependencies]
+async-executor = "1"
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 flate2 = "1"
 http-body-util = "0.1"
