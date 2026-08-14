@@ -112,10 +112,26 @@ fn print_allocation_accounting(phase: &str) {
     }
 }
 
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+fn finish_allocation_accounting() -> (u64, u64) {
+    ALLOCATION_ACCOUNTING_ENABLED.store(false, Ordering::Relaxed);
+    (
+        ALLOCATED_BYTES.load(Ordering::Relaxed),
+        ALLOCATION_CALLS.load(Ordering::Relaxed),
+    )
+}
+
 #[cfg(any(target_family = "wasm", feature = "system-allocation-profiler"))]
 fn reset_allocation_accounting() {}
 #[cfg(any(target_family = "wasm", feature = "system-allocation-profiler"))]
 fn print_allocation_accounting(_phase: &str) {}
+#[cfg(any(target_family = "wasm", feature = "system-allocation-profiler"))]
+fn finish_allocation_accounting() -> (u64, u64) {
+    (0, 0)
+}
 
 mod accounting;
 mod io_stats;
@@ -567,13 +583,55 @@ fn profile_hot_sql_session_operations(
         // Match the DuckDB control: one untimed warmup against one seeded and
         // optionally mutated fixture, followed by timed materializations.
         runtime.block_on(run_sql_session_operation(operation, &fixture));
+        let _ = fixture.take_io_stats();
         let mut samples = Vec::with_capacity(repeats);
         let mut row_count = 0;
-        for _ in 0..repeats {
+        for sample in 1..=repeats {
+            reset_allocation_accounting();
+            let cpu_before = process_cpu_micros();
+            let rss_before = process_resident_bytes();
             let start = Instant::now();
             row_count += runtime.block_on(run_sql_session_operation(operation, &fixture));
-            samples.push(start.elapsed());
+            let elapsed = start.elapsed();
+            let cpu_us = process_cpu_micros().saturating_sub(cpu_before);
+            let rss_after = process_resident_bytes();
+            let (allocated_bytes, allocation_calls) = finish_allocation_accounting();
+            let io = fixture.take_io_stats();
+            samples.push(elapsed);
+            println!(
+                "tracked_state_crud olap_sample: sample={sample} backend={} shape={} rows={} wall_us={:.3} cpu_us={cpu_us} alloc_bytes={allocated_bytes} alloc_calls={allocation_calls} rss_before_bytes={rss_before} rss_after_bytes={rss_after} get_calls={} get_keys={} get_values={} get_value_bytes={} scan_calls={} scan_entries={} scan_value_bytes={} write_batches={} write_bytes={} settled_bytes={}",
+                profile.name(),
+                sql_session_read_shape(),
+                rows.len(),
+                elapsed.as_secs_f64() * 1_000_000.0,
+                io.get_calls,
+                io.get_keys,
+                io.get_values,
+                io.get_value_bytes,
+                io.scan_calls,
+                io.scan_entries,
+                io.scan_value_bytes,
+                io.write_batches,
+                io.write_bytes,
+                fixture.settled_bytes(),
+            );
         }
+        let digest = runtime.block_on(fixture.selected_olap_digest());
+        println!(
+            "tracked_state_crud olap_digest: backend={} shape={} rows={} digest={digest:016x} settled_bytes={}",
+            profile.name(),
+            sql_session_read_shape(),
+            rows.len(),
+            fixture.settled_bytes(),
+        );
+        let (reopen_digest, settled_bytes) = runtime.block_on(fixture.cold_reopen_validate());
+        assert_eq!(reopen_digest, digest, "cold-reopen OLAP digest changed");
+        println!(
+            "tracked_state_crud olap_reopen: backend={} shape={} rows={} digest={reopen_digest:016x} settled_bytes={settled_bytes} status=pass",
+            profile.name(),
+            sql_session_read_shape(),
+            rows.len(),
+        );
         print_profile_samples(
             &format!(
                 "sql_session/{}/{}/{}",
@@ -1005,14 +1063,47 @@ fn print_profile_samples(
 ) {
     samples.sort_unstable();
     let median = samples[samples.len() / 2];
+    let p95_index = ((samples.len() * 95).div_ceil(100)).saturating_sub(1);
+    let p95 = samples[p95_index];
     let profile_detail = profile_read_many_detail(operation, read_many_pk_count);
     println!(
-        "tracked_state_crud profile: {layer}/{}/{} samples{profile_detail}: median={median:?} min={:?} max={:?}",
+        "tracked_state_crud profile: {layer}/{}/{} samples{profile_detail}: median={median:?} p95={p95:?} min={:?} max={:?}",
         profile_operation_name(operation),
         samples.len(),
         samples[0],
         samples[samples.len() - 1],
     );
+}
+
+fn process_resident_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .map_or(0, |kilobytes| kilobytes.saturating_mul(1024))
+}
+
+fn process_cpu_micros() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return 0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let user = u64::try_from(usage.ru_utime.tv_sec)
+        .unwrap_or_default()
+        .saturating_mul(1_000_000)
+        .saturating_add(u64::try_from(usage.ru_utime.tv_usec).unwrap_or_default());
+    let system = u64::try_from(usage.ru_stime.tv_sec)
+        .unwrap_or_default()
+        .saturating_mul(1_000_000)
+        .saturating_add(u64::try_from(usage.ru_stime.tv_usec).unwrap_or_default());
+    user.saturating_add(system)
 }
 
 fn profile_read_many_detail(operation: TransactionBenchOp, read_many_pk_count: usize) -> String {

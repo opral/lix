@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{fmt::Write as _, ops::Range};
 
 use lix::storage::Storage;
@@ -7,7 +7,9 @@ use lix::{Lix, open_lix};
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
-use crate::storage::{ProfileStorage, RocksDB, StorageProfile};
+use crate::storage::{
+    CountedProfileStorage, CountingStorage, IoStats, RocksDB, StorageProfile,
+};
 use crate::workload::{UpdateWorkloadRow, WorkloadRow, sql_string};
 
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
@@ -267,9 +269,9 @@ impl UntrackedFixture {
 }
 
 pub(crate) enum SqlFixture {
-    RocksDB(GenericSqlFixture<RocksDB>),
+    RocksDB(GenericSqlFixture<CountingStorage<RocksDB>>),
     #[cfg(feature = "slatedb")]
-    SlateDB(GenericSqlFixture<SlateDB>),
+    SlateDB(GenericSqlFixture<CountingStorage<SlateDB>>),
 }
 
 pub(crate) struct GenericSqlFixture<StorageImpl: Storage + Clone + Send + Sync + 'static> {
@@ -283,6 +285,8 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage + Clone + Send + Sync +
     bound_insert_all_batch: SharedParameterBatch,
     bound_seed_json_batch: SharedParameterBatch,
     olap_expected: Option<OlapExpected>,
+    io_stats: Arc<Mutex<IoStats>>,
+    storage: StorageImpl,
     select_all_sql: String,
     select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
@@ -322,22 +326,34 @@ async fn empty_fixture_with_shape(
         rows.len()
     );
     let untracked_fixture = profile_untracked_fixture();
-    match profile.storage() {
-        ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
-            prepare_session(storage).await,
+    match profile.counted_storage() {
+        CountedProfileStorage::RocksDB {
+            storage,
+            stats,
+            _dir: dir,
+        } => SqlFixture::RocksDB(fixture_for_session(
+            prepare_session(storage.clone()).await,
             rows,
             read_many_by_pk_count,
             untracked_fixture,
             shape,
+            storage,
+            stats,
             dir,
         )),
         #[cfg(feature = "slatedb")]
-        ProfileStorage::SlateDB { storage, _dir: dir } => SqlFixture::SlateDB(fixture_for_session(
-            prepare_session(storage).await,
+        CountedProfileStorage::SlateDB {
+            storage,
+            stats,
+            _dir: dir,
+        } => SqlFixture::SlateDB(fixture_for_session(
+            prepare_session(storage.clone()).await,
             rows,
             read_many_by_pk_count,
             untracked_fixture,
             shape,
+            storage,
+            stats,
             dir,
         )),
     }
@@ -424,6 +440,39 @@ pub(crate) async fn seeded_bound_update_fixture_with_read_many_pk_count(
 }
 
 impl SqlFixture {
+    pub(crate) fn take_io_stats(&self) -> IoStats {
+        match self {
+            Self::RocksDB(fixture) => fixture.take_io_stats(),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.take_io_stats(),
+        }
+    }
+
+    pub(crate) fn settled_bytes(&self) -> u64 {
+        match self {
+            Self::RocksDB(fixture) => fixture.settled_bytes(),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.settled_bytes(),
+        }
+    }
+
+    pub(crate) async fn selected_olap_digest(&self) -> u64 {
+        match self {
+            Self::RocksDB(fixture) => fixture.selected_olap_digest().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.selected_olap_digest().await,
+        }
+    }
+
+
+    pub(crate) async fn cold_reopen_validate(self) -> (u64, u64) {
+        match self {
+            Self::RocksDB(fixture) => fixture.cold_reopen_validate().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.cold_reopen_validate().await,
+        }
+    }
+
     fn install_olap_mutation_profile(&mut self, mutation_profile: OlapMutationProfile) {
         match self {
             Self::RocksDB(fixture) => fixture.install_olap_mutation_profile(mutation_profile),
@@ -709,6 +758,14 @@ impl<StorageImpl> GenericSqlFixture<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    fn take_io_stats(&self) -> IoStats {
+        std::mem::take(&mut *self.io_stats.lock().expect("OLAP I/O stats mutex"))
+    }
+
+    fn settled_bytes(&self) -> u64 {
+        directory_bytes(self._dir.path())
+    }
+
     fn install_olap_mutation_profile(&mut self, mutation_profile: OlapMutationProfile) {
         assert!(self.olap_expected.is_some(), "typed OLAP fixture required");
         self.olap_expected = Some(olap_expected(self.row_count, mutation_profile));
@@ -1003,6 +1060,16 @@ where
         result.len()
     }
 
+    async fn selected_olap_digest(&self) -> u64 {
+        let shape = selected_olap_read_shape().expect("selected OLAP shape");
+        let expected = self
+            .olap_expected
+            .as_ref()
+            .expect("typed OLAP query requires a typed OLAP fixture");
+        let result = execute(&self.session, shape.sql()).await;
+        assert_olap_and_digest(&result, expected, shape)
+    }
+
     async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
         let expected = self
             .olap_expected
@@ -1232,6 +1299,8 @@ fn fixture_for_session<StorageImpl>(
     read_many_by_pk_count: usize,
     untracked_fixture: UntrackedFixture,
     shape: FixtureShape,
+    storage: StorageImpl,
+    io_stats: Arc<Mutex<IoStats>>,
     dir: tempfile::TempDir,
 ) -> GenericSqlFixture<StorageImpl>
 where
@@ -1282,6 +1351,8 @@ where
             empty_parameter_batch()
         },
         olap_expected,
+        io_stats,
+        storage,
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
         select_many_by_pk_sql: select_many_by_pk_sql(
             rows,
@@ -1309,6 +1380,96 @@ where
         ),
         _dir: dir,
     }
+}
+
+impl GenericSqlFixture<CountingStorage<RocksDB>> {
+    async fn cold_reopen_validate(self) -> (u64, u64) {
+        let shape = selected_olap_read_shape().expect("selected OLAP shape");
+        let expected = self.olap_expected.expect("typed OLAP fixture");
+        let directory = self._dir;
+        let database_path = directory.path().join("bench.rocksdb");
+        let raw = self.storage.raw_clone();
+        raw.flush().expect("flush OLAP RocksDB before reopen");
+        drop(self.session);
+        drop(self.storage);
+        drop(raw);
+        let reopened = RocksDB::open(&database_path).expect("reopen OLAP RocksDB");
+        let (storage, _) = CountingStorage::new(reopened);
+        let session = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("cold reopen OLAP RocksDB repository")
+            .open_another_session()
+            .await
+            .expect("open cold RocksDB OLAP session");
+        let result = execute(&session, shape.sql()).await;
+        let digest = assert_olap_and_digest(&result, &expected, shape);
+        (digest, directory_bytes(directory.path()))
+    }
+}
+
+#[cfg(feature = "slatedb")]
+impl GenericSqlFixture<CountingStorage<SlateDB>> {
+    async fn cold_reopen_validate(self) -> (u64, u64) {
+        let shape = selected_olap_read_shape().expect("selected OLAP shape");
+        let expected = self.olap_expected.expect("typed OLAP fixture");
+        let directory = self._dir;
+        let database_path = directory.path().join("bench.slatedb");
+        let raw = self.storage.raw_clone();
+        raw.flush().await.expect("flush OLAP SlateDB before reopen");
+        drop(self.session);
+        drop(self.storage);
+        drop(raw);
+        let reopened = SlateDB::open(&database_path).expect("reopen OLAP SlateDB");
+        let (storage, _) = CountingStorage::new(reopened);
+        let session = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("cold reopen OLAP SlateDB repository")
+            .open_another_session()
+            .await
+            .expect("open cold SlateDB OLAP session");
+        let result = execute(&session, shape.sql()).await;
+        let digest = assert_olap_and_digest(&result, &expected, shape);
+        (digest, directory_bytes(directory.path()))
+    }
+}
+
+fn assert_olap_and_digest(
+    result: &ExecuteResult,
+    expected: &OlapExpected,
+    shape: OlapReadShape,
+) -> u64 {
+    match shape {
+        OlapReadShape::Scan => assert_olap_scan(result, expected),
+        OlapReadShape::Filter => assert_olap_filter(result, expected),
+        OlapReadShape::Sort => assert_olap_sort(result, expected),
+        OlapReadShape::Group => assert_olap_group(result, expected),
+        OlapReadShape::Aggregate => assert_olap_aggregate(result, expected),
+        OlapReadShape::Join => assert_olap_join(result, expected),
+    }
+    let mut digest = 0_u64;
+    for row in result.rows() {
+        for value in row.values() {
+            digest = fold_value(digest, value);
+        }
+    }
+    digest
+}
+
+fn directory_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries.flatten().fold(0_u64, |total, entry| {
+        let path = entry.path();
+        let bytes = if path.is_dir() {
+            directory_bytes(&path)
+        } else {
+            entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+        };
+        total.saturating_add(bytes)
+    })
 }
 
 fn olap_expected(row_count: usize, mutation_profile: OlapMutationProfile) -> OlapExpected {
