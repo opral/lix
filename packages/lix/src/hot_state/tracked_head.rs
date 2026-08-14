@@ -717,7 +717,7 @@ fn tracked_head_duplicate_insert_error_ref(schema_key: &str, row_pk: &RowPk) -> 
 
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&identity.schema_key))
-        && (filter.row_pks.is_empty() || filter.row_pks.contains(&identity.row_pk))
+        && filter.matches_row_pk(&identity.row_pk)
         && matches_file_filter(identity.file_id.as_ref(), &filter.file_ids)
 }
 

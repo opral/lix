@@ -441,6 +441,8 @@ fn direct_row_snapshot_request(request: &HotStateScanRequest) -> bool {
 fn direct_row_columnar_request(request: &HotStateScanRequest) -> bool {
     direct_row_snapshot_request(request)
         && request.filter.row_pks.is_empty()
+        && request.filter.row_pk_lower.is_none()
+        && request.filter.row_pk_upper.is_none()
         && request.limit.is_none()
 }
 

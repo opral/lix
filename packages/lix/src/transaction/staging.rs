@@ -3492,7 +3492,9 @@ impl PreparedStateRowOverlay {
         }
 
         let mut rows = MaterializedHotStateBatchBuilder::with_capacity(0);
-        append_matching_ordered_mutations(&mut rows, &self.staged_writes, request)?;
+        if append_matching_ordered_mutations(&mut rows, &self.staged_writes, request)? {
+            return Ok(rows.finish());
+        }
 
         if self
             .staged_writes
@@ -3800,7 +3802,7 @@ fn append_matching_ordered_mutations(
     output: &mut MaterializedHotStateBatchBuilder,
     staged_writes: &TransactionWriteBuffer,
     request: &HotStateScanRequest,
-) -> Result<(), LixError> {
+) -> Result<bool, LixError> {
     let ordered = staged_writes.ordered_mutations.lock().map_err(|_| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -3808,7 +3810,7 @@ fn append_matching_ordered_mutations(
         )
     })?;
     let Some(journal) = ordered.as_ref() else {
-        return Ok(());
+        return Ok(false);
     };
     if request.filter.untracked == Some(true)
         || (!request.filter.schema_keys.is_empty()
@@ -3825,15 +3827,49 @@ fn append_matching_ordered_mutations(
                 .any(|branch_id| branch_id == journal.branch_id()))
         || !nullable_key_matches_filters(None, &request.filter.file_ids)
     {
-        return Ok(());
+        return Ok(true);
     }
     if request.filter.row_pks.is_empty() {
+        let lower = match request.filter.row_pk_lower.as_ref() {
+            Some(bound) => match bound.row_pk.as_single_string() {
+                Ok(value) => Some((value, bound.inclusive)),
+                Err(_) => return Ok(true),
+            },
+            None => None,
+        };
+        let upper = match request.filter.row_pk_upper.as_ref() {
+            Some(bound) => match bound.row_pk.as_single_string() {
+                Ok(value) => Some((value, bound.inclusive)),
+                Err(_) => return Ok(true),
+            },
+            None => None,
+        };
         for chunk in journal.chunks.iter() {
-            for row_index in 0..chunk.len() {
+            let start = lower.map_or(0, |(bound, inclusive)| {
+                chunk.identity_offsets.partition_point(|&(start, end)| {
+                    let identity = chunk
+                        .identity_arena
+                        .as_str()
+                        .get(start as usize..end as usize)
+                        .expect("validated immutable mutation identity UTF-8");
+                    identity < bound || (!inclusive && identity == bound)
+                })
+            });
+            let end = upper.map_or(chunk.len(), |(bound, inclusive)| {
+                chunk.identity_offsets.partition_point(|&(start, end)| {
+                    let identity = chunk
+                        .identity_arena
+                        .as_str()
+                        .get(start as usize..end as usize)
+                        .expect("validated immutable mutation identity UTF-8");
+                    identity < bound || (inclusive && identity == bound)
+                })
+            });
+            for row_index in start..end.max(start) {
                 push_ordered_mutation_materialized(output, journal, chunk, row_index)?;
             }
         }
-        return Ok(());
+        return Ok(true);
     }
 
     // Preserve the journal's identity order while routing each requested key
@@ -3843,6 +3879,9 @@ fn append_matching_ordered_mutations(
     requested.sort_unstable();
     requested.dedup();
     for row_pk in requested {
+        if !request.filter.matches_row_pk(row_pk) {
+            continue;
+        }
         let Some((chunk, row_index)) = ordered_mutation_journal_row(
             journal,
             journal.branch_id(),
@@ -3854,7 +3893,7 @@ fn append_matching_ordered_mutations(
         };
         push_ordered_mutation_materialized(output, journal, chunk, row_index)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn load_ordered_mutation_exact_batch(
@@ -4328,10 +4367,7 @@ fn staged_row_identity_matches_scan(
     {
         return false;
     }
-    if !candidate_index_matched_schema_and_row
-        && !request.filter.row_pks.is_empty()
-        && !request.filter.row_pks.contains(row.row_pk)
-    {
+    if !request.filter.matches_row_pk(row.row_pk) {
         return false;
     }
     if !staged_branch_matches_scan(row.branch_id, request) {
@@ -4422,6 +4458,100 @@ mod tests {
         assert_eq!(chunk.identity(0), "a");
         assert_eq!(chunk.identity(1), "b");
         assert_eq!(chunk.identity_arena.len(), 2);
+    }
+
+    #[test]
+    fn immutable_journal_overlay_applies_primary_key_bounds_before_materialization() {
+        let staged_writes = test_staged_writes();
+        let snapshots = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|identity| format!(r#"{{"id":"{identity}"}}"#))
+            .collect::<Vec<_>>();
+        let snapshot_arena = snapshots.concat();
+        let mut cursor = 0_usize;
+        let snapshot_offsets = snapshots
+            .iter()
+            .map(|snapshot| {
+                let start = cursor;
+                cursor += snapshot.len();
+                (start, cursor)
+            })
+            .collect();
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+            SchemaPlanId::for_test(0),
+            "schema".into(),
+            "branch".into(),
+            None,
+            b"abcd".to_vec(),
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)],
+            snapshot_arena.into_bytes(),
+            snapshot_offsets,
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
+        )
+        .expect("bounded overlay chunk");
+        assert!(matches!(
+            staged_writes
+                .stage_immutable_mutation_chunk(chunk)
+                .expect("immutable chunk should stage"),
+            ImmutableMutationChunkStage::Staged
+        ));
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("bounded immutable overlay");
+        let request = |lower: (&str, bool), upper: (&str, bool)| HotStateScanRequest {
+            filter: HotStateFilter {
+                branch_ids: vec!["branch".into()],
+                schema_keys: vec!["schema".into()],
+                file_ids: vec![NullableKeyFilter::Null],
+                row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(lower.0),
+                    inclusive: lower.1,
+                }),
+                row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(upper.0),
+                    inclusive: upper.1,
+                }),
+                ..HotStateFilter::default()
+            },
+            ..HotStateScanRequest::default()
+        };
+
+        let rows = overlay
+            .scan(&request(("a", false), ("d", false)))
+            .expect("open staged range");
+        assert_eq!(
+            rows.into_iter()
+                .map(|row| row.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["b"], vec!["c"]]
+        );
+        let mut exact_bounded = request(("b", true), ("c", true));
+        exact_bounded.filter.row_pks = vec![
+            RowPk::single("a"),
+            RowPk::single("b"),
+            RowPk::single("d"),
+        ];
+        let exact_rows = overlay
+            .scan(&exact_bounded)
+            .expect("exact staged candidates must intersect range bounds");
+        assert_eq!(
+            exact_rows
+                .into_iter()
+                .map(|row| row.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["b"]]
+        );
+        assert!(
+            overlay
+                .scan(&request(("d", true), ("a", true)))
+                .expect("inverted staged range")
+                .is_empty()
+        );
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "bounded reads must retain the compact ordered journal"
+        );
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub(crate) use types::{
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
     TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    RowPkRangeBound, row_pk_satisfies_bounds,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
 };
 pub(crate) use types::CurrentStatePartSource;

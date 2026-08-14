@@ -262,6 +262,8 @@ impl WorkingDiffRoute {
                         .into_iter()
                         .map(NullableKeyFilter::Value)
                         .collect(),
+                    row_pk_lower: None,
+                    row_pk_upper: None,
                     include_tombstones: true,
                 },
                 retain_payloads: false,
