@@ -1,9 +1,9 @@
-//! EXP-LOCAL-PATCH-04: authenticated page-local patch layout experiment.
+//! EXP-HAMT-05: canonical authenticated HAMT layout experiment.
 //!
 //! Compares identical Schema-v1 typed tuple bytes stored as either:
 //! - immutable 64-row slotted snapshot pages with a rewritten page manifest; or
-//! - immutable schema base pages with at most one authenticated sparse patch
-//!   per leaf, deterministically compacted by patch entries/encoded bytes.
+//! - a canonical content-addressed 16-way HAMT keyed by the hash of the full
+//!   encoded StateKey, with bounded collision leaves and path-copy updates.
 //!
 //! The benchmark uses the shipping RocksDB/SlateDB storage traits. There is no
 //! SQL or workload-specific production shortcut: both layouts implement the
@@ -11,8 +11,10 @@
 //! cold-reopen operations over content-addressed objects.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -26,10 +28,12 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use uuid::Uuid;
 
-const LEDGER: &str = "EXP-LOCAL-PATCH-04";
+const LEDGER: &str = "EXP-HAMT-05";
 const PAGE_ROWS: usize = 64;
-const DEFAULT_PATCH_MAX_ENTRIES: usize = 32;
-const DEFAULT_PATCH_MAX_BYTES: usize = 2 * 1024;
+const HAMT_BITS: usize = 4;
+const HAMT_FANOUT: usize = 1 << HAMT_BITS;
+const HAMT_LEAF_MAX: usize = 8;
+const HAMT_MAX_DEPTH: usize = 64 / HAMT_BITS;
 const ROOT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00fe_2001), "exp.delta_page.root");
 const PAGE_SPACE: StorageSpace =
@@ -63,21 +67,21 @@ const TUPLE_PLAN: [BodyColumn; 5] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Layout {
     Slotted,
-    Delta,
+    Hamt,
 }
 
 impl Layout {
     fn name(self) -> &'static str {
         match self {
             Self::Slotted => "slotted",
-            Self::Delta => "delta",
+            Self::Hamt => "hamt",
         }
     }
 
     fn tag(self) -> u8 {
         match self {
             Self::Slotted => 1,
-            Self::Delta => 2,
+            Self::Hamt => 2,
         }
     }
 }
@@ -92,9 +96,9 @@ struct Counters {
     put_bytes: u64,
     decoded_pages: u64,
     decoded_rows: u64,
-    patch_reads: u64,
-    patch_compactions: u64,
-    patched_leaves: u64,
+    node_reads: u64,
+    nodes_staged: u64,
+    hash_pruned: u64,
 }
 
 impl Counters {
@@ -108,9 +112,9 @@ impl Counters {
             put_bytes: self.put_bytes - before.put_bytes,
             decoded_pages: self.decoded_pages - before.decoded_pages,
             decoded_rows: self.decoded_rows - before.decoded_rows,
-            patch_reads: self.patch_reads - before.patch_reads,
-            patch_compactions: self.patch_compactions - before.patch_compactions,
-            patched_leaves: self.patched_leaves - before.patched_leaves,
+            node_reads: self.node_reads - before.node_reads,
+            nodes_staged: self.nodes_staged - before.nodes_staged,
+            hash_pruned: self.hash_pruned - before.hash_pruned,
         }
     }
 
@@ -123,9 +127,9 @@ impl Counters {
         self.put_bytes += other.put_bytes;
         self.decoded_pages += other.decoded_pages;
         self.decoded_rows += other.decoded_rows;
-        self.patch_reads += other.patch_reads;
-        self.patch_compactions += other.patch_compactions;
-        self.patched_leaves += other.patched_leaves;
+        self.node_reads += other.node_reads;
+        self.nodes_staged += other.nodes_staged;
+        self.hash_pruned += other.hash_pruned;
     }
 }
 
@@ -150,9 +154,24 @@ struct Root {
     parent: Option<ObjectId>,
     /// Immutable schema-partitioned base pages.
     pages: Vec<ObjectId>,
-    /// At most one sparse patch per base leaf. The root authenticates both the
-    /// base page and its optional patch; no global delta structure exists.
-    patches: Vec<Option<ObjectId>>,
+    /// Sole current-state owner for the HAMT layout.
+    hamt_root: Option<ObjectId>,
+}
+
+#[derive(Clone, Debug)]
+enum HamtNode {
+    Branch {
+        bitmap: u16,
+        children: Vec<ObjectId>,
+    },
+    Leaf(Vec<HamtEntry>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HamtEntry {
+    encoded_key: Vec<u8>,
+    ordinal: u64,
+    value: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -424,10 +443,10 @@ impl<S: Storage + Clone> Store<S> {
 #[tokio::main]
 async fn main() {
     let config = parse_config();
+    hamt_codec_controls();
     println!(
-        "{LEDGER},kind=config,page_rows={PAGE_ROWS},patch_max_entries={},patch_max_bytes={},pattern={},sizes={:?},histories={:?}",
-        patch_max_entries(),
-        patch_max_bytes(),
+        "{LEDGER},kind=config,page_rows={PAGE_ROWS},hamt_fanout={HAMT_FANOUT},hamt_leaf_max={HAMT_LEAF_MAX},pk_kind={},pattern={},sizes={:?},histories={:?}",
+        pk_kind(),
         mutation_pattern(),
         config.sizes,
         config.histories
@@ -437,7 +456,7 @@ async fn main() {
         for &n in &config.sizes {
             for &history in &config.histories {
                 for &delta in &config.deltas {
-                    for layout in [Layout::Slotted, Layout::Delta] {
+                    for layout in [Layout::Slotted, Layout::Hamt] {
                         match backend.as_str() {
                             "rocksdb" => run_rocks(&config, case, n, history, delta, layout).await,
                             "slatedb" => run_slate(&config, case, n, history, delta, layout).await,
@@ -826,7 +845,7 @@ fn emit(
     c: Counters,
 ) {
     println!(
-        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},patch_reads={},patch_compactions={},patched_leaves={},settled_bytes={}",
+        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},node_reads={},nodes_staged={},hash_pruned={},settled_bytes={}",
         layout.name(),
         c.get_calls,
         c.get_keys,
@@ -836,9 +855,9 @@ fn emit(
         c.put_bytes,
         c.decoded_pages,
         c.decoded_rows,
-        c.patch_reads,
-        c.patch_compactions,
-        c.patched_leaves,
+        c.node_reads,
+        c.nodes_staged,
+        c.hash_pruned,
         directory_bytes(path)
     );
 }
@@ -872,15 +891,41 @@ async fn build_initial<S: Storage + Clone>(
     layout: Layout,
     rows: &BTreeMap<u64, Vec<u8>>,
 ) -> Result<ObjectId, String> {
-    let pages = encode_pages(rows);
-    store.put_objects(PAGE_SPACE, &pages).await?;
-    let root = Root {
-        layout,
-        count: rows.len() as u64,
-        generation: 0,
-        parent: None,
-        pages: pages.iter().map(|(id, _)| *id).collect(),
-        patches: vec![None; pages.len()],
+    let root = match layout {
+        Layout::Slotted => {
+            let pages = encode_pages(rows);
+            store.put_objects(PAGE_SPACE, &pages).await?;
+            Root {
+                layout,
+                count: rows.len() as u64,
+                generation: 0,
+                parent: None,
+                pages: pages.iter().map(|(id, _)| *id).collect(),
+                hamt_root: None,
+            }
+        }
+        Layout::Hamt => {
+            let entries = rows
+                .iter()
+                .map(|(ordinal, value)| HamtEntry {
+                    encoded_key: state_key(*ordinal),
+                    ordinal: *ordinal,
+                    value: value.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut staged = Vec::new();
+            let hamt_root = build_hamt_subtree(&entries, 0, &mut staged)?;
+            store.counters.nodes_staged += staged.len() as u64;
+            store.put_objects(PAGE_SPACE, &staged).await?;
+            Root {
+                layout,
+                count: rows.len() as u64,
+                generation: 0,
+                parent: None,
+                pages: Vec::new(),
+                hamt_root: Some(hamt_root),
+            }
+        }
     };
     put_root(store, &root).await
 }
@@ -927,65 +972,28 @@ async fn commit<S: Storage + Clone>(
                     generation,
                     parent: None,
                     pages: page_ids,
-                    patches: vec![None; root.pages.len()],
+                    hamt_root: None,
                 },
             )
             .await
         }
-        Layout::Delta => {
-            if root.patches.len() != root.pages.len() {
-                return Err("page-local patch/root geometry mismatch".to_owned());
+        Layout::Hamt => {
+            let mut hamt_root = root
+                .hamt_root
+                .ok_or_else(|| "HAMT root is missing".to_owned())?;
+            for (ordinal, value) in mutations {
+                hamt_root = hamt_insert(
+                    store,
+                    hamt_root,
+                    HamtEntry {
+                        encoded_key: state_key(*ordinal),
+                        ordinal: *ordinal,
+                        value: value.clone(),
+                    },
+                    0,
+                )
+                .await?;
             }
-            let touched = mutations
-                .keys()
-                .map(|key| (*key as usize) / PAGE_ROWS)
-                .collect::<BTreeSet<_>>();
-            let existing_patch_ids = touched
-                .iter()
-                .filter_map(|index| root.patches.get(*index).copied().flatten())
-                .collect::<Vec<_>>();
-            let existing_patch_bytes = store.get_many(PAGE_SPACE, &existing_patch_ids).await?;
-            let mut existing_patches = existing_patch_ids
-                .into_iter()
-                .zip(existing_patch_bytes)
-                .map(|(id, bytes)| Ok((id, decode_page_counted(&mut store.counters, &bytes)?)))
-                .collect::<Result<BTreeMap<_, _>, String>>()?;
-            let mut page_ids = root.pages;
-            let mut patch_ids = root.patches;
-            let mut staged = Vec::new();
-            for index in touched {
-                let mut patch = match patch_ids[index] {
-                    Some(id) => existing_patches
-                        .remove(&id)
-                        .ok_or_else(|| "missing authenticated page-local patch".to_owned())?,
-                    None => BTreeMap::new(),
-                };
-                let start = (index * PAGE_ROWS) as u64;
-                let end = start + PAGE_ROWS as u64 - 1;
-                patch.extend(
-                    mutations
-                        .range(start..=end)
-                        .map(|(key, value)| (*key, value.clone())),
-                );
-                let patch_bytes = encode_page(&patch);
-                if patch.len() >= patch_max_entries() || patch_bytes.len() >= patch_max_bytes() {
-                    let base_bytes = store.get_one(PAGE_SPACE, page_ids[index]).await?;
-                    let mut base = decode_page_counted(&mut store.counters, &base_bytes)?;
-                    base.extend(patch);
-                    let bytes = encode_page(&base);
-                    let id = ObjectId::of(&bytes);
-                    page_ids[index] = id;
-                    patch_ids[index] = None;
-                    staged.push((id, bytes));
-                    store.counters.patch_compactions += 1;
-                } else {
-                    let id = ObjectId::of(&patch_bytes);
-                    patch_ids[index] = Some(id);
-                    staged.push((id, patch_bytes));
-                }
-                store.counters.patched_leaves += 1;
-            }
-            store.put_objects(PAGE_SPACE, &staged).await?;
             put_root(
                 store,
                 &Root {
@@ -993,8 +1001,8 @@ async fn commit<S: Storage + Clone>(
                     count: full.len() as u64,
                     generation,
                     parent: Some(current),
-                    pages: page_ids,
-                    patches: patch_ids,
+                    pages: Vec::new(),
+                    hamt_root: Some(hamt_root),
                 },
             )
             .await
@@ -1017,26 +1025,20 @@ async fn point_on_read<R: StorageRead>(
     key: u64,
 ) -> Result<Option<Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
+    if root.layout == Layout::Hamt {
+        let encoded_key = state_key(key);
+        return hamt_point(
+            store,
+            root.hamt_root
+                .ok_or_else(|| "HAMT root is missing".to_owned())?,
+            &encoded_key,
+        )
+        .await;
+    }
     let page_index = key as usize / PAGE_ROWS;
     let Some(page_id) = root.pages.get(page_index).copied() else {
         return Ok(None);
     };
-    if root.layout == Layout::Delta {
-        let patch_id = *root
-            .patches
-            .get(page_index)
-            .ok_or_else(|| "page-local patch/root geometry mismatch".to_owned())?;
-        if let Some(patch_id) = patch_id {
-            let objects = store.get_many(PAGE_SPACE, &[patch_id, page_id]).await?;
-            let patch = decode_page_counted(store.counters, &objects[0])?;
-            store.counters.patch_reads += 1;
-            if let Some(value) = patch.get(&key) {
-                return Ok(Some(value.clone()));
-            }
-            let page = decode_page_counted(store.counters, &objects[1])?;
-            return Ok(page.get(&key).cloned());
-        }
-    }
     let bytes = store.get_one(PAGE_SPACE, page_id).await?;
     let page = decode_page_counted(store.counters, &bytes)?;
     Ok(page.get(&key).cloned())
@@ -1061,24 +1063,24 @@ async fn range<S: Storage + Clone>(
     if start >= end {
         return Ok(BTreeMap::new());
     }
+    if root.layout == Layout::Hamt {
+        let rows = hamt_enumerate(
+            &mut read,
+            root.hamt_root
+                .ok_or_else(|| "HAMT root is missing".to_owned())?,
+        )
+        .await?;
+        return Ok(rows
+            .range(start..end)
+            .map(|(key, value)| (*key, value.clone()))
+            .collect());
+    }
     let first = start as usize / PAGE_ROWS;
     let last = (end.saturating_sub(1) as usize / PAGE_ROWS).min(root.pages.len() - 1);
-    let mut ids = root.pages[first..=last].to_vec();
-    let patch_ids = root.patches[first..=last]
-        .iter()
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    ids.extend(&patch_ids);
-    let objects = read.get_many(PAGE_SPACE, &ids).await?;
-    let base_count = last - first + 1;
+    let objects = read.get_many(PAGE_SPACE, &root.pages[first..=last]).await?;
     let mut rows = BTreeMap::new();
-    for bytes in &objects[..base_count] {
+    for bytes in &objects {
         rows.extend(decode_page_counted(read.counters, bytes)?);
-    }
-    for bytes in &objects[base_count..] {
-        rows.extend(decode_page_counted(read.counters, bytes)?);
-        read.counters.patch_reads += 1;
     }
     Ok(rows
         .range(start..end)
@@ -1091,17 +1093,19 @@ async fn materialize_on_read<R: StorageRead>(
     root_id: ObjectId,
 ) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
-    let mut rows = BTreeMap::new();
-    let patch_ids = root.patches.iter().flatten().copied().collect::<Vec<_>>();
-    let mut ids = root.pages.clone();
-    ids.extend(&patch_ids);
-    let objects = store.get_many(PAGE_SPACE, &ids).await?;
-    for bytes in &objects[..root.pages.len()] {
-        rows.extend(decode_page_counted(store.counters, &bytes)?);
+    if root.layout == Layout::Hamt {
+        let rows = hamt_enumerate(
+            store,
+            root.hamt_root
+                .ok_or_else(|| "HAMT root is missing".to_owned())?,
+        )
+        .await?;
+        return Ok(rows);
     }
-    for bytes in &objects[root.pages.len()..] {
+    let mut rows = BTreeMap::new();
+    let objects = store.get_many(PAGE_SPACE, &root.pages).await?;
+    for bytes in &objects {
         rows.extend(decode_page_counted(store.counters, &bytes)?);
-        store.counters.patch_reads += 1;
     }
     Ok(rows)
 }
@@ -1130,7 +1134,18 @@ async fn diff_on_read<R: StorageRead>(
     }
     match before_root.layout {
         Layout::Slotted => diff_slotted(store, &before_root, &after_root).await,
-        Layout::Delta => diff_delta(store, &before_root, &after_root).await,
+        Layout::Hamt => {
+            hamt_diff(
+                store,
+                before_root
+                    .hamt_root
+                    .ok_or_else(|| "HAMT root is missing".to_owned())?,
+                after_root
+                    .hamt_root
+                    .ok_or_else(|| "HAMT root is missing".to_owned())?,
+            )
+            .await
+        }
     }
 }
 
@@ -1161,54 +1176,6 @@ async fn diff_slotted<R: StorageRead>(
     Ok(changed)
 }
 
-async fn diff_delta<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    before: &Root,
-    after: &Root,
-) -> Result<BTreeSet<u64>, String> {
-    if before.pages.len() != after.pages.len()
-        || before.patches.len() != before.pages.len()
-        || after.patches.len() != after.pages.len()
-    {
-        return Err("page-local roots have incompatible geometry".to_owned());
-    }
-    let mut changed = BTreeSet::new();
-    for index in 0..before.pages.len() {
-        if before.pages[index] == after.pages[index]
-            && before.patches[index] == after.patches[index]
-        {
-            continue;
-        }
-        let before_page = load_local_leaf(store, before, index).await?;
-        let after_page = load_local_leaf(store, after, index).await?;
-        changed.extend(
-            before_page
-                .keys()
-                .chain(after_page.keys())
-                .copied()
-                .filter(|key| before_page.get(key) != after_page.get(key)),
-        );
-    }
-    Ok(changed)
-}
-
-async fn load_local_leaf<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    root: &Root,
-    index: usize,
-) -> Result<BTreeMap<u64, Vec<u8>>, String> {
-    let mut ids = vec![root.pages[index]];
-    ids.extend(root.patches[index]);
-    let objects = store.get_many(PAGE_SPACE, &ids).await?;
-    let mut page = decode_page_counted(store.counters, &objects[0])?;
-    if objects.len() == 2 {
-        let patch = decode_page_counted(store.counters, &objects[1])?;
-        store.counters.patch_reads += 1;
-        page.extend(patch);
-    }
-    Ok(page)
-}
-
 async fn history_values<S: Storage + Clone>(
     store: &mut Store<S>,
     roots: &[ObjectId],
@@ -1236,38 +1203,71 @@ async fn corruption_control<S: Storage + Clone>(
 ) -> Result<(), String> {
     let root_bytes = store.get_one(ROOT_SPACE, root).await?;
     let decoded = decode_root(&root_bytes)?;
-    let Some(page) = decoded.pages.first().copied() else {
-        return Err("root has no page".to_owned());
-    };
     let wrong = ObjectId([0x55; 32]);
     let mut corrupted = decoded.clone();
-    corrupted.pages[0] = wrong;
+    let retained = match decoded.layout {
+        Layout::Slotted => {
+            let page = decoded
+                .pages
+                .first()
+                .copied()
+                .ok_or_else(|| "slotted root has no page".to_owned())?;
+            corrupted.pages[0] = wrong;
+            page
+        }
+        Layout::Hamt => {
+            let node = decoded
+                .hamt_root
+                .ok_or_else(|| "HAMT root is missing".to_owned())?;
+            corrupted.hamt_root = Some(wrong);
+            node
+        }
+    };
     let corrupt_bytes = encode_root(&corrupted);
     let corrupt_id = ObjectId::of(&corrupt_bytes);
     store
         .put_objects(ROOT_SPACE, &[(corrupt_id, corrupt_bytes)])
         .await?;
     assert!(materialize(store, corrupt_id).await.is_err());
-    assert!(store.get_one(PAGE_SPACE, page).await.is_ok());
-    if let Some((index, patch)) = decoded
-        .patches
-        .iter()
-        .enumerate()
-        .find_map(|(index, patch)| patch.map(|id| (index, id)))
-    {
-        let mut corrupted = decoded;
-        corrupted.patches[index] = Some(wrong);
-        let corrupt_bytes = encode_root(&corrupted);
-        let corrupt_id = ObjectId::of(&corrupt_bytes);
-        store
-            .put_objects(ROOT_SPACE, &[(corrupt_id, corrupt_bytes)])
-            .await?;
-        assert!(
-            point(store, corrupt_id, (index * PAGE_ROWS) as u64)
-                .await
-                .is_err()
-        );
-        assert!(store.get_one(PAGE_SPACE, patch).await.is_ok());
+    assert!(store.get_one(PAGE_SPACE, retained).await.is_ok());
+    if decoded.layout == Layout::Hamt {
+        let node_bytes = store.get_one(PAGE_SPACE, retained).await?;
+        if let HamtNode::Branch {
+            bitmap,
+            mut children,
+        } = decode_hamt_node(&node_bytes)?
+        {
+            children[0] = wrong;
+            let malformed_child = HamtNode::Branch { bitmap, children };
+            let malformed_bytes = encode_hamt_node(&malformed_child);
+            let malformed_id = ObjectId::of(&malformed_bytes);
+            store
+                .put_objects(PAGE_SPACE, &[(malformed_id, malformed_bytes)])
+                .await?;
+            let mut malformed_root = decoded.clone();
+            malformed_root.hamt_root = Some(malformed_id);
+            let root_bytes = encode_root(&malformed_root);
+            let root_id = ObjectId::of(&root_bytes);
+            store
+                .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
+                .await?;
+            assert!(materialize(store, root_id).await.is_err());
+
+            let mut bitmap_bytes = b"HMB1".to_vec();
+            bitmap_bytes.extend_from_slice(&1u16.to_be_bytes());
+            bitmap_bytes.push(0);
+            let bitmap_id = ObjectId::of(&bitmap_bytes);
+            store
+                .put_objects(PAGE_SPACE, &[(bitmap_id, bitmap_bytes)])
+                .await?;
+            malformed_root.hamt_root = Some(bitmap_id);
+            let root_bytes = encode_root(&malformed_root);
+            let root_id = ObjectId::of(&root_bytes);
+            store
+                .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
+                .await?;
+            assert!(materialize(store, root_id).await.is_err());
+        }
     }
     Ok(())
 }
@@ -1312,6 +1312,9 @@ fn encode_page(rows: &BTreeMap<u64, Vec<u8>>) -> Vec<u8> {
     let mut out = b"EDP1".to_vec();
     out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
     for (key, value) in rows {
+        let encoded_key = state_key(*key);
+        out.extend_from_slice(&(encoded_key.len() as u32).to_be_bytes());
+        out.extend_from_slice(&encoded_key);
         out.extend_from_slice(&key.to_be_bytes());
         out.extend_from_slice(&(value.len() as u32).to_be_bytes());
         out.extend_from_slice(value);
@@ -1335,7 +1338,12 @@ fn decode_page(bytes: &[u8]) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let count = input.u32()? as usize;
     let mut rows = BTreeMap::new();
     for _ in 0..count {
+        let key_len = input.u32()? as usize;
+        let encoded_key = input.bytes(key_len)?.to_vec();
         let key = input.u64()?;
+        if encoded_key != state_key(key) {
+            return Err("slotted encoded StateKey/ordinal binding mismatch".to_owned());
+        }
         let len = input.u32()? as usize;
         let value = input.bytes(len)?.to_vec();
         decode_body(&TUPLE_PLAN, &value).map_err(|e| e.to_string())?;
@@ -1348,7 +1356,7 @@ fn decode_page(bytes: &[u8]) -> Result<BTreeMap<u64, Vec<u8>>, String> {
 }
 
 fn encode_root(root: &Root) -> Vec<u8> {
-    let mut out = b"ELP1".to_vec();
+    let mut out = b"EHR1".to_vec();
     out.push(root.layout.tag());
     out.extend_from_slice(&root.count.to_be_bytes());
     out.extend_from_slice(&root.generation.to_be_bytes());
@@ -1363,25 +1371,22 @@ fn encode_root(root: &Root) -> Vec<u8> {
     for page in &root.pages {
         out.extend_from_slice(&page.0);
     }
-    out.extend_from_slice(&(root.patches.len() as u32).to_be_bytes());
-    for patch in &root.patches {
-        match patch {
-            Some(id) => {
-                out.push(1);
-                out.extend_from_slice(&id.0);
-            }
-            None => out.push(0),
+    match root.hamt_root {
+        Some(id) => {
+            out.push(1);
+            out.extend_from_slice(&id.0);
         }
+        None => out.push(0),
     }
     out
 }
 
 fn decode_root(bytes: &[u8]) -> Result<Root, String> {
     let mut input = Decoder::new(bytes);
-    input.magic(b"ELP1")?;
+    input.magic(b"EHR1")?;
     let layout = match input.u8()? {
         1 => Layout::Slotted,
-        2 => Layout::Delta,
+        2 => Layout::Hamt,
         _ => return Err("unknown root layout".to_owned()),
     };
     let count = input.u64()?;
@@ -1392,33 +1397,29 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
         _ => return Err("invalid parent tag".to_owned()),
     };
     if layout == Layout::Slotted && parent.is_some() {
-        return Err("slotted root has page-local ancestry".to_owned());
+        return Err("slotted root has HAMT ancestry".to_owned());
     }
-    if layout == Layout::Delta && generation == 0 && parent.is_some() {
-        return Err("initial delta root has parent".to_owned());
+    if layout == Layout::Hamt && generation == 0 && parent.is_some() {
+        return Err("initial HAMT root has parent".to_owned());
     }
-    if layout == Layout::Delta && generation > 0 && parent.is_none() {
-        return Err("versioned delta root is missing chronology parent".to_owned());
+    if layout == Layout::Hamt && generation > 0 && parent.is_none() {
+        return Err("versioned HAMT root is missing chronology parent".to_owned());
     }
     let count_pages = input.u32()? as usize;
     let mut pages = Vec::with_capacity(count_pages);
     for _ in 0..count_pages {
         pages.push(ObjectId(input.fixed_32()?));
     }
-    let patch_count = input.u32()? as usize;
-    let mut patches = Vec::with_capacity(patch_count);
-    for _ in 0..patch_count {
-        patches.push(match input.u8()? {
-            0 => None,
-            1 => Some(ObjectId(input.fixed_32()?)),
-            _ => return Err("invalid page-local patch tag".to_owned()),
-        });
+    let hamt_root = match input.u8()? {
+        0 => None,
+        1 => Some(ObjectId(input.fixed_32()?)),
+        _ => return Err("invalid HAMT root tag".to_owned()),
+    };
+    if layout == Layout::Slotted && hamt_root.is_some() {
+        return Err("slotted root has HAMT owner".to_owned());
     }
-    if patches.len() != pages.len() {
-        return Err("page-local patch/root geometry mismatch".to_owned());
-    }
-    if layout == Layout::Slotted && patches.iter().any(Option::is_some) {
-        return Err("slotted root has page-local patches".to_owned());
+    if layout == Layout::Hamt && (!pages.is_empty() || hamt_root.is_none()) {
+        return Err("HAMT root has a second or missing state owner".to_owned());
     }
     input.finish()?;
     Ok(Root {
@@ -1427,8 +1428,393 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
         generation,
         parent,
         pages,
-        patches,
+        hamt_root,
     })
+}
+
+fn state_key(ordinal: u64) -> Vec<u8> {
+    let mut out = b"schema-v1/entity/".to_vec();
+    match pk_kind().as_str() {
+        "uuid" => {
+            out.push(b'u');
+            out.extend_from_slice(&Uuid::from_u128(ordinal as u128 + 1).into_bytes());
+        }
+        "text" => {
+            let value = format!("pk-{ordinal:020}");
+            out.push(b't');
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        "composite" => {
+            let value = format!("pk-{ordinal:020}");
+            out.push(b'c');
+            out.extend_from_slice(&ordinal.to_be_bytes());
+            out.extend_from_slice(&Uuid::from_u128(ordinal as u128 + 1).into_bytes());
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        _ => {
+            out.push(b'i');
+            out.extend_from_slice(&ordinal.to_be_bytes());
+        }
+    }
+    out
+}
+
+fn pk_kind() -> String {
+    std::env::var("EXP_HAMT_PK_KIND").unwrap_or_else(|_| "integer".to_owned())
+}
+
+fn hamt_hash(key: &[u8]) -> [u8; 32] {
+    *blake3::hash(key).as_bytes()
+}
+
+fn hamt_slot(hash: &[u8; 32], depth: usize) -> usize {
+    let byte = hash[depth / 2];
+    if depth.is_multiple_of(2) {
+        (byte >> 4) as usize
+    } else {
+        (byte & 0x0f) as usize
+    }
+}
+
+fn encode_hamt_node(node: &HamtNode) -> Vec<u8> {
+    match node {
+        HamtNode::Branch { bitmap, children } => {
+            let mut out = b"HMB1".to_vec();
+            out.extend_from_slice(&bitmap.to_be_bytes());
+            out.push(children.len() as u8);
+            for child in children {
+                out.extend_from_slice(&child.0);
+            }
+            out
+        }
+        HamtNode::Leaf(entries) => {
+            let mut out = b"HML1".to_vec();
+            out.push(entries.len() as u8);
+            for entry in entries {
+                out.extend_from_slice(&(entry.encoded_key.len() as u32).to_be_bytes());
+                out.extend_from_slice(&entry.encoded_key);
+                out.extend_from_slice(&entry.ordinal.to_be_bytes());
+                out.extend_from_slice(&(entry.value.len() as u32).to_be_bytes());
+                out.extend_from_slice(&entry.value);
+            }
+            out
+        }
+    }
+}
+
+fn decode_hamt_node(bytes: &[u8]) -> Result<HamtNode, String> {
+    if bytes.starts_with(b"HMB1") {
+        let mut input = Decoder::new(bytes);
+        input.magic(b"HMB1")?;
+        let bitmap = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap());
+        let count = input.u8()? as usize;
+        if count == 0 || count != bitmap.count_ones() as usize {
+            return Err("malformed HAMT bitmap cardinality".to_owned());
+        }
+        let mut children = Vec::with_capacity(count);
+        for _ in 0..count {
+            children.push(ObjectId(input.fixed_32()?));
+        }
+        input.finish()?;
+        return Ok(HamtNode::Branch { bitmap, children });
+    }
+    let mut input = Decoder::new(bytes);
+    input.magic(b"HML1")?;
+    let count = input.u8()? as usize;
+    if count == 0 || count > HAMT_LEAF_MAX {
+        return Err("noncanonical HAMT collision leaf size".to_owned());
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_len = input.u32()? as usize;
+        let encoded_key = input.bytes(key_len)?.to_vec();
+        let ordinal = input.u64()?;
+        let value_len = input.u32()? as usize;
+        let value = input.bytes(value_len)?.to_vec();
+        if encoded_key != state_key(ordinal) {
+            return Err("HAMT encoded StateKey/ordinal binding mismatch".to_owned());
+        }
+        decode_body(&TUPLE_PLAN, &value).map_err(|error| error.to_string())?;
+        entries.push(HamtEntry {
+            encoded_key,
+            ordinal,
+            value,
+        });
+    }
+    input.finish()?;
+    if !entries
+        .windows(2)
+        .all(|pair| pair[0].encoded_key < pair[1].encoded_key)
+    {
+        return Err("duplicate or noncanonical HAMT leaf order".to_owned());
+    }
+    Ok(HamtNode::Leaf(entries))
+}
+
+fn stage_hamt_node(node: &HamtNode, staged: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
+    let bytes = encode_hamt_node(node);
+    let id = ObjectId::of(&bytes);
+    staged.push((id, bytes));
+    id
+}
+
+fn build_hamt_subtree(
+    entries: &[HamtEntry],
+    depth: usize,
+    staged: &mut Vec<(ObjectId, Vec<u8>)>,
+) -> Result<ObjectId, String> {
+    if entries.is_empty() {
+        return Err("cannot build empty HAMT subtree".to_owned());
+    }
+    if entries.len() <= HAMT_LEAF_MAX {
+        let mut leaf = entries.to_vec();
+        leaf.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+        leaf.dedup_by(|left, right| left.encoded_key == right.encoded_key);
+        if leaf.len() != entries.len() {
+            return Err("duplicate HAMT StateKey".to_owned());
+        }
+        return Ok(stage_hamt_node(&HamtNode::Leaf(leaf), staged));
+    }
+    if depth >= HAMT_MAX_DEPTH {
+        return Err("HAMT collision leaf exceeds canonical bound".to_owned());
+    }
+    let mut buckets = vec![Vec::new(); HAMT_FANOUT];
+    for entry in entries {
+        buckets[hamt_slot(&hamt_hash(&entry.encoded_key), depth)].push(entry.clone());
+    }
+    let mut bitmap = 0u16;
+    let mut children = Vec::new();
+    for (slot, bucket) in buckets.into_iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        bitmap |= 1u16 << slot;
+        children.push(build_hamt_subtree(&bucket, depth + 1, staged)?);
+    }
+    Ok(stage_hamt_node(
+        &HamtNode::Branch { bitmap, children },
+        staged,
+    ))
+}
+
+async fn load_hamt_node<R: StorageRead>(
+    store: &mut Reader<'_, R>,
+    id: ObjectId,
+) -> Result<HamtNode, String> {
+    let bytes = store.get_one(PAGE_SPACE, id).await?;
+    let node = decode_hamt_node(&bytes)?;
+    store.counters.node_reads += 1;
+    store.counters.decoded_pages += 1;
+    if let HamtNode::Leaf(entries) = &node {
+        store.counters.decoded_rows += entries.len() as u64;
+    }
+    Ok(node)
+}
+
+async fn put_hamt_node<S: Storage + Clone>(
+    store: &mut Store<S>,
+    node: &HamtNode,
+) -> Result<ObjectId, String> {
+    let bytes = encode_hamt_node(node);
+    let id = ObjectId::of(&bytes);
+    store.put_objects(PAGE_SPACE, &[(id, bytes)]).await?;
+    store.counters.nodes_staged += 1;
+    Ok(id)
+}
+
+fn hamt_insert<'a, S: Storage + Clone + 'a>(
+    store: &'a mut Store<S>,
+    node_id: ObjectId,
+    entry: HamtEntry,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<ObjectId, String>> + 'a>> {
+    Box::pin(async move {
+        let node = {
+            let mut read = store.reader().await?;
+            load_hamt_node(&mut read, node_id).await?
+        };
+        match node {
+            HamtNode::Leaf(mut entries) => {
+                match entries
+                    .binary_search_by(|candidate| candidate.encoded_key.cmp(&entry.encoded_key))
+                {
+                    Ok(index) => entries[index] = entry,
+                    Err(index) => entries.insert(index, entry),
+                }
+                if entries.len() <= HAMT_LEAF_MAX {
+                    put_hamt_node(store, &HamtNode::Leaf(entries)).await
+                } else {
+                    let mut staged = Vec::new();
+                    let root = build_hamt_subtree(&entries, depth, &mut staged)?;
+                    store.counters.nodes_staged += staged.len() as u64;
+                    store.put_objects(PAGE_SPACE, &staged).await?;
+                    Ok(root)
+                }
+            }
+            HamtNode::Branch {
+                mut bitmap,
+                mut children,
+            } => {
+                if depth >= HAMT_MAX_DEPTH {
+                    return Err("HAMT branch exceeds hash depth".to_owned());
+                }
+                let slot = hamt_slot(&hamt_hash(&entry.encoded_key), depth);
+                let mask = 1u16 << slot;
+                let rank = (bitmap & (mask - 1)).count_ones() as usize;
+                if bitmap & mask == 0 {
+                    let child = put_hamt_node(store, &HamtNode::Leaf(vec![entry])).await?;
+                    bitmap |= mask;
+                    children.insert(rank, child);
+                } else {
+                    children[rank] = hamt_insert(store, children[rank], entry, depth + 1).await?;
+                }
+                put_hamt_node(store, &HamtNode::Branch { bitmap, children }).await
+            }
+        }
+    })
+}
+
+async fn hamt_point<R: StorageRead>(
+    store: &mut Reader<'_, R>,
+    mut node_id: ObjectId,
+    encoded_key: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    let hash = hamt_hash(encoded_key);
+    for depth in 0..=HAMT_MAX_DEPTH {
+        match load_hamt_node(store, node_id).await? {
+            HamtNode::Leaf(entries) => {
+                return Ok(entries
+                    .binary_search_by(|entry| entry.encoded_key.as_slice().cmp(encoded_key))
+                    .ok()
+                    .map(|index| entries[index].value.clone()));
+            }
+            HamtNode::Branch { bitmap, children } => {
+                if depth >= HAMT_MAX_DEPTH {
+                    return Err("HAMT branch exceeds hash depth".to_owned());
+                }
+                let slot = hamt_slot(&hash, depth);
+                let mask = 1u16 << slot;
+                if bitmap & mask == 0 {
+                    return Ok(None);
+                }
+                let rank = (bitmap & (mask - 1)).count_ones() as usize;
+                node_id = children[rank];
+            }
+        }
+    }
+    Err("HAMT point exceeded hash depth".to_owned())
+}
+
+async fn hamt_enumerate<R: StorageRead>(
+    store: &mut Reader<'_, R>,
+    node_id: ObjectId,
+) -> Result<BTreeMap<u64, Vec<u8>>, String> {
+    let mut rows = BTreeMap::new();
+    let mut stack = vec![node_id];
+    while let Some(id) = stack.pop() {
+        match load_hamt_node(store, id).await? {
+            HamtNode::Leaf(entries) => {
+                for entry in entries {
+                    if rows.insert(entry.ordinal, entry.value).is_some() {
+                        return Err("duplicate HAMT row during enumeration".to_owned());
+                    }
+                }
+            }
+            HamtNode::Branch { children, .. } => {
+                stack.extend(children.into_iter().rev());
+            }
+        }
+    }
+    Ok(rows)
+}
+
+async fn hamt_diff<R: StorageRead>(
+    store: &mut Reader<'_, R>,
+    before: ObjectId,
+    after: ObjectId,
+) -> Result<BTreeSet<u64>, String> {
+    let mut changed = BTreeSet::new();
+    let mut stack = vec![(before, after)];
+    while let Some((before, after)) = stack.pop() {
+        if before == after {
+            store.counters.hash_pruned += 1;
+            continue;
+        }
+        let before_node = load_hamt_node(store, before).await?;
+        let after_node = load_hamt_node(store, after).await?;
+        match (before_node, after_node) {
+            (
+                HamtNode::Branch {
+                    bitmap: before_bitmap,
+                    children: before_children,
+                },
+                HamtNode::Branch {
+                    bitmap: after_bitmap,
+                    children: after_children,
+                },
+            ) if before_bitmap == after_bitmap => {
+                stack.extend(before_children.into_iter().zip(after_children));
+            }
+            (HamtNode::Leaf(before_entries), HamtNode::Leaf(after_entries)) => {
+                let before_rows = before_entries
+                    .into_iter()
+                    .map(|entry| (entry.ordinal, entry.value))
+                    .collect::<BTreeMap<_, _>>();
+                let after_rows = after_entries
+                    .into_iter()
+                    .map(|entry| (entry.ordinal, entry.value))
+                    .collect::<BTreeMap<_, _>>();
+                changed.extend(
+                    before_rows
+                        .keys()
+                        .chain(after_rows.keys())
+                        .copied()
+                        .filter(|key| before_rows.get(key) != after_rows.get(key)),
+                );
+            }
+            (before_node, after_node) => {
+                let before_rows = enumerate_loaded_hamt(store, before_node).await?;
+                let after_rows = enumerate_loaded_hamt(store, after_node).await?;
+                changed.extend(
+                    before_rows
+                        .keys()
+                        .chain(after_rows.keys())
+                        .copied()
+                        .filter(|key| before_rows.get(key) != after_rows.get(key)),
+                );
+            }
+        }
+    }
+    Ok(changed)
+}
+
+async fn enumerate_loaded_hamt<R: StorageRead>(
+    store: &mut Reader<'_, R>,
+    node: HamtNode,
+) -> Result<BTreeMap<u64, Vec<u8>>, String> {
+    let mut rows = BTreeMap::new();
+    let mut loaded = vec![node];
+    let mut ids = Vec::new();
+    while let Some(node) = loaded.pop() {
+        match node {
+            HamtNode::Leaf(entries) => {
+                for entry in entries {
+                    if rows.insert(entry.ordinal, entry.value).is_some() {
+                        return Err("duplicate HAMT row during diff".to_owned());
+                    }
+                }
+            }
+            HamtNode::Branch { children, .. } => {
+                ids.extend(children);
+            }
+        }
+        while let Some(id) = ids.pop() {
+            loaded.push(load_hamt_node(store, id).await?);
+        }
+    }
+    Ok(rows)
 }
 
 fn tuple(key: u64, generation: u64) -> Vec<u8> {
@@ -1452,22 +1838,6 @@ fn tuple(key: u64, generation: u64) -> Vec<u8> {
     out
 }
 
-fn patch_max_entries() -> usize {
-    std::env::var("EXP_LOCAL_PATCH_MAX_ENTRIES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0 && *value <= PAGE_ROWS)
-        .unwrap_or(DEFAULT_PATCH_MAX_ENTRIES)
-}
-
-fn patch_max_bytes() -> usize {
-    std::env::var("EXP_LOCAL_PATCH_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 128 && *value <= 64 * 1024)
-        .unwrap_or(DEFAULT_PATCH_MAX_BYTES)
-}
-
 fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
     match mutation_pattern().as_str() {
         "repeated" => vec![(n / 2) as u64],
@@ -1483,6 +1853,13 @@ fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
             }
             keys.into_iter().collect()
         }
+        "prefix" => {
+            let wanted = generation as usize % HAMT_FANOUT;
+            (0..n as u64)
+                .filter(|ordinal| hamt_slot(&hamt_hash(&state_key(*ordinal)), 0) == wanted)
+                .take(d)
+                .collect()
+        }
         _ => {
             let stride = (n / d.max(1)).max(1);
             (0..d)
@@ -1492,8 +1869,46 @@ fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
     }
 }
 
+fn hamt_codec_controls() {
+    let entries = (0..100u64)
+        .map(|ordinal| HamtEntry {
+            encoded_key: state_key(ordinal),
+            ordinal,
+            value: tuple(ordinal, 0),
+        })
+        .collect::<Vec<_>>();
+    let mut forward = Vec::new();
+    let forward_root = build_hamt_subtree(&entries, 0, &mut forward).unwrap();
+    let mut reversed_entries = entries.clone();
+    reversed_entries.reverse();
+    let mut reverse = Vec::new();
+    let reverse_root = build_hamt_subtree(&reversed_entries, 0, &mut reverse).unwrap();
+    assert_eq!(forward_root, reverse_root);
+
+    let mut malformed_bitmap = b"HMB1".to_vec();
+    malformed_bitmap.extend_from_slice(&1u16.to_be_bytes());
+    malformed_bitmap.push(0);
+    assert!(decode_hamt_node(&malformed_bitmap).is_err());
+
+    let oversized = HamtNode::Leaf(
+        (0..=HAMT_LEAF_MAX as u64)
+            .map(|ordinal| HamtEntry {
+                encoded_key: state_key(ordinal),
+                ordinal,
+                value: tuple(ordinal, 0),
+            })
+            .collect(),
+    );
+    assert!(decode_hamt_node(&encode_hamt_node(&oversized)).is_err());
+
+    let leaf = HamtNode::Leaf(vec![entries[0].clone()]);
+    let mut truncated = encode_hamt_node(&leaf);
+    truncated.pop();
+    assert!(decode_hamt_node(&truncated).is_err());
+}
+
 fn mutation_pattern() -> String {
-    std::env::var("EXP_LOCAL_PATCH_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
+    std::env::var("EXP_HAMT_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
 }
 
 fn map_digest(rows: &BTreeMap<u64, Vec<u8>>) -> ObjectId {
