@@ -12,7 +12,7 @@ pub(crate) struct CommitGraphChange {
     pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot: crate::json_store::JsonSlot,
+    pub(crate) snapshot: crate::changelog::ChangePayload,
     pub(crate) metadata: crate::json_store::JsonSlot,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,

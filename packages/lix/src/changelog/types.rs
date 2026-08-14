@@ -2,7 +2,7 @@ use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::common::{ExactBatch, ExactValue};
 use crate::row_pk::RowPk;
-use crate::json_store::{JsonRef, JsonSlot};
+use crate::json_store::{JsonRef, JsonSlot, JsonSlotRef};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -672,10 +672,120 @@ pub(crate) struct ChangeRecord {
     pub(crate) schema_key: String,
     pub(crate) row_pk: RowPk,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot: JsonSlot,
+    pub(crate) snapshot: ChangePayload,
     pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
+}
+
+/// The single in-memory payload authority for one change.
+///
+/// The durable standalone changelog format remains JSON-only. Registered
+/// Schema-v1 rows use [`ChangePayload::Native`] after their authenticated
+/// row-group has been loaded; they must never be lowered into that legacy
+/// storage format. Keeping deletion as its own variant prevents a missing
+/// JSON slot from being confused with a live native row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChangePayload {
+    Tombstone,
+    Json(JsonSlot),
+    Native(AuthenticatedNativeRow),
+}
+
+impl ChangePayload {
+    pub(crate) fn is_none(&self) -> bool {
+        self.is_deleted()
+    }
+
+    pub(crate) fn is_some(&self) -> bool {
+        !self.is_deleted()
+    }
+
+    pub(crate) fn is_deleted(&self) -> bool {
+        matches!(self, Self::Tombstone)
+    }
+
+    pub(crate) fn native_row(&self) -> Option<&AuthenticatedNativeRow> {
+        match self {
+            Self::Native(row) => Some(row),
+            Self::Tombstone | Self::Json(_) => None,
+        }
+    }
+
+    /// Borrow the legacy JSON representation.
+    ///
+    /// This method intentionally preserves the old `JsonSlot` call surface
+    /// for legacy-only consumers. A native row reaching one is an authority
+    /// violation and fails closed. Storage codecs should use
+    /// [`Self::try_as_ref_slot`] to return a structured error instead.
+    pub(crate) fn as_ref_slot(&self) -> JsonSlotRef<'_> {
+        self.try_as_ref_slot().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub(crate) fn try_as_ref_slot(&self) -> Result<JsonSlotRef<'_>, LixError> {
+        match self {
+            Self::Tombstone => Ok(JsonSlotRef::None),
+            Self::Json(slot) => Ok(slot.as_ref_slot()),
+            Self::Native(_) => Err(LixError::new(
+                "LIX_NATIVE_CHANGE_LEGACY_ENCODING",
+                "authenticated native change payload cannot be encoded in legacy CHANGE_SPACE",
+            )),
+        }
+    }
+
+    pub(crate) fn semantic_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Tombstone, Self::Tombstone) => true,
+            (Self::Json(left), Self::Json(right)) => left == right,
+            (Self::Native(left), Self::Native(right)) => {
+                left.layout_fingerprint == right.layout_fingerprint
+                    && left.semantic_payload_digest == right.semantic_payload_digest
+                    && left.cells == right.cells
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<JsonSlot> for ChangePayload {
+    fn from(slot: JsonSlot) -> Self {
+        match slot {
+            JsonSlot::None => Self::Tombstone,
+            slot => Self::Json(slot),
+        }
+    }
+}
+
+/// A schema-bound typed row loaded from one authenticated row-group member.
+///
+/// Primary-key components are deliberately absent: the canonical StateKey
+/// carried by [`ChangeRecord::row_pk`] is their only authority. `cells` are
+/// non-PK columns in the order authenticated by `layout_fingerprint`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedNativeRow {
+    pub(crate) owner_commit_id: CommitId,
+    pub(crate) row_group_set_id: [u8; 16],
+    pub(crate) manifest_digest: [u8; 32],
+    pub(crate) layout_fingerprint: String,
+    pub(crate) semantic_payload_digest: [u8; 32],
+    pub(crate) cells: Vec<NativeScalarCell>,
+}
+
+/// Lossless Schema-v1 scalar cells.
+///
+/// Floating-point values use their exact IEEE-754 bits. JSON is present only
+/// for a column declared as `jsonb`; it is a cell value, never a whole-row
+/// snapshot or a second row authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeScalarCell {
+    Null,
+    Text(String),
+    Uuid([u8; 16]),
+    Int8(i64),
+    Float8Bits(u64),
+    Boolean(bool),
+    Jsonb(Vec<u8>),
+    Timestamptz(LixTimestamp),
 }
 
 #[derive(musli::Encode)]
@@ -688,9 +798,9 @@ pub(crate) struct ChangeRecordRef<'a> {
     #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<&'a str>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) snapshot: JsonSlotRef<'a>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) metadata: JsonSlotRef<'a>,
     pub(crate) created_at: LixTimestamp,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) origin_key: Option<&'a str>,
@@ -711,26 +821,28 @@ pub(crate) struct TransactionChangeRecordRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) row_pk: &'a RowPk,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) snapshot: JsonSlotRef<'a>,
+    pub(crate) metadata: JsonSlotRef<'a>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<&'a str>,
 }
 
-impl<'a> From<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
-    fn from(record: &'a ChangeRecord) -> Self {
-        Self {
+impl<'a> TryFrom<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
+    type Error = LixError;
+
+    fn try_from(record: &'a ChangeRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
             change_id: record.change_id,
             format_version: record.format_version,
             account_id: &record.account_id,
             schema_key: &record.schema_key,
             row_pk: &record.row_pk,
             file_id: record.file_id.as_deref(),
-            snapshot: record.snapshot.as_ref_slot(),
+            snapshot: record.snapshot.try_as_ref_slot()?,
             metadata: record.metadata.as_ref_slot(),
             created_at: record.created_at,
             origin_key: record.origin_key.as_deref(),
-        }
+        })
     }
 }
 

@@ -19,13 +19,14 @@ pub(crate) fn append_commit_record(
 
 #[cfg(test)]
 pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
+    let snapshot = record.snapshot.try_as_ref_slot()?;
     encode_change_record_ref(&ChangeRecordRef {
         format_version: record.format_version,
         account_id: &record.account_id,
         schema_key: &record.schema_key,
         row_pk: &record.row_pk,
         file_id: record.file_id.as_deref(),
-        snapshot: record.snapshot.as_ref_slot(),
+        snapshot,
         metadata: record.metadata.as_ref_slot(),
         created_at: record.created_at,
         origin_key: record.origin_key.as_deref(),
@@ -36,6 +37,7 @@ pub(crate) fn append_change_record(
     bytes: &mut Vec<u8>,
     record: &ChangeRecord,
 ) -> Result<std::ops::Range<usize>, LixError> {
+    let snapshot = record.snapshot.try_as_ref_slot()?;
     append_change_record_ref(
         bytes,
         &ChangeRecordRef {
@@ -44,7 +46,7 @@ pub(crate) fn append_change_record(
             schema_key: &record.schema_key,
             row_pk: &record.row_pk,
             file_id: record.file_id.as_deref(),
-            snapshot: record.snapshot.as_ref_slot(),
+            snapshot,
             metadata: record.metadata.as_ref_slot(),
             created_at: record.created_at,
             origin_key: record.origin_key.as_deref(),
@@ -115,7 +117,7 @@ pub(crate) fn decode_change_record(
         schema_key: view.schema_key.to_string(),
         row_pk: view.row_pk,
         file_id: view.file_id,
-        snapshot: view.snapshot,
+        snapshot: view.snapshot.into(),
         metadata: view.metadata,
         created_at: view.created_at,
         origin_key: view.origin_key,
@@ -165,7 +167,9 @@ mod tests {
             row_pk: RowPk::from_parts(vec!["part-a".to_string(), "part-b".to_string()])
                 .expect("row pk should build"),
             file_id: Some("file-1".to_string()),
-            snapshot: JsonSlot::Ref(JsonRef::for_content(b"snapshot")),
+            snapshot: super::super::types::ChangePayload::Json(JsonSlot::Ref(
+                JsonRef::for_content(b"snapshot"),
+            )),
             metadata: JsonSlot::Ref(JsonRef::for_content(b"metadata")),
             created_at: LixTimestamp::expect_parse("created_at", "2026-06-10T00:00:00.000Z"),
             origin_key: Some("codec-test-origin".to_string()),
@@ -184,12 +188,17 @@ mod tests {
     #[test]
     fn transaction_change_record_encoding_matches_owned_record() {
         let record = ChangeRecord {
-            snapshot: JsonSlot::from_json("{\"name\":\"libf\\u00f6\\u4e2d\"}"),
+            snapshot: super::super::types::ChangePayload::Json(JsonSlot::from_json(
+                "{\"name\":\"libf\\u00f6\\u4e2d\"}",
+            )),
             metadata: JsonSlot::from_json("{\"k\":1}"),
             ..full_record()
         };
         assert_eq!(
-            encode_transaction_change_record(&TransactionChangeRecordRef::from(&record))
+            encode_transaction_change_record(
+                &TransactionChangeRecordRef::try_from(&record)
+                    .expect("JSON record should borrow"),
+            )
                 .expect("borrowed record should encode"),
             encode_change_record(&record).expect("owned record should encode"),
         );
@@ -200,11 +209,16 @@ mod tests {
         // The Inline slot variant (tag 2) carries the JSON text itself; it
         // must survive encode/decode byte-exactly, including non-ASCII.
         let record = ChangeRecord {
-            snapshot: JsonSlot::from_json("{\"name\":\"libf\u{00f6}\u{4e2d}\"}"),
+            snapshot: super::super::types::ChangePayload::Json(JsonSlot::from_json(
+                "{\"name\":\"libf\u{00f6}\u{4e2d}\"}",
+            )),
             metadata: JsonSlot::from_json("{\"k\":1}"),
             ..full_record()
         };
-        assert!(matches!(record.snapshot, JsonSlot::Inline(_)));
+        assert!(matches!(
+            record.snapshot,
+            super::super::types::ChangePayload::Json(JsonSlot::Inline(_))
+        ));
         let encoded = encode_change_record(&record).expect("record should encode");
         let decoded =
             decode_change_record(&encoded, record.change_id).expect("record should decode");
@@ -215,7 +229,7 @@ mod tests {
     fn change_record_round_trips_with_empty_options() {
         let record = ChangeRecord {
             file_id: None,
-            snapshot: JsonSlot::None,
+            snapshot: super::super::types::ChangePayload::Tombstone,
             metadata: JsonSlot::None,
             origin_key: None,
             ..full_record()
@@ -281,5 +295,74 @@ mod tests {
         let other_id = ChangeId::for_test_label("other-change");
         let decoded = decode_change_record(&encoded, other_id).expect("record should decode");
         assert_eq!(decoded.change_id, other_id);
+    }
+
+    #[test]
+    fn native_change_payload_cannot_enter_legacy_change_space() {
+        let record = ChangeRecord {
+            snapshot: super::super::types::ChangePayload::Native(
+                super::super::types::AuthenticatedNativeRow {
+                    owner_commit_id: CommitId::for_test_label("native-change-owner"),
+                    row_group_set_id: [1; 16],
+                    manifest_digest: [2; 32],
+                    layout_fingerprint: "schema-v1-layout".to_string(),
+                    semantic_payload_digest: [3; 32],
+                    cells: vec![
+                        super::super::types::NativeScalarCell::Text("native".to_string()),
+                        super::super::types::NativeScalarCell::Uuid([4; 16]),
+                        super::super::types::NativeScalarCell::Int8(-7),
+                        super::super::types::NativeScalarCell::Float8Bits(
+                            1.25_f64.to_bits(),
+                        ),
+                        super::super::types::NativeScalarCell::Boolean(true),
+                        super::super::types::NativeScalarCell::Jsonb(br#"{\"k\":1}"#.to_vec()),
+                        super::super::types::NativeScalarCell::Timestamptz(
+                            LixTimestamp::expect_parse(
+                                "native cell timestamp",
+                                "2026-08-14T00:00:00Z",
+                            ),
+                        ),
+                        super::super::types::NativeScalarCell::Null,
+                    ],
+                },
+            ),
+            ..full_record()
+        };
+
+        let error = encode_change_record(&record)
+            .expect_err("native payload must fail closed at legacy codec boundary");
+        assert_eq!(error.code, "LIX_NATIVE_CHANGE_LEGACY_ENCODING");
+        assert!(TransactionChangeRecordRef::try_from(&record).is_err());
+    }
+
+    #[test]
+    fn native_semantic_equality_is_schema_and_digest_bound() {
+        let native = super::super::types::AuthenticatedNativeRow {
+            owner_commit_id: CommitId::for_test_label("native-semantic-owner"),
+            row_group_set_id: [5; 16],
+            manifest_digest: [6; 32],
+            layout_fingerprint: "schema-v1-layout".to_string(),
+            semantic_payload_digest: [7; 32],
+            cells: vec![super::super::types::NativeScalarCell::Int8(42)],
+        };
+        let left = super::super::types::ChangePayload::Native(native.clone());
+        let mut same_semantics_different_storage = native.clone();
+        same_semantics_different_storage.row_group_set_id = [8; 16];
+        same_semantics_different_storage.manifest_digest = [9; 32];
+        let right = super::super::types::ChangePayload::Native(same_semantics_different_storage);
+        assert!(left.semantic_eq(&right));
+
+        let mut wrong_layout = native.clone();
+        wrong_layout.layout_fingerprint = "substituted-layout".to_string();
+        assert!(!left.semantic_eq(&super::super::types::ChangePayload::Native(
+            wrong_layout,
+        )));
+
+        let mut wrong_digest = native;
+        wrong_digest.semantic_payload_digest = [10; 32];
+        assert!(!left.semantic_eq(&super::super::types::ChangePayload::Native(
+            wrong_digest,
+        )));
+        assert!(!left.semantic_eq(&super::super::types::ChangePayload::Tombstone));
     }
 }

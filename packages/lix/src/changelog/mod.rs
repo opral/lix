@@ -32,9 +32,10 @@ pub(crate) use store::{CHANGE_SPACE, COMMIT_SPACE, commit_key};
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::COMMIT_RECORD_FORMAT_VERSION;
 pub(crate) use types::{
-    ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
-    ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord, CommitScanBatch,
-    CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
+    AuthenticatedNativeRow, ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangePayload,
+    ChangeRecord, ChangeScanBatch, ChangeScanRequest, ChangelogAppend, CommitId, CommitLoadBatch,
+    CommitLoadRequest, CommitRecord, CommitScanBatch, CommitScanRequest, NativeScalarCell,
+    TransactionChangeRecordRef, TransactionChangelogAppend,
     commit_row_snapshot_json, next_first_parent_jump,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
