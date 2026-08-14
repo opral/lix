@@ -6,10 +6,13 @@
 use crate::LixError;
 use crate::changelog::CommitId;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor;
+use crate::tracked_state::current_state_envelope::{
+    current_state_descriptor_from_scoped_range_part,
+    scoped_range_part_from_current_state_descriptor,
+};
 use crate::tracked_state::scoped_range::{
-    ScopedRangeCoverageMarker, ScopedRangeRoot, load_scoped_range_coverage,
-    load_scoped_range_coverage_with_staged, stage_replace_scoped_range, stage_scoped_range_tree,
+    ScopedRangeCoverageMarker, ScopedRangeRoot, load_scoped_range_coverage_with_staged,
+    stage_replace_scoped_range, stage_scoped_range_tree, validate_scoped_range_tree_with_staged,
 };
 use crate::tracked_state::types::{
     ColumnarPageSource, CommitDeltaReplacementScope, CommitStateManifest,
@@ -171,13 +174,72 @@ async fn stage_disjoint_columnar_current_state_pages(
         // seed a scope only when absence is certified; an already covered
         // scope waits for the bounded sparse range-rewrite path.
         if let Some(parent) = parent
-            && load_scoped_range_coverage(store, &parent.tree, &prefix)
+            && load_scoped_range_coverage_with_staged(store, writes, &parent.tree, &prefix)
                 .await?
                 .is_some()
         {
-            return Ok(None);
+            let reachable =
+                validate_scoped_range_tree_with_staged(store, writes, &parent.tree).await?;
+            let mut inherited = reachable
+                .parts
+                .iter()
+                .filter(|part| part.scope == prefix)
+                .map(current_state_descriptor_from_scoped_range_part)
+                .collect::<Result<Vec<_>, LixError>>()?;
+            inherited.sort_by(|left, right| left.first_key.cmp(&right.first_key));
+            let overlaps = inherited.iter().any(|old| {
+                descriptors.iter().any(|new| {
+                    old.first_key.as_slice() <= new.last_key.as_slice()
+                        && new.first_key.as_slice() <= old.last_key.as_slice()
+                })
+            });
+            if overlaps {
+                inherited = merge_columnar_current_state_descriptors(
+                    store,
+                    writes,
+                    inherited,
+                    descriptors,
+                )
+                .await?;
+            } else {
+                inherited.extend(descriptors);
+            }
+            inherited.sort_by(|left, right| left.first_key.cmp(&right.first_key));
+            let row_count = inherited.iter().try_fold(0u64, |count, descriptor| {
+                count
+                    .checked_add(u64::from(descriptor.row_count))
+                    .ok_or_else(|| scoped_state_error("columnar scope row count overflows"))
+            })?;
+            let scoped_parts = inherited
+                .iter()
+                .map(|descriptor| {
+                    scoped_range_part_from_current_state_descriptor(&scope, descriptor)
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            let marker = ScopedRangeCoverageMarker {
+                scope: prefix,
+                row_count,
+                part_count: u32::try_from(scoped_parts.len())
+                    .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
+            };
+            let tree = stage_replace_scoped_range(
+                store,
+                writes,
+                &parent.tree,
+                marker,
+                scoped_parts,
+            )
+            .await?
+            .root;
+            return Ok(Some(attest_scoped_range_root(
+                commit_id,
+                parent_manifest.map(|manifest| (manifest.commit_id, parent)),
+                inventory,
+                tree,
+            )?));
         }
-        if !touched_scope_filter_proves_absent(inherited_scope_filter, &scope)? {
+        validate_touched_scope_filter(inherited_scope_filter)?;
+        if !inherited_scope_filter.complete {
             return Ok(None);
         }
         let marker = ScopedRangeCoverageMarker {
@@ -203,6 +265,118 @@ async fn stage_disjoint_columnar_current_state_pages(
         inventory,
         tree,
     )?))
+}
+
+/// Merges an interleaved columnar mutation into one covered scope without
+/// copying either generation's immutable row bodies. Only authenticated row
+/// identities are decoded; the resulting descriptors retain exact source
+/// coordinates. An update keeps the previous current-state `created_at`
+/// while taking the new authored `updated_at` and body.
+async fn merge_columnar_current_state_descriptors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    inherited: Vec<CurrentStatePartDescriptor>,
+    authored: Vec<CurrentStatePartDescriptor>,
+) -> Result<Vec<CurrentStatePartDescriptor>, LixError> {
+    #[derive(Clone)]
+    struct LocatedRow {
+        descriptor: CurrentStatePartDescriptor,
+        source_index: u16,
+        row: crate::tracked_state::current_state_data_part::CurrentStateDataRow,
+    }
+
+    let mut rows = std::collections::BTreeMap::<Vec<u8>, LocatedRow>::new();
+    for descriptor in inherited {
+        let loaded = crate::tracked_state::storage::load_scoped_current_state_descriptor_rows(
+            store,
+            writes,
+            &descriptor,
+        )
+        .await?;
+        for (index, row) in loaded.into_iter().enumerate() {
+            let source_index = u16::try_from(index)
+                .map_err(|_| scoped_state_error("current-state source index exceeds u16"))?;
+            if rows
+                .insert(
+                    row.encoded_key.clone(),
+                    LocatedRow {
+                        descriptor: descriptor.clone(),
+                        source_index,
+                        row,
+                    },
+                )
+                .is_some()
+            {
+                return Err(scoped_state_error(
+                    "inherited current-state scope contains duplicate identities",
+                ));
+            }
+        }
+    }
+    for descriptor in authored {
+        let loaded = crate::tracked_state::storage::load_scoped_current_state_descriptor_rows(
+            store,
+            writes,
+            &descriptor,
+        )
+        .await?;
+        for (index, mut row) in loaded.into_iter().enumerate() {
+            let source_index = u16::try_from(index)
+                .map_err(|_| scoped_state_error("current-state source index exceeds u16"))?;
+            if let Some(previous) = rows.get(&row.encoded_key) {
+                row.value.created_at = previous.row.value.created_at;
+            }
+            let mut retained = descriptor.clone();
+            let CurrentStatePartSource::ColumnarPage(source) = &mut retained.source else {
+                return Err(scoped_state_error(
+                    "columnar current-state merge received a non-columnar authored source",
+                ));
+            };
+            source.uniform_created_at = row.value.created_at;
+            source.uniform_updated_at = row.value.updated_at;
+            rows.insert(
+                row.encoded_key.clone(),
+                LocatedRow {
+                    descriptor: retained,
+                    source_index,
+                    row,
+                },
+            );
+        }
+    }
+
+    let mut merged = Vec::<CurrentStatePartDescriptor>::new();
+    for located in rows.into_values() {
+        let absolute_offset = located
+            .descriptor
+            .source_row_offset
+            .checked_add(located.source_index)
+            .ok_or_else(|| scoped_state_error("current-state source offset overflows"))?;
+        if let Some(previous) = merged.last_mut()
+            && previous.content_digest == located.descriptor.content_digest
+            && previous.source == located.descriptor.source
+            && previous
+                .source_row_offset
+                .checked_add(previous.row_count)
+                == Some(absolute_offset)
+        {
+            previous.last_key = located.row.encoded_key;
+            previous.row_count = previous
+                .row_count
+                .checked_add(1)
+                .ok_or_else(|| scoped_state_error("current-state merged part overflows"))?;
+            previous.fragmented = true;
+            continue;
+        }
+        let mut descriptor = located.descriptor;
+        descriptor.first_key = located.row.encoded_key.clone();
+        descriptor.last_key = located.row.encoded_key;
+        descriptor.source_row_offset = absolute_offset;
+        descriptor.row_count = 1;
+        descriptor.fragmented = true;
+        merged.push(descriptor);
+    }
+    Ok(merged)
 }
 
 /// Proves one collection has never been authored in the certified linear
@@ -655,7 +829,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         ));
     }
     let parent_root = serving_base.and_then(|parent| parent.current_state_scoped_ranges);
-    let touched = crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
+    let mut touched = crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
         commit_id,
         inventory,
         serving_base.is_none(),
@@ -701,10 +875,69 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     let touched_scope_filter =
         extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
 
-    let (initial_root, mut certified_rows) = match certified_body {
+    let (initial_root, certified_members, mut certified_rows) = match certified_body {
         Some(certified) => certified.into_publication_parts(writes, commit_id, inventory)?,
-        None => (None, std::collections::BTreeMap::new()),
+        None => (None, Vec::new(), std::collections::BTreeMap::new()),
     };
+    let mut cleared_scopes = std::collections::BTreeSet::new();
+    let mut cascade_file_ids = std::collections::BTreeSet::new();
+    let mut certified_scopes = std::collections::BTreeSet::new();
+    for (encoded_key, row) in &certified_rows {
+        let key = crate::tracked_state::codec::decode_key(encoded_key)?;
+        certified_scopes.insert(CommitDeltaReplacementScope {
+            schema_key: key.schema_key.clone(),
+            file_id: key.file_id.clone(),
+        });
+        if key.schema_key == "lix_file_descriptor" && row.is_none() {
+            cascade_file_ids.insert(key.row_pk.as_single_string_owned().map_err(|error| {
+                scoped_state_error(format!(
+                    "file descriptor tombstone has invalid identity: {error}"
+                ))
+            })?);
+        }
+        if key.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+            let (schema_key, file_id) =
+                crate::collection_generation::collection_scope_from_row_pk(&key.row_pk)?;
+            cleared_scopes.insert(CommitDeltaReplacementScope {
+                schema_key,
+                file_id,
+            });
+        }
+    }
+    if !cascade_file_ids.is_empty()
+        && let Some(parent_root) = parent_root
+    {
+        let reachable =
+            validate_scoped_range_tree_with_staged(store, writes, &parent_root.tree).await?;
+        for part in reachable.parts {
+            let key = crate::tracked_state::codec::decode_key(&part.first_key)?;
+            if key
+                .file_id
+                .as_ref()
+                .is_some_and(|file_id| cascade_file_ids.contains(file_id))
+            {
+                cleared_scopes.insert(CommitDeltaReplacementScope {
+                    schema_key: key.schema_key,
+                    file_id: key.file_id,
+                });
+            }
+        }
+    }
+    // A physical mutation part may span several schema/file scopes even
+    // though its same-publication body certificate enumerates every authored
+    // identity exactly. Recover those exact scopes from the private
+    // certificate instead of dropping the serving root. Owner-side cascade
+    // handling above additionally clears every authenticated file/scope run
+    // retired by descriptor or generation semantics before sparse authored
+    // post-images are applied.
+    if !certified_scopes.is_empty() || !cleared_scopes.is_empty() {
+        let mut exact = touched.take().unwrap_or_default();
+        exact.extend(certified_scopes);
+        exact.extend(cleared_scopes.iter().cloned());
+        exact.sort();
+        exact.dedup();
+        touched = Some(exact);
+    }
     if let Some(initial_root) = initial_root {
         if parent_root.is_some() || graph_parents.len() > 1 || selected_source.is_some() {
             return Err(scoped_state_error(
@@ -807,17 +1040,21 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     }
     touched.sort();
     touched.dedup();
-    let staged_segments = crate::tracked_state::storage::staged_commit_delta_segment_bytes(
-        writes, commit_id, inventory,
-    )?;
-    let members = crate::tracked_state::storage::staged_commit_delta_members(
-        store,
-        commit_id,
-        account_id,
-        inventory,
-        staged_segments,
-    )
-    .await?;
+    let members = if certified_members.is_empty() {
+        let staged_segments = crate::tracked_state::storage::staged_commit_delta_segment_bytes(
+            writes, commit_id, inventory,
+        )?;
+        crate::tracked_state::storage::staged_commit_delta_members(
+            store,
+            commit_id,
+            account_id,
+            inventory,
+            staged_segments,
+        )
+        .await?
+    } else {
+        certified_members
+    };
     let mut members_by_scope = std::collections::BTreeMap::<
         CommitDeltaReplacementScope,
         Vec<crate::tracked_state::storage::CommitDeltaMember>,
@@ -835,6 +1072,28 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             .push(member);
     }
     let mut tree = parent_root.tree.clone();
+    for scope in &cleared_scopes {
+        let prefix =
+            crate::tracked_state::current_state_envelope::current_state_scope_prefix(scope)?;
+        if load_scoped_range_coverage_with_staged(store, writes, &tree, &prefix)
+            .await?
+            .is_some()
+        {
+            tree = stage_replace_scoped_range(
+                store,
+                writes,
+                &tree,
+                ScopedRangeCoverageMarker {
+                    scope: prefix,
+                    row_count: 0,
+                    part_count: 0,
+                },
+                Vec::new(),
+            )
+            .await?
+            .root;
+        }
+    }
     for scope in touched {
         let prefix =
             crate::tracked_state::current_state_envelope::current_state_scope_prefix(&scope)?;
@@ -842,7 +1101,8 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             .await?
             .is_none()
         {
-            if !touched_scope_filter_proves_absent(&inherited_scope_filter, &scope)? {
+            validate_touched_scope_filter(&inherited_scope_filter)?;
+            if !inherited_scope_filter.complete {
                 return Ok(CertifiedCommitStatePhysicalPublication {
                     write_set_id: writes.identity(),
                     commit_id,
@@ -977,6 +1237,7 @@ fn scoped_state_error(message: impl std::fmt::Display) -> LixError {
 mod tests {
     use bytes::Bytes;
 
+    use crate::LixError;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::json_store::JsonSlotRef;
@@ -990,9 +1251,11 @@ mod tests {
         stage_scoped_range_part_splice, stage_scoped_range_tree, validate_scoped_range_tree,
     };
     use crate::tracked_state::storage::{
-        CertifiedCommitStateTopologyParent, CommitDeltaReplacementGeneration,
-        PublishedCommitStateManifest, load_complete_current_state_values_from_scoped_root,
-        load_published_commit_state_manifest, sparse_current_state_materialization_count_for_test,
+        CertifiedAuthoredCurrentStateBody, CertifiedCommitStateTopologyParent,
+        CommitDeltaReplacementGeneration, OrderedAddressableCommitDeltaStage,
+        PublishedCommitStateManifest, certify_authored_current_state_body,
+        load_complete_current_state_values_from_scoped_root, load_published_commit_state_manifest,
+        sparse_current_state_materialization_count_for_test,
         stage_certified_commit_state_manifest, stage_certified_commit_state_manifest_with_handle,
         stage_current_state_scoped_ranges_from_published_parent,
         stage_current_state_scoped_ranges_from_staged_parent,
@@ -1047,6 +1310,40 @@ mod tests {
             file_id: None,
             row_pk: row,
         }))
+    }
+
+    async fn certify_fixture_body<'a>(
+        store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+        writes: &mut crate::storage_adapter::StorageWriteSet,
+        stage: &OrderedAddressableCommitDeltaStage,
+        deltas: &[TrackedStateCommitDeltaRef<'a>],
+    ) -> Option<CertifiedAuthoredCurrentStateBody> {
+        let adjusted = deltas
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, mut delta)| {
+                if let Some(change_id) = stage.change_id_at(index) {
+                    delta.delta.change_id = change_id;
+                }
+                delta
+            })
+            .collect::<Vec<_>>();
+        certify_authored_current_state_body(
+            store,
+            writes,
+            deltas
+                .first()
+                .expect("fixture body requires at least one delta")
+                .delta
+                .commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            stage.mutation_inventory(),
+            false,
+            adjusted,
+        )
+        .await
+        .expect("fixture authored bodies should certify")
     }
 
     async fn publish_replacement_scope(
@@ -1270,13 +1567,22 @@ mod tests {
         )
         .expect("sparse mutations should stage")
         .expect("sparse mutations should be addressable");
-        let child_publication = stage_current_state_scoped_ranges_from_published_parent(
+        let child_body = certify_fixture_body(
             &parent_read,
             &mut child_writes,
-            Some(&parent),
+            &child_stage,
+            &changes,
+        )
+        .await;
+        let child_publication = stage_current_state_scoped_ranges_from_topology(
+            &parent_read,
+            &mut child_writes,
+            &[CertifiedCommitStateTopologyParent::Published(&parent)],
+            None,
             child_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             child_stage.mutation_inventory(),
+            child_body,
         )
         .await
         .expect("sparse post-image should path-copy");
@@ -1440,13 +1746,22 @@ mod tests {
         )
         .expect("certified sparse mutation should stage")
         .expect("certified sparse mutation should be addressable");
-        let certified = stage_current_state_scoped_ranges_from_published_parent(
+        let certified_body = certify_fixture_body(
             &read,
             &mut certified_writes,
-            Some(&parent),
+            &certified_stage,
+            &[change],
+        )
+        .await;
+        let certified = stage_current_state_scoped_ranges_from_topology(
+            &read,
+            &mut certified_writes,
+            &[CertifiedCommitStateTopologyParent::Published(&parent)],
+            None,
             child_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             certified_stage.mutation_inventory(),
+            certified_body,
         )
         .await
         .expect("certified absent scope should seed an authenticated marker");
@@ -1516,13 +1831,16 @@ mod tests {
         )
         .expect("multi-scope mutations should stage")
         .expect("multi-scope mutations should be addressable");
-        let publication = stage_current_state_scoped_ranges_from_published_parent(
+        let certified_body = certify_fixture_body(&read, &mut writes, &staged, &changes).await;
+        let publication = stage_current_state_scoped_ranges_from_topology(
             &read,
             &mut writes,
-            Some(&beta),
+            &[CertifiedCommitStateTopologyParent::Published(&beta)],
+            None,
             child_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             staged.mutation_inventory(),
+            certified_body,
         )
         .await
         .expect("both scope rewrites should see earlier staged nodes");
@@ -1629,13 +1947,17 @@ mod tests {
         )
         .expect("first child mutation should stage")
         .expect("first child mutation should be addressable");
-        let first_publication = stage_current_state_scoped_ranges_from_published_parent(
+        let first_body =
+            certify_fixture_body(&read, &mut writes, &first_stage, &[first_change]).await;
+        let first_publication = stage_current_state_scoped_ranges_from_topology(
             &read,
             &mut writes,
-            Some(&base),
+            &[CertifiedCommitStateTopologyParent::Published(&base)],
+            None,
             first_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             first_stage.mutation_inventory(),
+            first_body,
         )
         .await
         .expect("first child root should stage");
@@ -1661,6 +1983,8 @@ mod tests {
         )
         .expect("second child mutation should stage")
         .expect("second child mutation should be addressable");
+        let second_body =
+            certify_fixture_body(&read, &mut writes, &second_stage, &[second_change]).await;
         let second_publication = stage_current_state_scoped_ranges_from_staged_parent(
             &read,
             &mut writes,
@@ -1668,7 +1992,7 @@ mod tests {
             second_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             second_stage.mutation_inventory(),
-            None,
+            second_body,
         )
         .await
         .expect("staged child must read its parent's staged scoped nodes");
@@ -1869,7 +2193,7 @@ mod tests {
         unknown.selected_source_commit_id = Some(*selected_id.as_uuid().as_bytes());
         let selected = manifest(selected_id, None, CommitStateMutationInventory::default());
         let mut writes = storage.new_write_set();
-        let publication = stage_current_state_scoped_ranges(
+        let error = match stage_current_state_scoped_ranges(
             &read,
             &mut writes,
             &[],
@@ -1880,8 +2204,11 @@ mod tests {
             &unknown,
         )
         .await
-        .unwrap();
-        assert!(publication.root().is_none());
+        {
+            Ok(_) => panic!("selected history without an authenticated source root must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
 
         let left = RowPk::single("a");
         let right = RowPk::single("z");
@@ -1893,7 +2220,7 @@ mod tests {
             replacement_part: None,
         });
         let mut writes = storage.new_write_set();
-        let publication = stage_current_state_scoped_ranges(
+        let error = match stage_current_state_scoped_ranges(
             &read,
             &mut writes,
             &[],
@@ -1904,11 +2231,11 @@ mod tests {
             &broad,
         )
         .await
-        .unwrap();
-        assert!(
-            publication.root().is_none(),
-            "cross-scope mutation must not inherit serving authority"
-        );
+        {
+            Ok(_) => panic!("broad history without an authenticated source root must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
     }
 
     #[tokio::test]

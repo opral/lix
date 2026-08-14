@@ -206,12 +206,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
-    Box::pin(validate_active_account_and_account_rows(
-        read,
-        &prepared_writes,
-        active_account_id,
-    ))
-    .await?;
+    validate_active_account_and_account_rows(read, &prepared_writes, active_account_id).await?;
     Box::pin(validate_account_deletions(
         read,
         &prepared_writes,
@@ -6701,11 +6696,15 @@ fn merge_parent_commit_ids(mut base: Vec<CommitId>, extra: Vec<CommitId>) -> Vec
     base
 }
 
-async fn validate_active_account_and_account_rows(
-    read: &mut impl StorageAdapterRead,
-    prepared_writes: &PreparedWriteSet,
-    active_account_id: &str,
-) -> Result<(), LixError> {
+fn validate_active_account_and_account_rows<'a, R>(
+    read: &'a mut R,
+    prepared_writes: &'a PreparedWriteSet,
+    active_account_id: &'a str,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+where
+    R: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(async move {
     let account_pk = RowPk::uuid_from_canonical(active_account_id).map_err(|_| {
         LixError::new(
             "LIX_INVALID_ACCOUNT_ID",
@@ -6774,7 +6773,8 @@ async fn validate_active_account_and_account_rows(
         ));
     }
 
-    validate_prepared_account_rows(prepared_writes)
+        validate_prepared_account_rows(prepared_writes)
+    })
 }
 
 /// Shape rules for account rows carried by this commit. These read nothing and

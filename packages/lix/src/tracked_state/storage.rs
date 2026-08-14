@@ -1416,10 +1416,11 @@ async fn hydrate_authored_history_members(
                 member.key.schema_key, state.commit_id
             ))
         })?;
-        if row.value != member.value
-            || history_body_digest(row.snapshot.as_ref_slot(), row.metadata.as_ref_slot())
-                != member.body_digest
-        {
+        if !authored_history_body_matches_current_row(
+            &row,
+            &member.value,
+            member.body_digest,
+        ) {
             return Err(replacement_payload_error(
                 "authored history body disagrees with its identity or semantic digest",
             ));
@@ -1486,10 +1487,7 @@ async fn hydrate_loaded_history_entries(
                 entry.change_record.schema_key, state.commit_id
             ))
         })?;
-        if row.value != entry.value
-            || history_body_digest(row.snapshot.as_ref_slot(), row.metadata.as_ref_slot())
-                != entry.body_digest
-        {
+        if !authored_history_body_matches_current_row(&row, &entry.value, entry.body_digest) {
             return Err(replacement_payload_error(
                 "authored history body disagrees with its identity or semantic digest",
             ));
@@ -1498,6 +1496,26 @@ async fn hydrate_loaded_history_entries(
         entry.change_record.metadata = row.metadata;
     }
     Ok(())
+}
+
+fn authored_history_body_matches_current_row(
+    row: &crate::tracked_state::current_state_data_part::CurrentStateDataRow,
+    history_value: &TrackedStateIndexValue,
+    body_digest: [u8; 32],
+) -> bool {
+    // A current-state post-image preserves the row's original lifecycle
+    // `created_at`, whereas each authored history member records the time of
+    // that particular change. The exact change/commit back-edge, deletion
+    // state, update time and native body digest are the authentication
+    // identity shared by both representations; requiring equal `created_at`
+    // would reject every valid update after sparse path-copy preserves the
+    // original row timestamp.
+    row.value.change_id == history_value.change_id
+        && row.value.commit_id == history_value.commit_id
+        && row.value.deleted == history_value.deleted
+        && row.value.updated_at == history_value.updated_at
+        && history_body_digest(row.snapshot.as_ref_slot(), row.metadata.as_ref_slot())
+            == body_digest
 }
 
 /// Uses a manifest returned by [`load_commit_state_manifest`] or
@@ -3229,6 +3247,7 @@ pub(crate) struct CertifiedAuthoredCurrentStateBody {
     mutation_authority_digest: [u8; 32],
     staged_member_closure_digest: [u8; 32],
     initial_root: Option<CurrentStateScopedRangeRoot>,
+    members: Vec<CommitDeltaMember>,
     rows: BTreeMap<Vec<u8>, Option<crate::tracked_state::current_state_data_part::CurrentStateDataRow>>,
 }
 
@@ -3240,6 +3259,7 @@ impl CertifiedAuthoredCurrentStateBody {
         inventory: &CommitStateMutationInventory,
     ) -> Result<(
         Option<CurrentStateScopedRangeRoot>,
+        Vec<CommitDeltaMember>,
         BTreeMap<Vec<u8>, Option<crate::tracked_state::current_state_data_part::CurrentStateDataRow>>,
     ), LixError> {
         if self.write_set_id != writes.identity()
@@ -3263,7 +3283,7 @@ impl CertifiedAuthoredCurrentStateBody {
                 commit_id, inventory, root,
             )?;
         }
-        Ok((self.initial_root, self.rows))
+        Ok((self.initial_root, self.members, self.rows))
     }
 }
 
@@ -3458,6 +3478,7 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
             super::scoped_current_state::current_state_mutation_authority_digest(inventory)?,
         staged_member_closure_digest: staged_member_closure_digest(writes, commit_id, inventory)?,
         initial_root,
+        members: staged_members,
         rows: certified_rows,
     }))
 }
@@ -3687,7 +3708,7 @@ fn stage_scoped_current_state_bytes(
     Ok(())
 }
 
-async fn load_scoped_current_state_descriptor_rows(
+pub(super) async fn load_scoped_current_state_descriptor_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     descriptor: &CurrentStatePartDescriptor,
