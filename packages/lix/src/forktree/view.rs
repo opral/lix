@@ -402,6 +402,14 @@ where
         super::serving::state_range(self, lower, upper, limit, include_tombstones).await
     }
 
+    pub(crate) async fn live_count(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<u64, StorageError> {
+        super::serving::state_live_count(self, lower, upper).await
+    }
+
     /// Resolves disjoint canonical ranges through one retained authenticated
     /// tree walk. Output slots correspond to input ranges and each slot is in
     /// intrinsic state-key order.

@@ -7138,7 +7138,7 @@ fn schema_range_bounds(schema_key: &str) -> (Vec<u8>, Option<Vec<u8>>) {
     let empty_row_pk = RowPk {
         components: crate::row_pk::RowPkComponents::Empty,
     };
-    let lower = crate::forktree::encode_state_entity_prefix(schema_key, &empty_row_pk);
+    let lower = crate::forktree::encode_state_row_prefix(schema_key, &empty_row_pk);
     let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
     (lower, upper)
 }
@@ -8527,6 +8527,7 @@ mod tests {
                     encode_state_value(StateValueRef {
                         pack_object_id: location.pack_object_id,
                         pack_ordinal: location.pack_ordinal,
+                        tombstone: false,
                     })
                     .expect("global native fixture state value"),
                     StateMutationAudit {

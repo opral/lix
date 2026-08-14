@@ -316,6 +316,14 @@ where
             .map(|rows| rows.into_iter().map(StateRow::from_committed).collect())
     }
 
+    pub(crate) async fn live_count(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<u64, StorageError> {
+        self.view.live_count(lower, upper).await
+    }
+
     /// Resolves exact keys from another branch through a borrowed coherent
     /// view. The branch view reuses this view's retained read; it never
     /// refreshes the selector or opens a second storage operation.
@@ -544,6 +552,27 @@ impl<R> TransactionStateView<R>
 where
     R: StorageAdapterRead,
 {
+    pub(crate) async fn live_count_if_unmodified(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<Option<u64>, StorageError> {
+        let staged_in_range = self.staged.iter().any(|row| {
+            !lower.is_some_and(|lower| row.key.as_slice() < lower)
+                && !upper.is_some_and(|upper| row.key.as_slice() >= upper)
+        });
+        let removed_overlap = self.removed_local_ranges.iter().any(|(removed_lower, removed_upper)| {
+            !upper.is_some_and(|upper| removed_lower.as_slice() >= upper)
+                && !removed_upper
+                    .as_deref()
+                    .is_some_and(|removed_upper| lower.is_some_and(|lower| removed_upper <= lower))
+        });
+        if staged_in_range || removed_overlap {
+            return Ok(None);
+        }
+        self.committed.live_count(lower, upper).await.map(Some)
+    }
+
     pub(crate) fn branch_id(&self) -> String {
         self.committed.branch_id()
     }

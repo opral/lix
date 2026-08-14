@@ -61,6 +61,7 @@ struct ReceiptEntrySummary {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TreeSummary {
     entry_count: u64,
+    live_count: u64,
     logical_bytes: u64,
     contiguous_prefix_bytes: u64,
     first_part: Option<u64>,
@@ -101,6 +102,13 @@ struct Node {
 pub(crate) struct OrderedTreeRoot {
     pub(crate) object_id: ObjectId,
     pub(crate) entry_count: u64,
+    pub(crate) live_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OrderedTreeRangeSummary {
+    pub(crate) entry_count: u64,
+    pub(crate) live_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -456,6 +464,7 @@ where
     let next_root = OrderedTreeRoot {
         object_id: next_root.id,
         entry_count: next_root.summary.entry_count,
+        live_count: next_root.summary.live_count,
     };
     retain_reachable_new_nodes(next_root.object_id, kind, &mut objects)?;
     Ok(OrderedTreeEdit {
@@ -509,6 +518,7 @@ where
     let next_root = OrderedTreeRoot {
         object_id: next.id,
         entry_count: next.summary.entry_count,
+        live_count: next.summary.live_count,
     };
     if next_root.entry_count
         != root
@@ -923,6 +933,7 @@ where
     Ok(OrderedTreeRoot {
         object_id: root,
         entry_count: node.summary.entry_count,
+        live_count: node.summary.live_count,
     })
 }
 
@@ -956,6 +967,7 @@ pub(super) fn validate_root_bytes(
     Ok(OrderedTreeRoot {
         object_id: root,
         entry_count: node.summary.entry_count,
+        live_count: node.summary.live_count,
     })
 }
 
@@ -1091,6 +1103,98 @@ where
     }
     if output.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(corruption("ordered-tree range is not globally ordered"));
+    }
+    Ok(output)
+}
+
+/// Authenticates a half-open state-key range and returns its raw/live
+/// cardinality. Fully enclosed child subtrees contribute their summaries
+/// directly; only the two boundary paths are decoded. The live count is part
+/// of every state node's content-addressed bytes and is recomputed from the
+/// leaf's authenticated tombstone-bearing state references.
+pub(super) async fn summarize_state_range_on_read<R>(
+    root: ObjectId,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    read: &R,
+) -> Result<OrderedTreeRangeSummary, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if lower.zip(upper).is_some_and(|(lower, upper)| lower > upper) {
+        return Err(corruption("ordered-tree range bounds are inverted"));
+    }
+    let mut output = OrderedTreeRangeSummary::default();
+    let mut frontier = vec![(root, None, None::<Vec<u8>>)];
+    while let Some((id, expected, minimum_exclusive)) = frontier.pop() {
+        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        validate_loaded_node(id, &node, TreeKind::State, expected.as_ref())?;
+        if expected.is_none() && lower.is_none() && upper.is_none() {
+            output.entry_count = node.summary.entry_count;
+            output.live_count = node.summary.live_count;
+            continue;
+        }
+        match node.body {
+            NodeBody::Leaf(entries) => {
+                for entry in entries {
+                    if lower.is_some_and(|lower| entry.key.as_slice() < lower) {
+                        continue;
+                    }
+                    if upper.is_some_and(|upper| entry.key.as_slice() >= upper) {
+                        break;
+                    }
+                    let value = super::state::decode_state_value(&entry.value)
+                        .map_err(|error| corruption(error.to_string()))?;
+                    output.entry_count = output
+                        .entry_count
+                        .checked_add(1)
+                        .ok_or_else(|| corruption("state range entry count overflows u64"))?;
+                    output.live_count = output
+                        .live_count
+                        .checked_add(u64::from(!value.tombstone))
+                        .ok_or_else(|| corruption("state range live count overflows u64"))?;
+                }
+            }
+            NodeBody::Internal(children) => {
+                let mut prior_max = minimum_exclusive;
+                for child in children {
+                    let below = lower.is_some_and(|lower| child.max_key.as_slice() < lower);
+                    let above = upper.is_some_and(|upper| {
+                        prior_max
+                            .as_deref()
+                            .is_some_and(|minimum| minimum >= upper)
+                    });
+                    if !below && !above {
+                        let lower_inside = lower.is_none()
+                            || prior_max
+                                .as_deref()
+                                .is_some_and(|minimum| minimum >= lower.unwrap());
+                        let upper_inside = upper
+                            .is_none_or(|upper| child.max_key.as_slice() < upper);
+                        if lower_inside && upper_inside {
+                            output.entry_count = output
+                                .entry_count
+                                .checked_add(child.summary.entry_count)
+                                .ok_or_else(|| {
+                                    corruption("state range entry count overflows u64")
+                                })?;
+                            output.live_count = output
+                                .live_count
+                                .checked_add(child.summary.live_count)
+                                .ok_or_else(|| {
+                                    corruption("state range live count overflows u64")
+                                })?;
+                        } else {
+                            frontier.push((child.id, Some(child.clone()), prior_max.clone()));
+                        }
+                    }
+                    prior_max = Some(child.max_key);
+                }
+            }
+        }
+    }
+    if output.live_count > output.entry_count {
+        return Err(corruption("state range live count exceeds entry count"));
     }
     Ok(output)
 }
@@ -2144,6 +2248,7 @@ fn build_tree(kind: TreeKind, entries: &[LeafEntry]) -> Result<TreeBuild, Storag
         root: OrderedTreeRoot {
             object_id: root.id,
             entry_count: root.summary.entry_count,
+            live_count: root.summary.live_count,
         },
         objects,
     })
@@ -2566,6 +2671,7 @@ fn decode_node(id: ObjectId, bytes: &[u8]) -> Result<Node, StorageError> {
 
 fn encode_summary(encoder: &mut Encoder, summary: TreeSummary) {
     encoder.u64(summary.entry_count);
+    encoder.u64(summary.live_count);
     encoder.u64(summary.logical_bytes);
     encoder.u64(summary.contiguous_prefix_bytes);
     encode_optional_u64(encoder, summary.first_part);
@@ -2576,8 +2682,9 @@ fn encode_summary(encoder: &mut Encoder, summary: TreeSummary) {
 }
 
 fn decode_summary(decoder: &mut Decoder<'_>) -> Result<TreeSummary, StorageError> {
-    Ok(TreeSummary {
+    let summary = TreeSummary {
         entry_count: decoder.u64()?,
+        live_count: decoder.u64()?,
         logical_bytes: decoder.u64()?,
         contiguous_prefix_bytes: decoder.u64()?,
         first_part: decode_optional_u64(decoder, "first part")?,
@@ -2593,7 +2700,11 @@ fn decode_summary(decoder: &mut Decoder<'_>) -> Result<TreeSummary, StorageError
                 )));
             }
         },
-    })
+    };
+    if summary.live_count > summary.entry_count {
+        return Err(corruption("tree live count exceeds entry count"));
+    }
+    Ok(summary)
 }
 
 fn encode_optional_u64(encoder: &mut Encoder, value: Option<u64>) {
@@ -2624,8 +2735,20 @@ fn summary_from_entries(
     entries: &[LeafEntry],
 ) -> Result<TreeSummary, StorageError> {
     if kind != TreeKind::Receipt {
+        let live_count = if kind == TreeKind::State {
+            entries.iter().try_fold(0_u64, |total, entry| {
+                let value = super::state::decode_state_value(&entry.value)
+                    .map_err(|error| corruption(error.to_string()))?;
+                total
+                    .checked_add(u64::from(!value.tombstone))
+                    .ok_or_else(|| corruption("tree live count overflows u64"))
+            })?
+        } else {
+            entries.len() as u64
+        };
         return Ok(TreeSummary {
             entry_count: entries.len() as u64,
+            live_count,
             fully_contiguous: true,
             ..TreeSummary::default()
         });
@@ -2657,6 +2780,11 @@ fn summary_from_children(
                 total
                     .checked_add(child.summary.entry_count)
                     .ok_or_else(|| corruption("tree entry count overflows u64"))
+            })?,
+            live_count: children.iter().try_fold(0_u64, |total, child| {
+                total
+                    .checked_add(child.summary.live_count)
+                    .ok_or_else(|| corruption("tree live count overflows u64"))
             })?,
             fully_contiguous: true,
             ..TreeSummary::default()
@@ -2714,6 +2842,7 @@ fn summary_from_part_ranges(parts: &[(u64, u64, u64)]) -> Result<TreeSummary, St
         .ok_or_else(|| corruption("receipt byte range overflows u64"))?;
     Ok(TreeSummary {
         entry_count: parts.len() as u64,
+        live_count: parts.len() as u64,
         logical_bytes,
         contiguous_prefix_bytes: if first.0 == 0 && first.1 == 0 {
             prefix_end
@@ -2764,6 +2893,7 @@ fn combine_receipt_summaries(
     let last = summaries[summaries.len() - 1];
     Ok(TreeSummary {
         entry_count,
+        live_count: entry_count,
         logical_bytes,
         contiguous_prefix_bytes: if first.first_part == Some(0) && first.first_offset == 0 {
             prefix_end

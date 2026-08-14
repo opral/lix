@@ -249,6 +249,52 @@ impl<R> RowSpec<R>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    async fn authenticated_zero_projection_count(
+        &self,
+        request: &EntityScanRequest,
+    ) -> Result<Option<usize>> {
+        if request.filter.rows != EntityRowSelection::All
+            || request.filter.include_tombstones
+            || request.filter.untracked.is_some()
+            || !request.filter.file_ids.is_empty()
+            || !request.filter.row_pks.is_empty()
+            || !request.filter.constraints.is_empty()
+            || request.filter.branch_ids.len() != 1
+        {
+            return Ok(None);
+        }
+        let (lower, upper) = crate::sql2::entity_batch::schema_bounds(request)
+            .map_err(lix_error_to_datafusion_error)?;
+        let count = if let Some(state_view) = &self.state_view {
+            if request.filter.branch_ids[0] != state_view.branch_id() {
+                return Ok(None);
+            }
+            state_view
+                .live_count(lower.as_deref(), upper.as_deref())
+                .await
+                .map_err(|error| lix_error_to_datafusion_error(error.into()))?
+        } else if let Some(write_ctx) = &self.write_ctx {
+            if request.filter.branch_ids[0] != write_ctx.active_branch_id() {
+                return Ok(None);
+            }
+            let Some(count) = write_ctx
+                .state_view()
+                .live_count_if_unmodified(lower.as_deref(), upper.as_deref())
+                .await
+                .map_err(|error| lix_error_to_datafusion_error(error.into()))?
+            else {
+                return Ok(None);
+            };
+            count
+        } else {
+            return Ok(None);
+        };
+        let count = usize::try_from(count).map_err(|_| {
+            DataFusionError::Execution("native row row count exceeds usize".to_string())
+        })?;
+        Ok(Some(request.limit.map_or(count, |limit| count.min(limit))))
+    }
+
     fn active(
         spec: Arc<SchemaSurfaceSpec>,
         state_view: ForkTreeStateView<R>,
@@ -1114,6 +1160,17 @@ where
                         )?;
                         return Ok(batch);
                     } else {
+                        if schema.fields().is_empty()
+                            && row_filters.is_empty()
+                            && let Some(row_count) = provider
+                                .authenticated_zero_projection_count(&request)
+                                .await?
+                        {
+                            let options = RecordBatchOptions::new()
+                                .with_row_count(Some(row_count));
+                            return RecordBatch::try_new_with_options(schema, vec![], &options)
+                                .map_err(DataFusionError::from);
+                        }
                         let slots = provider
                             .scan_rows(&request)
                             .await

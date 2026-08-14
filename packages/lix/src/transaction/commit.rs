@@ -28,7 +28,7 @@ use crate::forktree::{
     CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
     PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCell, StateKey,
     StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValue, StateValueRef,
-    encode_current_state_packs, encode_state_entity_prefix_bounds, encode_state_key,
+    encode_current_state_packs, encode_state_row_prefix_bounds, encode_state_key,
     encode_state_value, introduced_checkpoint_marker, load_commit, load_commit_summary,
     open_coherent_view_on_read, select_historical_commit_members, state_points,
 };
@@ -303,7 +303,7 @@ where
                 ));
             }
             let bounds =
-                encode_state_entity_prefix_bounds(first.schema_key.as_str(), &RowPk::empty());
+                encode_state_row_prefix_bounds(first.schema_key.as_str(), &RowPk::empty());
             Ok((bounds.lower, bounds.upper))
         })
         .transpose()?;
@@ -455,6 +455,7 @@ where
             let encoded = encode_state_value(StateValueRef {
                 pack_object_id: location.pack_object_id,
                 pack_ordinal: location.pack_ordinal,
+                tombstone: row.snapshot.is_none(),
             })?;
             let audit = StateMutationAudit {
                 commit_id: *commit_id.as_uuid().as_bytes(),
@@ -1364,6 +1365,7 @@ where
                         let encoded = encode_state_value(StateValueRef {
                             pack_object_id: location.pack_object_id,
                             pack_ordinal: location.pack_ordinal,
+                            tombstone,
                         })?;
                         let audit = StateMutationAudit {
                             commit_id: *draft.commit_id.as_uuid().as_bytes(),
@@ -2099,7 +2101,7 @@ fn collection_delete_range(
     if file_id.is_some() {
         return Ok(None);
     }
-    let bounds = encode_state_entity_prefix_bounds(&schema_key, &RowPk::empty());
+    let bounds = encode_state_row_prefix_bounds(&schema_key, &RowPk::empty());
     Ok(Some((bounds.lower, bounds.upper)))
 }
 

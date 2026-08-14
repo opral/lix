@@ -6,7 +6,7 @@ use crate::LixError;
 use crate::common::{LixTimestamp, SharedStr};
 use crate::row_pk::{RowPk, RowPkComponent};
 
-const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x02";
+const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x03";
 const CURRENT_STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFCV\0\x02";
 const MAX_BLOB_ROOTS_PER_STATE_ROW: usize = AUTHENTICATED_EDGE_PAGE_ENTRIES;
 
@@ -48,6 +48,7 @@ pub(crate) struct CanonicalPrefixBounds {
 pub(crate) struct StateValueRef {
     pub(crate) pack_object_id: ObjectId,
     pub(crate) pack_ordinal: u32,
+    pub(crate) tombstone: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,10 +359,11 @@ pub(crate) fn encode_state_value(value: StateValueRef) -> Result<Vec<u8>, LixErr
     if value.pack_object_id == ObjectId::ZERO {
         return Err(state_error("state value pack object id is zero"));
     }
-    let mut output = Vec::with_capacity(STATE_VALUE_MAGIC.len() + 32 + 4);
+    let mut output = Vec::with_capacity(STATE_VALUE_MAGIC.len() + 32 + 4 + 1);
     output.extend_from_slice(STATE_VALUE_MAGIC);
     output.extend_from_slice(value.pack_object_id.as_bytes());
     output.extend_from_slice(&value.pack_ordinal.to_be_bytes());
+    output.push(u8::from(value.tombstone));
     Ok(output)
 }
 
@@ -372,10 +374,20 @@ pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValueRef, LixError
         return Err(state_error("state value pack object id is zero"));
     }
     let pack_ordinal = decoder.u32("state pack ordinal")?;
+    let tombstone = match decoder.take(1, "state tombstone tag")?[0] {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(state_error(format!(
+                "state value tombstone tag {value} is invalid"
+            )));
+        }
+    };
     decoder.finish("state value")?;
     Ok(StateValueRef {
         pack_object_id,
         pack_ordinal,
+        tombstone,
     })
 }
 
