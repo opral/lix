@@ -1143,16 +1143,24 @@ fn selected_change_count_after_authored_shadow(
     state_row_indices: &[RowIndex],
     batches: &[StagedCommitChangeBatch],
 ) -> usize {
-    selected_changes(batches)
-        .filter(|change_ref| {
-            !selected_change_is_shadowed_by_authored_row(
-                *change_ref,
-                commit_id,
-                state_rows,
-                state_row_indices,
-            )
-        })
+    selected_changes_after_authored_shadow(commit_id, state_rows, state_row_indices, batches)
         .count()
+}
+
+fn selected_changes_after_authored_shadow<'a>(
+    commit_id: CommitId,
+    state_rows: &'a PreparedStateBatch,
+    state_row_indices: &'a [RowIndex],
+    batches: &'a [StagedCommitChangeBatch],
+) -> impl Iterator<Item = StagedCommitChangeRef<'a>> + 'a {
+    selected_changes(batches).filter(move |change_ref| {
+        !selected_change_is_shadowed_by_authored_row(
+            *change_ref,
+            commit_id,
+            state_rows,
+            state_row_indices,
+        )
+    })
 }
 
 fn dense_selected_source_is_exact<'a>(
@@ -2591,14 +2599,12 @@ async fn stage_tracked_commit_delta_index(
             // not need standalone change locators in the public ledger.
             addressable.push(false);
         }
-        for change_ref in selected_changes(&staged.selected_change_batches).filter(|change_ref| {
-            !selected_change_is_shadowed_by_authored_row(
-                *change_ref,
-                root.commit_id,
-                state_rows,
-                state_row_indices,
-            )
-        }) {
+        for change_ref in selected_changes_after_authored_shadow(
+            root.commit_id,
+            state_rows,
+            state_row_indices,
+            &staged.selected_change_batches,
+        ) {
             *selected_members_by_source
                 .entry(change_ref.source_commit_id)
                 .or_default() += 1;
@@ -2625,10 +2631,15 @@ async fn stage_tracked_commit_delta_index(
                 "lix.perf.commit_delta_selected_sources"
             );
         }
+        let effective_selected_count = selected_change_count_after_authored_shadow(
+            root.commit_id,
+            state_rows,
+            state_row_indices,
+            &staged.selected_change_batches,
+        );
         let selected_source_alias = if certified_root_rows.is_empty()
             && selected_members_by_source.len() == 1
-            && selected_members_by_source.values().sum::<usize>()
-                == selected_change_count(&staged.selected_change_batches)
+            && selected_members_by_source.values().sum::<usize>() == effective_selected_count
         {
             let source_commit_id = *selected_members_by_source
                 .first_key_value()
@@ -2643,12 +2654,17 @@ async fn stage_tracked_commit_delta_index(
                 .is_some_and(|source| {
                     if source.selected_source_commit_id.is_some()
                         || usize::try_from(source.member_count).ok()
-                            != Some(selected_change_count(&staged.selected_change_batches))
+                            != Some(effective_selected_count)
                     {
                         return false;
                     }
                     if source.direct_segment_row_counts.is_empty() {
-                        let selected = selected_changes(&staged.selected_change_batches)
+                        let selected = selected_changes_after_authored_shadow(
+                            root.commit_id,
+                            state_rows,
+                            state_row_indices,
+                            &staged.selected_change_batches,
+                        )
                             .map(|change_ref| {
                                 (
                                     encode_key_ref(TrackedStateKeyRef {
@@ -2688,7 +2704,12 @@ async fn stage_tracked_commit_delta_index(
                             .selected_change_batches
                             .iter()
                             .all(StagedCommitChangeBatch::source_membership_certified),
-                        selected_changes(&staged.selected_change_batches),
+                        selected_changes_after_authored_shadow(
+                            root.commit_id,
+                            state_rows,
+                            state_row_indices,
+                            &staged.selected_change_batches,
+                        ),
                     )
                 })
                 .then_some(source_commit_id)
@@ -3492,14 +3513,12 @@ async fn build_lifecycle_tracked_snapshots(
                 ),
             )
         })?;
-        for change_ref in selected_changes(&staged.selected_change_batches).filter(|change_ref| {
-            !selected_change_is_shadowed_by_authored_row(
-                *change_ref,
-                root.commit_id,
-                state_rows,
-                row_indices,
-            )
-        }) {
+        for change_ref in selected_changes_after_authored_shadow(
+            root.commit_id,
+            state_rows,
+            row_indices,
+            &staged.selected_change_batches,
+        ) {
             let key = selected_change_key(change_ref);
             let source = prepared_by_identity.get(&key.identity);
             let payload = selected_payloads.get(&key);
@@ -3900,15 +3919,12 @@ async fn stage_tracked_head(
         let selected_materialization = if !staged.selected_change_batches.is_empty()
             && !tracked_snapshots.contains_key(&root.commit_id)
         {
-            let selected_rows = selected_changes(&staged.selected_change_batches)
-                .filter(|change_ref| {
-                    !selected_change_is_shadowed_by_authored_row(
-                        *change_ref,
-                        root.commit_id,
-                        state_rows,
-                        state_row_indices,
-                    )
-                })
+            let selected_rows = selected_changes_after_authored_shadow(
+                root.commit_id,
+                state_rows,
+                state_row_indices,
+                &staged.selected_change_batches,
+            )
                 .map(|change_ref| {
                     let key = selected_change_key(change_ref);
                     lifecycle_selected_tracked_row(
@@ -4412,7 +4428,12 @@ async fn stage_tracked_head(
             &selected_materialization
         {
             tracked_deltas.extend(
-                selected_changes(&staged.selected_change_batches)
+                selected_changes_after_authored_shadow(
+                    root.commit_id,
+                    state_rows,
+                    state_row_indices,
+                    &staged.selected_change_batches,
+                )
                     .zip(selected_rows)
                     .zip(selected_snapshots.iter().zip(selected_metadata))
                     .map(|((change_ref, row), (snapshot, metadata))| {
@@ -6133,15 +6154,12 @@ async fn stage_tracked_roots(
                     .map(tracked_delta_from_certified_root_row),
             )
             .chain(
-                selected_changes(&staged.selected_change_batches)
-                    .filter(|change_ref| {
-                        !selected_change_is_shadowed_by_authored_row(
-                            *change_ref,
-                            root.commit_id,
-                            state_rows,
-                            state_row_indices,
-                        )
-                    })
+                selected_changes_after_authored_shadow(
+                    root.commit_id,
+                    state_rows,
+                    state_row_indices,
+                    &staged.selected_change_batches,
+                )
                     .map(|change_ref| {
                         tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
                     }),
@@ -7591,13 +7609,31 @@ mod tests {
     #[test]
     fn selected_change_refs_allow_authored_rows_to_shadow_selected_rows() {
         let row = tracked_global_row("normal-change");
+        let rows = prepared_rows![row];
+        let mixed = vec![
+            selected_change_batch("selected-shadowed", "entity-1"),
+            selected_change_batch("selected-retained", "entity-2"),
+        ];
         validate_selected_change_refs(
             commit_id("test-uuid-1"),
-            &prepared_rows![row],
+            &rows,
             &[0],
-            &[selected_change_batch("selected-change", "entity-1")],
+            &mixed,
         )
         .expect("an authored row must shadow a selected row with the same identity");
+        let effective = selected_changes_after_authored_shadow(
+            commit_id("test-uuid-1"),
+            &rows,
+            &[0],
+            &mixed,
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].change_id, change_id("selected-retained"));
+        assert_eq!(
+            effective[0].entity_pk(),
+            &EntityPk::single("entity-2")
+        );
 
         let row = tracked_global_row("normal-change");
         validate_selected_change_refs(
