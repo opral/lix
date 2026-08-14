@@ -244,14 +244,14 @@ pub(crate) fn normalize_raw_write_row_in_place(
 }
 
 fn normalized_row_facts(
-    rows: &RawWriteBatch,
+    rows: &mut RawWriteBatch,
     row_index: usize,
     schema_plan_id: SchemaPlanId,
     relational_schema: &lix_schema::Schema,
     facts: PreparedRowFacts,
 ) -> Result<NormalizedRowFacts, LixError> {
     let row = rows.row(row_index);
-    let native_row = row
+    let native = row
         .snapshot
         .map(|snapshot| {
             let entity_pk = row.entity_pk.ok_or_else(|| {
@@ -260,19 +260,35 @@ fn normalized_row_facts(
                     "normalized native row is missing its entity identity",
                 )
             })?;
-            crate::native_row::encode(
+            let native = crate::native_row::encode(
                 relational_schema,
                 entity_pk,
-                if row.global {
-                    crate::GLOBAL_BRANCH_ID
-                } else {
-                    row.branch_id.as_str()
-                },
+                row.global,
                 row.file_id.map(AsRef::as_ref),
                 snapshot.value(),
-            )
+            )?;
+            let canonical = crate::native_row::logical_value(
+                relational_schema,
+                entity_pk,
+                row.global,
+                row.file_id.map(AsRef::as_ref),
+                &native,
+            )?;
+            Ok::<_, LixError>((native, canonical))
         })
         .transpose()?;
+    let (native_row, canonical_snapshot) = native
+        .map(|(native, canonical)| (Some(native), Some(canonical)))
+        .unwrap_or((None, None));
+    if let Some(canonical) = canonical_snapshot {
+        rows.set_snapshot(
+            row_index,
+            Some(TransactionJson::from_value(
+                canonical,
+                "canonical native row snapshot",
+            )?),
+        );
+    }
     Ok(NormalizedRowFacts {
         schema_plan_id,
         facts,

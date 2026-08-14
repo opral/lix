@@ -68,16 +68,15 @@ impl EntityPk {
     }
 }
 
-pub(crate) fn native_row_owner_digest(
-    branch_id: &str,
+pub(crate) fn state_identity_digest(
+    global: bool,
     schema_key: &str,
     entity_pk: &EntityPk,
     file_id: Option<&str>,
 ) -> [u8; 32] {
     let mut owner = blake3::Hasher::new();
-    owner.update(b"lix.forktree.schema-v1.native-row-owner.v1\0");
-    owner.update(&(branch_id.len() as u64).to_be_bytes());
-    owner.update(branch_id.as_bytes());
+    owner.update(b"lix.forktree.schema-v1.native-row-owner.v2\0");
+    owner.update(&[u8::from(global)]);
     owner.update(&(schema_key.len() as u64).to_be_bytes());
     owner.update(schema_key.as_bytes());
     match file_id {

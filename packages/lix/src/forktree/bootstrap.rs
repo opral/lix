@@ -93,13 +93,26 @@ where
     let mut add_row = |schema_key: &str,
                        file_id: Option<&str>,
                        entity_pk: EntityPk,
-                       snapshot: serde_json::Value|
+                       mut snapshot: serde_json::Value|
      -> Result<(), LixError> {
         let change_uuid = functions.call_uuid_v7();
         let change_id = ChangelogChangeId::new(change_uuid);
         let local = schema_key == crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
             || (schema_key == KEY_VALUE_SCHEMA_KEY
                 && entity_pk.as_single_string().is_ok_and(|key| key == PLUGIN_REGISTRY_KEY));
+        let schema = crate::native_row::seed_schema(schema_key)?;
+        let serde_json::Value::Array(primary_key) = entity_pk.as_json_array_value()? else {
+            unreachable!("typed entity primary key always encodes as an array")
+        };
+        let object = snapshot.as_object_mut().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("bootstrap row '{schema_key}' is not an object"),
+            )
+        })?;
+        for (name, value) in schema.primary_key.iter().zip(primary_key) {
+            object.insert(name.clone(), value);
+        }
         let encoded_snapshot = JsonSlot::Inline(snapshot.to_string().into());
         let key = encode_state_key(StateKeyRef {
             schema_key,
@@ -261,7 +274,7 @@ where
                         JsonSlot::Inline(_) => StateCell::NativeRow(crate::native_row::encode(
                             &crate::native_row::seed_schema(&row.schema_key)?,
                             &row.entity_pk,
-                            branch_id,
+                            branch_id == crate::GLOBAL_BRANCH_ID,
                             row.file_id.as_deref(),
                             &row.native_snapshot,
                         )?),

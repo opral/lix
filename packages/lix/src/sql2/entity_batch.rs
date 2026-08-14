@@ -357,9 +357,11 @@ fn slot_branch_sort_key(slot: &EntityStateSlot) -> String {
     match slot {
         EntityStateSlot::Tracked(row) => match row.source {
             crate::state::StateRowSource::Global => crate::GLOBAL_BRANCH_ID.to_string(),
-            crate::state::StateRowSource::Branch | crate::state::StateRowSource::Staged => {
+            crate::state::StateRowSource::Branch
+            | crate::state::StateRowSource::StagedBranch => {
                 String::new()
             }
+            crate::state::StateRowSource::StagedGlobal => crate::GLOBAL_BRANCH_ID.to_string(),
         },
         EntityStateSlot::TrackedAt { branch_id, .. } => branch_id.clone(),
     }

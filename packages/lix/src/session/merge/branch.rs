@@ -174,6 +174,7 @@ where
                 let analysis = super::analysis::analyze(
                     &facade,
                     &active_branch_id,
+                    transaction.sql_schema_snapshot(),
                     MergeCommits {
                         base_commit_id: merge_base,
                         target_commit_id: target_head,
@@ -308,6 +309,7 @@ where
             let analysis = super::analysis::analyze(
                 &facade,
                 &active_branch_id,
+                transaction.sql_schema_snapshot(),
                 MergeCommits {
                     base_commit_id: merge_base,
                     target_commit_id: target_head,

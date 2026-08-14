@@ -46,6 +46,7 @@ impl MergeAnalysis {
 pub(crate) async fn analyze<S>(
     facade: &ForkTreeReadFacade<S>,
     branch_id: &str,
+    catalog: &crate::catalog::CatalogSnapshot,
     commits: MergeCommits,
 ) -> Result<MergeAnalysis, LixError>
 where
@@ -80,13 +81,19 @@ where
         )
     };
     let state_view = ForkTreeStateView::new(view);
-    let mut source_diff = load_forktree_diff(&state_view, &base, &source).await?;
+    let mut source_diff = load_forktree_diff(&state_view, catalog, &base, &source).await?;
     let mut target_diff = if commits.base_commit_id == commits.source_commit_id
         || commits.base_commit_id == commits.target_commit_id
     {
         MergeDiff::default()
     } else {
-        load_forktree_diff(&state_view, &base, target.as_ref().expect("target loaded")).await?
+        load_forktree_diff(
+            &state_view,
+            catalog,
+            &base,
+            target.as_ref().expect("target loaded"),
+        )
+        .await?
     };
     exclude_internal_checkpoint_markers(&mut source_diff);
     exclude_internal_checkpoint_markers(&mut target_diff);
@@ -131,6 +138,7 @@ fn native_commit_id(value: CommitId) -> crate::forktree::CommitId {
 
 async fn load_forktree_diff<S>(
     view: &ForkTreeStateView<&S>,
+    catalog: &crate::catalog::CatalogSnapshot,
     base: &crate::forktree::CommitObjectV1,
     side: &crate::forktree::CommitObjectV1,
 ) -> Result<MergeDiff, LixError>
@@ -187,13 +195,29 @@ where
             // bytes and lifecycle directly instead of comparing storage planes.
             let snapshot_matches = match (&record.snapshot, &state.cell) {
                 (crate::json_store::JsonSlot::None, crate::forktree::StateCell::Tombstone) => true,
-                (crate::json_store::JsonSlot::Inline(value), crate::forktree::StateCell::Null) => {
-                    value.as_ref() == "null"
-                }
                 (
                     crate::json_store::JsonSlot::Inline(expected),
-                    crate::forktree::StateCell::Value(actual),
-                ) => expected.as_ref() == actual.as_str(),
+                    crate::forktree::StateCell::NativeRow(native),
+                ) => {
+                    let global = value.source == crate::forktree::StateSource::Global;
+                    let expected_digest = crate::native_row::semantic_digest_text(expected).ok();
+                    catalog
+                        .plan_for_key(&entry.key.schema_key)
+                        .and_then(|(_, plan)| {
+                            crate::native_row::logical_value(
+                                &plan.relational_schema,
+                                &entry.key.entity_pk,
+                                global,
+                                entry.key.file_id.as_deref(),
+                                native,
+                            )
+                            .ok()
+                        })
+                        .zip(expected_digest)
+                        .is_some_and(|(value, expected_digest)| {
+                            crate::native_row::semantic_digest(&value) == expected_digest
+                        })
+                }
                 _ => false,
             };
             let metadata_matches = match (&record.metadata, state.metadata.as_deref()) {

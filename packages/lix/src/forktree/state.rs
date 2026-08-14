@@ -7,7 +7,7 @@ use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::{EntityPk, EntityPkComponent};
 
 const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x02";
-const CURRENT_STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFCV\0\x01";
+const CURRENT_STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFCV\0\x02";
 const MAX_BLOB_ROOTS_PER_STATE_ROW: usize = AUTHENTICATED_EDGE_PAGE_ENTRIES;
 
 const KEY_ESCAPE: u8 = 0xff;
@@ -135,11 +135,11 @@ impl StateCell {
     pub(crate) fn seed_logical_text(
         &self,
         key: &StateKey,
-        branch_id: &str,
+        global: bool,
     ) -> Result<Option<crate::common::SharedStr>, crate::LixError> {
         match self {
             Self::NativeRow(native) => {
-                crate::native_row::logical_text_for_seed(key, branch_id, native).map(Some)
+                crate::native_row::logical_text_for_seed(key, global, native).map(Some)
             }
             Self::Value(_) => Err(crate::LixError::new(
                 crate::LixError::CODE_STORAGE_ERROR,
@@ -153,7 +153,10 @@ impl StateCell {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeRowCell {
     pub(crate) layout_id: [u8; 32],
-    pub(crate) owner_branch_id: [u8; 16],
+    /// Stable authenticated state domain. The selected global/local root
+    /// authenticates visibility; local rows remain shareable across branch
+    /// creation without embedding a mutable branch UUID.
+    pub(crate) global: bool,
     pub(crate) owner_digest: [u8; 32],
     pub(crate) semantic_digest: [u8; 32],
     pub(crate) body: bytes::Bytes,
@@ -392,7 +395,7 @@ pub(super) fn encode_current_state_value(value: &StateValue) -> Result<Vec<u8>, 
         StateCell::NativeRow(value) => {
             output.push(3);
             output.extend_from_slice(&value.layout_id);
-            output.extend_from_slice(&value.owner_branch_id);
+            output.push(u8::from(value.global));
             output.extend_from_slice(&value.owner_digest);
             output.extend_from_slice(&value.semantic_digest);
             put_bytes(&mut output, &value.body)?;
@@ -742,14 +745,18 @@ impl<'a> ValueDecoder<'a> {
             2 => Ok(StateCell::Tombstone),
             3 => {
                 let layout_id = self.fixed_32(field)?;
-                let owner_branch_id = self.fixed_16(field)?;
+                let global = match self.take(1, field)?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(state_error(format!("{field} has invalid owner domain"))),
+                };
                 let owner_digest = self.fixed_32(field)?;
                 let semantic_digest = self.fixed_32(field)?;
                 let length = self.u32(field)? as usize;
                 let body = bytes::Bytes::copy_from_slice(self.take(length, field)?);
                 Ok(StateCell::NativeRow(NativeRowCell {
                     layout_id,
-                    owner_branch_id,
+                    global,
                     owner_digest,
                     semantic_digest,
                     body,
@@ -815,4 +822,64 @@ impl<'a> ValueDecoder<'a> {
 
 fn state_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
+}
+
+#[cfg(test)]
+mod current_state_v2_tests {
+    use super::*;
+
+    fn native_value() -> StateValue {
+        StateValue {
+            change_id: crate::changelog::ChangeId::new(
+                uuid::Uuid::parse_str("01950000-0000-7000-8000-000000000001").unwrap(),
+            ),
+            commit_id: crate::changelog::CommitId::new(
+                uuid::Uuid::parse_str("01950000-0000-7000-8000-000000000002").unwrap(),
+            ),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.001Z"),
+            cell: StateCell::NativeRow(NativeRowCell {
+                layout_id: [1; 32],
+                global: false,
+                owner_digest: [2; 32],
+                semantic_digest: [3; 32],
+                body: bytes::Bytes::from_static(b"native-body"),
+            }),
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn current_state_v2_rejects_v1_unknown_domain_truncation_and_trailing_bytes() {
+        let encoded = encode_current_state_value(&native_value()).expect("v2 encodes");
+        assert_eq!(decode_current_state_value(&encoded).unwrap(), native_value());
+
+        let mut v1 = encoded.clone();
+        v1[7] = 1;
+        assert!(decode_current_state_value(&v1).is_err());
+
+        // magic + change + commit + created_at + updated_at + cell tag + layout
+        let domain_offset = 8 + 16 + 16 + 8 + 8 + 1 + 32;
+        let mut unknown_domain = encoded.clone();
+        unknown_domain[domain_offset] = 2;
+        assert!(decode_current_state_value(&unknown_domain).is_err());
+
+        assert!(decode_current_state_value(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_current_state_value(&trailing).is_err());
+    }
+
+    #[test]
+    fn current_state_v2_rejects_removed_value_and_null_tags() {
+        let encoded = encode_current_state_value(&native_value()).expect("v2 encodes");
+        let cell_tag_offset = 8 + 16 + 16 + 8 + 8;
+        for tag in [0, 1] {
+            let mut removed = encoded.clone();
+            removed[cell_tag_offset] = tag;
+            assert!(decode_current_state_value(&removed).is_err());
+        }
+    }
 }

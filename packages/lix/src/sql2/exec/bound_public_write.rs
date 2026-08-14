@@ -127,11 +127,7 @@ impl NativeStateRow {
             StateCell::NativeRow(native) => Some(crate::native_row::logical_text(
                 spec.native_schema.as_ref(),
                 &key.entity_pk,
-                if row.source == StateRowSource::Global {
-                    crate::GLOBAL_BRANCH_ID
-                } else {
-                    branch_id
-                },
+                row.source == StateRowSource::Global,
                 key.file_id.as_deref(),
                 &native,
             )?),

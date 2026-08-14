@@ -309,6 +309,7 @@ fn bind_state_blob_ref(
         &row.value.blob_manifest_object_ids,
         expected_key,
         branch_id,
+        row.source == super::serving::StateSource::Global,
         view_id,
         view_instance_id,
     )
@@ -320,6 +321,7 @@ fn bind_state_blob_ref_parts(
     manifest_object_ids: &[ObjectId],
     expected_key: Option<&StateKey>,
     branch_id: CanonicalBranchId,
+    global: bool,
     view_id: [u8; 32],
     view_instance_id: u64,
 ) -> Result<AuthenticatedBlobRef, crate::LixError> {
@@ -347,7 +349,7 @@ fn bind_state_blob_ref_parts(
         StateCell::NativeRow(native) => crate::native_row::logical_text(
             &crate::native_row::seed_schema(&key.schema_key)?,
             &key.entity_pk,
-            &uuid::Uuid::from_bytes(*branch_id.as_bytes()).to_string(),
+            global,
             key.file_id.as_deref(),
             native,
         )?,
@@ -492,6 +494,7 @@ where
                     &value.blob_manifest_object_ids,
                     Some(key),
                     self.branch_id(),
+                    global,
                     self.view_id(),
                     self.view_instance_id(),
                 )
