@@ -2086,6 +2086,20 @@ fn decode_internal_v4(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
             Some(first_key.clone()),
             &mut boundary_arena,
         )?;
+        if boundary_arena[first_key.clone()] > boundary_arena[last_key.clone()] {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node child has an inverted key range",
+            ));
+        }
+        if previous_last.as_ref().is_some_and(|previous_last| {
+            boundary_arena[previous_last.clone()] >= boundary_arena[first_key.clone()]
+        }) {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node children overlap or are unordered",
+            ));
+        }
         let child_hash = <[u8; TRACKED_STATE_HASH_BYTES]>::try_from(slice(
             body,
             &mut offset,
@@ -2198,6 +2212,38 @@ mod tests {
         DecodedNodeRef as NodeRefForLeafTests, decode_node_ref as decode_node_ref_for_leaf_tests,
         encode_leaf_node_refs as encode_leaf_refs_for_tests,
     };
+
+    fn encode_unchecked_internal_boundaries(children: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut encoded = vec![NODE_KIND_INTERNAL_V4];
+        write_varint(&mut encoded, children.len() as u64);
+        let mut previous_last = &[][..];
+        for (index, (first_key, last_key)) in children.iter().enumerate() {
+            write_front_coded(&mut encoded, previous_last, first_key);
+            write_front_coded(&mut encoded, first_key, last_key);
+            encoded.extend_from_slice(&[index as u8 + 1; TRACKED_STATE_HASH_BYTES]);
+            write_varint(&mut encoded, 1);
+            previous_last = last_key;
+        }
+        encoded
+    }
+
+    #[test]
+    fn internal_node_rejects_reordered_sibling_ranges() {
+        let encoded = encode_unchecked_internal_boundaries(&[
+            (b"schema-z/a", b"schema-z/z"),
+            (b"schema-a/a", b"schema-a/z"),
+        ]);
+        let error = decode_node_ref(&encoded).expect_err("reordered siblings must fail closed");
+        assert!(error.message.contains("overlap or are unordered"));
+    }
+
+    #[test]
+    fn internal_node_rejects_inverted_child_range() {
+        let encoded =
+            encode_unchecked_internal_boundaries(&[(b"schema-z/z", b"schema-z/a")]);
+        let error = decode_node_ref(&encoded).expect_err("inverted range must fail closed");
+        assert!(error.message.contains("inverted key range"));
+    }
 
     fn raw_value(change: u8, commit: u8, tail: u8) -> Vec<u8> {
         let mut value = Vec::with_capacity(VALUE_MAX_BYTES);
