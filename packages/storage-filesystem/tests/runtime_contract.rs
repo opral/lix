@@ -1,6 +1,8 @@
 use lix::{Value, open_lix};
 use lix_storage_filesystem::FilesystemStorage;
 
+fn assert_send<T: Send>(_: T) {}
+
 #[test]
 fn open_and_start_sync_work_under_plain_block_on() {
     let root = tempfile::tempdir().expect("temporary filesystem root");
@@ -14,7 +16,8 @@ fn open_and_start_sync_work_under_plain_block_on() {
             .with_storage(storage.clone())
             .await
             .expect("open Lix under plain block_on");
-        let sync = storage
+        assert_send(storage.start_sync(&lix));
+        storage
             .start_sync(&lix)
             .await
             .expect("start sync under plain block_on");
@@ -28,7 +31,10 @@ fn open_and_start_sync_work_under_plain_block_on() {
             .expect("read synchronized file");
         assert_eq!(result.rows().len(), 1);
 
-        drop(sync);
+        storage
+            .stop_sync()
+            .await
+            .expect("stop sync under plain block_on");
         lix.close().await.expect("close Lix");
     });
 }

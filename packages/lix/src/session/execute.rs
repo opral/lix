@@ -2055,6 +2055,25 @@ where
         result
     }
 
+    pub(crate) fn execute_coherent_read_batch_owned(
+        self: Arc<Self>,
+        statements: Vec<(String, Vec<Value>)>,
+    ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
+        // SAFETY: the future owns its Arc session and every SQL/parameter
+        // payload. Storage read handles are Send by the Storage contract; the
+        // compiler obstruction is the higher-ranked shared reference carried
+        // by borrowing adapters such as RocksDB snapshots.
+        unsafe {
+            super::AssumeSendFuture::new(async move {
+                let statement_refs = statements
+                    .iter()
+                    .map(|(sql, params)| (sql.as_str(), params.as_slice()))
+                    .collect::<Vec<_>>();
+                self.execute_coherent_read_batch(&statement_refs).await
+            })
+        }
+    }
+
     async fn execute_coherent_read_batch_inner(
         &self,
         statements: &[(&str, &[Value])],
