@@ -134,6 +134,21 @@ fn run_corruption_controls() {
     bad_chunk_index[last_ref..last_ref + 2].copy_from_slice(&1u16.to_be_bytes());
     assert!(parse_ordinal_directory(&bad_chunk_index).is_err());
 
+    let chunk_entry = directory[28..69].to_vec();
+    let row_refs = directory[69..].to_vec();
+    let mut duplicate_chunk = directory[..28].to_vec();
+    duplicate_chunk[26..28].copy_from_slice(&2u16.to_be_bytes());
+    duplicate_chunk.extend_from_slice(&chunk_entry);
+    duplicate_chunk.extend_from_slice(&chunk_entry);
+    duplicate_chunk.extend_from_slice(&row_refs);
+    assert!(parse_ordinal_directory(&duplicate_chunk).is_err());
+
+    let mut duplicate_row = directory.clone();
+    duplicate_row[22..26].copy_from_slice(&2u32.to_be_bytes());
+    duplicate_row.extend_from_slice(&0u16.to_be_bytes());
+    duplicate_row.extend_from_slice(&0u32.to_be_bytes());
+    assert!(parse_ordinal_directory(&duplicate_row).is_err());
+
     let mut substituted = chunk.clone();
     let last = substituted.len() - 1;
     substituted[last] ^= 1;
@@ -612,9 +627,9 @@ async fn authenticate_referenced_chunks<S: Storage>(
         let parsed = parse_chunk(&value).expect("authenticate referenced chunk");
         assert_eq!(parsed.schema, schema, "referenced chunk schema mismatch");
         assert_eq!(parsed.ordinal, ordinal, "referenced chunk ordinal mismatch");
-        assert!(
-            referenced_rows <= parsed.row_count,
-            "ordinal-directory row index out of bounds"
+        assert_eq!(
+            referenced_rows, parsed.row_count,
+            "ordinal-directory membership count mismatch"
         );
     }
 }
@@ -951,7 +966,7 @@ fn descriptors(commit: usize, width: usize) -> Vec<u8> {
 
 fn descriptor(commit: usize, row: usize) -> [u8; DESCRIPTOR_BYTES] {
     let mut out = [0u8; DESCRIPTOR_BYTES];
-    out[0] = (row % SCHEMAS) as u8;
+    out[0] = (row % active_schemas()) as u8;
     out[1..9].copy_from_slice(&(commit as u64).to_be_bytes());
     out[9..17].copy_from_slice(&(row as u64).to_be_bytes());
     let hash = blake3::hash(&out[..17]);
