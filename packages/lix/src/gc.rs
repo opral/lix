@@ -14,7 +14,9 @@ use crate::branch::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
     branch_head_control_precondition,
 };
-use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
+use crate::changelog::{
+    ChangeId, ChangePayload, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet,
+};
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
 #[cfg(any(test, feature = "storage-benches"))]
@@ -1343,10 +1345,11 @@ where
     .await?
     .values()
     {
-        for slot in [&record.snapshot, &record.metadata] {
-            if let JsonSlot::Ref(json_ref) = slot {
-                live.insert(*json_ref.as_hash_array());
-            }
+        if let ChangePayload::Json(JsonSlot::Ref(json_ref)) = &record.snapshot {
+            live.insert(*json_ref.as_hash_array());
+        }
+        if let JsonSlot::Ref(json_ref) = &record.metadata {
+            live.insert(*json_ref.as_hash_array());
         }
     }
 
@@ -2387,10 +2390,11 @@ where
 
 #[cfg(test)]
 fn collect_change_payload_hashes(change: &ChangeRecord, hashes: &mut BTreeSet<[u8; 32]>) {
-    for slot in [&change.snapshot, &change.metadata] {
-        if let JsonSlot::Ref(json_ref) = slot {
-            hashes.insert(*json_ref.as_hash_array());
-        }
+    if let ChangePayload::Json(JsonSlot::Ref(json_ref)) = &change.snapshot {
+        hashes.insert(*json_ref.as_hash_array());
+    }
+    if let JsonSlot::Ref(json_ref) = &change.metadata {
+        hashes.insert(*json_ref.as_hash_array());
     }
 }
 
@@ -6146,7 +6150,7 @@ mod tests {
             row_pk: RowPk::single(row_label),
             schema_key: "authority_gc".to_string(),
             file_id: None,
-            snapshot,
+            snapshot: ChangePayload::from(snapshot),
             metadata: JsonSlot::None,
             created_at: LixTimestamp::expect_parse(
                 "authority GC change timestamp",

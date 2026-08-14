@@ -106,7 +106,9 @@ pub(crate) async fn seed_branch_head_with_rows(
                     row_pk: branch_ref_row_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot: crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
+                    snapshot: crate::changelog::ChangePayload::from(
+                        crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
+                    ),
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: test_timestamp(),
                     origin_key: None,
@@ -804,12 +806,14 @@ pub(crate) fn tracked_change_from_materialized(
         row_pk: row.row_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot: row
-            .snapshot_content
-            .as_deref()
-            .map_or(crate::json_store::JsonSlot::None, |content| {
-                crate::json_store::JsonSlot::from_json(content)
-            }),
+        snapshot: row.snapshot_content.as_deref().map_or(
+            crate::changelog::ChangePayload::Tombstone,
+            |content| {
+                crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::from_json(
+                    content,
+                ))
+            },
+        ),
         metadata: row
             .metadata
             .as_ref()

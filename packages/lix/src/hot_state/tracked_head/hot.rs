@@ -4097,6 +4097,26 @@ fn materialize_packed_slot(
     }
 }
 
+fn materialize_packed_payload(
+    include: bool,
+    payload: crate::changelog::ChangePayload,
+    json_refs: &mut Vec<JsonRef>,
+    deferred: &mut Vec<DeferredJson>,
+    row_index: usize,
+    field: DeferredJsonField,
+) -> Result<Option<SharedStr>, LixError> {
+    match payload {
+        crate::changelog::ChangePayload::Tombstone => Ok(None),
+        crate::changelog::ChangePayload::Json(slot) => Ok(materialize_packed_slot(
+            include, slot, json_refs, deferred, row_index, field,
+        )),
+        crate::changelog::ChangePayload::Native(_) if !include => Ok(None),
+        crate::changelog::ChangePayload::Native(_) => Err(head_value_error(
+            "authenticated native payload reached the legacy packed JSON materializer",
+        )),
+    }
+}
+
 async fn scan_packed_current_base_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -4267,14 +4287,14 @@ async fn scan_packed_current_base_rows(
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
     for (key, value, change) in winner_rows.into_iter().take(row_capacity) {
         let row_index = rows.len();
-        let snapshot = materialize_packed_slot(
+        let snapshot = materialize_packed_payload(
             projection.snapshot_content,
             change.snapshot,
             &mut json_refs,
             &mut deferred,
             row_index,
             DeferredJsonField::Snapshot,
-        );
+        )?;
         let metadata = materialize_packed_slot(
             projection.metadata,
             change.metadata,
@@ -4490,14 +4510,14 @@ async fn load_packed_current_base_exact(
             ),
             columnar_base_coordinate,
         });
-        let snapshot = materialize_packed_slot(
+        let snapshot = materialize_packed_payload(
             projection.snapshot_content,
             change_record.snapshot,
             &mut json_refs,
             &mut deferred,
             row_index,
             DeferredJsonField::Snapshot,
-        );
+        )?;
         let metadata = materialize_packed_slot(
             projection.metadata,
             change_record.metadata,
@@ -5794,14 +5814,28 @@ where
                 ));
             }
             match member.change.snapshot {
-                JsonSlot::None => snapshots.push(None),
-                JsonSlot::Inline(json) => {
+                crate::changelog::ChangePayload::Tombstone => {
+                    return Err(head_value_error(
+                        "live exclusive row has a tombstone payload",
+                    ));
+                }
+                crate::changelog::ChangePayload::Json(JsonSlot::Inline(json)) => {
                     snapshots.push(Some(Bytes::from(json.into_string())));
                 }
-                JsonSlot::Ref(json_ref) => {
+                crate::changelog::ChangePayload::Json(JsonSlot::Ref(json_ref)) => {
                     deferred_rows.push(snapshots.len());
                     deferred_refs.push(json_ref);
                     snapshots.push(None);
+                }
+                crate::changelog::ChangePayload::Json(JsonSlot::None) => {
+                    return Err(head_value_error(
+                        "live exclusive row has a JSON tombstone payload",
+                    ));
+                }
+                crate::changelog::ChangePayload::Native(_) => {
+                    return Err(head_value_error(
+                        "authenticated native payload reached the legacy exclusive JSON reader",
+                    ));
                 }
             }
         }
@@ -11347,6 +11381,31 @@ fn packed_working_diff_slot(slot: &JsonSlot) -> WorkingDiffSlotFingerprint {
     }
 }
 
+fn packed_working_diff_payload(
+    payload: &crate::changelog::ChangePayload,
+) -> WorkingDiffSlotFingerprint {
+    match payload {
+        crate::changelog::ChangePayload::Tombstone => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_NONE,
+            hash: [0; JSON_REF_BYTES],
+        },
+        crate::changelog::ChangePayload::Json(slot) => packed_working_diff_slot(slot),
+        crate::changelog::ChangePayload::Native(row) => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"lix.hot.working_diff.native_payload.v1\0");
+            hasher.update(row.layout_fingerprint.as_bytes());
+            hasher.update(&row.semantic_payload_digest);
+            WorkingDiffSlotFingerprint {
+                // This is a non-authoritative semantic fingerprint. Reuse the
+                // existing inline-fingerprint encoding instead of introducing
+                // a second durable working-diff format.
+                kind: WORKING_DIFF_SLOT_INLINE,
+                hash: *hasher.finalize().as_bytes(),
+            }
+        }
+    }
+}
+
 fn packed_working_diff_version(
     member: &crate::tracked_state::CommitDeltaMember,
 ) -> WorkingDiffVersion {
@@ -11356,7 +11415,7 @@ fn packed_working_diff_version(
         deleted: member.value.deleted,
         created_at: member.value.created_at,
         updated_at: member.value.updated_at,
-        snapshot: packed_working_diff_slot(&member.change.snapshot),
+        snapshot: packed_working_diff_payload(&member.change.snapshot),
         metadata: packed_working_diff_slot(&member.change.metadata),
     }
 }
@@ -12007,7 +12066,7 @@ async fn resolve_working_diff_before_payloads<T>(
                 ));
             }
             version.resolve_payload_slots(
-                packed_working_diff_slot(&record.snapshot),
+                packed_working_diff_payload(&record.snapshot),
                 packed_working_diff_slot(&record.metadata),
             );
         }

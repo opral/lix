@@ -950,7 +950,9 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        snapshot: crate::changelog::ChangePayload::from(
+            crate::json_store::JsonSlot::from_json(&snapshot_content),
+        ),
         metadata: crate::json_store::JsonSlot::None,
         created_at: node.created_at,
         origin_key: None,
@@ -1961,7 +1963,7 @@ mod tests {
                     row_pk: crate::row_pk::RowPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot: crate::json_store::JsonSlot::None,
+                    snapshot: crate::changelog::ChangePayload::Tombstone,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     origin_key: None,
@@ -1992,10 +1994,14 @@ mod tests {
                     row_pk: crate::row_pk::RowPk::single(row_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
-                    snapshot: snapshot_content
-                        .map_or(crate::json_store::JsonSlot::None, |content| {
-                            crate::json_store::JsonSlot::from_json(content)
-                        }),
+                    snapshot: snapshot_content.map_or(
+                        crate::changelog::ChangePayload::Tombstone,
+                        |content| {
+                            crate::changelog::ChangePayload::from(
+                                crate::json_store::JsonSlot::from_json(content),
+                            )
+                        },
+                    ),
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts(created_at),
                     origin_key: None,

@@ -542,7 +542,9 @@ async fn seed_visible_schema_rows<StorageImpl>(
                     row_pk: row_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot: crate::json_store::JsonSlot::from_json(snapshot),
+                    snapshot: crate::changelog::ChangePayload::from(
+                        crate::json_store::JsonSlot::from_json(snapshot),
+                    ),
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: timestamp,
                     origin_key: None,

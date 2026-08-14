@@ -566,7 +566,9 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         row_pk: change.row_pk.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
+        snapshot: crate::changelog::ChangePayload::from(
+            crate::json_store::JsonSlot::from_json(&change.snapshot_content),
+        ),
         metadata: crate::json_store::JsonSlot::None,
         created_at: change.created_at,
         origin_key: None,
@@ -581,7 +583,9 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
         row_pk: row.row_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&row.snapshot_content),
+        snapshot: crate::changelog::ChangePayload::from(
+            crate::json_store::JsonSlot::from_json(&row.snapshot_content),
+        ),
         metadata: crate::json_store::JsonSlot::None,
         created_at: row.updated_at,
         origin_key: None,

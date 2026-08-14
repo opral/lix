@@ -1569,7 +1569,7 @@ async fn stage_changelog_commits(
         .chain(
             branch_head_changes
                 .iter()
-                .map(|change| Ok(TransactionChangeRecordRef::from(change))),
+                .map(TransactionChangeRecordRef::try_from),
         )
         // Engine-owned untracked state follows the same current-only rule.
         .collect::<Result<Vec<_>, _>>()?;
@@ -1765,7 +1765,9 @@ fn branch_ref_change_record(
             )
         })?,
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+        snapshot: crate::changelog::ChangePayload::from(
+            crate::json_store::JsonSlot::from_json(&snapshot),
+        ),
         metadata: crate::json_store::JsonSlot::None,
         created_at: root.ref_updated_at,
         origin_key: None,
@@ -1798,7 +1800,9 @@ fn deterministic_sequence_current_row(
             schema_key: "lix_key_value".to_string(),
             row_pk,
             file_id: None,
-            snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+            snapshot: crate::changelog::ChangePayload::from(
+                crate::json_store::JsonSlot::from_json(&snapshot),
+            ),
             metadata: crate::json_store::JsonSlot::None,
             created_at: timestamp,
             origin_key: None,
@@ -2121,8 +2125,8 @@ impl crate::hot_state::DeferredFreshHotRows for PreparedStateBatch {
 
 fn current_state_delta_from_engine_row(
     row: &EngineCurrentRow,
-) -> crate::hot_state::CurrentStateDeltaRef<'_> {
-    crate::hot_state::CurrentStateDeltaRef {
+) -> Result<crate::hot_state::CurrentStateDeltaRef<'_>, LixError> {
+    Ok(crate::hot_state::CurrentStateDeltaRef {
         schema_key: &row.change.schema_key,
         file_id: row.change.file_id.as_deref(),
         row_pk: &row.change.row_pk,
@@ -2132,13 +2136,13 @@ fn current_state_delta_from_engine_row(
         change_id: Some(row.change.change_id),
         commit_id: None,
         untracked: true,
-        deleted: row.change.snapshot == crate::json_store::JsonSlot::None,
+        deleted: row.change.snapshot.is_deleted(),
         created_at: row.created_at,
         updated_at: row.updated_at,
-        snapshot: row.change.snapshot.as_ref_slot(),
+        snapshot: row.change.snapshot.try_as_ref_slot()?,
         metadata: row.change.metadata.as_ref_slot(),
         columnar_base_coordinate: None,
-    }
+    })
 }
 
 /// Stages a compact, identity-addressable change record for every tracked
@@ -3938,7 +3942,8 @@ async fn stage_tracked_head(
             engine_rows
                 .iter()
                 .filter(|row| row.branch_id == root.branch_id)
-                .map(current_state_delta_from_engine_row),
+                .map(current_state_delta_from_engine_row)
+                .collect::<Result<Vec<_>, _>>()?,
         );
         let can_publish_ordered_packed_current_base = ordered_addressable_commits
             .contains(&root.commit_id)
@@ -4793,7 +4798,8 @@ async fn stage_tracked_head(
             engine_rows
                 .iter()
                 .filter(|row| row.branch_id == branch_id)
-                .map(current_state_delta_from_engine_row),
+                .map(current_state_delta_from_engine_row)
+                .collect::<Result<Vec<_>, _>>()?,
         );
         let absence_guards =
             tracked_head_absence_guards(state_rows, insert_selection, branch_id, None);
@@ -5021,7 +5027,7 @@ fn apply_pending_untracked_identities(
             file_id: row.change.file_id.clone(),
             row_pk: row.change.row_pk.clone(),
         };
-        if row.change.snapshot == crate::json_store::JsonSlot::None {
+        if row.change.snapshot.is_deleted() {
             identities.remove(&identity);
         } else {
             identities.insert(identity);
@@ -5291,7 +5297,7 @@ async fn stage_root_backed_branch_publication(
             engine_rows
                 .iter()
                 .filter(|row| row.branch_id == branch_id)
-                .map(|row| Ok(current_state_delta_from_engine_row(row))),
+                .map(current_state_delta_from_engine_row),
         )
         .collect::<Result<Vec<_>, _>>()?;
     if !untracked_deltas.is_empty() {

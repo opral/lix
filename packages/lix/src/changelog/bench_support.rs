@@ -512,9 +512,11 @@ fn direct_append_with_shape(
                 schema_key: "message".to_string(),
                 row_pk: row_pk.clone(),
                 file_id: None,
-                snapshot: crate::json_store::JsonSlot::from_json(&format!(
-                    "{{\"value\":{next_change}}}"
-                )),
+                snapshot: crate::changelog::ChangePayload::from(
+                    crate::json_store::JsonSlot::from_json(&format!(
+                        "{{\"value\":{next_change}}}"
+                    )),
+                ),
                 metadata: crate::json_store::JsonSlot::None,
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",

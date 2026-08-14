@@ -3377,15 +3377,26 @@ where
             continue;
         }
         match &member.change.snapshot {
-            JsonSlot::Inline(snapshot) => {
+            crate::changelog::ChangePayload::Json(JsonSlot::Inline(snapshot)) => {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(snapshot) {
                     collect_binary_cas_json_owners(&value, &mut references, &mut owners);
                 }
             }
-            JsonSlot::Ref(json_ref) => {
+            crate::changelog::ChangePayload::Json(JsonSlot::Ref(json_ref)) => {
                 json_ref_hashes.insert(*json_ref.as_hash_array());
             }
-            JsonSlot::None => {}
+            crate::changelog::ChangePayload::Native(row) => {
+                for cell in &row.cells {
+                    let crate::changelog::NativeScalarCell::Jsonb(jsonb) = cell else {
+                        continue;
+                    };
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(jsonb) {
+                        collect_binary_cas_json_owners(&value, &mut references, &mut owners);
+                    }
+                }
+            }
+            crate::changelog::ChangePayload::Tombstone
+            | crate::changelog::ChangePayload::Json(JsonSlot::None) => {}
         }
     }
     let json_refs = json_ref_hashes

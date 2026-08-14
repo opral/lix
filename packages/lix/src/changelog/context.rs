@@ -146,9 +146,9 @@ fn transaction_change_value_capacity(
         .saturating_add(json_slot_ref_value_capacity(change.metadata))
 }
 
-fn change_value_capacity(change: &ChangeRecord) -> usize {
-    let change = crate::changelog::TransactionChangeRecordRef::from(change);
-    transaction_change_value_capacity(&change)
+fn change_value_capacity(change: &ChangeRecord) -> Result<usize, LixError> {
+    let change = crate::changelog::TransactionChangeRecordRef::try_from(change)?;
+    Ok(transaction_change_value_capacity(&change))
 }
 
 fn json_slot_ref_value_capacity(slot: JsonSlotRef<'_>) -> usize {
@@ -463,10 +463,16 @@ where
 
     fn stage_append_records(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
         let ChangelogAppend { commits, changes } = append;
+        let change_value_bytes = changes
+            .iter()
+            .map(change_value_capacity)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum();
         let mut change_batch = EncodedChangelogBatch::with_capacity(
             changes.len(),
             changes.len() * 16,
-            changes.iter().map(change_value_capacity).sum(),
+            change_value_bytes,
         );
         let mut commit_batch = EncodedChangelogBatch::with_capacity(
             commits.len(),

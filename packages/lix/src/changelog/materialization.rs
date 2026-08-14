@@ -11,7 +11,7 @@ use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageProjectedValue,
 };
 
-use super::{CHANGE_SPACE, ChangeId, ChangeRecord, decode_change_record};
+use super::{CHANGE_SPACE, ChangeId, ChangePayload, ChangeRecord, decode_change_record};
 
 const CHANGE_STORAGE_KEY_BYTES: usize = 16;
 
@@ -229,7 +229,11 @@ where
                 row_pk: change.row_pk,
                 file_id: change.file_id,
             },
-            materialized_json_slot(projection.snapshot_content, change.snapshot, &mut json_refs),
+            materialized_change_payload(
+                projection.snapshot_content,
+                change.snapshot,
+                &mut json_refs,
+            )?,
             materialized_json_slot(projection.metadata, change.metadata, &mut json_refs),
         ));
     }
@@ -252,6 +256,24 @@ where
             ))
         })
         .collect()
+}
+
+fn materialized_change_payload(
+    include: bool,
+    payload: ChangePayload,
+    json_refs: &mut Vec<JsonRef>,
+) -> Result<MaterializedJsonSlot, LixError> {
+    if !include {
+        return Ok(MaterializedJsonSlot::None);
+    }
+    match payload {
+        ChangePayload::Tombstone => Ok(MaterializedJsonSlot::None),
+        ChangePayload::Json(slot) => Ok(materialized_json_slot(true, slot, json_refs)),
+        ChangePayload::Native(_) => Err(LixError::new(
+            "LIX_NATIVE_CHANGE_JSON_MATERIALIZATION",
+            "authenticated native change payload reached the legacy JSON materializer",
+        )),
+    }
 }
 
 enum MaterializedJsonSlot {
