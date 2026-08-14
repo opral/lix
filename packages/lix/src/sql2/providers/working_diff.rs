@@ -122,6 +122,10 @@ where
                             .build(schema, &[])
                             .map_err(working_diff_batch_error);
                     }
+                    #[cfg(feature = "storage-benches")]
+                    let topology_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+                        crate::storage_bench::WorkingDiffProfilePhase::Topology,
+                    );
                     let heads = selected_heads(
                         branch_ref.as_ref(),
                         active_branch_id.as_deref(),
@@ -129,6 +133,8 @@ where
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
+                    #[cfg(feature = "storage-benches")]
+                    drop(topology_scope);
                     let tracked_head = TrackedHeadContext::new();
                     // Normal tracked reads use the direct head epoch and do
                     // not need the historical graph or tracked-state reader.
@@ -140,12 +146,18 @@ where
                         if limit.is_some_and(|limit| rows.len() >= limit) {
                             break;
                         }
-                        let direct_diff = match BranchHeadControlContext::new()
+                        #[cfg(feature = "storage-benches")]
+                        let topology_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+                            crate::storage_bench::WorkingDiffProfilePhase::Topology,
+                        );
+                        let control = BranchHeadControlContext::new()
                             .reader(store.clone())
                             .load(&head.branch_id)
                             .await
-                            .map_err(lix_error_to_datafusion_error)?
-                        {
+                            .map_err(lix_error_to_datafusion_error)?;
+                        #[cfg(feature = "storage-benches")]
+                        drop(topology_scope);
+                        let direct_diff = match control {
                             Some(control) if control.head_commit_id == head.commit_id => {
                                 tracked_head
                                     .reader(store.clone())
@@ -181,6 +193,10 @@ where
                                 .await
                                 .map_err(lix_error_to_datafusion_error)?
                         };
+                        #[cfg(feature = "storage-benches")]
+                        let projection_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+                            crate::storage_bench::WorkingDiffProfilePhase::Projection,
+                        );
                         for entry in diff.entries {
                             if entry.identity.schema_key() == CHECKPOINT_SCHEMA_KEY
                                 || entry.identity.schema_key()
@@ -206,7 +222,13 @@ where
                                 break;
                             }
                         }
+                        #[cfg(feature = "storage-benches")]
+                        drop(projection_scope);
                     }
+                    #[cfg(feature = "storage-benches")]
+                    let _projection_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+                        crate::storage_bench::WorkingDiffProfilePhase::Projection,
+                    );
                     WORKING_DIFF_COLS
                         .build(schema, &rows)
                         .map_err(working_diff_batch_error)

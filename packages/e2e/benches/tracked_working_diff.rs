@@ -206,6 +206,35 @@ fn main() {
                 }
             });
         }
+        "measure-cold" => {
+            let expected_changes = parse_usize(
+                args.get(4),
+                DEFAULT_ROW_COUNT,
+                "expected working diff count",
+            );
+            runtime.block_on(async {
+                match backend {
+                    Backend::Rocks => {
+                        measure_cold(
+                            RocksDB::open(path).expect("open tracked-working-diff RocksDB"),
+                            backend,
+                            Path::new(path),
+                            expected_changes,
+                        )
+                        .await;
+                    }
+                    Backend::Slate => {
+                        measure_cold(
+                            SlateDB::open(path).expect("open tracked-working-diff SlateDB"),
+                            backend,
+                            Path::new(path),
+                            expected_changes,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
         "measure-history" => {
             let Some(base_commit_id) = args.get(4) else {
                 print_usage();
@@ -365,10 +394,52 @@ fn print_usage() {
         "usage:\n  tracked_working_diff setup <rocksdb|slatedb> <directory> <repeated|disjoint> \
          [rows] [commits] [changes-per-commit]\n  \
          tracked_working_diff measure <rocksdb|slatedb> <directory> [repetitions]\n  \
+         tracked_working_diff measure-cold <rocksdb|slatedb> <directory> <expected-working-diffs>\n  \
          tracked_working_diff measure-history <rocksdb|slatedb> <directory> <base-commit-id> <head-commit-id> [repetitions]\n  \
          tracked_working_diff merge-preview <rocksdb|slatedb> <directory> [rows] [commits-per-side] [changes-per-commit] [repetitions]\n  \
          tracked_working_diff merge-commit <rocksdb|slatedb> <directory> [repetitions] [changes-per-side]\n  \
          tracked_working_diff checkpoint <rocksdb|slatedb> <directory>"
+    );
+}
+
+async fn measure_cold<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
+    path: &Path,
+    expected_changes: usize,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    assert!(path.exists(), "fixture {} does not exist", path.display());
+    let open_start = Instant::now();
+    let lix = open_lix()
+        .with_storage(storage)
+        .await
+        .expect("cold-open tracked-working-diff lix");
+    let session = lix
+        .open_another_session()
+        .await
+        .expect("cold-open tracked-working-diff session");
+    let open_elapsed = open_start.elapsed();
+
+    let _ = lix::storage_bench::take_working_diff_profile_accounting();
+    let query_start = Instant::now();
+    let count = profile_working_diff_query(&session).await;
+    let query_elapsed = query_start.elapsed();
+    assert_eq!(count, expected_changes);
+    let phases = lix::storage_bench::take_working_diff_profile_accounting();
+    println!(
+        "tracked_working_diff measure-cold backend={} working_diffs={count} \
+         open_ms={:.3} query_ms={:.3} topology_ms={:.3} index_ms={:.3} \
+         current_row_ms={:.3} history_ms={:.3} projection_ms={:.3}",
+        backend.name(),
+        millis(open_elapsed),
+        millis(query_elapsed),
+        phases.topology_ns as f64 / 1_000_000.0,
+        phases.index_ns as f64 / 1_000_000.0,
+        phases.current_row_ns as f64 / 1_000_000.0,
+        phases.history_ns as f64 / 1_000_000.0,
+        phases.projection_ns as f64 / 1_000_000.0,
     );
 }
 
@@ -491,6 +562,7 @@ async fn measure<StorageImpl>(
     // reported samples. Repeated measurements remain read-only.
     assert_eq!(working_diff_count(&session).await, expected_changes);
     let mut latencies = Vec::with_capacity(repetitions);
+    let _ = lix::storage_bench::take_working_diff_profile_accounting();
     for _ in 0..repetitions {
         let start = Instant::now();
         let count = profile_working_diff_query(&session).await;
@@ -499,14 +571,21 @@ async fn measure<StorageImpl>(
     }
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
+    let phases = lix::storage_bench::take_working_diff_profile_accounting();
     println!(
         "tracked_working_diff measure backend={} working_diffs={expected_changes} \
-         repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+         repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3} \
+         topology_ms={:.3} index_ms={:.3} current_row_ms={:.3} history_ms={:.3} projection_ms={:.3}",
         backend.name(),
         millis(sorted[sorted.len() / 2]),
         mean_millis(&latencies),
         millis(sorted[0]),
         millis(*sorted.last().expect("measurement samples are non-empty")),
+        phases.topology_ns as f64 / 1_000_000.0,
+        phases.index_ns as f64 / 1_000_000.0,
+        phases.current_row_ns as f64 / 1_000_000.0,
+        phases.history_ns as f64 / 1_000_000.0,
+        phases.projection_ns as f64 / 1_000_000.0,
     );
 }
 

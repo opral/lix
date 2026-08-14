@@ -44,6 +44,11 @@ static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_TOPOLOGY_NS: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_INDEX_NS: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_CURRENT_ROW_NS: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_HISTORY_NS: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_PROJECTION_NS: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
@@ -2581,6 +2586,71 @@ pub(crate) fn record_transaction_schema_catalog_load() {
 
 pub(crate) fn record_transaction_schema_catalog_compile() {
     TRANSACTION_SCHEMA_CATALOG_COMPILES.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WorkingDiffProfilePhase {
+    Topology,
+    Index,
+    CurrentRow,
+    History,
+    Projection,
+}
+
+pub(crate) struct WorkingDiffProfileScope {
+    phase: WorkingDiffProfilePhase,
+    started: std::time::Instant,
+}
+
+impl WorkingDiffProfileScope {
+    pub(crate) fn enter(phase: WorkingDiffProfilePhase) -> Self {
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for WorkingDiffProfileScope {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_nanos() as u64;
+        match self.phase {
+            WorkingDiffProfilePhase::Topology => {
+                WORKING_DIFF_TOPOLOGY_NS.fetch_add(elapsed, Ordering::Relaxed);
+            }
+            WorkingDiffProfilePhase::Index => {
+                WORKING_DIFF_INDEX_NS.fetch_add(elapsed, Ordering::Relaxed);
+            }
+            WorkingDiffProfilePhase::CurrentRow => {
+                WORKING_DIFF_CURRENT_ROW_NS.fetch_add(elapsed, Ordering::Relaxed);
+            }
+            WorkingDiffProfilePhase::History => {
+                WORKING_DIFF_HISTORY_NS.fetch_add(elapsed, Ordering::Relaxed);
+            }
+            WorkingDiffProfilePhase::Projection => {
+                WORKING_DIFF_PROJECTION_NS.fetch_add(elapsed, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkingDiffProfileAccounting {
+    pub topology_ns: u64,
+    pub index_ns: u64,
+    pub current_row_ns: u64,
+    pub history_ns: u64,
+    pub projection_ns: u64,
+}
+
+pub fn take_working_diff_profile_accounting() -> WorkingDiffProfileAccounting {
+    WorkingDiffProfileAccounting {
+        topology_ns: WORKING_DIFF_TOPOLOGY_NS.swap(0, Ordering::Relaxed),
+        index_ns: WORKING_DIFF_INDEX_NS.swap(0, Ordering::Relaxed),
+        current_row_ns: WORKING_DIFF_CURRENT_ROW_NS.swap(0, Ordering::Relaxed),
+        history_ns: WORKING_DIFF_HISTORY_NS.swap(0, Ordering::Relaxed),
+        projection_ns: WORKING_DIFF_PROJECTION_NS.swap(0, Ordering::Relaxed),
+    }
 }
 
 pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {

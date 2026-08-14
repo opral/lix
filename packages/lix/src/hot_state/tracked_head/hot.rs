@@ -6740,7 +6740,14 @@ where
         control: BranchHeadControl,
         request: &TrackedStateDiffRequest,
     ) -> Result<Option<TrackedWorkingDiff>, LixError> {
-        let Ok(Some(epoch)) = self.working_diff_epoch(branch_id).await else {
+        #[cfg(feature = "storage-benches")]
+        let topology_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+            crate::storage_bench::WorkingDiffProfilePhase::Topology,
+        );
+        let epoch_result = self.working_diff_epoch(branch_id).await;
+        #[cfg(feature = "storage-benches")]
+        drop(topology_scope);
+        let Ok(Some(epoch)) = epoch_result else {
             return Ok(None);
         };
         let generation = epoch.generation;
@@ -11433,6 +11440,10 @@ async fn hot_working_diff_entries(
     expected_coverage: WorkingDiffIndexCoverage,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    #[cfg(feature = "storage-benches")]
+    let index_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+        crate::storage_bench::WorkingDiffProfilePhase::Index,
+    );
     let packed_refs = packed_current_base_refs(store, branch_id, generation).await?;
     let packed_refs = packed_refs
         .into_iter()
@@ -11576,6 +11587,12 @@ async fn hot_working_diff_entries(
         return Ok(None);
     }
     let (selected, base_versions): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
+    #[cfg(feature = "storage-benches")]
+    drop(index_scope);
+    #[cfg(feature = "storage-benches")]
+    let current_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+        crate::storage_bench::WorkingDiffProfilePhase::CurrentRow,
+    );
     let after_values = hot_load_primary_identity_bytes(store, &selected).await?;
     let mut candidates = Vec::with_capacity(selected.len());
     for ((identity, after), base_after) in selected.into_iter().zip(after_values).zip(base_versions)
@@ -11640,6 +11657,8 @@ async fn hot_working_diff_entries(
             after,
         ));
     }
+    #[cfg(feature = "storage-benches")]
+    drop(current_scope);
     Ok(Some(
         classify_hot_working_diff_entries(store, candidates).await?,
     ))
@@ -11865,6 +11884,10 @@ async fn resolve_working_diff_before_payloads<T>(
     key_of: impl Fn(&T) -> TrackedStateKey,
     before_of: impl Fn(&mut T) -> &mut Option<WorkingDiffVersion>,
 ) -> Result<(), LixError> {
+    #[cfg(feature = "storage-benches")]
+    let _history_scope = crate::storage_bench::WorkingDiffProfileScope::enter(
+        crate::storage_bench::WorkingDiffProfilePhase::History,
+    );
     let mut pending = Vec::new();
     for index in 0..candidates.len() {
         let Some(version) = before_of(&mut candidates[index]).as_mut() else {
