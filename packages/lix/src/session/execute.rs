@@ -6350,7 +6350,13 @@ mod tests {
             "base-1023",
         )
         .await;
-        let reopened_engine = Engine::new(storage.clone())
+        let cold_storage = Memory::from_snapshot(
+            &storage
+                .export_snapshot()
+                .expect("redo storage snapshot should export"),
+        )
+        .expect("redo storage snapshot should import into an isolated backend");
+        let reopened_engine = Engine::new(cold_storage)
             .await
             .expect("redo storage should cold reopen");
         let reopened_after_redo = reopened_engine

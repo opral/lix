@@ -106,6 +106,15 @@ pub(crate) async fn materialize_commit_graph_change<S>(
 where
     S: StorageAdapterRead,
 {
+    if change.snapshot.is_some() && change.typed_snapshot.is_some() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!(
+                "change '{}' has duplicate JSON and typed snapshot authorities",
+                change.id
+            ),
+        ));
+    }
     let snapshot_content = if payload_projection.snapshot_content && change.typed_snapshot.is_none() {
         load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?
     } else {
@@ -314,11 +323,10 @@ mod tests {
             primary_key_paths: vec![vec!["id".to_owned()]],
             fields: Vec::new(),
         });
-        let row = materialize_located_history_change(&mut json_reader, typed, true)
+        let duplicate = materialize_located_history_change(&mut json_reader, typed, true)
             .await
-            .expect("typed payload must bypass the legacy JSON slot");
-        assert!(row.snapshot_content.is_none());
-        assert!(row.typed_snapshot.is_some());
+            .expect_err("typed history must reject a duplicate legacy JSON authority");
+        assert!(duplicate.message.contains("duplicate JSON and typed"));
 
         let error = materialize_located_history_change(
             &mut json_reader,

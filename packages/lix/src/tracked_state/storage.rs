@@ -7185,6 +7185,8 @@ fn decode_columnar_change_record(
         ));
     }
     let snapshot = if materialize_json_snapshot && !deleted {
+        #[cfg(test)]
+        COLUMNAR_HISTORY_JSON_PROJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut object = serde_json::Map::with_capacity(typed_fields.len());
         for field in &typed_fields {
             object.insert(
@@ -7234,8 +7236,12 @@ fn decode_columnar_change_record(
 }
 
 #[cfg(test)]
+static COLUMNAR_HISTORY_JSON_PROJECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
 pub(crate) fn take_columnar_history_json_projections() -> usize {
-    0
+    COLUMNAR_HISTORY_JSON_PROJECTIONS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn insert_columnar_identity_path(

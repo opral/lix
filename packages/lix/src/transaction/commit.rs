@@ -2202,11 +2202,25 @@ async fn load_selected_change_records(
                     ),
                 ));
             };
+            let record_deleted = match (record.snapshot.is_some(), record.typed_snapshot.as_ref()) {
+                (true, Some(_)) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "selected change '{}' has duplicate JSON and typed payload authorities",
+                            change_ref.change_id
+                        ),
+                    ));
+                }
+                (true, None) => false,
+                (false, Some(snapshot)) => snapshot.deleted,
+                (false, None) => true,
+            };
             if record.change_id != change_ref.change_id
                 || record.schema_key != change_ref.schema_key()
                 || record.file_id.as_deref() != change_ref.file_id()
                 || record.entity_pk != *change_ref.entity_pk()
-                || record.snapshot.is_none() != change_ref.deleted
+                || record_deleted != change_ref.deleted
                 || record.created_at != change_ref.updated_at
             {
                 return Err(LixError::new(

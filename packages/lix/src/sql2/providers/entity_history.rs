@@ -358,6 +358,12 @@ fn validate_typed_history_row(row: &EntityHistoryRow, spec: &EntitySurfaceSpec) 
             spec.schema_key
         )));
     }
+    if snapshot.primary_key_paths != spec.primary_key_paths {
+        return Err(DataFusionError::Execution(format!(
+            "{} typed history primary-key layout mismatch",
+            spec.schema_key
+        )));
+    }
     if snapshot.deleted {
         if !snapshot.fields.is_empty() {
             return Err(DataFusionError::Execution(format!(
@@ -636,7 +642,7 @@ mod tests {
 
     use super::{
         EntityHistoryRow, ProjectedHistoryValue, entity_history_route_from_filters,
-        typed_history_column_value,
+        typed_history_column_value, validate_typed_history_row,
     };
 
     fn seven_type_spec() -> crate::sql2::catalog::EntitySurfaceSpec {
@@ -735,6 +741,21 @@ mod tests {
             .expect_err("missing typed field must fail")
             .to_string()
             .contains("omitted a declared field"));
+
+        let mut wrong_primary_key_layout =
+            typed_history_row(spec.columnar_layout_fingerprint(), Vec::new());
+        wrong_primary_key_layout
+            .change
+            .typed_snapshot
+            .as_mut()
+            .expect("typed fixture")
+            .primary_key_paths = vec![vec!["wrong_id".to_owned()]];
+        assert!(
+            validate_typed_history_row(&wrong_primary_key_layout, &spec)
+                .expect_err("wrong primary-key layout must fail")
+                .to_string()
+                .contains("primary-key layout mismatch")
+        );
 
         let mut legacy = typed_history_row(spec.columnar_layout_fingerprint(), Vec::new());
         legacy.change.typed_snapshot = None;
