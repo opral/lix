@@ -125,20 +125,9 @@ where
     #[cfg(not(target_family = "wasm"))]
     fn spawn_driver(&self) -> Result<(), LixError> {
         let coordinator = self.clone();
-        let runtime = tokio::runtime::Handle::current();
-        std::thread::Builder::new()
-            .name("lix-commit-coordinator".to_owned())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || {
-                runtime.block_on(coordinator.drive());
-            })
-            .map(|_| ())
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("start transaction commit coordinator: {error}"),
-                )
-            })
+        crate::background_task::spawn("lix-commit-coordinator", move || async move {
+            coordinator.drive().await;
+        })
     }
 
     fn enqueue(&self, request: CommitRequest<StorageImpl>) -> bool {
