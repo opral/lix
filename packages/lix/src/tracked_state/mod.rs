@@ -93,7 +93,7 @@ pub(crate) use storage::{
     stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
-    stage_current_state_scoped_ranges_from_published_parent,
+    certify_authored_current_state_body,
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_ordered_addressable_commit_deltas,

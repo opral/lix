@@ -378,7 +378,7 @@ pub(crate) struct CommitStateTouchedScopeFilter {
 ///
 /// The fields intentionally mirror the existing commit-delta directory. This
 /// lets the hard-cut manifest become authoritative without changing the
-/// bounded LXCD16 segment and payload-sidecar codec in the same step.
+/// bounded LXCD17 native-member segment and payload-sidecar codec in the same step.
 #[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateMutationInventory {

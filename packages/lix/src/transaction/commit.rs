@@ -20,7 +20,6 @@ use crate::changelog::{
     TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
-use crate::row_pk::RowPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::hot_state::{
@@ -31,6 +30,7 @@ use crate::hot_state::{
 use crate::json_store::{
     JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 #[cfg(test)]
 use crate::tracked_state::stage_commit_state_manifest;
@@ -354,11 +354,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         deleted_checkpoint_files.remove(&(write.branch_id.clone(), write.file_id.clone()));
     }
     let mut insert_selection = prepared_writes.insert_selection;
-    let mut row_columnar_write_sets = prepare_row_columnar_write_sets(
-        &mut state_rows,
-        &insert_selection,
-        row_schema_catalog,
-    )?;
+    let mut row_columnar_write_sets =
+        prepare_row_columnar_write_sets(&mut state_rows, &insert_selection, row_schema_catalog)?;
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_content_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -746,6 +743,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut writes,
         &commit_rows,
         &staged_delta_index.inventories,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &certified_packet_root_rows,
+        &certified_packet_json_refs,
         &rootless_ordered_commits,
         &staged_commits,
         &staged_snapshot_roots,
@@ -906,10 +907,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     })
 }
 
-fn certified_batch_requires_root_expansion(batch: &crate::plugin::runtime::WasmCertifiedRowBatch) -> bool {
+fn certified_batch_requires_root_expansion(
+    batch: &crate::plugin::runtime::WasmCertifiedRowBatch,
+) -> bool {
     !matches!(
         batch.format,
-        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+            | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
     )
 }
 
@@ -2504,15 +2508,16 @@ async fn stage_tracked_commit_delta_index(
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
             let mut delta = tracked_commit_delta_from_state_row(row)?;
-            delta.base_coordinate = row_columnar_write_sets
-                .state_row_location(row_index)
-                .map(
-                    |location| crate::tracked_state::TrackedStateBaseCoordinate {
-                        base_commit_id: root.commit_id,
-                        group_index: location.group_index,
-                        row_index: location.row_index,
-                    },
-                );
+            delta.base_coordinate =
+                row_columnar_write_sets
+                    .state_row_location(row_index)
+                    .map(
+                        |location| crate::tracked_state::TrackedStateBaseCoordinate {
+                            base_commit_id: root.commit_id,
+                            group_index: location.group_index,
+                            row_index: location.row_index,
+                        },
+                    );
             deltas.push(delta);
         }
         for (row, json_refs) in certified_root_rows.iter().zip(certified_root_json_refs) {
@@ -2748,11 +2753,8 @@ fn try_stage_lossless_columnar_mutations(
     }
     let parts = crate::tracked_state::ColumnarMutationPartSet {
         owner_commit_id: *commit_id.as_uuid().as_bytes(),
-        row_group_set_id: crate::hot_state::row_group_set_id(
-            commit_id,
-            first.schema_key.as_str(),
-        )
-        .as_bytes(),
+        row_group_set_id: crate::hot_state::row_group_set_id(commit_id, first.schema_key.as_str())
+            .as_bytes(),
         manifest_digest: encoded.manifest.content_digest()?,
         schema_key: first.schema_key.to_string(),
         row_count: u32::try_from(state_row_indices.len()).map_err(|_| {
@@ -3712,8 +3714,13 @@ async fn stage_tracked_head(
     let mut controls = BTreeMap::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
-    let transaction_global_schema_keys =
-        global_branch_schema_keys(state_rows, engine_rows, tracked_roots, staged_commits, &tracked_snapshots);
+    let transaction_global_schema_keys = global_branch_schema_keys(
+        state_rows,
+        engine_rows,
+        tracked_roots,
+        staged_commits,
+        &tracked_snapshots,
+    );
 
     for root in tracked_roots_parent_first(tracked_roots)?
         .into_iter()
@@ -5577,10 +5584,9 @@ fn prepare_row_columnar_write_sets(
                     crate::hot_state::RowColumnarWriteSets::with_dense_state_rows(row_count)
                 }
                 crate::sql2::RowGroupLocations::Explicit(locations) => {
-                    let mut encoded =
-                        crate::hot_state::RowColumnarWriteSets::with_state_row_count(
-                            state_rows.len(),
-                        );
+                    let mut encoded = crate::hot_state::RowColumnarWriteSets::with_state_row_count(
+                        state_rows.len(),
+                    );
                     for (state_row_index, location) in locations.into_iter().enumerate() {
                         encoded.set_state_row_location(state_row_index, location);
                     }
@@ -5592,8 +5598,7 @@ fn prepare_row_columnar_write_sets(
         }
     }
     if let Some((commit_id, schema_key, snapshots)) = state_rows.dense_row_columnar_input() {
-        let Some(schema) = row_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
-        else {
+        let Some(schema) = row_schema_catalog.and_then(|catalog| catalog.schema(schema_key)) else {
             return Ok(crate::hot_state::RowColumnarWriteSets::new());
         };
         let Ok(spec) = crate::sql2::derive_schema_surface_spec_from_schema(schema) else {
@@ -6105,6 +6110,10 @@ fn stage_commit_state_manifests<'a, S>(
     writes: &'a mut StorageWriteSet,
     commit_rows: &'a [FinalizedCommitRow],
     mutation_inventories: &'a BTreeMap<CommitId, CommitStateMutationInventory>,
+    state_rows: &'a PreparedStateBatch,
+    tracked_row_indices_by_commit: &'a BTreeMap<CommitId, Vec<RowIndex>>,
+    certified_packet_root_rows: &'a BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
+    certified_packet_json_refs: &'a BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
     rootless_commit_ids: &'a BTreeSet<CommitId>,
     staged_commits: &'a BTreeMap<CommitId, StagedChangelogCommit>,
     snapshot_roots: &'a BTreeMap<CommitId, TrackedStateCommitRoot>,
@@ -6171,6 +6180,38 @@ where
             } else {
                 None
             };
+            let indices = tracked_row_indices_by_commit
+                .get(&record.commit_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let certified_rows = certified_packet_root_rows
+                .get(&record.commit_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let certified_refs = certified_packet_json_refs
+                .get(&record.commit_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let deltas = indices
+                .iter()
+                .map(|&index| tracked_commit_delta_from_state_row(state_rows.row(index)))
+                .chain(
+                    certified_rows
+                        .iter()
+                        .zip(certified_refs)
+                        .map(|(row, refs)| tracked_commit_delta_from_certified_root_row(row, refs)),
+                )
+                .collect::<Result<Vec<_>, LixError>>()?;
+            let certified_body = crate::tracked_state::certify_authored_current_state_body(
+                read,
+                writes,
+                record.commit_id,
+                &record.account_id,
+                &mutations,
+                false,
+                deltas,
+            )
+            .await?;
             let catalog_publication = if record.parent_commit_ids.len() <= 1
                 && mutations.selected_source_commit_id.is_none()
             {
@@ -6182,6 +6223,7 @@ where
                         record.commit_id,
                         &record.account_id,
                         &mutations,
+                        certified_body,
                     )
                     .await?
                 } else {
@@ -6192,6 +6234,7 @@ where
                         record.commit_id,
                         &record.account_id,
                         &mutations,
+                        certified_body,
                     )
                     .await?
                 })
@@ -9841,11 +9884,19 @@ mod tests {
             .iter()
             .map(|commit| (commit.commit_id, CommitStateMutationInventory::default()))
             .collect::<BTreeMap<_, _>>();
+        let state_rows = PreparedStateBatch::new();
+        let tracked_row_indices = BTreeMap::new();
+        let certified_rows = BTreeMap::new();
+        let certified_refs = BTreeMap::new();
         stage_commit_state_manifests(
             &read,
             &mut writes,
             &commits,
             &mutation_inventories,
+            &state_rows,
+            &tracked_row_indices,
+            &certified_rows,
+            &certified_refs,
             &rootless_commit_ids,
             &staged,
             &BTreeMap::new(),

@@ -646,6 +646,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     commit_id: CommitId,
     account_id: &str,
     inventory: &CommitStateMutationInventory,
+    certified_body: Option<super::storage::CertifiedAuthoredCurrentStateBody>,
 ) -> Result<CertifiedCommitStatePhysicalPublication, LixError> {
     let selected_source_commit_id = selected_source.map(|source| source.commit_id);
     if selected_source_commit_id != inventory.selected_source_commit_id() {
@@ -700,6 +701,25 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     let touched_scope_filter =
         extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
 
+    let (initial_root, mut certified_rows) = match certified_body {
+        Some(certified) => certified.into_publication_parts(writes, commit_id, inventory)?,
+        None => (None, std::collections::BTreeMap::new()),
+    };
+    if let Some(initial_root) = initial_root {
+        if parent_root.is_some() || graph_parents.len() > 1 || selected_source.is_some() {
+            return Err(scoped_state_error(
+                "initial current-state body certification overlaps inherited state authority",
+            ));
+        }
+        return Ok(CertifiedCommitStatePhysicalPublication {
+            write_set_id: writes.identity(),
+            commit_id,
+            selected_source_commit_id,
+            root: Some(initial_root),
+            touched_scope_filter,
+        });
+    }
+
     if inventory.replacement_generation.is_some() {
         let root = stage_complete_replacement_scoped_range_root(
             store,
@@ -723,6 +743,23 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     }
 
     let Some(mut touched) = touched else {
+        if let Some(parent_root) = parent_root
+            && inventory.selected_source_commit_id.is_some()
+            && certified_rows.is_empty()
+        {
+            return Ok(CertifiedCommitStatePhysicalPublication {
+                write_set_id: writes.identity(),
+                commit_id,
+                selected_source_commit_id,
+                root: Some(attest_scoped_range_root(
+                    commit_id,
+                    serving_base.map(|parent| (parent.commit_id, parent_root)),
+                    inventory,
+                    parent_root.tree.clone(),
+                )?),
+                touched_scope_filter,
+            });
+        }
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             commit_id,
@@ -777,6 +814,9 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         Vec<crate::tracked_state::storage::CommitDeltaMember>,
     >::new();
     for member in members {
+        if !member.authored {
+            continue;
+        }
         members_by_scope
             .entry(CommitDeltaReplacementScope {
                 schema_key: member.key.schema_key.clone(),
@@ -829,6 +869,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 &transient,
                 &scope,
                 members_by_scope.remove(&scope).unwrap_or_default(),
+                &mut certified_rows,
             )
             .await?
         else {
@@ -845,6 +886,11 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     if !members_by_scope.is_empty() {
         return Err(scoped_state_error(
             "exact touched scopes omitted materialized mutation members",
+        ));
+    }
+    if !certified_rows.is_empty() {
+        return Err(scoped_state_error(
+            "certified authored current-state rows escaped their touched scopes",
         ));
     }
     Ok(CertifiedCommitStatePhysicalPublication {
@@ -885,6 +931,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
         commit_id,
         account_id,
         inventory,
+        None,
     )
     .await
 }
@@ -923,8 +970,8 @@ mod tests {
 
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
     use crate::json_store::JsonSlotRef;
+    use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::encode_key_ref;
     use crate::tracked_state::scoped_range::{
@@ -1612,6 +1659,7 @@ mod tests {
             second_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             second_stage.mutation_inventory(),
+            None,
         )
         .await
         .expect("staged child must read its parent's staged scoped nodes");

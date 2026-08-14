@@ -429,14 +429,25 @@ where
                 )
             })?;
         let initial_mutations = staged_delta.mutation_inventory().clone();
-        let physical_publication =
-            crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
+        let initial_body = crate::tracked_state::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            plan.commit.id,
+            &plan.commit.account_id,
+            &initial_mutations,
+            true,
+            commit_deltas.iter().copied(),
+        )
+        .await?;
+        let physical_publication = crate::tracked_state::
+            stage_current_state_scoped_ranges_from_published_topology_parent(
                 &read,
                 &mut writes,
                 None,
                 plan.commit.id,
                 &plan.commit.account_id,
                 &initial_mutations,
+                initial_body,
             )
             .await?;
         let _initial_state =
