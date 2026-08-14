@@ -5,6 +5,8 @@
 
 use serde_json::{Map, Number, Value};
 
+use crate::common::jsonb::{canonical_decimal, normalize_jsonb, reject_jsonb_nul};
+
 const MAGIC: &[u8; 4] = b"LJCI";
 const VERSION: u8 = 1;
 const HEADER_BYTES: usize = 41;
@@ -24,7 +26,7 @@ const SMALL_OBJECT: u8 = 7;
 
 pub(crate) fn encode(value: &Value) -> Result<Vec<u8>, String> {
     let mut value = value.clone();
-    normalize(&mut value)?;
+    normalize_jsonb(&mut value)?;
     let root = encode_frame(&value)?;
     let total = HEADER_BYTES
         .checked_add(root.len())
@@ -82,75 +84,6 @@ fn content_id(bytes: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn normalize(value: &mut Value) -> Result<(), String> {
-    match value {
-        Value::String(value) => reject_nul(value, "string")?,
-        Value::Array(values) => {
-            for value in values {
-                normalize(value)?;
-            }
-        }
-        Value::Object(values) => {
-            let old = std::mem::take(values);
-            let mut entries = old.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
-            for (key, mut value) in entries {
-                reject_nul(&key, "object key")?;
-                normalize(&mut value)?;
-                values.insert(key, value);
-            }
-        }
-        Value::Number(number) => {
-            let canonical = canonical_decimal(&number.to_string())?;
-            *number = serde_json::from_str(&canonical)
-                .map_err(|error| format!("canonical JSONB number is invalid: {error}"))?;
-        }
-        Value::Null | Value::Bool(_) => {}
-    }
-    Ok(())
-}
-
-fn canonical_decimal(raw: &str) -> Result<String, String> {
-    let (negative, raw) = raw
-        .strip_prefix('-')
-        .map_or((false, raw), |raw| (true, raw));
-    let exponent_at = raw.find(['e', 'E']);
-    let (mantissa, exponent) = exponent_at.map_or((raw, "0"), |at| (&raw[..at], &raw[at + 1..]));
-    let exponent = exponent
-        .parse::<i64>()
-        .map_err(|_| "JSONB exponent exceeds i64")?;
-    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if integer.is_empty()
-        || !integer.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err("JSONB number has invalid decimal digits".into());
-    }
-    let mut digits = format!("{integer}{fraction}");
-    let Some(first_nonzero) = digits.find(|byte: char| byte != '0') else {
-        return Ok("0".into());
-    };
-    digits.drain(..first_nonzero);
-    let mut scale = i64::try_from(fraction.len())
-        .map_err(|_| "JSONB fractional scale exceeds i64")?
-        .checked_sub(exponent)
-        .ok_or("JSONB decimal scale overflow")?;
-    while digits.len() > 1 && digits.ends_with('0') {
-        digits.pop();
-        scale = scale.checked_sub(1).ok_or("JSONB decimal scale overflow")?;
-    }
-    if digits.len() > MAX_NUMBER_DIGITS {
-        return Err("JSONB numeric coefficient exceeds the v1 cell bound".into());
-    }
-    let sign = if negative { "-" } else { "" };
-    if scale == 0 {
-        Ok(format!("{sign}{digits}"))
-    } else {
-        let exponent = scale.checked_neg().ok_or("JSONB exponent overflow")?;
-        Ok(format!("{sign}{digits}e{exponent}"))
-    }
-}
-
 fn encode_frame(value: &Value) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     match value {
@@ -159,7 +92,7 @@ fn encode_frame(value: &Value) -> Result<Vec<u8>, String> {
         Value::Bool(true) => output.push(TRUE),
         Value::Number(number) => encode_number(number, &mut output)?,
         Value::String(value) => {
-            reject_nul(value, "string")?;
+            reject_jsonb_nul(value)?;
             output.push(STRING);
             output.extend_from_slice(value.as_bytes());
         }
@@ -193,6 +126,9 @@ fn encode_number(number: &Number, output: &mut Vec<u8>) -> Result<(), String> {
         .map_or((unsigned, 0_i64), |(digits, exponent)| {
             (digits, exponent.parse().expect("canonical exponent"))
         });
+    if digits.len() > MAX_NUMBER_DIGITS {
+        return Err("JSONB numeric coefficient exceeds the v1 cell bound".into());
+    }
     let scale = exponent
         .checked_neg()
         .ok_or("JSONB numeric scale overflow")?;
@@ -236,7 +172,7 @@ fn decode_frame(frame: &[u8]) -> Result<Value, String> {
         NUMBER => decode_number(payload),
         STRING => {
             let value = std::str::from_utf8(payload).map_err(|_| "invalid UTF-8 string")?;
-            reject_nul(value, "string")?;
+            reject_jsonb_nul(value)?;
             Ok(Value::String(value.to_owned()))
         }
         SMALL_ARRAY => decode_small_array(payload),
@@ -326,19 +262,11 @@ fn take_sized<'a>(bytes: &mut &'a [u8], context: &str) -> Result<&'a [u8], Strin
 
 fn validate_key(key: &[u8], previous: Option<&[u8]>) -> Result<(), String> {
     let key = std::str::from_utf8(key).map_err(|_| "object key is not UTF-8")?;
-    reject_nul(key, "object key")?;
+    reject_jsonb_nul(key)?;
     if previous.is_some_and(|previous| previous >= key.as_bytes()) {
         return Err("object keys are not strictly sorted".into());
     }
     Ok(())
-}
-
-fn reject_nul(value: &str, context: &str) -> Result<(), String> {
-    if value.contains('\0') {
-        Err(format!("{context} contains Unicode NUL"))
-    } else {
-        Ok(())
-    }
 }
 
 fn require_empty(bytes: &[u8], context: &str) -> Result<(), String> {

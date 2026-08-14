@@ -2,6 +2,7 @@ pub(crate) mod error;
 pub(crate) mod exact_batch;
 mod execution_metadata;
 pub(crate) mod identity;
+pub(crate) mod jsonb;
 pub(crate) mod json_pointer;
 pub(crate) mod lix_path;
 pub(crate) mod metadata;
