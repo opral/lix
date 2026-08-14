@@ -404,6 +404,12 @@ path = "benches/uuid_v7_physical_keys.rs"
 harness = false
 required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
 
+[[bench]]
+name = "large_binary_multimedia_qualification"
+path = "benches/large_binary_multimedia_qualification.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
 
 
 [[example]]
