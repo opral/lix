@@ -368,11 +368,11 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
         vec![
             vec![
                 Value::Text("batch-rs-a".to_string()),
-                Value::Json(serde_json::json!("first").into()),
+                Value::Jsonb(serde_json::json!("first").into()),
             ],
             vec![
                 Value::Text("batch-rs-b".to_string()),
-                Value::Json(serde_json::json!("second").into()),
+                Value::Jsonb(serde_json::json!("second").into()),
             ],
         ]
     );
@@ -1610,7 +1610,7 @@ fn assert_crm_task_projection(result: &lix::ExecuteResult) {
     assert!(!row.get::<bool>("done").unwrap());
 
     let meta = row.get::<Value>("meta").unwrap();
-    let Value::Json(meta) = meta else {
+    let Value::Jsonb(meta) = meta else {
         panic!("expected meta JSON value, got {meta:?}");
     };
     let meta = meta.to_value();

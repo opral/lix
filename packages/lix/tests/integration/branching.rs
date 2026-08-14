@@ -893,7 +893,7 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[0].values(),
             &[
-                Value::Json(
+                Value::Jsonb(
                     JsonValue::Array(vec![JsonValue::String("draft-merge-source".to_string())])
                         .into()
                 ),
@@ -904,7 +904,7 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[1].values(),
             &[
-                Value::Json(
+                Value::Jsonb(
                     JsonValue::Array(vec![JsonValue::String("main-merge-target".to_string())])
                         .into()
                 ),
@@ -1911,7 +1911,7 @@ async fn assert_key_value(
                 .expect("expected key-value should be valid JSON");
             assert_eq!(
                 rows.rows()[0].values(),
-                &[Value::Json(expected_json.into())]
+                &[Value::Jsonb(expected_json.into())]
             );
         }
         None => assert_eq!(rows.len(), 0),
@@ -2384,21 +2384,21 @@ simulation_test!(
             actual,
             vec![
                 vec![
-                    Value::Json(
+                    Value::Jsonb(
                         JsonValue::Array(vec![JsonValue::String("branch-broad-a".to_string())])
                             .into()
                     ),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Json(
+                    Value::Jsonb(
                         JsonValue::Array(vec![JsonValue::String("branch-broad-b".to_string())])
                             .into()
                     ),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Json(
+                    Value::Jsonb(
                         JsonValue::Array(vec![JsonValue::String("branch-broad-new".to_string())])
                             .into()
                     ),

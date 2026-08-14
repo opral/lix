@@ -70,7 +70,7 @@ and result columns. They do not appear in `information_schema.tables` or
 `information_schema.columns`.
 
 JSON-backed columns are SQL `TEXT` and are marked with
-`lix_value_kind = 'JSON'`. `is_nullable` describes values returned by reads;
+`lix_value_kind = 'JSONB'`. `is_nullable` describes values returned by reads;
 `column_default` and `lix_insert_policy` separately describe whether a write
 may omit a column. A defaulted ID, for example, is non-null when read, may be
 omitted on insert, and rejects an explicit `NULL`.

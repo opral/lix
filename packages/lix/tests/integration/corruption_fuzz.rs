@@ -43,7 +43,7 @@ simulation_test!(
                                 .execute(
                                     "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
                                      ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                                    &[Value::Text(key.clone()), Value::Json(value.clone().into())],
+                                    &[Value::Text(key.clone()), Value::Jsonb(value.clone().into())],
                                 )
                                 .await
                                 .unwrap_or_else(|error| {
@@ -57,7 +57,7 @@ simulation_test!(
                             transaction
                                 .execute(
                                     "UPDATE lix_key_value SET value = $2 WHERE key = $1",
-                                    &[Value::Text(key.clone()), Value::Json(value.clone().into())],
+                                    &[Value::Text(key.clone()), Value::Jsonb(value.clone().into())],
                                 )
                                 .await
                                 .unwrap_or_else(|error| {
@@ -153,7 +153,7 @@ async fn exercise_rejected_batch(
                 "INSERT INTO lix_key_value (key, value) VALUES ($1, $2), ($1, $2)",
                 &[
                     Value::Text(duplicate_key.clone()),
-                    Value::Json(value.into()),
+                    Value::Jsonb(value.into()),
                 ],
             )
             .await
@@ -168,7 +168,7 @@ async fn exercise_rejected_batch(
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 &[
                     Value::Text(duplicate_key.clone()),
-                    Value::Json(staged_value.clone().into()),
+                    Value::Jsonb(staged_value.clone().into()),
                 ],
             )
             .await
@@ -183,7 +183,7 @@ async fn exercise_rejected_batch(
                 &[
                     Value::Text(fresh_key.clone()),
                     Value::Text(duplicate_key),
-                    Value::Json(rejected_value.into()),
+                    Value::Jsonb(rejected_value.into()),
                 ],
             )
             .await;
@@ -245,7 +245,7 @@ fn assert_rows(actual: &[lix::Row], expected: &BTreeMap<String, serde_json::Valu
                 if value.is_null() {
                     Value::Null
                 } else {
-                    Value::Json(value.clone().into())
+                    Value::Jsonb(value.clone().into())
                 },
             ]
         })

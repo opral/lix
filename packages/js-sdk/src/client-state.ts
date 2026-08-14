@@ -173,9 +173,9 @@ function assertClientStateKey(key: string): void {
 }
 
 function assertJsonValue(value: JsonValue): void {
-	// Value.json owns the SDK's full JSON validation, including finite numbers,
+	// Value.jsonb owns the SDK's full JSON validation, including finite numbers,
 	// well-formed strings, plain objects, and cycle detection.
-	Value.json(value);
+	Value.jsonb(value);
 }
 
 function cloneJsonValue(value: JsonValue): JsonValue {

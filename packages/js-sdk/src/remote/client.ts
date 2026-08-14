@@ -1554,8 +1554,8 @@ function nativeValuesEqual(
 				left.blob.length === right.blob.length &&
 				left.blob.every((byte, index) => byte === right.blob[index])
 			);
-		case "json":
-			return right.kind === "json" && jsonValuesEqual(left.value, right.value);
+		case "jsonb":
+			return right.kind === "jsonb" && jsonValuesEqual(left.value, right.value);
 		default:
 			return left.value === right.value;
 	}

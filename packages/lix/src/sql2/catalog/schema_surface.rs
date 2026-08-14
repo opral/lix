@@ -24,7 +24,7 @@ pub(crate) enum SchemaSurfaceShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaColumnType {
     String,
-    Json,
+    Jsonb,
     Integer,
     Number,
     Boolean,
@@ -85,7 +85,7 @@ impl SchemaSurfaceSpec {
     /// Stable identity of the registered schema properties that determine an
     /// row columnar sidecar's physical meaning.
     ///
-    /// In particular, String and Json both use Arrow Utf8. A name/type-only
+    /// In particular, String and Jsonb both use Arrow Utf8. A name/type-only
     /// comparison cannot distinguish scalar string bytes from canonical JSON
     /// text after a registered-schema amendment.
     pub(crate) fn columnar_layout_fingerprint(&self) -> String {
@@ -101,7 +101,7 @@ impl SchemaSurfaceSpec {
             update_part(&mut hasher, column.name.as_bytes());
             hasher.update(&[match column.column_type {
                 SchemaColumnType::String => 1,
-                SchemaColumnType::Json => 2,
+                SchemaColumnType::Jsonb => 2,
                 SchemaColumnType::Integer => 3,
                 SchemaColumnType::Number => 4,
                 SchemaColumnType::Boolean => 5,
@@ -167,7 +167,7 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 lix_schema::DataType::Int8 => SchemaColumnType::Integer,
                 lix_schema::DataType::Float8 => SchemaColumnType::Number,
                 lix_schema::DataType::Boolean => SchemaColumnType::Boolean,
-                lix_schema::DataType::Jsonb => SchemaColumnType::Json,
+                lix_schema::DataType::Jsonb => SchemaColumnType::Jsonb,
                 lix_schema::DataType::Timestamptz => SchemaColumnType::Timestamptz,
             },
             read_nullable: column.nullable,
@@ -337,7 +337,7 @@ pub(crate) fn schema_surface_schema(
                 arrow_data_type_for_schema_column_type(column.column_type),
                 read_nullable,
             );
-            if column.column_type == SchemaColumnType::Json {
+            if column.column_type == SchemaColumnType::Jsonb {
                 mark_json_field(field)
             } else {
                 field
@@ -394,7 +394,7 @@ pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
 
 fn arrow_data_type_for_schema_column_type(column_type: SchemaColumnType) -> DataType {
     match column_type {
-        SchemaColumnType::String | SchemaColumnType::Json => DataType::Utf8,
+        SchemaColumnType::String | SchemaColumnType::Jsonb => DataType::Utf8,
         SchemaColumnType::Integer => DataType::Int64,
         SchemaColumnType::Number => DataType::Float64,
         SchemaColumnType::Boolean => DataType::Boolean,

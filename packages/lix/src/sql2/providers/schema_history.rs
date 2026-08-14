@@ -360,7 +360,7 @@ fn row_history_column_array(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(match column_type {
-        SchemaColumnType::String | SchemaColumnType::Json => Arc::new(StringArray::from(
+        SchemaColumnType::String | SchemaColumnType::Jsonb => Arc::new(StringArray::from(
             projected_values
                 .iter()
                 .map(|snapshot| row_json_text_value(snapshot.as_deref(), column_type))

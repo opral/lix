@@ -57,7 +57,7 @@ use crate::sql2::predicate_typecheck::{
 };
 use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
-    LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
+    LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
 };
 use crate::sql2::session::{
     SqlWriteSessionOptions, build_read_session, build_read_session_at_head,
@@ -2765,7 +2765,7 @@ fn validate_json_predicate_params(
         let Some(value) = params.get(index - 1) else {
             continue;
         };
-        if !matches!(value, Value::Json(_) | Value::Null) {
+        if !matches!(value, Value::Jsonb(_) | Value::Null) {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 "JSON columns can only be compared with JSON expressions",
@@ -3019,11 +3019,11 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
         Value::Integer(value) => ScalarValue::Int64(Some(*value)).into(),
         Value::Real(value) => ScalarValue::Float64(Some(*value)).into(),
         Value::Text(value) => ScalarValue::Utf8(Some(value.clone())).into(),
-        Value::Json(value) => ScalarAndMetadata::new(
+        Value::Jsonb(value) => ScalarAndMetadata::new(
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
-        Value::Timestamp(value) => ScalarValue::TimestampMicrosecond(
+        Value::Timestamptz(value) => ScalarValue::TimestampMicrosecond(
             Some(*value),
             Some("UTC".into()),
         )
@@ -3035,7 +3035,7 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
 fn json_field_metadata() -> FieldMetadata {
     FieldMetadata::new(BTreeMap::from([(
         LIX_VALUE_TYPE_METADATA_KEY.to_string(),
-        LIX_VALUE_TYPE_JSON.to_string(),
+        LIX_VALUE_TYPE_JSONB.to_string(),
     )]))
 }
 
@@ -3140,7 +3140,7 @@ enum ColumnCursor<'a> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextKind {
     Text,
-    Json,
+    Jsonb,
 }
 
 fn column_cursor<'a>(
@@ -3148,7 +3148,7 @@ fn column_cursor<'a>(
     array: &'a dyn Array,
 ) -> Result<ColumnCursor<'a>, LixError> {
     let text_kind = if field.is_some_and(field_is_json) {
-        TextKind::Json
+        TextKind::Jsonb
     } else {
         TextKind::Text
     };
@@ -3296,7 +3296,7 @@ impl ColumnCursor<'_> {
                     row.push(if values.is_null(row_index) {
                         Value::Null
                     } else {
-                        Value::Timestamp(values.value(row_index))
+                        Value::Timestamptz(values.value(row_index))
                     });
                 }
             }
@@ -3343,7 +3343,7 @@ fn text_value(value: &str, kind: TextKind) -> Value {
         // storage, and the projection decoder copies those bytes into Arrow
         // verbatim. Re-parsing here only rebuilt a DOM that was immediately
         // re-serialized, so the bytes are retained directly instead.
-        TextKind::Json => Value::Json(crate::Json::from_canonical_text(value)),
+        TextKind::Jsonb => Value::Jsonb(crate::Json::from_canonical_text(value)),
         TextKind::Text => Value::Text(value.to_owned()),
     }
 }
@@ -3688,7 +3688,7 @@ mod tests {
                 Value::Text(u64::MAX.to_string()),
                 Value::Real(1.5),
                 Value::Text("hello".to_owned()),
-                Value::Json(crate::Json::from_canonical_text(r#"{"a":1}"#)),
+                Value::Jsonb(crate::Json::from_canonical_text(r#"{"a":1}"#)),
                 Value::Blob(vec![0x41, 0x42, 0x43].into()),
             ]
         );
@@ -5824,7 +5824,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
-        assert_eq!(rows[0][2], Value::Json(json!(["row-history"]).into()));
+        assert_eq!(rows[0][2], Value::Jsonb(json!(["row-history"]).into()));
         assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
@@ -7780,7 +7780,7 @@ mod tests {
             &[
                 Value::Text("/multi/param-a.md".to_string()),
                 Value::Blob(b"param-a".to_vec().into()),
-                Value::Json(json!({"source": "json-param"}).into()),
+                Value::Jsonb(json!({"source": "json-param"}).into()),
                 Value::Text("/multi/param-b.md".to_string()),
                 Value::Blob(b"param-b".to_vec().into()),
                 Value::Text(r#"{"source":"text-param"}"#.to_string()),
@@ -7852,7 +7852,7 @@ mod tests {
         let params = [
             Value::Text("/docs/existing.md".to_string()),
             Value::Blob(b"updated".to_vec().into()),
-            Value::Json(json!({"source": "upload"}).into()),
+            Value::Jsonb(json!({"source": "upload"}).into()),
         ];
 
         let (fast_result, fast_path) =
@@ -7924,7 +7924,7 @@ mod tests {
             &[
                 Value::Text("/invalid.md".to_string()),
                 Value::Blob(b"content".to_vec().into()),
-                Value::Json(json!(["not", "an", "object"]).into()),
+                Value::Jsonb(json!(["not", "an", "object"]).into()),
             ],
             WriteExecutorMode::ForceFast,
         )
@@ -8771,7 +8771,7 @@ mod tests {
         let sql = "UPDATE lix_file SET content = $1, lixcol_metadata = $2 WHERE id = $3";
         let params = [
             Value::Blob(b"parameterized".to_vec().into()),
-            Value::Json(serde_json::json!({"source": "git"}).into()),
+            Value::Jsonb(serde_json::json!({"source": "git"}).into()),
             Value::Text("01920000-0000-7000-8000-0000000000d2".to_string()),
         ];
 
@@ -9494,7 +9494,7 @@ mod tests {
                 assert_eq!(result.columns, vec!["value", "lixcol_row_pk"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-                assert_eq!(result.rows[0][1], Value::Json(json!(["row-a"]).into()));
+                assert_eq!(result.rows[0][1], Value::Jsonb(json!(["row-a"]).into()));
     }
 
     #[tokio::test]

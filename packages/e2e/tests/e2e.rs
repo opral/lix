@@ -252,7 +252,7 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
         "UPDATE csv_row SET cells = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Json(serde_json::json!(["row", "second"]).into()),
+            Value::Jsonb(serde_json::json!(["row", "second"]).into()),
             Value::Text(edited_row_id),
             Value::Text(file_id.clone()),
         ],
@@ -1120,7 +1120,7 @@ async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
     lix.execute(
         "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Json(serde_json::json!(["much-longer", "x"]).into()),
+            Value::Jsonb(serde_json::json!(["much-longer", "x"]).into()),
             Value::Text(first_id.clone()),
             Value::Text(file_id.clone()),
         ],
@@ -1183,7 +1183,7 @@ async fn csv_row_structure_edits_use_full_reconciliation() {
     lix.execute(
         "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Json(serde_json::json!(["old", "ONE"]).into()),
+            Value::Jsonb(serde_json::json!(["old", "ONE"]).into()),
             Value::Text(old_id.clone()),
             Value::Text(file_id.clone()),
         ],
@@ -2795,7 +2795,7 @@ async fn v2_csv_delete_vs_edit_fails_ownership_without_a_plugin_conflict_api() {
         "UPDATE csv_row SET cells = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Json(serde_json::json!(["alpha", "ONE", "red"]).into()),
+            Value::Jsonb(serde_json::json!(["alpha", "ONE", "red"]).into()),
             Value::Text(row_id.clone()),
             Value::Text(file_id.clone()),
         ],
@@ -2869,7 +2869,7 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
     lix.execute(
         "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Json(serde_json::json!(["TARGET", "one", "red"]).into()),
+            Value::Jsonb(serde_json::json!(["TARGET", "one", "red"]).into()),
             Value::Text(row_id.clone()),
             Value::Text(file_id.clone()),
         ],
@@ -2893,7 +2893,7 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
     lix.execute(
         "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Json(serde_json::json!(["SOURCE", "one", "red"]).into()),
+            Value::Jsonb(serde_json::json!(["SOURCE", "one", "red"]).into()),
             Value::Text(row_id.clone()),
             Value::Text(file_id.clone()),
         ],
@@ -7584,7 +7584,7 @@ fn native_csv_control_table_insert(file_id: &str) -> NativeJsonControlStatement 
         sql: "INSERT INTO csv_table (id, dialect, lixcol_file_id) VALUES ('root', $1, $2)"
             .to_owned(),
         params: vec![
-            Value::Json(
+            Value::Jsonb(
                 serde_json::json!({
                     "delimiter": ",",
                     "quote": "\"",
@@ -7622,7 +7622,7 @@ fn native_csv_control_row_insert_chunks(
                         | 1;
                     params.push(Value::Text(format!("019a0000-0000-7000-8000-{index:012x}")));
                     params.push(Value::Text(format!("{order_rank:016x}")));
-                    params.push(Value::Json(
+                    params.push(Value::Jsonb(
                         serde_json::json!([
                             if *index < LONG_ROW_COUNT {
                                 "000000000000000"

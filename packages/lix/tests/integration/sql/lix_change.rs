@@ -37,9 +37,9 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
     assert_eq!(
         rows.rows()[0].values(),
         &[
-            Value::Json(json!(["change-query"]).into()),
+            Value::Jsonb(json!(["change-query"]).into()),
             Value::Text("lix_key_value".to_string()),
-            Value::Json(json!({"key": "change-query", "value": "one"}).into()),
+            Value::Jsonb(json!({"key": "change-query", "value": "one"}).into()),
         ]
     );
 });
@@ -127,7 +127,7 @@ simulation_test!(
         assert_eq!(
             result.rows()[0].values(),
             &[
-                Value::Json(json!(["welcome.title", "en"]).into()),
+                Value::Jsonb(json!(["welcome.title", "en"]).into()),
                 Value::Text("welcome.title".to_string()),
                 Value::Text("en".to_string()),
             ]

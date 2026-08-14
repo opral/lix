@@ -1,7 +1,7 @@
 //! Does a JSON-column equality reach the row provider?
 //!
 //! Not a product module. `filterable_column_name` returns `None` for
-//! `SchemaColumnType::Json`, so a JSON-column equality cannot become an
+//! `SchemaColumnType::Jsonb`, so a JSON-column equality cannot become an
 //! `RowFilter`. What that costs is the open question: the predicate is
 //! still *answered*, by DataFusion's `FilterExec` one layer above the
 //! provider, so the rows are materialised and then discarded.

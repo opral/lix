@@ -106,7 +106,7 @@ async fn postgresql_jsonb_syntax_registers_queries_and_updates_rows() {
             "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, $2)",
             &[
                 Value::Text("acme_jsonb_probe".into()),
-                Value::Json(definition.into()),
+                Value::Jsonb(definition.into()),
             ],
         )
         .await
@@ -177,7 +177,7 @@ async fn postgresql_jsonb_syntax_registers_queries_and_updates_rows() {
             Value::Boolean(true),
             Value::Boolean(true),
             Value::Boolean(true),
-            Value::Json(json!(null).into()),
+            Value::Jsonb(json!(null).into()),
             Value::Null,
         ]
     );

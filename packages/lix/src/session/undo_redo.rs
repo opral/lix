@@ -550,7 +550,7 @@ mod tests {
             .and_then(|row| row.get::<Value>("value").ok())
             .and_then(|value| match value {
                 Value::Text(value) => Some(value),
-                Value::Json(value) => value.as_json_string(),
+                Value::Jsonb(value) => value.as_json_string(),
                 _ => None,
             })
     }

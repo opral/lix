@@ -72,8 +72,8 @@ fn value_to_text(value: &Value) -> String {
         Value::Integer(v) => v.to_string(),
         Value::Real(v) => v.to_string(),
         Value::Text(v) => v.clone(),
-        Value::Json(v) => v.to_string(),
-        Value::Timestamp(v) => timestamp_text(*v),
+        Value::Jsonb(v) => v.to_string(),
+        Value::Timestamptz(v) => timestamp_text(*v),
         Value::Blob(bytes) => bytes_to_hex(bytes),
     }
 }
@@ -87,8 +87,8 @@ fn value_to_json(value: &Value) -> JsonValue {
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Value::Text(v) => JsonValue::String(v.clone()),
-        Value::Json(v) => v.to_value(),
-        Value::Timestamp(v) => JsonValue::String(timestamp_text(*v)),
+        Value::Jsonb(v) => v.to_value(),
+        Value::Timestamptz(v) => JsonValue::String(timestamp_text(*v)),
         Value::Blob(bytes) => serde_json::json!({
             "$blob": base64::engine::general_purpose::STANDARD.encode(bytes),
         }),
@@ -146,7 +146,7 @@ mod tests {
             JsonValue::String("hello".to_string())
         );
         assert_eq!(
-            value_to_json(&Value::Json(serde_json::json!({"ok": true}).into())),
+            value_to_json(&Value::Jsonb(serde_json::json!({"ok": true}).into())),
             serde_json::json!({"ok": true})
         );
     }

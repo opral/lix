@@ -744,18 +744,18 @@ impl TryFrom<LixValueDto> for Value {
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .map(Self::Text)
                 .ok_or_else(|| invalid_param("text value must be a string")),
-            "json" => Ok(Self::Json(
+            "jsonb" => Ok(Self::Jsonb(
                 value.value.unwrap_or(serde_json::Value::Null).into(),
             )),
-            "timestamp" => {
+            "timestamptz" => {
                 let raw = value
                     .value
                     .and_then(|value| value.as_str().map(str::to_owned))
-                    .ok_or_else(|| invalid_param("timestamp value must be an RFC 3339 string"))?;
+                    .ok_or_else(|| invalid_param("timestamptz value must be an RFC 3339 string"))?;
                 let parsed = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
-                    invalid_param(format!("timestamp value is invalid: {error}"))
+                    invalid_param(format!("timestamptz value is invalid: {error}"))
                 })?;
-                Ok(Self::Timestamp(parsed.timestamp_micros()))
+                Ok(Self::Timestamptz(parsed.timestamp_micros()))
             }
             "blob" => value
                 .blob
@@ -779,12 +779,12 @@ impl TryFrom<&Value> for LixValueDto {
             }
             Value::Real(_) => return Err(invalid_param("cannot encode non-finite real value")),
             Value::Text(value) => ("text", Some(serde_json::json!(value)), None),
-            Value::Json(value) => ("json", Some(value.to_value()), None),
-            Value::Timestamp(value) => {
+            Value::Jsonb(value) => ("jsonb", Some(value.to_value()), None),
+            Value::Timestamptz(value) => {
                 let value = chrono::DateTime::from_timestamp_micros(*value)
-                    .ok_or_else(|| invalid_param("timestamp is out of range"))?;
+                    .ok_or_else(|| invalid_param("timestamptz is out of range"))?;
                 (
-                    "timestamp",
+                    "timestamptz",
                     Some(serde_json::Value::String(
                         value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                     )),
@@ -945,4 +945,22 @@ fn lix_error_to_js(error: LixError) -> JsValue {
         let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
     }
     js_error.into()
+}
+
+#[cfg(test)]
+mod value_kind_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_and_timestamp_value_kinds_are_rejected() {
+        for kind in ["json", "timestamp"] {
+            let error = Value::try_from(LixValueDto {
+                kind: kind.to_owned(),
+                value: Some(serde_json::Value::Null),
+                blob: None,
+            })
+            .expect_err("legacy WebAssembly value kind must not decode");
+            assert!(error.message.contains("unsupported LixValue kind"));
+        }
+    }
 }

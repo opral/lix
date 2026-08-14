@@ -68,7 +68,7 @@ fn assert_key_value_row(event: &ObserveEvent, key: &str, value: &str) {
         event.rows.rows()[0].values(),
         &[
             Value::Text(key.to_string()),
-            Value::Json(json!(value).into()),
+            Value::Jsonb(json!(value).into()),
         ]
     );
 }

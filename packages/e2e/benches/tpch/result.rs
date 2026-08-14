@@ -77,7 +77,7 @@ fn cell_from_lix(value: &Value) -> Cell {
         Value::Integer(value) => Cell::Int(i128::from(*value)),
         Value::Real(value) => Cell::Float(*value),
         Value::Text(value) => Cell::Text(value.clone()),
-        Value::Json(value) => Cell::Text(value.to_string()),
+        Value::Jsonb(value) => Cell::Text(value.to_string()),
         Value::Blob(value) => Cell::Text(format!("{value:?}")),
     }
 }

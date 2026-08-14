@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use datafusion::arrow::datatypes::Field;
 
 pub(crate) const LIX_VALUE_TYPE_METADATA_KEY: &str = "lix.value_type";
-pub(crate) const LIX_VALUE_TYPE_JSON: &str = "json";
+pub(crate) const LIX_VALUE_TYPE_JSONB: &str = "jsonb";
 
 pub(crate) fn json_field(name: impl Into<String>, nullable: bool) -> Field {
     Field::new(name, datafusion::arrow::datatypes::DataType::Utf8, nullable)
@@ -18,12 +18,12 @@ pub(crate) fn field_is_json(field: &Field) -> bool {
     field
         .metadata()
         .get(LIX_VALUE_TYPE_METADATA_KEY)
-        .is_some_and(|value| value == LIX_VALUE_TYPE_JSON)
+        .is_some_and(|value| value == LIX_VALUE_TYPE_JSONB)
 }
 
 fn json_field_metadata_map() -> HashMap<String, String> {
     HashMap::from([(
         LIX_VALUE_TYPE_METADATA_KEY.to_string(),
-        LIX_VALUE_TYPE_JSON.to_string(),
+        LIX_VALUE_TYPE_JSONB.to_string(),
     )])
 }

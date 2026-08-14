@@ -1592,7 +1592,7 @@ fn direct_path_value_replacement(
     if assignment.column.name != "value"
         || spec
             .visible_column("value")
-            .is_none_or(|column| column.column_type != SchemaColumnType::Json)
+            .is_none_or(|column| column.column_type != SchemaColumnType::Jsonb)
     {
         return None;
     }
@@ -2528,7 +2528,7 @@ fn eval_fast_file_metadata(
         BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
             Some(Value::Null) => return Ok(None),
             Some(Value::Text(value)) => parse_row_metadata_value(value, "lix_file")?,
-            Some(Value::Json(value)) => {
+            Some(Value::Jsonb(value)) => {
                 let value = value.to_value();
                 validate_row_metadata(&value, "lix_file")?;
                 value
@@ -3471,12 +3471,12 @@ fn row_returning_value(
             RowEvalValue::SqlNull => Value::Null,
             RowEvalValue::Json(JsonValue::Null)
                 if visible_row_column(expr, spec)
-                    .is_some_and(|column| column.column_type == SchemaColumnType::Json) =>
+                    .is_some_and(|column| column.column_type == SchemaColumnType::Jsonb) =>
             {
                 Value::Null
             }
             RowEvalValue::SqlText(value) => Value::Text(value),
-            RowEvalValue::Json(value) => Value::Json(value.into()),
+            RowEvalValue::Json(value) => Value::Jsonb(value.into()),
         });
     }
     if let Some(column) = visible_row_column(expr, spec) {
@@ -3503,7 +3503,7 @@ fn row_returning_value(
             .or_else(|| value.as_f64().map(Value::Real))
             .unwrap_or_else(|| Value::Text(value.to_string())),
         RowEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
-            Value::Json(value.into())
+            Value::Jsonb(value.into())
         }
     })
 }
@@ -4732,7 +4732,7 @@ fn certified_direct_parameter_insert_batch(
                         }))
                         .with_timezone("UTC"),
                     ),
-                    (SchemaColumnType::String | SchemaColumnType::Json, None) => {
+                    (SchemaColumnType::String | SchemaColumnType::Jsonb, None) => {
                         Arc::new(StringArray::new_null(row_count))
                     }
                     (SchemaColumnType::Boolean, None) => {
@@ -4744,7 +4744,7 @@ fn certified_direct_parameter_insert_batch(
                         TimestampMicrosecondArray::new_null(row_count).with_timezone("UTC"),
                     ),
                     (
-                        SchemaColumnType::Json
+                        SchemaColumnType::Jsonb
                         | SchemaColumnType::Integer
                         | SchemaColumnType::Number,
                         Some(_),
@@ -4815,7 +4815,7 @@ fn certified_direct_path_value_insert_batch(
                 expr,
                 InsertColumnTarget::Visible {
                     name: column_name,
-                    column_type: SchemaColumnType::Json,
+                    column_type: SchemaColumnType::Jsonb,
                     ..
                 },
             ) if column_name == "value" => {
@@ -4988,7 +4988,7 @@ fn certified_row_insert_rows<'a>(
             target,
             InsertColumnTarget::FileId
                 | InsertColumnTarget::Visible {
-                    column_type: SchemaColumnType::Json
+                    column_type: SchemaColumnType::Jsonb
                         | SchemaColumnType::Integer
                         | SchemaColumnType::Number,
                     ..
@@ -6162,7 +6162,7 @@ fn numeric_comparison_value(
                     .map(|value| value.map(NumericComparisonValue::Double))
             }
             SchemaColumnType::String
-            | SchemaColumnType::Json
+            | SchemaColumnType::Jsonb
             | SchemaColumnType::Boolean
             | SchemaColumnType::Timestamptz => Ok(None),
         };
@@ -6507,7 +6507,7 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &SchemaSurfaceSpec) -> bool {
     match expr {
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => {
             spec.visible_column(&column.name)
-                .is_some_and(|column| column.column_type == SchemaColumnType::Json)
+                .is_some_and(|column| column.column_type == SchemaColumnType::Jsonb)
                 || matches!(column.name.as_str(), "lixcol_row_pk" | "lixcol_metadata")
         }
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
@@ -6591,7 +6591,7 @@ fn row_json_value(
     let value = exact_bigint_literal.map_or_else(
         || match (value, column_type) {
             (RowEvalValue::SqlNull, _) => JsonValue::Null,
-            (RowEvalValue::SqlText(value), SchemaColumnType::Json) => {
+            (RowEvalValue::SqlText(value), SchemaColumnType::Jsonb) => {
                 serde_json::from_str(&value).unwrap_or(JsonValue::String(value))
             }
             (RowEvalValue::SqlText(value), _) => JsonValue::String(value),
@@ -6630,7 +6630,7 @@ fn row_json_value(
                 )
             })?;
         }
-        SchemaColumnType::String | SchemaColumnType::Json | SchemaColumnType::Boolean => {}
+        SchemaColumnType::String | SchemaColumnType::Jsonb | SchemaColumnType::Boolean => {}
     }
     Ok(value)
 }
@@ -6780,7 +6780,7 @@ fn reject_direct_blob_json_value(
     column_type: SchemaColumnType,
     params: &[Value],
 ) -> Result<(), LixError> {
-    if column_type != SchemaColumnType::Json {
+    if column_type != SchemaColumnType::Jsonb {
         return Ok(());
     }
     let is_blob = match expr {
@@ -6826,8 +6826,8 @@ fn value_json(value: &Value) -> JsonValue {
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
-        Value::Json(value) => value.to_value(),
-        Value::Timestamp(value) => JsonValue::from(*value),
+        Value::Jsonb(value) => value.to_value(),
+        Value::Timestamptz(value) => JsonValue::from(*value),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
         }

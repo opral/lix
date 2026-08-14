@@ -162,7 +162,7 @@ simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
         vec![
             Value::Text("history-conformance-row".to_string()),
             Value::Null,
-            Value::Json(serde_json::json!(["history-conformance-row"]).into()),
+            Value::Jsonb(serde_json::json!(["history-conformance-row"]).into()),
             Value::Integer(0),
         ]
     );
@@ -211,13 +211,13 @@ simulation_test!(
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
                     Value::Null,
-                    Value::Json(serde_json::json!(["history-pk-backfill"]).into()),
+                    Value::Jsonb(serde_json::json!(["history-pk-backfill"]).into()),
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
-                    Value::Json(serde_json::json!("one").into()),
-                    Value::Json(serde_json::json!(["history-pk-backfill"]).into()),
+                    Value::Jsonb(serde_json::json!("one").into()),
+                    Value::Jsonb(serde_json::json!(["history-pk-backfill"]).into()),
                     Value::Integer(1),
                 ],
             ]
@@ -430,7 +430,7 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
+                Value::Jsonb(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -489,7 +489,7 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
+                Value::Jsonb(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -548,7 +548,7 @@ simulation_test!(
                 .iter()
                 .map(|row| row.get::<Value>("value").expect("value"))
                 .collect::<Vec<_>>(),
-            vec![Value::Json(json!("one").into())]
+            vec![Value::Jsonb(json!("one").into())]
         );
 
         let nullable_side = session
@@ -570,7 +570,7 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![Value::Json(json!("one").into()),]]
+            vec![vec![Value::Jsonb(json!("one").into()),]]
         );
 
         let right_nullable_side = session
@@ -592,7 +592,7 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![Value::Json(json!("one").into()),]]
+            vec![vec![Value::Jsonb(json!("one").into()),]]
         );
 
         let semi_join = session
@@ -614,7 +614,7 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![Value::Json(json!("one").into()),]]
+            vec![vec![Value::Jsonb(json!("one").into()),]]
         );
 
         let projected = session
@@ -637,7 +637,7 @@ simulation_test!(
                 .iter()
                 .map(|row| row.get::<Value>("snapshot").expect("snapshot"))
                 .collect::<Vec<_>>(),
-            vec![Value::Json(json!("one").into())]
+            vec![Value::Jsonb(json!("one").into())]
         );
     }
 );
@@ -770,12 +770,12 @@ simulation_test!(
                 vec![
                     Value::Text(first_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Json(json!("one").into()),
+                    Value::Jsonb(json!("one").into()),
                 ],
                 vec![
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Json(json!("two").into()),
+                    Value::Jsonb(json!("two").into()),
                 ],
             ],
             "multiple history function calls can be unioned"

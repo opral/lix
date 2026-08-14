@@ -207,7 +207,7 @@ pub(crate) fn parameter_record_batch(rows: &[&[Value]]) -> Result<Option<RecordB
             rows.iter()
                 .any(|row| matches!(row[column_index], Value::Null)),
         );
-        fields.push(if kind == ParameterKind::Json {
+        fields.push(if kind == ParameterKind::Jsonb {
             crate::sql2::result_metadata::mark_json_field(field)
         } else {
             field
@@ -254,8 +254,8 @@ enum ParameterKind {
     Integer,
     Real,
     Text,
-    Json,
-    Timestamp,
+    Jsonb,
+    Timestamptz,
     Blob,
 }
 
@@ -267,8 +267,8 @@ impl ParameterKind {
             Value::Integer(_) => Some(Self::Integer),
             Value::Real(_) => Some(Self::Real),
             Value::Text(_) => Some(Self::Text),
-            Value::Json(_) => Some(Self::Json),
-            Value::Timestamp(_) => Some(Self::Timestamp),
+            Value::Jsonb(_) => Some(Self::Jsonb),
+            Value::Timestamptz(_) => Some(Self::Timestamptz),
             Value::Blob(_) => Some(Self::Blob),
         }
     }
@@ -278,8 +278,8 @@ impl ParameterKind {
             Self::Boolean => DataType::Boolean,
             Self::Integer => DataType::Int64,
             Self::Real => DataType::Float64,
-            Self::Text | Self::Json => DataType::Utf8,
-            Self::Timestamp => DataType::Timestamp(
+            Self::Text | Self::Jsonb => DataType::Utf8,
+            Self::Timestamptz => DataType::Timestamp(
                 datafusion::arrow::datatypes::TimeUnit::Microsecond,
                 Some("UTC".into()),
             ),
@@ -293,16 +293,16 @@ impl ParameterKind {
             (Self::Integer, Value::Integer(value)) => Ok(ScalarValue::Int64(Some(*value))),
             (Self::Real, Value::Real(value)) => Ok(ScalarValue::Float64(Some(*value))),
             (Self::Text, Value::Text(value)) => Ok(ScalarValue::Utf8(Some(value.clone()))),
-            (Self::Json, Value::Json(value)) => Ok(ScalarValue::Utf8(Some(value.to_string()))),
-            (Self::Timestamp, Value::Timestamp(value)) => Ok(
+            (Self::Jsonb, Value::Jsonb(value)) => Ok(ScalarValue::Utf8(Some(value.to_string()))),
+            (Self::Timestamptz, Value::Timestamptz(value)) => Ok(
                 ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())),
             ),
             (Self::Blob, Value::Blob(value)) => Ok(ScalarValue::LargeBinary(Some(value.to_vec()))),
             (Self::Boolean, Value::Null) => Ok(ScalarValue::Boolean(None)),
             (Self::Integer, Value::Null) => Ok(ScalarValue::Int64(None)),
             (Self::Real, Value::Null) => Ok(ScalarValue::Float64(None)),
-            (Self::Text | Self::Json, Value::Null) => Ok(ScalarValue::Utf8(None)),
-            (Self::Timestamp, Value::Null) => Ok(ScalarValue::TimestampMicrosecond(
+            (Self::Text | Self::Jsonb, Value::Null) => Ok(ScalarValue::Utf8(None)),
+            (Self::Timestamptz, Value::Null) => Ok(ScalarValue::TimestampMicrosecond(
                 None,
                 Some("UTC".into()),
             )),
@@ -319,9 +319,9 @@ fn scalar_parameter_value(scalar: ScalarValue, is_json: bool) -> Result<Value, L
         ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(value)),
         ScalarValue::Int64(Some(value)) => Ok(Value::Integer(value)),
         ScalarValue::Float64(Some(value)) => Ok(Value::Real(value)),
-        ScalarValue::TimestampMicrosecond(Some(value), _) => Ok(Value::Timestamp(value)),
+        ScalarValue::TimestampMicrosecond(Some(value), _) => Ok(Value::Timestamptz(value)),
         ScalarValue::Utf8(Some(value)) if is_json => serde_json::from_str(&value)
-            .map(Value::Json)
+            .map(Value::Jsonb)
             .map_err(|error| {
                 LixError::unknown(format!(
                     "invalid JSON value in SQL parameter batch: {error}"
@@ -329,7 +329,7 @@ fn scalar_parameter_value(scalar: ScalarValue, is_json: bool) -> Result<Value, L
             }),
         ScalarValue::Utf8(Some(value)) => Ok(Value::Text(value)),
         ScalarValue::LargeUtf8(Some(value)) if is_json => serde_json::from_str(&value)
-            .map(Value::Json)
+            .map(Value::Jsonb)
             .map_err(|error| {
                 LixError::unknown(format!(
                     "invalid JSON value in SQL parameter batch: {error}"

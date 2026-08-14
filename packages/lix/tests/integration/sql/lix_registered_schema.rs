@@ -45,7 +45,7 @@ simulation_test!(
             .rows()
             .iter()
             .find_map(|row| match row.values() {
-                [Value::Json(row_pk), Value::Json(value)]
+                [Value::Jsonb(row_pk), Value::Jsonb(value)]
                     if value
                         .to_value()
                         .get("key")
@@ -54,7 +54,7 @@ simulation_test!(
                 {
                     Some(row_pk)
                 }
-                [Value::Json(row_pk), Value::Text(value)] => {
+                [Value::Jsonb(row_pk), Value::Text(value)] => {
                     let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                     (value.get("key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema"))
@@ -120,7 +120,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES ($1)",
-                &[Value::Json(schema.into())],
+                &[Value::Jsonb(schema.into())],
             )
             .await
             .expect("schema registration should succeed");
@@ -169,7 +169,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES ($1)",
-                &[Value::Json(schema.into())],
+                &[Value::Jsonb(schema.into())],
             )
             .await
             .expect("schema registration should succeed");
@@ -329,7 +329,7 @@ simulation_test!(
                     "INSERT INTO lix_registered_schema \
                      (value, lixcol_global, lixcol_untracked) \
                      VALUES ($1, false, false)",
-                    &[Value::Json(schema.into())],
+                    &[Value::Jsonb(schema.into())],
                 )
                 .await
                 .expect_err("every lix_* runtime schema key should be reserved");
@@ -362,7 +362,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema \
                  (value, lixcol_global, lixcol_untracked) \
                  VALUES ($1, false, false)",
-                &[Value::Json(noncolliding_schema.into())],
+                &[Value::Jsonb(noncolliding_schema.into())],
             )
             .await
             .expect("an application-owned schema namespace should remain registerable");
@@ -522,7 +522,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
         .rows()
         .iter()
         .find_map(|row| match row.values() {
-            [Value::Json(row_pk), Value::Json(value)]
+            [Value::Jsonb(row_pk), Value::Jsonb(value)]
                 if value
                     .to_value()
                     .get("key")
@@ -531,7 +531,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
             {
                 Some(row_pk.clone())
             }
-            [Value::Json(row_pk), Value::Text(value)] => {
+            [Value::Jsonb(row_pk), Value::Text(value)] => {
                 let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                 (value.get("key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema"))
@@ -545,7 +545,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
         .execute(
             "DELETE FROM lix_registered_schema \
                  WHERE lixcol_row_pk = $1",
-            &[Value::Json(delete_schema_row_pk)],
+            &[Value::Jsonb(delete_schema_row_pk)],
         )
         .await
         .expect_err("schema deletion is not supported yet");
@@ -612,7 +612,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES ($1, false, false)",
-                &[Value::Json(initial_schema.clone().into())],
+                &[Value::Jsonb(initial_schema.clone().into())],
             )
             .await
             .expect("tracked schema insert should succeed");
@@ -627,7 +627,7 @@ simulation_test!(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
                  WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB)",
-                &[Value::Json(amended_schema.clone().into())],
+                &[Value::Jsonb(amended_schema.clone().into())],
             )
             .await
             .expect("compatible tracked schema amendment should succeed");
@@ -655,14 +655,14 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Json(amended_schema.into()),
-                    Value::Json(json!(["engine_schema_update_history"]).into()),
+                    Value::Jsonb(amended_schema.into()),
+                    Value::Jsonb(json!(["engine_schema_update_history"]).into()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
-                    Value::Json(initial_schema.into()),
-                    Value::Json(json!(["engine_schema_update_history"]).into()),
+                    Value::Jsonb(initial_schema.into()),
+                    Value::Jsonb(json!(["engine_schema_update_history"]).into()),
                     Value::Text(first_commit_id),
                     Value::Integer(1),
                 ],
@@ -870,7 +870,7 @@ simulation_test!(
             )
             .await
             .expect("main schema read should succeed");
-        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema.into())]]);
+        assert_rows_eq(main_result, vec![vec![Value::Jsonb(main_schema.into())]]);
 
         let target_result = target
             .execute(
@@ -881,7 +881,7 @@ simulation_test!(
             )
             .await
             .expect("target schema read should succeed");
-        assert_rows_eq(target_result, vec![vec![Value::Json(target_schema.into())]]);
+        assert_rows_eq(target_result, vec![vec![Value::Jsonb(target_schema.into())]]);
     }
 );
 
@@ -930,7 +930,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES ($1, false, false)",
-            &[Value::Json(base_schema.into())],
+            &[Value::Jsonb(base_schema.into())],
         )
         .await
         .expect("base schema should be registered");
@@ -956,7 +956,7 @@ simulation_test!(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
                  WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
-                &[Value::Json(main_schema.clone().into())],
+                &[Value::Jsonb(main_schema.clone().into())],
             )
             .await
             .expect("main additive schema amendment should succeed");
@@ -967,7 +967,7 @@ simulation_test!(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
                  WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
-                &[Value::Json(draft_schema.clone().into())],
+                &[Value::Jsonb(draft_schema.clone().into())],
             )
             .await
             .expect("draft additive schema amendment should succeed");
@@ -982,7 +982,7 @@ simulation_test!(
             )
             .await
             .expect("main amended schema read should succeed");
-        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema.into())]]);
+        assert_rows_eq(main_result, vec![vec![Value::Jsonb(main_schema.into())]]);
 
         let draft_result = draft
             .execute(
@@ -993,7 +993,7 @@ simulation_test!(
             )
             .await
             .expect("draft amended schema read should succeed");
-        assert_rows_eq(draft_result, vec![vec![Value::Json(draft_schema.into())]]);
+        assert_rows_eq(draft_result, vec![vec![Value::Jsonb(draft_schema.into())]]);
     }
 );
 
@@ -1124,7 +1124,7 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Json(row_pk), Value::Text(id), Value::Text(name)] = values else {
+        let [Value::Jsonb(row_pk), Value::Text(id), Value::Text(name)] = values else {
             panic!("expected generated id row, got {values:?}");
         };
         assert_eq!(row_pk, &json!([id]));
@@ -1377,7 +1377,7 @@ simulation_test!(
                 Value::Text("typed-row-1".to_string()),
                 Value::Text("Typed Row".to_string()),
                 Value::Real(7.0),
-                Value::Json(json!(["typed-row-1"]).into()),
+                Value::Jsonb(json!(["typed-row-1"]).into()),
             ]],
         );
     }
@@ -2383,7 +2383,7 @@ simulation_test!(
                 )
                 .await
                 .expect("updated propertyless row should remain readable"),
-            vec![vec![Value::Json(json!({"phase": "after"}).into())]],
+            vec![vec![Value::Jsonb(json!({"phase": "after"}).into())]],
         );
     }
 );

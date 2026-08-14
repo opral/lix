@@ -79,7 +79,7 @@ simulation_test!(
             .expect("current state should remain readable after collection");
         assert_eq!(
             state.rows()[0].values(),
-            &[Value::Json(json!("interval-two").into())]
+            &[Value::Jsonb(json!("interval-two").into())]
         );
         assert_eq!(
             session
@@ -169,7 +169,7 @@ simulation_test!(
             .expect("protected branch state should remain readable");
         assert_eq!(
             state.rows()[0].values(),
-            &[Value::Json(json!("protected-source").into())]
+            &[Value::Jsonb(json!("protected-source").into())]
         );
 
         drop(protected);

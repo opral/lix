@@ -52,8 +52,8 @@ export type LixValue =
 	| { kind: "integer"; value: number }
 	| { kind: "real"; value: number }
 	| { kind: "text"; value: string }
-	| { kind: "json"; value: JsonValue }
-	| { kind: "timestamp"; value: string }
+	| { kind: "jsonb"; value: JsonValue }
+	| { kind: "timestamptz"; value: string }
 	| { kind: "blob"; value: Uint8Array };
 
 export type JsonValue =

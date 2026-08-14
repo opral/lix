@@ -111,7 +111,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path, lixcol_metadata) \
                  VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700.txt', $1)",
-                &[Value::Json(file_metadata.clone().into())],
+                &[Value::Jsonb(file_metadata.clone().into())],
             )
             .await
             .expect("file insert should succeed");
@@ -132,7 +132,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata) \
                  VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700', $1)",
-                &[Value::Json(directory_metadata.clone().into())],
+                &[Value::Jsonb(directory_metadata.clone().into())],
             )
             .await
             .expect("directory insert should succeed");
@@ -262,7 +262,7 @@ simulation_test!(
                 .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
                      VALUES ('metadata-row-json-null-param-insert', 'value', $1)",
-                    &[Value::Json(json!(null).into())],
+                    &[Value::Jsonb(json!(null).into())],
                 )
                 .await
                 .expect_err("JSON null parameter metadata should be rejected on INSERT"),
@@ -494,7 +494,7 @@ simulation_test!(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = $1 \
                      WHERE key = 'metadata-row-update'",
-                    &[Value::Json(json!(null).into())],
+                    &[Value::Jsonb(json!(null).into())],
                 )
                 .await
                 .expect_err("JSON null parameter metadata should be rejected on UPDATE"),
@@ -604,7 +604,7 @@ fn assert_metadata_value(result: lix::ExecuteResult, column: &str, expected: &se
     let value = result.rows()[0]
         .get::<Value>(column)
         .unwrap_or_else(|_| panic!("{column} should be present"));
-    assert_eq!(value, Value::Json(expected.clone().into()));
+    assert_eq!(value, Value::Jsonb(expected.clone().into()));
 }
 
 fn assert_metadata_null(result: lix::ExecuteResult, column: &str) {

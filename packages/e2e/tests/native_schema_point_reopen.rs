@@ -113,7 +113,7 @@ async fn assert_point<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix
         .expect("read native point row");
     assert_eq!(result.columns(), ["body"]);
     assert_eq!(result.len(), 1);
-    let Value::Json(actual) = result.rows()[0].get_index(0).expect("point payload") else {
+    let Value::Jsonb(actual) = result.rows()[0].get_index(0).expect("point payload") else {
         panic!("point payload must remain JSONB");
     };
     assert_eq!(actual.as_str(), expected);

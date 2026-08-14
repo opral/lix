@@ -151,7 +151,7 @@ async fn volatile_execution_functions_stay_fresh_on_a_reused_session() {
         );
         assert!(matches!(
             rows.rows()[0].value("stamp"),
-            Ok(Value::Timestamp(_))
+            Ok(Value::Timestamptz(_))
         ));
         uuids.push(first);
         uuids.push(second);

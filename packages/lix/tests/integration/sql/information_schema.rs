@@ -245,7 +245,7 @@ simulation_test!(
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
-                    Value::Text("JSON".to_string()),
+                    Value::Text("JSONB".to_string()),
                     Value::Text("REQUIRED".to_string()),
                 ],
                 vec![
@@ -551,12 +551,12 @@ simulation_test!(
                     Value::Text("false".to_string()),
                     Value::Boolean(false),
                 ),
-                ("json_value", Some("JSON")) => (
+                ("json_value", Some("JSONB")) => (
                     Value::Text("{\"phase\":\"insert\"}".to_string()),
                     Value::Text("{\"phase\":\"insert\"}".to_string()),
-                    Value::Json(serde_json::json!({"phase": "insert"}).into()),
+                    Value::Jsonb(serde_json::json!({"phase": "insert"}).into()),
                     Value::Text("{\"phase\":\"update\"}".to_string()),
-                    Value::Json(serde_json::json!({"phase": "update"}).into()),
+                    Value::Jsonb(serde_json::json!({"phase": "update"}).into()),
                 ),
                 ("content", None) => (
                     Value::Text("before".to_string()),
@@ -647,7 +647,7 @@ simulation_test!(
             assert_eq!(contract.data_type, expected_type);
             assert_eq!(
                 contract.value_kind.as_deref(),
-                (contract.column_name == "json_value").then_some("JSON")
+                (contract.column_name == "json_value").then_some("JSONB")
             );
 
             let (insert_param, select_expected, _, _, _) = values_for_contract(contract);
@@ -1255,7 +1255,7 @@ simulation_test!(
                 .expect("updated row should be readable"),
             vec![vec![
                 Value::Text("fresh".to_string()),
-                Value::Json(serde_json::json!(["same"]).into()),
+                Value::Jsonb(serde_json::json!(["same"]).into()),
             ]],
         );
 
@@ -1431,7 +1431,7 @@ simulation_test!(
                 .expect("DELETE RETURNING should match SELECT null semantics"),
             vec![vec![
                 Value::Null,
-                Value::Json(serde_json::Value::Null.into()),
+                Value::Jsonb(serde_json::Value::Null.into()),
             ]],
         );
     }

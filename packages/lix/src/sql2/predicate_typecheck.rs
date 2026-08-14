@@ -10,7 +10,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 use crate::LixError;
 
 use super::error::lix_error_to_datafusion_error;
-use super::result_metadata::{LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json};
+use super::result_metadata::{LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, field_is_json};
 
 pub(crate) fn validate_json_predicate_filters(
     schema: &Schema,
@@ -161,7 +161,7 @@ fn canonicalize_json_text_literal(expr: Expr) -> Result<Expr, DataFusionError> {
 fn json_field_metadata() -> FieldMetadata {
     FieldMetadata::new(BTreeMap::from([(
         LIX_VALUE_TYPE_METADATA_KEY.to_string(),
-        LIX_VALUE_TYPE_JSON.to_string(),
+        LIX_VALUE_TYPE_JSONB.to_string(),
     )]))
 }
 
@@ -454,7 +454,7 @@ fn is_json_expr<'a>(
         Expr::Literal(_, Some(metadata)) => metadata
             .inner()
             .get(LIX_VALUE_TYPE_METADATA_KEY)
-            .is_some_and(|value| value == LIX_VALUE_TYPE_JSON),
+            .is_some_and(|value| value == LIX_VALUE_TYPE_JSONB),
         Expr::ScalarFunction(function) => matches!(
             function.name(),
             "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"

@@ -643,7 +643,7 @@ fn git_replay_marker_statement(commit: &ReplayCommit) -> SqlStatement {
             .to_string(),
         params: vec![
             Value::Text(GIT_REPLAY_MARKER_KEY.to_string()),
-            Value::Json(
+            Value::Jsonb(
                 json!({
                     "sha": commit.sha,
                     "first_parent": commit.first_parent,
@@ -1892,7 +1892,7 @@ fn value_from_optional_blob(data: Option<&Vec<u8>>) -> Value {
 }
 
 fn git_file_metadata_value(row: &WriteRow) -> Value {
-    Value::Json(
+    Value::Jsonb(
         json!({
             "git_mode": row.git_mode,
             "git_oid": row.git_oid,
@@ -2088,7 +2088,7 @@ fn value_to_optional_blob<'a>(
 
 fn value_to_json(value: &Value, context: &str) -> Result<serde_json::Value, CliError> {
     match value {
-        Value::Json(value) => Ok(value.to_value()),
+        Value::Jsonb(value) => Ok(value.to_value()),
         _ => Err(CliError::msg(format!("unexpected JSON type for {context}"))),
     }
 }
@@ -2533,7 +2533,7 @@ mod tests {
                     Value::Text(stable_file_id(&git_path(b"one"))),
                     Value::Text("/one".to_string()),
                     Value::Blob(vec![1_u8, 2].into()),
-                    Value::Json(json!({"git_mode": "100644", "git_oid": "oid-1"}).into()),
+                    Value::Jsonb(json!({"git_mode": "100644", "git_oid": "oid-1"}).into()),
                 ],
             },
             SqlStatement {
@@ -2543,7 +2543,7 @@ mod tests {
                     Value::Text(stable_file_id(&git_path(b"two"))),
                     Value::Text("/two".to_string()),
                     Value::Blob(vec![3_u8, 4].into()),
-                    Value::Json(json!({"git_mode": "100644", "git_oid": "oid-2"}).into()),
+                    Value::Jsonb(json!({"git_mode": "100644", "git_oid": "oid-2"}).into()),
                 ],
             },
             git_replay_marker_statement(&ReplayCommit {
@@ -3054,7 +3054,7 @@ mod tests {
         );
         assert_eq!(
             statement.params[1],
-            Value::Json(json!({"sha": "a".repeat(40), "first_parent": "b".repeat(40)}).into())
+            Value::Jsonb(json!({"sha": "a".repeat(40), "first_parent": "b".repeat(40)}).into())
         );
     }
 
@@ -3085,7 +3085,7 @@ mod tests {
                 Value::Text("/src/main.ts".to_string()),
                 Value::Text("/src/main.ts".to_string()),
                 Value::Blob(b"hello".to_vec().into()),
-                Value::Json(json!({"git_mode": "100755", "git_oid": "a".repeat(40)}).into()),
+                Value::Jsonb(json!({"git_mode": "100755", "git_oid": "a".repeat(40)}).into()),
             ]
         );
     }
@@ -3122,7 +3122,7 @@ mod tests {
                 Value::Text("/src/new.ts".to_string()),
                 Value::Text("/src/new.ts".to_string()),
                 Value::Blob(b"hello".to_vec().into()),
-                Value::Json(json!({"git_mode": "100644", "git_oid": "b".repeat(40)}).into()),
+                Value::Jsonb(json!({"git_mode": "100644", "git_oid": "b".repeat(40)}).into()),
             ]
         );
     }

@@ -315,8 +315,8 @@ impl RowProjectionSink for PublicProjectionSink {
                 SchemaColumnType::String => raw_string_text(raw)?
                     .map(crate::Value::Text)
                     .unwrap_or(crate::Value::Null),
-                SchemaColumnType::Json => raw_json_text(raw)
-                    .map(|json| crate::Value::Json(crate::Json::from_canonical_text(json)))
+                SchemaColumnType::Jsonb => raw_json_text(raw)
+                    .map(|json| crate::Value::Jsonb(crate::Json::from_canonical_text(json)))
                     .unwrap_or(crate::Value::Null),
                 SchemaColumnType::Integer => {
                     let value = parse_json_value(raw)?;
@@ -336,7 +336,7 @@ impl RowProjectionSink for PublicProjectionSink {
                 SchemaColumnType::Timestamptz => raw_string_text(raw)?
                     .map(|value| {
                         chrono::DateTime::parse_from_rfc3339(&value)
-                            .map(|timestamp| crate::Value::Timestamp(timestamp.timestamp_micros()))
+                            .map(|timestamp| crate::Value::Timestamptz(timestamp.timestamp_micros()))
                             .map_err(|error| {
                                 LixError::new(
                                     LixError::CODE_TYPE_MISMATCH,
@@ -422,7 +422,7 @@ fn snapshot_decode_error(error: serde_json::Error) -> LixError {
 
 enum RowProjectionColumn {
     String(Vec<Option<String>>),
-    Json(Vec<Option<String>>),
+    Jsonb(Vec<Option<String>>),
     Integer(Vec<Option<i64>>),
     Number(Vec<Option<f64>>),
     Boolean(Vec<Option<bool>>),
@@ -433,7 +433,7 @@ impl RowProjectionColumn {
     fn new(column_type: SchemaColumnType, capacity: usize) -> Self {
         match column_type {
             SchemaColumnType::String => Self::String(Vec::with_capacity(capacity)),
-            SchemaColumnType::Json => Self::Json(Vec::with_capacity(capacity)),
+            SchemaColumnType::Jsonb => Self::Jsonb(Vec::with_capacity(capacity)),
             SchemaColumnType::Integer => Self::Integer(Vec::with_capacity(capacity)),
             SchemaColumnType::Number => Self::Number(Vec::with_capacity(capacity)),
             SchemaColumnType::Boolean => Self::Boolean(Vec::with_capacity(capacity)),
@@ -443,7 +443,7 @@ impl RowProjectionColumn {
 
     fn push_null(&mut self) {
         match self {
-            Self::String(values) | Self::Json(values) => values.push(None),
+            Self::String(values) | Self::Jsonb(values) => values.push(None),
             Self::Integer(values) => values.push(None),
             Self::Number(values) => values.push(None),
             Self::Boolean(values) => values.push(None),
@@ -463,7 +463,7 @@ impl RowProjectionColumn {
                     .last_mut()
                     .expect("projection sink must start the row first") = raw_string_text(raw)?;
             }
-            Self::Json(values) if field.column_type == SchemaColumnType::Json => {
+            Self::Jsonb(values) if field.column_type == SchemaColumnType::Jsonb => {
                 *values
                     .last_mut()
                     .expect("projection sink must start the row first") = raw_json_text(raw);
@@ -519,7 +519,7 @@ impl RowProjectionColumn {
 
     fn into_array(self) -> ArrayRef {
         match self {
-            Self::String(values) | Self::Json(values) => Arc::new(StringArray::from(values)),
+            Self::String(values) | Self::Jsonb(values) => Arc::new(StringArray::from(values)),
             Self::Integer(values) => Arc::new(Int64Array::from(values)),
             Self::Number(values) => Arc::new(Float64Array::from(values)),
             Self::Boolean(values) => Arc::new(BooleanArray::from(values)),
@@ -571,9 +571,9 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                Value::Json(canonical_json(r#"{"a":[true,null]}"#)),
+                Value::Jsonb(canonical_json(r#"{"a":[true,null]}"#)),
                 Value::Null,
-                Value::Timestamp(1_735_689_600_123_456),
+                Value::Timestamptz(1_735_689_600_123_456),
             ]
         );
     }
@@ -743,7 +743,7 @@ mod tests {
             arrows[0],
             vec![
                 Value::Text("line\nquote: \"".to_string()),
-                Value::Json(canonical_json(r#"{"z":[true,null],"a":"value"}"#)),
+                Value::Jsonb(canonical_json(r#"{"z":[true,null],"a":"value"}"#)),
                 Value::Integer(7),
                 Value::Real(4.5),
                 Value::Boolean(true),

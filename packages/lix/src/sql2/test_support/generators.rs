@@ -37,7 +37,7 @@ pub(crate) enum ExpectedExecution {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DifferentialParam {
-    Json(&'static str),
+    Jsonb(&'static str),
     Text(&'static str),
     Blob(&'static [u8]),
 }
@@ -79,7 +79,7 @@ const FILE_AND_REGISTERED_SCHEMA_PROBES: &[DifferentialProbe] = &[
 
 #[cfg(test)]
 const PARAM_METADATA_JSON: &[DifferentialParam] =
-    &[DifferentialParam::Json("{\"seen\":\"param\"}")];
+    &[DifferentialParam::Jsonb("{\"seen\":\"param\"}")];
 
 #[cfg(test)]
 const PARAM_FILE_PATH_AND_DATA: &[DifferentialParam] = &[

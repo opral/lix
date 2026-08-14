@@ -2831,7 +2831,7 @@ simulation_test!(
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
                     Value::Blob(b"before".to_vec().into()),
-                    Value::Json(metadata.clone().into()),
+                    Value::Jsonb(metadata.clone().into()),
                 ],
             )
             .await
@@ -2853,7 +2853,7 @@ simulation_test!(
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
                     Value::Blob(b"after".to_vec().into()),
-                    Value::Json(metadata.clone().into()),
+                    Value::Jsonb(metadata.clone().into()),
                 ],
             )
             .await
@@ -2875,7 +2875,7 @@ simulation_test!(
             current.rows()[0].values(),
             &[
                 Value::Blob(b"after".to_vec().into()),
-                Value::Json(metadata.into()),
+                Value::Jsonb(metadata.into()),
             ]
         );
         assert_eq!(
@@ -2907,7 +2907,7 @@ simulation_test!(
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
                     Value::Blob(b"one".to_vec().into()),
-                    Value::Json(json!({"version": 1}).into()),
+                    Value::Jsonb(json!({"version": 1}).into()),
                 ],
             )
             .await
@@ -2929,7 +2929,7 @@ simulation_test!(
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
                     Value::Blob(b"two".to_vec().into()),
-                    Value::Json(json!({"version": 2}).into()),
+                    Value::Jsonb(json!({"version": 2}).into()),
                 ],
             )
             .await
@@ -3019,7 +3019,7 @@ async fn file_descriptor_event_count(
     let Some(row) = result.rows().first() else {
         return 0;
     };
-    let Value::Json(source_changes) = row
+    let Value::Jsonb(source_changes) = row
         .get::<Value>("lixcol_source_changes")
         .expect("file history source changes should decode")
     else {

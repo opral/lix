@@ -1889,7 +1889,7 @@ where
     lix.execute(
         "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Json(cells.into()),
+            Value::Jsonb(cells.into()),
             Value::Text(csv_row_id),
             Value::Text(csv_id),
         ],
