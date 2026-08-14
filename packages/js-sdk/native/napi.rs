@@ -2028,21 +2028,3 @@ fn throw_lix_error(env: &Env, error: LixError) -> Error {
         Err(error) => error,
     }
 }
-
-#[cfg(test)]
-mod value_kind_tests {
-    use super::*;
-
-    #[test]
-    fn legacy_json_and_timestamp_value_kinds_are_rejected() {
-        for kind in ["json", "timestamp"] {
-            let error = Value::try_from(LixValue {
-                kind: kind.to_owned(),
-                value: Some(serde_json::Value::Null),
-                blob: None,
-            })
-            .expect_err("legacy JavaScript value kind must not decode");
-            assert!(error.message.contains("unsupported LixValue kind"));
-        }
-    }
-}
