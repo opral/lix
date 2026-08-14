@@ -405,25 +405,34 @@ where
         lock_or_recover(&self.read_plans).clear();
     }
 
-    /// Parses exact SQL once and returns an owned clone of the cached AST.
+    /// Parses exact SQL once and retains the cached AST for native read routes.
     ///
     /// Parse failures are intentionally not cached. Two concurrent cold calls
     /// may do duplicate parsing, but parsing happens outside the mutex and the
     /// second insertion reuses the first successful template.
-    pub(crate) fn parse_statement(&self, sql: &str) -> Result<DataFusionStatement, LixError> {
+    pub(crate) fn parse_statement_shared(
+        &self,
+        sql: &str,
+    ) -> Result<Arc<DataFusionStatement>, LixError> {
         let cached = lock_or_recover(&self.parsed_statements).get(sql).cloned();
         if let Some(statement) = cached {
-            return Ok(statement.as_ref().clone());
+            return Ok(statement);
         }
 
         let parsed = crate::sql2::parse::parse_statement(sql)?;
         let mut statements = lock_or_recover(&self.parsed_statements);
         if let Some(statement) = statements.get(sql).cloned() {
-            drop(statements);
-            return Ok(statement.as_ref().clone());
+            return Ok(statement);
         }
-        statements.put(Arc::from(sql), Arc::new(parsed.clone()));
+        let parsed = Arc::new(parsed);
+        statements.put(Arc::from(sql), Arc::clone(&parsed));
         Ok(parsed)
+    }
+
+    /// Returns an owned statement for planning paths that consume the AST.
+    pub(crate) fn parse_statement(&self, sql: &str) -> Result<DataFusionStatement, LixError> {
+        self.parse_statement_shared(sql)
+            .map(|statement| statement.as_ref().clone())
     }
 
     /// Reuses one parsed template for UPDATE statements that differ only in

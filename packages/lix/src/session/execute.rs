@@ -1266,8 +1266,9 @@ where
         require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
-        let statement = self.sql_planning_cache.parse_statement(sql)?;
-        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+        let statement = self.sql_planning_cache.parse_statement_shared(sql)?;
+        if sql2::bind_statement_route(statement.as_ref())? == sql2::BoundStatementRoute::Write {
+            let statement = statement.as_ref().clone();
             if require_idempotency_for_writes && idempotency.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_IDEMPOTENCY_KEY_REQUIRED,
@@ -1318,27 +1319,28 @@ where
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
-        let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
+        let exact_filesystem_read = exact_filesystem_read_route(statement.as_ref(), params);
         let exact_schema_point_read = exact_filesystem_read
             .is_none()
-            .then(|| exact_schema_point_read_route(&statement, params))
+            .then(|| exact_schema_point_read_route(statement.as_ref(), params))
             .flatten();
         let exact_schema_batch_read = (exact_filesystem_read.is_none()
             && exact_schema_point_read.is_none())
-            .then(|| exact_schema_batch_read_route(&statement, params))
+            .then(|| exact_schema_batch_read_route(statement.as_ref(), params))
             .flatten();
         let late_file_content_read = (exact_filesystem_read.is_none()
             && exact_schema_point_read.is_none()
             && exact_schema_batch_read.is_none())
-            .then(|| late_materialized_lix_file_content_read(&statement))
+            .then(|| late_materialized_lix_file_content_read(statement.as_ref()))
             .flatten();
-        let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
+        let acknowledge_file_views = is_acknowledgeable_file_content_read(statement.as_ref(), params)
             || matches!(
                 &exact_filesystem_read,
                 Some(ExactFilesystemRead::PathContentBatch(_))
             )
             || late_file_content_read.is_some();
-        let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
+        let has_durable_runtime_function =
+            sql2::statement_has_durable_runtime_function(statement.as_ref());
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
             Some(write_access)
@@ -2328,7 +2330,7 @@ where
         &self,
         read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
         sql: &str,
-        statement: datafusion::sql::parser::Statement,
+        statement: Arc<datafusion::sql::parser::Statement>,
         params: &[Value],
         acknowledge_file_views: bool,
         exact_filesystem_read: Option<ExactFilesystemRead>,
@@ -2556,7 +2558,7 @@ where
                 let rewritten_sql = statement.to_string();
                 (statement, Some(plan.data_column_index), Some(rewritten_sql))
             }
-            None => (statement, None, None),
+            None => (statement.as_ref().clone(), None, None),
         };
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
@@ -3974,8 +3976,25 @@ struct ExactSchemaBatchRead {
     table_name: String,
     projected_columns: Vec<String>,
     output_columns: Vec<String>,
-    identities: Vec<BTreeMap<String, Value>>,
+    identities: ExactSchemaBatchIdentities,
     order_by_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ExactSchemaBatchIdentities {
+    Product(BTreeMap<String, Vec<Value>>),
+    Rows(Vec<BTreeMap<String, Value>>),
+}
+
+impl ExactSchemaBatchIdentities {
+    fn len(&self) -> Option<usize> {
+        match self {
+            Self::Product(columns) => columns
+                .values()
+                .try_fold(1_usize, |total, values| total.checked_mul(values.len())),
+            Self::Rows(rows) => Some(rows.len()),
+        }
+    }
 }
 
 fn exact_schema_point_read_route(
@@ -4066,17 +4085,79 @@ fn exact_schema_batch_read_route(
         }
         Some(_) => return None,
     };
-    let identities = collect_exact_schema_identity_rows(
-        simple.select.selection.as_ref()?,
-        params,
-    )?;
-    (identities.len() > 1).then_some(ExactSchemaBatchRead {
+    let selection = simple.select.selection.as_ref()?;
+    let identities = collect_exact_schema_identity_product(selection, params)
+        .map(ExactSchemaBatchIdentities::Product)
+        .or_else(|| {
+            collect_exact_schema_identity_rows(selection, params)
+                .map(ExactSchemaBatchIdentities::Rows)
+        })?;
+    (identities.len()? > 1).then_some(ExactSchemaBatchRead {
         table_name: simple.table_name,
         projected_columns,
         output_columns,
         identities,
         order_by_columns,
     })
+}
+
+fn collect_exact_schema_identity_product(
+    expression: &Expr,
+    params: &[Value],
+) -> Option<BTreeMap<String, Vec<Value>>> {
+    fn collect(
+        expression: &Expr,
+        params: &[Value],
+        columns: &mut BTreeMap<String, Vec<Value>>,
+    ) -> Option<()> {
+        match expression {
+            Expr::Nested(expression) => collect(expression, params, columns),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                collect(left, params, columns)?;
+                collect(right, params, columns)
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
+                let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
+                    (Some(column), None) => (column, exact_schema_literal(right, params)?),
+                    (None, Some(column)) => (column, exact_schema_literal(left, params)?),
+                    _ => return None,
+                };
+                columns.insert(column, vec![value]).is_none().then_some(())
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } if !list.is_empty() => {
+                let column = exact_point_column(expr)?;
+                let values = list
+                    .iter()
+                    .map(|value| exact_schema_literal(value, params))
+                    .collect::<Option<Vec<_>>>()?;
+                columns.insert(column, values).is_none().then_some(())
+            }
+            Expr::IsNull(expression) => {
+                let column = exact_point_column(expression)?;
+                columns
+                    .insert(column, vec![Value::Null])
+                    .is_none()
+                    .then_some(())
+            }
+            _ => None,
+        }
+    }
+
+    let mut columns = BTreeMap::new();
+    collect(expression, params, &mut columns)?;
+    Some(columns)
 }
 
 fn collect_exact_schema_identity_rows(
@@ -4326,54 +4407,121 @@ fn resolve_exact_schema_batch_read(
     {
         return Ok(None);
     }
+    let external_part = |component_type: &crate::row_pk::RowPkComponentType,
+                         value: &Value|
+     -> Option<String> {
+        match (component_type, value) {
+            (
+                crate::row_pk::RowPkComponentType::Uuid
+                | crate::row_pk::RowPkComponentType::String
+                | crate::row_pk::RowPkComponentType::Bytes,
+                Value::Text(value),
+            ) => Some(value.clone()),
+            (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
+                Some(value.to_string())
+            }
+            _ => None,
+        }
+    };
     let mut seen = BTreeSet::new();
-    let mut identities = Vec::with_capacity(exact.identities.len());
-    for identity in &exact.identities {
-        if identity.len() != primary_key_columns.len() + 1
-            || identity
-                .keys()
-                .any(|column| {
+    let mut identities = Vec::with_capacity(exact.identities.len().unwrap_or(0));
+    let ExactSchemaBatchIdentities::Product(columns) = &exact.identities else {
+        let ExactSchemaBatchIdentities::Rows(rows) = &exact.identities else {
+            unreachable!();
+        };
+        for identity in rows {
+            if identity.len() != primary_key_columns.len() + 1
+                || identity.keys().any(|column| {
                     column != "lixcol_file_id"
                         && !primary_key_columns.contains(&column.as_str())
                 })
-        {
-            return Ok(None);
+            {
+                return Ok(None);
+            }
+            let file_id = match identity.get("lixcol_file_id") {
+                Some(Value::Null) => None,
+                Some(Value::Text(file_id)) => Some(file_id.clone()),
+                _ => return Ok(None),
+            };
+            let parts = primary_key_columns
+                .iter()
+                .zip(&spec.primary_key_component_types)
+                .map(|(column, component_type)| {
+                    external_part(component_type, identity.get(*column)?)
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(parts) = parts else {
+                return Ok(None);
+            };
+            let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
+                parts,
+                &spec.primary_key_component_types,
+            ) else {
+                return Ok(None);
+            };
+            if seen.insert((row_pk.clone(), file_id.clone())) {
+                identities.push((row_pk, file_id));
+            }
         }
-        let file_id = match identity.get("lixcol_file_id") {
-            Some(Value::Null) => None,
-            Some(Value::Text(file_id)) => Some(file_id.clone()),
-            _ => return Ok(None),
-        };
-        let parts = primary_key_columns
+        if !exact.order_by_columns.is_empty() {
+            identities.sort_unstable();
+        }
+        return Ok(Some((spec, identities)));
+    };
+    if columns.len() != primary_key_columns.len() + 1
+        || columns.keys().any(|column| {
+            column != "lixcol_file_id" && !primary_key_columns.contains(&column.as_str())
+        })
+    {
+        return Ok(None);
+    }
+    let Some(file_ids) = columns.get("lixcol_file_id").and_then(|values| {
+        values
             .iter()
-            .zip(&spec.primary_key_component_types)
-            .map(|(column, component_type)| {
-                let value = identity.get(*column)?;
-                match (component_type, value) {
-                    (
-                        crate::row_pk::RowPkComponentType::Uuid
-                        | crate::row_pk::RowPkComponentType::String
-                        | crate::row_pk::RowPkComponentType::Bytes,
-                        Value::Text(value),
-                    ) => Some(value.clone()),
-                    (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
-                        Some(value.to_string())
-                    }
-                    _ => None,
-                }
+            .map(|value| match value {
+                Value::Null => Some(None),
+                Value::Text(file_id) => Some(Some(file_id.clone())),
+                _ => None,
             })
-            .collect::<Option<Vec<_>>>();
-        let Some(parts) = parts else {
+            .collect::<Option<Vec<_>>>()
+    }) else {
+        return Ok(None);
+    };
+    let mut part_rows = vec![Vec::with_capacity(primary_key_columns.len())];
+    for (column, component_type) in primary_key_columns
+        .iter()
+        .zip(&spec.primary_key_component_types)
+    {
+        let Some(values) = columns.get(*column) else {
             return Ok(None);
         };
+        let Some(next_capacity) = part_rows.len().checked_mul(values.len()) else {
+            return Ok(None);
+        };
+        let mut next = Vec::with_capacity(next_capacity);
+        for parts in part_rows {
+            for value in values {
+                let Some(part) = external_part(component_type, value) else {
+                    return Ok(None);
+                };
+                let mut expanded = parts.clone();
+                expanded.push(part);
+                next.push(expanded);
+            }
+        }
+        part_rows = next;
+    }
+    for parts in part_rows {
         let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
             parts,
             &spec.primary_key_component_types,
         ) else {
             return Ok(None);
         };
-        if seen.insert((row_pk.clone(), file_id.clone())) {
-            identities.push((row_pk, file_id));
+        for file_id in &file_ids {
+            if seen.insert((row_pk.clone(), file_id.clone())) {
+                identities.push((row_pk.clone(), file_id.clone()));
+            }
         }
     }
     if !exact.order_by_columns.is_empty() {
@@ -5490,13 +5638,43 @@ mod tests {
             ],
         )
         .expect("complete composite identities should route");
-        assert_eq!(route.identities.len(), 3, "request slots stay aligned");
+        assert_eq!(route.identities.len(), Some(3), "request slots stay aligned");
         assert_eq!(route.order_by_columns, ["tenant", "revision"]);
-        assert_eq!(route.identities[0]["tenant"], Value::Text("docs".to_owned()));
-        assert_eq!(route.identities[0]["revision"], Value::Integer(7));
-        assert_eq!(route.identities[0]["lixcol_file_id"], Value::Null);
-        assert_eq!(route.identities[1]["revision"], Value::Integer(9));
-        assert_eq!(route.identities[2]["revision"], Value::Integer(7));
+        let ExactSchemaBatchIdentities::Product(columns) = route.identities else {
+            panic!("conjunctive identities should retain their compact product");
+        };
+        assert_eq!(columns["tenant"], [Value::Text("docs".to_owned())]);
+        assert_eq!(
+            columns["revision"],
+            [Value::Integer(7), Value::Integer(9), Value::Integer(7)]
+        );
+        assert_eq!(columns["lixcol_file_id"], [Value::Null]);
+    }
+
+    #[test]
+    fn exact_schema_batch_route_keeps_large_in_set_factorized() {
+        const IDENTITIES: usize = 5_000;
+        let placeholders = (1..=IDENTITIES)
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let statement = sql2::parse_statement(&format!(
+            "SELECT id FROM large_batch_route_row \
+             WHERE id IN ({placeholders}) AND lixcol_file_id IS NULL ORDER BY id"
+        ))
+        .expect("large exact batch SQL should parse");
+        let params = (0..IDENTITIES)
+            .map(|index| Value::Text(format!("row-{index:08}")))
+            .collect::<Vec<_>>();
+        let route = exact_schema_batch_read_route(&statement, &params)
+            .expect("large complete identity set should retain the exact route");
+
+        assert_eq!(route.identities.len(), Some(IDENTITIES));
+        let ExactSchemaBatchIdentities::Product(columns) = route.identities else {
+            panic!("large conjunctive identity set must not expand into per-row maps");
+        };
+        assert_eq!(columns["id"].len(), IDENTITIES);
+        assert_eq!(columns["lixcol_file_id"], [Value::Null]);
     }
 
     #[tokio::test]
