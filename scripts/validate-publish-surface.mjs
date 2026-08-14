@@ -11,6 +11,7 @@ import {
 
 const CRATES_IO_PACKAGES = new Set([
 	"lix",
+	"lix-schema",
 	"lix-storage-filesystem",
 	"lix-storage-rocksdb",
 	"lix-storage-slatedb",
@@ -63,6 +64,7 @@ for (const cargoPackage of metadata.packages) {
 
 for (const dependency of [
 	"lix",
+	"lix_schema",
 	"lix_storage_filesystem",
 	"lix_storage_rocksdb",
 	"lix_storage_slatedb",

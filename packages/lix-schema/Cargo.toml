@@ -1,6 +1,6 @@
 [package]
 name = "lix-schema"
-version = "0.1.0"
+version.workspace = true
 authors.workspace = true
 edition.workspace = true
 description = "PostgreSQL-derived relational schema format for Lix"
@@ -8,7 +8,6 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-publish = false
 
 [lints]
 workspace = true
