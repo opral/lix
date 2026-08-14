@@ -69,14 +69,6 @@ impl RowColumnarWriteSets {
         self.sets.get(key)
     }
 
-    pub(crate) fn iter(
-        &self,
-    ) -> impl Iterator<
-        Item = (&(CommitId, String), &crate::columnar_row_group::EncodedRowGroupSet),
-    > {
-        self.sets.iter()
-    }
-
     pub(crate) fn take(
         &mut self,
         key: &(CommitId, String),

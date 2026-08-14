@@ -2566,12 +2566,6 @@ impl PublishedCommitStateTopology {
         self.header.current_state_scoped_ranges.as_deref()
     }
 
-    pub(crate) fn accelerator_roots(
-        &self,
-    ) -> Option<&crate::tracked_state::types::RebuildableAcceleratorRootSet> {
-        self.header.accelerator_roots.as_deref()
-    }
-
     fn topology_ref(&self) -> super::scoped_current_state::CommitStateTopologyRef<'_> {
         super::scoped_current_state::CommitStateTopologyRef {
             commit_id: self.header.commit_id,
@@ -4205,6 +4199,128 @@ fn stage_commit_state_manifest_bytes(
     Ok(())
 }
 
+pub(crate) struct CertifiedRebuildableAcceleratorPublication {
+    commit_id: CommitId,
+    root_set_digest: [u8; 32],
+    write_set_id: u64,
+}
+
+pub(crate) async fn certify_rebuildable_accelerator_publication(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &StorageWriteSet,
+    manifest: &CommitStateManifest,
+) -> Result<Option<CertifiedRebuildableAcceleratorPublication>, LixError> {
+    let Some(root_set) = manifest.accelerator_roots.as_deref() else {
+        return Ok(None);
+    };
+    validate_commit_state_manifest(manifest)?;
+    if root_set
+        .roots
+        .iter()
+        .all(|root| root.source_owner_commit_id == manifest.commit_id)
+    {
+        validate_staged_accelerator_publication(writes, manifest)?;
+    } else {
+        let current = manifest.current_state_scoped_ranges.as_deref().ok_or_else(|| {
+            replacement_payload_error(
+                "inherited accelerator publication has no canonical scoped-state root",
+            )
+        })?;
+        if root_set.source_state_root_id != current.tree.root_id
+            || root_set.source_state_root_digest != current.tree.root_digest
+        {
+            return Err(replacement_payload_error(
+                "inherited accelerator publication disagrees with canonical scoped state",
+            ));
+        }
+        let serving_base_commit_id = current.serving_base_commit_id.ok_or_else(|| {
+            replacement_payload_error(
+                "inherited accelerator publication has no canonical serving base",
+            )
+        })?;
+        let source = load_commit_state_manifest(read, serving_base_commit_id)
+            .await?
+            .ok_or_else(|| replacement_payload_error("inherited accelerator serving base is missing"))?;
+        let source_roots = source.accelerator_roots.as_deref().ok_or_else(|| {
+            replacement_payload_error("inherited accelerator serving base has no root authority")
+        })?;
+        if source.commit_id != serving_base_commit_id
+            || source_roots.publication_commit_id != serving_base_commit_id
+            || source_roots.roots != root_set.roots
+        {
+            return Err(replacement_payload_error(
+                "inherited accelerator descriptor disagrees with canonical serving-base authority",
+            ));
+        }
+    }
+    Ok(Some(CertifiedRebuildableAcceleratorPublication {
+        commit_id: manifest.commit_id,
+        root_set_digest: accelerator_root_set_digest(Some(root_set))?,
+        write_set_id: writes.identity(),
+    }))
+}
+
+fn validate_accelerator_certificate(
+    writes: &StorageWriteSet,
+    manifest: &CommitStateManifest,
+    certificate: Option<&CertifiedRebuildableAcceleratorPublication>,
+) -> Result<(), LixError> {
+    match (manifest.accelerator_roots.as_deref(), certificate) {
+        (None, None) => Ok(()),
+        (Some(roots), Some(certificate))
+            if certificate.write_set_id == writes.identity()
+                && certificate.commit_id == manifest.commit_id
+                && certificate.root_set_digest == accelerator_root_set_digest(Some(roots))? =>
+        {
+            Ok(())
+        }
+        _ => Err(replacement_payload_error(
+            "accelerator authority lacks its publisher-owned retained-view certificate",
+        )),
+    }
+}
+
+fn validate_staged_accelerator_publication(
+    writes: &StorageWriteSet,
+    manifest: &CommitStateManifest,
+) -> Result<(), LixError> {
+    let Some(root_set) = manifest.accelerator_roots.as_deref() else {
+        return Ok(());
+    };
+    let parts = manifest.mutations.columnar_parts.as_ref().ok_or_else(|| {
+        replacement_payload_error(
+            "accelerator publication has no canonical columnar mutation authority",
+        )
+    })?;
+    if root_set.roots.len() != 1 {
+        return Err(replacement_payload_error(
+            "accelerator publication must describe exactly one canonical columnar source",
+        ));
+    }
+    let root = &root_set.roots[0];
+    if root.domain != crate::tracked_state::RebuildableAcceleratorDomain::RowColumnarScalar
+        || root.source_owner_commit_id != manifest.commit_id
+        || parts.owner_commit_id != *manifest.commit_id.as_uuid().as_bytes()
+        || root.schema_key != parts.schema_key
+        || root.layout_fingerprint != parts.layout_fingerprint
+        || root.object_id != parts.row_group_set_id
+        || root.root_digest != parts.manifest_digest
+        || root.complete_row_count != u64::from(parts.row_count)
+    {
+        return Err(replacement_payload_error(
+            "accelerator descriptor disagrees with canonical mutation authority",
+        ));
+    }
+    crate::columnar_row_group::verify_staged_row_group_set(
+        writes,
+        crate::columnar_row_group::RowGroupSetId::new(root.object_id),
+        &root.schema_key,
+        &root.layout_fingerprint,
+        root.root_digest,
+        root.complete_row_count,
+    )
+}
+
 /// Stages authority that carries no serving scoped-range root. Root-bearing
 /// authorities require the opaque canonical transition proof returned by
 /// `stage_current_state_scoped_ranges`.
@@ -4212,6 +4328,7 @@ pub(crate) fn stage_commit_state_manifest(
     writes: &mut StorageWriteSet,
     manifest: &CommitStateManifest,
 ) -> Result<(), LixError> {
+    validate_accelerator_certificate(writes, manifest, None)?;
     if manifest.current_state_scoped_ranges.is_some() {
         return Err(replacement_payload_error(
             "current-state scoped ranges require canonical publication certification",
@@ -4236,6 +4353,24 @@ pub(crate) fn stage_commit_state_manifest_with_handle(
     })
 }
 
+pub(crate) fn stage_commit_state_manifest_with_accelerator_handle(
+    writes: &mut StorageWriteSet,
+    manifest: &CommitStateManifest,
+    certificate: &CertifiedRebuildableAcceleratorPublication,
+) -> Result<StagedCommitStateManifest, LixError> {
+    if manifest.current_state_scoped_ranges.is_some() || manifest.touched_scope_filter.complete {
+        return Err(replacement_payload_error(
+            "rootless accelerator publication received scoped-state authority",
+        ));
+    }
+    validate_accelerator_certificate(writes, manifest, Some(certificate))?;
+    stage_commit_state_manifest_bytes(writes, manifest)?;
+    Ok(StagedCommitStateManifest {
+        manifest: manifest.clone(),
+        write_set_id: writes.identity(),
+    })
+}
+
 /// Publishes physical serving authority only when the exact opaque proof from
 /// its canonical topology and range transition accompanies the manifest.
 pub(crate) fn stage_certified_commit_state_manifest(
@@ -4243,6 +4378,7 @@ pub(crate) fn stage_certified_commit_state_manifest(
     manifest: &CommitStateManifest,
     publication: &super::scoped_current_state::CertifiedCommitStatePhysicalPublication,
 ) -> Result<(), LixError> {
+    validate_accelerator_certificate(writes, manifest, None)?;
     if writes.identity() != publication.write_set_id() {
         return Err(replacement_payload_error(
             "physical publication proof belongs to a different storage write set",
@@ -4277,6 +4413,31 @@ pub(crate) fn stage_certified_commit_state_manifest_with_handle(
     publication: &super::scoped_current_state::CertifiedCommitStatePhysicalPublication,
 ) -> Result<StagedCommitStateManifest, LixError> {
     stage_certified_commit_state_manifest(writes, manifest, publication)?;
+    Ok(StagedCommitStateManifest {
+        manifest: manifest.clone(),
+        write_set_id: writes.identity(),
+    })
+}
+
+pub(crate) fn stage_certified_commit_state_manifest_with_accelerator_handle(
+    writes: &mut StorageWriteSet,
+    manifest: &CommitStateManifest,
+    publication: &super::scoped_current_state::CertifiedCommitStatePhysicalPublication,
+    accelerator: &CertifiedRebuildableAcceleratorPublication,
+) -> Result<StagedCommitStateManifest, LixError> {
+    if writes.identity() != publication.write_set_id()
+        || manifest.commit_id != publication.commit_id()
+        || manifest.mutations.selected_source_commit_id()
+            != publication.selected_source_commit_id()
+        || manifest.current_state_scoped_ranges != publication.root()
+        || &manifest.touched_scope_filter != publication.touched_scope_filter()
+    {
+        return Err(replacement_payload_error(
+            "commit manifest disagrees with its physical publication proof",
+        ));
+    }
+    validate_accelerator_certificate(writes, manifest, Some(accelerator))?;
+    stage_commit_state_manifest_bytes(writes, manifest)?;
     Ok(StagedCommitStateManifest {
         manifest: manifest.clone(),
         write_set_id: writes.identity(),
@@ -13543,11 +13704,6 @@ fn validate_commit_state_manifest_header(
             "tracked_state commit_state_manifest scoped-range transition disagrees with its header authority",
         ));
     }
-    validate_rebuildable_accelerator_roots(
-        stored.commit_id,
-        stored.current_state_scoped_ranges.as_deref(),
-        stored.accelerator_roots.as_deref(),
-    )?;
     Ok(())
 }
 
@@ -13601,6 +13757,7 @@ fn validate_commit_state_manifest_inner(
     validate_current_state_scoped_ranges(manifest, validate_scoped_range_attestation)?;
     validate_rebuildable_accelerator_roots(
         manifest.commit_id,
+        &manifest.mutations,
         manifest.current_state_scoped_ranges.as_deref(),
         manifest.accelerator_roots.as_deref(),
     )
@@ -13608,6 +13765,28 @@ fn validate_commit_state_manifest_inner(
 
 const ACCELERATOR_ROOT_SET_DIGEST_CONTEXT: &str =
     "lix rebuildable accelerator root set v1";
+
+pub(crate) fn canonical_accelerator_source_identity(
+    commit_id: CommitId,
+    mutations: &CommitStateMutationInventory,
+) -> Result<([u8; 32], [u8; 32]), LixError> {
+    let encoded = storage_codec::encode(
+        "rebuildable accelerator canonical mutation source",
+        mutations,
+    )?;
+    let mut root_id =
+        blake3::Hasher::new_derive_key("lix accelerator canonical mutation root id v1");
+    root_id.update(commit_id.as_uuid().as_bytes());
+    root_id.update(&(encoded.len() as u64).to_be_bytes());
+    root_id.update(&encoded);
+    let root_id = *root_id.finalize().as_bytes();
+    let mut root_digest =
+        blake3::Hasher::new_derive_key("lix accelerator canonical mutation root body v1");
+    root_digest.update(&root_id);
+    root_digest.update(&(encoded.len() as u64).to_be_bytes());
+    root_digest.update(&encoded);
+    Ok((root_id, *root_digest.finalize().as_bytes()))
+}
 
 /// Exact digest copied into the branch-keyed serving selector. The selected
 /// commit manifest remains the object authority; this digest binds that
@@ -13632,6 +13811,7 @@ pub(crate) fn accelerator_root_set_digest(
 
 fn validate_rebuildable_accelerator_roots(
     commit_id: CommitId,
+    mutations: &CommitStateMutationInventory,
     current_state_root: Option<&CurrentStateScopedRangeRoot>,
     roots: Option<&crate::tracked_state::types::RebuildableAcceleratorRootSet>,
 ) -> Result<(), LixError> {
@@ -13649,6 +13829,14 @@ fn validate_rebuildable_accelerator_roots(
     {
         return Err(replacement_payload_error(
             "accelerator root set disagrees with selected canonical state",
+        ));
+    }
+    if current_state_root.is_none()
+        && (roots.source_state_root_id, roots.source_state_root_digest)
+            != canonical_accelerator_source_identity(commit_id, mutations)?
+    {
+        return Err(replacement_payload_error(
+            "rootless accelerator source identity disagrees with canonical mutations",
         ));
     }
     let mut previous = None;
@@ -18529,6 +18717,67 @@ mod tests {
         let error = encode_commit_state_manifest(&manifest)
             .expect_err("forged scoped-range transition must fail closed");
         assert!(error.message.contains("transition"));
+    }
+
+    #[test]
+    fn rootless_accelerator_identity_is_recomputed_from_canonical_mutations() {
+        let mut manifest = commit_state_manifest_fixture();
+        let (source_state_root_id, source_state_root_digest) =
+            super::canonical_accelerator_source_identity(manifest.commit_id, &manifest.mutations)
+                .expect("canonical mutation identity should hash");
+        manifest.accelerator_roots = Some(Box::new(RebuildableAcceleratorRootSet {
+            publication_commit_id: manifest.commit_id,
+            source_state_root_id,
+            source_state_root_digest,
+            roots: vec![RebuildableAcceleratorRoot {
+                domain: RebuildableAcceleratorDomain::RowColumnarScalar,
+                schema_key: "manifest-schema".to_owned(),
+                layout_fingerprint: "layout-v1".to_owned(),
+                source_owner_commit_id: manifest.commit_id,
+                object_id: [7; 16],
+                root_digest: [8; 32],
+                complete_row_count: 1,
+            }],
+        }));
+        encode_commit_state_manifest(&manifest)
+            .expect("canonical rootless accelerator identity should encode");
+
+        manifest
+            .accelerator_roots
+            .as_mut()
+            .expect("fixture has roots")
+            .source_state_root_id[0] ^= 1;
+        let error = encode_commit_state_manifest(&manifest)
+            .expect_err("forged rootless accelerator identity must fail closed");
+        assert!(error.message.contains("canonical mutations"));
+    }
+
+    #[test]
+    fn manifest_publisher_rejects_caller_authored_accelerator_authority() {
+        let mut manifest = commit_state_manifest_fixture();
+        let (source_state_root_id, source_state_root_digest) =
+            super::canonical_accelerator_source_identity(manifest.commit_id, &manifest.mutations)
+                .expect("canonical mutation identity should hash");
+        manifest.accelerator_roots = Some(Box::new(RebuildableAcceleratorRootSet {
+            publication_commit_id: manifest.commit_id,
+            source_state_root_id,
+            source_state_root_digest,
+            roots: vec![RebuildableAcceleratorRoot {
+                domain: RebuildableAcceleratorDomain::RowColumnarScalar,
+                schema_key: "manifest-schema".to_owned(),
+                layout_fingerprint: "layout-v1".to_owned(),
+                source_owner_commit_id: manifest.commit_id,
+                object_id: [7; 16],
+                root_digest: [8; 32],
+                complete_row_count: 1,
+            }],
+        }));
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        let error = stage_commit_state_manifest(&mut writes, &manifest)
+            .expect_err("plain manifest input must not certify accelerator authority");
+        assert!(error.message.contains("publisher-owned retained-view certificate"));
+        assert!(writes.is_empty());
     }
 
     #[tokio::test]

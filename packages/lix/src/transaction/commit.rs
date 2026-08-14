@@ -741,18 +741,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         )),
     )
     .await?;
-    let accelerator_root_set_digests = stage_commit_state_manifests(
-        read,
-        &mut writes,
-        &commit_rows,
-        &staged_delta_index.inventories,
-        &rootless_ordered_commits,
-        &staged_commits,
-        &staged_snapshot_roots,
-        &external_parent_manifests,
-        &row_columnar_write_sets,
-    )
-    .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
     // point-row futures. Keep their combined async state out of the parent
     // commit future so an inactive bulk branch cannot inflate every ordinary
@@ -784,6 +772,21 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         target: "lix_perf",
         "lix.perf.materialization.tracked_head"
     ))
+    .await?;
+    // Stage the selected commit authority after every physical accelerator
+    // object has entered this same write set. The manifest publisher can then
+    // verify object identity/body/count directly instead of trusting a caller
+    // description of a future write.
+    let accelerator_root_set_digests = stage_commit_state_manifests(
+        read,
+        &mut writes,
+        &commit_rows,
+        &staged_delta_index.inventories,
+        &rootless_ordered_commits,
+        &staged_commits,
+        &staged_snapshot_roots,
+        &external_parent_manifests,
+    )
     .await?;
     for file in &prepared_writes.file_content_writes {
         let Some(control) = staged_hot_heads.controls.get_mut(&file.branch_id) else {
@@ -6156,7 +6159,6 @@ fn stage_commit_state_manifests<'a, S>(
         CommitId,
         crate::tracked_state::PublishedCommitStateTopology,
     >,
-    row_columnar_write_sets: &'a crate::hot_state::RowColumnarWriteSets,
 ) -> std::pin::Pin<
     Box<dyn Future<Output = Result<BTreeMap<CommitId, [u8; 32]>, LixError>> + Send + 'a>,
 >
@@ -6339,10 +6341,6 @@ where
                 record.commit_id,
                 &mutations,
                 current_state_scoped_ranges.as_deref(),
-                staged_parent
-                    .and_then(|parent| parent.accelerator_roots.as_deref())
-                    .or_else(|| external_parent.and_then(|parent| parent.accelerator_roots())),
-                row_columnar_write_sets,
             )
             .await?;
             let manifest = CommitStateManifest {
@@ -6359,14 +6357,36 @@ where
                 accelerator_roots,
                 snapshot_root: snapshot_root.map(Box::new),
             };
-            let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
-                crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
-                    writes,
-                    &manifest,
-                    publication,
-                )?
-            } else {
-                crate::tracked_state::stage_commit_state_manifest_with_handle(writes, &manifest)?
+            let accelerator = crate::tracked_state::certify_rebuildable_accelerator_publication(
+                read, writes, &manifest,
+            )
+            .await?;
+            let staged_manifest = match (catalog_publication.as_ref(), accelerator.as_ref()) {
+                (Some(publication), Some(accelerator)) => {
+                    crate::tracked_state::stage_certified_commit_state_manifest_with_accelerator_handle(
+                        writes,
+                        &manifest,
+                        publication,
+                        accelerator,
+                    )?
+                }
+                (Some(publication), None) => {
+                    crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+                        writes,
+                        &manifest,
+                        publication,
+                    )?
+                }
+                (None, Some(accelerator)) => {
+                    crate::tracked_state::stage_commit_state_manifest_with_accelerator_handle(
+                        writes,
+                        &manifest,
+                        accelerator,
+                    )?
+                }
+                (None, None) => crate::tracked_state::stage_commit_state_manifest_with_handle(
+                    writes, &manifest,
+                )?,
             };
             accelerator_root_set_digests.insert(
                 record.commit_id,
@@ -6385,71 +6405,7 @@ async fn rebuildable_accelerator_roots(
     commit_id: CommitId,
     mutations: &CommitStateMutationInventory,
     current_state_root: Option<&crate::tracked_state::CurrentStateScopedRangeRoot>,
-    inherited_root_set: Option<&crate::tracked_state::RebuildableAcceleratorRootSet>,
-    row_columnar_write_sets: &crate::hot_state::RowColumnarWriteSets,
 ) -> Result<Option<Box<crate::tracked_state::RebuildableAcceleratorRootSet>>, LixError> {
-    let mut staged_roots = row_columnar_write_sets
-        .iter()
-        .filter(|((owner, _), _)| *owner == commit_id)
-        .map(|((_, schema_key), encoded)| {
-            let layout_fingerprint = encoded
-                .manifest
-                .metadata
-                .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "staged row-columnar accelerator omitted its layout fingerprint",
-                    )
-                })?;
-            Ok(crate::tracked_state::RebuildableAcceleratorRoot {
-                domain: crate::tracked_state::RebuildableAcceleratorDomain::RowColumnarScalar,
-                schema_key: schema_key.clone(),
-                layout_fingerprint: layout_fingerprint.clone(),
-                source_owner_commit_id: commit_id,
-                object_id: crate::hot_state::row_group_set_id(commit_id, schema_key).as_bytes(),
-                root_digest: encoded.manifest.content_digest()?,
-                complete_row_count: encoded.manifest.row_count(),
-            })
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    if !staged_roots.is_empty() {
-        staged_roots.sort_unstable_by(|left, right| {
-            left
-                .schema_key
-                .cmp(&right.schema_key)
-                .then_with(|| left.domain.cmp(&right.domain))
-        });
-        let (source_state_root_id, source_state_root_digest) =
-            if let Some(current_state_root) = current_state_root {
-                (
-                    current_state_root.tree.root_id,
-                    current_state_root.tree.root_digest,
-                )
-            } else {
-                canonical_accelerator_source_identity(commit_id, mutations)?
-            };
-        return Ok(Some(Box::new(
-            crate::tracked_state::RebuildableAcceleratorRootSet {
-                publication_commit_id: commit_id,
-                source_state_root_id,
-                source_state_root_digest,
-                roots: staged_roots,
-            },
-        )));
-    }
-    if mutations.columnar_parts.is_none()
-        && let Some(inherited) = inherited_root_set
-    {
-        let mut inherited = inherited.clone();
-        inherited.publication_commit_id = commit_id;
-        if let Some(current_state_root) = current_state_root {
-            inherited.source_state_root_id = current_state_root.tree.root_id;
-            inherited.source_state_root_digest = current_state_root.tree.root_digest;
-        }
-        return Ok(Some(Box::new(inherited)));
-    }
-    let inherited;
     let parts = match mutations.columnar_parts.as_ref() {
         Some(parts) => parts,
         None => {
@@ -6470,13 +6426,19 @@ async fn rebuildable_accelerator_roots(
                     "selected current-state root has no retained serving-base authority",
                 ));
             };
-            inherited = serving_base;
-            let Some(parts) = inherited.mutations.columnar_parts.as_ref() else {
+            let Some(source_roots) = serving_base.accelerator_roots.as_deref() else {
                 return Ok(None);
             };
-            parts
+            let mut inherited = source_roots.clone();
+            inherited.publication_commit_id = commit_id;
+            inherited.source_state_root_id = current_state_root.tree.root_id;
+            inherited.source_state_root_digest = current_state_root.tree.root_digest;
+            return Ok(Some(Box::new(inherited)));
         }
     };
+    if CommitId::new(uuid::Uuid::from_bytes(parts.owner_commit_id)) != commit_id {
+        return Ok(None);
+    }
     let mut roots = vec![crate::tracked_state::RebuildableAcceleratorRoot {
         domain: crate::tracked_state::RebuildableAcceleratorDomain::RowColumnarScalar,
         schema_key: parts.schema_key.clone(),
@@ -6498,7 +6460,7 @@ async fn rebuildable_accelerator_roots(
                 current_state_root.tree.root_digest,
             )
         } else {
-            canonical_accelerator_source_identity(commit_id, mutations)?
+            crate::tracked_state::canonical_accelerator_source_identity(commit_id, mutations)?
         };
     Ok(Some(Box::new(crate::tracked_state::RebuildableAcceleratorRootSet {
         publication_commit_id: commit_id,
@@ -6506,32 +6468,6 @@ async fn rebuildable_accelerator_roots(
         source_state_root_digest,
         roots,
     })))
-}
-
-/// Binds an accelerator selected for a rootless publication to the commit's
-/// independently authenticated mutation authority. The accelerator bytes do
-/// not participate in this identity, so a self-consistent replacement object
-/// cannot manufacture the source root that authorizes its own selection.
-fn canonical_accelerator_source_identity(
-    commit_id: CommitId,
-    mutations: &CommitStateMutationInventory,
-) -> Result<([u8; 32], [u8; 32]), LixError> {
-    let encoded = crate::storage_codec::encode(
-        "rebuildable accelerator canonical mutation source",
-        mutations,
-    )?;
-    let mut root_id =
-        blake3::Hasher::new_derive_key("lix accelerator canonical mutation root id v1");
-    root_id.update(commit_id.as_uuid().as_bytes());
-    root_id.update(&(encoded.len() as u64).to_be_bytes());
-    root_id.update(&encoded);
-    let root_id = *root_id.finalize().as_bytes();
-    let mut root_digest =
-        blake3::Hasher::new_derive_key("lix accelerator canonical mutation root body v1");
-    root_digest.update(&root_id);
-    root_digest.update(&(encoded.len() as u64).to_be_bytes());
-    root_digest.update(&encoded);
-    Ok((root_id, *root_digest.finalize().as_bytes()))
 }
 
 /// Every current-protocol commit is a root fence.
@@ -10067,7 +10003,6 @@ mod tests {
             .iter()
             .map(|commit| (commit.commit_id, CommitStateMutationInventory::default()))
             .collect::<BTreeMap<_, _>>();
-        let row_columnar_write_sets = crate::hot_state::RowColumnarWriteSets::new();
         stage_commit_state_manifests(
             &read,
             &mut writes,
@@ -10077,7 +10012,6 @@ mod tests {
             &staged,
             &BTreeMap::new(),
             &external_parent_manifests,
-            &row_columnar_write_sets,
         )
         .await
         .expect("child-before-parent manifests should publish parent authority first");

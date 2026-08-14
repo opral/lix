@@ -1893,6 +1893,34 @@ where
         })?;
         authority_manifests.insert(base_id, manifest);
     }
+    loop {
+        let accelerator_owner_ids = authority_manifests
+            .values()
+            .filter_map(|manifest| manifest.accelerator_roots.as_deref())
+            .flat_map(|roots| roots.roots.iter().map(|root| root.source_owner_commit_id))
+            .filter(|owner| !authority_manifests.contains_key(owner))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if accelerator_owner_ids.is_empty() {
+            break;
+        }
+        let loaded = crate::tracked_state::load_commit_state_manifests(
+            store,
+            &accelerator_owner_ids,
+        )
+        .await?;
+        for (owner, manifest) in accelerator_owner_ids.into_iter().zip(loaded) {
+            let manifest = manifest.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("selected accelerator owner '{owner}' has no commit-state authority"),
+                )
+            })?;
+            retained_authority_commits.insert(owner);
+            authority_manifests.insert(owner, manifest);
+        }
+    }
     for commit_id in &live_commits {
         let manifest = authority_manifests
             .get(commit_id)
@@ -2482,7 +2510,7 @@ mod tests {
         stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
         stage_ordered_addressable_replacement_parts,
     };
-    use crate::{GLOBAL_BRANCH_ID, LixError, Value, engine::Engine};
+    use crate::{ExecuteBatchStatement, GLOBAL_BRANCH_ID, LixError, Value, engine::Engine};
     use bytes::Bytes;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -6556,6 +6584,118 @@ mod tests {
             .get::<i64>("rows")
             .expect("row count should decode");
         assert_eq!(survivors, 16);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_retains_selected_accelerator_owner_and_object() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("accelerator GC fixture should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("accelerator GC fixture should open");
+        let session = engine
+            .open_session_with_account(crate::SYSTEM_ACCOUNT_ID)
+            .await
+            .expect("accelerator GC fixture session should open");
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("accelerator GC fixture branch should resolve");
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "gc_accelerator_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["path"],
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("accelerator GC schema should register");
+        let inserts = (0..65_537)
+            .map(|row| ExecuteBatchStatement {
+                label: None,
+                sql: "INSERT INTO gc_accelerator_fixture (path, value) VALUES ($1, $2)".to_owned(),
+                params: vec![
+                    Value::Text(format!("/row/{row:05}")),
+                    Value::Text(format!("value-{row}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&inserts)
+            .await
+            .expect("dense accelerator fixture should publish atomically");
+
+        let storage = StorageAdapter::new(backend);
+        let (head, root) = {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("accelerator control read should open");
+            let control = BranchHeadControlContext::new()
+                .reader(&read)
+                .scan()
+                .await
+                .expect("accelerator controls should load")
+                .into_iter()
+                .find(|(candidate, _)| candidate == &branch_id)
+                .expect("active branch control should exist")
+                .1;
+            let manifest = crate::tracked_state::load_commit_state_manifest(
+                &read,
+                control.head_commit_id,
+            )
+            .await
+            .expect("selected manifest should load")
+            .expect("selected manifest should exist");
+            let root = manifest
+                .accelerator_roots
+                .as_deref()
+                .expect("dense insert should select an accelerator")
+                .roots[0]
+                .clone();
+            (control.head_commit_id, root)
+        };
+
+        run_ordinary_repository_gc(&storage).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-GC accelerator read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, head)
+                .await
+                .expect("post-GC selected authority should load")
+                .is_some()
+        );
+        assert!(
+            crate::columnar_row_group::load_row_group_manifest(
+                &read,
+                crate::columnar_row_group::RowGroupSetId::new(root.object_id),
+            )
+            .await
+            .expect("post-GC accelerator object should load")
+            .is_some(),
+            "selected accelerator object must remain reachable through its owner authority"
+        );
+        drop(read);
+        let rows = session
+            .execute("SELECT COUNT(*) AS rows FROM gc_accelerator_fixture", &[])
+            .await
+            .expect("post-GC accelerator rows should remain readable")
+            .rows()[0]
+            .get::<i64>("rows")
+            .expect("post-GC row count should decode");
+        assert_eq!(rows, 65_537);
     }
 
     async fn load_audited_repository_retention(

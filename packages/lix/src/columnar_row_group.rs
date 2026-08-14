@@ -480,6 +480,38 @@ pub(crate) fn stage_row_group_set(
     Ok(())
 }
 
+/// Verifies that one accelerator descriptor is backed by the exact immutable
+/// row-group manifest already staged in the same atomic publication. This is
+/// deliberately a write-set proof: callers cannot manufacture it from object
+/// identifiers or from bytes in an older retained read.
+pub(crate) fn verify_staged_row_group_set(
+    writes: &StorageWriteSet,
+    id: RowGroupSetId,
+    expected_namespace: &str,
+    expected_layout_fingerprint: &str,
+    expected_digest: [u8; BLAKE3_DIGEST_LEN],
+    expected_row_count: u64,
+) -> Result<(), LixError> {
+    let bytes = writes
+        .staged_value(ROW_GROUP_MANIFEST_SPACE, &id.manifest_key().0)
+        .ok_or_else(|| row_group_error("accelerator manifest is not staged in its publication"))?;
+    let manifest = decode_manifest(&bytes)?;
+    if manifest.namespace != expected_namespace
+        || manifest
+            .metadata
+            .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+            .map(String::as_str)
+            != Some(expected_layout_fingerprint)
+        || manifest.content_digest()? != expected_digest
+        || manifest.row_count() != expected_row_count
+    {
+        return Err(row_group_error(
+            "staged accelerator manifest disagrees with its publication descriptor",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn load_row_group_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     id: RowGroupSetId,
