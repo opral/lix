@@ -3,7 +3,8 @@
 //! This is deliberately a model, not a production compatibility format. It
 //! compares the current commit-first segment/change-locator geometry with one
 //! sole-payload-owner geometry: immutable schema chunks selected by an
-//! authenticated MMR root, commit ordinal references, and one repository head.
+//! authenticated rolling schema root, commit ordinal references, and one
+//! repository head.
 
 use std::ops::Bound;
 use std::path::Path;
@@ -31,8 +32,6 @@ const CURRENT_HEAD: StorageSpace =
     StorageSpace::mutable(lix::storage::SpaceId(0x7f20_0004), "model.current.head");
 const CHUNK: StorageSpace =
     StorageSpace::immutable(lix::storage::SpaceId(0x7f20_0011), "model.schema.chunk");
-const SCHEMA_ROOT: StorageSpace =
-    StorageSpace::immutable(lix::storage::SpaceId(0x7f20_0012), "model.schema.root");
 const PACKED_COMMIT: StorageSpace =
     StorageSpace::immutable(lix::storage::SpaceId(0x7f20_0013), "model.schema.commit");
 const PACKED_HEAD: StorageSpace =
@@ -160,14 +159,18 @@ async fn run_case<S: Storage>(
     let mut checksum = 0u64;
     for _ in 0..samples {
         let started = Instant::now();
+        checksum ^= load_commit(storage, layout, history / 2).await;
+        commit_lookup.push(started.elapsed());
+    }
+    for _ in 0..samples {
+        let started = Instant::now();
         checksum ^= scan_schema(storage, layout, 0).await;
         schema_history.push(started.elapsed());
+    }
+    for _ in 0..samples {
         let started = Instant::now();
         checksum ^= scan_key_history(storage, layout, 0, 0).await;
         key_history.push(started.elapsed());
-        let started = Instant::now();
-        checksum ^= load_commit(storage, layout, history / 2).await;
-        commit_lookup.push(started.elapsed());
     }
     schema_history.sort_unstable();
     key_history.sort_unstable();
@@ -269,10 +272,13 @@ async fn stage_chunks<S: Storage>(
         .begin_write(WriteOptions::default())
         .await
         .expect("begin chunk write");
-    let mut commit_body = Vec::with_capacity(64 + width * 8);
-    let mut chunk_entries = Vec::with_capacity(SCHEMAS.min(width));
+    let mut commit_body = Vec::with_capacity(64);
+    let mut ordinal_directory = Vec::with_capacity(16 + width * 41);
+    let mut chunk_entries = Vec::with_capacity(SCHEMAS.min(width) + 1);
     commit_body.extend_from_slice(b"LXSCH1");
     commit_body.extend_from_slice(&(commit as u64).to_be_bytes());
+    ordinal_directory.extend_from_slice(b"LXORD1");
+    ordinal_directory.extend_from_slice(&(width as u32).to_be_bytes());
     for schema in 0..SCHEMAS.min(width) {
         let rows = (schema..width).step_by(SCHEMAS).collect::<Vec<_>>();
         if rows.is_empty() {
@@ -293,10 +299,38 @@ async fn stage_chunks<S: Storage>(
         push_entry(&mut chunk_entries, chunk_key, chunk, metrics);
         schema_roots[schema] = hash_append(schema, ordinal, schema_roots[schema], digest);
         ordinals[schema] += 1;
-        commit_body.push(schema as u8);
-        commit_body.extend_from_slice(&ordinal.to_be_bytes());
-        commit_body.extend_from_slice(&digest);
+        ordinal_directory.push(schema as u8);
+        ordinal_directory.extend_from_slice(&ordinal.to_be_bytes());
+        ordinal_directory.extend_from_slice(&digest);
     }
+    let ordinal_directory_id = *blake3::hash(&ordinal_directory).as_bytes();
+    let mut ordinal_directory_key = Vec::with_capacity(33);
+    ordinal_directory_key.push(0xff);
+    ordinal_directory_key.extend_from_slice(&ordinal_directory_id);
+    push_entry(
+        &mut chunk_entries,
+        ordinal_directory_key,
+        ordinal_directory,
+        metrics,
+    );
+    let mut root_directory = Vec::with_capacity(48 + SCHEMAS * 41);
+    root_directory.extend_from_slice(b"LXRHR1");
+    root_directory.extend_from_slice(&ordinal_directory_id);
+    for schema in 0..SCHEMAS {
+        root_directory.push(schema as u8);
+        root_directory.extend_from_slice(&ordinals[schema].to_be_bytes());
+        root_directory.extend_from_slice(&schema_roots[schema]);
+    }
+    let root_directory_id = *blake3::hash(&root_directory).as_bytes();
+    let mut root_directory_key = Vec::with_capacity(33);
+    root_directory_key.push(0xfe);
+    root_directory_key.extend_from_slice(&root_directory_id);
+    push_entry(
+        &mut chunk_entries,
+        root_directory_key,
+        root_directory,
+        metrics,
+    );
     write
         .put_many(
             CHUNK,
@@ -305,32 +339,15 @@ async fn stage_chunks<S: Storage>(
             },
         )
         .await
-        .expect("put schema chunks");
+        .expect("put schema chunks and authenticated directories");
     metrics.put_many_calls += 1;
-    let commit_digest = *blake3::hash(&commit_body).as_bytes();
+    commit_body.extend_from_slice(&root_directory_id);
+    let repository_root_id = *blake3::hash(&commit_body).as_bytes();
     put(
         &mut write,
         PACKED_COMMIT,
         commit_key(commit),
         commit_body,
-        metrics,
-    )
-    .await;
-    let mut repository_root = Vec::with_capacity(48 + SCHEMAS * 41);
-    repository_root.extend_from_slice(b"LXRHR1");
-    repository_root.extend_from_slice(&(commit as u64).to_be_bytes());
-    repository_root.extend_from_slice(&commit_digest);
-    for schema in 0..SCHEMAS {
-        repository_root.push(schema as u8);
-        repository_root.extend_from_slice(&ordinals[schema].to_be_bytes());
-        repository_root.extend_from_slice(&schema_roots[schema]);
-    }
-    let repository_root_id = *blake3::hash(&repository_root).as_bytes();
-    put(
-        &mut write,
-        SCHEMA_ROOT,
-        repository_root_id.to_vec(),
-        repository_root,
         metrics,
     )
     .await;
