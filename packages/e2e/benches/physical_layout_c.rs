@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -19,10 +20,9 @@ use lix_storage_slatedb::SlateDB;
 const OBJECT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00ff_00c1), "bench.physical_layout_c.object");
 const SCHEMA_FINGERPRINT: [u8; 16] = *b"typed-row-v1\0\0\0\0";
-const PAGE_TARGETS: [usize; 4] = [4 << 10, 16 << 10, 64 << 10, 256 << 10];
-const ROW_COUNTS: [usize; 3] = [1_000, 10_000, 50_000];
+const PAGE_TARGETS: [usize; 6] = [2 << 10, 4 << 10, 8 << 10, 16 << 10, 32 << 10, 64 << 10];
+const ROW_COUNTS: [usize; 4] = [1_000, 10_000, 50_000, 100_000];
 const ROW_WIDTHS: [usize; 4] = [64, 256, 1_024, 4_096];
-const DELTAS: [usize; 3] = [1, 100, 1_000];
 const MAX_DECODED_OBJECT_BYTES: usize = 256 << 10;
 const PAGE_BOUNDARY_DOMAIN: &[u8] = b"lix.forktree.slotted-page-boundary.v1\0";
 
@@ -34,8 +34,6 @@ enum Geometry {
 }
 
 impl Geometry {
-    const ALL: [Self; 3] = [Self::C1, Self::C2, Self::C3];
-
     const fn label(self) -> &'static str {
         match self {
             Self::C1 => "c1_one_row",
@@ -48,8 +46,29 @@ impl Geometry {
 #[derive(Clone)]
 struct TypedRow {
     key: Vec<u8>,
-    canonical: Vec<u8>,
+    canonical: Arc<[u8]>,
     fixed_len: usize,
+}
+
+#[derive(Clone, Copy)]
+enum PrimaryKeyShape {
+    Integer,
+    Uuid,
+    Text,
+    Composite,
+}
+
+impl PrimaryKeyShape {
+    const ALL: [Self; 4] = [Self::Integer, Self::Uuid, Self::Text, Self::Composite];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Integer => "int8",
+            Self::Uuid => "uuid",
+            Self::Text => "text",
+            Self::Composite => "composite",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -99,35 +118,83 @@ struct CpuMetric {
 fn main() {
     print_header();
     let backend = std::env::var_os("LIX_LAYOUT_C_BACKEND").is_some();
-    for width in ROW_WIDTHS {
-        for n in ROW_COUNTS {
-            let rows = fixture_rows(n, width);
-            for geometry in Geometry::ALL {
-                let targets: &[usize] = if geometry == Geometry::C1 {
-                    &PAGE_TARGETS[..1]
-                } else {
-                    &PAGE_TARGETS
-                };
-                for &target in targets {
+    let backend_only = std::env::var_os("LIX_PAGE_SIZE_06_BACKEND_ONLY").is_some();
+    let smoke = std::env::var_os("LIX_PAGE_SIZE_06_SMOKE").is_some();
+    let primary_keys = if smoke {
+        &PrimaryKeyShape::ALL[..1]
+    } else {
+        &PrimaryKeyShape::ALL
+    };
+    let widths = if smoke {
+        &ROW_WIDTHS[1..2]
+    } else {
+        &ROW_WIDTHS
+    };
+    let row_counts = if smoke { &ROW_COUNTS[..1] } else { &ROW_COUNTS };
+    for &primary_key in primary_keys {
+        for &width in widths {
+            for &n in row_counts {
+                // The full N/width sweep uses the integer key. Other key
+                // shapes hold N and tuple bytes fixed to isolate key geometry
+                // without multiplying the 100K x 4KiB payload corpus.
+                if primary_key.label() != "int8" && (width != 256 || n != 10_000) {
+                    continue;
+                }
+                if backend_only
+                    && (primary_key.label() != "int8"
+                        || width != 256
+                        || (n != 10_000 && n != 100_000))
+                {
+                    continue;
+                }
+                let rows = fixture_rows_with_primary_key(n, width, primary_key);
+                let adaptive = adaptive_target(width);
+                for (policy, target) in PAGE_TARGETS
+                    .into_iter()
+                    .map(|target| ("fixed", target))
+                    .chain(std::iter::once(("adaptive_4_16", adaptive)))
+                {
                     let started = Instant::now();
-                    let tree = Tree::build(rows.clone(), geometry, target);
+                    let tree = Tree::build(rows.clone(), Geometry::C2, target);
                     let build = started.elapsed();
                     tree.verify_all().expect("fresh tree authenticates");
-                    for d in DELTAS.into_iter().filter(|d| *d <= n) {
-                        let (mutation, update_cpu) = tree.update_spread(d);
-                        let reads = tree.profile_reads();
-                        let cpu = tree.profile_cpu(&reads, update_cpu);
-                        print_model_row(&tree, width, n, d, build, &reads, &mutation, &cpu);
+                    if !backend_only {
+                        for d in deltas(n) {
+                            let (mutation, update_cpu) = tree.update_spread(d);
+                            let reads = tree.profile_reads();
+                            let cpu = tree.profile_cpu(&reads, update_cpu);
+                            print_model_row(
+                                &tree,
+                                primary_key.label(),
+                                policy,
+                                width,
+                                n,
+                                d,
+                                build,
+                                &reads,
+                                &mutation,
+                                &cpu,
+                            );
+                        }
                     }
-                    if geometry == Geometry::C2 {
-                        for d in DELTAS.into_iter().filter(|d| *d <= n) {
+                    if !backend_only
+                        && primary_key.label() == "int8"
+                        && (n == 10_000 || n == 100_000)
+                    {
+                        for d in deltas(n) {
                             print_mutation_control("insert", &tree, d, tree.insert_spread(d));
                             print_mutation_control("delete", &tree, d, tree.delete_spread(d));
                         }
-                        print_branch_control(&tree);
+                        for d in deltas(n) {
+                            print_branch_control(&tree, d);
+                        }
                     }
-                    if backend && width == 256 && n <= 10_000 {
-                        run_backends(&tree);
+                    if backend
+                        && primary_key.label() == "int8"
+                        && width == 256
+                        && (n == 10_000 || n == 100_000)
+                    {
+                        run_backends(&tree, primary_key.label(), policy);
                     }
                 }
             }
@@ -138,9 +205,20 @@ fn main() {
     run_boundary_controls();
 }
 
+const fn adaptive_target(width: usize) -> usize {
+    if width <= 1_024 { 4 << 10 } else { 16 << 10 }
+}
+
+fn deltas(n: usize) -> Vec<usize> {
+    let mut deltas = vec![1, 10.min(n), (n / 100).max(1)];
+    deltas.sort_unstable();
+    deltas.dedup();
+    deltas
+}
+
 fn print_header() {
     println!(
-        "kind,backend,geometry,target,row_width,n,d,height,leaves,objects,fanout,total_bytes,compression_ratio,point_calls,point_objects,point_bytes,range_calls,range_objects,range_bytes,scan_calls,scan_objects,scan_bytes,partial_bytes,update_puts,update_bytes,splits,build_us,point_us,range_us,scan_us,update_us,settled_bytes,cold_reopen,logical_key_bytes,logical_payload_bytes"
+        "kind,backend,geometry,pk_shape,page_policy,target,row_width,n,d,height,leaves,objects,fanout,total_bytes,compression_ratio,point_calls,point_objects,point_bytes,range_calls,range_objects,range_bytes,scan_calls,scan_objects,scan_bytes,partial_bytes,update_puts,update_bytes,splits,build_us,point_us,range_us,scan_us,update_us,settled_bytes,cold_reopen,logical_key_bytes,logical_payload_bytes"
     );
 }
 
@@ -257,8 +335,9 @@ impl Tree {
         let stride = (rows.len() / d).max(1);
         for ordinal in 0..d {
             let index = (ordinal * stride).min(rows.len() - 1);
-            let last = rows[index].canonical.len() - 1;
-            rows[index].canonical[last] ^= 0x5a;
+            let canonical = Arc::make_mut(&mut rows[index].canonical);
+            let last = canonical.len() - 1;
+            canonical[last] ^= 0x5a;
         }
         let started = Instant::now();
         let updated = Self::build(rows, self.geometry, self.target);
@@ -282,7 +361,7 @@ impl Tree {
             let source = &self.rows[(ordinal * stride).min(self.rows.len() - 1)];
             let mut inserted = source.clone();
             inserted.key.extend_from_slice(b"/insert");
-            inserted.canonical[0] ^= 0xa5;
+            Arc::make_mut(&mut inserted.canonical)[0] ^= 0xa5;
             rows.push(inserted);
         }
         rows.sort_by(|left, right| left.key.cmp(&right.key));
@@ -1011,11 +1090,32 @@ fn authenticate_metric(tree: &Tree, metric: &ReadMetric) -> Duration {
 }
 
 fn fixture_rows(n: usize, width: usize) -> Vec<TypedRow> {
+    fixture_rows_with_primary_key(n, width, PrimaryKeyShape::Integer)
+}
+
+fn fixture_rows_with_primary_key(
+    n: usize,
+    width: usize,
+    primary_key: PrimaryKeyShape,
+) -> Vec<TypedRow> {
     const TEXT: &[u8] =
         b"project status open owner agent typed row payload description priority branch ";
-    (0..n)
+    let mut rows = (0..n)
         .map(|ordinal| {
-            let key = format!("tenant/acme/schema/task/{ordinal:012}").into_bytes();
+            let key = match primary_key {
+                PrimaryKeyShape::Integer => format!("task/i/{ordinal:020}").into_bytes(),
+                PrimaryKeyShape::Uuid => {
+                    let digest = blake3::hash(&ordinal.to_be_bytes());
+                    format!("task/u/{}", &digest.to_hex()[..32]).into_bytes()
+                }
+                PrimaryKeyShape::Text => {
+                    format!("task/t/project-acme-item-{ordinal:012}").into_bytes()
+                }
+                PrimaryKeyShape::Composite => {
+                    format!("task/c/tenant-acme/{:08}/{:012}", ordinal % 10_000, ordinal)
+                        .into_bytes()
+                }
+            };
             let mut canonical = vec![0_u8; width];
             let mut state = (ordinal as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
             for (offset, byte) in canonical.iter_mut().enumerate() {
@@ -1035,11 +1135,13 @@ fn fixture_rows(n: usize, width: usize) -> Vec<TypedRow> {
             let fixed_len = if width >= 1_024 { 64 } else { width };
             TypedRow {
                 key,
-                canonical,
+                canonical: Arc::from(canonical),
                 fixed_len,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.key.cmp(&right.key));
+    rows
 }
 
 fn common_prefix<'a>(mut values: impl Iterator<Item = &'a [u8]>) -> &'a [u8] {
@@ -1076,6 +1178,8 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 
 fn print_model_row(
     tree: &Tree,
+    pk_shape: &str,
+    page_policy: &str,
     width: usize,
     n: usize,
     d: usize,
@@ -1093,7 +1197,7 @@ fn print_model_row(
         1.0
     };
     println!(
-        "model,-,{geometry},{target},{width},{n},{d},{height},{leaves},{objects},{fanout:.2},{total},{ratio:.4},{point_calls},{point_objects},{point_bytes},{range_calls},{range_objects},{range_bytes},{scan_calls},{scan_objects},{scan_bytes},{partial_bytes},{update_puts},{update_bytes},{splits},{build_us},{point_us},{range_us},{scan_us},{update_us},0,-,{key_bytes},{payload_bytes}",
+        "model,-,{geometry},{pk_shape},{page_policy},{target},{width},{n},{d},{height},{leaves},{objects},{fanout:.2},{total},{ratio:.4},{point_calls},{point_objects},{point_bytes},{range_calls},{range_objects},{range_bytes},{scan_calls},{scan_objects},{scan_bytes},{partial_bytes},{update_puts},{update_bytes},{splits},{build_us},{point_us},{range_us},{scan_us},{update_us},0,-,{key_bytes},{payload_bytes}",
         geometry = tree.geometry.label(),
         target = tree.target,
         height = tree.levels.len(),
@@ -1149,7 +1253,7 @@ fn print_mutation_control(kind: &str, tree: &Tree, d: usize, mutation: MutationM
     );
 }
 
-fn print_branch_control(tree: &Tree) {
+fn print_branch_control(tree: &Tree, d: usize) {
     let (main_store, main_ref) = tree.authenticated_store_for_branch(b"main");
     let (branch_store, branch_ref) = tree.authenticated_store_for_branch(b"feature");
     let main = verify_branch(&main_store, main_ref).expect("main branch authenticates");
@@ -1158,7 +1262,11 @@ fn print_branch_control(tree: &Tree) {
     assert_eq!(main.visited, branch.visited);
 
     let mut modified_rows = tree.rows.clone();
-    modified_rows[tree.rows.len() / 2].canonical[0] ^= 0x5a;
+    let stride = (tree.rows.len() / d).max(1);
+    for ordinal in 0..d {
+        let index = (ordinal * stride).min(tree.rows.len() - 1);
+        Arc::make_mut(&mut modified_rows[index].canonical)[0] ^= 0x5a;
+    }
     let modified = Tree::build(modified_rows, tree.geometry, tree.target);
     let old_ids = tree.objects.keys().copied().collect::<BTreeSet<_>>();
     let changed_objects = modified
@@ -1166,10 +1274,12 @@ fn print_branch_control(tree: &Tree) {
         .keys()
         .filter(|id| !old_ids.contains(*id))
         .count();
-    let expected_path_objects = tree.levels.len() + usize::from(tree.geometry == Geometry::C3);
-    assert_eq!(changed_objects, expected_path_objects);
+    if d == 1 {
+        let expected_path_objects = tree.levels.len() + usize::from(tree.geometry == Geometry::C3);
+        assert_eq!(changed_objects, expected_path_objects);
+    }
     println!(
-        "branch_share,-,{geometry},{target},{width},{n},0,{height},{leaves},{objects},0,{total},0,0,0,0,0,0,0,0,0,0,0,{changed_objects},0,0,0,0,0,0,0,0,-,{key_bytes},{payload_bytes}",
+        "branch_share,-,{geometry},{target},{width},{n},{d},{height},{leaves},{objects},0,{total},0,0,0,0,0,0,0,0,0,0,0,{changed_objects},0,0,0,0,0,0,0,0,-,{key_bytes},{payload_bytes}",
         geometry = tree.geometry.label(),
         target = tree.target,
         width = tree.rows[0].canonical.len(),
@@ -1188,7 +1298,7 @@ fn print_branch_control(tree: &Tree) {
     );
 }
 
-fn run_backends(tree: &Tree) {
+fn run_backends(tree: &Tree, pk_shape: &str, page_policy: &str) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1203,7 +1313,7 @@ fn run_backends(tree: &Tree) {
         let rocks_settled = directory_bytes(rocks.path());
         let reopened = RocksDB::open(&rocks_path).expect("reopen rocks");
         verify_backend(&reopened, tree).await;
-        print_backend_row("rocksdb", tree, rocks_settled);
+        print_backend_row("rocksdb", tree, pk_shape, page_policy, rocks_settled);
         drop(reopened);
         drop(rocks);
 
@@ -1219,7 +1329,7 @@ fn run_backends(tree: &Tree) {
         let slate_settled = directory_bytes(slate.path());
         let reopened = SlateDB::open(&slate_path).expect("reopen slate");
         verify_backend(&reopened, tree).await;
-        print_backend_row("slatedb", tree, slate_settled);
+        print_backend_row("slatedb", tree, pk_shape, page_policy, slate_settled);
         drop(reopened);
         drop(slate);
     });
@@ -1288,7 +1398,13 @@ async fn verify_backend<S: Storage>(storage: &S, tree: &Tree) {
     assert_eq!(verified.rows, tree.rows.len());
 }
 
-fn print_backend_row(backend: &str, tree: &Tree, settled_bytes: u64) {
+fn print_backend_row(
+    backend: &str,
+    tree: &Tree,
+    pk_shape: &str,
+    page_policy: &str,
+    settled_bytes: u64,
+) {
     let root = tree
         .levels
         .last()
@@ -1297,7 +1413,7 @@ fn print_backend_row(backend: &str, tree: &Tree, settled_bytes: u64) {
         .expect("root");
     let total = tree.objects.values().map(Bytes::len).sum::<usize>();
     println!(
-        "backend,{backend},{geometry},{target},{width},{n},0,{height},{leaves},{objects},0,{total},{ratio:.4},1,1,{root_bytes},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{settled_bytes},true,{key_bytes},{payload_bytes}",
+        "backend,{backend},{geometry},{pk_shape},{page_policy},{target},{width},{n},0,{height},{leaves},{objects},0,{total},{ratio:.4},1,1,{root_bytes},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{settled_bytes},true,{key_bytes},{payload_bytes}",
         geometry = tree.geometry.label(),
         target = tree.target,
         width = tree.rows[0].canonical.len(),
@@ -1338,6 +1454,16 @@ fn run_corruption_controls() {
     let (store, branch_ref_id) = tree.authenticated_store_for_branch(b"main");
     let root_id = tree.root_id();
     let root = store.get(&root_id).expect("root object");
+
+    let mut missing = store.clone();
+    missing.remove(&root_id);
+    assert!(verify_branch(&missing, branch_ref_id).is_err());
+
+    let mut truncated = store.clone();
+    let mut bytes = root.to_vec();
+    bytes.truncate(bytes.len() - 1);
+    truncated.insert(root_id, Bytes::from(bytes));
+    assert!(verify_branch(&truncated, branch_ref_id).is_err());
 
     let mut envelope = store.clone();
     let mut bytes = root.to_vec();
@@ -1406,7 +1532,7 @@ fn assert_rehashed_root_rejected(tree: &Tree, changed_raw: Vec<u8>) {
 fn run_compression_bound_control() {
     let mut rows = fixture_rows(10_000, 4_096);
     for row in &mut rows {
-        row.canonical.fill(b'a');
+        row.canonical = Arc::from(vec![b'a'; row.canonical.len()]);
     }
     let started = Instant::now();
     let tree = Tree::build(rows, Geometry::C2, 64 << 10);
