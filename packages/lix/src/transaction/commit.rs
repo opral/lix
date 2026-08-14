@@ -26,7 +26,7 @@ use crate::functions::FunctionContext;
 use crate::hot_state::{
     HotStateContext, HotStateRowRequest, HotTrackedSnapshot, MaterializedHotStateRow,
     TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
+    stage_tracked_working_diff_epoch,
 };
 use crate::json_store::{
     JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
@@ -763,6 +763,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &row_columnar_write_sets,
         &engine_rows,
         &row_index.tracked_row_indices_by_commit,
+        &row_index.tracked_delete_indices_by_commit,
         &tracked_roots,
         &staged_commits,
         &selected_change_payloads,
@@ -794,11 +795,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         );
     }
     stage_checkpoint_working_diff_epochs(
-        read,
         &mut writes,
         &prepared_writes.checkpoint_publications,
         &staged_hot_heads.controls,
-        &branch_control_observations,
     )
     .await?;
     let mut root_backed_branch_publications = BTreeSet::new();
@@ -1078,10 +1077,12 @@ fn json_payloads_from_state_row(
 
 struct PreparedRowIndex {
     tracked_row_indices_by_commit: BTreeMap<CommitId, Vec<RowIndex>>,
+    tracked_delete_indices_by_commit: BTreeMap<CommitId, Vec<RowIndex>>,
 }
 
 fn index_prepared_rows(rows: &PreparedStateBatch) -> Result<PreparedRowIndex, LixError> {
     let mut tracked_row_indices_by_commit = BTreeMap::<CommitId, Vec<RowIndex>>::new();
+    let mut tracked_delete_indices_by_commit = BTreeMap::<CommitId, Vec<RowIndex>>::new();
 
     for (row_index, row) in rows.iter().enumerate() {
         if row.untracked {
@@ -1097,10 +1098,17 @@ fn index_prepared_rows(rows: &PreparedStateBatch) -> Result<PreparedRowIndex, Li
             .entry(*commit_id)
             .or_default()
             .push(row_index);
+        if row.snapshot.is_none() {
+            tracked_delete_indices_by_commit
+                .entry(*commit_id)
+                .or_default()
+                .push(row_index);
+        }
     }
 
     Ok(PreparedRowIndex {
         tracked_row_indices_by_commit,
+        tracked_delete_indices_by_commit,
     })
 }
 
@@ -3655,6 +3663,7 @@ async fn stage_tracked_head(
     row_columnar_write_sets: &crate::hot_state::RowColumnarWriteSets,
     engine_rows: &[EngineCurrentRow],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
+    tracked_delete_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     selected_change_payloads: &HashMap<
@@ -3735,9 +3744,130 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
+        let is_checkpoint_publication = checkpoint_commit_id == Some(root.commit_id);
         let certified_columnar_parts = mutation_inventories
             .get(&root.commit_id)
             .and_then(|inventory| inventory.columnar_parts.as_ref());
+
+        // A checkpoint changes the authenticated epoch/control, not current
+        // row values. Take the O(deletes) route before constructing ordinary
+        // tracked/untracked delta cohorts or selected-row materializations.
+        // The deletion ordinals were built while their typed owners were
+        // produced, so this branch never scans non-deleted members.
+        if is_checkpoint_publication && !tracked_snapshots.contains_key(&root.commit_id) {
+            let parent_generation = parent_control
+                .map(|control| control.tracked_generation)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "checkpoint hot publication for '{}' lacks a complete parent generation",
+                            root.commit_id
+                        ),
+                    )
+                })?;
+            let mut writer = tracked_head.writer(read, writes);
+            if let Some(schema_keys) = transaction_global_schema_keys.as_ref() {
+                writer = writer.with_transaction_global_schema_keys(schema_keys);
+            }
+            if writer
+                .can_rotate_checkpoint_epoch(&root.branch_id, parent_generation)
+                .await?
+            {
+                let selected_deleted_rows = staged
+                    .selected_change_batches
+                    .iter()
+                    .flat_map(StagedCommitChangeBatch::deleted_iter)
+                    .map(|change_ref| {
+                        let key = selected_change_key(change_ref);
+                        lifecycle_selected_tracked_row(
+                            change_ref,
+                            root.commit_id,
+                            None,
+                            selected_change_payloads.get(&key),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let selected_snapshots = selected_deleted_rows
+                    .iter()
+                    .map(|row| {
+                        row.snapshot_content.as_deref().map_or(
+                            crate::json_store::JsonSlot::None,
+                            crate::json_store::JsonSlot::from_json,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let selected_metadata = selected_deleted_rows
+                    .iter()
+                    .map(|row| {
+                        row.metadata.as_deref().map_or(
+                            crate::json_store::JsonSlot::None,
+                            crate::json_store::JsonSlot::from_json,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut deleted_deltas = tracked_delete_indices_by_commit
+                    .get(&root.commit_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                deleted_deltas.extend(
+                    staged
+                        .selected_change_batches
+                        .iter()
+                        .flat_map(StagedCommitChangeBatch::deleted_iter)
+                        .zip(selected_deleted_rows.iter())
+                        .zip(selected_snapshots.iter().zip(&selected_metadata))
+                        .map(|((change_ref, row), (snapshot, metadata))| {
+                            crate::hot_state::CurrentStateDeltaRef {
+                                schema_key: &row.schema_key,
+                                file_id: row.file_id.as_deref(),
+                                row_pk: &row.row_pk,
+                                change_id: Some(change_ref.change_id),
+                                commit_id: Some(root.commit_id),
+                                untracked: false,
+                                deleted: true,
+                                created_at: change_ref.created_at,
+                                updated_at: change_ref.updated_at,
+                                snapshot: snapshot.as_ref_slot(),
+                                metadata: metadata.as_ref_slot(),
+                                columnar_base_coordinate: None,
+                            }
+                        }),
+                );
+                let mut coverage = WorkingDiffIndexCoverage::default();
+                let generation = if deleted_deltas.is_empty() {
+                    parent_generation
+                } else {
+                    writer
+                        .stage_checkpoint_current_state(
+                            &root.branch_id,
+                            parent_generation,
+                            root.commit_id,
+                            &deleted_deltas,
+                            &BTreeSet::new(),
+                            checkpoint_commit_id
+                                .expect("checkpoint publication has an epoch commit id"),
+                            &mut coverage,
+                        )
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.materialization.tracked_head.stage_checkpoint_tombstones"
+                        ))
+                        .await?
+                };
+                let control = normal_branch_head_control(
+                    root,
+                    parent_control,
+                    generation,
+                    checkpoint_commit_id,
+                )?;
+                insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+                continue;
+            }
+        }
         let selected_materialization = if !staged.selected_change_batches.is_empty()
             && !tracked_snapshots.contains_key(&root.commit_id)
         {
@@ -3793,8 +3923,6 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == root.branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
-        let is_checkpoint_publication = checkpoint_commit_id == Some(root.commit_id);
         let can_publish_ordered_packed_current_base = ordered_addressable_commits
             .contains(&root.commit_id)
             && !is_checkpoint_publication
@@ -4460,8 +4588,9 @@ async fn stage_tracked_head(
             "packed current-base route decision"
         );
         let generation = if is_checkpoint_publication {
-            let checkpoint_commit_id =
-                checkpoint_commit_id.expect("checkpoint publication has an epoch commit id");
+            // Reaching this point means an immutable packed base prevented
+            // the O(deletes) epoch-rotation route above. Materialize it once;
+            // retirement makes later checkpoints eligible for lazy rotation.
             coverage = WorkingDiffIndexCoverage::default();
             writer
                 .stage_checkpoint_current_state(
@@ -4470,7 +4599,7 @@ async fn stage_tracked_head(
                     root.commit_id,
                     &deltas,
                     &owned_absence_guards(&absence_guards),
-                    checkpoint_commit_id,
+                    checkpoint_commit_id.expect("checkpoint publication has an epoch commit id"),
                     &mut coverage,
                 )
                 .instrument(tracing::debug_span!(
@@ -4907,11 +5036,9 @@ fn selected_tracked_ref_untracked_collision_error(
 /// hot generation. Unchanged rows were already clean, so rotating to an empty
 /// sparse dirty-key index starts the next epoch without a full-state rewrite.
 async fn stage_checkpoint_working_diff_epochs(
-    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     publications: &[crate::gc::CheckpointPublication],
     controls: &BTreeMap<String, BranchHeadControl>,
-    observations: &BTreeMap<String, BranchHeadControlObservation>,
 ) -> Result<(), LixError> {
     let mut branches = BTreeSet::new();
     for publication in publications {
@@ -4951,22 +5078,9 @@ async fn stage_checkpoint_working_diff_epochs(
         if control.head_commit_id != recovery.checkpoint_commit_id {
             continue;
         }
-        if let Some(previous) = observations
-            .get(&recovery.branch_id)
-            .and_then(|observation| observation.control)
-            && let Some(previous_checkpoint) = previous.working_diff_checkpoint_commit_id
-            && (previous_checkpoint != recovery.checkpoint_commit_id
-                || previous.tracked_generation != control.tracked_generation)
-        {
-            stage_delete_tracked_working_diff_epoch(
-                read,
-                writes,
-                &recovery.branch_id,
-                previous_checkpoint,
-                previous.tracked_generation,
-            )
-            .await?;
-        }
+        // The previous sparse index becomes unreachable when this marker and
+        // branch control commit. Repository GC reclaims stale epoch prefixes;
+        // scanning them here would make checkpoint publication O(D).
         stage_tracked_working_diff_epoch(
             writes,
             &recovery.branch_id,
@@ -6881,14 +6995,9 @@ mod tests {
     #[tokio::test]
     async fn real_checkpoint_without_complete_hot_control_still_fails() {
         let storage = StorageAdapter::new(Memory::new());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("checkpoint validation read should open");
         let mut writes = storage.new_write_set();
         let checkpoint = commit_id("missing-hot-checkpoint");
         let error = stage_checkpoint_working_diff_epochs(
-            &read,
             &mut writes,
             &[crate::gc::CheckpointPublication {
                 recovery_ref: crate::gc::CheckpointRecoveryRef {
@@ -6899,7 +7008,6 @@ mod tests {
                 },
                 gc_state: crate::gc::CheckpointGcState::default(),
             }],
-            &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .await
