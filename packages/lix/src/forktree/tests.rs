@@ -5,11 +5,9 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use bytes::Bytes;
 
 use crate::LixError;
-use crate::changelog::ChangeRecord;
 use crate::commit_graph::CommitGraphStoreReader;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonSlot;
 use crate::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
     KeyRange, Memory, MemoryRead, MemoryWrite, ProjectedValue, PutBatch, ReadOptions, ScanCursor,
@@ -38,7 +36,7 @@ use super::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, CanonicalUploadId,
     ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CheckpointCursorV1,
-    CoherentView, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
+    CoherentView, CommitCatalogEntry, CommitChangePageV3, CommitId, CommitMemberV3, CommitObjectV1,
     CommitTopologyReader, ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId,
     PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
     ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
@@ -420,7 +418,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     );
     assert_eq!(
         member.clone(),
-        CommitMemberV1::selected(
+        CommitMemberV3::selected(
             seed.semantic_change_id,
             seed.commit_object_id,
             0,
@@ -492,7 +490,7 @@ async fn selected_member_batch_proof_rejects_wrong_view_owner_ordinal_generation
         .take_selected()
         .pop()
         .expect("selected member");
-    let wrong = CommitMemberV1::selected(
+    let wrong = CommitMemberV3::selected(
         seed.semantic_change_id,
         seed.commit_object_id,
         1,
@@ -507,7 +505,7 @@ async fn selected_member_batch_proof_rejects_wrong_view_owner_ordinal_generation
 
     let mut wrong_owner = resolve().await.expect("wrong-owner proof source");
     let _ = wrong_owner.take_selected();
-    let wrong = CommitMemberV1::selected(
+    let wrong = CommitMemberV3::selected(
         seed.semantic_change_id,
         content_id(0xa1),
         0,
@@ -660,7 +658,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         "a selected leaf without a ChangeCatalog back-edge must fail closed"
     );
 
-    let selected = CommitMemberV1::selected(
+    let selected = CommitMemberV3::selected(
         member.change_id(),
         seed.commit_object_id,
         1,
@@ -692,7 +690,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
             view.view_instance_id(),
-            &CommitMemberV1::selected(
+            &CommitMemberV3::selected(
                 member.change_id(),
                 seed.commit_object_id,
                 0,
@@ -768,17 +766,17 @@ fn four_page_stale_fixture() -> (
     CommitId,
     Vec<(ObjectId, Bytes)>,
     Vec<ObjectId>,
-    Vec<CommitChangePageV2>,
+    Vec<CommitChangePageV3>,
 ) {
     let commit_id = CommitId::from_bytes(raw_id(0xd0));
     let members = (0..769).map(zero_edge_page_member).collect::<Vec<_>>();
     let pages =
-        CommitChangePageV2::encode_pages(commit_id, &members).expect("four-page stale fixture");
+        CommitChangePageV3::encode_pages(commit_id, &members).expect("four-page stale fixture");
     let page_ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let decoded = pages
         .objects
         .iter()
-        .map(|(id, bytes)| CommitChangePageV2::decode(*id, bytes).expect("fixture page"))
+        .map(|(id, bytes)| CommitChangePageV3::decode(*id, bytes).expect("fixture page"))
         .collect::<Vec<_>>();
     (commit_id, pages.objects, page_ids, decoded)
 }
@@ -788,7 +786,7 @@ async fn validate_four_page_stale_fixture(
     objects: Vec<(ObjectId, Bytes)>,
     page_ids: Vec<ObjectId>,
     selected_page_object_id: ObjectId,
-    selected_page: &CommitChangePageV2,
+    selected_page: &CommitChangePageV3,
 ) -> Result<(), StorageError> {
     let storage = Memory::new();
     let mut writes = StorageWriteSet::new();
@@ -973,7 +971,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("open selected history view");
-    let member = CommitMemberV1::selected(
+    let member = CommitMemberV3::selected(
         seed.semantic_change_id,
         seed.commit_object_id,
         0,
@@ -1077,7 +1075,7 @@ fn test_state_member(
     commit_byte: u8,
     manifests: &[ObjectId],
     global: bool,
-) -> (Vec<u8>, CommitMemberV1) {
+) -> TestStateEntry {
     let entity_pk = EntityPk::single(primary_key);
     let key = encode_state_key(StateKeyRef {
         schema_key: "app.row",
@@ -1085,34 +1083,107 @@ fn test_state_member(
         entity_pk: &entity_pk,
     });
     let change_id = test_change_id(commit_byte, &key, global);
-    let snapshot = match cell {
-        StateCellRef::Value(value) => JsonSlot::Inline(value.into()),
-        StateCellRef::Null => JsonSlot::Inline("null".into()),
-        StateCellRef::Tombstone => JsonSlot::None,
-    };
-    let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-        format_version: 2,
-        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
-        account_id: "forktree-test".to_owned(),
-        schema_key: "app.row".to_owned(),
-        entity_pk,
-        file_id: Some("file".to_owned()),
-        snapshot,
-        metadata: JsonSlot::None,
-        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-        origin_key: None,
-    })
-    .expect("test change payload");
-    (
-        key,
-        CommitMemberV1::introduced(
-            change_id,
-            payload,
-            global,
-            LixTimestamp::from_unix_millis_utc_lossy(2),
-            manifests.to_vec(),
+    let cell = match cell {
+        StateCellRef::Value(value) => StateCell::NativeRow(
+            crate::native_row::encode(
+                &lix_schema::from_value(serde_json::json!({
+                    "$schema": lix_schema::SCHEMA_V1_URI,
+                    "key": "app.row",
+                    "columns": [
+                        {"name": "id", "type": "text", "nullable": false},
+                        {"name": "value", "type": "text", "nullable": true}
+                    ],
+                    "primary_key": ["id"]
+                }))
+                .expect("test app schema"),
+                &entity_pk,
+                global,
+                Some("file"),
+                &serde_json::json!({"id": primary_key, "value": value}),
+            )
+            .expect("test native row"),
         ),
+        StateCellRef::Null => StateCell::NativeRow(
+            crate::native_row::encode(
+                &lix_schema::from_value(serde_json::json!({
+                    "$schema": lix_schema::SCHEMA_V1_URI,
+                    "key": "app.row",
+                    "columns": [
+                        {"name": "id", "type": "text", "nullable": false},
+                        {"name": "value", "type": "text", "nullable": true}
+                    ],
+                    "primary_key": ["id"]
+                }))
+                .expect("test app schema"),
+                &entity_pk,
+                global,
+                Some("file"),
+                &serde_json::json!({"id": primary_key, "value": null}),
+            )
+            .expect("test native null row"),
+        ),
+        StateCellRef::Tombstone => StateCell::Tombstone,
+    };
+    test_state_entry(
+        key,
+        change_id,
+        cell,
+        global,
+        manifests.to_vec(),
     )
+}
+
+struct TestStateEntry {
+    key: Vec<u8>,
+    member: CommitMemberV3,
+    value: StateValue,
+}
+
+fn test_state_entry(
+    key: Vec<u8>,
+    change_id: ChangeId,
+    cell: StateCell,
+    global: bool,
+    manifests: Vec<ObjectId>,
+) -> TestStateEntry {
+    let (layout_id, owner_digest, semantic_digest, deleted) = match &cell {
+        StateCell::NativeRow(native) => (
+            native.layout_id,
+            native.owner_digest,
+            native.semantic_digest,
+            false,
+        ),
+        StateCell::Tombstone => ([0; 32], [0; 32], [0; 32], true),
+        StateCell::Value(_) | StateCell::Null => panic!("test history must be native"),
+    };
+    let public_change_id =
+        crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes()));
+    TestStateEntry {
+        member: CommitMemberV3::introduced(
+            change_id,
+            key.clone(),
+            layout_id,
+            global,
+            owner_digest,
+            semantic_digest,
+            deleted,
+            "forktree-test".to_owned(),
+            LixTimestamp::from_unix_millis_utc_lossy(1),
+            LixTimestamp::from_unix_millis_utc_lossy(2),
+            None,
+        ),
+        value: StateValue {
+            change_id: public_change_id,
+            commit_id: crate::changelog::CommitId::default(),
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            cell,
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: manifests,
+        },
+        key,
+    }
 }
 
 fn test_blob_ref_member(
@@ -1122,7 +1193,7 @@ fn test_blob_ref_member(
     size_bytes: u64,
     commit_byte: u8,
     manifest: ObjectId,
-) -> (Vec<u8>, CommitMemberV1) {
+) -> TestStateEntry {
     let entity_pk = EntityPk::uuid_from_canonical(primary_key).expect("canonical blob-ref id");
     let key = encode_state_key(StateKeyRef {
         schema_key: "lix_binary_blob_ref",
@@ -1135,85 +1206,54 @@ fn test_blob_ref_member(
         "blob_hash": blob_id.to_hex(),
         "size_bytes": size_bytes,
     })
-    .to_string();
-    let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-        format_version: 2,
-        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
-        account_id: "forktree-test".to_owned(),
-        schema_key: "lix_binary_blob_ref".to_owned(),
-        entity_pk,
-        file_id: Some(primary_key.to_owned()),
-        snapshot: JsonSlot::Inline(snapshot.into()),
-        metadata: JsonSlot::None,
-        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-        origin_key: None,
-    })
-    .expect("blob-ref change payload");
-    (
-        key,
-        CommitMemberV1::introduced(
-            change_id,
-            payload,
+    ;
+    let cell = StateCell::NativeRow(
+        crate::native_row::encode(
+            &crate::native_row::seed_schema("lix_binary_blob_ref").expect("blob-ref schema"),
+            &entity_pk,
             false,
-            LixTimestamp::from_unix_millis_utc_lossy(2),
-            vec![manifest],
-        ),
+            Some(primary_key),
+            &snapshot,
+        )
+        .expect("native blob-ref row"),
+    );
+    test_state_entry(
+        key,
+        change_id,
+        cell,
+        false,
+        vec![manifest],
     )
 }
 
 fn encode_test_state_entries(
     commit_byte: u8,
-    entries: Vec<(Vec<u8>, CommitMemberV1)>,
+    entries: Vec<TestStateEntry>,
 ) -> (
     Vec<(Vec<u8>, Vec<u8>)>,
-    Vec<CommitMemberV1>,
+    Vec<CommitMemberV3>,
     Vec<(ObjectId, Bytes)>,
     Vec<(ObjectId, Bytes)>,
 ) {
     let members = entries
         .iter()
-        .map(|(_, member)| member.clone())
+        .map(|entry| entry.member.clone())
         .collect::<Vec<_>>();
     let pages =
-        CommitChangePageV2::encode_pages(CommitId::from_bytes(raw_id(commit_byte)), &members)
+        CommitChangePageV3::encode_pages(CommitId::from_bytes(raw_id(commit_byte)), &members)
             .expect("test change pages");
     let pack_rows = entries
         .iter()
         .zip(&pages.member_locations)
-        .map(|((key, member), location)| {
-            let (payload, global, updated_at, manifests) = member
-                .introduced_payload()
-                .expect("test state entry is introduced");
-            let change_id = crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
-                *member.change_id().as_bytes(),
-            ));
-            let record = crate::changelog::decode_forktree_change_payload(payload, change_id)
-                .expect("test state payload");
-            let cell = match record.snapshot {
-                JsonSlot::None => StateCell::Tombstone,
-                JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
-                JsonSlot::Inline(value) => StateCell::Value(value.into()),
-                JsonSlot::ForkTreeObject(_) => panic!("test state payload must be inline"),
-            };
-            let metadata = match record.metadata {
-                JsonSlot::None => None,
-                JsonSlot::Inline(value) => Some(value.into()),
-                JsonSlot::ForkTreeObject(_) => panic!("test state metadata must be inline"),
-            };
+        .map(|(entry, location)| {
+            let global = entry.member.introduced_identity().expect("introduced").2;
+            let mut value = entry.value.clone();
+            value.commit_id = crate::changelog::CommitId::new(uuid::Uuid::from_bytes(raw_id(
+                commit_byte,
+            )));
             (
-                key.clone(),
-                StateValue {
-                    change_id,
-                    commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(raw_id(
-                        commit_byte,
-                    ))),
-                    created_at: record.created_at,
-                    updated_at,
-                    cell,
-                    metadata,
-                    origin_key: record.origin_key,
-                    blob_manifest_object_ids: manifests.to_vec(),
-                },
+                entry.key.clone(),
+                value,
                 *location,
                 global,
             )
@@ -1242,16 +1282,13 @@ fn encode_test_state_entries(
     }
     let rows = entries
         .into_iter()
-        .map(|(key, member)| {
-            let global = member
-                .introduced_payload()
-                .expect("test state entry is introduced")
-                .1;
+        .map(|entry| {
+            let global = entry.member.introduced_identity().expect("introduced").2;
             let location = pack_locations
-                .get(&(global, key.clone()))
+                .get(&(global, entry.key.clone()))
                 .expect("test pack location");
             (
-                key,
+                entry.key,
                 encode_state_value(StateValueRef {
                     pack_object_id: location.pack_object_id,
                     pack_ordinal: location.pack_ordinal,
@@ -1347,7 +1384,7 @@ fn build_seed() -> SeedData {
         commit_id,
         generation: 1,
         parent_commit_object_ids: Vec::new(),
-        member_page_object_ids: CommitChangePageV2::encode_pages(commit_id, &members)
+        member_page_object_ids: CommitChangePageV3::encode_pages(commit_id, &members)
             .expect("seed member pages")
             .objects
             .iter()
@@ -1635,7 +1672,7 @@ fn insert_graph_commit_with_options(
     } else {
         Vec::new()
     };
-    let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+    let pages = CommitChangePageV3::encode_pages(commit_id, &members)
         .expect("graph chronology member pages");
     for (id, bytes) in &pages.objects {
         seed.objects
@@ -1696,7 +1733,7 @@ fn insert_indexed_chronology_commit(
         ),
     };
     let members = chronology_checkpoint_members(seed, commit_id, introduces_checkpoint);
-    let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+    let pages = CommitChangePageV3::encode_pages(commit_id, &members)
         .expect("indexed chronology member pages");
     for (id, bytes) in &pages.objects {
         seed.objects
@@ -1725,7 +1762,7 @@ fn chronology_checkpoint_members(
     seed: &SeedData,
     commit_id: CommitId,
     introduces_checkpoint: bool,
-) -> Vec<CommitMemberV1> {
+) -> Vec<CommitMemberV3> {
     if !introduces_checkpoint {
         return Vec::new();
     }
@@ -1733,30 +1770,31 @@ fn chronology_checkpoint_members(
     change_bytes[1] ^= 0x5a;
     let change_id = ChangeId::from_bytes(change_bytes);
     let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
-    let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-        format_version: 2,
-        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(change_bytes)),
-        account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
-        schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY.to_owned(),
-        entity_pk: EntityPk::uuid_from_canonical(&branch_id).expect("checkpoint branch UUID"),
+    let entity_pk = EntityPk::uuid_from_canonical(&branch_id).expect("checkpoint branch UUID");
+    let key = encode_state_key(StateKeyRef {
+        schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY,
         file_id: None,
-        snapshot: JsonSlot::Inline(
-            serde_json::json!({ "branch_id": branch_id })
-                .to_string()
-                .into(),
-        ),
-        metadata: JsonSlot::None,
-        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-        origin_key: None,
-    })
-    .expect("checkpoint marker payload");
-    vec![CommitMemberV1::introduced(
+        entity_pk: &entity_pk,
+    });
+    let cell = StateCell::NativeRow(
+        crate::native_row::encode(
+            &crate::native_row::seed_schema(crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY)
+                .expect("checkpoint schema"),
+            &entity_pk,
+            false,
+            None,
+            &serde_json::json!({ "branch_id": branch_id }),
+        )
+        .expect("checkpoint native row"),
+    );
+    vec![test_state_entry(
+        key,
         change_id,
-        payload,
+        cell,
         false,
-        LixTimestamp::from_unix_millis_utc_lossy(1),
         Vec::new(),
-    )]
+    )
+    .member]
 }
 
 fn install_graph_head(
@@ -2604,7 +2642,7 @@ fn load_from(
     }
 }
 
-fn seed_commit_members(seed: &SeedData) -> Vec<CommitMemberV1> {
+fn seed_commit_members(seed: &SeedData) -> Vec<CommitMemberV3> {
     let commit = CommitObjectV1::decode(
         seed.commit_object_id,
         seed.objects
@@ -2657,9 +2695,9 @@ fn commit_member_catalog_entries(
 fn insert_test_change_pages(
     objects: &mut ImmutableObjectSet,
     commit_id: CommitId,
-    members: &[CommitMemberV1],
+    members: &[CommitMemberV3],
 ) -> Vec<ObjectId> {
-    let pages = CommitChangePageV2::encode_pages(commit_id, members).expect("test change pages");
+    let pages = CommitChangePageV3::encode_pages(commit_id, members).expect("test change pages");
     let ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     for (id, bytes) in pages.objects {
         objects.insert(id, bytes).expect("test change page object");
@@ -2734,13 +2772,13 @@ async fn branch_transition_with_members<R: StorageAdapterRead>(
     view: &CoherentView<R>,
     state_edit: super::serving::StateTreeEdit,
     identity: u8,
-    members: Vec<CommitMemberV1>,
+    members: Vec<CommitMemberV3>,
 ) -> BranchStateTransition {
     let commit_id = CommitId::from_bytes(raw_id(identity));
     let member_page_object_ids = if members.is_empty() {
         Vec::new()
     } else {
-        CommitChangePageV2::encode_pages(commit_id, &members)
+        CommitChangePageV3::encode_pages(commit_id, &members)
             .expect("transition change pages")
             .objects
             .iter()
@@ -3333,7 +3371,13 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
     let masked = masked_row.after.expect("masked endpoint");
     assert!(!masked.global);
     assert!(!masked.deleted);
-    assert_eq!(masked.snapshot_content.as_deref(), Some("local-b"));
+    assert_eq!(
+        masked
+            .seed_snapshot_content()
+            .expect("terminal test projection")
+            .as_deref(),
+        Some(r#"{"id":"b","value":"local-b"}"#)
+    );
 
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
@@ -3383,11 +3427,23 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
     let before = unmasked_row.before.expect("masked before endpoint");
     assert!(!before.global);
     assert!(!before.deleted);
-    assert_eq!(before.snapshot_content.as_deref(), Some("local-b"));
+    assert_eq!(
+        before
+            .seed_snapshot_content()
+            .expect("terminal test projection")
+            .as_deref(),
+        Some(r#"{"id":"b","value":"local-b"}"#)
+    );
     let after = unmasked_row.after.expect("global fallback endpoint");
     assert!(after.global);
     assert!(!after.deleted);
-    assert_eq!(after.snapshot_content.as_deref(), Some("global-b"));
+    assert_eq!(
+        after
+            .seed_snapshot_content()
+            .expect("terminal test projection")
+            .as_deref(),
+        Some(r#"{"id":"b","value":"global-b"}"#)
+    );
 }
 
 #[cfg(any())]
@@ -3919,7 +3975,7 @@ fn catalogs_use_one_raw_uuid_tree_and_fail_closed_on_owner_mismatch() {
         },
     };
     assert!(validate_change_catalog_back_edge(seed.semantic_change_id, bad, &load).is_err());
-    let semantic = CommitChangePageV2::decode(
+    let semantic = CommitChangePageV3::decode(
         seed.semantic_change_object_id,
         seed.objects
             .get(seed.semantic_change_object_id)
@@ -4435,7 +4491,7 @@ async fn zero_edge_commit_change_pages_reopen_at_member_count_boundary() {
             .to_vec();
         corrupted[0] ^= 0x01;
         assert!(
-            CommitChangePageV2::decode(first_page_id, &corrupted).is_err(),
+            CommitChangePageV3::decode(first_page_id, &corrupted).is_err(),
             "corrupt zero-edge page must fail closed after reopen"
         );
     }
@@ -6561,29 +6617,25 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     let mismatched_owner_key = mismatched_row.0.clone();
     let transplanted_owner_key = transplanted_row.0.clone();
     let valid_multichunk_key = valid_multichunk_row.0.clone();
-    let bound_insert = |row: (Vec<u8>, Vec<u8>), member: &CommitMemberV1| {
+    let bound_insert = |row: (Vec<u8>, Vec<u8>), manifests: Vec<ObjectId>| {
         StateTreeMutation::insert_bound(
             row.0,
             row.1,
             StateMutationAudit {
                 commit_id: raw_id(0x70),
                 tombstone: false,
-                blob_manifest_object_ids: member
-                    .introduced_payload()
-                    .expect("introduced test member")
-                    .3
-                    .to_vec(),
+                blob_manifest_object_ids: manifests,
             },
         )
     };
     let mut state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![
-            bound_insert(wrong_owner_row, &members[0]),
-            bound_insert(selected_row, &members[1]),
-            bound_insert(mismatched_row, &members[2]),
-            bound_insert(transplanted_row, &members[3]),
-            bound_insert(valid_multichunk_row, &members[4]),
+            bound_insert(wrong_owner_row, vec![manifest_id]),
+            bound_insert(selected_row, vec![manifest_id]),
+            bound_insert(mismatched_row, vec![manifest_id]),
+            bound_insert(transplanted_row, vec![transplanted_manifest_id]),
+            bound_insert(valid_multichunk_row, vec![transplanted_manifest_id]),
         ],
         view.test_storage_read(),
     )
@@ -6809,19 +6861,15 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     let wrong_identity_key = rows[2].0.clone();
     let mut mutations = rows
         .into_iter()
-        .zip(&members)
-        .map(|(row, member)| {
+        .zip([wrong_manifest_id, valid_manifest_id, valid_manifest_id])
+        .map(|(row, manifest)| {
             StateTreeMutation::insert_bound(
                 row.0,
                 row.1,
                 StateMutationAudit {
                     commit_id: raw_id(0x70),
                     tombstone: false,
-                    blob_manifest_object_ids: member
-                        .introduced_payload()
-                        .expect("introduced test member")
-                        .3
-                        .to_vec(),
+                    blob_manifest_object_ids: vec![manifest],
                 },
             )
         })
@@ -7137,7 +7185,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         .expect("stage retained current-state pack");
     let semantic_change_ids = members
         .iter()
-        .map(CommitMemberV1::change_id)
+        .map(CommitMemberV3::change_id)
         .collect::<Vec<_>>();
     let transition = branch_transition_with_members(&view, state_edit, 0x80, members).await;
     let mut complete = PreparedPublication::from_branch_view(&view).expect("complete");
@@ -7606,35 +7654,33 @@ fn seed_provenance_and_ref_edge_are_not_aliased() {
     validate_branch_snapshot_ref_edge(&snapshot, load_from(&seed.objects)).expect("ref edge");
 }
 
-fn zero_edge_page_member(index: usize) -> CommitMemberV1 {
+fn zero_edge_page_member(index: usize) -> CommitMemberV3 {
+    page_member_with_key_bytes(index, 1)
+}
+
+fn page_member_with_key_bytes(index: usize, key_bytes: usize) -> CommitMemberV3 {
     let mut change_raw = [0_u8; 16];
     change_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
     change_raw[15] = 1;
-    CommitMemberV1::introduced(
+    CommitMemberV3::introduced(
         ChangeId::from_bytes(change_raw),
-        vec![b'x'],
+        vec![b'x'; key_bytes],
+        [1; 32],
         false,
+        [2; 32],
+        [3; 32],
+        false,
+        "forktree-test".to_owned(),
         LixTimestamp::from_unix_millis_utc_lossy(1),
-        Vec::new(),
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+        None,
     )
 }
 
 #[test]
 fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
-    fn page_member(index: usize) -> CommitMemberV1 {
-        let mut change_raw = [0_u8; 16];
-        change_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-        change_raw[15] = 1;
-        let mut edge_raw = [0_u8; 32];
-        edge_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-        edge_raw[31] = 2;
-        CommitMemberV1::introduced(
-            ChangeId::from_bytes(change_raw),
-            vec![b'x'],
-            false,
-            LixTimestamp::from_unix_millis_utc_lossy(1),
-            vec![ObjectId::from_bytes(edge_raw)],
-        )
+    fn page_member(index: usize) -> CommitMemberV3 {
+        page_member_with_key_bytes(index, 1)
     }
 
     for count in [255usize, 256, 257, 1002] {
@@ -7682,22 +7728,13 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         let members = (0..count)
             .map(|index| {
                 if count == 100_000 {
-                    let mut change_raw = [0_u8; 16];
-                    change_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-                    change_raw[15] = 1;
-                    CommitMemberV1::introduced(
-                        ChangeId::from_bytes(change_raw),
-                        vec![b'x'; 256],
-                        false,
-                        LixTimestamp::from_unix_millis_utc_lossy(1),
-                        Vec::new(),
-                    )
+                    page_member_with_key_bytes(index, 256)
                 } else {
                     zero_edge_page_member(index)
                 }
             })
             .collect::<Vec<_>>();
-        let pages = CommitChangePageV2::encode_pages(CommitId::from_bytes(raw_id(0xa5)), &members)
+        let pages = CommitChangePageV3::encode_pages(CommitId::from_bytes(raw_id(0xa5)), &members)
             .expect("zero-edge page closure");
         assert!(
             pages.objects.len() + 2 <= 256,
@@ -7706,7 +7743,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         assert_eq!(pages.member_locations.len(), count);
         let mut next_ordinal = 0_u32;
         for (id, bytes) in pages.objects {
-            let page = CommitChangePageV2::decode(id, &bytes).expect("zero-edge page decodes");
+            let page = CommitChangePageV3::decode(id, &bytes).expect("zero-edge page decodes");
             assert_eq!(page.start_ordinal, next_ordinal);
             next_ordinal += u32::try_from(page.members.len()).expect("bounded test page");
         }
@@ -7716,7 +7753,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         );
     }
 
-    let (zero_edge_page_id, zero_edge_page_bytes) = CommitChangePageV2 {
+    let (zero_edge_page_id, zero_edge_page_bytes) = CommitChangePageV3 {
         commit_id: CommitId::from_bytes(raw_id(0xa6)),
         start_ordinal: 0,
         members: (0..257).map(zero_edge_page_member).collect(),
@@ -7724,7 +7761,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     .encode()
     .expect("inline members may exceed the independent object-edge budget");
     assert_eq!(
-        CommitChangePageV2::decode(zero_edge_page_id, &zero_edge_page_bytes)
+        CommitChangePageV3::decode(zero_edge_page_id, &zero_edge_page_bytes)
             .expect("large inline page decodes")
             .members
             .len(),
@@ -7781,7 +7818,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     );
 
     let mut wrong_ordinal =
-        CommitChangePageV2::decode(root, page_map.get(&root).expect("root page"))
+        CommitChangePageV3::decode(root, page_map.get(&root).expect("root page"))
             .expect("valid root page");
     wrong_ordinal.start_ordinal = 1;
     let (wrong_id, wrong_bytes) = wrong_ordinal.encode().expect("wrong ordinal page");
@@ -7801,7 +7838,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
             .is_err()
     );
 
-    let duplicate = CommitChangePageV2 {
+    let duplicate = CommitChangePageV3 {
         commit_id: CommitId::from_bytes(raw_id(0xa3)),
         start_ordinal: 0,
         members: vec![page_member(0x81), page_member(0x81)],
@@ -7825,7 +7862,7 @@ struct ThreePageStaleFixture {
     seed: SeedData,
     after_commit_id: CommitId,
     after_commit_object_id: ObjectId,
-    members: Vec<CommitMemberV1>,
+    members: Vec<CommitMemberV3>,
     selected_key: Vec<u8>,
     selected_change_id: ChangeId,
     page_ids: Vec<ObjectId>,
@@ -8232,7 +8269,7 @@ async fn stale_reconciliation_authenticates_three_page_prefix_after_reopen() {
     // reduced to direct calls to validate_stale_page_position: the caller
     // authenticates the selected CommitCatalog/ChangeCatalog owner and the
     // endpoint roots before resolving the selected page prefix.
-    let second_page = CommitChangePageV2::decode(
+    let second_page = CommitChangePageV3::decode(
         fixture.page_ids[1],
         fixture
             .seed

@@ -776,12 +776,7 @@ fn common_live_plugin_owner_ref(
     if base.change_id != target.change_id || base.change_id != source.change_id {
         return Ok(None);
     }
-    let Some(base_snapshot) = base.snapshot_content.as_ref() else {
-        return Ok(None);
-    };
-    if target.snapshot_content.as_ref().map(SharedStr::as_str) != Some(base_snapshot.as_str())
-        || source.snapshot_content.as_ref().map(SharedStr::as_str) != Some(base_snapshot.as_str())
-    {
+    if target.cell != base.cell || source.cell != base.cell {
         return Ok(None);
     }
     let Some(base_owner) = PluginFileOwner::from_historical_state_row(base)? else {
@@ -1078,7 +1073,7 @@ where
             base_rows[index].as_ref(),
             target_rows[index].as_ref(),
             source_rows[index].as_ref(),
-        ) else {
+        )? else {
             descriptors.insert(file_id, None);
             continue;
         };
@@ -1105,11 +1100,22 @@ where
 fn historical_file_descriptor_row_ref(
     row: Option<&HistoricalStateRow>,
     expected_file_id: &str,
-) -> Option<(Option<String>, HistoricalFileDescriptor)> {
-    let row = row.filter(|row| !row.deleted)?;
-    let snapshot = row.snapshot_content.as_ref()?;
-    let descriptor = serde_json::from_str::<HistoricalFileDescriptor>(snapshot.as_str()).ok()?;
-    (descriptor.id == expected_file_id).then(|| (row.key.file_id.clone(), descriptor))
+) -> Result<Option<(Option<String>, HistoricalFileDescriptor)>, LixError> {
+    let Some(row) = row.filter(|row| !row.deleted) else {
+        return Ok(None);
+    };
+    let Some(snapshot) = row.seed_snapshot_content()? else {
+        return Ok(None);
+    };
+    let descriptor = serde_json::from_str::<HistoricalFileDescriptor>(snapshot.as_str()).map_err(
+        |error| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("historical file descriptor is malformed: {error}"),
+            )
+        },
+    )?;
+    Ok((descriptor.id == expected_file_id).then(|| (row.key.file_id.clone(), descriptor)))
 }
 
 fn common_historical_file_descriptor_ref(
@@ -1117,11 +1123,17 @@ fn common_historical_file_descriptor_ref(
     base: Option<&HistoricalStateRow>,
     target: Option<&HistoricalStateRow>,
     source: Option<&HistoricalStateRow>,
-) -> Option<(Option<String>, HistoricalFileDescriptor)> {
-    let base = historical_file_descriptor_row_ref(base, expected_file_id)?;
-    let target = historical_file_descriptor_row_ref(target, expected_file_id)?;
-    let source = historical_file_descriptor_row_ref(source, expected_file_id)?;
-    (base == target && base == source).then_some(base)
+) -> Result<Option<(Option<String>, HistoricalFileDescriptor)>, LixError> {
+    let Some(base) = historical_file_descriptor_row_ref(base, expected_file_id)? else {
+        return Ok(None);
+    };
+    let Some(target) = historical_file_descriptor_row_ref(target, expected_file_id)? else {
+        return Ok(None);
+    };
+    let Some(source) = historical_file_descriptor_row_ref(source, expected_file_id)? else {
+        return Ok(None);
+    };
+    Ok((base == target && base == source).then_some(base))
 }
 
 fn common_historical_path(
@@ -1169,10 +1181,10 @@ where
         if row.deleted {
             return Ok(None);
         }
-        let Some(snapshot) = row.snapshot_content.as_deref() else {
+        let Some(snapshot) = row.seed_snapshot_content()? else {
             return Ok(None);
         };
-        let Ok(directory) = serde_json::from_str::<HistoricalDirectoryDescriptor>(snapshot) else {
+        let Ok(directory) = serde_json::from_str::<HistoricalDirectoryDescriptor>(snapshot.as_str()) else {
             return Ok(None);
         };
         if directory.id != id {
@@ -1271,7 +1283,7 @@ fn historical_live_payload_ref(
 ) -> Result<Option<PluginMergeConflictPayload>, LixError> {
     row.filter(|row| !row.deleted)
         .map(|row| {
-            let snapshot = row.snapshot_content.clone().ok_or_else(|| {
+            let snapshot = row.seed_snapshot_content()?.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "live plugin semantic row is missing its complete snapshot",
@@ -1567,10 +1579,9 @@ fn push_transaction_row_from_tracked_row_ref(
     rows: &mut RawWriteBatch,
     row: &HistoricalStateRow,
     target_branch_id: &SharedStr,
-) {
+) -> Result<(), LixError> {
     let snapshot = row
-        .snapshot_content
-        .clone()
+        .seed_snapshot_content()?
         .map(TransactionJson::from_unvalidated_shared_normalized_content);
     let metadata = row
         .metadata
@@ -1591,6 +1602,7 @@ fn push_transaction_row_from_tracked_row_ref(
         false,
         target_branch_id.clone(),
     );
+    Ok(())
 }
 
 async fn materialized_plugin_merge_rows<R>(
@@ -1660,7 +1672,7 @@ where
                 ),
             )
         })?;
-        push_transaction_row_from_tracked_row_ref(&mut rows, row, target_branch_id);
+        push_transaction_row_from_tracked_row_ref(&mut rows, row, target_branch_id)?;
     }
     rows.append(resolved_plugin_rows);
     Ok(rows)
@@ -1700,7 +1712,7 @@ where
         let target = target_rows[index].as_ref().filter(|row| !row.deleted);
         let target_snapshot = target
             .map(|row| {
-                row.snapshot_content.as_ref().ok_or_else(|| {
+                row.seed_snapshot_content()?.ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         "live plugin target row omitted its snapshot",
@@ -1709,7 +1721,7 @@ where
             })
             .transpose()?;
         match classify_plugin_resolution(
-            target_snapshot.map(SharedStr::as_str),
+            target_snapshot.as_ref().map(SharedStr::as_str),
             target
                 .and_then(|row| row.metadata.as_ref())
                 .map(SharedStr::as_str),

@@ -11,12 +11,9 @@ use serde_json::json;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::changelog::{
-    ChangeId as ChangelogChangeId, ChangeRecord, CommitId as ChangelogCommitId,
-};
+use crate::changelog::{ChangeId as ChangelogChangeId, CommitId as ChangelogCommitId};
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonSlot;
 use crate::plugin::{PLUGIN_REGISTRY_KEY, PluginRegistry};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
@@ -28,7 +25,7 @@ use crate::storage_adapter::{
 use super::encode_current_state_packs;
 use super::model::{
     BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
-    ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1,
+    ChangeObjectV1, CommitCatalogEntry, CommitChangePageV3, CommitId, CommitMemberV3,
     CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
@@ -51,9 +48,8 @@ struct SeedRow {
     schema_key: String,
     entity_pk: EntityPk,
     file_id: Option<String>,
-    native_snapshot: serde_json::Value,
-    snapshot: JsonSlot,
-    metadata: JsonSlot,
+    global_native_row: super::state::NativeRowCell,
+    local_native_row: Option<super::state::NativeRowCell>,
 }
 
 pub(crate) async fn initialize_empty_repository<S>(
@@ -113,7 +109,16 @@ where
         for (name, value) in schema.primary_key.iter().zip(primary_key) {
             object.insert(name.clone(), value);
         }
-        let encoded_snapshot = JsonSlot::Inline(snapshot.to_string().into());
+        let global_native_row = crate::native_row::encode(
+            &schema,
+            &entity_pk,
+            true,
+            file_id,
+            &snapshot,
+        )?;
+        let local_native_row = local
+            .then(|| crate::native_row::encode(&schema, &entity_pk, false, file_id, &snapshot))
+            .transpose()?;
         let key = encode_state_key(StateKeyRef {
             schema_key,
             file_id,
@@ -126,9 +131,8 @@ where
             schema_key: schema_key.to_owned(),
             entity_pk,
             file_id: file_id.map(str::to_owned),
-            native_snapshot: snapshot,
-            snapshot: encoded_snapshot,
-            metadata: JsonSlot::None,
+            global_native_row,
+            local_native_row,
         });
         Ok(())
     };
@@ -206,56 +210,48 @@ where
     let mut semantic_members = Vec::with_capacity(rows.len() + local_rows.len());
     let mut changes = Vec::with_capacity(rows.len() + local_rows.len());
     for row in &rows {
-            let public_change_id = row.change_id;
-            let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-                format_version: 2,
-                change_id: public_change_id,
-                account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
-                schema_key: row.schema_key.clone(),
-                entity_pk: row.entity_pk.clone(),
-                file_id: row.file_id.clone(),
-                snapshot: row.snapshot.clone(),
-                metadata: row.metadata.clone(),
-                created_at: timestamp,
-                origin_key: None,
-            })?;
+        let public_change_id = row.change_id;
             let change_id =
                 super::model::ChangeId::from_bytes(*public_change_id.as_uuid().as_bytes());
-        semantic_members.push(CommitMemberV1::introduced(
+        semantic_members.push(CommitMemberV3::introduced(
             change_id,
-            payload,
+            row.key.clone(),
+            row.global_native_row.layout_id,
             true,
+            row.global_native_row.owner_digest,
+            row.global_native_row.semantic_digest,
+            false,
+            crate::SYSTEM_ACCOUNT_ID.to_owned(),
             timestamp,
-            Vec::new(),
+            timestamp,
+            None,
         ));
         changes.push(change_id);
     }
     for row in &local_rows {
         let public_change_id = row.local_change_id.expect("local seed row has an identity");
-        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-            format_version: 2,
-            change_id: public_change_id,
-            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
-            schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
-            file_id: row.file_id.clone(),
-            snapshot: row.snapshot.clone(),
-            metadata: row.metadata.clone(),
-            created_at: timestamp,
-            origin_key: None,
-        })?;
         let change_id = super::model::ChangeId::from_bytes(*public_change_id.as_uuid().as_bytes());
-        semantic_members.push(CommitMemberV1::introduced(
+        let native = row
+            .local_native_row
+            .as_ref()
+            .expect("local seed row has a native tuple");
+        semantic_members.push(CommitMemberV3::introduced(
             change_id,
-            payload,
+            row.key.clone(),
+            native.layout_id,
             false,
+            native.owner_digest,
+            native.semantic_digest,
+            false,
+            crate::SYSTEM_ACCOUNT_ID.to_owned(),
             timestamp,
-            Vec::new(),
+            timestamp,
+            None,
         ));
         changes.push(change_id);
     }
 
-    let member_pages = CommitChangePageV2::encode_pages(model_commit, &semantic_members)
+    let member_pages = CommitChangePageV3::encode_pages(model_commit, &semantic_members)
         .map_err(LixError::from)?;
     let values_for =
         |seed_rows: &[&SeedRow],
@@ -270,21 +266,14 @@ where
                     } else {
                         row.local_change_id.expect("local seed row has an identity")
                     };
-                    let cell = match &row.snapshot {
-                        JsonSlot::Inline(_) => StateCell::NativeRow(crate::native_row::encode(
-                            &crate::native_row::seed_schema(&row.schema_key)?,
-                            &row.entity_pk,
-                            branch_id == crate::GLOBAL_BRANCH_ID,
-                            row.file_id.as_deref(),
-                            &row.native_snapshot,
-                        )?),
-                        JsonSlot::None => StateCell::Tombstone,
-                        JsonSlot::ForkTreeObject(_) => {
-                            return Err(LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                "bootstrap current state contains an out-of-pack JSON reference",
-                            ));
-                        }
+                    let cell = if branch_id == crate::GLOBAL_BRANCH_ID {
+                        StateCell::NativeRow(row.global_native_row.clone())
+                    } else {
+                        StateCell::NativeRow(
+                            row.local_native_row
+                                .clone()
+                                .expect("local seed row has a native tuple"),
+                        )
                     };
                     Ok((
                         row.key.clone(),
@@ -294,16 +283,7 @@ where
                             created_at: timestamp,
                             updated_at: timestamp,
                             cell,
-                            metadata: match &row.metadata {
-                                JsonSlot::None => None,
-                                JsonSlot::Inline(value) => Some(value.clone().into()),
-                                JsonSlot::ForkTreeObject(_) => {
-                                    return Err(LixError::new(
-                                        LixError::CODE_INTERNAL_ERROR,
-                                        "bootstrap metadata contains an out-of-pack JSON reference",
-                                    ));
-                                }
-                            },
+                            metadata: None,
                             origin_key: None,
                             blob_manifest_object_ids: Vec::new(),
                         },

@@ -75,13 +75,24 @@ pub(crate) struct HistoricalStateRow {
     pub(crate) commit_id: crate::changelog::CommitId,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot_content: Option<SharedStr>,
+    /// Sole authenticated historical row body. Schema-v1 rows remain native
+    /// through history/diff/merge; JSON is constructed only by an explicitly
+    /// requested terminal public projection.
+    pub(crate) cell: StateCell,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) deleted: bool,
     /// Authenticated BlobManifest edges carried with the state value. A
     /// payload-free historical transition must preserve this edge when it
     /// republishes a prior blob-ref row.
     pub(crate) blob_manifest_object_ids: Vec<ObjectId>,
+}
+
+impl HistoricalStateRow {
+    /// Terminal projection for trusted built-in schemas. Core history, diff,
+    /// and merge code must consume `cell` directly and never call this helper.
+    pub(crate) fn seed_snapshot_content(&self) -> Result<Option<SharedStr>, LixError> {
+        self.cell.seed_logical_text(&self.key, self.global)
+    }
 }
 
 /// One semantic change between two authenticated historical ForkTree state

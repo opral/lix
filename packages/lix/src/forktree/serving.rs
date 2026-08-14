@@ -11,7 +11,7 @@ use crate::storage_adapter::StorageAdapterRead;
 use super::codec::corruption;
 use super::model::{
     BranchSelectorV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV3, CommitObjectV1, GlobalSelectorV1,
     RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
@@ -36,7 +36,7 @@ const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
 pub(crate) async fn load_commit_members<R>(
     read: &R,
     commit: &CommitObjectV1,
-) -> Result<Vec<CommitMemberV1>, StorageError>
+) -> Result<Vec<CommitMemberV3>, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -53,7 +53,7 @@ where
         let bytes = pages
             .get(page_id)
             .ok_or_else(|| corruption("commit change page is absent"))?;
-        let page = super::model::CommitChangePageV2::decode(*page_id, bytes)?;
+        let page = super::model::CommitChangePageV3::decode(*page_id, bytes)?;
         if page.commit_id != commit.commit_id
             || page.start_ordinal
                 != u32::try_from(members.len())
@@ -76,44 +76,66 @@ where
 
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedSemanticMember {
+    source_commit_object_id: ObjectId,
     change_id: ChangeId,
-    payload: Vec<u8>,
+    encoded_key: Vec<u8>,
+    layout_id: [u8; 32],
     global: bool,
+    owner_digest: [u8; 32],
+    semantic_digest: [u8; 32],
+    deleted: bool,
+    account_id: String,
+    created_at: LixTimestamp,
     updated_at: LixTimestamp,
+    origin_key: Option<String>,
     selected_created_at: Option<LixTimestamp>,
-    blob_manifest_object_ids: Vec<ObjectId>,
 }
 
 async fn resolve_semantic_member<R>(
     read: &R,
-    member: &CommitMemberV1,
+    owner_commit_object_id: ObjectId,
+    member: &CommitMemberV3,
 ) -> Result<ResolvedSemanticMember, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    resolve_semantic_member_with_cache(read, member, &mut BTreeMap::new()).await
+    resolve_semantic_member_with_cache(
+        read,
+        owner_commit_object_id,
+        member,
+        &mut BTreeMap::new(),
+    )
+    .await
 }
 
 async fn resolve_semantic_member_with_cache<R>(
     read: &R,
-    member: &CommitMemberV1,
-    member_closures: &mut BTreeMap<ObjectId, Arc<[CommitMemberV1]>>,
+    owner_commit_object_id: ObjectId,
+    member: &CommitMemberV3,
+    member_closures: &mut BTreeMap<ObjectId, Arc<[CommitMemberV3]>>,
 ) -> Result<ResolvedSemanticMember, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
     let expected_change_id = member.change_id();
     let mut current = member.clone();
+    let mut current_commit_object_id = owner_commit_object_id;
     let mut visited = BTreeSet::new();
     let mut selected_created_at = None;
     loop {
         match current {
-            CommitMemberV1::Introduced {
+            CommitMemberV3::Introduced {
                 change_id,
-                payload,
+                encoded_key,
+                layout_id,
                 global,
+                owner_digest,
+                semantic_digest,
+                deleted,
+                account_id,
+                created_at,
                 updated_at,
-                blob_manifest_object_ids,
+                origin_key,
             } => {
                 if change_id != expected_change_id {
                     return Err(corruption(
@@ -121,15 +143,22 @@ where
                     ));
                 }
                 return Ok(ResolvedSemanticMember {
+                    source_commit_object_id: current_commit_object_id,
                     change_id,
-                    payload,
+                    encoded_key,
+                    layout_id,
                     global,
+                    owner_digest,
+                    semantic_digest,
+                    deleted,
+                    account_id,
+                    created_at,
                     updated_at,
+                    origin_key,
                     selected_created_at,
-                    blob_manifest_object_ids,
                 });
             }
-            CommitMemberV1::Selected {
+            CommitMemberV3::Selected {
                 change_id,
                 source_commit_object_id,
                 source_ordinal,
@@ -150,7 +179,7 @@ where
                         let bytes =
                             super::view::load_object_bytes(read, source_commit_object_id).await?;
                         let source = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
-                        let members: Arc<[CommitMemberV1]> =
+                        let members: Arc<[CommitMemberV3]> =
                             load_commit_members(read, &source).await?.into();
                         member_closures.insert(source_commit_object_id, Arc::clone(&members));
                         members
@@ -159,6 +188,7 @@ where
                     .get(source_ordinal as usize)
                     .cloned()
                     .ok_or_else(|| corruption("selected member source ordinal is absent"))?;
+                current_commit_object_id = source_commit_object_id;
             }
         }
     }
@@ -166,28 +196,165 @@ where
 
 async fn semantic_change_for_member<R>(
     read: &R,
-    member: &CommitMemberV1,
+    owner_commit_object_id: ObjectId,
+    member: &CommitMemberV3,
 ) -> Result<ChangeObjectV1, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let resolved = resolve_semantic_member(read, member).await?;
-    let payload = if let Some(created_at) = resolved.selected_created_at {
-        let public_change_id =
-            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
-        let mut record =
-            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
-                .map_err(|error| corruption(error.to_string()))?;
-        record.created_at = created_at;
-        crate::changelog::encode_forktree_change_payload(&record)
-            .map_err(|error| corruption(error.to_string()))?
-    } else {
-        resolved.payload
-    };
+    let resolved = resolve_semantic_member(read, owner_commit_object_id, member).await?;
+    let record = materialize_resolved_change_record(read, &resolved).await?;
+    let payload = crate::changelog::encode_forktree_change_payload(&record)
+        .map_err(|error| corruption(error.to_string()))?;
     Ok(ChangeObjectV1::Semantic {
         change_id: resolved.change_id,
         payload,
         json_payload_object_ids: Vec::new(),
+    })
+}
+
+async fn load_resolved_state_value<R>(
+    read: &R,
+    resolved: &ResolvedSemanticMember,
+) -> Result<(super::state::StateKey, StateValue), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let commit_bytes =
+        super::view::load_object_bytes(read, resolved.source_commit_object_id).await?;
+    let commit = CommitObjectV1::decode(resolved.source_commit_object_id, &commit_bytes)?;
+    let root = if resolved.global {
+        commit.global_state_root
+    } else {
+        commit.local_state_root
+    };
+    let encoded = lookup_on_read(root, "state", &resolved.encoded_key, read)
+        .await?
+        .ok_or_else(|| corruption("introduced history member has no authenticated state row"))?;
+    let source = if resolved.global {
+        StateSource::Global
+    } else {
+        StateSource::Branch
+    };
+    let pack_row = load_current_pack_rows(read, &[Some((
+        resolved.encoded_key.clone(),
+        encoded,
+        source,
+    ))])
+    .await?
+    .pop()
+    .flatten()
+    .map(|(row, _)| row)
+    .ok_or_else(|| corruption("introduced history member pack row is absent"))?;
+    validate_resolved_member_pack_binding(resolved, &resolved.encoded_key, source, &pack_row.value)?;
+    let key = decode_state_key(&resolved.encoded_key)
+        .map_err(|error| corruption(error.to_string()))?;
+    Ok((key, pack_row.value))
+}
+
+async fn schema_for_historical_native_row<R>(
+    read: &R,
+    source_commit_object_id: ObjectId,
+    schema_key: &str,
+) -> Result<lix_schema::Schema, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if schema_key == crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+        || crate::schema::seed_schema_definition(schema_key).is_some()
+    {
+        return crate::native_row::seed_schema(schema_key)
+            .map_err(|error| corruption(error.to_string()));
+    }
+    let commit_bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
+    let commit = CommitObjectV1::decode(source_commit_object_id, &commit_bytes)?;
+    let registry_pk = crate::schema::registered_schema_entity_pk(schema_key)
+        .map_err(|error| corruption(error.to_string()))?;
+    let registry_key = encode_state_key(super::state::StateKeyRef {
+        schema_key: "lix_registered_schema",
+        file_id: None,
+        entity_pk: &registry_pk,
+    });
+    let encoded = lookup_on_read(commit.global_state_root, "state", &registry_key, read)
+        .await?
+        .ok_or_else(|| corruption("historical native row has no registered schema authority"))?;
+    let pack_row = load_current_pack_rows(read, &[Some((
+        registry_key.clone(),
+        encoded,
+        StateSource::Global,
+    ))])
+    .await?
+    .pop()
+    .flatten()
+    .map(|(row, _)| row)
+    .ok_or_else(|| corruption("registered schema pack row is absent"))?;
+    let registry_state_key = decode_state_key(&registry_key)
+        .map_err(|error| corruption(error.to_string()))?;
+    let text = pack_row
+        .value
+        .cell
+        .seed_logical_text(&registry_state_key, true)
+        .map_err(|error| corruption(error.to_string()))?
+        .ok_or_else(|| corruption("registered schema authority is a tombstone"))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| corruption(format!("registered schema row is malformed: {error}")))?;
+    let definition = value
+        .get("value")
+        .cloned()
+        .ok_or_else(|| corruption("registered schema row has no value"))?;
+    crate::schema::parse_lix_schema(&definition).map_err(|error| corruption(error.to_string()))
+}
+
+async fn materialize_resolved_change_record<R>(
+    read: &R,
+    resolved: &ResolvedSemanticMember,
+) -> Result<crate::changelog::ChangeRecord, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let (key, value) = load_resolved_state_value(read, resolved).await?;
+    let snapshot = match &value.cell {
+        StateCell::NativeRow(native) => {
+            let schema = schema_for_historical_native_row(
+                read,
+                resolved.source_commit_object_id,
+                &key.schema_key,
+            )
+            .await?;
+            let text = crate::native_row::logical_text(
+                &schema,
+                &key.entity_pk,
+                resolved.global,
+                key.file_id.as_deref(),
+                native,
+            )
+            .map_err(|error| corruption(error.to_string()))?;
+            crate::json_store::JsonSlot::Inline(text.as_str().into())
+        }
+        StateCell::Tombstone => crate::json_store::JsonSlot::None,
+        StateCell::Value(_) | StateCell::Null => {
+            return Err(corruption(
+                "history terminal projection found the removed JSON state representation",
+            ));
+        }
+    };
+    Ok(crate::changelog::ChangeRecord {
+        format_version: 3,
+        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+            *resolved.change_id.as_bytes(),
+        )),
+        account_id: resolved.account_id.clone(),
+        schema_key: key.schema_key,
+        entity_pk: key.entity_pk,
+        file_id: key.file_id,
+        snapshot,
+        metadata: value
+            .metadata
+            .map_or(crate::json_store::JsonSlot::None, |value| {
+                crate::json_store::JsonSlot::Inline(value.as_str().into())
+            }),
+        created_at: resolved.selected_created_at.unwrap_or(resolved.created_at),
+        origin_key: resolved.origin_key.clone(),
     })
 }
 
@@ -1291,7 +1458,7 @@ where
     let members = load_commit_members(read, &commit).await?;
     let member_ids = members
         .iter()
-        .map(CommitMemberV1::change_id)
+        .map(CommitMemberV3::change_id)
         .collect::<Vec<_>>();
     let catalog_entries =
         lookup_change_catalog_entries(read, repository.change_catalog_root, &member_ids).await?;
@@ -1318,7 +1485,7 @@ where
             }
         };
         let ChangeObjectV1::Semantic { payload, .. } =
-            semantic_change_for_member(read, member).await?
+            semantic_change_for_member(read, commit_object_id, member).await?
         else {
             return Err(corruption("Commit member has no semantic Change payload").into());
         };
@@ -1868,6 +2035,7 @@ where
             semantic_change_for_member_with_commit_cache(
                 read,
                 commit_catalog_root,
+                commit_object_id,
                 member,
                 &mut cache.closures,
             )
@@ -1968,7 +2136,7 @@ where
             if member.change_id() != id || member.source().is_some() {
                 return Err(corruption("ChangeCatalog owner/ordinal back-edge is invalid").into());
             }
-            semantic_change_for_member(read, member).await?
+            semantic_change_for_member(read, commit_object_id, member).await?
         }
         ChangeCatalogOwner::BranchRef {
             ref_change_object_id,
@@ -2106,7 +2274,7 @@ pub(super) async fn validate_member_catalog_owner<R>(
     target_commit_object_id: ObjectId,
     target_generation: u64,
     target_ordinal: usize,
-    member: CommitMemberV1,
+    member: CommitMemberV3,
     entry: ChangeCatalogEntry,
 ) -> Result<(), StorageError>
 where
@@ -2176,7 +2344,7 @@ where
             let source_members = load_commit_members(read, &source_commit).await?;
             if source_members
                 .get(source_ordinal as usize)
-                .map(CommitMemberV1::change_id)
+                .map(CommitMemberV3::change_id)
                 != Some(member.change_id())
             {
                 return Err(corruption(
@@ -2188,7 +2356,7 @@ where
     Ok(())
 }
 
-type AuthenticatedCommitMemberClosure = (CommitObjectV1, Arc<[CommitMemberV1]>);
+type AuthenticatedCommitMemberClosure = (CommitObjectV1, Arc<[CommitMemberV3]>);
 
 async fn load_authenticated_commit_member_closure<R>(
     read: &R,
@@ -2205,7 +2373,7 @@ where
     let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
     let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
     validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, &commit).await?;
-    let members: Arc<[CommitMemberV1]> = load_commit_members(read, &commit).await?.into();
+    let members: Arc<[CommitMemberV3]> = load_commit_members(read, &commit).await?.into();
     validate_commit_topology(read, commit_catalog_root, commit.commit_id, &commit)
         .await
         .map_err(|error| corruption(error.to_string()))?;
@@ -2217,7 +2385,8 @@ where
 async fn semantic_change_for_member_with_commit_cache<R>(
     read: &R,
     commit_catalog_root: ObjectId,
-    member: &CommitMemberV1,
+    owner_commit_object_id: ObjectId,
+    member: &CommitMemberV3,
     closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
 ) -> Result<ChangeObjectV1, StorageError>
 where
@@ -2225,16 +2394,23 @@ where
 {
     let expected_change_id = member.change_id();
     let mut current = member.clone();
+    let mut current_commit_object_id = owner_commit_object_id;
     let mut visited = BTreeSet::new();
     let mut selected_created_at = None;
     let resolved = loop {
         match current {
-            CommitMemberV1::Introduced {
+            CommitMemberV3::Introduced {
                 change_id,
-                payload,
+                encoded_key,
+                layout_id,
                 global,
+                owner_digest,
+                semantic_digest,
+                deleted,
+                account_id,
+                created_at,
                 updated_at,
-                blob_manifest_object_ids,
+                origin_key,
             } => {
                 if change_id != expected_change_id {
                     return Err(corruption(
@@ -2242,15 +2418,22 @@ where
                     ));
                 }
                 break ResolvedSemanticMember {
+                    source_commit_object_id: current_commit_object_id,
                     change_id,
-                    payload,
+                    encoded_key,
+                    layout_id,
                     global,
+                    owner_digest,
+                    semantic_digest,
+                    deleted,
+                    account_id,
+                    created_at,
                     updated_at,
+                    origin_key,
                     selected_created_at,
-                    blob_manifest_object_ids,
                 };
             }
-            CommitMemberV1::Selected {
+            CommitMemberV3::Selected {
                 change_id,
                 source_commit_object_id,
                 source_ordinal,
@@ -2275,21 +2458,13 @@ where
                     .get(source_ordinal as usize)
                     .cloned()
                     .ok_or_else(|| corruption("selected member source ordinal is absent"))?;
+                current_commit_object_id = source_commit_object_id;
             }
         }
     };
-    let payload = if let Some(created_at) = resolved.selected_created_at {
-        let public_change_id =
-            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
-        let mut record =
-            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
-                .map_err(|error| corruption(error.to_string()))?;
-        record.created_at = created_at;
-        crate::changelog::encode_forktree_change_payload(&record)
-            .map_err(|error| corruption(error.to_string()))?
-    } else {
-        resolved.payload
-    };
+    let record = materialize_resolved_change_record(read, &resolved).await?;
+    let payload = crate::changelog::encode_forktree_change_payload(&record)
+        .map_err(|error| corruption(error.to_string()))?;
     Ok(ChangeObjectV1::Semantic {
         change_id: resolved.change_id,
         payload,
@@ -2301,7 +2476,7 @@ async fn resolve_semantic_member_with_authenticated_cache<R>(
     read: &R,
     commit_catalog_root: ObjectId,
     change_catalog_root: ObjectId,
-    member: &CommitMemberV1,
+    member: &CommitMemberV3,
     binding: HistoricalMemberBinding,
     closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
 ) -> Result<ResolvedSemanticMember, StorageError>
@@ -2348,23 +2523,36 @@ where
         )
         .await?;
         match current {
-            CommitMemberV1::Introduced {
+            CommitMemberV3::Introduced {
                 change_id,
-                payload,
+                encoded_key,
+                layout_id,
                 global,
+                owner_digest,
+                semantic_digest,
+                deleted,
+                account_id,
+                created_at,
                 updated_at,
-                blob_manifest_object_ids,
+                origin_key,
             } => {
                 return Ok(ResolvedSemanticMember {
+                    source_commit_object_id: current_commit_object_id,
                     change_id,
-                    payload,
+                    encoded_key,
+                    layout_id,
                     global,
+                    owner_digest,
+                    semantic_digest,
+                    deleted,
+                    account_id,
+                    created_at,
                     updated_at,
+                    origin_key,
                     selected_created_at,
-                    blob_manifest_object_ids,
                 });
             }
-            CommitMemberV1::Selected {
+            CommitMemberV3::Selected {
                 source_commit_object_id,
                 source_ordinal,
                 created_at,
@@ -2396,7 +2584,7 @@ async fn validate_member_catalog_owner_with_commit_cache<R>(
     target_commit_object_id: ObjectId,
     target_generation: u64,
     target_ordinal: usize,
-    member: &CommitMemberV1,
+    member: &CommitMemberV3,
     entry: ChangeCatalogEntry,
     closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
 ) -> Result<(), StorageError>
@@ -2461,7 +2649,7 @@ where
             }
             if source_members
                 .get(source_ordinal as usize)
-                .map(CommitMemberV1::change_id)
+                .map(CommitMemberV3::change_id)
                 != Some(member.change_id())
             {
                 return Err(corruption(
@@ -2476,8 +2664,8 @@ where
 pub(super) struct StaleMemberAuthCache {
     binding_id: u64,
     commits: BTreeMap<ObjectId, CommitObjectV1>,
-    members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV1, u32)>,
-    pages: BTreeMap<(ObjectId, ObjectId), super::model::CommitChangePageV2>,
+    members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV3, u32)>,
+    pages: BTreeMap<(ObjectId, ObjectId), super::model::CommitChangePageV3>,
     change_catalog_entries: BTreeMap<ChangeId, ChangeCatalogEntry>,
 }
 
@@ -2535,7 +2723,7 @@ async fn load_stale_page_for_position<R>(
     commit_id: CommitId,
     page_object_id: ObjectId,
     cache: &mut StaleMemberAuthCache,
-) -> Result<super::model::CommitChangePageV2, StorageError>
+) -> Result<super::model::CommitChangePageV3, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -2544,7 +2732,7 @@ where
         return Ok(page.clone());
     }
     let bytes = super::view::load_object_bytes(read, page_object_id).await?;
-    let page = super::model::CommitChangePageV2::decode(page_object_id, &bytes)?;
+    let page = super::model::CommitChangePageV3::decode(page_object_id, &bytes)?;
     if page.commit_id != commit_id {
         return Err(corruption(
             "commit change page belongs to a different Commit",
@@ -2566,7 +2754,7 @@ pub(super) async fn validate_stale_page_position<R>(
     commit_id: CommitId,
     page_object_ids: &[ObjectId],
     page_object_id: ObjectId,
-    page: &super::model::CommitChangePageV2,
+    page: &super::model::CommitChangePageV3,
     cache: &mut StaleMemberAuthCache,
 ) -> Result<(), StorageError>
 where
@@ -2674,7 +2862,7 @@ async fn load_stale_member_at_key<R>(
     state_key: &[u8],
     expected_change_id: ChangeId,
     cache: &mut StaleMemberAuthCache,
-) -> Result<(CommitObjectV1, CommitMemberV1, u32), StorageError>
+) -> Result<(CommitObjectV1, CommitMemberV3, u32), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -2716,7 +2904,7 @@ where
         let page_bytes =
             super::view::load_object_bytes(read, pack_row.history_page_object_id).await?;
         let page =
-            super::model::CommitChangePageV2::decode(pack_row.history_page_object_id, &page_bytes)?;
+            super::model::CommitChangePageV3::decode(pack_row.history_page_object_id, &page_bytes)?;
         if page.commit_id != commit.commit_id
             || !commit
                 .member_page_object_ids
@@ -2753,7 +2941,7 @@ where
                 "authenticated source state key resolves to a different ChangeId",
             ));
         }
-        if let CommitMemberV1::Introduced { global, .. } = &member
+        if let CommitMemberV3::Introduced { global, .. } = &member
             && *global != expected_global
         {
             return Err(corruption(
@@ -2960,7 +3148,7 @@ where
             .get(&page_object_id)
             .copied()
             .ok_or_else(|| corruption("batched stale page has no expected owner"))?;
-        let page = super::model::CommitChangePageV2::decode(page_object_id, &bytes)?;
+        let page = super::model::CommitChangePageV3::decode(page_object_id, &bytes)?;
         if page.commit_id != commit_id {
             return Err(corruption(
                 "commit change page belongs to a different Commit",
@@ -3001,7 +3189,7 @@ where
                 "authenticated source state key resolves to a different ChangeId",
             ));
         }
-        if let CommitMemberV1::Introduced { global, .. } = &member
+        if let CommitMemberV3::Introduced { global, .. } = &member
             && *global != lookup.expected_global
         {
             return Err(corruption(
@@ -3027,7 +3215,7 @@ async fn prime_stale_member_chains<R>(
     read: &R,
     binding_id: u64,
     commit_catalog_root: ObjectId,
-    seeds: &[(CommitMemberV1, Vec<u8>)],
+    seeds: &[(CommitMemberV3, Vec<u8>)],
     cache: &mut StaleMemberAuthCache,
 ) -> Result<(), StorageError>
 where
@@ -3100,7 +3288,7 @@ async fn validate_member_catalog_owner_with_stale_cache<R>(
     target_generation: u64,
     target_ordinal: usize,
     state_key: &[u8],
-    member: &CommitMemberV1,
+    member: &CommitMemberV3,
     entry: ChangeCatalogEntry,
     cache: &mut StaleMemberAuthCache,
 ) -> Result<(), StorageError>
@@ -3184,7 +3372,7 @@ where
 pub(super) async fn resolve_semantic_member_with_stale_auth<R>(
     read: &R,
     binding_id: u64,
-    member: &CommitMemberV1,
+    member: &CommitMemberV3,
     state_key: &[u8],
     target_commit_object_id: ObjectId,
     target_generation: u64,
@@ -3247,12 +3435,18 @@ where
         .await?;
 
         match current {
-            CommitMemberV1::Introduced {
+            CommitMemberV3::Introduced {
                 change_id,
-                payload,
+                encoded_key,
+                layout_id,
                 global,
+                owner_digest,
+                semantic_digest,
+                deleted,
+                account_id,
+                created_at,
                 updated_at,
-                blob_manifest_object_ids,
+                origin_key,
             } => {
                 if change_id != expected_change_id {
                     return Err(corruption(
@@ -3260,15 +3454,22 @@ where
                     ));
                 }
                 return Ok(ResolvedSemanticMember {
+                    source_commit_object_id: owner,
                     change_id,
-                    payload,
+                    encoded_key,
+                    layout_id,
                     global,
+                    owner_digest,
+                    semantic_digest,
+                    deleted,
+                    account_id,
+                    created_at,
                     updated_at,
+                    origin_key,
                     selected_created_at,
-                    blob_manifest_object_ids,
                 });
             }
-            CommitMemberV1::Selected {
+            CommitMemberV3::Selected {
                 change_id,
                 source_commit_object_id,
                 source_ordinal,
@@ -3334,9 +3535,8 @@ impl HistoricalMemberSelection {
 /// Authenticated resolution of one ordered historical member.
 #[derive(Clone, Debug)]
 pub(crate) struct SelectedHistoricalMember {
-    pub(crate) member: CommitMemberV1,
+    pub(crate) member: CommitMemberV3,
     pub(crate) source_commit: CommitObjectV1,
-    pub(crate) source_change: ChangeObjectV1,
     pub(crate) source_state: StateValue,
     pub(crate) source_domain: StateSource,
     pub(crate) sequence_state: Option<(StateValue, StateSource)>,
@@ -3365,7 +3565,7 @@ impl SelectedHistoricalMemberBatch {
         &mut self,
         view_instance_id: u64,
         target_generation: u64,
-        member: &CommitMemberV1,
+        member: &CommitMemberV3,
     ) -> Result<(), StorageError> {
         self.proof
             .consume(view_instance_id, target_generation, member)
@@ -3408,7 +3608,7 @@ impl HistoricalMemberBatchProof {
         &mut self,
         view_instance_id: u64,
         target_generation: u64,
-        member: &CommitMemberV1,
+        member: &CommitMemberV3,
     ) -> Result<(), StorageError> {
         if self.view_instance_id != view_instance_id {
             return Err(corruption(
@@ -3452,7 +3652,7 @@ impl HistoricalMemberBatchProof {
 struct HistoricalSourceClosure {
     object_id: ObjectId,
     commit: CommitObjectV1,
-    members: Arc<[CommitMemberV1]>,
+    members: Arc<[CommitMemberV3]>,
     ordinal_by_change: BTreeMap<ChangeId, usize>,
 }
 
@@ -3537,14 +3737,13 @@ where
             .members
             .get(source_ordinal)
             .ok_or_else(|| corruption("selected source ordinal is absent"))?;
-        let source_change = semantic_change_for_member_with_commit_cache(
+        let resolved = resolve_semantic_member(
             view.retained_read(),
-            view.repository_root().commit_catalog_root,
+            source.object_id,
             source_member,
-            &mut authenticated_closures,
         )
         .await?;
-        if source_change.change_id() != selection.change_id {
+        if resolved.change_id != selection.change_id {
             return Err(corruption(
                 "selected source Change disagrees with requested ChangeId",
             ));
@@ -3576,29 +3775,14 @@ where
             }
         }
         resolved_members.push((
-            CommitMemberV1::selected(
+            CommitMemberV3::selected(
                 selection.change_id,
                 source.object_id,
                 u32::try_from(source_ordinal)
                     .map_err(|_| corruption("selected source ordinal exceeds u32"))?,
-                crate::changelog::decode_forktree_change_payload(
-                    match &source_change {
-                        ChangeObjectV1::Semantic { payload, .. } => payload,
-                        ChangeObjectV1::BranchRef { .. } => {
-                            return Err(corruption(
-                                "selected semantic member resolved to a branch-ref change",
-                            ));
-                        }
-                    },
-                    crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
-                        *selection.change_id.as_bytes(),
-                    )),
-                )
-                .map_err(|error| corruption(error.to_string()))?
-                .created_at,
+                resolved.created_at,
             ),
             source.commit.clone(),
-            source_change,
         ));
     }
 
@@ -3645,7 +3829,7 @@ where
     .await?;
 
     let mut selected = Vec::with_capacity(selections.len());
-    for (((member, source_commit, source_change), source_state), sequence_state) in resolved_members
+    for (((member, source_commit), source_state), sequence_state) in resolved_members
         .into_iter()
         .zip(source_state)
         .zip(sequence_state)
@@ -3655,7 +3839,6 @@ where
         selected.push(SelectedHistoricalMember {
             member,
             source_commit,
-            source_change,
             source_state,
             source_domain,
             sequence_state,
@@ -3981,7 +4164,7 @@ where
     let pages = super::view::load_object_map(read, page_ids).await?;
     let mut decoded_pages = BTreeMap::new();
     for (id, bytes) in pages {
-        decoded_pages.insert(id, super::model::CommitChangePageV2::decode(id, &bytes)?);
+        decoded_pages.insert(id, super::model::CommitChangePageV3::decode(id, &bytes)?);
     }
 
     let mut summary_cache = StaleCommitSummaryCache::new(binding_id);
@@ -3996,7 +4179,7 @@ where
             let page = decoded_pages.get(&pack_row.history_page_object_id)?;
             page.members
                 .get(pack_row.history_page_ordinal as usize)
-                .map(CommitMemberV1::change_id)
+                .map(CommitMemberV3::change_id)
         })
         .collect::<BTreeSet<_>>();
     let change_ids = change_ids.into_iter().collect::<Vec<_>>();
@@ -4148,54 +4331,8 @@ where
                 "state value page domain differs from its state root",
             ));
         }
-        let public_change_id =
-            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
-        let record =
-            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
-                .map_err(|error| corruption(error.to_string()))?;
-        let created_at = resolved.selected_created_at.unwrap_or(record.created_at);
-        if encode_state_key(super::state::StateKeyRef {
-            schema_key: &record.schema_key,
-            file_id: record.file_id.as_deref(),
-            entity_pk: &record.entity_pk,
-        }) != *encoded_key
-        {
-            return Err(corruption(
-                "state value page identity differs from its state key",
-            ));
-        }
-        let cell = authenticated_current_cell_for_history(
-            &record.snapshot,
-            &pack_row.value.cell,
-        )?;
-        let logical_cell = logical_history_cell(&record.snapshot)?;
-        let metadata = match record.metadata {
-            crate::json_store::JsonSlot::None => None,
-            crate::json_store::JsonSlot::Inline(value) => Some(value),
-            crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption("state value page contains out-of-page metadata"));
-            }
-        };
-        let historical_value = StateValue {
-            change_id: public_change_id,
-            commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-                *page.commit_id.as_bytes(),
-            )),
-            created_at,
-            updated_at: resolved.updated_at,
-            cell,
-            metadata: metadata.map(Into::into),
-            origin_key: record.origin_key,
-            blob_manifest_object_ids: resolved.blob_manifest_object_ids,
-        };
-        if historical_value != pack_row.value {
-            return Err(corruption(
-                "current-state pack value differs from its stale-authenticated history member",
-            ));
-        }
-        let mut output_value = historical_value;
-        output_value.cell = logical_cell;
-        output.push(Some((output_value, *source)));
+        validate_resolved_member_pack_binding(&resolved, encoded_key, *source, &pack_row.value)?;
+        output.push(Some((pack_row.value, *source)));
     }
 
     output
@@ -4211,50 +4348,47 @@ where
         .collect()
 }
 
-fn authenticated_current_cell_for_history(
-    historical: &crate::json_store::JsonSlot,
-    current: &StateCell,
-) -> Result<StateCell, StorageError> {
-    match (historical, current) {
-        (crate::json_store::JsonSlot::None, StateCell::Tombstone) => Ok(StateCell::Tombstone),
-        (crate::json_store::JsonSlot::Inline(value), StateCell::Null)
-            if value.as_ref() == "null" =>
+fn validate_resolved_member_pack_binding(
+    member: &ResolvedSemanticMember,
+    encoded_key: &[u8],
+    source: StateSource,
+    value: &StateValue,
+) -> Result<(), StorageError> {
+    let expected_change_id =
+        crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*member.change_id.as_bytes()));
+    let created_at = member.selected_created_at.unwrap_or(member.created_at);
+    if member.encoded_key != encoded_key
+        || member.global != (source == StateSource::Global)
+        || value.change_id != expected_change_id
+        || value.created_at != created_at
+        || value.updated_at != member.updated_at
+        || value.origin_key != member.origin_key
+    {
+        return Err(corruption(
+            "authenticated history member provenance differs from its current-state pack row",
+        ));
+    }
+    match (&value.cell, member.deleted) {
+        (StateCell::NativeRow(native), false)
+            if native.layout_id == member.layout_id
+                && native.global == member.global
+                && native.owner_digest == member.owner_digest
+                && native.semantic_digest == member.semantic_digest =>
         {
-            Ok(StateCell::Null)
+            Ok(())
         }
-        (crate::json_store::JsonSlot::Inline(value), StateCell::NativeRow(native)) => {
-            let digest = crate::native_row::semantic_digest_text(value)
-                .map_err(|error| corruption(error.to_string()))?;
-            if digest != native.semantic_digest {
-                return Err(corruption(
-                    "native current-state payload differs from its authenticated history member",
-                ));
-            }
-            Ok(current.clone())
+        (StateCell::Tombstone, true)
+            if member.layout_id == [0; 32]
+                && member.owner_digest == [0; 32]
+                && member.semantic_digest == [0; 32] =>
+        {
+            Ok(())
         }
-        (crate::json_store::JsonSlot::ForkTreeObject(_), _) => Err(corruption(
-            "state value page contains an out-of-page JSON reference",
-        )),
-        (_, StateCell::Value(_)) => Err(corruption(
-            "state value page uses the removed JSON current-state representation",
+        (StateCell::Value(_) | StateCell::Null, _) => Err(corruption(
+            "authenticated history pack uses the removed JSON state representation",
         )),
         _ => Err(corruption(
-            "current-state cell kind differs from its authenticated history member",
-        )),
-    }
-}
-
-fn logical_history_cell(
-    historical: &crate::json_store::JsonSlot,
-) -> Result<StateCell, StorageError> {
-    match historical {
-        crate::json_store::JsonSlot::None => Ok(StateCell::Tombstone),
-        crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
-            Ok(StateCell::Null)
-        }
-        crate::json_store::JsonSlot::Inline(value) => Ok(StateCell::Value(value.clone().into())),
-        crate::json_store::JsonSlot::ForkTreeObject(_) => Err(corruption(
-            "state value page contains an out-of-page JSON reference",
+            "authenticated history member tuple identity differs from its pack row",
         )),
     }
 }
@@ -4352,7 +4486,7 @@ where
     let pages = super::view::load_object_map(read, page_ids).await?;
     let mut decoded_pages = BTreeMap::new();
     for (id, bytes) in pages {
-        decoded_pages.insert(id, super::model::CommitChangePageV2::decode(id, &bytes)?);
+        decoded_pages.insert(id, super::model::CommitChangePageV3::decode(id, &bytes)?);
     }
 
     let mut output = Vec::with_capacity(selected.len());
@@ -4428,54 +4562,8 @@ where
                 "state value page domain differs from its state root",
             ));
         }
-        let public_change_id =
-            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
-        let record =
-            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
-                .map_err(|error| corruption(error.to_string()))?;
-        let created_at = resolved.selected_created_at.unwrap_or(record.created_at);
-        if encode_state_key(super::state::StateKeyRef {
-            schema_key: &record.schema_key,
-            file_id: record.file_id.as_deref(),
-            entity_pk: &record.entity_pk,
-        }) != *encoded_key
-        {
-            return Err(corruption(
-                "state value page identity differs from its state key",
-            ));
-        }
-        let cell = authenticated_current_cell_for_history(
-            &record.snapshot,
-            &pack_row.value.cell,
-        )?;
-        let logical_cell = logical_history_cell(&record.snapshot)?;
-        let metadata = match record.metadata {
-            crate::json_store::JsonSlot::None => None,
-            crate::json_store::JsonSlot::Inline(value) => Some(value),
-            crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption("state value page contains out-of-page metadata"));
-            }
-        };
-        let historical_value = StateValue {
-            change_id: public_change_id,
-            commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-                *page.commit_id.as_bytes(),
-            )),
-            created_at,
-            updated_at: resolved.updated_at,
-            cell,
-            metadata: metadata.map(Into::into),
-            origin_key: record.origin_key,
-            blob_manifest_object_ids: resolved.blob_manifest_object_ids,
-        };
-        if historical_value != pack_row.value {
-            return Err(corruption(
-                "current-state pack value differs from its authenticated history member",
-            ));
-        }
-        let mut output_value = historical_value;
-        output_value.cell = logical_cell;
-        output.push(Some((output_value, *source)));
+        validate_resolved_member_pack_binding(&resolved, encoded_key, *source, &pack_row.value)?;
+        output.push(Some((pack_row.value, *source)));
     }
     Ok(output)
 }
@@ -4491,12 +4579,12 @@ async fn validate_historical_state_page_member<R>(
     read: &R,
     auth: HistoricalStateAuth,
     page_object_id: ObjectId,
-    page: &super::model::CommitChangePageV2,
+    page: &super::model::CommitChangePageV3,
     page_ordinal: u32,
-    member: &CommitMemberV1,
+    member: &CommitMemberV3,
     encoded_key: &[u8],
     source: StateSource,
-    endpoint_members: Option<&[CommitMemberV1]>,
+    endpoint_members: Option<&[CommitMemberV3]>,
     endpoint_commit: Option<&CommitObjectV1>,
     page_commits: &mut BTreeMap<CommitId, (ObjectId, CommitObjectV1)>,
     member_closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
@@ -4582,7 +4670,7 @@ where
     } else if let Some(endpoint_member) = endpoint_member {
         if !matches!(
             endpoint_member,
-            CommitMemberV1::Selected {
+            CommitMemberV3::Selected {
                 source_commit_object_id,
                 source_ordinal,
                 ..
@@ -4672,7 +4760,7 @@ where
         }
     }
     match member {
-        CommitMemberV1::Introduced { .. } => match entry.owner {
+        CommitMemberV3::Introduced { .. } => match entry.owner {
             ChangeCatalogOwner::CommitMember {
                 commit_object_id,
                 ordinal,
@@ -4687,7 +4775,7 @@ where
                 "historical semantic state member resolved to a packed marker",
             )),
         },
-        CommitMemberV1::Selected { .. } => {
+        CommitMemberV3::Selected { .. } => {
             validate_member_catalog_owner_with_commit_cache(
                 read,
                 auth.commit_catalog_root,
@@ -5135,17 +5223,13 @@ fn historical_state_rows_from_range(
     rows.into_iter()
         .map(|(encoded_key, value, source)| {
             let key = decode_state_key(&encoded_key)?;
-            let (snapshot_content, deleted) = match value.cell {
-                StateCell::Value(snapshot) => (Some(snapshot), false),
-                StateCell::NativeRow(_) => {
-                    return Err(corruption(
-                        "historical native state range requires its authenticated branch owner",
-                    )
-                    .into());
-                }
-                StateCell::Null => (None, false),
-                StateCell::Tombstone => (None, true),
-            };
+            if matches!(value.cell, StateCell::Value(_) | StateCell::Null) {
+                return Err(corruption(
+                    "historical range uses the removed JSON state representation",
+                )
+                .into());
+            }
+            let deleted = matches!(value.cell, StateCell::Tombstone);
             Ok(HistoricalStateRow {
                 key,
                 global: source == StateSource::Global,
@@ -5153,7 +5237,7 @@ fn historical_state_rows_from_range(
                 commit_id: value.commit_id,
                 created_at: value.created_at,
                 updated_at: value.updated_at,
-                snapshot_content,
+                cell: value.cell,
                 metadata: value.metadata,
                 deleted,
                 blob_manifest_object_ids: value.blob_manifest_object_ids,
@@ -5601,7 +5685,7 @@ where
 async fn load_commit_with_members<R>(
     view: &CoherentView<R>,
     id: CommitId,
-) -> Result<Option<(ObjectId, CommitObjectV1, Arc<[CommitMemberV1]>)>, StorageError>
+) -> Result<Option<(ObjectId, CommitObjectV1, Arc<[CommitMemberV3]>)>, StorageError>
 where
     R: StorageAdapterRead,
 {
@@ -5720,7 +5804,7 @@ async fn validate_retained_commit_members<R>(
     change_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     commit: &CommitObjectV1,
-) -> Result<Arc<[CommitMemberV1]>, StorageError>
+) -> Result<Arc<[CommitMemberV3]>, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -5734,11 +5818,11 @@ where
         }
     }
     validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, commit).await?;
-    let members: Arc<[CommitMemberV1]> = load_commit_members(read, commit).await?.into();
+    let members: Arc<[CommitMemberV3]> = load_commit_members(read, commit).await?.into();
     let mut closures = BTreeMap::from([(commit_object_id, (commit.clone(), Arc::clone(&members)))]);
     let change_ids = members
         .iter()
-        .map(CommitMemberV1::change_id)
+        .map(CommitMemberV3::change_id)
         .collect::<Vec<_>>();
     let catalog_values =
         lookup_change_catalog_entries(read, change_catalog_root, &change_ids).await?;
@@ -5751,6 +5835,7 @@ where
         let change = semantic_change_for_member_with_commit_cache(
             read,
             commit_catalog_root,
+            commit_object_id,
             member,
             &mut closures,
         )

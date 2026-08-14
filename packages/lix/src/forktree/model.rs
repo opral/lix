@@ -181,13 +181,19 @@ impl BranchSnapshotV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CommitMemberV1 {
+pub(crate) enum CommitMemberV3 {
     Introduced {
         change_id: ChangeId,
-        payload: Vec<u8>,
+        encoded_key: Vec<u8>,
+        layout_id: [u8; 32],
         global: bool,
+        owner_digest: [u8; 32],
+        semantic_digest: [u8; 32],
+        deleted: bool,
+        account_id: String,
+        created_at: LixTimestamp,
         updated_at: LixTimestamp,
-        blob_manifest_object_ids: Vec<ObjectId>,
+        origin_key: Option<String>,
     },
     Selected {
         change_id: ChangeId,
@@ -200,20 +206,32 @@ pub(crate) enum CommitMemberV1 {
     },
 }
 
-impl CommitMemberV1 {
+impl CommitMemberV3 {
     pub(crate) fn introduced(
         change_id: ChangeId,
-        payload: Vec<u8>,
+        encoded_key: Vec<u8>,
+        layout_id: [u8; 32],
         global: bool,
+        owner_digest: [u8; 32],
+        semantic_digest: [u8; 32],
+        deleted: bool,
+        account_id: String,
+        created_at: LixTimestamp,
         updated_at: LixTimestamp,
-        blob_manifest_object_ids: Vec<ObjectId>,
+        origin_key: Option<String>,
     ) -> Self {
         Self::Introduced {
             change_id,
-            payload,
+            encoded_key,
+            layout_id,
             global,
+            owner_digest,
+            semantic_digest,
+            deleted,
+            account_id,
+            created_at,
             updated_at,
-            blob_manifest_object_ids,
+            origin_key,
         }
     }
 
@@ -272,15 +290,26 @@ impl CommitMemberV1 {
         }
     }
 
-    pub(crate) fn introduced_payload(&self) -> Option<(&[u8], bool, LixTimestamp, &[ObjectId])> {
+    pub(crate) fn introduced_identity(
+        &self,
+    ) -> Option<(&[u8], [u8; 32], bool, [u8; 32], [u8; 32], bool)> {
         match self {
             Self::Introduced {
-                payload,
+                encoded_key,
+                layout_id,
                 global,
-                updated_at,
-                blob_manifest_object_ids,
+                owner_digest,
+                semantic_digest,
+                deleted,
                 ..
-            } => Some((payload, *global, *updated_at, blob_manifest_object_ids)),
+            } => Some((
+                encoded_key,
+                *layout_id,
+                *global,
+                *owner_digest,
+                *semantic_digest,
+                *deleted,
+            )),
             Self::Selected { .. } => None,
         }
     }
@@ -289,17 +318,35 @@ impl CommitMemberV1 {
         match self {
             Self::Introduced {
                 change_id,
-                payload,
+                encoded_key,
+                layout_id,
                 global,
+                owner_digest,
+                semantic_digest,
+                deleted,
+                account_id,
+                created_at,
                 updated_at,
-                blob_manifest_object_ids,
+                origin_key,
             } => {
                 encoder.u8(0);
                 encoder.fixed(change_id.as_bytes());
-                encoder.bytes(payload)?;
+                encoder.bytes(encoded_key)?;
+                encoder.fixed(layout_id);
                 encoder.u8(u8::from(*global));
+                encoder.fixed(owner_digest);
+                encoder.fixed(semantic_digest);
+                encoder.u8(u8::from(*deleted));
+                encoder.bytes(account_id.as_bytes())?;
+                encoder.u64(created_at.packed());
                 encoder.u64(updated_at.packed());
-                encode_object_id_list(encoder, blob_manifest_object_ids)?;
+                match origin_key {
+                    None => encoder.u8(0),
+                    Some(value) => {
+                        encoder.u8(1);
+                        encoder.bytes(value.as_bytes())?;
+                    }
+                }
             }
             Self::Selected {
                 change_id,
@@ -321,7 +368,8 @@ impl CommitMemberV1 {
         let value = match decoder.u8()? {
             0 => Self::introduced(
                 ChangeId::from_bytes(decoder.fixed()?),
-                decoder.bytes("semantic change payload")?,
+                decoder.bytes("semantic change key")?,
+                decoder.fixed()?,
                 match decoder.u8()? {
                     0 => false,
                     1 => true,
@@ -331,10 +379,37 @@ impl CommitMemberV1 {
                         )));
                     }
                 },
+                decoder.fixed()?,
+                decoder.fixed()?,
+                match decoder.u8()? {
+                    0 => false,
+                    1 => true,
+                    value => {
+                        return Err(corruption(format!(
+                            "semantic change deletion tag {value} is invalid"
+                        )));
+                    }
+                },
+                String::from_utf8(decoder.bytes("semantic change account")?)
+                    .map_err(|_| corruption("semantic change account is not UTF-8"))?,
+                LixTimestamp::from_packed(decoder.u64()?).map_err(|error| {
+                    corruption(format!("semantic change created_at is invalid: {error}"))
+                })?,
                 LixTimestamp::from_packed(decoder.u64()?).map_err(|error| {
                     corruption(format!("semantic change updated_at is invalid: {error}"))
                 })?,
-                decode_object_id_list(decoder, "semantic change blob-manifest edges")?,
+                match decoder.u8()? {
+                    0 => None,
+                    1 => Some(
+                        String::from_utf8(decoder.bytes("semantic change origin key")?)
+                            .map_err(|_| corruption("semantic change origin key is not UTF-8"))?,
+                    ),
+                    tag => {
+                        return Err(corruption(format!(
+                            "semantic change origin-key tag {tag} is invalid"
+                        )));
+                    }
+                },
             ),
             1 => Self::selected(
                 ChangeId::from_bytes(decoder.fixed()?),
@@ -362,19 +437,32 @@ impl CommitMemberV1 {
             return Err(corruption("commit member contains a zero object edge"));
         }
         if let Self::Introduced {
-            payload,
-            blob_manifest_object_ids,
+            encoded_key,
+            layout_id,
+            owner_digest,
+            semantic_digest,
+            deleted,
+            account_id,
             ..
         } = self
         {
-            if payload.is_empty() {
-                return Err(corruption("introduced commit member has an empty payload"));
+            if encoded_key.is_empty() {
+                return Err(corruption("introduced commit member has an empty key"));
             }
-            validate_nonzero_ids("semantic change blob manifest", blob_manifest_object_ids)?;
-            if blob_manifest_object_ids.len() > AUTHENTICATED_EDGE_PAGE_ENTRIES {
+            let any_zero_digest =
+                *layout_id == [0; 32] || *owner_digest == [0; 32] || *semantic_digest == [0; 32];
+            let all_zero_digests =
+                *layout_id == [0; 32] && *owner_digest == [0; 32] && *semantic_digest == [0; 32];
+            if *deleted && !all_zero_digests {
                 return Err(corruption(
-                    "semantic change has too many blob-manifest edges",
+                    "introduced tombstone member carries a native tuple digest",
                 ));
+            }
+            if !*deleted && any_zero_digest {
+                return Err(corruption("introduced live member has a zero native digest"));
+            }
+            if account_id.is_empty() {
+                return Err(corruption("introduced commit member has an empty account"));
             }
         }
         Ok(())
@@ -382,29 +470,27 @@ impl CommitMemberV1 {
 
     fn authenticated_edge_count(&self) -> usize {
         match self {
-            Self::Introduced {
-                blob_manifest_object_ids,
-                ..
-            } => blob_manifest_object_ids.len(),
+            Self::Introduced { .. } => 0,
             Self::Selected { .. } => 1,
         }
     }
 }
 
+
 /// One byte-bounded authenticated page in a commit's ordered semantic-change
-/// closure. Introduced payloads live only in these pages; there is no per-row
-/// immutable SemanticChange object or alternate lookup path. The commit
-/// object authenticates the complete ordered page-ID vector. State leaves
-/// point directly at one of these immutable pages, so an exact batch resolves
-/// every selected payload with one object-space `get_many`.
+/// closure. Introduced members carry only native-row identity, lifecycle, and
+/// provenance; the body lives once in the authenticated current-state pack.
+/// There is no per-row immutable SemanticChange payload or alternate lookup
+/// path. The commit authenticates the complete ordered page-ID vector and
+/// state leaves point back to the exact page/ordinal descriptor.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitChangePageV2 {
+pub(crate) struct CommitChangePageV3 {
     pub(crate) commit_id: CommitId,
     pub(crate) start_ordinal: u32,
-    pub(crate) members: Vec<CommitMemberV1>,
+    pub(crate) members: Vec<CommitMemberV3>,
 }
 
-impl CommitChangePageV2 {
+impl CommitChangePageV3 {
     pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
         self.validate()?;
         let mut body = Encoder::default();
@@ -424,7 +510,7 @@ impl CommitChangePageV2 {
         let compressed = crate::compression::compress_zstd_level_1(&body).map_err(|error| {
             corruption(format!("commit change page compression failed: {error}"))
         })?;
-        encode_object(ObjectDomain::CommitChangePageV2, |encoder| {
+        encode_object(ObjectDomain::CommitChangePageV3, |encoder| {
             encoder.u32(
                 u32::try_from(body.len())
                     .map_err(|_| corruption("commit change page decoded length exceeds u32"))?,
@@ -434,7 +520,7 @@ impl CommitChangePageV2 {
     }
 
     pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
-        let mut decoder = decode_object(id, ObjectDomain::CommitChangePageV2, bytes)?;
+        let mut decoder = decode_object(id, ObjectDomain::CommitChangePageV3, bytes)?;
         let decoded_len = decoder.usize("commit change page decoded length")?;
         if decoded_len == 0 || decoded_len > COMMIT_CHANGE_PAGE_MAX_BYTES {
             return Err(corruption(
@@ -466,7 +552,7 @@ impl CommitChangePageV2 {
         }
         let mut members = Vec::with_capacity(count);
         for _ in 0..count {
-            members.push(CommitMemberV1::decode(&mut body)?);
+            members.push(CommitMemberV3::decode(&mut body)?);
         }
         body.finish()?;
         let value = Self {
@@ -485,7 +571,7 @@ impl CommitChangePageV2 {
         let member_edges = self
             .members
             .iter()
-            .map(CommitMemberV1::authenticated_edge_count)
+            .map(CommitMemberV3::authenticated_edge_count)
             .try_fold(0usize, |total, count| total.checked_add(count))
             .ok_or_else(|| corruption("commit member page edge count overflowed"))?;
         if member_edges > AUTHENTICATED_EDGE_PAGE_ENTRIES {
@@ -511,7 +597,7 @@ impl CommitChangePageV2 {
 
     pub(crate) fn encode_pages(
         commit_id: CommitId,
-        members: &[CommitMemberV1],
+        members: &[CommitMemberV3],
     ) -> Result<PreparedCommitChangePages, StorageError> {
         if members.is_empty() {
             // Empty/ref-only commits are represented by an empty authenticated
@@ -556,7 +642,7 @@ impl CommitChangePageV2 {
             .max(required_page_payload.saturating_add(128))
             .min(COMMIT_CHANGE_PAGE_MAX_BYTES);
 
-        let mut chunks = Vec::<(u32, Vec<CommitMemberV1>)>::new();
+        let mut chunks = Vec::<(u32, Vec<CommitMemberV3>)>::new();
         let mut start = 0usize;
         let mut current = Vec::new();
         let mut current_edges = 0usize;
@@ -626,6 +712,7 @@ impl CommitChangePageV2 {
     }
 }
 
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StatePageLocation {
     pub(crate) page_object_id: ObjectId,
@@ -643,7 +730,7 @@ pub(crate) struct CommitObjectV1 {
     pub(crate) commit_id: CommitId,
     pub(crate) generation: u64,
     pub(crate) parent_commit_object_ids: Vec<ObjectId>,
-    pub(crate) members: Vec<CommitMemberV1>,
+    pub(crate) members: Vec<CommitMemberV3>,
     pub(crate) member_page_object_ids: Vec<ObjectId>,
     pub(crate) global_state_root: ObjectId,
     pub(crate) local_state_root: ObjectId,
@@ -1063,7 +1150,7 @@ impl CommitObjectV1 {
         if self.members.is_empty() && self.member_page_object_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let pages = CommitChangePageV2::encode_pages(self.commit_id, &self.members)?;
+        let pages = CommitChangePageV3::encode_pages(self.commit_id, &self.members)?;
         let page_ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         if !self.member_page_object_ids.is_empty() {
             if self.member_page_object_ids != page_ids {
@@ -1084,7 +1171,7 @@ impl CommitObjectV1 {
     pub(crate) fn load_members_with(
         &self,
         mut load: impl FnMut(ObjectId) -> Result<Bytes, StorageError>,
-    ) -> Result<Vec<CommitMemberV1>, StorageError> {
+    ) -> Result<Vec<CommitMemberV3>, StorageError> {
         if self.member_page_object_ids.is_empty() {
             return Ok(self.members.clone());
         }
@@ -1093,7 +1180,7 @@ impl CommitObjectV1 {
         }
         let mut output = Vec::new();
         for page_id in &self.member_page_object_ids {
-            let page = CommitChangePageV2::decode(*page_id, &load(*page_id)?)?;
+            let page = CommitChangePageV3::decode(*page_id, &load(*page_id)?)?;
             if page.commit_id != self.commit_id
                 || page.start_ordinal
                     != u32::try_from(output.len()).map_err(|_| {
@@ -2706,11 +2793,11 @@ pub(super) fn gc_progress_selector_key() -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChangeCatalogEntry, ChangeCatalogOwner, CommitChangePageV2, CommitId, ObjectId};
+    use super::{ChangeCatalogEntry, ChangeCatalogOwner, CommitChangePageV3, CommitId, ObjectId};
 
     #[test]
     fn empty_commit_change_pages_are_a_valid_empty_closure() {
-        let pages = CommitChangePageV2::encode_pages(CommitId::from_bytes([0x42; 16]), &[])
+        let pages = CommitChangePageV3::encode_pages(CommitId::from_bytes([0x42; 16]), &[])
             .expect("empty commit page closure should be encodable");
         assert!(pages.member_locations.is_empty());
         assert!(pages.objects.is_empty());

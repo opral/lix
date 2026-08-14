@@ -12,7 +12,6 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::forktree::{StateCell, StateKey, StateValue};
-use crate::json_store::JsonSlot;
 use crate::state::StateDiffEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -112,12 +111,12 @@ impl MergeDiff {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct MergePayloadBatch {
-    values: HashMap<ChangeId, (JsonSlot, JsonSlot)>,
+    values: HashMap<ChangeId, (StateCell, Option<SharedStr>)>,
 }
 
 impl MergePayloadBatch {
     pub(crate) fn from_payloads(
-        payloads: impl IntoIterator<Item = (ChangeId, JsonSlot, JsonSlot)>,
+        payloads: impl IntoIterator<Item = (ChangeId, StateCell, Option<SharedStr>)>,
     ) -> Result<Self, LixError> {
         let mut values = HashMap::new();
         for (change_id, snapshot, metadata) in payloads {
@@ -131,10 +130,10 @@ impl MergePayloadBatch {
         Ok(Self { values })
     }
 
-    pub(crate) fn get(&self, change_id: ChangeId) -> Option<(&JsonSlot, &JsonSlot)> {
+    pub(crate) fn get(&self, change_id: ChangeId) -> Option<(&StateCell, Option<&SharedStr>)> {
         self.values
             .get(&change_id)
-            .map(|(snapshot, metadata)| (snapshot, metadata))
+            .map(|(snapshot, metadata)| (snapshot, metadata.as_ref()))
     }
 }
 
@@ -391,7 +390,7 @@ mod tests {
 
     fn diff_with_payloads(
         entries: Vec<MergeDiffEntry>,
-        payloads: impl IntoIterator<Item = (ChangeId, JsonSlot, JsonSlot)>,
+        payloads: impl IntoIterator<Item = (ChangeId, StateCell, Option<SharedStr>)>,
     ) -> MergeDiff {
         MergeDiff::from_entries_with_payloads(
             entries,
@@ -493,7 +492,7 @@ mod tests {
     fn both_sides_same_final_value_is_convergent_noop() {
         let target_change = ChangeId::for_test_label("target");
         let source_change = ChangeId::for_test_label("source");
-        let same_snapshot = JsonSlot::Inline(r#"{"value":"same"}"#.into());
+        let same_snapshot = StateCell::Value(r#"{"value":"same"}"#.into());
         let target = diff_with_payloads(
             vec![entry(
                 "entity-a",
@@ -501,7 +500,7 @@ mod tests {
                 Some(row("base", false)),
                 Some(row("target", false)),
             )],
-            [(target_change, same_snapshot.clone(), JsonSlot::None)],
+            [(target_change, same_snapshot.clone(), None)],
         );
         let source = diff_with_payloads(
             vec![entry(
@@ -510,7 +509,7 @@ mod tests {
                 Some(row("base", false)),
                 Some(row("source", false)),
             )],
-            [(source_change, same_snapshot, JsonSlot::None)],
+            [(source_change, same_snapshot, None)],
         );
 
         let plan = plan_merge(&target, &source).expect("merge should plan");
@@ -753,7 +752,7 @@ mod tests {
 
     #[test]
     fn live_payload_comparison_only_reads_intersecting_changed_identity() {
-        let same = JsonSlot::Inline(r#"{"same":true}"#.into());
+        let same = StateCell::Value(r#"{"same":true}"#.into());
         let target = diff_with_payloads(
             vec![entry(
                 "entity-a",
@@ -764,7 +763,7 @@ mod tests {
             [(
                 ChangeId::for_test_label("target-a"),
                 same.clone(),
-                JsonSlot::None,
+                None,
             )],
         );
         let source = diff_with_payloads(
@@ -774,7 +773,7 @@ mod tests {
                 Some(row("base-a", false)),
                 Some(row("source-a", false)),
             )],
-            [(ChangeId::for_test_label("source-a"), same, JsonSlot::None)],
+            [(ChangeId::for_test_label("source-a"), same, None)],
         );
 
         let plan = plan_merge(&target, &source).expect("payload comparison should plan");
@@ -854,8 +853,8 @@ mod tests {
     fn merge_payload_batch_rejects_duplicate_change_ids() {
         let change_id = ChangeId::for_test_label("duplicate");
         let error = MergePayloadBatch::from_payloads([
-            (change_id, JsonSlot::None, JsonSlot::None),
-            (change_id, JsonSlot::None, JsonSlot::None),
+            (change_id, StateCell::Tombstone, None),
+            (change_id, StateCell::Tombstone, None),
         ])
         .expect_err("duplicate payload identities must fail closed");
 

@@ -2717,6 +2717,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 origin_key: None,
             },
+            native_row: None,
             observed_commit_id: format!("commit-{depth}"),
             commit_created_at: Some("2026-01-01T00:00:00Z".to_string()),
             as_of_commit_id: "start".to_string(),
@@ -2755,7 +2756,11 @@ mod tests {
                 file_id: file_id.map(str::to_owned),
             },
             global: false,
-            snapshot_content: None,
+            cell: if deleted {
+                crate::forktree::StateCell::Tombstone
+            } else {
+                crate::forktree::StateCell::Null
+            },
             metadata: None,
             deleted,
             blob_manifest_object_ids: Vec::new(),
@@ -2854,7 +2859,10 @@ mod tests {
                         file_id: change.file_id,
                     },
                     global: false,
-                    snapshot_content: change.snapshot_content,
+                    cell: change.snapshot_content.map_or(
+                        crate::forktree::StateCell::Tombstone,
+                        crate::forktree::StateCell::Value,
+                    ),
                     metadata: change.metadata,
                     deleted,
                     blob_manifest_object_ids: Vec::new(),

@@ -8343,7 +8343,7 @@ mod tests {
         BlobWriteReceipt,
     };
     use crate::branch::{BranchHead, BranchRefReader};
-    use crate::changelog::{ChangeId, ChangeRecord, CommitId};
+    use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{
         FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemPathIndex,
@@ -8351,13 +8351,12 @@ mod tests {
     };
     use crate::forktree::{
         AuthenticatedBlobReader, BranchStateTransition, ChangeCatalogEntry, ChangeCatalogOwner,
-        ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitObjectV1, ForkTreeReadFacade,
+        ChangeObjectV1, CommitCatalogEntry, CommitChangePageV3, CommitObjectV1, ForkTreeReadFacade,
         PreparedPublication, RepositoryRootV1, StateCell, StateKey, StateMutationAudit,
         StateTreeMutation, StateValue, StateValueRef, encode_current_state_packs, encode_state_key,
         encode_state_value,
     };
     use crate::functions::FunctionProviderHandle;
-    use crate::json_store::JsonSlot;
     use crate::plugin::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
         PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
@@ -8415,51 +8414,71 @@ mod tests {
 
     fn test_global_state_member(
         row: &FilesystemStateRow,
-    ) -> (Vec<u8>, crate::forktree::CommitMemberV1) {
+    ) -> (Vec<u8>, crate::forktree::CommitMemberV3, StateValue) {
         let change_id = row
             .change_id
             .expect("global native fixture row should have a ChangeId");
         let fork_change_id = crate::forktree::ChangeId::from_bytes(*change_id.as_uuid().as_bytes());
-        let snapshot = if row.deleted {
-            JsonSlot::None
-        } else if let Some(snapshot) = &row.snapshot_content {
-            JsonSlot::Inline(snapshot.to_string().into_boxed_str())
-        } else {
-            JsonSlot::Inline("null".into())
-        };
-        let metadata = row
-            .metadata
-            .as_ref()
-            .map(|metadata| JsonSlot::Inline(metadata.to_string().into_boxed_str()))
-            .unwrap_or(JsonSlot::None);
-        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-            format_version: 2,
-            change_id,
-            account_id: "native-file-fixture".to_owned(),
-            schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
-            file_id: row.file_id.clone(),
-            snapshot,
-            metadata,
-            created_at: row.created_at,
-            origin_key: None,
-        })
-        .expect("global native fixture change payload");
         let key = encode_state_key(crate::forktree::StateKeyRef {
             schema_key: &row.schema_key,
             file_id: row.file_id.as_deref(),
             entity_pk: &row.entity_pk,
         });
-        (
-            key,
-            crate::forktree::CommitMemberV1::introduced(
-                fork_change_id,
-                payload,
-                true,
-                row.updated_at,
-                Vec::new(),
+        let cell = if row.deleted {
+            StateCell::Tombstone
+        } else {
+            let snapshot = serde_json::from_str(
+                row.snapshot_content
+                    .as_deref()
+                    .expect("live global fixture snapshot"),
+            )
+            .expect("global fixture canonical JSON");
+            StateCell::NativeRow(
+                crate::native_row::encode(
+                    &crate::native_row::seed_schema(&row.schema_key)
+                        .expect("global fixture Schema-v1 plan"),
+                    &row.entity_pk,
+                    true,
+                    row.file_id.as_deref(),
+                    &snapshot,
+                )
+                .expect("global fixture native row"),
+            )
+        };
+        let (layout_id, owner_digest, semantic_digest, deleted) = match &cell {
+            StateCell::NativeRow(native) => (
+                native.layout_id,
+                native.owner_digest,
+                native.semantic_digest,
+                false,
             ),
-        )
+            StateCell::Tombstone => ([0; 32], [0; 32], [0; 32], true),
+            StateCell::Value(_) | StateCell::Null => unreachable!(),
+        };
+        let member = crate::forktree::CommitMemberV3::introduced(
+                fork_change_id,
+                key.clone(),
+                layout_id,
+                true,
+                owner_digest,
+                semantic_digest,
+                deleted,
+                "native-file-fixture".to_owned(),
+                row.created_at,
+                row.updated_at,
+                None,
+            );
+        let value = StateValue {
+            change_id,
+            commit_id: CommitId::new(uuid::Uuid::from_bytes([0x6a; 16])),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            cell,
+            metadata: row.metadata.clone(),
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        };
+        (key, member, value)
     }
 
     fn publish_global_fixture_rows(
@@ -8479,9 +8498,9 @@ mod tests {
         let commit_id = crate::forktree::CommitId::from_bytes([0x6a; 16]);
         let members = entries
             .iter()
-            .map(|(_, member)| member.clone())
+            .map(|(_, member, _)| member.clone())
             .collect::<Vec<_>>();
-        let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+        let pages = CommitChangePageV3::encode_pages(commit_id, &members)
             .expect("global native fixture member pages");
         let packs = encode_current_state_packs(
             commit_id,
@@ -8489,42 +8508,10 @@ mod tests {
             entries
                 .iter()
                 .zip(&pages.member_locations)
-                .map(|((key, member), location)| {
-                    let (payload, _, updated_at, manifests) = member
-                        .introduced_payload()
-                        .expect("global fixture member is introduced");
-                    let change_id =
-                        ChangeId::new(uuid::Uuid::from_bytes(*member.change_id().as_bytes()));
-                    let record =
-                        crate::changelog::decode_forktree_change_payload(payload, change_id)
-                            .expect("global fixture payload");
-                    let cell = match record.snapshot {
-                        JsonSlot::None => StateCell::Tombstone,
-                        JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
-                        JsonSlot::Inline(value) => StateCell::Value(value.into()),
-                        JsonSlot::ForkTreeObject(_) => {
-                            panic!("global fixture payload must be inline")
-                        }
-                    };
-                    let metadata = match record.metadata {
-                        JsonSlot::None => None,
-                        JsonSlot::Inline(value) => Some(value.into()),
-                        JsonSlot::ForkTreeObject(_) => {
-                            panic!("global fixture metadata must be inline")
-                        }
-                    };
+                .map(|((key, _, value), location)| {
                     (
                         key.clone(),
-                        StateValue {
-                            change_id,
-                            commit_id: CommitId::new(uuid::Uuid::from_bytes(*commit_id.as_bytes())),
-                            created_at: record.created_at,
-                            updated_at,
-                            cell,
-                            metadata,
-                            origin_key: record.origin_key,
-                            blob_manifest_object_ids: manifests.to_vec(),
-                        },
+                        value.clone(),
                         *location,
                     )
                 })
@@ -8533,7 +8520,7 @@ mod tests {
         .expect("global native fixture current-state packs");
         let mutations = entries
             .iter()
-            .map(|(key, _)| {
+            .map(|(key, _, _)| {
                 let location = packs.locations.get(key).expect("global fixture pack row");
                 StateTreeMutation::insert_bound(
                     key.clone(),

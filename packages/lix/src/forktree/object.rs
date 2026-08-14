@@ -57,9 +57,9 @@ pub(super) enum ObjectDomain {
     GcLiveBranchPackV1 = 16,
     BlobMerkleLeafV1 = 18,
     BlobMerkleInternalV1 = 19,
-    CommitChangePageV2 = 20,
     CommitV2 = 21,
     CurrentStatePackV1 = 22,
+    CommitChangePageV3 = 23,
 }
 
 impl ObjectDomain {
@@ -82,9 +82,9 @@ impl ObjectDomain {
             16 => Ok(Self::GcLiveBranchPackV1),
             18 => Ok(Self::BlobMerkleLeafV1),
             19 => Ok(Self::BlobMerkleInternalV1),
-            20 => Ok(Self::CommitChangePageV2),
             21 => Ok(Self::CommitV2),
             22 => Ok(Self::CurrentStatePackV1),
+            23 => Ok(Self::CommitChangePageV3),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
     }

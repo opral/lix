@@ -230,7 +230,7 @@ fn same_authenticated_state(before: &HistoricalStateRow, after: &HistoricalState
         && before.change_id == after.change_id
         && before.created_at == after.created_at
         && before.updated_at == after.updated_at
-        && before.snapshot_content == after.snapshot_content
+        && before.cell == after.cell
         && before.metadata == after.metadata
         && before.deleted == after.deleted
         && before.blob_manifest_object_ids == after.blob_manifest_object_ids
@@ -365,7 +365,7 @@ mod tests {
     use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
     use crate::common::{LixTimestamp, SharedStr};
     use crate::entity_pk::EntityPk;
-    use crate::forktree::{HistoricalStateRow, ObjectId, StateKey};
+    use crate::forktree::{HistoricalStateRow, ObjectId, StateCell, StateKey};
     use crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY;
 
     fn semantic_row() -> HistoricalStateRow {
@@ -380,7 +380,7 @@ mod tests {
             commit_id: CommitId::for_test_label("page-placement"),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
             updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
-            snapshot_content: Some(SharedStr::from("value")),
+            cell: StateCell::Value(SharedStr::from("value")),
             metadata: Some(SharedStr::from("metadata")),
             deleted: false,
             blob_manifest_object_ids: vec![ObjectId::from_bytes([0x11; 32])],
@@ -414,7 +414,7 @@ mod tests {
                 "updated_at",
                 Box::new(|row| row.updated_at = LixTimestamp::from_unix_millis_utc_lossy(4)),
             ),
-            ("value_to_null", Box::new(|row| row.snapshot_content = None)),
+            ("value_to_null", Box::new(|row| row.cell = StateCell::Null)),
             ("deleted", Box::new(|row| row.deleted = true)),
             (
                 "metadata",
@@ -428,7 +428,7 @@ mod tests {
             ),
             (
                 "null_to_value",
-                Box::new(|row| row.snapshot_content = Some(SharedStr::from("other-value"))),
+                Box::new(|row| row.cell = StateCell::Value(SharedStr::from("other-value"))),
             ),
         ];
 

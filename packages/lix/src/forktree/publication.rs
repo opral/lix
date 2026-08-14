@@ -19,39 +19,28 @@ use super::model::{
 };
 
 pub(crate) fn introduced_checkpoint_marker(
-    members: &[super::model::CommitMemberV1],
+    members: &[super::model::CommitMemberV3],
     branch_id: super::model::CanonicalBranchId,
 ) -> Result<bool, StorageError> {
     let expected_branch = uuid::Uuid::from_bytes(*branch_id.as_bytes()).to_string();
+    let expected_pk = crate::entity_pk::EntityPk::uuid_from_canonical(&expected_branch)
+        .map_err(|error| corruption(error.to_string()))?;
+    let expected_key = super::state::encode_state_key(super::state::StateKeyRef {
+        schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY,
+        file_id: None,
+        entity_pk: &expected_pk,
+    });
     let mut found = false;
     for member in members {
-        let Some((payload, global, _, _)) = member.introduced_payload() else {
+        let Some((encoded_key, _, global, _, _, deleted)) = member.introduced_identity() else {
             continue;
         };
-        let change_id =
-            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*member.change_id().as_bytes()));
-        let record = crate::changelog::decode_forktree_change_payload(payload, change_id)
-            .map_err(|error| corruption(error.to_string()))?;
-        if record.schema_key != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY {
+        if encoded_key != expected_key {
             continue;
         }
-        if found || global || record.file_id.is_some() {
+        if found || global || deleted {
             return Err(corruption(
                 "checkpoint commit contains an invalid or duplicate marker",
-            ));
-        }
-        let crate::json_store::JsonSlot::Inline(snapshot) = record.snapshot else {
-            return Err(corruption(
-                "checkpoint marker snapshot is absent or indirect",
-            ));
-        };
-        let payload: serde_json::Value = serde_json::from_str(&snapshot)
-            .map_err(|error| corruption(format!("checkpoint marker is malformed: {error}")))?;
-        if payload.get("branch_id").and_then(serde_json::Value::as_str)
-            != Some(expected_branch.as_str())
-        {
-            return Err(corruption(
-                "checkpoint marker branch identity does not match its commit owner",
             ));
         }
         found = true;
@@ -1348,27 +1337,13 @@ impl PreparedPublication {
             if !expected_change_ids.insert(change_id) {
                 return Err(corruption("semantic commit repeats one member ChangeId"));
             }
-            let Some((payload, _global, _updated_at, _blob_manifest_object_ids)) =
-                member.introduced_payload()
+            let Some((_encoded_key, _layout, _global, _owner, _semantic, _deleted)) =
+                member.introduced_identity()
             else {
                 return Err(corruption(
                     "single-transition semantic member is not introduced",
                 ));
             };
-            let record = crate::changelog::decode_forktree_change_payload(
-                payload,
-                crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
-            )
-            .map_err(|error| corruption(error.to_string()))?;
-            let expected_json = crate::changelog::forktree_change_json_payload_ids(&record)
-                .into_iter()
-                .map(super::object::ObjectId::from_bytes)
-                .collect::<Vec<_>>();
-            if !expected_json.is_empty() {
-                return Err(corruption(
-                    "semantic page member contains an out-of-page JSON reference",
-                ));
-            }
             let expected = super::model::ChangeCatalogEntry {
                 owner: super::model::ChangeCatalogOwner::CommitMember {
                     commit_object_id: commit_id,
@@ -1608,30 +1583,13 @@ impl PreparedPublication {
                 }
                 match member.source() {
                     None => {
-                        let Some((payload, _global, _updated_at, _blob_manifest_object_ids)) =
-                            member.introduced_payload()
+                        let Some((_encoded_key, _layout, _global, _owner, _semantic, _deleted)) =
+                            member.introduced_identity()
                         else {
                             return Err(corruption(
                                 "introduced member has no embedded semantic payload",
                             ));
                         };
-                        let record = crate::changelog::decode_forktree_change_payload(
-                            payload,
-                            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
-                                *change_id.as_bytes(),
-                            )),
-                        )
-                        .map_err(|error| corruption(error.to_string()))?;
-                        let expected_json =
-                            crate::changelog::forktree_change_json_payload_ids(&record)
-                                .into_iter()
-                                .map(super::object::ObjectId::from_bytes)
-                                .collect::<Vec<_>>();
-                        if !expected_json.is_empty() {
-                            return Err(corruption(
-                                "ordered semantic page member contains an out-of-page JSON reference",
-                            ));
-                        }
                         let expected = super::model::ChangeCatalogEntry {
                             owner: super::model::ChangeCatalogOwner::CommitMember {
                                 commit_object_id,

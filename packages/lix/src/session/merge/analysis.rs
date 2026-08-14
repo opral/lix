@@ -157,54 +157,22 @@ where
             },
         )
         .await?;
-    let mut change_ids = std::collections::BTreeSet::new();
-    for entry in &entries {
-        if let Some(value) = entry.before.as_ref() {
-            change_ids.insert(value.value.change_id);
-        }
-        if let Some(value) = entry.after.as_ref() {
-            change_ids.insert(value.value.change_id);
-        }
-    }
-    let change_ids = change_ids.into_iter().collect::<Vec<_>>();
-    let records = view.load_change_records(&change_ids).await?;
-    let mut authenticated = std::collections::HashMap::with_capacity(records.len());
-    for (change_id, record) in change_ids.iter().copied().zip(records) {
-        let record = record.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("merge state row references missing change '{change_id}'"),
-            )
-        })?;
-        authenticated.insert(change_id, record);
-    }
+    let mut payloads = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for entry in &entries {
         for value in [entry.before.as_ref(), entry.after.as_ref()]
             .into_iter()
             .flatten()
         {
             let state = &value.value;
-            let record = authenticated.get(&state.change_id).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("merge state row lost change payload '{}'", state.change_id),
-                )
-            })?;
-            // ForkTree change payloads own their canonical JSON inline or in
-            // an authenticated ForkTree object. Authenticate the canonical
-            // bytes and lifecycle directly instead of comparing storage planes.
-            let snapshot_matches = match (&record.snapshot, &state.cell) {
-                (crate::json_store::JsonSlot::None, crate::forktree::StateCell::Tombstone) => true,
-                (
-                    crate::json_store::JsonSlot::Inline(expected),
-                    crate::forktree::StateCell::NativeRow(native),
-                ) => {
+            match &state.cell {
+                crate::forktree::StateCell::Tombstone => {}
+                crate::forktree::StateCell::NativeRow(native) => {
                     let global = value.source == crate::forktree::StateSource::Global;
-                    let expected_digest = crate::native_row::semantic_digest_text(expected).ok();
-                    catalog
+                    let authenticated = catalog
                         .plan_for_key(&entry.key.schema_key)
                         .and_then(|(_, plan)| {
-                            crate::native_row::logical_value(
+                            crate::native_row::decode(
                                 &plan.relational_schema,
                                 &entry.key.entity_pk,
                                 global,
@@ -213,40 +181,36 @@ where
                             )
                             .ok()
                         })
-                        .zip(expected_digest)
-                        .is_some_and(|(value, expected_digest)| {
-                            crate::native_row::semantic_digest(&value) == expected_digest
-                        })
+                        .is_some();
+                    if !authenticated {
+                        return Err(LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!(
+                                "merge state row '{}' has invalid native schema/owner binding",
+                                state.change_id
+                            ),
+                        ));
+                    }
                 }
-                _ => false,
-            };
-            let metadata_matches = match (&record.metadata, state.metadata.as_deref()) {
-                (crate::json_store::JsonSlot::None, None) => true,
-                (crate::json_store::JsonSlot::Inline(expected), Some(actual)) => {
-                    expected.as_ref() == actual
+                crate::forktree::StateCell::Value(_) | crate::forktree::StateCell::Null => {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "merge state row '{}' uses a non-native payload",
+                            state.change_id
+                        ),
+                    ));
                 }
-                _ => false,
-            };
-            if record.schema_key != entry.key.schema_key
-                || record.file_id != entry.key.file_id
-                || record.entity_pk != entry.key.entity_pk
-                || record.created_at != state.created_at
-                || !snapshot_matches
-                || !metadata_matches
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "merge change '{}' does not authenticate its state row",
-                        state.change_id
-                    ),
+            }
+            if seen.insert(state.change_id) {
+                payloads.push((
+                    state.change_id,
+                    state.cell.clone(),
+                    state.metadata.clone(),
                 ));
             }
         }
     }
-    let payloads = authenticated
-        .into_iter()
-        .map(|(change_id, record)| (change_id, record.snapshot, record.metadata));
     let payloads = MergePayloadBatch::from_payloads(payloads)?;
     Ok(MergeDiff::from_native(entries, payloads))
 }
