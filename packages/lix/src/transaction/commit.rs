@@ -5433,12 +5433,12 @@ fn prepare_row_columnar_write_sets(
     insert_selection: &PreparedInsertSelection,
     row_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::hot_state::RowColumnarWriteSets, LixError> {
-    if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
-        return Ok(crate::hot_state::RowColumnarWriteSets::new());
-    }
     let publishes_ordered_insert =
         insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
-    if !publishes_ordered_insert {
+    // Dense updates already carry a certified columnar input. Admitting them
+    // here makes that row group the sole commit-mutation authority instead of
+    // lowering their authored history through whole-row JSON deltas.
+    if publishes_ordered_insert && state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
         return Ok(crate::hot_state::RowColumnarWriteSets::new());
     }
     if let Some((commit_id, schema_key, row_groups)) = state_rows.take_dense_row_columnar() {
@@ -5505,9 +5505,6 @@ fn prepare_row_columnar_write_sets(
     }
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
-        if !insert_selection.contains(index) {
-            return Ok(crate::hot_state::RowColumnarWriteSets::new());
-        }
         let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {
             continue;
         };
@@ -5522,7 +5519,7 @@ fn prepare_row_columnar_write_sets(
     let mut encoded =
         crate::hot_state::RowColumnarWriteSets::with_state_row_count(state_rows.len());
     for ((commit_id, schema_key), row_indices) in indices {
-        if row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
+        if publishes_ordered_insert && row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
             continue;
         }
         let Some(schema) = row_schema_catalog.and_then(|catalog| catalog.schema(&schema_key))
