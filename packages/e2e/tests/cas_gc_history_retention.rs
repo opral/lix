@@ -93,6 +93,7 @@ where
 {
     const OLD: &[u8] = b"shared-old-content";
     const NEW: &[u8] = b"replacement-content";
+    const ROLLED_BACK: &[u8] = b"rolled-back-content";
     let storage = open(path).expect("open shared-blob fixture");
     let lix = open_lix()
         .with_storage(storage.clone())
@@ -134,13 +135,27 @@ where
     rollback
         .execute(
             "UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'",
-            &[Value::Blob(NEW.to_vec().into())],
+            &[Value::Blob(ROLLED_BACK.to_vec().into())],
         )
         .await
         .expect("stage shared replacement rollback");
     rollback.rollback().await.expect("rollback shared replacement");
     assert_eq!(read_file_at(&session, "/shared-a.bin").await, Some(OLD.to_vec()));
     assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+    let rolled_back_hash = blake3::hash(ROLLED_BACK).to_hex().to_string();
+    collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
+        .await
+        .expect("collect rolled-back replacement");
+    assert!(
+        read_binary_cas_for_bench(
+            &StorageAdapter::new(storage.clone()),
+            &rolled_back_hash,
+        )
+        .await
+        .expect("rolled-back CAS lookup should succeed")
+        .is_none(),
+        "rolled-back replacement must not become a current or historical owner",
+    );
 
     session
         .execute(
@@ -149,6 +164,7 @@ where
         )
         .await
         .expect("commit one shared owner replacement");
+    assert_eq!(read_file_at(&session, "/shared-a.bin").await, Some(NEW.to_vec()));
     session
         .execute("DELETE FROM lix_file WHERE path = '/shared-a.bin'", &[])
         .await
@@ -165,6 +181,14 @@ where
             .expect("shared old CAS lookup should succeed")
             .as_deref(),
         Some(OLD),
+    );
+    assert_eq!(
+        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &new_hash)
+            .await
+            .expect("historical replacement CAS lookup should succeed")
+            .as_deref(),
+        Some(NEW),
+        "deleted replacement must remain while branch history still reaches it",
     );
     drop(session);
     drop(lix);
@@ -188,6 +212,21 @@ where
     assert_eq!(
         read_file_at(&reopened_session, "/shared-b.bin").await,
         Some(OLD.to_vec())
+    );
+    let reopened_adapter = StorageAdapter::new(reopened_storage.clone());
+    assert_eq!(
+        read_binary_cas_for_bench(&reopened_adapter, &old_hash)
+            .await
+            .expect("reopened old CAS lookup should succeed")
+            .as_deref(),
+        Some(OLD),
+    );
+    assert_eq!(
+        read_binary_cas_for_bench(&reopened_adapter, &new_hash)
+            .await
+            .expect("reopened replacement CAS lookup should succeed")
+            .as_deref(),
+        Some(NEW),
     );
     reopened_session
         .execute("DELETE FROM lix_file WHERE path = '/shared-b.bin'", &[])

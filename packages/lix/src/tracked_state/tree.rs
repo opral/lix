@@ -192,16 +192,44 @@ impl TrackedStateTree {
                     return Ok(leaf.entry_owned(low).map(|entry| entry.key));
                 }
                 DecodedNode::Internal(internal) => {
-                    let Some(child) = internal
-                        .children()
-                        .iter()
+                    let children = internal.into_children();
+                    for child in &children {
+                        self.authenticate_subtree_right_edge(store, child).await?;
+                    }
+                    let Some(child) = children
+                        .into_iter()
                         .find(|child| child.last_key.as_ref() >= lower)
-                        .cloned()
                     else {
                         return Ok(None);
                     };
                     current = child.child_hash;
                     expected_summary = Some(child);
+                }
+            }
+        }
+    }
+
+    async fn authenticate_subtree_right_edge(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        summary: &ChildSummary,
+    ) -> Result<(), LixError> {
+        let mut current = summary.child_hash;
+        let mut expected = summary.clone();
+        loop {
+            let node = self.load_node(store, &current).await?;
+            validate_decoded_node_summary(&node, &expected)?;
+            match node {
+                DecodedNode::Leaf(_) => return Ok(()),
+                DecodedNode::Internal(internal) => {
+                    let Some(child) = internal.children().last().cloned() else {
+                        return Err(LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "tracked-state internal node has no right edge",
+                        ));
+                    };
+                    current = child.child_hash;
+                    expected = child;
                 }
             }
         }
@@ -2941,7 +2969,7 @@ mod tests {
     use crate::tracked_state::codec::{encode_value, hash_bytes};
 
     #[test]
-    fn schema_inventory_rejects_parent_child_summary_substitution() {
+    fn schema_inventory_rejects_too_low_routing_boundary() {
         let key = encode_key(&TrackedStateKey {
             schema_key: "private_schema".to_string(),
             file_id: Some("file-a".to_string()),
@@ -2956,8 +2984,8 @@ mod tests {
         let error = validate_decoded_node_summary(
             &node,
             &ChildSummary {
-                first_key: Bytes::from_static(b"forged-first"),
-                last_key: Bytes::from(key),
+                first_key: Bytes::from(key),
+                last_key: Bytes::from_static(b"forged-too-low"),
                 child_hash: hash_bytes(&bytes),
                 subtree_count: 1,
             },
