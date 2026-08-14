@@ -231,14 +231,36 @@ mod tests {
             .find("pub(crate) async fn state_points_on_read_with_historical_auth")
             .expect("historical state point authority");
         let point_end = serving[point_start..]
-            .find("async fn validate_resolved_native_body")
+            .find("struct HistoricalStateAuth")
             .map(|offset| point_start + offset)
             .expect("historical point authority terminator");
         assert!(
-            serving[point_start..point_end].contains("validate_resolved_native_body("),
-            "historical point authority must validate native bodies"
+            serving[point_start..point_end].contains("state_points_on_read_impl(")
+                && serving[point_start..point_end].contains("Some(HistoricalStateAuth"),
+            "historical point authority must enter the authenticated canonical resolver"
         );
-        let validator_start = point_end;
+        let point_impl_start = serving
+            .find("async fn state_points_on_read_impl")
+            .expect("historical point implementation");
+        let point_impl_end = serving[point_impl_start..]
+            .find("pub(super) async fn state_points_on_read_for_stale")
+            .map(|offset| point_impl_start + offset)
+            .expect("historical point implementation terminator");
+        assert!(
+            serving[point_impl_start..point_impl_end]
+                .contains("resolve_state_values_on_read(read, &selected, historical_auth)"),
+            "historical point implementation must preserve authentication into canonical resolution"
+        );
+        let stale_start = point_impl_end;
+        let stale_end = serving[stale_start..]
+            .find("async fn validate_resolved_native_body")
+            .map(|offset| stale_start + offset)
+            .expect("stale historical resolver terminator");
+        assert!(
+            serving[stale_start..stale_end].contains("validate_resolved_native_body("),
+            "stale historical resolver must validate native bodies"
+        );
+        let validator_start = stale_end;
         let validator_end = serving[validator_start..]
             .find("fn validate_resolved_member_pack_binding")
             .map(|offset| validator_start + offset)
