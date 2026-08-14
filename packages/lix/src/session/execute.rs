@@ -1303,8 +1303,12 @@ where
         }
 
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
-        let late_file_content_read = exact_filesystem_read
+        let exact_schema_point_read = exact_filesystem_read
             .is_none()
+            .then(|| exact_schema_point_read_route(&statement, params))
+            .flatten();
+        let late_file_content_read = (exact_filesystem_read.is_none()
+            && exact_schema_point_read.is_none())
             .then(|| late_materialized_lix_file_content_read(&statement))
             .flatten();
         let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
@@ -1348,6 +1352,7 @@ where
                     params,
                     acknowledge_file_views,
                     exact_filesystem_read,
+                    exact_schema_point_read,
                     late_file_content_read,
                     has_durable_runtime_function,
                 )
@@ -2298,6 +2303,7 @@ where
         params: &[Value],
         acknowledge_file_views: bool,
         exact_filesystem_read: Option<ExactFilesystemRead>,
+        exact_schema_point_read: Option<ExactSchemaPointRead>,
         late_file_content_read: Option<LateMaterializedLixFileContentRead>,
         has_durable_runtime_function: bool,
     ) -> Result<
@@ -2413,6 +2419,48 @@ where
                 },
                 file_view_mutations,
             ));
+        }
+        if let Some(exact) = exact_schema_point_read {
+            let ctx = SessionSqlExecutionContext {
+                active_branch_id: &active_branch_id,
+                active_account_id: self.active_account_id(),
+                read_store: read_store.clone(),
+                hot_state: Arc::clone(&self.hot_state),
+                binary_cas: Arc::clone(&self.binary_cas),
+                branch_ctx: Arc::clone(&self.branch_ctx),
+                catalog_context: Arc::clone(&self.catalog_context),
+                sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+                functions: FunctionProviderHandle::system(),
+                plugin_host: self.plugin_host.clone(),
+                file_views: None,
+            };
+            let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
+            if let Some((spec, row_pk)) =
+                resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
+            {
+                let reader: Arc<dyn sql2::RowSnapshotReader> = Arc::new(
+                    sql2::CurrentRowSnapshotReader::new(
+                        Arc::clone(&self.hot_state),
+                        read_store.clone(),
+                    ),
+                );
+                let query = sql2::execute_exact_schema_point_read(
+                    &spec,
+                    &active_branch_id,
+                    reader,
+                    row_pk,
+                    &exact.projected_columns,
+                    exact.output_columns,
+                )
+                .await?;
+                return Ok((
+                    sql2::SessionReadSqlResult {
+                        runtime_functions: None,
+                        query: sql2::SessionReadResult::Rows(query),
+                    },
+                    Vec::new(),
+                ));
+            }
         }
         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
             Arc::new(self.hot_state.reader(read_store.clone()));
@@ -3837,6 +3885,172 @@ enum ExactFilesystemRead {
     IdManifestBatch(BTreeSet<String>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ExactSchemaPointRead {
+    table_name: String,
+    projected_columns: Vec<String>,
+    output_columns: Vec<String>,
+    equalities: BTreeMap<String, Value>,
+}
+
+fn exact_schema_point_read_route(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<ExactSchemaPointRead> {
+    let simple = simple_single_table_select(statement)?;
+    if !simple.unqualified_unquoted_table
+        || simple.alias.is_some()
+        || simple.query.order_by.is_some()
+        || simple.query.fetch.is_some()
+        || !point_read_limit_is_safe(simple.query.limit_clause.as_ref())
+    {
+        return None;
+    }
+    let mut projected_columns = Vec::with_capacity(simple.select.projection.len());
+    let mut output_columns = Vec::with_capacity(simple.select.projection.len());
+    for item in &simple.select.projection {
+        let (expression, alias) = match item {
+            SelectItem::UnnamedExpr(expression) => (expression, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            _ => return None,
+        };
+        let column = exact_point_column(expression)?;
+        projected_columns.push(column.clone());
+        output_columns.push(alias.map_or(column, |alias| alias.value.clone()));
+    }
+    if projected_columns.is_empty() {
+        return None;
+    }
+    let mut equalities = BTreeMap::new();
+    collect_exact_schema_equalities(
+        simple.select.selection.as_ref()?,
+        params,
+        &mut equalities,
+    )?;
+    Some(ExactSchemaPointRead {
+        table_name: simple.table_name,
+        projected_columns,
+        output_columns,
+        equalities,
+    })
+}
+
+fn collect_exact_schema_equalities(
+    expression: &Expr,
+    params: &[Value],
+    equalities: &mut BTreeMap<String, Value>,
+) -> Option<()> {
+    match expression {
+        Expr::Nested(expression) => collect_exact_schema_equalities(expression, params, equalities),
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            collect_exact_schema_equalities(left, params, equalities)?;
+            collect_exact_schema_equalities(right, params, equalities)
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
+                (Some(column), None) => (column, exact_schema_literal(right, params)?),
+                (None, Some(column)) => (column, exact_schema_literal(left, params)?),
+                _ => return None,
+            };
+            equalities.insert(column, value).is_none().then_some(())
+        }
+        _ => None,
+    }
+}
+
+fn exact_schema_literal(expression: &Expr, params: &[Value]) -> Option<Value> {
+    let Expr::Value(value) = expression else {
+        return None;
+    };
+    match &value.value {
+        SqlValue::Placeholder(placeholder) => placeholder
+            .strip_prefix('$')
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| params.get(index))
+            .cloned(),
+        SqlValue::SingleQuotedString(value) => Some(Value::Text(value.clone())),
+        SqlValue::Number(value, _) => value.parse::<i64>().ok().map(Value::Integer),
+        _ => None,
+    }
+}
+
+fn resolve_exact_schema_point_read(
+    catalog: &sql2::PublicCatalog,
+    exact: &ExactSchemaPointRead,
+) -> Result<Option<(sql2::SchemaSurfaceSpec, crate::row_pk::RowPk)>, LixError> {
+    let Some(surface) = catalog.surface(&exact.table_name) else {
+        return Ok(None);
+    };
+    let sql2::PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind else {
+        return Ok(None);
+    };
+    let spec = catalog.schema_spec(schema_key).cloned().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "exact schema point route is missing schema metadata",
+        )
+    })?;
+    if exact
+        .projected_columns
+        .iter()
+        .any(|column| spec.visible_column(column).is_none())
+    {
+        return Ok(None);
+    }
+    let primary_key_columns = spec
+        .primary_key_paths
+        .iter()
+        .map(|path| match path.as_slice() {
+            [column] => Some(column.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "exact schema point route requires top-level primary-key columns",
+            )
+        })?;
+    if exact.equalities.len() != primary_key_columns.len()
+        || exact
+            .equalities
+            .keys()
+            .any(|column| !primary_key_columns.contains(&column.as_str()))
+    {
+        return Ok(None);
+    }
+    let parts = primary_key_columns
+        .iter()
+        .zip(&spec.primary_key_component_types)
+        .map(|(column, component_type)| {
+            let value = exact.equalities.get(*column)?;
+            match (component_type, value) {
+                (
+                    crate::row_pk::RowPkComponentType::Uuid
+                    | crate::row_pk::RowPkComponentType::String
+                    | crate::row_pk::RowPkComponentType::Bytes,
+                    Value::Text(value),
+                ) => Some(value.clone()),
+                (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
+                    Some(value.to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
+        parts,
+        &spec.primary_key_component_types,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((spec, row_pk)))
+}
+
 fn exact_filesystem_read_route(
     statement: &DataFusionStatement,
     params: &[Value],
@@ -4516,6 +4730,64 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         engine.open_session().await.expect("session should open")
+    }
+
+    #[tokio::test]
+    async fn exact_registered_schema_point_preserves_typed_public_projection() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "native_point_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "payload", "type": "jsonb", "nullable": true },
+                { "name": "optional", "type": "text", "nullable": true }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO native_point_probe (id, payload, optional) VALUES ($1, CAST($2 AS JSONB), NULL)",
+                &[
+                    Value::Text("row-a".into()),
+                    Value::Text(r#"{"nested":[true,null],"count":7}"#.into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let native = session
+            .execute(
+                "SELECT payload AS body, optional FROM native_point_probe WHERE id = $1 LIMIT 1",
+                &[Value::Text("row-a".into())],
+            )
+            .await
+            .unwrap();
+        let planned = session
+            .execute(
+                "SELECT payload AS body, optional FROM native_point_probe WHERE id = CAST($1 AS TEXT) LIMIT 1",
+                &[Value::Text("row-a".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(native.columns(), &["body", "optional"]);
+        assert_eq!(native, planned);
+
+        let missing = session
+            .execute(
+                "SELECT payload FROM native_point_probe WHERE id = $1 LIMIT 1",
+                &[Value::Text("missing".into())],
+            )
+            .await
+            .unwrap();
+        assert!(missing.is_empty());
     }
 
     async fn assert_columnar_lifecycle_current(
