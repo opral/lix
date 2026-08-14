@@ -1486,6 +1486,8 @@ fn tracked_scan_request_from_live(request: &HotStateScanRequest) -> TrackedState
         filter: TrackedStateFilter {
             schema_keys: request.filter.schema_keys.clone(),
             row_pks: request.filter.row_pks.clone(),
+            row_pk_lower: request.filter.row_pk_lower.clone(),
+            row_pk_upper: request.filter.row_pk_upper.clone(),
             file_ids: request.filter.file_ids.clone(),
             // Scan tombstones internally so branch-local tombstones can hide
             // global fallback rows before the serving facade filters them.

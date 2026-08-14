@@ -1399,6 +1399,10 @@ pub(crate) struct HotStateFilter {
     #[serde(default)]
     pub(crate) row_pks: Vec<RowPk>,
     #[serde(default)]
+    pub(crate) row_pk_lower: Option<crate::tracked_state::RowPkRangeBound>,
+    #[serde(default)]
+    pub(crate) row_pk_upper: Option<crate::tracked_state::RowPkRangeBound>,
+    #[serde(default)]
     pub(crate) branch_ids: Vec<String>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
@@ -1428,6 +1432,17 @@ pub(crate) struct HotStateFilter {
     pub(crate) declared_column_range: Option<Box<DeclaredColumnRange>>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
+}
+
+impl HotStateFilter {
+    pub(crate) fn matches_row_pk(&self, row_pk: &RowPk) -> bool {
+        (self.row_pks.is_empty() || self.row_pks.contains(row_pk))
+            && crate::tracked_state::row_pk_satisfies_bounds(
+                row_pk,
+                self.row_pk_lower.as_ref(),
+                self.row_pk_upper.as_ref(),
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]

@@ -436,6 +436,8 @@ fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeS
         schema_keys: filter.schema_keys,
         row_pks: filter.row_pks,
         file_ids: filter.file_ids,
+        row_pk_lower: filter.row_pk_lower,
+        row_pk_upper: filter.row_pk_upper,
         include_tombstones: true,
         limit: None,
     }
