@@ -70,8 +70,6 @@ static MATERIALIZE_OWNED_KEY_BUILDS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_OWNED_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_REVERIFY_ROWS: AtomicU64 = AtomicU64::new(0);
 static COMMIT_DELTA_COLUMNAR_ROWS: AtomicU64 = AtomicU64::new(0);
-static ROW_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static ROW_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -516,12 +514,6 @@ pub fn take_certified_row_update_value_batch_accounting() -> CrudCertificateAcco
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RowPointSnapshotCacheAccounting {
-    pub hits: u64,
-    pub misses: u64,
-}
-
 pub(crate) fn record_root_base_batch_cache_hit() {
     ROOT_BASE_BATCH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
 }
@@ -832,21 +824,6 @@ pub fn take_hot_index_probe_census() -> HotIndexProbeCensus {
             .swap(0, Ordering::Relaxed),
         probes_refused_over_budget: HOT_INDEX_PROBES_REFUSED_OVER_BUDGET
             .swap(0, Ordering::Relaxed),
-    }
-}
-
-pub(crate) fn record_row_point_snapshot_cache_hit() {
-    ROW_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_row_point_snapshot_cache_miss() {
-    ROW_POINT_SNAPSHOT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_row_point_snapshot_cache_accounting() -> RowPointSnapshotCacheAccounting {
-    RowPointSnapshotCacheAccounting {
-        hits: ROW_POINT_SNAPSHOT_CACHE_HITS.swap(0, Ordering::Relaxed),
-        misses: ROW_POINT_SNAPSHOT_CACHE_MISSES.swap(0, Ordering::Relaxed),
     }
 }
 
