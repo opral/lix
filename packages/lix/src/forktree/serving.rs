@@ -4333,34 +4333,15 @@ where
             ));
         }
         validate_resolved_member_pack_binding(&resolved, encoded_key, *source, &pack_row.value)?;
-        if let StateCell::NativeRow(native) = &pack_row.value.cell {
-            let state_key = decode_state_key(encoded_key)
-                .map_err(|error| corruption(error.to_string()))?;
-            let schema_cache_key = (
-                resolved.source_commit_object_id,
-                state_key.schema_key.clone(),
-            );
-            if !native_schema_cache.contains_key(&schema_cache_key) {
-                let schema = schema_for_historical_native_row(
-                    read,
-                    resolved.source_commit_object_id,
-                    &state_key.schema_key,
-                )
-                .await?;
-                native_schema_cache.insert(schema_cache_key.clone(), schema);
-            }
-            let schema = native_schema_cache
-                .get(&schema_cache_key)
-                .expect("historical native schema was inserted");
-            crate::native_row::decode(
-                schema,
-                &state_key.entity_pk,
-                expected_global,
-                state_key.file_id.as_deref(),
-                native,
-            )
-            .map_err(|error| corruption(error.to_string()))?;
-        }
+        validate_resolved_native_body(
+            read,
+            &resolved,
+            encoded_key,
+            expected_global,
+            &pack_row.value,
+            &mut native_schema_cache,
+        )
+        .await?;
         output.push(Some((pack_row.value, *source)));
     }
 
@@ -4375,6 +4356,49 @@ where
             value => Ok(value),
         })
         .collect()
+}
+
+async fn validate_resolved_native_body<R>(
+    read: &R,
+    resolved: &ResolvedSemanticMember,
+    encoded_key: &[u8],
+    expected_global: bool,
+    value: &StateValue,
+    schema_cache: &mut BTreeMap<(ObjectId, String), lix_schema::Schema>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let StateCell::NativeRow(native) = &value.cell else {
+        return Ok(());
+    };
+    let state_key =
+        decode_state_key(encoded_key).map_err(|error| corruption(error.to_string()))?;
+    let cache_key = (
+        resolved.source_commit_object_id,
+        state_key.schema_key.clone(),
+    );
+    if !schema_cache.contains_key(&cache_key) {
+        let schema = schema_for_historical_native_row(
+            read,
+            resolved.source_commit_object_id,
+            &state_key.schema_key,
+        )
+        .await?;
+        schema_cache.insert(cache_key.clone(), schema);
+    }
+    let schema = schema_cache
+        .get(&cache_key)
+        .expect("historical native schema was inserted");
+    crate::native_row::decode(
+        schema,
+        &state_key.entity_pk,
+        expected_global,
+        state_key.file_id.as_deref(),
+        native,
+    )
+    .map_err(|error| corruption(error.to_string()))?;
+    Ok(())
 }
 
 fn validate_resolved_member_pack_binding(
@@ -4521,6 +4545,7 @@ where
     let mut output = Vec::with_capacity(selected.len());
     let mut authenticated_member_closures = BTreeMap::new();
     let mut page_commit_cache = BTreeMap::new();
+    let mut native_schema_cache = BTreeMap::<(ObjectId, String), lix_schema::Schema>::new();
     let (endpoint_commit, endpoint_members) = if let Some(auth) = historical_auth {
         let closure = load_authenticated_commit_member_closure(
             read,
@@ -4592,6 +4617,15 @@ where
             ));
         }
         validate_resolved_member_pack_binding(&resolved, encoded_key, *source, &pack_row.value)?;
+        validate_resolved_native_body(
+            read,
+            &resolved,
+            encoded_key,
+            expected_global,
+            &pack_row.value,
+            &mut native_schema_cache,
+        )
+        .await?;
         output.push(Some((pack_row.value, *source)));
     }
     Ok(output)
