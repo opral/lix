@@ -1,9 +1,9 @@
-//! EXP-BPTREE-07: canonical authenticated high-fanout B+ tree experiment.
+//! EXP-INLINE-DELTA-09: authenticated inline leaf-delta experiment.
 //!
 //! Compares identical Schema-v1 typed tuple bytes stored as either:
 //! - immutable 64-row slotted snapshot pages with a rewritten page manifest; or
-//! - a canonical content-addressed B+ tree ordered by the full encoded
-//!   StateKey, with prefix-compressed pages and path-copy value updates.
+//! - C2 pages with one bounded canonical mutation area encoded inside the same
+//!   authenticated leaf object and deterministically compacted into its base.
 //!
 //! The benchmark uses the shipping RocksDB/SlateDB storage traits. There is no
 //! SQL or workload-specific production shortcut: both layouts implement the
@@ -11,10 +11,8 @@
 //! cold-reopen operations over content-addressed objects.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -28,10 +26,8 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use uuid::Uuid;
 
-const LEDGER: &str = "EXP-BPTREE-07";
+const LEDGER: &str = "EXP-INLINE-DELTA-09";
 const PAGE_ROWS: usize = 64;
-const BPTREE_MIN_PAGE_BYTES: usize = 4 * 1024;
-const BPTREE_MAX_PAGE_BYTES: usize = 32 * 1024;
 const ROOT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00fe_2001), "exp.delta_page.root");
 const PAGE_SPACE: StorageSpace =
@@ -65,21 +61,21 @@ const TUPLE_PLAN: [BodyColumn; 5] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Layout {
     Slotted,
-    Bptree,
+    Inline,
 }
 
 impl Layout {
     fn name(self) -> &'static str {
         match self {
             Self::Slotted => "slotted",
-            Self::Bptree => "bptree",
+            Self::Inline => "inline_delta",
         }
     }
 
     fn tag(self) -> u8 {
         match self {
             Self::Slotted => 1,
-            Self::Bptree => 2,
+            Self::Inline => 2,
         }
     }
 }
@@ -94,9 +90,9 @@ struct Counters {
     put_bytes: u64,
     decoded_pages: u64,
     decoded_rows: u64,
-    node_reads: u64,
-    nodes_staged: u64,
-    hash_pruned: u64,
+    inline_reads: u64,
+    inline_entries: u64,
+    inline_compactions: u64,
 }
 
 impl Counters {
@@ -110,9 +106,9 @@ impl Counters {
             put_bytes: self.put_bytes - before.put_bytes,
             decoded_pages: self.decoded_pages - before.decoded_pages,
             decoded_rows: self.decoded_rows - before.decoded_rows,
-            node_reads: self.node_reads - before.node_reads,
-            nodes_staged: self.nodes_staged - before.nodes_staged,
-            hash_pruned: self.hash_pruned - before.hash_pruned,
+            inline_reads: self.inline_reads - before.inline_reads,
+            inline_entries: self.inline_entries - before.inline_entries,
+            inline_compactions: self.inline_compactions - before.inline_compactions,
         }
     }
 
@@ -125,9 +121,9 @@ impl Counters {
         self.put_bytes += other.put_bytes;
         self.decoded_pages += other.decoded_pages;
         self.decoded_rows += other.decoded_rows;
-        self.node_reads += other.node_reads;
-        self.nodes_staged += other.nodes_staged;
-        self.hash_pruned += other.hash_pruned;
+        self.inline_reads += other.inline_reads;
+        self.inline_entries += other.inline_entries;
+        self.inline_compactions += other.inline_compactions;
     }
 }
 
@@ -150,27 +146,20 @@ struct Root {
     count: u64,
     generation: u64,
     parent: Option<ObjectId>,
-    /// Immutable schema-partitioned base pages.
+    /// Sole current-state owner: immutable schema-partitioned pages.
     pages: Vec<ObjectId>,
-    /// Sole current-state owner for the B+ tree layout.
-    tree_root: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug)]
-enum BptreeNode {
-    Branch {
-        /// Canonical minimum encoded key for each child, in strict order.
-        fences: Vec<Vec<u8>>,
-        children: Vec<ObjectId>,
-    },
-    Leaf(Vec<BptreeEntry>),
+struct InlinePage {
+    base: BTreeMap<u64, Vec<u8>>,
+    overlay: BTreeMap<u64, InlineMutation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct BptreeEntry {
-    encoded_key: Vec<u8>,
-    ordinal: u64,
-    value: Vec<u8>,
+enum InlineMutation {
+    Value(Vec<u8>),
+    Tombstone,
 }
 
 #[derive(Clone, Debug)]
@@ -442,10 +431,11 @@ impl<S: Storage + Clone> Store<S> {
 #[tokio::main]
 async fn main() {
     let config = parse_config();
-    bptree_codec_controls();
+    inline_codec_controls();
     println!(
-        "{LEDGER},kind=config,page_rows={PAGE_ROWS},bptree_page_bytes={},pk_kind={},pattern={},sizes={:?},histories={:?}",
-        bptree_page_bytes(),
+        "{LEDGER},kind=config,page_rows={PAGE_ROWS},inline_entries={},inline_bytes={},pk_kind={},pattern={},sizes={:?},histories={:?}",
+        inline_entry_cap(),
+        inline_byte_cap(),
         pk_kind(),
         mutation_pattern(),
         config.sizes,
@@ -456,7 +446,7 @@ async fn main() {
         for &n in &config.sizes {
             for &history in &config.histories {
                 for &delta in &config.deltas {
-                    for layout in [Layout::Slotted, Layout::Bptree] {
+                    for layout in [Layout::Slotted, Layout::Inline] {
                         match backend.as_str() {
                             "rocksdb" => run_rocks(&config, case, n, history, delta, layout).await,
                             "slatedb" => run_slate(&config, case, n, history, delta, layout).await,
@@ -878,7 +868,7 @@ fn emit(
     c: Counters,
 ) {
     println!(
-        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},node_reads={},nodes_staged={},hash_pruned={},settled_bytes={}",
+        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},inline_reads={},inline_entries={},inline_compactions={},settled_bytes={}",
         layout.name(),
         c.get_calls,
         c.get_keys,
@@ -888,9 +878,9 @@ fn emit(
         c.put_bytes,
         c.decoded_pages,
         c.decoded_rows,
-        c.node_reads,
-        c.nodes_staged,
-        c.hash_pruned,
+        c.inline_reads,
+        c.inline_entries,
+        c.inline_compactions,
         directory_bytes(path)
     );
 }
@@ -934,29 +924,17 @@ async fn build_initial<S: Storage + Clone>(
                 generation: 0,
                 parent: None,
                 pages: pages.iter().map(|(id, _)| *id).collect(),
-                tree_root: None,
             }
         }
-        Layout::Bptree => {
-            let entries = rows
-                .iter()
-                .map(|(ordinal, value)| BptreeEntry {
-                    encoded_key: state_key(*ordinal),
-                    ordinal: *ordinal,
-                    value: value.clone(),
-                })
-                .collect::<Vec<_>>();
-            let mut staged = Vec::new();
-            let tree_root = build_bptree(&entries, &mut staged)?;
-            store.counters.nodes_staged += staged.len() as u64;
-            store.put_objects(PAGE_SPACE, &staged).await?;
+        Layout::Inline => {
+            let pages = encode_inline_pages(rows);
+            store.put_objects(PAGE_SPACE, &pages).await?;
             Root {
                 layout,
                 count: rows.len() as u64,
                 generation: 0,
                 parent: None,
-                pages: Vec::new(),
-                tree_root: Some(tree_root),
+                pages: pages.iter().map(|(id, _)| *id).collect(),
             }
         }
     };
@@ -1005,24 +983,41 @@ async fn commit<S: Storage + Clone>(
                     generation,
                     parent: None,
                     pages: page_ids,
-                    tree_root: None,
                 },
             )
             .await
         }
-        Layout::Bptree => {
-            let tree_root = root
-                .tree_root
-                .ok_or_else(|| "B+ tree root is missing".to_owned())?;
-            let entries = mutations
+        Layout::Inline => {
+            let mut page_ids = root.pages.clone();
+            let touched = mutations
+                .keys()
+                .map(|key| (*key as usize) / PAGE_ROWS)
+                .collect::<BTreeSet<_>>();
+            let ids = touched
                 .iter()
-                .map(|(ordinal, value)| BptreeEntry {
-                    encoded_key: state_key(*ordinal),
-                    ordinal: *ordinal,
-                    value: value.clone(),
-                })
+                .filter_map(|index| page_ids.get(*index).copied())
                 .collect::<Vec<_>>();
-            let tree_root = bptree_update_many(store, tree_root, entries).await?;
+            let encoded = store.get_many(PAGE_SPACE, &ids).await?;
+            let mut staged = Vec::new();
+            for (index, bytes) in touched.iter().zip(encoded) {
+                let mut page = decode_inline_page_counted(&mut store.counters, &bytes)?;
+                for (key, value) in mutations {
+                    if (*key as usize) / PAGE_ROWS == *index {
+                        page.overlay
+                            .insert(*key, InlineMutation::Value(value.clone()));
+                    }
+                }
+                store.counters.inline_entries += page.overlay.len() as u64;
+                if should_compact_inline(&page) {
+                    compact_inline_page(&mut page)?;
+                    store.counters.inline_compactions += 1;
+                }
+                let bytes = encode_inline_page(&page);
+                let id = ObjectId::of(&bytes);
+                page_ids[*index] = id;
+                staged.push((id, bytes));
+            }
+            store.put_objects(PAGE_SPACE, &staged).await?;
             put_root(
                 store,
                 &Root {
@@ -1030,8 +1025,7 @@ async fn commit<S: Storage + Clone>(
                     count: full.len() as u64,
                     generation,
                     parent: Some(current),
-                    pages: Vec::new(),
-                    tree_root: Some(tree_root),
+                    pages: page_ids,
                 },
             )
             .await
@@ -1054,22 +1048,12 @@ async fn point_on_read<R: StorageRead>(
     key: u64,
 ) -> Result<Option<Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
-    if root.layout == Layout::Bptree {
-        let encoded_key = state_key(key);
-        return bptree_point(
-            store,
-            root.tree_root
-                .ok_or_else(|| "B+ tree root is missing".to_owned())?,
-            &encoded_key,
-        )
-        .await;
-    }
     let page_index = key as usize / PAGE_ROWS;
     let Some(page_id) = root.pages.get(page_index).copied() else {
         return Ok(None);
     };
     let bytes = store.get_one(PAGE_SPACE, page_id).await?;
-    let page = decode_page_counted(store.counters, &bytes)?;
+    let page = decode_visible_page_counted(store.counters, root.layout, &bytes, page_index)?;
     Ok(page.get(&key).cloned())
 }
 
@@ -1092,22 +1076,17 @@ async fn range<S: Storage + Clone>(
     if start >= end {
         return Ok(BTreeMap::new());
     }
-    if root.layout == Layout::Bptree {
-        return bptree_range(
-            &mut read,
-            root.tree_root
-                .ok_or_else(|| "B+ tree root is missing".to_owned())?,
-            &state_key(start),
-            &state_key(end),
-        )
-        .await;
-    }
     let first = start as usize / PAGE_ROWS;
     let last = (end.saturating_sub(1) as usize / PAGE_ROWS).min(root.pages.len() - 1);
     let objects = read.get_many(PAGE_SPACE, &root.pages[first..=last]).await?;
     let mut rows = BTreeMap::new();
-    for bytes in &objects {
-        rows.extend(decode_page_counted(read.counters, bytes)?);
+    for (offset, bytes) in objects.iter().enumerate() {
+        rows.extend(decode_visible_page_counted(
+            read.counters,
+            root.layout,
+            bytes,
+            first + offset,
+        )?);
     }
     Ok(rows
         .range(start..end)
@@ -1120,19 +1099,15 @@ async fn materialize_on_read<R: StorageRead>(
     root_id: ObjectId,
 ) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
-    if root.layout == Layout::Bptree {
-        let rows = bptree_enumerate(
-            store,
-            root.tree_root
-                .ok_or_else(|| "B+ tree root is missing".to_owned())?,
-        )
-        .await?;
-        return Ok(rows);
-    }
     let mut rows = BTreeMap::new();
     let objects = store.get_many(PAGE_SPACE, &root.pages).await?;
-    for bytes in &objects {
-        rows.extend(decode_page_counted(store.counters, &bytes)?);
+    for (index, bytes) in objects.iter().enumerate() {
+        rows.extend(decode_visible_page_counted(
+            store.counters,
+            root.layout,
+            bytes,
+            index,
+        )?);
     }
     Ok(rows)
 }
@@ -1160,23 +1135,11 @@ async fn diff_on_read<R: StorageRead>(
         return Err("cannot diff roots from different layouts".to_owned());
     }
     match before_root.layout {
-        Layout::Slotted => diff_slotted(store, &before_root, &after_root).await,
-        Layout::Bptree => {
-            bptree_diff(
-                store,
-                before_root
-                    .tree_root
-                    .ok_or_else(|| "B+ tree root is missing".to_owned())?,
-                after_root
-                    .tree_root
-                    .ok_or_else(|| "B+ tree root is missing".to_owned())?,
-            )
-            .await
-        }
+        Layout::Slotted | Layout::Inline => diff_pages(store, &before_root, &after_root).await,
     }
 }
 
-async fn diff_slotted<R: StorageRead>(
+async fn diff_pages<R: StorageRead>(
     store: &mut Reader<'_, R>,
     before: &Root,
     after: &Root,
@@ -1185,13 +1148,15 @@ async fn diff_slotted<R: StorageRead>(
         return Err("slotted roots have incompatible page geometry".to_owned());
     }
     let mut changed = BTreeSet::new();
-    for (before_id, after_id) in before.pages.iter().zip(&after.pages) {
+    for (index, (before_id, after_id)) in before.pages.iter().zip(&after.pages).enumerate() {
         if before_id == after_id {
             continue;
         }
         let bytes = store.get_many(PAGE_SPACE, &[*before_id, *after_id]).await?;
-        let before_page = decode_page_counted(store.counters, &bytes[0])?;
-        let after_page = decode_page_counted(store.counters, &bytes[1])?;
+        let before_page =
+            decode_visible_page_counted(store.counters, before.layout, &bytes[0], index)?;
+        let after_page =
+            decode_visible_page_counted(store.counters, after.layout, &bytes[1], index)?;
         changed.extend(
             before_page
                 .keys()
@@ -1232,24 +1197,12 @@ async fn corruption_control<S: Storage + Clone>(
     let decoded = decode_root(&root_bytes)?;
     let wrong = ObjectId([0x55; 32]);
     let mut corrupted = decoded.clone();
-    let retained = match decoded.layout {
-        Layout::Slotted => {
-            let page = decoded
-                .pages
-                .first()
-                .copied()
-                .ok_or_else(|| "slotted root has no page".to_owned())?;
-            corrupted.pages[0] = wrong;
-            page
-        }
-        Layout::Bptree => {
-            let node = decoded
-                .tree_root
-                .ok_or_else(|| "B+ tree root is missing".to_owned())?;
-            corrupted.tree_root = Some(wrong);
-            node
-        }
-    };
+    let retained = decoded
+        .pages
+        .first()
+        .copied()
+        .ok_or_else(|| "state root has no page".to_owned())?;
+    corrupted.pages[0] = wrong;
     let corrupt_bytes = encode_root(&corrupted);
     let corrupt_id = ObjectId::of(&corrupt_bytes);
     store
@@ -1257,63 +1210,15 @@ async fn corruption_control<S: Storage + Clone>(
         .await?;
     assert!(materialize(store, corrupt_id).await.is_err());
     assert!(store.get_one(PAGE_SPACE, retained).await.is_ok());
-    if decoded.layout == Layout::Bptree {
-        let node_bytes = store.get_one(PAGE_SPACE, retained).await?;
-        if let BptreeNode::Branch {
-            fences,
-            mut children,
-        } = decode_bptree_node(&node_bytes)?
-        {
-            if children.len() >= 2 {
-                let mut substituted_children = children.clone();
-                substituted_children[0] = substituted_children[1];
-                let substituted = BptreeNode::Branch {
-                    fences: fences.clone(),
-                    children: substituted_children,
-                };
-                let substituted_bytes = encode_bptree_node(&substituted);
-                let substituted_id = ObjectId::of(&substituted_bytes);
-                store
-                    .put_objects(PAGE_SPACE, &[(substituted_id, substituted_bytes)])
-                    .await?;
-                let mut substituted_root = decoded.clone();
-                substituted_root.tree_root = Some(substituted_id);
-                let root_bytes = encode_root(&substituted_root);
-                let root_id = ObjectId::of(&root_bytes);
-                store
-                    .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
-                    .await?;
-                assert!(materialize(store, root_id).await.is_err());
-            }
-            children[0] = wrong;
-            let malformed_child = BptreeNode::Branch { fences, children };
-            let malformed_bytes = encode_bptree_node(&malformed_child);
-            let malformed_id = ObjectId::of(&malformed_bytes);
-            store
-                .put_objects(PAGE_SPACE, &[(malformed_id, malformed_bytes)])
-                .await?;
-            let mut malformed_root = decoded.clone();
-            malformed_root.tree_root = Some(malformed_id);
-            let root_bytes = encode_root(&malformed_root);
-            let root_id = ObjectId::of(&root_bytes);
-            store
-                .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
-                .await?;
-            assert!(materialize(store, root_id).await.is_err());
-
-            let malformed_fence_bytes = b"BPB1\0\0\0\x01\0\0\0\0".to_vec();
-            let malformed_fence_id = ObjectId::of(&malformed_fence_bytes);
-            store
-                .put_objects(PAGE_SPACE, &[(malformed_fence_id, malformed_fence_bytes)])
-                .await?;
-            malformed_root.tree_root = Some(malformed_fence_id);
-            let root_bytes = encode_root(&malformed_root);
-            let root_id = ObjectId::of(&root_bytes);
-            store
-                .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
-                .await?;
-            assert!(materialize(store, root_id).await.is_err());
-        }
+    if decoded.layout == Layout::Inline && decoded.pages.len() >= 2 {
+        let mut substituted = decoded.clone();
+        substituted.pages[0] = substituted.pages[1];
+        let root_bytes = encode_root(&substituted);
+        let root_id = ObjectId::of(&root_bytes);
+        store
+            .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
+            .await?;
+        assert!(materialize(store, root_id).await.is_err());
     }
     Ok(())
 }
@@ -1402,7 +1307,7 @@ fn decode_page(bytes: &[u8]) -> Result<BTreeMap<u64, Vec<u8>>, String> {
 }
 
 fn encode_root(root: &Root) -> Vec<u8> {
-    let mut out = b"EHR1".to_vec();
+    let mut out = b"EIR1".to_vec();
     out.push(root.layout.tag());
     out.extend_from_slice(&root.count.to_be_bytes());
     out.extend_from_slice(&root.generation.to_be_bytes());
@@ -1417,22 +1322,15 @@ fn encode_root(root: &Root) -> Vec<u8> {
     for page in &root.pages {
         out.extend_from_slice(&page.0);
     }
-    match root.tree_root {
-        Some(id) => {
-            out.push(1);
-            out.extend_from_slice(&id.0);
-        }
-        None => out.push(0),
-    }
     out
 }
 
 fn decode_root(bytes: &[u8]) -> Result<Root, String> {
     let mut input = Decoder::new(bytes);
-    input.magic(b"EHR1")?;
+    input.magic(b"EIR1")?;
     let layout = match input.u8()? {
         1 => Layout::Slotted,
-        2 => Layout::Bptree,
+        2 => Layout::Inline,
         _ => return Err("unknown root layout".to_owned()),
     };
     let count = input.u64()?;
@@ -1443,29 +1341,21 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
         _ => return Err("invalid parent tag".to_owned()),
     };
     if layout == Layout::Slotted && parent.is_some() {
-        return Err("slotted root has B+ tree ancestry".to_owned());
+        return Err("slotted root has inline chronology".to_owned());
     }
-    if layout == Layout::Bptree && generation == 0 && parent.is_some() {
-        return Err("initial B+ tree root has parent".to_owned());
+    if layout == Layout::Inline && generation == 0 && parent.is_some() {
+        return Err("initial inline root has parent".to_owned());
     }
-    if layout == Layout::Bptree && generation > 0 && parent.is_none() {
-        return Err("versioned B+ tree root is missing chronology parent".to_owned());
+    if layout == Layout::Inline && generation > 0 && parent.is_none() {
+        return Err("versioned inline root is missing chronology parent".to_owned());
     }
     let count_pages = input.u32()? as usize;
     let mut pages = Vec::with_capacity(count_pages);
     for _ in 0..count_pages {
         pages.push(ObjectId(input.fixed_32()?));
     }
-    let tree_root = match input.u8()? {
-        0 => None,
-        1 => Some(ObjectId(input.fixed_32()?)),
-        _ => return Err("invalid B+ tree root tag".to_owned()),
-    };
-    if layout == Layout::Slotted && tree_root.is_some() {
-        return Err("slotted root has B+ tree owner".to_owned());
-    }
-    if layout == Layout::Bptree && (!pages.is_empty() || tree_root.is_none()) {
-        return Err("B+ tree root has a second or missing state owner".to_owned());
+    if pages.is_empty() && count != 0 {
+        return Err("state root is missing its sole page owner".to_owned());
     }
     input.finish()?;
     Ok(Root {
@@ -1474,7 +1364,6 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
         generation,
         parent,
         pages,
-        tree_root,
     })
 }
 
@@ -1508,561 +1397,268 @@ fn state_key(ordinal: u64) -> Vec<u8> {
 }
 
 fn pk_kind() -> String {
-    std::env::var("EXP_BPTREE_PK_KIND").unwrap_or_else(|_| "integer".to_owned())
+    std::env::var("EXP_INLINE_PK_KIND").unwrap_or_else(|_| "integer".to_owned())
 }
 
-fn bptree_page_bytes() -> usize {
-    std::env::var("EXP_BPTREE_PAGE_BYTES")
+fn inline_entry_cap() -> usize {
+    std::env::var("EXP_INLINE_ENTRIES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (*value).is_power_of_two())
-        .filter(|value| (BPTREE_MIN_PAGE_BYTES..=BPTREE_MAX_PAGE_BYTES).contains(value))
+        .filter(|value| matches!(*value, 2 | 4 | 8 | 16))
         .unwrap_or_else(|| {
-            let width = state_key(0).len() + tuple(0, 0).len();
-            (width * 32)
-                .next_power_of_two()
-                .clamp(BPTREE_MIN_PAGE_BYTES, BPTREE_MAX_PAGE_BYTES)
+            let width = state_key(0).len() + tuple(0, 0).len() + 16;
+            (256 / width).clamp(2, 16).next_power_of_two()
         })
 }
 
-fn common_prefix(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
+fn inline_byte_cap() -> usize {
+    std::env::var("EXP_INLINE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| matches!(*value, 128 | 256 | 512 | 1024 | 2048))
+        .unwrap_or_else(|| {
+            let width = state_key(0).len() + tuple(0, 0).len() + 16;
+            (inline_entry_cap() * width)
+                .next_power_of_two()
+                .clamp(128, 2048)
+        })
 }
 
-fn encode_prefixed_keys<'a>(keys: impl Iterator<Item = &'a [u8]>, out: &mut Vec<u8>) {
-    let mut previous = Vec::new();
-    for key in keys {
-        let prefix = common_prefix(&previous, key);
-        let suffix = &key[prefix..];
-        out.extend_from_slice(&(prefix as u16).to_be_bytes());
-        out.extend_from_slice(&(suffix.len() as u16).to_be_bytes());
-        out.extend_from_slice(suffix);
-        previous.clear();
-        previous.extend_from_slice(key);
-    }
+fn encode_inline_pages(rows: &BTreeMap<u64, Vec<u8>>) -> Vec<(ObjectId, Vec<u8>)> {
+    rows.iter()
+        .collect::<Vec<_>>()
+        .chunks(PAGE_ROWS)
+        .map(|chunk| {
+            let page = InlinePage {
+                base: chunk
+                    .iter()
+                    .map(|(key, value)| (**key, (*value).clone()))
+                    .collect(),
+                overlay: BTreeMap::new(),
+            };
+            let bytes = encode_inline_page(&page);
+            (ObjectId::of(&bytes), bytes)
+        })
+        .collect()
 }
 
-fn decode_prefixed_key(input: &mut Decoder<'_>, previous: &[u8]) -> Result<Vec<u8>, String> {
-    let prefix = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap()) as usize;
-    let suffix = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap()) as usize;
-    if prefix > previous.len() {
-        return Err("malformed B+ tree key prefix".to_owned());
-    }
-    let mut key = previous[..prefix].to_vec();
-    key.extend_from_slice(input.bytes(suffix)?);
-    Ok(key)
-}
-
-fn encode_bptree_node(node: &BptreeNode) -> Vec<u8> {
-    match node {
-        BptreeNode::Branch { fences, children } => {
-            let mut out = b"BPB1".to_vec();
-            out.extend_from_slice(&(fences.len() as u32).to_be_bytes());
-            encode_prefixed_keys(fences.iter().map(Vec::as_slice), &mut out);
-            for child in children {
-                out.extend_from_slice(&child.0);
-            }
-            out
-        }
-        BptreeNode::Leaf(entries) => {
-            let mut out = b"BPL1".to_vec();
-            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-            let mut previous = Vec::new();
-            for entry in entries {
-                let prefix = common_prefix(&previous, &entry.encoded_key);
-                let suffix = &entry.encoded_key[prefix..];
-                out.extend_from_slice(&(prefix as u16).to_be_bytes());
-                out.extend_from_slice(&(suffix.len() as u16).to_be_bytes());
-                out.extend_from_slice(suffix);
-                out.extend_from_slice(&entry.ordinal.to_be_bytes());
-                out.extend_from_slice(&(entry.value.len() as u32).to_be_bytes());
-                out.extend_from_slice(&entry.value);
-                previous.clone_from(&entry.encoded_key);
-            }
-            out
+fn encode_inline_mutation(out: &mut Vec<u8>, key: u64, mutation: &InlineMutation) {
+    let encoded_key = state_key(key);
+    out.extend_from_slice(&(encoded_key.len() as u32).to_be_bytes());
+    out.extend_from_slice(&encoded_key);
+    out.extend_from_slice(&key.to_be_bytes());
+    match mutation {
+        InlineMutation::Tombstone => out.push(0),
+        InlineMutation::Value(value) => {
+            out.push(1);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value);
         }
     }
 }
 
-fn decode_bptree_node(bytes: &[u8]) -> Result<BptreeNode, String> {
-    if bytes.len() > bptree_page_bytes() {
-        return Err("B+ tree node exceeds canonical byte target".to_owned());
+fn encode_inline_page(page: &InlinePage) -> Vec<u8> {
+    let base = encode_page(&page.base);
+    let mut out = b"IDP1".to_vec();
+    out.extend_from_slice(&(base.len() as u32).to_be_bytes());
+    out.extend_from_slice(&base);
+    out.extend_from_slice(&(page.overlay.len() as u16).to_be_bytes());
+    for (key, mutation) in &page.overlay {
+        encode_inline_mutation(&mut out, *key, mutation);
     }
-    if bytes.starts_with(b"BPB1") {
-        let mut input = Decoder::new(bytes);
-        input.magic(b"BPB1")?;
-        let count = input.u32()? as usize;
-        if count < 2 {
-            return Err("noncanonical unary/empty B+ tree branch".to_owned());
-        }
-        let mut fences = Vec::with_capacity(count);
-        let mut previous = Vec::new();
-        for _ in 0..count {
-            let key = decode_prefixed_key(&mut input, &previous)?;
-            if !previous.is_empty() && previous >= key {
-                return Err("duplicate or unordered B+ tree fence".to_owned());
-            }
-            previous.clone_from(&key);
-            fences.push(key);
-        }
-        let mut children = Vec::with_capacity(count);
-        for _ in 0..count {
-            children.push(ObjectId(input.fixed_32()?));
-        }
-        input.finish()?;
-        return Ok(BptreeNode::Branch { fences, children });
-    }
+    out
+}
+
+fn decode_inline_page(bytes: &[u8]) -> Result<InlinePage, String> {
     let mut input = Decoder::new(bytes);
-    input.magic(b"BPL1")?;
-    let count = input.u32()? as usize;
-    if count == 0 {
-        return Err("empty B+ tree leaf".to_owned());
+    input.magic(b"IDP1")?;
+    let base_len = input.u32()? as usize;
+    let base = decode_page(input.bytes(base_len)?)?;
+    if base.is_empty() {
+        return Err("inline page has empty base".to_owned());
     }
-    let mut entries = Vec::with_capacity(count);
-    let mut previous = Vec::new();
+    let base_page = *base.first_key_value().unwrap().0 as usize / PAGE_ROWS;
+    if base
+        .keys()
+        .any(|key| *key as usize / PAGE_ROWS != base_page)
+    {
+        return Err("inline page base crosses canonical leaf boundary".to_owned());
+    }
+    let count = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap()) as usize;
+    if count > 16 {
+        return Err("inline mutation area exceeds format bound".to_owned());
+    }
+    let mut overlay = BTreeMap::new();
+    let mut previous = None;
     for _ in 0..count {
-        let encoded_key = decode_prefixed_key(&mut input, &previous)?;
-        if !previous.is_empty() && previous >= encoded_key {
-            return Err("duplicate or unordered B+ tree leaf key".to_owned());
+        let key_len = input.u32()? as usize;
+        let encoded_key = input.bytes(key_len)?.to_vec();
+        let key = input.u64()?;
+        if encoded_key != state_key(key) {
+            return Err("inline StateKey/ordinal binding mismatch".to_owned());
         }
-        let ordinal = input.u64()?;
-        let value_len = input.u32()? as usize;
-        let value = input.bytes(value_len)?.to_vec();
-        if encoded_key != state_key(ordinal) {
-            return Err("B+ tree StateKey/ordinal binding mismatch".to_owned());
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err("duplicate or noncanonical inline mutation order".to_owned());
         }
-        decode_body(&TUPLE_PLAN, &value).map_err(|error| error.to_string())?;
-        previous.clone_from(&encoded_key);
-        entries.push(BptreeEntry {
-            encoded_key,
-            ordinal,
-            value,
-        });
+        if key as usize / PAGE_ROWS != base_page {
+            return Err("inline mutation has wrong base-page binding".to_owned());
+        }
+        let mutation = match input.u8()? {
+            0 => InlineMutation::Tombstone,
+            1 => {
+                let value_len = input.u32()? as usize;
+                let value = input.bytes(value_len)?.to_vec();
+                decode_body(&TUPLE_PLAN, &value).map_err(|error| error.to_string())?;
+                InlineMutation::Value(value)
+            }
+            _ => return Err("malformed inline mutation tag".to_owned()),
+        };
+        previous = Some(key);
+        if overlay.insert(key, mutation).is_some() {
+            return Err("duplicate inline mutation".to_owned());
+        }
     }
     input.finish()?;
-    Ok(BptreeNode::Leaf(entries))
+    Ok(InlinePage { base, overlay })
 }
 
-fn node_min_key(node: &BptreeNode) -> &[u8] {
-    match node {
-        BptreeNode::Branch { fences, .. } => &fences[0],
-        BptreeNode::Leaf(entries) => &entries[0].encoded_key,
-    }
+fn decode_inline_page_counted(counters: &mut Counters, bytes: &[u8]) -> Result<InlinePage, String> {
+    let page = decode_inline_page(bytes)?;
+    counters.decoded_pages += 1;
+    counters.decoded_rows += page.base.len() as u64;
+    counters.inline_reads += 1;
+    counters.inline_entries += page.overlay.len() as u64;
+    Ok(page)
 }
 
-fn stage_bptree_node(
-    node: &BptreeNode,
-    staged: &mut Vec<(ObjectId, Vec<u8>)>,
-) -> Result<ObjectId, String> {
-    let bytes = encode_bptree_node(node);
-    if bytes.len() > bptree_page_bytes() {
-        return Err("B+ tree node exceeds target during staging".to_owned());
+fn inline_overlay_bytes(page: &InlinePage) -> usize {
+    let mut bytes = Vec::new();
+    for (key, mutation) in &page.overlay {
+        encode_inline_mutation(&mut bytes, *key, mutation);
     }
-    let id = ObjectId::of(&bytes);
-    staged.push((id, bytes));
-    Ok(id)
+    bytes.len()
 }
 
-fn partition_entries(entries: &[BptreeEntry]) -> Vec<Vec<BptreeEntry>> {
-    let mut pages = Vec::new();
-    let mut current = Vec::new();
-    for entry in entries {
-        let mut candidate = current.clone();
-        candidate.push(entry.clone());
-        if !current.is_empty()
-            && encode_bptree_node(&BptreeNode::Leaf(candidate)).len() > bptree_page_bytes()
-        {
-            pages.push(std::mem::take(&mut current));
-        }
-        current.push(entry.clone());
-    }
-    if !current.is_empty() {
-        pages.push(current);
-    }
-    pages
+fn should_compact_inline(page: &InlinePage) -> bool {
+    page.overlay.len() >= inline_entry_cap() || inline_overlay_bytes(page) >= inline_byte_cap()
 }
 
-fn partition_children(children: &[(Vec<u8>, ObjectId)]) -> Vec<Vec<(Vec<u8>, ObjectId)>> {
-    let mut pages = Vec::new();
-    let mut current = Vec::new();
-    for child in children {
-        let mut candidate = current.clone();
-        candidate.push(child.clone());
-        let node = BptreeNode::Branch {
-            fences: candidate.iter().map(|(key, _)| key.clone()).collect(),
-            children: candidate.iter().map(|(_, id)| *id).collect(),
-        };
-        if current.len() >= 2 && encode_bptree_node(&node).len() > bptree_page_bytes() {
-            pages.push(std::mem::take(&mut current));
-        }
-        current.push(child.clone());
-    }
-    if !current.is_empty() {
-        pages.push(current);
-    }
-    pages
-}
-
-fn build_bptree(
-    entries: &[BptreeEntry],
-    staged: &mut Vec<(ObjectId, Vec<u8>)>,
-) -> Result<ObjectId, String> {
-    if entries.is_empty() {
-        return Err("cannot build empty B+ tree".to_owned());
-    }
-    let mut sorted = entries.to_vec();
-    sorted.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
-    if !sorted
-        .windows(2)
-        .all(|pair| pair[0].encoded_key < pair[1].encoded_key)
-    {
-        return Err("duplicate B+ tree StateKey".to_owned());
-    }
-    let mut level = Vec::new();
-    for page in partition_entries(&sorted) {
-        let node = BptreeNode::Leaf(page);
-        let min = node_min_key(&node).to_vec();
-        level.push((min, stage_bptree_node(&node, staged)?));
-    }
-    while level.len() > 1 {
-        let groups = partition_children(&level);
-        level = groups
-            .into_iter()
-            .map(|group| {
-                if group.len() == 1 {
-                    return Ok(group[0].clone());
-                }
-                let node = BptreeNode::Branch {
-                    fences: group.iter().map(|(key, _)| key.clone()).collect(),
-                    children: group.iter().map(|(_, id)| *id).collect(),
-                };
-                let min = node_min_key(&node).to_vec();
-                Ok((min, stage_bptree_node(&node, staged)?))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-    }
-    Ok(level[0].1)
-}
-
-async fn load_bptree_node<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    id: ObjectId,
-    expected_min: Option<&[u8]>,
-) -> Result<BptreeNode, String> {
-    let bytes = store.get_one(PAGE_SPACE, id).await?;
-    let node = decode_bptree_node(&bytes)?;
-    if expected_min.is_some_and(|expected| expected != node_min_key(&node)) {
-        return Err("B+ tree fence/child minimum binding mismatch".to_owned());
-    }
-    store.counters.node_reads += 1;
-    store.counters.decoded_pages += 1;
-    if let BptreeNode::Leaf(entries) = &node {
-        store.counters.decoded_rows += entries.len() as u64;
-    }
-    Ok(node)
-}
-
-async fn put_bptree_node<S: Storage + Clone>(
-    store: &mut Store<S>,
-    node: &BptreeNode,
-) -> Result<ObjectId, String> {
-    let bytes = encode_bptree_node(node);
-    if bytes.len() > bptree_page_bytes() {
-        return Err("B+ tree path-copy page exceeds target".to_owned());
-    }
-    let id = ObjectId::of(&bytes);
-    store.put_objects(PAGE_SPACE, &[(id, bytes)]).await?;
-    store.counters.nodes_staged += 1;
-    Ok(id)
-}
-
-fn branch_child_index(fences: &[Vec<u8>], key: &[u8]) -> usize {
-    fences
-        .partition_point(|fence| fence.as_slice() <= key)
-        .saturating_sub(1)
-}
-
-async fn bptree_update_many<S: Storage + Clone>(
-    store: &mut Store<S>,
-    node_id: ObjectId,
-    entries: Vec<BptreeEntry>,
-) -> Result<ObjectId, String> {
-    let mut level = bptree_update_nodes(store, node_id, None, entries).await?;
-    while level.len() > 1 {
-        let groups = partition_children(&level);
-        let mut next = Vec::new();
-        for group in groups {
-            if group.len() == 1 {
-                next.push(group[0].clone());
-                continue;
+fn compact_inline_page(page: &mut InlinePage) -> Result<(), String> {
+    for (key, mutation) in std::mem::take(&mut page.overlay) {
+        match mutation {
+            InlineMutation::Value(value) => {
+                page.base.insert(key, value);
             }
-            let node = BptreeNode::Branch {
-                fences: group.iter().map(|(key, _)| key.clone()).collect(),
-                children: group.iter().map(|(_, id)| *id).collect(),
-            };
-            let min = node_min_key(&node).to_vec();
-            next.push((min, put_bptree_node(store, &node).await?));
-        }
-        level = next;
-    }
-    Ok(level[0].1)
-}
-
-fn bptree_update_nodes<'a, S: Storage + Clone + 'a>(
-    store: &'a mut Store<S>,
-    node_id: ObjectId,
-    expected_min: Option<Vec<u8>>,
-    entries: Vec<BptreeEntry>,
-) -> Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, ObjectId)>, String>> + 'a>> {
-    Box::pin(async move {
-        if entries.is_empty() {
-            return Ok(vec![(
-                expected_min.ok_or_else(|| "missing unchanged subtree fence".to_owned())?,
-                node_id,
-            )]);
-        }
-        let node = {
-            let mut read = store.reader().await?;
-            load_bptree_node(&mut read, node_id, expected_min.as_deref()).await?
-        };
-        match node {
-            BptreeNode::Leaf(mut existing) => {
-                for entry in entries {
-                    let index = existing
-                        .binary_search_by(|candidate| candidate.encoded_key.cmp(&entry.encoded_key))
-                        .map_err(|_| {
-                            "B+ tree update cannot insert through value-only path".to_owned()
-                        })?;
-                    existing[index] = entry;
-                }
-                let mut result = Vec::new();
-                for page in partition_entries(&existing) {
-                    let node = BptreeNode::Leaf(page);
-                    let min = node_min_key(&node).to_vec();
-                    result.push((min, put_bptree_node(store, &node).await?));
-                }
-                Ok(result)
-            }
-            BptreeNode::Branch { fences, children } => {
-                let mut grouped = BTreeMap::<usize, Vec<BptreeEntry>>::new();
-                for entry in entries {
-                    let index = branch_child_index(&fences, &entry.encoded_key);
-                    if entry.encoded_key.as_slice() < fences[index].as_slice() {
-                        return Err("B+ tree update escaped selected fence".to_owned());
-                    }
-                    grouped.entry(index).or_default().push(entry);
-                }
-                let mut replacement = Vec::new();
-                for index in 0..children.len() {
-                    if let Some(entries) = grouped.remove(&index) {
-                        replacement.extend(
-                            bptree_update_nodes(
-                                store,
-                                children[index],
-                                Some(fences[index].clone()),
-                                entries,
-                            )
-                            .await?,
-                        );
-                    } else {
-                        replacement.push((fences[index].clone(), children[index]));
-                    }
-                }
-                let mut result = Vec::new();
-                for group in partition_children(&replacement) {
-                    if group.len() == 1 {
-                        result.push(group[0].clone());
-                        continue;
-                    }
-                    let node = BptreeNode::Branch {
-                        fences: group.iter().map(|(key, _)| key.clone()).collect(),
-                        children: group.iter().map(|(_, id)| *id).collect(),
-                    };
-                    let min = node_min_key(&node).to_vec();
-                    result.push((min, put_bptree_node(store, &node).await?));
-                }
-                Ok(result)
-            }
-        }
-    })
-}
-
-async fn bptree_point<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    mut node_id: ObjectId,
-    encoded_key: &[u8],
-) -> Result<Option<Vec<u8>>, String> {
-    let mut expected_min: Option<Vec<u8>> = None;
-    loop {
-        match load_bptree_node(store, node_id, expected_min.as_deref()).await? {
-            BptreeNode::Leaf(entries) => {
-                return Ok(entries
-                    .binary_search_by(|entry| entry.encoded_key.as_slice().cmp(encoded_key))
-                    .ok()
-                    .map(|index| entries[index].value.clone()));
-            }
-            BptreeNode::Branch { fences, children } => {
-                let index = branch_child_index(&fences, encoded_key);
-                expected_min = Some(fences[index].clone());
-                node_id = children[index];
+            InlineMutation::Tombstone => {
+                page.base.remove(&key);
             }
         }
     }
+    if page.base.is_empty() {
+        return Err("inline compaction cannot remove the complete leaf".to_owned());
+    }
+    Ok(())
 }
 
-fn bptree_collect_range<'a, R: StorageRead + 'a>(
-    store: &'a mut Reader<'_, R>,
-    node_id: ObjectId,
-    expected_min: Option<Vec<u8>>,
-    start: &'a [u8],
-    end: &'a [u8],
-    rows: &'a mut BTreeMap<u64, Vec<u8>>,
-) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
-    Box::pin(async move {
-        match load_bptree_node(store, node_id, expected_min.as_deref()).await? {
-            BptreeNode::Leaf(entries) => {
-                for entry in entries {
-                    if entry.encoded_key.as_slice() >= start && entry.encoded_key.as_slice() < end {
-                        if rows.insert(entry.ordinal, entry.value).is_some() {
-                            return Err("duplicate B+ tree row during range".to_owned());
-                        }
-                    }
-                }
+fn inline_visible(page: InlinePage) -> BTreeMap<u64, Vec<u8>> {
+    let mut rows = page.base;
+    for (key, mutation) in page.overlay {
+        match mutation {
+            InlineMutation::Value(value) => {
+                rows.insert(key, value);
             }
-            BptreeNode::Branch { fences, children } => {
-                for index in 0..children.len() {
-                    let lower = fences[index].as_slice();
-                    let upper = fences.get(index + 1).map(Vec::as_slice);
-                    if upper.is_some_and(|upper| upper <= start) || lower >= end {
-                        continue;
-                    }
-                    bptree_collect_range(
-                        store,
-                        children[index],
-                        Some(fences[index].clone()),
-                        start,
-                        end,
-                        rows,
-                    )
-                    .await?;
-                }
+            InlineMutation::Tombstone => {
+                rows.remove(&key);
             }
         }
-        Ok(())
-    })
+    }
+    rows
 }
 
-async fn bptree_range<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    node_id: ObjectId,
-    start: &[u8],
-    end: &[u8],
+fn validate_page_index(rows: &BTreeMap<u64, Vec<u8>>, expected: usize) -> Result<(), String> {
+    if rows.keys().any(|key| *key as usize / PAGE_ROWS != expected) {
+        return Err("state page/root directory position mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn decode_visible_page_counted(
+    counters: &mut Counters,
+    layout: Layout,
+    bytes: &[u8],
+    expected_index: usize,
 ) -> Result<BTreeMap<u64, Vec<u8>>, String> {
-    let mut rows = BTreeMap::new();
-    bptree_collect_range(store, node_id, None, start, end, &mut rows).await?;
+    let rows = match layout {
+        Layout::Slotted => decode_page_counted(counters, bytes)?,
+        Layout::Inline => inline_visible(decode_inline_page_counted(counters, bytes)?),
+    };
+    validate_page_index(&rows, expected_index)?;
     Ok(rows)
 }
 
-async fn bptree_enumerate<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    node_id: ObjectId,
-) -> Result<BTreeMap<u64, Vec<u8>>, String> {
-    let mut rows = BTreeMap::new();
-    let mut stack = vec![(node_id, None)];
-    while let Some((id, expected_min)) = stack.pop() {
-        match load_bptree_node(store, id, expected_min.as_deref()).await? {
-            BptreeNode::Leaf(entries) => {
-                for entry in entries {
-                    if rows.insert(entry.ordinal, entry.value).is_some() {
-                        return Err("duplicate B+ tree row during enumeration".to_owned());
-                    }
-                }
-            }
-            BptreeNode::Branch { fences, children } => {
-                stack.extend(
-                    children
-                        .into_iter()
-                        .zip(fences)
-                        .rev()
-                        .map(|(id, fence)| (id, Some(fence))),
-                );
-            }
-        }
-    }
-    Ok(rows)
-}
+fn inline_codec_controls() {
+    let base = (0..PAGE_ROWS as u64)
+        .map(|key| (key, tuple(key, 0)))
+        .collect::<BTreeMap<_, _>>();
+    let mut first = InlinePage {
+        base: base.clone(),
+        overlay: BTreeMap::new(),
+    };
+    first.overlay.insert(1, InlineMutation::Value(tuple(1, 2)));
+    first.overlay.insert(2, InlineMutation::Tombstone);
+    let encoded = encode_inline_page(&first);
+    let decoded = decode_inline_page(&encoded).unwrap();
+    let visible = inline_visible(decoded);
+    assert_eq!(visible.get(&1), Some(&tuple(1, 2)));
+    assert!(!visible.contains_key(&2));
 
-async fn bptree_diff<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    before: ObjectId,
-    after: ObjectId,
-) -> Result<BTreeSet<u64>, String> {
-    let mut changed = BTreeSet::new();
-    let mut stack = vec![(before, after, None::<Vec<u8>>)];
-    while let Some((before, after, expected_min)) = stack.pop() {
-        if before == after {
-            store.counters.hash_pruned += 1;
-            continue;
-        }
-        let before_node = load_bptree_node(store, before, expected_min.as_deref()).await?;
-        let after_node = load_bptree_node(store, after, expected_min.as_deref()).await?;
-        match (before_node, after_node) {
-            (
-                BptreeNode::Branch {
-                    fences: before_fences,
-                    children: before_children,
-                },
-                BptreeNode::Branch {
-                    fences: after_fences,
-                    children: after_children,
-                },
-            ) if before_fences == after_fences => {
-                stack.extend(
-                    before_children
-                        .into_iter()
-                        .zip(after_children)
-                        .zip(before_fences)
-                        .map(|((before, after), fence)| (before, after, Some(fence))),
-                );
-            }
-            (BptreeNode::Leaf(before_entries), BptreeNode::Leaf(after_entries)) => {
-                let before_rows = before_entries
-                    .into_iter()
-                    .map(|entry| (entry.ordinal, entry.value))
-                    .collect::<BTreeMap<_, _>>();
-                let after_rows = after_entries
-                    .into_iter()
-                    .map(|entry| (entry.ordinal, entry.value))
-                    .collect::<BTreeMap<_, _>>();
-                changed.extend(
-                    before_rows
-                        .keys()
-                        .chain(after_rows.keys())
-                        .copied()
-                        .filter(|key| before_rows.get(key) != after_rows.get(key)),
-                );
-            }
-            _ => {
-                // Deterministic split/merge can change local geometry. Only
-                // the unequal authenticated subtree is enumerated.
-                let before_rows = bptree_enumerate(store, before).await?;
-                let after_rows = bptree_enumerate(store, after).await?;
-                changed.extend(
-                    before_rows
-                        .keys()
-                        .chain(after_rows.keys())
-                        .copied()
-                        .filter(|key| before_rows.get(key) != after_rows.get(key)),
-                );
-            }
-        }
-    }
-    Ok(changed)
-}
+    let mut reverse = InlinePage {
+        base: base.clone(),
+        overlay: BTreeMap::new(),
+    };
+    reverse.overlay.insert(2, InlineMutation::Tombstone);
+    reverse
+        .overlay
+        .insert(1, InlineMutation::Value(tuple(1, 2)));
+    assert_eq!(encode_inline_page(&first), encode_inline_page(&reverse));
 
+    let mut compacted_first = first.clone();
+    compact_inline_page(&mut compacted_first).unwrap();
+    let mut compacted_reverse = reverse;
+    compact_inline_page(&mut compacted_reverse).unwrap();
+    assert_eq!(
+        encode_inline_page(&compacted_first),
+        encode_inline_page(&compacted_reverse)
+    );
+
+    let mut duplicate = b"IDP1".to_vec();
+    let base_bytes = encode_page(&base);
+    duplicate.extend_from_slice(&(base_bytes.len() as u32).to_be_bytes());
+    duplicate.extend_from_slice(&base_bytes);
+    duplicate.extend_from_slice(&2u16.to_be_bytes());
+    encode_inline_mutation(&mut duplicate, 1, &InlineMutation::Tombstone);
+    encode_inline_mutation(&mut duplicate, 1, &InlineMutation::Value(tuple(1, 1)));
+    assert!(decode_inline_page(&duplicate).is_err());
+
+    let wrong_base = InlinePage {
+        base,
+        overlay: BTreeMap::from([(
+            PAGE_ROWS as u64,
+            InlineMutation::Value(tuple(PAGE_ROWS as u64, 1)),
+        )]),
+    };
+    assert!(decode_inline_page(&encode_inline_page(&wrong_base)).is_err());
+
+    let mut malformed = encoded.clone();
+    malformed.pop();
+    assert!(decode_inline_page(&malformed).is_err());
+
+    // Both pre-compaction and compacted bytes are independently complete;
+    // publication selects one immutable object, so a crash cannot expose a
+    // partially compacted second authority.
+    assert!(decode_inline_page(&encode_inline_page(&first)).is_ok());
+    assert!(decode_inline_page(&encode_inline_page(&compacted_first)).is_ok());
+}
 fn tuple(key: u64, generation: u64) -> Vec<u8> {
     let mut out = Vec::new();
     encode_body(
@@ -2112,53 +1708,8 @@ fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
     }
 }
 
-fn bptree_codec_controls() {
-    let entries = (0..1_000u64)
-        .map(|ordinal| BptreeEntry {
-            encoded_key: state_key(ordinal),
-            ordinal,
-            value: tuple(ordinal, 0),
-        })
-        .collect::<Vec<_>>();
-    let mut forward = Vec::new();
-    let forward_root = build_bptree(&entries, &mut forward).unwrap();
-    let mut reversed_entries = entries.clone();
-    reversed_entries.reverse();
-    let mut reverse = Vec::new();
-    let reverse_root = build_bptree(&reversed_entries, &mut reverse).unwrap();
-    assert_eq!(forward_root, reverse_root);
-
-    let duplicate_fences = BptreeNode::Branch {
-        fences: vec![state_key(0), state_key(0)],
-        children: vec![ObjectId([1; 32]), ObjectId([2; 32])],
-    };
-    assert!(decode_bptree_node(&encode_bptree_node(&duplicate_fences)).is_err());
-
-    let leaf = BptreeNode::Leaf(vec![entries[0].clone()]);
-    let mut truncated = encode_bptree_node(&leaf);
-    truncated.pop();
-    assert!(decode_bptree_node(&truncated).is_err());
-
-    // Canonical deterministic split/merge/delete: rebuilding after deleting
-    // an adversarial boundary key is independent of insertion order, and
-    // reinsertion restores the original authenticated root.
-    let mut deleted = entries.clone();
-    let removed = deleted.remove(deleted.len() / 2);
-    let mut deleted_forward = Vec::new();
-    let deleted_root = build_bptree(&deleted, &mut deleted_forward).unwrap();
-    deleted.reverse();
-    let mut deleted_reverse = Vec::new();
-    assert_eq!(
-        deleted_root,
-        build_bptree(&deleted, &mut deleted_reverse).unwrap()
-    );
-    deleted.push(removed);
-    let mut restored = Vec::new();
-    assert_eq!(forward_root, build_bptree(&deleted, &mut restored).unwrap());
-}
-
 fn mutation_pattern() -> String {
-    std::env::var("EXP_BPTREE_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
+    std::env::var("EXP_INLINE_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
 }
 
 fn map_digest(rows: &BTreeMap<u64, Vec<u8>>) -> ObjectId {

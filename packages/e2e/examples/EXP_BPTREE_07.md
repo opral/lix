@@ -2,7 +2,11 @@
 
 ## Verdict
 
-**QUALIFIED NO-WIN. Global consecutive no-win streak: 7/20.**
+**QUALIFIED NO-WIN. Corrected global consecutive no-win streak: 8/20.**
+
+The immutable B+ tree ref originally recorded 7/20. EXP-HOTCOLD-04 completed
+independently and precedes it in the coordinator's global ledger, making the
+B+ tree the eighth consecutive no-win. Its frozen ref remains unchanged.
 
 The prior HAMT result is globally experiment 6/20 because EXP-JSONB-01
 completed independently. Its immutable ref remains unchanged.
