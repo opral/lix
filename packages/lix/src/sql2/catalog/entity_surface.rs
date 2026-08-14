@@ -301,6 +301,7 @@ pub(crate) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
             | "lix_change"
             | "lix_directory_descriptor"
             | "lix_file_descriptor"
+            | "lix_checkpoint_marker"
             | "lix_undo_redo_marker"
             | "lix_collection_generation"
     )

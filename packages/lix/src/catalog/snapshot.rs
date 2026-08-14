@@ -746,37 +746,34 @@ fn primary_key_component_types(
     schema: &JsonValue,
     paths: &[Vec<String>],
 ) -> Result<Vec<crate::entity_pk::EntityPkComponentType>, LixError> {
+    let schema = crate::schema::parse_lix_schema(schema)?;
     paths
         .iter()
         .enumerate()
         .map(|(index, path)| {
-            let property = path.iter().try_fold(schema, |current, segment| {
-                current.get("properties")?.get(segment)
-            });
-            let Some(property) = property else {
+            let [name] = path.as_slice() else {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
-                    format!("primary-key path at index {index} has no property schema"),
+                    format!("primary-key path at index {index} must name one column"),
                 ));
             };
-            match (
-                property.get("type").and_then(JsonValue::as_str),
-                property.get("format").and_then(JsonValue::as_str),
-                property.get("contentEncoding").and_then(JsonValue::as_str),
-            ) {
-                (Some("integer"), _, _) => Ok(crate::entity_pk::EntityPkComponentType::Integer),
-                (Some("string"), Some("uuid"), _) => {
-                    Ok(crate::entity_pk::EntityPkComponentType::Uuid)
-                }
-                (Some("string"), _, Some("base64")) => {
-                    Ok(crate::entity_pk::EntityPkComponentType::Bytes)
-                }
-                (Some("string"), _, _) => Ok(crate::entity_pk::EntityPkComponentType::String),
+            let column = schema
+                .columns
+                .iter()
+                .find(|column| &column.name == name)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!("primary-key column '{name}' does not exist"),
+                    )
+                })?;
+            match column.data_type {
+                lix_schema::DataType::Int8 => Ok(crate::entity_pk::EntityPkComponentType::Integer),
+                lix_schema::DataType::Uuid => Ok(crate::entity_pk::EntityPkComponentType::Uuid),
+                lix_schema::DataType::Text => Ok(crate::entity_pk::EntityPkComponentType::String),
                 _ => Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "primary-key path at index {index} must be an integer, string, UUID string, or base64 string"
-                    ),
+                    format!("primary-key column at index {index} must be bigint, text, or uuid"),
                 )),
             }
         })
@@ -2502,29 +2499,14 @@ impl SchemaCatalogFact {
 }
 
 fn primary_key_paths(schema: &JsonValue) -> Result<Option<Vec<Vec<String>>>, LixError> {
-    let Some(primary_key) = schema.get("x-lix-primary-key") else {
-        return Ok(None);
-    };
-    let primary_key = primary_key.as_array().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            "schema x-lix-primary-key must be an array of JSON Pointers",
-        )
-    })?;
-    primary_key
-        .iter()
-        .enumerate()
-        .map(|(index, pointer)| {
-            let pointer = pointer.as_str().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!("schema x-lix-primary-key entry at index {index} must be a string"),
-                )
-            })?;
-            parse_json_pointer(pointer)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    let schema = crate::schema::parse_lix_schema(schema)?;
+    Ok(Some(
+        schema
+            .primary_key
+            .into_iter()
+            .map(|column| vec![column])
+            .collect(),
+    ))
 }
 
 fn pointer_groups(schema: &JsonValue, field: &str) -> Result<Vec<PointerGroup>, LixError> {
