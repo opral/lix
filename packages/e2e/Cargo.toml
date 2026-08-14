@@ -225,6 +225,7 @@ required-features = ["storage-benches", "slatedb"]
 [[bench]]
 name = "parsed_markdown_qualification"
 path = "benches/parsed_markdown_qualification.rs"
+harness = false
 required-features = ["storage-benches", "slatedb", "sdk-tests"]
 
 [[test]]
