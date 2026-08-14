@@ -7031,7 +7031,8 @@ fn decode_columnar_change_record(
             serde_json::Value::Null
         } else {
             match field.data_type {
-                crate::columnar_row_group::RowGroupDataType::String => {
+                crate::columnar_row_group::RowGroupDataType::String
+                | crate::columnar_row_group::RowGroupDataType::Json => {
                     let value = column
                         .as_any()
                         .downcast_ref::<StringArray>()

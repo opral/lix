@@ -98,6 +98,7 @@ pub(crate) enum RowGroupDataType {
     Int64 = 2,
     Float64 = 3,
     Boolean = 4,
+    Json = 5,
 }
 
 impl RowGroupDataType {
@@ -113,12 +114,22 @@ impl RowGroupDataType {
         }
     }
 
+    fn from_field(field: &Field) -> Result<Self, LixError> {
+        if field.data_type() == &DataType::Utf8
+            && field.metadata().get("lix.value_type").map(String::as_str) == Some("json")
+        {
+            return Ok(Self::Json);
+        }
+        Self::from_arrow(field.data_type())
+    }
+
     pub(crate) fn to_arrow(self) -> DataType {
         match self {
             Self::String => DataType::Utf8,
             Self::Int64 => DataType::Int64,
             Self::Float64 => DataType::Float64,
             Self::Boolean => DataType::Boolean,
+            Self::Json => DataType::Utf8,
         }
     }
 
@@ -128,6 +139,7 @@ impl RowGroupDataType {
             2 => Ok(Self::Int64),
             3 => Ok(Self::Float64),
             4 => Ok(Self::Boolean),
+            5 => Ok(Self::Json),
             _ => Err(row_group_error(
                 "row-group manifest has an unknown column type",
             )),
@@ -380,7 +392,7 @@ fn encode_row_group_set_impl(
         .map(|field| {
             Ok(RowGroupField {
                 name: field.name().clone(),
-                data_type: RowGroupDataType::from_arrow(field.data_type())?,
+                data_type: RowGroupDataType::from_field(field)?,
                 nullable: field.is_nullable(),
                 metadata: field.metadata().clone(),
             })
@@ -952,7 +964,7 @@ fn encode_column(array: &ArrayRef, data_type: RowGroupDataType) -> Result<Vec<u8
     );
     raw.extend_from_slice(&validity);
     match data_type {
-        RowGroupDataType::String => {
+        RowGroupDataType::String | RowGroupDataType::Json => {
             let values = array
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -962,7 +974,14 @@ fn encode_column(array: &ArrayRef, data_type: RowGroupDataType) -> Result<Vec<u8
             offsets.push(0_i32);
             for index in 0..values.len() {
                 if values.is_valid(index) {
-                    data.extend_from_slice(values.value(index).as_bytes());
+                    if data_type == RowGroupDataType::Json {
+                        let value = serde_json::from_str(values.value(index)).map_err(|error| {
+                            row_group_error(format!("row-group JSON value is invalid: {error}"))
+                        })?;
+                        encode_binary_json(&value, &mut data)?;
+                    } else {
+                        data.extend_from_slice(values.value(index).as_bytes());
+                    }
                 }
                 offsets.push(i32::try_from(data.len()).map_err(|_| {
                     row_group_error("row-group String data exceeds Arrow i32 offsets")
@@ -1045,7 +1064,7 @@ fn decode_column(
         .then(|| NullBuffer::new(BooleanBuffer::new(Buffer::from(validity), 0, row_count)));
 
     let array: ArrayRef = match expected_type {
-        RowGroupDataType::String => {
+        RowGroupDataType::String | RowGroupDataType::Json => {
             let data_len = cursor.u32_le()? as usize;
             let offset_count = row_count
                 .checked_add(1)
@@ -1064,15 +1083,46 @@ fn decode_column(
             {
                 return Err(row_group_error("row-group String offsets are invalid"));
             }
-            let data = cursor.bytes(data_len)?.to_vec();
-            Arc::new(
-                StringArray::try_new(
-                    OffsetBuffer::new(ScalarBuffer::from(offsets)),
-                    Buffer::from(data),
-                    nulls,
+            let data = cursor.bytes(data_len)?;
+            if expected_type == RowGroupDataType::Json {
+                let mut rendered = Vec::with_capacity(data_len);
+                let mut rendered_offsets = Vec::with_capacity(offset_count);
+                rendered_offsets.push(0_i32);
+                for index in 0..row_count {
+                    if nulls.as_ref().is_none_or(|nulls| nulls.is_valid(index)) {
+                        let start = usize::try_from(offsets[index]).map_err(|_| {
+                            row_group_error("row-group JSON offset is negative")
+                        })?;
+                        let end = usize::try_from(offsets[index + 1]).map_err(|_| {
+                            row_group_error("row-group JSON offset is negative")
+                        })?;
+                        let value = decode_binary_json(&data[start..end])?;
+                        serde_json::to_writer(&mut rendered, &value).map_err(|error| {
+                            row_group_error(format!("row-group JSON rendering failed: {error}"))
+                        })?;
+                    }
+                    rendered_offsets.push(i32::try_from(rendered.len()).map_err(|_| {
+                        row_group_error("row-group rendered JSON exceeds Arrow i32 offsets")
+                    })?);
+                }
+                Arc::new(
+                    StringArray::try_new(
+                        OffsetBuffer::new(ScalarBuffer::from(rendered_offsets)),
+                        Buffer::from(rendered),
+                        nulls,
+                    )
+                    .map_err(|error| row_group_error(error.to_string()))?,
                 )
-                .map_err(|error| row_group_error(error.to_string()))?,
-            )
+            } else {
+                Arc::new(
+                    StringArray::try_new(
+                        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                        Buffer::from(data.to_vec()),
+                        nulls,
+                    )
+                    .map_err(|error| row_group_error(error.to_string()))?,
+                )
+            }
         }
         RowGroupDataType::Int64 => {
             let mut values = Vec::with_capacity(row_count);
@@ -1102,6 +1152,164 @@ fn decode_column(
         return Err(row_group_error("row-group column has trailing bytes"));
     }
     Ok(array)
+}
+
+const JSON_NULL: u8 = 0;
+const JSON_FALSE: u8 = 1;
+const JSON_TRUE: u8 = 2;
+const JSON_I64: u8 = 3;
+const JSON_U64: u8 = 4;
+const JSON_F64: u8 = 5;
+const JSON_STRING: u8 = 6;
+const JSON_ARRAY: u8 = 7;
+const JSON_OBJECT: u8 = 8;
+
+fn encode_binary_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<(), LixError> {
+    match value {
+        serde_json::Value::Null => output.push(JSON_NULL),
+        serde_json::Value::Bool(false) => output.push(JSON_FALSE),
+        serde_json::Value::Bool(true) => output.push(JSON_TRUE),
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                output.push(JSON_I64);
+                output.extend_from_slice(&value.to_be_bytes());
+            } else if let Some(value) = number.as_u64() {
+                output.push(JSON_U64);
+                output.extend_from_slice(&value.to_be_bytes());
+            } else if let Some(value) = number.as_f64() {
+                output.push(JSON_F64);
+                output.extend_from_slice(&value.to_be_bytes());
+            } else {
+                return Err(row_group_error("row-group JSON number is not finite"));
+            }
+        }
+        serde_json::Value::String(value) => {
+            output.push(JSON_STRING);
+            encode_binary_json_bytes(value.as_bytes(), output)?;
+        }
+        serde_json::Value::Array(values) => {
+            output.push(JSON_ARRAY);
+            encode_binary_json_len(values.len(), output)?;
+            for value in values {
+                encode_binary_json(value, output)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            output.push(JSON_OBJECT);
+            encode_binary_json_len(values.len(), output)?;
+            let mut fields = values.iter().collect::<Vec<_>>();
+            fields.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            for (name, value) in fields {
+                encode_binary_json_bytes(name.as_bytes(), output)?;
+                encode_binary_json(value, output)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_binary_json_len(value: usize, output: &mut Vec<u8>) -> Result<(), LixError> {
+    let value = u32::try_from(value)
+        .map_err(|_| row_group_error("row-group JSON length exceeds u32"))?;
+    output.extend_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn encode_binary_json_bytes(value: &[u8], output: &mut Vec<u8>) -> Result<(), LixError> {
+    encode_binary_json_len(value.len(), output)?;
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn decode_binary_json(encoded: &[u8]) -> Result<serde_json::Value, LixError> {
+    let mut cursor = BinaryJsonCursor { encoded, position: 0 };
+    let value = cursor.value()?;
+    if cursor.position != encoded.len() {
+        return Err(row_group_error("row-group JSON value has trailing bytes"));
+    }
+    Ok(value)
+}
+
+struct BinaryJsonCursor<'a> {
+    encoded: &'a [u8],
+    position: usize,
+}
+
+impl BinaryJsonCursor<'_> {
+    fn value(&mut self) -> Result<serde_json::Value, LixError> {
+        Ok(match self.byte()? {
+            JSON_NULL => serde_json::Value::Null,
+            JSON_FALSE => serde_json::Value::Bool(false),
+            JSON_TRUE => serde_json::Value::Bool(true),
+            JSON_I64 => serde_json::Value::Number(i64::from_be_bytes(self.eight()?).into()),
+            JSON_U64 => serde_json::Value::Number(u64::from_be_bytes(self.eight()?).into()),
+            JSON_F64 => serde_json::Number::from_f64(f64::from_be_bytes(self.eight()?))
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| row_group_error("row-group JSON contains a non-finite number"))?,
+            JSON_STRING => serde_json::Value::String(self.string()?.to_owned()),
+            JSON_ARRAY => {
+                let count = self.len()?;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push(self.value()?);
+                }
+                serde_json::Value::Array(values)
+            }
+            JSON_OBJECT => {
+                let count = self.len()?;
+                let mut values = serde_json::Map::new();
+                let mut previous: Option<String> = None;
+                for _ in 0..count {
+                    let name = self.string()?.to_owned();
+                    if previous.as_ref().is_some_and(|previous| previous >= &name) {
+                        return Err(row_group_error(
+                            "row-group JSON object keys are not strictly ordered",
+                        ));
+                    }
+                    previous = Some(name.clone());
+                    values.insert(name, self.value()?);
+                }
+                serde_json::Value::Object(values)
+            }
+            tag => return Err(row_group_error(format!("row-group JSON has unknown tag {tag}"))),
+        })
+    }
+
+    fn byte(&mut self) -> Result<u8, LixError> {
+        let value = self.encoded.get(self.position).copied().ok_or_else(|| {
+            row_group_error("row-group JSON value is truncated")
+        })?;
+        self.position += 1;
+        Ok(value)
+    }
+
+    fn eight(&mut self) -> Result<[u8; 8], LixError> {
+        self.take(8)?.try_into().map_err(|_| row_group_error("row-group JSON value is truncated"))
+    }
+
+    fn len(&mut self) -> Result<usize, LixError> {
+        let bytes: [u8; 4] = self.take(4)?.try_into().map_err(|_| {
+            row_group_error("row-group JSON length is truncated")
+        })?;
+        Ok(u32::from_be_bytes(bytes) as usize)
+    }
+
+    fn string(&mut self) -> Result<&str, LixError> {
+        let len = self.len()?;
+        std::str::from_utf8(self.take(len)?)
+            .map_err(|_| row_group_error("row-group JSON string is not UTF-8"))
+    }
+
+    fn take(&mut self, len: usize) -> Result<&[u8], LixError> {
+        let end = self.position.checked_add(len).ok_or_else(|| {
+            row_group_error("row-group JSON range overflowed")
+        })?;
+        let value = self.encoded.get(self.position..end).ok_or_else(|| {
+            row_group_error("row-group JSON value is truncated")
+        })?;
+        self.position = end;
+        Ok(value)
+    }
 }
 
 fn decode_verified_column(
@@ -1153,7 +1361,7 @@ fn column_statistics(
     let null_count = u32::try_from(array.null_count())
         .map_err(|_| row_group_error("row-group null count exceeds u32"))?;
     let (min, max, sum) = match data_type {
-        RowGroupDataType::String => {
+        RowGroupDataType::String | RowGroupDataType::Json => {
             let values = array
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -1490,7 +1698,9 @@ fn put_optional_scalar(
     };
     output.push(1);
     match (expected, scalar) {
-        (RowGroupDataType::String, RowGroupScalar::String(value)) => put_string(output, value)?,
+        (RowGroupDataType::String | RowGroupDataType::Json, RowGroupScalar::String(value)) => {
+            put_string(output, value)?
+        }
         (RowGroupDataType::Int64, RowGroupScalar::Int64(value)) => {
             output.extend_from_slice(&value.to_le_bytes());
         }
@@ -1629,7 +1839,9 @@ impl<'a> Cursor<'a> {
         match self.u8()? {
             0 => Ok(None),
             1 => Ok(Some(match data_type {
-                RowGroupDataType::String => RowGroupScalar::String(self.string()?),
+                RowGroupDataType::String | RowGroupDataType::Json => {
+                    RowGroupScalar::String(self.string()?)
+                }
                 RowGroupDataType::Int64 => RowGroupScalar::Int64(self.i64_le()?),
                 RowGroupDataType::Float64 => {
                     RowGroupScalar::Float64(f64::from_bits(self.u64_le()?))
@@ -1739,6 +1951,55 @@ mod tests {
             assert_eq!(
                 *blake3::hash(column_bytes).as_bytes(),
                 group.column_page_digests[column.column_index][column.page_index]
+            );
+        }
+    }
+
+    #[test]
+    fn json_column_uses_canonical_binary_cells_and_fails_closed() {
+        let mut metadata = HashMap::new();
+        metadata.insert("lix.value_type".to_string(), "json".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Utf8, true).with_metadata(metadata),
+        ]));
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some(r#"{"z":[null,true,3],"a":{"nested":"value"}}"#),
+            Some(r#"{"a":{"nested":"value"},"z":[null,true,3]}"#),
+            Some("[]"),
+            None,
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])
+            .expect("JSON fixture batch");
+        let encoded = encode_row_group_set("json", schema, &[batch]).expect("encode JSON");
+        assert_eq!(encoded.manifest.fields[0].data_type, RowGroupDataType::Json);
+        let column = &encoded.columns[0];
+        let decoded = decode_column(
+            encoded.column_bytes(column),
+            RowGroupDataType::Json,
+            4,
+        )
+        .expect("decode JSON");
+        let decoded = decoded
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("decoded JSON is surfaced as UTF-8");
+        assert_eq!(decoded.value(0), decoded.value(1));
+        assert_eq!(decoded.value(2), "[]");
+        assert!(decoded.is_null(3));
+
+        for malformed in [
+            vec![],
+            vec![99],
+            vec![JSON_I64, 0],
+            vec![JSON_STRING, 0, 0, 0, 2, b'a'],
+            vec![JSON_ARRAY, 0, 0, 0, 1],
+            vec![JSON_NULL, JSON_TRUE],
+            vec![JSON_OBJECT, 0, 0, 0, 2, 0, 0, 0, 1, b'z', JSON_NULL,
+                 0, 0, 0, 1, b'a', JSON_NULL],
+        ] {
+            assert!(
+                decode_binary_json(&malformed).is_err(),
+                "malformed JSON unexpectedly decoded: {malformed:?}"
             );
         }
     }

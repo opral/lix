@@ -66,7 +66,7 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// `CHECKPOINT_GC_STATE_FORMAT_VERSION` 1 -> 2. Every record is
 /// `#[musli(packed)]`, so one bump carries any number of shape changes at no
 /// extra cost to the user, who recreates the repository once either way.
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v68";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
