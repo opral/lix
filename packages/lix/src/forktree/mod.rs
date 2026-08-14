@@ -49,7 +49,8 @@ pub(crate) use serving::{
     state_points, state_points_on_read, state_range,
 };
 pub(crate) use state::{
-    HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
+    HistoricalStateRow, NativeRowCell, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue,
+    StateValueRef,
     decode_state_key, decode_state_value, encode_state_entity_prefix,
     encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
     exclusive_prefix_upper_bound,

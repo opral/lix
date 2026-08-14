@@ -47,10 +47,11 @@ const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 struct SeedRow {
     key: Vec<u8>,
     change_id: ChangelogChangeId,
-    local_change_id: ChangelogChangeId,
+    local_change_id: Option<ChangelogChangeId>,
     schema_key: String,
     entity_pk: EntityPk,
     file_id: Option<String>,
+    native_snapshot: serde_json::Value,
     snapshot: JsonSlot,
     metadata: JsonSlot,
 }
@@ -96,8 +97,10 @@ where
      -> Result<(), LixError> {
         let change_uuid = functions.call_uuid_v7();
         let change_id = ChangelogChangeId::new(change_uuid);
-        let local_change_id = ChangelogChangeId::new(functions.call_uuid_v7());
-        let snapshot = JsonSlot::Inline(snapshot.to_string().into());
+        let local = schema_key == crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+            || (schema_key == KEY_VALUE_SCHEMA_KEY
+                && entity_pk.as_single_string().is_ok_and(|key| key == PLUGIN_REGISTRY_KEY));
+        let encoded_snapshot = JsonSlot::Inline(snapshot.to_string().into());
         let key = encode_state_key(StateKeyRef {
             schema_key,
             file_id,
@@ -106,11 +109,12 @@ where
         rows.push(SeedRow {
             key,
             change_id,
-            local_change_id,
+            local_change_id: local.then(|| ChangelogChangeId::new(functions.call_uuid_v7())),
             schema_key: schema_key.to_owned(),
             entity_pk,
             file_id: file_id.map(str::to_owned),
-            snapshot,
+            native_snapshot: snapshot,
+            snapshot: encoded_snapshot,
             metadata: JsonSlot::None,
         });
         Ok(())
@@ -182,15 +186,14 @@ where
     )?;
 
     rows.sort_by(|left, right| left.key.cmp(&right.key));
-    let mut semantic_members = Vec::with_capacity(rows.len() * 2);
-    let mut changes = Vec::with_capacity(rows.len() * 2);
-    for global in [true, false] {
-        for row in &rows {
-            let public_change_id = if global {
-                row.change_id
-            } else {
-                row.local_change_id
-            };
+    let local_rows = rows
+        .iter()
+        .filter(|row| row.local_change_id.is_some())
+        .collect::<Vec<_>>();
+    let mut semantic_members = Vec::with_capacity(rows.len() + local_rows.len());
+    let mut changes = Vec::with_capacity(rows.len() + local_rows.len());
+    for row in &rows {
+            let public_change_id = row.change_id;
             let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
                 format_version: 2,
                 change_id: public_change_id,
@@ -205,34 +208,63 @@ where
             })?;
             let change_id =
                 super::model::ChangeId::from_bytes(*public_change_id.as_uuid().as_bytes());
-            semantic_members.push(CommitMemberV1::introduced(
-                change_id,
-                payload,
-                global,
-                timestamp,
-                Vec::new(),
-            ));
-            changes.push(change_id);
-        }
+        semantic_members.push(CommitMemberV1::introduced(
+            change_id,
+            payload,
+            true,
+            timestamp,
+            Vec::new(),
+        ));
+        changes.push(change_id);
+    }
+    for row in &local_rows {
+        let public_change_id = row.local_change_id.expect("local seed row has an identity");
+        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+            format_version: 2,
+            change_id: public_change_id,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            schema_key: row.schema_key.clone(),
+            entity_pk: row.entity_pk.clone(),
+            file_id: row.file_id.clone(),
+            snapshot: row.snapshot.clone(),
+            metadata: row.metadata.clone(),
+            created_at: timestamp,
+            origin_key: None,
+        })?;
+        let change_id = super::model::ChangeId::from_bytes(*public_change_id.as_uuid().as_bytes());
+        semantic_members.push(CommitMemberV1::introduced(
+            change_id,
+            payload,
+            false,
+            timestamp,
+            Vec::new(),
+        ));
+        changes.push(change_id);
     }
 
     let member_pages = CommitChangePageV2::encode_pages(model_commit, &semantic_members)
         .map_err(LixError::from)?;
     let values_for =
-        |global: bool,
-         locations: &[super::model::StatePageLocation]|
+        |seed_rows: &[&SeedRow],
+         locations: &[super::model::StatePageLocation],
+         branch_id: &str|
          -> Result<Vec<(Vec<u8>, StateValue, super::model::StatePageLocation)>, LixError> {
-            rows.iter()
+            seed_rows.iter()
                 .zip(locations)
                 .map(|(row, location)| {
-                    let change_id = if global {
+                    let change_id = if branch_id == crate::GLOBAL_BRANCH_ID {
                         row.change_id
                     } else {
-                        row.local_change_id
+                        row.local_change_id.expect("local seed row has an identity")
                     };
                     let cell = match &row.snapshot {
-                        JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
-                        JsonSlot::Inline(value) => StateCell::Value(value.clone().into()),
+                        JsonSlot::Inline(_) => StateCell::NativeRow(crate::native_row::encode(
+                            &crate::native_row::seed_schema(&row.schema_key)?,
+                            &row.entity_pk,
+                            branch_id,
+                            row.file_id.as_deref(),
+                            &row.native_snapshot,
+                        )?),
                         JsonSlot::None => StateCell::Tombstone,
                         JsonSlot::ForkTreeObject(_) => {
                             return Err(LixError::new(
@@ -270,13 +302,21 @@ where
     let global_packs = encode_current_state_packs(
         model_commit,
         true,
-        values_for(true, &member_pages.member_locations[..rows.len()])?,
+        values_for(
+            &rows.iter().collect::<Vec<_>>(),
+            &member_pages.member_locations[..rows.len()],
+            crate::GLOBAL_BRANCH_ID,
+        )?,
     )
     .map_err(LixError::from)?;
     let local_packs = encode_current_state_packs(
         model_commit,
         false,
-        values_for(false, &member_pages.member_locations[rows.len()..])?,
+        values_for(
+            &local_rows,
+            &member_pages.member_locations[rows.len()..],
+            &main_branch.to_string(),
+        )?,
     )
     .map_err(LixError::from)?;
     let global_entries = rows
@@ -297,7 +337,7 @@ where
             ))
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    let local_entries = rows
+    let local_entries = local_rows
         .iter()
         .map(|row| {
             let location = local_packs.locations.get(&row.key).ok_or_else(|| {
@@ -316,10 +356,6 @@ where
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let global_state = build_state_tree(&global_entries).map_err(LixError::from)?;
-    // Seed the first workspace branch with the same authenticated tracked
-    // rows.  Global rows remain available to the global view, while the
-    // branch-local copy gives ordinary branch-scoped catalog queries their
-    // exact branch identity instead of forcing them through a global owner.
     let local_state = build_state_tree(&local_entries).map_err(LixError::from)?;
 
     let mut objects = ImmutableObjectSet::default();

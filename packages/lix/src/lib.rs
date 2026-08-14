@@ -71,6 +71,7 @@ pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
 mod prepared_dml;
 mod schema;
+mod native_row;
 #[cfg(feature = "server-protocol")]
 pub mod server_protocol;
 mod session;

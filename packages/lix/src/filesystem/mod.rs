@@ -157,10 +157,7 @@ impl FilesystemStateRow {
     ) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
         let deleted = row.value.cell.deleted();
-        let snapshot_content = match &row.value.cell {
-            crate::forktree::StateCell::Value(value) => Some(value.clone()),
-            crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
-        };
+        let snapshot_content = row.seed_logical_snapshot(branch_id)?;
         Ok(Self {
             entity_pk: key.entity_pk,
             schema_key: key.schema_key,

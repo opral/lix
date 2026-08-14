@@ -117,10 +117,30 @@ impl NativeStateRow {
         &self.branch_id
     }
 
-    fn from_state_row(row: StateRow, branch_id: &str) -> Result<Self, LixError> {
+    fn from_state_row(
+        row: StateRow,
+        branch_id: &str,
+        spec: &EntitySurfaceSpec,
+    ) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
         let snapshot_content = match row.value.cell {
-            StateCell::Value(value) => Some(value),
+            StateCell::NativeRow(native) => Some(crate::native_row::logical_text(
+                spec.native_schema.as_ref(),
+                &key.entity_pk,
+                if row.source == StateRowSource::Global {
+                    crate::GLOBAL_BRANCH_ID
+                } else {
+                    branch_id
+                },
+                key.file_id.as_deref(),
+                &native,
+            )?),
+            StateCell::Value(_) => {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "Schema-v1 write candidate uses the removed JSON current-state representation",
+                ));
+            }
             StateCell::Null | StateCell::Tombstone => None,
         };
         Ok(Self {
@@ -3420,9 +3440,16 @@ pub(crate) async fn prepare_path_value_replacement_row(
     let primary_key = program.primary_key(params)?;
     let entity_pk = EntityPk::single(primary_key.to_owned());
     let branch_id = ctx.active_branch_id().to_owned();
+    let catalog = ctx.public_catalog()?;
+    let spec = catalog.entity_spec(program.schema_key.as_str()).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("entity schema '{}' is not registered", program.schema_key),
+        )
+    })?;
     let candidates = scan_native_entity_ranges(
         ctx,
-        program.schema_key.as_str(),
+        spec,
         vec![entity_pk.clone()],
         false,
         std::slice::from_ref(&branch_id),
@@ -4242,7 +4269,7 @@ async fn scan_entity_conflict_candidates(
     // transaction's retained native view, then apply SQL identity predicates.
     let mut candidates = scan_native_entity_ranges(
         ctx,
-        spec.schema_key.as_str(),
+        spec,
         entity_pks.into_iter().collect(),
         false,
         &insert_rows
@@ -4276,7 +4303,7 @@ async fn scan_entity_candidates(
         Some(entity_pks) => {
             scan_native_entity_ranges(
                 ctx,
-                spec.schema_key.as_str(),
+                spec,
                 entity_pks,
                 false,
                 &scan_branch_ids(&plan.bound.branch_scope)?,
@@ -4286,7 +4313,7 @@ async fn scan_entity_candidates(
         None => {
             scan_native_entity_ranges(
                 ctx,
-                spec.schema_key.as_str(),
+                spec,
                 Vec::new(),
                 false,
                 &scan_branch_ids(&plan.bound.branch_scope)?,
@@ -4308,7 +4335,7 @@ async fn scan_entity_candidates_for_pks(
     let _ = (scan_branch_ids(&plan.bound.branch_scope)?, metadata_only);
     let mut rows = scan_native_entity_ranges(
         ctx,
-        spec.schema_key.as_str(),
+        spec,
         entity_pks,
         false,
         &scan_branch_ids(&plan.bound.branch_scope)?,
@@ -4320,11 +4347,12 @@ async fn scan_entity_candidates_for_pks(
 
 async fn scan_native_entity_ranges(
     ctx: &mut impl SqlWriteExecutionContext,
-    schema_key: &str,
+    spec: &EntitySurfaceSpec,
     mut entity_pks: Vec<EntityPk>,
     include_tombstones: bool,
     branch_ids: &[String],
 ) -> Result<NativeStateBatch, LixError> {
+    let schema_key = spec.schema_key.as_str();
     let mut rows = Vec::new();
     entity_pks.sort();
     entity_pks.dedup();
@@ -4353,7 +4381,7 @@ async fn scan_native_entity_ranges(
                 )
                 .await?;
             for row in native {
-                let row = NativeStateRow::from_state_row(row, branch_id)?;
+                let row = NativeStateRow::from_state_row(row, branch_id, spec)?;
                 if row.schema_key == schema_key {
                     rows.push(row);
                 }
@@ -4375,7 +4403,7 @@ async fn scan_native_entity_ranges(
                 rows.extend(
                     native
                         .into_iter()
-                        .map(|row| NativeStateRow::from_state_row(row, branch_id))
+                        .map(|row| NativeStateRow::from_state_row(row, branch_id, spec))
                         .collect::<Result<Vec<_>, _>>()?,
                 );
             }

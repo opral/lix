@@ -616,11 +616,14 @@ fn state_key_from_row(row: PreparedStateRowRef<'_>) -> StateKey {
     }
 }
 
-fn staged_cell(snapshot: Option<&StageJson>) -> StateCell {
-    match snapshot {
+fn staged_cell(row: PreparedStateRowRef<'_>) -> StateCell {
+    match row.snapshot {
         None => StateCell::Tombstone,
-        Some(snapshot) if snapshot.normalized() == "null" => StateCell::Null,
-        Some(snapshot) => StateCell::Value(snapshot.normalized().into()),
+        Some(_) => StateCell::NativeRow(
+            row.native_row
+                .cloned()
+                .expect("prepared live row must own its native current-state tuple"),
+        ),
     }
 }
 
@@ -630,7 +633,7 @@ fn state_value_from_prepared(row: PreparedStateRowRef<'_>) -> StateValue {
         commit_id: row.commit_id.unwrap_or_default(),
         created_at: row.created_at,
         updated_at: row.updated_at,
-        cell: staged_cell(row.snapshot),
+        cell: staged_cell(row),
         metadata: row.metadata.map(|metadata| metadata.normalized().into()),
         origin_key: row.origin_key.map(ToString::to_string),
         // File payload publication is represented by the staged filesystem

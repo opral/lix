@@ -40,9 +40,12 @@ pub(crate) struct EntitySurfaceColumn {
     pub(crate) default_expression: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EntitySurfaceSpec {
     pub(crate) schema_key: String,
+    /// Trusted complete Schema-v1 layout used to decode the authenticated
+    /// native value half at the final SQL projection boundary.
+    pub(crate) native_schema: Arc<lix_schema::Schema>,
     pub(crate) primary_key_paths: Vec<Vec<String>>,
     pub(crate) primary_key_component_types: Vec<EntityPkComponentType>,
     pub(crate) columns: Vec<EntitySurfaceColumn>,
@@ -208,6 +211,7 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
     });
     Ok(EntitySurfaceSpec {
         schema_key,
+        native_schema: Arc::new(parsed.clone()),
         primary_key_paths,
         primary_key_component_types,
         indexed_columns,

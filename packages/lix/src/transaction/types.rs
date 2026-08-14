@@ -14,7 +14,7 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::forktree::StateKey;
+use crate::forktree::{NativeRowCell, StateKey};
 use crate::state::CertifiedStatePredecessor;
 use crate::plugin::runtime::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
@@ -716,6 +716,7 @@ impl CertifiedParameterBatch {
                 untracked,
             }),
             entity_pks,
+            native_rows: vec![None; row_count],
             strings,
             string_index,
             json,
@@ -1259,6 +1260,7 @@ impl RawWriteBatch {
             slots: prepared_slots,
             dense_certified_parameter: None,
             entity_pks: prepared_entity_pks,
+            native_rows: vec![None; row_count],
             strings,
             string_index,
             json,
@@ -2714,6 +2716,7 @@ impl TestPreparedStateRow {
             schema_plan_id: self.schema_plan_id,
             facts: self.facts,
             entity_pk: &self.entity_pk,
+            native_row: None,
             schema_key: &self.schema_key,
             file_id: self.file_id.as_ref(),
             snapshot: self.snapshot.as_ref(),
@@ -2748,6 +2751,10 @@ pub(crate) struct PreparedStateBatch {
     /// needs row-local topology expands this representation into `slots`.
     dense_certified_parameter: Option<DenseCertifiedParameterSlots>,
     entity_pks: Vec<EntityPk>,
+    /// Native current-state payloads aligned one-for-one with logical rows.
+    /// Canonical JSON remains a semantic/history input, never a second
+    /// committed-state representation.
+    native_rows: Vec<Option<NativeRowCell>>,
     strings: Vec<SharedStr>,
     string_index: HashMap<SharedStr, u32>,
     json: Vec<StageJson>,
@@ -2848,6 +2855,7 @@ pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
     pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) native_row: Option<&'a NativeRowCell>,
     pub(crate) schema_key: &'a SharedStr,
     pub(crate) file_id: Option<&'a SharedStr>,
     pub(crate) snapshot: Option<&'a StageJson>,
@@ -2900,6 +2908,7 @@ impl PreparedStateBatch {
             slots: Vec::with_capacity(row_capacity),
             dense_certified_parameter: None,
             entity_pks: Vec::with_capacity(row_capacity),
+            native_rows: Vec::with_capacity(row_capacity),
             // Most bulk batches share schema, branch, and origin descriptors;
             // file ids are the only commonly row-cardinal string. Reserving
             // five entries per row made the empty dictionary dominate peak
@@ -3044,6 +3053,7 @@ impl PreparedStateBatch {
                 row.branch_id.clone(),
             );
             let index = rows.len() - 1;
+            rows.set_native_row(index, row.native_row.cloned());
             rows.set_durable_predecessor(index, row.durable_predecessor.cloned());
         }
         rows
@@ -3063,6 +3073,7 @@ impl PreparedStateBatch {
                 schema_plan_id: dense.schema_plan_id,
                 facts: dense.facts,
                 entity_pk: &self.entity_pks[index],
+                native_row: self.native_rows[index].as_ref(),
                 schema_key: &self.strings[dense.schema_key as usize],
                 file_id: None,
                 snapshot: Some(&self.json[index]),
@@ -3085,6 +3096,7 @@ impl PreparedStateBatch {
             schema_plan_id: slot.schema_plan_id,
             facts: slot.facts,
             entity_pk: &self.entity_pks[slot.entity_pk as usize],
+            native_row: self.native_rows[index].as_ref(),
             schema_key: &self.strings[slot.schema_key as usize],
             file_id: slot.file_id.map(|index| &self.strings[index as usize]),
             snapshot: slot.snapshot.map(|index| &self.json[index as usize]),
@@ -3247,6 +3259,7 @@ impl PreparedStateBatch {
             branch_id,
             durable_predecessor: None,
         });
+        self.native_rows.push(None);
     }
 
     fn expand_dense_certified_parameter(&mut self) {
@@ -3295,6 +3308,10 @@ impl PreparedStateBatch {
             self.durable_predecessors.push(value);
             index
         });
+    }
+
+    pub(crate) fn set_native_row(&mut self, row: usize, value: Option<NativeRowCell>) {
+        self.native_rows[row] = value;
     }
 
     /// Extends one fixed-shape certified parameter journal without expanding
@@ -3358,6 +3375,7 @@ impl PreparedStateBatch {
             .checked_add(right.len)
             .expect("prepared dense parameter row count overflowed");
         self.entity_pks.append(&mut other.entity_pks);
+        self.native_rows.append(&mut other.native_rows);
         self.json.append(&mut other.json);
         self.complete_collection_replacement = None;
         true
@@ -3418,6 +3436,7 @@ impl PreparedStateBatch {
             .map(|value| self.intern_origin(value))
             .collect::<Vec<_>>();
         self.entity_pks.append(&mut other.entity_pks);
+        self.native_rows.append(&mut other.native_rows);
         self.json.append(&mut other.json);
         self.durable_predecessors
             .append(&mut other.durable_predecessors);
@@ -3458,6 +3477,7 @@ impl PreparedStateBatch {
         self.certified_tracked_keys_strictly_ordered = false;
         self.complete_collection_replacement = None;
         self.slots.swap(left, right);
+        self.native_rows.swap(left, right);
     }
 
     /// Selects unique source ordinals into the requested destination order.
@@ -3506,11 +3526,13 @@ impl PreparedStateBatch {
             }
             let displaced_original = original_at_position[destination];
             self.slots.swap(destination, source_position);
+            self.native_rows.swap(destination, source_position);
             original_at_position.swap(destination, source_position);
             position_of_original[source] = destination;
             position_of_original[displaced_original] = source_position;
         }
         self.slots.truncate(source_by_destination.len());
+        self.native_rows.truncate(source_by_destination.len());
     }
 
     /// Truncates a slot prefix after callers have placed final rows directly.
@@ -3527,6 +3549,7 @@ impl PreparedStateBatch {
             self.complete_collection_replacement = None;
         }
         self.slots.truncate(retained_len);
+        self.native_rows.truncate(retained_len);
         if !self.should_compact_owner_columns(retained_len) {
             return;
         }
@@ -3818,6 +3841,7 @@ impl PreparedStateBatch {
             row.branch_id.clone(),
         );
         let index = self.len() - 1;
+        self.set_native_row(index, row.native_row.cloned());
         self.set_durable_predecessor(index, row.durable_predecessor.cloned());
     }
 }
@@ -3874,6 +3898,7 @@ impl PartialEq for PreparedStateRowRef<'_> {
         self.schema_plan_id == other.schema_plan_id
             && self.facts == other.facts
             && self.entity_pk == other.entity_pk
+            && self.native_row == other.native_row
             && self.schema_key == other.schema_key
             && self.file_id == other.file_id
             && self.snapshot == other.snapshot

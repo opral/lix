@@ -1168,22 +1168,21 @@ fn parse_descriptor(row: &StateRow, expected_id: &str) -> Result<BranchDescripto
 }
 
 fn parse_snapshot(row: &StateRow, schema_key: &str) -> Result<JsonValue, LixError> {
-    let snapshot_content = match &row.value.cell {
-        StateCell::Value(value) => value.as_str(),
-        StateCell::Null | StateCell::Tombstone => {
-            return Err(LixError::new(
+    let snapshot_content = row
+        .seed_logical_snapshot(crate::GLOBAL_BRANCH_ID)?
+        .ok_or_else(|| {
+            LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 format!("{schema_key} row is missing snapshot_content"),
-            ));
-        }
-    };
+            )
+        })?;
     if snapshot_content.is_empty() {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             format!("{schema_key} row is missing snapshot_content"),
         ));
     }
-    serde_json::from_str(snapshot_content).map_err(|error| {
+    serde_json::from_str(&snapshot_content).map_err(|error| {
         LixError::new(
             LixError::CODE_STORAGE_ERROR,
             format!("{schema_key} snapshot_content is invalid JSON: {error}"),

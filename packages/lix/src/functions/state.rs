@@ -132,8 +132,9 @@ where
                 format!("deterministic key-value row '{key}' has a duplicate identity"),
             ));
         }
+        let snapshot_content = row.seed_logical_snapshot(crate::GLOBAL_BRANCH_ID)?;
         if row.value.cell.deleted() {
-            if state_snapshot_content(row).is_some()
+            if snapshot_content.is_some()
                 && matches!(
                     key,
                     DETERMINISTIC_MODE_KEY
@@ -146,9 +147,9 @@ where
                     format!("deterministic key-value tombstone '{key}' carries a payload"),
                 ));
             }
-        } else if let Some(snapshot_content) = state_snapshot_content(row) {
+        } else if let Some(snapshot_content) = snapshot_content {
             let snapshot =
-                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+                serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
                     LixError::new(
                         LixError::CODE_STORAGE_ERROR,
                         format!("deterministic key-value row '{key}' has invalid JSON: {error}"),
@@ -186,16 +187,15 @@ fn state_row_key(row: &StateRow) -> Result<crate::forktree::StateKey, LixError> 
 }
 
 fn key_value_payload(row: &StateRow, key: &str) -> Result<JsonValue, LixError> {
-    let snapshot_content = match &row.value.cell {
-        crate::forktree::StateCell::Value(value) => value.as_str(),
-        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
-            return Err(LixError::new(
+    let snapshot_content = row
+        .seed_logical_snapshot(crate::GLOBAL_BRANCH_ID)?
+        .ok_or_else(|| {
+            LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("deterministic key-value row '{key}' is missing snapshot_content"),
-            ));
-        }
-    };
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+            )
+        })?;
+    let snapshot = serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("deterministic key-value row '{key}' has invalid JSON: {error}"),
@@ -214,13 +214,6 @@ fn key_value_payload(row: &StateRow, key: &str) -> Result<JsonValue, LixError> {
             format!("deterministic key-value row '{key}' is missing value"),
         )
     })
-}
-
-fn state_snapshot_content(row: &StateRow) -> Option<&str> {
-    match &row.value.cell {
-        crate::forktree::StateCell::Value(value) => Some(value.as_str()),
-        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
-    }
 }
 
 fn parse_mode_value(value: JsonValue) -> Result<DeterministicMode, LixError> {
