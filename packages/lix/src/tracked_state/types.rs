@@ -189,6 +189,10 @@ pub(crate) struct CommitStateMutationPart {
     pub(crate) first_key: Vec<u8>,
     #[musli(bytes)]
     pub(crate) last_key: Vec<u8>,
+    /// Digest of the immutable schema-owned history chunk. The physical key
+    /// also carries this digest, while the commit's authenticated mutation
+    /// directory is the sole authority that selects it.
+    pub(crate) content_digest: [u8; 32],
     #[musli(with = crate::storage_codec::option)]
     pub(crate) replacement_part: Option<StoredReplacementPart>,
 }

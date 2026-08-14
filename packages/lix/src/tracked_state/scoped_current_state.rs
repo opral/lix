@@ -1833,6 +1833,7 @@ mod tests {
         broad.parts.push(CommitStateMutationPart {
             first_key: encoded_key("alpha", &left).to_vec(),
             last_key: encoded_key("omega", &right).to_vec(),
+            content_digest: [1; 32],
             replacement_part: None,
         });
         let mut writes = storage.new_write_set();

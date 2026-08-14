@@ -6145,7 +6145,7 @@ where
                     ),
                 ));
             }
-            let mut mutations = mutation_inventories
+            let mutations = mutation_inventories
                 .get(&record.commit_id)
                 .cloned()
                 .unwrap_or_default();
@@ -6283,9 +6283,6 @@ where
                 crate::tracked_state::incomplete_touched_scope_filter,
                 |publication| publication.touched_scope_filter().clone(),
             );
-            if mutations.replacement_generation.is_some() {
-                mutations.parts.clear();
-            }
             let manifest = CommitStateManifest {
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),

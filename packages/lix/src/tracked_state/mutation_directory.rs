@@ -20,13 +20,13 @@ use super::types::CommitStateMutationPart;
 
 pub(crate) const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_002d),
-    "tracked_state.commit_mutation_directory_node.v1",
+    "tracked_state.commit_mutation_directory_node.v2",
     ValueSemantics::Immutable,
 );
 
-const NODE_MAGIC: &[u8] = b"LXMD1";
-const NODE_HASH_CONTEXT: &str = "lix commit mutation directory node v1";
-const ROOT_HASH_CONTEXT: &str = "lix commit mutation directory root v1";
+const NODE_MAGIC: &[u8] = b"LXMD3";
+const NODE_HASH_CONTEXT: &str = "lix commit mutation directory node v2";
+const ROOT_HASH_CONTEXT: &str = "lix commit mutation directory root v2";
 const FANOUT: usize = 128;
 
 // A pass-through counting allocator, test builds only.  It delegates every
@@ -440,6 +440,7 @@ pub(crate) mod seekable_prototype {
                 part: CommitStateMutationPart {
                     first_key,
                     last_key,
+                    content_digest: [1; 32],
                     replacement_part: None,
                 },
                 direct_row_count,
@@ -945,6 +946,11 @@ pub(crate) enum MutationDirectoryReadSelection<'a> {
     SortedRanges(&'a [MutationDirectoryKeyRange]),
     SortedUniquePoints(&'a [Bytes]),
     SortedUniqueDirectCoordinates(&'a [MutationDirectoryDirectCoordinate]),
+    /// Selects physical parts by authenticated directory ordinal without
+    /// claiming that the ordinal is encoded in the ChangeId. Explicit
+    /// locators use this for indirect layouts and validate the row ordinal
+    /// against the selected immutable part after it is decoded.
+    SortedUniquePartCoordinates(&'a [MutationDirectoryDirectCoordinate]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1005,6 +1011,9 @@ fn record_selector(selection: MutationDirectoryReadSelection<'_>) {
             counters::add(counters::SELECTOR_DIRECT_CALLS, 1);
             #[cfg(test)]
             test_read_accounting::record_selector_direct();
+        }
+        MutationDirectoryReadSelection::SortedUniquePartCoordinates(_) => {
+            counters::add(counters::SELECTOR_DIRECT_CALLS, 1);
         }
     }
 }
@@ -1127,6 +1136,7 @@ enum StoredEntry {
         first_key: Vec<u8>,
         #[musli(bytes)]
         last_key: Vec<u8>,
+        content_digest: [u8; 32],
         #[musli(with = storage_codec::option)]
         replacement_part: Option<super::types::StoredReplacementPart>,
         direct_row_count: u16,
@@ -1258,6 +1268,7 @@ pub(crate) fn build_bounded_mutation_directory(
         .map(|(index, part)| StoredEntry::Bounded {
             first_key: part.first_key.clone(),
             last_key: part.last_key.clone(),
+            content_digest: part.content_digest,
             replacement_part: part.replacement_part.clone(),
             direct_row_count: direct_row_counts.map_or(0, |rows| rows[index]),
         });
@@ -1827,6 +1838,7 @@ impl MutationDirectoryReadSelection<'_> {
             Self::SortedRanges(ranges) => ranges.len(),
             Self::SortedUniquePoints(points) => points.len(),
             Self::SortedUniqueDirectCoordinates(coordinates) => coordinates.len(),
+            Self::SortedUniquePartCoordinates(coordinates) => coordinates.len(),
         }
     }
 }
@@ -1894,6 +1906,18 @@ fn validate_selection(
             }
             Ok(())
         }
+        MutationDirectoryReadSelection::SortedUniquePartCoordinates(coordinates) => {
+            if coordinates.windows(2).any(|pair| pair[0] >= pair[1])
+                || coordinates
+                    .last()
+                    .is_some_and(|coordinate| coordinate.part_index >= root.entry_count)
+            {
+                return Err(directory_error(
+                    "part-coordinate selection must be in-range, strictly sorted and unique",
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1936,6 +1960,17 @@ fn selection_span_for_entry(
             Ok((start < end).then_some(start..end))
         }
         MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(coordinates) => {
+            while *cursor < selector_end && coordinates[*cursor].part_index < entry_index {
+                *cursor += 1;
+            }
+            let start = *cursor;
+            while *cursor < selector_end && coordinates[*cursor].part_index < entry_end {
+                *cursor += 1;
+            }
+            let _ = direct_row_count;
+            Ok((start < *cursor).then_some(start..*cursor))
+        }
+        MutationDirectoryReadSelection::SortedUniquePartCoordinates(coordinates) => {
             while *cursor < selector_end && coordinates[*cursor].part_index < entry_index {
                 *cursor += 1;
             }
@@ -2508,7 +2543,9 @@ fn is_bounded(layout: u8) -> bool {
 }
 
 fn valid_part(part: &CommitStateMutationPart) -> bool {
-    !part.first_key.is_empty() && part.first_key <= part.last_key
+    !part.first_key.is_empty()
+        && part.first_key <= part.last_key
+        && part.content_digest != [0; 32]
 }
 
 #[cfg(test)]
@@ -2520,6 +2557,7 @@ fn stored_entry(entry: &MutationDirectoryEntry) -> StoredEntry {
         } => StoredEntry::Bounded {
             first_key: part.first_key.clone(),
             last_key: part.last_key.clone(),
+            content_digest: part.content_digest,
             replacement_part: part.replacement_part.clone(),
             direct_row_count: *direct_row_count,
         },
@@ -2541,12 +2579,14 @@ fn runtime_entry(entry: StoredEntry) -> Result<MutationDirectoryEntry, LixError>
         StoredEntry::Bounded {
             first_key,
             last_key,
+            content_digest,
             replacement_part,
             direct_row_count,
         } => MutationDirectoryEntry::Bounded {
             part: CommitStateMutationPart {
                 first_key,
                 last_key,
+                content_digest,
                 replacement_part,
             },
             direct_row_count,
@@ -2669,6 +2709,7 @@ mod tests {
                 part: CommitStateMutationPart {
                     first_key,
                     last_key,
+                    content_digest: [1; 32],
                     replacement_part: None,
                 },
                 direct_row_count: 7,
@@ -2767,6 +2808,7 @@ mod tests {
                 .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
                     first_key: first_key.clone(),
                     last_key: last_key.clone(),
+                    content_digest: [1; 32],
                     replacement_part: None,
                     direct_row_count: *direct_row_count,
                 })
@@ -2840,6 +2882,7 @@ mod tests {
                     .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
                         first_key: first_key.clone(),
                         last_key: last_key.clone(),
+                        content_digest: [1; 32],
                         replacement_part: None,
                         direct_row_count: *direct_row_count,
                     })
@@ -2992,6 +3035,7 @@ mod tests {
                     .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
                         first_key: first_key.clone(),
                         last_key: last_key.clone(),
+                        content_digest: [1; 32],
                         replacement_part: None,
                         direct_row_count: *direct_row_count,
                     })
@@ -3055,6 +3099,7 @@ mod tests {
             part: CommitStateMutationPart {
                 first_key,
                 last_key,
+                content_digest: [1; 32],
                 replacement_part: None,
             },
             direct_row_count: 7,
