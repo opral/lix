@@ -312,6 +312,11 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "physical_layout_root_fusion"
+path = "benches/physical_layout_root_fusion.rs"
+harness = false
+
+[[bench]]
 name = "current_state_scope_sharing"
 path = "benches/current_state_scope_sharing.rs"
 harness = false
