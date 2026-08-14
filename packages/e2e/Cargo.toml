@@ -70,6 +70,7 @@ criterion = { package = "codspeed-criterion-compat", version = "4" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 lix_collaboration_test_support = { path = "../collaboration-test-support" }
+lix_schema.workspace = true
 sha2 = "0.10"
 libc = "0.2"
 rustc-hash = "2"
@@ -410,6 +411,11 @@ required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
 name = "exppq_write_scaling"
 path = "examples/exppq_write_scaling.rs"
 required-features = ["storage-benches"]
+
+[[example]]
+name = "exp_delta_page_01"
+path = "examples/exp_delta_page_01.rs"
+required-features = ["rocksdb", "slatedb"]
 
 [[example]]
 name = "write_amplification"
