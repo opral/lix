@@ -7,10 +7,10 @@ mod benchmark_metrics;
 use bytes::Bytes;
 use lix::plugin::runtime::{
     WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
-    WasmEntitySource, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
-    WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput, WasmPluginSelection,
-    WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters, WasmTransitionLimits,
+    WasmCreateContext, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
+    WasmHostRow, WasmInputBytes, WasmInputSplice, WasmOpenRowsInput, WasmPluginSelection, WasmRow,
+    WasmRowChange, WasmRowKey, WasmRowPage, WasmRowSource, WasmRuntime, WasmSourceRange,
+    WasmSourceSlice, WasmTransitionCounters, WasmTransitionLimits,
 };
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
@@ -419,7 +419,7 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
 /// "identical behaviour" is *asserted* rather than asserted-about: the same
 /// bytes go through the same plugin and the same projection, and only the lane
 /// differs. Before plugin reconciliation was unskipped for untracked writes,
-/// the untracked arm produced no entity rows at all — an untracked JSON file
+/// the untracked arm produced no rows at all — an untracked JSON file
 /// was a descriptor plus a content blob whose contents were unqueryable.
 ///
 /// The untracked arm's row shape is the one #1346 established: a real
@@ -427,7 +427,7 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
 /// is asserted as a property, never as a literal — its value is a function of
 /// UUID draw order.
 #[tokio::test]
-async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_one() {
+async fn untracked_json_file_produces_the_same_plugin_rows_as_a_tracked_one() {
     const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a1";
     const UNTRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a2";
     const TRACKED_PATH: &str = "/lane-parity-tracked.json";
@@ -486,7 +486,7 @@ async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_o
             .expect("plugin-derived rows should query");
         let [row] = result.rows() else {
             panic!(
-                "expected exactly one plugin entity row for file '{file_id}', got {}",
+                "expected exactly one plugin row for file '{file_id}', got {}",
                 result.len()
             );
         };
@@ -503,19 +503,17 @@ async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_o
     ] = member_row(TRACKED_FILE_ID)
         .await
         .try_into()
-        .unwrap_or_else(|_| {
-            panic!("expected four projected columns for the tracked plugin entity row")
-        });
+        .unwrap_or_else(|_| panic!("expected four projected columns for the tracked plugin row"));
     assert_eq!(tracked_scalar, Value::Text(r#""plugin""#.to_owned()));
     assert_eq!(tracked_untracked, Value::Boolean(false));
     assert!(
         matches!(&tracked_change_id, Value::Text(value)
             if uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil())),
-        "tracked plugin entity rows must carry a real change id, got {tracked_change_id:?}"
+        "tracked plugin rows must carry a real change id, got {tracked_change_id:?}"
     );
     assert!(
         matches!(&tracked_commit_id, Value::Text(value) if !value.is_empty()),
-        "tracked plugin entity rows enter the commit graph, got {tracked_commit_id:?}"
+        "tracked plugin rows enter the commit graph, got {tracked_commit_id:?}"
     );
 
     // Untracked arm: the same plugin, the same bytes, the same projection.
@@ -527,33 +525,31 @@ async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_o
     ] = member_row(UNTRACKED_FILE_ID)
         .await
         .try_into()
-        .unwrap_or_else(|_| {
-            panic!("expected four projected columns for the untracked plugin entity row")
-        });
+        .unwrap_or_else(|_| panic!("expected four projected columns for the untracked plugin row"));
     assert_eq!(
         untracked_scalar, tracked_scalar,
-        "the same JSON must parse to the same entity value irrespective of lane"
+        "the same JSON must parse to the same row value irrespective of lane"
     );
     assert_eq!(
         untracked_untracked,
         Value::Boolean(true),
-        "entity rows inherit their file's lane"
+        "rows inherit their file's lane"
     );
     assert!(
         matches!(&untracked_change_id, Value::Text(value)
             if uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil())),
-        "untracked plugin entity rows are identity-bearing, got {untracked_change_id:?}"
+        "untracked plugin rows are identity-bearing, got {untracked_change_id:?}"
     );
     assert_eq!(
         untracked_commit_id,
         Value::Null,
-        "untracked plugin entity rows must stay outside the commit graph"
+        "untracked plugin rows must stay outside the commit graph"
     );
 
-    // Editing an entity row must round-trip back into the file's bytes on both
+    // Editing a row must round-trip back into the file's bytes on both
     // lanes. This probes the read-path boundary deliberately left tracked-only
     // in `sql2/providers/file.rs`: if an untracked file's content depended on
-    // being re-rendered from entities through that owner lookup, it would fail
+    // being re-rendered from rows through that owner lookup, it would fail
     // here rather than silently later.
     for (file_id, path) in [
         (TRACKED_FILE_ID, TRACKED_PATH),
@@ -565,11 +561,11 @@ async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_o
             &[Value::Text(file_id.to_owned())],
         )
         .await
-        .unwrap_or_else(|error| panic!("entity edit on '{path}' should commit: {error:?}"));
+        .unwrap_or_else(|error| panic!("row edit on '{path}' should commit: {error:?}"));
         assert_eq!(
             read_file(&lix, path).await.unwrap(),
             Some(br#"{"alpha":"edited"}"#.to_vec()),
-            "an entity edit must re-render '{path}' irrespective of lane"
+            "a row edit must re-render '{path}' irrespective of lane"
         );
     }
 
@@ -727,7 +723,7 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
 ///
 /// The collection-replacement marker a certified packet carries
 /// (`complete_file_state`) is not produced on the decode path. The argument
-/// that this is harmless is that `open_file` only runs when no prior entity
+/// that this is harmless is that `open_file` only runs when no prior row
 /// state exists under the selected plugin, because a previous owner's rows are
 /// tombstoned separately. This measures that argument in the case where it
 /// would fail: rows already exist for the file when it is parsed fresh again.
@@ -831,7 +827,7 @@ async fn a_fresh_reparse_after_ownership_loss_replaces_untracked_rows_like_track
 /// Scopes the blast radius of unskipping reconciliation for untracked writes.
 ///
 /// An untracked file whose path matches no installed plugin must keep working
-/// exactly as before: bytes in, bytes out, no entity rows, no plugin involved.
+/// exactly as before: bytes in, bytes out, no rows, no plugin involved.
 /// This separates "untracked plugin-owned files are blocked" from the far worse
 /// "untracked files are blocked".
 #[tokio::test]
@@ -1209,7 +1205,7 @@ async fn csv_row_structure_edits_use_full_reconciliation() {
 }
 
 #[tokio::test]
-async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
+async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_row_edit() {
     let archive = build_markdown_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -1966,7 +1962,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_batch_guard() {
 }
 
 #[tokio::test]
-async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
+async fn v2_markdown_merges_unrelated_rows_and_regenerates_derived_bytes() {
     let archive = build_markdown_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -2360,7 +2356,7 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
 }
 
 #[tokio::test]
-async fn v2_json_unrelated_entity_branch_merge_accepts_certified_snapshots() {
+async fn v2_json_unrelated_row_branch_merge_accepts_certified_snapshots() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
@@ -2446,7 +2442,7 @@ async fn v2_json_unrelated_entity_branch_merge_accepts_certified_snapshots() {
 }
 
 #[tokio::test]
-async fn v2_json_same_entity_branch_merge_runs_static_resolver_on_certified_snapshots() {
+async fn v2_json_same_row_branch_merge_runs_static_resolver_on_certified_snapshots() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
@@ -2520,7 +2516,7 @@ async fn v2_json_same_entity_branch_merge_runs_static_resolver_on_certified_snap
 }
 
 #[tokio::test]
-async fn v3_json_same_entity_branch_merge_uses_fused_conflict_and_renderer_sinks() {
+async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
@@ -3289,7 +3285,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         .unwrap();
 
     // Structure is byte-owned. A stale scalar delta is not allowed to
-    // recreate an entity after another writer removes its containing slot.
+    // recreate a row after another writer removes its containing slot.
     let stale_writer = lix.open_another_session().await.unwrap();
     let structure_writer = lix.open_another_session().await.unwrap();
     assert_eq!(
@@ -3358,11 +3354,11 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
 }
 
 #[tokio::test]
-#[ignore = "10 MiB JSON unrelated-entity merge benchmark"]
-async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
+#[ignore = "10 MiB JSON unrelated-row merge benchmark"]
+async fn v2_json_ten_mib_unrelated_row_merge_benchmark() {
     init_perf_tracing();
     const SAMPLES: usize = 7;
-    const BENCHMARK: &str = "v2_json_ten_mib_unrelated_entity_merge_benchmark";
+    const BENCHMARK: &str = "v2_json_ten_mib_unrelated_row_merge_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON merge benchmark directory");
     let archive = build_json_plugin_archive();
@@ -3470,7 +3466,7 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
         measurements.push(measurement);
         emit_sample(
             BENCHMARK,
-            "unrelated_entity",
+            "unrelated_row",
             sample,
             fixture,
             BenchmarkGate::ElapsedRegression,
@@ -3513,7 +3509,7 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     let p95_index = ((elapsed_ms.len() * 95).div_ceil(100)).saturating_sub(1);
     let merge_p95_ms = elapsed_ms[p95_index];
     eprintln!(
-        "v2_json_ten_mib_unrelated_entity_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
+        "v2_json_ten_mib_unrelated_row_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
          preview_p50_ms={:.3} preview_p95_ms={:.3} merge_p50_ms={merge_p50_ms:.3} merge_p95_ms={merge_p95_ms:.3}",
         p50_ms(&preview_elapsed_ms),
         p95_ms(&preview_elapsed_ms),
@@ -3527,7 +3523,7 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     );
     emit_summary(
         BENCHMARK,
-        "unrelated_entity",
+        "unrelated_row",
         fixture,
         BenchmarkGate::ElapsedRegression,
         &measurements,
@@ -3536,16 +3532,16 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     lix.close().await.expect("JSON benchmark should close");
 }
 
-/// End-to-end RocksDB gate for a same-entity conflict over the same large
-/// tracked tree as the adjacent unrelated-entity benchmark. The tiny built-in
+/// End-to-end RocksDB gate for a same-row conflict over the same large
+/// tracked tree as the adjacent unrelated-row benchmark. The tiny built-in
 /// control row keeps the frozen reference runnable even when its JSON plugin
 /// merge path cannot fingerprint certified snapshots.
 #[tokio::test]
-#[ignore = "10 MiB JSON same-entity conflict-resolution merge benchmark"]
-async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
+#[ignore = "10 MiB JSON same-row conflict-resolution merge benchmark"]
+async fn v2_json_ten_mib_same_row_canonical_b_merge_benchmark() {
     init_perf_tracing();
     const SAMPLES: usize = 7;
-    const BENCHMARK: &str = "v2_json_ten_mib_same_entity_canonical_b_merge_benchmark";
+    const BENCHMARK: &str = "v2_json_ten_mib_same_row_canonical_b_merge_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON conflict benchmark directory");
     let archive = build_json_plugin_archive();
@@ -3620,7 +3616,7 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
         measurements.push(measurement);
         emit_sample(
             BENCHMARK,
-            "same_entity_conflict",
+            "same_row_conflict",
             sample,
             fixture,
             BenchmarkGate::ElapsedRegression,
@@ -3643,14 +3639,14 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
     let raw_ms = elapsed_ms.clone();
     elapsed_ms.sort_by(f64::total_cmp);
     eprintln!(
-        "v2_json_ten_mib_same_entity_canonical_b_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
+        "v2_json_ten_mib_same_row_canonical_b_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
          raw_ms={raw_ms:?} p50_ms={:.3} p95_ms={:.3}",
         p50_ms(&elapsed_ms),
         p95_ms(&elapsed_ms),
     );
     emit_summary(
         BENCHMARK,
-        "same_entity_conflict",
+        "same_row_conflict",
         fixture,
         BenchmarkGate::ElapsedRegression,
         &measurements,
@@ -3857,7 +3853,7 @@ async fn qualify_corrupt_current_plugin_checkpoint<B: CurrentPluginCheckpointCor
 /// degrades into the cold rebuild it was accelerating.
 ///
 /// The second half is the correctness crux. A restored actor that served stale
-/// entity rows would be silent corruption, so the edit after cold reopen has to
+/// rows would be silent corruption, so the edit after cold reopen has to
 /// re-render exactly the bytes a cold rebuild would have produced.
 #[tokio::test]
 async fn untracked_plugin_file_publishes_and_restores_its_durable_checkpoint() {
@@ -3926,7 +3922,7 @@ async fn untracked_plugin_file_publishes_and_restores_its_durable_checkpoint() {
         &[Value::Text(FILE_ID.to_owned())],
     )
     .await
-    .expect("a restored untracked actor should accept an entity edit");
+    .expect("a restored untracked actor should accept a row edit");
     assert_eq!(
         read_file(&lix, PATH).await.unwrap(),
         Some(br#"{"alpha":"after"}"#.to_vec()),
@@ -3952,7 +3948,7 @@ async fn untracked_plugin_file_publishes_and_restores_its_durable_checkpoint() {
 }
 
 #[tokio::test]
-async fn universal_entity_page_streams_oversized_output_snapshot() {
+async fn universal_row_page_streams_oversized_output_snapshot() {
     const PATH: &str = "/universal-oversized-output.json";
     let value = "x".repeat(3 * 1024 * 1024);
     let bytes = serde_json::to_vec(&serde_json::json!({ "large": value })).unwrap();
@@ -4008,28 +4004,23 @@ impl WasmByteSource for BenchmarkByteSource {
     }
 }
 
-struct BenchmarkEntitySource {
-    entities: Vec<WasmHostEntity>,
+struct BenchmarkRowSource {
+    rows: Vec<WasmHostRow>,
     next: usize,
 }
 
-impl WasmEntitySource for BenchmarkEntitySource {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
-        if self.next == self.entities.len() {
+impl WasmRowSource for BenchmarkRowSource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError> {
+        if self.next == self.rows.len() {
             return Ok(None);
         }
         let start = self.next;
         let mut bytes = 0usize;
-        while self.next < self.entities.len() {
-            let entity = &self.entities[self.next];
-            let size = entity.key.schema_key.len()
-                + entity
-                    .key
-                    .entity_pk
-                    .iter()
-                    .map(|part| part.len())
-                    .sum::<usize>()
-                + entity.snapshot_content.len() as usize
+        while self.next < self.rows.len() {
+            let row = &self.rows[self.next];
+            let size = row.key.schema_key.len()
+                + row.key.row_pk.iter().map(|part| part.len()).sum::<usize>()
+                + row.snapshot_content.len() as usize
                 + 64;
             if self.next > start && bytes.saturating_add(size) > max_bytes as usize {
                 break;
@@ -4037,8 +4028,8 @@ impl WasmEntitySource for BenchmarkEntitySource {
             bytes = bytes.saturating_add(size);
             self.next += 1;
         }
-        Ok(Some(WasmEntityPage {
-            entities: self.entities[start..self.next].to_vec(),
+        Ok(Some(WasmRowPage {
+            rows: self.rows[start..self.next].to_vec(),
         }))
     }
 }
@@ -4071,15 +4062,15 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
     }))
     .unwrap();
     let oversized_snapshot_len = oversized_snapshot.len() as u64;
-    let entities = vec![
-        WasmEntity {
-            key: WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+    let rows = vec![
+        WasmRow {
+            key: WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
             snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
                 br#"{"id":"root","kind":"object"}"#,
             )),
         },
-        WasmEntity {
-            key: WasmEntityKey::from_owned_parts(
+        WasmRow {
+            key: WasmRowKey::from_owned_parts(
                 "json_object_member",
                 vec!["root".to_owned(), "a".to_owned()],
             ),
@@ -4087,8 +4078,8 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
                 br#"{"parent_id":"root","key":"a","order_key":"40","kind":"string","scalar_json":"\"one\""}"#,
             )),
         },
-        WasmEntity {
-            key: WasmEntityKey::from_owned_parts(
+        WasmRow {
+            key: WasmRowKey::from_owned_parts(
                 "json_object_member",
                 vec!["root".to_owned(), "b".to_owned()],
             ),
@@ -4101,10 +4092,7 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
             }),
         },
     ];
-    let original_keys = entities
-        .iter()
-        .map(|entity| entity.key.clone())
-        .collect::<Vec<_>>();
+    let original_keys = rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
 
     let limits = WasmTransitionLimits {
         max_page_bytes: 32 * 1024,
@@ -4128,7 +4116,7 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
                 }],
                 after: Arc::new(BenchmarkByteSource(after)),
                 creates: WasmCreateContext { high: 13, low: 17 },
-                entities: Box::new(BenchmarkEntitySource { entities, next: 0 }),
+                rows: Box::new(BenchmarkRowSource { rows, next: 0 }),
             },
         )
         .await
@@ -4143,7 +4131,7 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
             page.changes
                 .changes
                 .iter()
-                .filter_map(WasmEntityChange::entity_key)
+                .filter_map(WasmRowChange::row_key)
                 .cloned(),
         );
     }
@@ -4153,10 +4141,10 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
     actor.retire().await.unwrap();
 }
 
-fn json_ten_mib_durable_entities() -> Vec<WasmHostEntity> {
-    let mut entities = Vec::with_capacity(JSON_TEN_MIB_PROPERTY_COUNT + 1);
-    entities.push(WasmEntity {
-        key: WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+fn json_ten_mib_durable_rows() -> Vec<WasmHostRow> {
+    let mut rows = Vec::with_capacity(JSON_TEN_MIB_PROPERTY_COUNT + 1);
+    rows.push(WasmRow {
+        key: WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
         snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
             br#"{"id":"root","kind":"object"}"#,
         )),
@@ -4183,15 +4171,12 @@ fn json_ten_mib_durable_entities() -> Vec<WasmHostEntity> {
             "scalar_json": serde_json::to_string(&value).unwrap(),
         }))
         .unwrap();
-        entities.push(WasmEntity {
-            key: WasmEntityKey::from_owned_parts(
-                "json_object_member",
-                vec!["root".to_owned(), key],
-            ),
+        rows.push(WasmRow {
+            key: WasmRowKey::from_owned_parts("json_object_member", vec!["root".to_owned(), key]),
             snapshot_content: WasmHostBytes::Inline(Bytes::from(snapshot)),
         });
     }
-    entities
+    rows
 }
 
 async fn drain_direct_file_transition(
@@ -4204,7 +4189,7 @@ async fn drain_direct_file_transition(
         .unwrap()
         .is_some()
     {}
-    let _ = actor.take_certified_entity_batches(transition.transition);
+    let _ = actor.take_certified_row_batches(transition.transition);
     actor
         .finish_transition(transition.transition)
         .await
@@ -4242,14 +4227,14 @@ async fn v3_json_direct_cold_successor_benchmark() {
     let (before, edit_offset, _) = json_ten_mib_flat_fixture();
     let mut after = before.clone();
     after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
-    let entities = json_ten_mib_durable_entities();
+    let rows = json_ten_mib_durable_rows();
     for lane in ["hydrate_then_update", "cold_successor"] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|selected| selected != lane) {
             continue;
         }
         let mut elapsed = Vec::new();
         for sample in 0..samples {
-            let source_entities = entities.clone();
+            let source_rows = rows.clone();
             let before_source = Arc::new(BenchmarkByteSource(before.clone()));
             let after_source = Arc::new(BenchmarkByteSource(after.clone()));
             let mut actor = factory.instantiate_actor().await.unwrap();
@@ -4257,12 +4242,12 @@ async fn v3_json_direct_cold_successor_benchmark() {
             let started = Instant::now();
             let counters = if lane == "hydrate_then_update" {
                 let hydrated = actor
-                    .open_entities(
+                    .open_rows(
                         WasmTransitionLimits::default(),
-                        WasmOpenEntitiesInput {
+                        WasmOpenRowsInput {
                             descriptor: descriptor.clone(),
-                            entities: Box::new(BenchmarkEntitySource {
-                                entities: source_entities,
+                            rows: Box::new(BenchmarkRowSource {
+                                rows: source_rows,
                                 next: 0,
                             }),
                             accepted: Some(before_source.clone()),
@@ -4314,8 +4299,8 @@ async fn v3_json_direct_cold_successor_benchmark() {
                             }],
                             after: after_source,
                             creates,
-                            entities: Box::new(BenchmarkEntitySource {
-                                entities: source_entities,
+                            rows: Box::new(BenchmarkRowSource {
+                                rows: source_rows,
                                 next: 0,
                             }),
                         },
@@ -4772,7 +4757,7 @@ fn report_cold_materialized_open(
         assert_eq!(counters.full_document_reparses, 0);
         assert!(
             counters.component_boundary_bytes > 0,
-            "{label} cold successor must account for its bounded entity pages"
+            "{label} cold successor must account for its bounded row pages"
         );
     }
 
@@ -4809,7 +4794,7 @@ fn report_cold_materialized_open(
 }
 
 #[tokio::test]
-async fn v2_json_cold_entity_write_is_scoped_by_file_despite_shared_root_keys() {
+async fn v2_json_cold_row_write_is_scoped_by_file_despite_shared_root_keys() {
     let tempdir = tempfile::tempdir().unwrap();
     let archive = build_json_plugin_archive();
     let lix = open_filesystem_lix(tempdir.path()).await;
@@ -4868,7 +4853,7 @@ async fn v2_json_cold_entity_write_is_scoped_by_file_despite_shared_root_keys() 
 }
 
 #[tokio::test]
-async fn v2_json_entity_write_rollback_keeps_original_bytes_and_actor() {
+async fn v2_json_row_write_rollback_keeps_original_bytes_and_actor() {
     let archive = build_json_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -4878,7 +4863,7 @@ async fn v2_json_entity_write_rollback_keeps_original_bytes_and_actor() {
         &["json_root", "json_object_member", "json_array_item"],
     )
     .await;
-    let path = "/entity-rollback.json";
+    let path = "/row-rollback.json";
     let original = b"{\"value\":\"before\"}\n".to_vec();
     let committed = b"{\"value\":\"after\"}\n".to_vec();
     write_file(&lix, path, original.clone()).await.unwrap();
@@ -5226,7 +5211,7 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
 }
 
 #[tokio::test]
-async fn v2_json_rejects_mixed_byte_and_entity_transitions_in_one_transaction() {
+async fn v2_json_rejects_mixed_byte_and_row_transitions_in_one_transaction() {
     let archive = build_json_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -5257,7 +5242,7 @@ async fn v2_json_rejects_mixed_byte_and_entity_transitions_in_one_transaction() 
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-            &[Value::Text(r#""entity""#.to_string()), Value::Text(file_id)],
+            &[Value::Text(r#""row""#.to_string()), Value::Text(file_id)],
         )
         .await
         .expect_err("one transaction must choose byte or semantic authority per file");
@@ -5587,12 +5572,12 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 
 // A space id has exactly one value semantics, declared once in Lix
 // registry. These read it back instead of restating id, name and semantics.
-fn certified_entity_batch_space() -> StorageSpace {
-    lix::storage_bench::storage_space_by_name("hot_state.certified_entity_batch.v1")
+fn certified_row_batch_space() -> StorageSpace {
+    lix::storage_bench::storage_space_by_name("hot_state.certified_row_batch.v1")
 }
 
-fn certified_entity_batch_page_space() -> StorageSpace {
-    lix::storage_bench::storage_space_by_name("hot_state.certified_entity_batch_page.v1")
+fn certified_row_batch_page_space() -> StorageSpace {
+    lix::storage_bench::storage_space_by_name("hot_state.certified_row_batch_page.v1")
 }
 const CEB2_FIXTURE_PATH: &str = "/ceb2-hard-cut.excalidraw";
 const CEB2_FIXTURE_BYTES: &[u8] = br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}]}"#;
@@ -5672,7 +5657,7 @@ where
     );
     lix.close().await.expect("close CEB2 fixture workspace");
 
-    let contents = storage_space_entries(storage, certified_entity_batch_space()).await;
+    let contents = storage_space_entries(storage, certified_row_batch_space()).await;
     assert!(
         !contents.is_empty(),
         "writer must publish a certified batch"
@@ -5682,7 +5667,7 @@ where
         "current writers must emit only CEB2"
     );
     assert!(
-        !storage_space_entries(storage, certified_entity_batch_page_space())
+        !storage_space_entries(storage, certified_row_batch_page_space())
             .await
             .is_empty(),
         "CEB2 writer must publish external pages"
@@ -5717,7 +5702,7 @@ async fn corrupt_first_ceb2_page<StorageImpl>(storage: &StorageImpl)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut pages = storage_space_entries(storage, certified_entity_batch_page_space()).await;
+    let mut pages = storage_space_entries(storage, certified_row_batch_page_space()).await;
     let (key, mut bytes) = pages
         .drain(..)
         .next()
@@ -5730,7 +5715,7 @@ where
         .expect("open CEB2 corruption write");
     write
         .put_many(
-            certified_entity_batch_page_space(),
+            certified_row_batch_page_space(),
             PutBatch {
                 entries: vec![PutEntry {
                     key,
@@ -5756,7 +5741,7 @@ where
         .await
         .expect_err("corrupt CEB2 page must fail closed");
     assert!(
-        error.to_string().contains("certified entity batch"),
+        error.to_string().contains("certified row batch"),
         "unexpected CEB2 corruption error: {error}"
     );
     lix.close().await.expect("close corrupt CEB2 workspace");
@@ -6629,14 +6614,14 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
         )
         .await
         .unwrap();
-    let active_row_rows = lix
+    let active_plugin_rows = lix
         .execute(
             "SELECT lixcol_file_id FROM csv_row WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.clone())],
         )
         .await
         .unwrap();
-    assert_eq!(active_table_rows.len() + active_row_rows.len(), 0);
+    assert_eq!(active_table_rows.len() + active_plugin_rows.len(), 0);
     let active_owner_rows = lix
         .execute(
             "SELECT key FROM lix_key_value \
@@ -6760,7 +6745,7 @@ where
 {
     let rows = lix
         .execute(
-            "SELECT lixcol_entity_pk, id, order_key, cells FROM csv_row \
+            "SELECT lixcol_row_pk, id, order_key, cells FROM csv_row \
              WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_string())],
         )
@@ -6770,15 +6755,15 @@ where
         .rows()
         .iter()
         .map(|row| {
-            let entity_pk = row
-                .get::<serde_json::Value>("lixcol_entity_pk")
+            let row_pk = row
+                .get::<serde_json::Value>("lixcol_row_pk")
                 .unwrap()
                 .as_array()
                 .cloned()
-                .expect("csv_row entity_pk must be an array");
+                .expect("csv_row row_pk must be an array");
             let id = row.get::<String>("id").unwrap();
             assert_eq!(
-                entity_pk,
+                row_pk,
                 vec![serde_json::Value::String(id.clone())],
                 "csv_row snapshot identity must equal its durable primary key"
             );
@@ -7536,7 +7521,7 @@ async fn register_native_json_control_schemas<StorageImpl>(lix: &Lix<StorageImpl
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    // Deliberately register only the public JSON entity surfaces. The direct
+    // Deliberately register only the public JSON schema surfaces. The direct
     // control must exercise normal SQL/transaction/RocksDB work without
     // installing a component that would reconcile or render the rows.
     let mut transaction = lix

@@ -31,7 +31,7 @@ pub(crate) struct TrackedStateMergePlan {
 ///
 /// Every row retains a compact identity handle into the source diff's shared
 /// identity columns. The batch therefore owns one descriptor buffer and no
-/// row-owned schema, file, entity, or payload allocation.
+/// row-owned schema, file, row, or payload allocation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TrackedStateMergePickBatch {
     rows: Vec<TrackedStateMergePick>,
@@ -41,7 +41,7 @@ pub(crate) struct TrackedStateMergePickBatch {
 ///
 /// Conflict entries and their before/after rows all retain the target diff's
 /// shared identity handle. Cloning or iterating the batch never clones key
-/// strings, entity keys, or JSON payloads.
+/// strings, row keys, or JSON payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TrackedStateMergeConflictBatch {
     rows: Vec<TrackedStateMergeConflict>,
@@ -332,13 +332,13 @@ fn duplicate_diff_entry_error(entry: &TrackedStateDiffEntry) -> LixError {
     LixError::new(
         "LIX_ERROR_UNKNOWN",
         format!(
-            "tracked-state merge received duplicate diff entry for schema '{}' entity '{}'",
+            "tracked-state merge received duplicate diff entry for schema '{}' row '{}'",
             entry.identity.schema_key(),
             entry
                 .identity
-                .entity_pk()
+                .row_pk()
                 .as_json_array_text()
-                .unwrap_or_else(|_| "<invalid entity pk>".to_string())
+                .unwrap_or_else(|_| "<invalid row pk>".to_string())
         ),
     )
 }
@@ -393,7 +393,7 @@ where
                 if !same_final_state(target, source, payloads) {
                     // Keep the target entry's identity owner explicitly, then
                     // rebind both cloned sides to it so one conflict stores
-                    // schema/file/entity buffers once.
+                    // schema/file/row buffers once.
                     let identity = target.identity.clone();
                     plan.conflicts.push(TrackedStateMergeConflict {
                         target: clone_entry_with_identity(target, &identity),
@@ -458,9 +458,9 @@ fn source_change_pick(entry: &TrackedStateDiffEntry) -> Result<TrackedStateMerge
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "tracked-state merge cannot pick source removal for schema '{}' entity '{}' without a tombstone row",
+                "tracked-state merge cannot pick source removal for schema '{}' row '{}' without a tombstone row",
                 entry.identity.schema_key(),
-                entry.identity.entity_pk().as_json_array_text()?
+                entry.identity.row_pk().as_json_array_text()?
             ),
         ));
     };
@@ -529,7 +529,7 @@ fn tracked_row_payload_eq(
 mod tests {
     use super::*;
     use crate::changelog::CommitId;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::tracked_state::TrackedStateDiffKind;
 
     fn change_id(label: &str) -> String {
@@ -541,16 +541,16 @@ mod tests {
         let plan = plan_merge(
             &TrackedStateDiff::default(),
             &diff(vec![entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Added,
                 None,
-                Some(row("entity-a", "source")),
+                Some(row("row-a", "source")),
             )]),
             &TrackedStatePayloadBatch::default(),
         )
         .expect("merge should plan");
 
-        assert_eq!(pick_ids(&plan), vec!["entity-a"]);
+        assert_eq!(pick_ids(&plan), vec!["row-a"]);
         assert!(plan.conflicts.is_empty());
     }
 
@@ -559,16 +559,16 @@ mod tests {
         let plan = plan_merge(
             &TrackedStateDiff::default(),
             &diff(vec![entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Modified,
-                Some(row_with_value("entity-a", "base")),
-                Some(row_with_value("entity-a", "source")),
+                Some(row_with_value("row-a", "base")),
+                Some(row_with_value("row-a", "source")),
             )]),
             &TrackedStatePayloadBatch::default(),
         )
         .expect("merge should plan");
 
-        assert_eq!(pick_ids(&plan), vec!["entity-a"]);
+        assert_eq!(pick_ids(&plan), vec!["row-a"]);
         assert!(!plan.picks[0].source_row().deleted);
         assert_eq!(plan.picks[0].source_change_id(), change_id("source"));
     }
@@ -578,16 +578,16 @@ mod tests {
         let plan = plan_merge(
             &TrackedStateDiff::default(),
             &diff(vec![entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Removed,
-                Some(row("entity-a", "base")),
-                Some(tombstone("entity-a", "source-delete")),
+                Some(row("row-a", "base")),
+                Some(tombstone("row-a", "source-delete")),
             )]),
             &TrackedStatePayloadBatch::default(),
         )
         .expect("merge should plan");
 
-        assert_eq!(pick_ids(&plan), vec!["entity-a"]);
+        assert_eq!(pick_ids(&plan), vec!["row-a"]);
         assert!(plan.picks[0].source_row().deleted);
         assert_eq!(plan.picks[0].source_change_id(), change_id("source-delete"));
     }
@@ -596,10 +596,10 @@ mod tests {
     fn target_only_change_is_noop() {
         let plan = plan_merge(
             &diff(vec![entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Modified,
-                Some(row("entity-a", "base")),
-                Some(row("entity-a", "target")),
+                Some(row("row-a", "base")),
+                Some(row("row-a", "target")),
             )]),
             &TrackedStateDiff::default(),
             &TrackedStatePayloadBatch::default(),
@@ -613,16 +613,16 @@ mod tests {
     #[test]
     fn both_sides_same_final_value_is_convergent_noop() {
         let target = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base")),
-            Some(row_with_value("entity-a", "target")),
+            Some(row_with_value("row-a", "base")),
+            Some(row_with_value("row-a", "target")),
         );
         let source = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base")),
-            Some(row_with_value("entity-a", "source")),
+            Some(row_with_value("row-a", "base")),
+            Some(row_with_value("row-a", "source")),
         );
 
         // Different change ids with identical content: each diff retains the
@@ -663,16 +663,16 @@ mod tests {
     #[test]
     fn both_sides_delete_is_convergent_noop() {
         let target = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Removed,
-            Some(row("entity-a", "base")),
-            Some(tombstone("entity-a", "target-delete")),
+            Some(row("row-a", "base")),
+            Some(tombstone("row-a", "target-delete")),
         );
         let source = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Removed,
-            Some(row("entity-a", "base")),
-            Some(tombstone("entity-a", "source-delete")),
+            Some(row("row-a", "base")),
+            Some(tombstone("row-a", "source-delete")),
         );
 
         let plan = plan_merge(
@@ -689,16 +689,16 @@ mod tests {
     #[test]
     fn different_modifications_conflict() {
         let target = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base")),
-            Some(row_with_value("entity-a", "target")),
+            Some(row_with_value("row-a", "base")),
+            Some(row_with_value("row-a", "target")),
         );
         let source = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base")),
-            Some(row_with_value("entity-a", "source")),
+            Some(row_with_value("row-a", "base")),
+            Some(row_with_value("row-a", "source")),
         );
 
         let plan = plan_merge(
@@ -709,22 +709,22 @@ mod tests {
         .expect("merge should plan");
 
         assert!(plan.picks.is_empty());
-        assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
+        assert_eq!(conflict_ids(&plan), vec!["row-a"]);
     }
 
     #[test]
     fn delete_modify_conflicts() {
         let target = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Removed,
-            Some(row("entity-a", "base")),
-            Some(tombstone("entity-a", "target-delete")),
+            Some(row("row-a", "base")),
+            Some(tombstone("row-a", "target-delete")),
         );
         let source = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row("entity-a", "base")),
-            Some(row_with_value("entity-a", "source")),
+            Some(row("row-a", "base")),
+            Some(row_with_value("row-a", "source")),
         );
 
         let plan = plan_merge(
@@ -734,22 +734,22 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
+        assert_eq!(conflict_ids(&plan), vec!["row-a"]);
     }
 
     #[test]
     fn modify_delete_conflicts() {
         let target = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row("entity-a", "base")),
-            Some(row_with_value("entity-a", "target")),
+            Some(row("row-a", "base")),
+            Some(row_with_value("row-a", "target")),
         );
         let source = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Removed,
-            Some(row("entity-a", "base")),
-            Some(tombstone("entity-a", "source-delete")),
+            Some(row("row-a", "base")),
+            Some(tombstone("row-a", "source-delete")),
         );
 
         let plan = plan_merge(
@@ -759,7 +759,7 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
+        assert_eq!(conflict_ids(&plan), vec!["row-a"]);
     }
 
     #[test]
@@ -767,9 +767,9 @@ mod tests {
         let error = plan_merge(
             &TrackedStateDiff::default(),
             &diff(vec![entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Removed,
-                Some(row("entity-a", "base")),
+                Some(row("row-a", "base")),
                 None,
             )]),
             &TrackedStatePayloadBatch::default(),
@@ -782,37 +782,37 @@ mod tests {
     #[test]
     fn pick_and_conflict_order_is_deterministic_by_identity() {
         let target = diff(vec![entry(
-            "entity-b",
+            "row-b",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-b", "base")),
-            Some(row_with_value("entity-b", "target")),
+            Some(row_with_value("row-b", "base")),
+            Some(row_with_value("row-b", "target")),
         )]);
         let source = diff(vec![
             entry(
-                "entity-c",
+                "row-c",
                 TrackedStateDiffKind::Added,
                 None,
-                Some(row("entity-c", "source-c")),
+                Some(row("row-c", "source-c")),
             ),
             entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Added,
                 None,
-                Some(row("entity-a", "source-a")),
+                Some(row("row-a", "source-a")),
             ),
             entry(
-                "entity-b",
+                "row-b",
                 TrackedStateDiffKind::Modified,
-                Some(row_with_value("entity-b", "base")),
-                Some(row_with_value("entity-b", "source")),
+                Some(row_with_value("row-b", "base")),
+                Some(row_with_value("row-b", "source")),
             ),
         ]);
 
         let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
             .expect("merge should plan");
 
-        assert_eq!(pick_ids(&plan), vec!["entity-a", "entity-c"]);
-        assert_eq!(conflict_ids(&plan), vec!["entity-b"]);
+        assert_eq!(pick_ids(&plan), vec!["row-a", "row-c"]);
+        assert_eq!(conflict_ids(&plan), vec!["row-b"]);
     }
 
     #[test]
@@ -821,12 +821,12 @@ mod tests {
         let source = diff(
             (0..10_000)
                 .map(|index| {
-                    let entity_pk = format!("entity-{index:05}");
+                    let row_pk = format!("row-{index:05}");
                     entry(
-                        &entity_pk,
+                        &row_pk,
                         TrackedStateDiffKind::Added,
                         None,
-                        Some(row(&entity_pk, &format!("source-{index:05}"))),
+                        Some(row(&row_pk, &format!("source-{index:05}"))),
                     )
                 })
                 .collect(),
@@ -894,7 +894,7 @@ mod tests {
 
         assert_eq!(plan.picks.len(), 1);
         assert_eq!(plan.picks.row_capacity(), 1);
-        assert_eq!(plan.picks[0].identity.entity_pk(), &integer_entity_pk(-1));
+        assert_eq!(plan.picks[0].identity.row_pk(), &integer_row_pk(-1));
         assert!(plan.conflicts.is_empty());
         assert_eq!(plan.conflicts.row_capacity(), 0);
     }
@@ -939,8 +939,8 @@ mod tests {
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts.row_capacity(), 1);
         assert_eq!(
-            plan.conflicts[0].identity.entity_pk(),
-            &integer_entity_pk(-1)
+            plan.conflicts[0].identity.row_pk(),
+            &integer_row_pk(-1)
         );
     }
 
@@ -953,7 +953,7 @@ mod tests {
                     .map(|index| crate::tracked_state::TrackedStateKey {
                         schema_key: "shared_schema".to_string(),
                         file_id: None,
-                        entity_pk: EntityPk::single(format!("{identity_prefix}-{index:05}")),
+                        row_pk: RowPk::single(format!("{identity_prefix}-{index:05}")),
                     })
                     .collect(),
             )
@@ -985,8 +985,8 @@ mod tests {
                     .collect(),
             )
         };
-        let target = batched_diff("entity-a", "target");
-        let source = batched_diff("entity-b", "source");
+        let target = batched_diff("row-a", "target");
+        let source = batched_diff("row-b", "source");
 
         let fallback_ids = merge_payload_fallback_ids(&target, &source)
             .expect("disjoint sorted batches should intersect");
@@ -999,52 +999,52 @@ mod tests {
 
     #[test]
     fn unsorted_payload_fallback_intersects_only_live_differing_changes() {
-        let mut target_deleted = row("entity-c", "target-c");
+        let mut target_deleted = row("row-c", "target-c");
         target_deleted.deleted = true;
         let target = diff(vec![
             entry(
-                "entity-c",
+                "row-c",
                 TrackedStateDiffKind::Removed,
                 None,
                 Some(target_deleted),
             ),
             entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Modified,
                 None,
-                Some(row("entity-a", "target-a")),
+                Some(row("row-a", "target-a")),
             ),
             entry(
-                "entity-b",
+                "row-b",
                 TrackedStateDiffKind::Modified,
                 None,
-                Some(row("entity-b", "same-b")),
+                Some(row("row-b", "same-b")),
             ),
         ]);
         let source = diff(vec![
             entry(
-                "entity-b",
+                "row-b",
                 TrackedStateDiffKind::Modified,
                 None,
-                Some(row("entity-b", "same-b")),
+                Some(row("row-b", "same-b")),
             ),
             entry(
-                "entity-c",
+                "row-c",
                 TrackedStateDiffKind::Modified,
                 None,
-                Some(row("entity-c", "source-c")),
+                Some(row("row-c", "source-c")),
             ),
             entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Modified,
                 None,
-                Some(row("entity-a", "source-a")),
+                Some(row("row-a", "source-a")),
             ),
             entry(
-                "entity-d",
+                "row-d",
                 TrackedStateDiffKind::Added,
                 None,
-                Some(row("entity-d", "source-d")),
+                Some(row("row-d", "source-d")),
             ),
         ]);
 
@@ -1068,7 +1068,7 @@ mod tests {
                 .map(|index| crate::tracked_state::TrackedStateKey {
                     schema_key: "shared_schema".to_string(),
                     file_id: Some("shared_file".to_string()),
-                    entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                    row_pk: RowPk::single(format!("row-{index:05}")),
                 })
                 .collect()
         };
@@ -1136,30 +1136,30 @@ mod tests {
     fn unsorted_merge_uses_one_partitioned_reference_buffer() {
         let target = diff(vec![
             entry(
-                "entity-c",
+                "row-c",
                 TrackedStateDiffKind::Modified,
-                Some(row("entity-c", "base-c")),
-                Some(row("entity-c", "target-c")),
+                Some(row("row-c", "base-c")),
+                Some(row("row-c", "target-c")),
             ),
             entry(
-                "entity-a",
+                "row-a",
                 TrackedStateDiffKind::Modified,
-                Some(row("entity-a", "base-a")),
-                Some(row("entity-a", "target-a")),
+                Some(row("row-a", "base-a")),
+                Some(row("row-a", "target-a")),
             ),
         ]);
         let source = diff(vec![
             entry(
-                "entity-d",
+                "row-d",
                 TrackedStateDiffKind::Added,
                 None,
-                Some(row("entity-d", "source-d")),
+                Some(row("row-d", "source-d")),
             ),
             entry(
-                "entity-b",
+                "row-b",
                 TrackedStateDiffKind::Added,
                 None,
-                Some(row("entity-b", "source-b")),
+                Some(row("row-b", "source-b")),
             ),
         ]);
 
@@ -1176,43 +1176,43 @@ mod tests {
                 assert_eq!(
                     entries[0]
                         .identity
-                        .entity_pk()
+                        .row_pk()
                         .as_single_string_owned()
                         .expect("target identity"),
-                    "entity-a"
+                    "row-a"
                 );
                 assert_eq!(
                     entries[target_len]
                         .identity
-                        .entity_pk()
+                        .row_pk()
                         .as_single_string_owned()
                         .expect("source identity"),
-                    "entity-b"
+                    "row-b"
                 );
             }
         }
 
         let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
             .expect("unsorted merge should plan");
-        assert_eq!(pick_ids(&plan), vec!["entity-b", "entity-d"]);
+        assert_eq!(pick_ids(&plan), vec!["row-b", "row-d"]);
         assert!(plan.conflicts.is_empty());
     }
 
     #[test]
     fn unsorted_non_adjacent_duplicate_identity_is_rejected() {
         let duplicate = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Added,
             None,
-            Some(row("entity-a", "source-a")),
+            Some(row("row-a", "source-a")),
         );
         let source = diff(vec![
             duplicate.clone(),
             entry(
-                "entity-b",
+                "row-b",
                 TrackedStateDiffKind::Added,
                 None,
-                Some(row("entity-b", "source-b")),
+                Some(row("row-b", "source-b")),
             ),
             duplicate,
         ]);
@@ -1225,24 +1225,24 @@ mod tests {
         .expect_err("duplicate source identity must be rejected");
 
         assert!(error.message.contains("duplicate diff entry"));
-        assert!(error.message.contains("entity-a"));
+        assert!(error.message.contains("row-a"));
     }
 
     fn diff(entries: Vec<TrackedStateDiffEntry>) -> TrackedStateDiff {
         TrackedStateDiff::from_entries(entries)
     }
 
-    fn integer_entity_pk(value: i64) -> EntityPk {
-        EntityPk::from_components(smallvec::smallvec![
-            crate::entity_pk::EntityPkComponent::Integer(value)
+    fn integer_row_pk(value: i64) -> RowPk {
+        RowPk::from_components(smallvec::smallvec![
+            crate::row_pk::RowPkComponent::Integer(value)
         ])
-        .expect("one integer is a valid entity primary key")
+        .expect("one integer is a valid row primary key")
     }
 
     fn integer_identity_batch(first: i64, row_count: usize) -> Vec<TrackedStateDiffIdentity> {
-        let entity_pks = (0..row_count)
+        let row_pks = (0..row_count)
             .map(|offset| {
-                integer_entity_pk(
+                integer_row_pk(
                     first + i64::try_from(offset).expect("test row count fits an i64"),
                 )
             })
@@ -1251,7 +1251,7 @@ mod tests {
             crate::tracked_state::TrackedStateKeyRef {
                 schema_key: "test_schema",
                 file_id: None,
-                entity_pk: &entity_pks[index],
+                row_pk: &row_pks[index],
             }
         })
         .expect("integer identity batch should seal")
@@ -1285,14 +1285,14 @@ mod tests {
     }
 
     fn entry(
-        entity_pk: &str,
+        row_pk: &str,
         kind: TrackedStateDiffKind,
         mut before: Option<TrackedStateDiffRow>,
         mut after: Option<TrackedStateDiffRow>,
     ) -> TrackedStateDiffEntry {
         let identity = TrackedStateDiffIdentity::from_key(crate::tracked_state::TrackedStateKey {
             schema_key: "test_schema".to_string(),
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
             file_id: None,
         });
         if let Some(before) = before.as_mut() {
@@ -1315,7 +1315,7 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity()
-                    .entity_pk()
+                    .row_pk()
                     .as_single_string_owned()
                     .expect("identity")
             })
@@ -1328,27 +1328,27 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity
-                    .entity_pk()
+                    .row_pk()
                     .as_single_string_owned()
                     .expect("identity")
             })
             .collect()
     }
 
-    fn tombstone(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
-        let mut row = row(entity_pk, change_id);
+    fn tombstone(row_pk: &str, change_id: &str) -> TrackedStateDiffRow {
+        let mut row = row(row_pk, change_id);
         row.deleted = true;
         row
     }
 
-    fn row(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
-        row_with_value(entity_pk, change_id)
+    fn row(row_pk: &str, change_id: &str) -> TrackedStateDiffRow {
+        row_with_value(row_pk, change_id)
     }
 
-    fn row_with_value(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
+    fn row_with_value(row_pk: &str, change_id: &str) -> TrackedStateDiffRow {
         TrackedStateDiffRow {
             identity: TrackedStateDiffIdentity::from_key(crate::tracked_state::TrackedStateKey {
-                entity_pk: EntityPk::single(entity_pk),
+                row_pk: RowPk::single(row_pk),
                 schema_key: "test_schema".to_string(),
                 file_id: None,
             }),
@@ -1369,10 +1369,10 @@ mod tests {
     #[test]
     fn merge_plan_reuses_diff_identity_owner_for_conflicts_and_side_rows() {
         let target = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row("entity-a", "base")),
-            Some(row("entity-a", "target")),
+            Some(row("row-a", "base")),
+            Some(row("row-a", "target")),
         );
         let target_owner = target.identity.clone();
         assert!(
@@ -1388,10 +1388,10 @@ mod tests {
                 .is_some_and(|row| target_owner.shares_key_with(&row.identity))
         );
         let source = entry(
-            "entity-a",
+            "row-a",
             TrackedStateDiffKind::Modified,
-            Some(row("entity-a", "base")),
-            Some(row("entity-a", "source")),
+            Some(row("row-a", "base")),
+            Some(row("row-a", "source")),
         );
         let source_owner = source.identity.clone();
 

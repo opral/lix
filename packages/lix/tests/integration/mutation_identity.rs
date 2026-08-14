@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use lix::common::{LixTimestamp, MutationIdentity};
-use lix::entity_pk::EntityPk;
+use lix::row_pk::RowPk;
 use lix::hot_state::MaterializedHotStateRow;
 use lix::plugin::runtime::{
     BoundCreateContext, PluginActorKey, reserve_create_row, validate_create_reservation,
@@ -49,7 +49,7 @@ async fn create_reservations_survive_repository_reopen() {
         .expect("reservation materializes")
         .expect("a fresh identity writes one reservation");
     let reservation_key = reservation
-        .entity_pk
+        .row_pk
         .as_ref()
         .expect("reservation key")
         .as_single_string()
@@ -144,7 +144,7 @@ async fn load_reservation(
         .get::<serde_json::Value>("value")
         .expect("reservation value is JSON");
     MaterializedHotStateRow {
-        entity_pk: EntityPk::single(reservation_key),
+        row_pk: RowPk::single(reservation_key),
         schema_key: "lix_key_value".to_string(),
         file_id: Some(
             row.get::<String>("lixcol_file_id")

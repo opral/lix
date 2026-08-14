@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_collection_generation",
-  "description": "Internal tracked control row selecting the active physical generation for one schema/file collection. This schema is intentionally hidden from generated entity SQL surfaces.",
+  "description": "Internal tracked control row selecting the active physical generation for one schema/file collection. This schema is intentionally hidden from generated schema SQL surfaces.",
   "columns": [
     {
       "name": "file_id",

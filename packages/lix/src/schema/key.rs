@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SchemaKey {
@@ -52,8 +52,8 @@ pub fn schema_from_registered_snapshot(
     Ok((SchemaKey::new(schema_key), value))
 }
 
-pub(crate) fn registered_schema_entity_pk(schema_key: &str) -> Result<EntityPk, LixError> {
-    EntityPk::from_primary_key_paths(
+pub(crate) fn registered_schema_row_pk(schema_key: &str) -> Result<RowPk, LixError> {
+    RowPk::from_primary_key_paths(
         &serde_json::json!({ "schema_key": schema_key }),
         &[vec!["schema_key".to_string()]],
     )

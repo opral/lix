@@ -90,14 +90,14 @@ impl CompiledSchema {
         Ok(())
     }
 
-    /// Validate the canonical JSON object used for an entity snapshot.
+    /// Validate the canonical JSON object used for a row snapshot.
     ///
     /// A JSON `null` in a JSONB column is a JSONB value. In every other column
     /// it represents SQL `NULL` and therefore requires a nullable column.
     pub fn validate(&self, value: &Value) -> Result<(), Error> {
         let object = value
             .as_object()
-            .ok_or_else(|| Error::new(ErrorKind::Row, "/", "entity snapshot must be an object"))?;
+            .ok_or_else(|| Error::new(ErrorKind::Row, "/", "row snapshot must be an object"))?;
         for name in object.keys() {
             if !self.columns.contains_key(name) {
                 return row_error(format!("/{name}"), "unknown column");

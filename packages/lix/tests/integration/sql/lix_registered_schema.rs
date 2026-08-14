@@ -34,36 +34,36 @@ simulation_test!(
 
         let registered_schema_row = session
             .execute(
-                "SELECT lixcol_entity_pk, value \
+                "SELECT lixcol_row_pk, value \
                  FROM lix_registered_schema",
                 &[],
             )
             .await
             .expect("registered schema read should succeed");
         let registered_schema_rows = registered_schema_row;
-        let registered_schema_entity_pk = registered_schema_rows
+        let registered_schema_row_pk = registered_schema_rows
             .rows()
             .iter()
             .find_map(|row| match row.values() {
-                [Value::Json(entity_pk), Value::Json(value)]
+                [Value::Json(row_pk), Value::Json(value)]
                     if value
                         .to_value()
                         .get("key")
                         .and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema") =>
                 {
-                    Some(entity_pk)
+                    Some(row_pk)
                 }
-                [Value::Json(entity_pk), Value::Text(value)] => {
+                [Value::Json(row_pk), Value::Text(value)] => {
                     let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                     (value.get("key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema"))
-                    .then_some(entity_pk)
+                    .then_some(row_pk)
                 }
                 _ => None,
             })
             .expect("registered schema row should be visible");
-        assert_eq!(registered_schema_entity_pk, &json!(["engine_dummy_schema"]));
+        assert_eq!(registered_schema_row_pk, &json!(["engine_dummy_schema"]));
 
         let insert_state_result = session
             .execute(
@@ -134,7 +134,7 @@ simulation_test!(
         let selected = session
             .execute("SELECT id, label FROM default_values_probe", &[])
             .await
-            .expect("defaulted entity should be readable");
+            .expect("defaulted row should be readable");
         assert_eq!(selected.len(), 1);
         let [Value::Text(id), Value::Text(label)] = selected.rows()[0].values() else {
             panic!("generated and literal defaults should produce text columns");
@@ -249,7 +249,7 @@ simulation_test!(
                 &[Value::Text("note-1".to_string())],
             )
             .await
-            .expect("new entity surface should be readable after commit");
+            .expect("new schema surface should be readable after commit");
         assert_rows_eq(
             selected,
             vec![vec![Value::Text("after commit".to_string())]],
@@ -512,40 +512,40 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
 
     let registered_schema_rows = session
         .execute(
-            "SELECT lixcol_entity_pk, value \
+            "SELECT lixcol_row_pk, value \
                  FROM lix_registered_schema",
             &[],
         )
         .await
         .expect("registered schema read should succeed");
-    let delete_schema_entity_pk = registered_schema_rows
+    let delete_schema_row_pk = registered_schema_rows
         .rows()
         .iter()
         .find_map(|row| match row.values() {
-            [Value::Json(entity_pk), Value::Json(value)]
+            [Value::Json(row_pk), Value::Json(value)]
                 if value
                     .to_value()
                     .get("key")
                     .and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema") =>
             {
-                Some(entity_pk.clone())
+                Some(row_pk.clone())
             }
-            [Value::Json(entity_pk), Value::Text(value)] => {
+            [Value::Json(row_pk), Value::Text(value)] => {
                 let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                 (value.get("key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema"))
-                .then_some(entity_pk.clone())
+                .then_some(row_pk.clone())
             }
             _ => None,
         })
-        .expect("registered schema entity pk should be discoverable");
+        .expect("registered schema row pk should be discoverable");
 
     let error = session
         .execute(
             "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = $1",
-            &[Value::Json(delete_schema_entity_pk)],
+                 WHERE lixcol_row_pk = $1",
+            &[Value::Json(delete_schema_row_pk)],
         )
         .await
         .expect_err("schema deletion is not supported yet");
@@ -626,7 +626,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB)",
                 &[Value::Json(amended_schema.clone().into())],
             )
             .await
@@ -641,9 +641,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_depth \
+                    "SELECT value, lixcol_row_pk, lixcol_observed_commit_id, lixcol_depth \
                      FROM lix_registered_schema_history('{second_commit_id}') \
-                       WHERE lixcol_entity_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB) \
+                       WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB) \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -740,7 +740,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_by_branch_insert_rejects_target_branch_without_schema,
+    row_by_branch_insert_rejects_target_branch_without_schema,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -865,7 +865,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -876,7 +876,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -955,7 +955,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[Value::Json(main_schema.clone().into())],
             )
             .await
@@ -966,7 +966,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[Value::Json(draft_schema.clone().into())],
             )
             .await
@@ -977,7 +977,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -988,7 +988,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -998,7 +998,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_by_branch_insert_rejects_fk_graph_when_target_branch_lacks_schemas,
+    row_by_branch_insert_rejects_fk_graph_when_target_branch_lacks_schemas,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -1079,7 +1079,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_entity_insert_applies_defaulted_primary_key,
+    registered_row_insert_applies_defaulted_primary_key,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1109,32 +1109,32 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity insert should apply defaulted primary key");
+            .expect("row insert should apply defaulted primary key");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
-                "SELECT lixcol_entity_pk, id, name \
+                "SELECT lixcol_row_pk, id, name \
                  FROM engine_default_id_schema \
                  WHERE name = 'Generated'",
                 &[],
             )
             .await
-            .expect("entity read should succeed");
+            .expect("row read should succeed");
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Json(entity_pk), Value::Text(id), Value::Text(name)] = values else {
+        let [Value::Json(row_pk), Value::Text(id), Value::Text(name)] = values else {
             panic!("expected generated id row, got {values:?}");
         };
-        assert_eq!(entity_pk, &json!([id]));
+        assert_eq!(row_pk, &json!([id]));
         assert!(!id.is_empty(), "defaulted id should be non-empty");
         assert_eq!(name, "Generated");
     }
 );
 
 simulation_test!(
-    registered_entity_insert_preserves_explicit_null_for_defaulted_column,
+    registered_row_insert_preserves_explicit_null_for_defaulted_column,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1165,7 +1165,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity insert should preserve explicit null");
+            .expect("row insert should preserve explicit null");
 
         session
             .execute(
@@ -1174,7 +1174,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity insert should apply default for omitted column");
+            .expect("row insert should apply default for omitted column");
 
         let result = session
             .execute(
@@ -1184,7 +1184,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity read should succeed");
+            .expect("row read should succeed");
 
         assert_rows_eq(
             result,
@@ -1199,7 +1199,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
+simulation_test!(row_by_branch_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let global_session = sim.wrap_session(
         engine
@@ -1246,35 +1246,35 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
         .execute(
             "INSERT INTO engine_overlay_schema \
                  (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('entity-global-overlay', 'Global Entity', true, false)",
+                 VALUES ('row-global-overlay', 'Global Row', true, false)",
             &[],
         )
         .await
-        .expect("global entity insert should succeed");
+        .expect("global row insert should succeed");
 
     let result = session
         .execute(
             "SELECT id, name, lixcol_branch_id, lixcol_global, lixcol_untracked \
                  FROM engine_overlay_schema_by_branch \
-                 WHERE lixcol_entity_pk = CAST('[\"entity-global-overlay\"]' AS JSONB) \
+                 WHERE lixcol_row_pk = CAST('[\"row-global-overlay\"]' AS JSONB) \
                  ORDER BY lixcol_branch_id",
             &[],
         )
         .await
-        .expect("entity by-branch read should succeed");
+        .expect("row by-branch read should succeed");
     assert_rows_eq(
         result,
         vec![
             vec![
-                Value::Text("entity-global-overlay".to_string()),
-                Value::Text("Global Entity".to_string()),
+                Value::Text("row-global-overlay".to_string()),
+                Value::Text("Global Row".to_string()),
                 Value::Text(sim.main_branch_id().to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ],
             vec![
-                Value::Text("entity-global-overlay".to_string()),
-                Value::Text("Global Entity".to_string()),
+                Value::Text("row-global-overlay".to_string()),
+                Value::Text("Global Row".to_string()),
                 Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
@@ -1284,7 +1284,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
 });
 
 simulation_test!(
-    global_entity_insert_rejects_active_only_schema,
+    global_row_insert_rejects_active_only_schema,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1327,7 +1327,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_typed_entity_surface_uses_primary_key_columns,
+    registered_typed_schema_surface_uses_primary_key_columns,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1342,7 +1342,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_typed_entity_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"float8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_typed_row_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"float8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1353,38 +1353,38 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO engine_typed_entity_schema \
+                "INSERT INTO engine_typed_row_schema \
                  (id, name, count, lixcol_global, lixcol_untracked) \
-                 VALUES ('typed-entity-1', 'Typed Entity', 7, false, false)",
+                 VALUES ('typed-row-1', 'Typed Row', 7, false, false)",
                 &[],
             )
             .await
-            .expect("typed entity insert should succeed");
+            .expect("typed row insert should succeed");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
-                "SELECT id, name, count, lixcol_entity_pk \
-                 FROM engine_typed_entity_schema \
-                 WHERE id = 'typed-entity-1'",
+                "SELECT id, name, count, lixcol_row_pk \
+                 FROM engine_typed_row_schema \
+                 WHERE id = 'typed-row-1'",
                 &[],
             )
             .await
-            .expect("typed entity query by primary-key column should succeed");
+            .expect("typed row query by primary-key column should succeed");
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("typed-entity-1".to_string()),
-                Value::Text("Typed Entity".to_string()),
+                Value::Text("typed-row-1".to_string()),
+                Value::Text("Typed Row".to_string()),
                 Value::Real(7.0),
-                Value::Json(json!(["typed-entity-1"]).into()),
+                Value::Json(json!(["typed-row-1"]).into()),
             ]],
         );
     }
 );
 
 simulation_test!(
-    typed_entity_number_update_accepts_integer_param_like_insert,
+    typed_row_number_update_accepts_integer_param_like_insert,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1416,7 +1416,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed entity insert should accept integer literal for number column");
+            .expect("typed row insert should accept integer literal for number column");
 
         session
             .execute(
@@ -1426,7 +1426,7 @@ simulation_test!(
                 &[Value::Integer(52000)],
             )
             .await
-            .expect("typed entity update should accept integer param for number column");
+            .expect("typed row update should accept integer param for number column");
 
         let result = session
             .execute(
@@ -1436,13 +1436,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed entity query should succeed");
+            .expect("typed row query should succeed");
         assert_rows_eq(result, vec![vec![Value::Real(52000.0)]]);
     }
 );
 
 simulation_test!(
-    typed_entity_update_accepts_file_id_predicate,
+    typed_row_update_accepts_file_id_predicate,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1457,7 +1457,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_file_scoped_entity_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_file_scoped_row_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1479,7 +1479,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO engine_file_scoped_entity_schema \
+                "INSERT INTO engine_file_scoped_row_schema \
                  (id, name, lixcol_file_id, lixcol_global, lixcol_untracked) \
                  VALUES \
                  ('row-1', 'before-1', '66696c65-2d31-8000-8000-000000000000', false, false), \
@@ -1487,28 +1487,28 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed entity inserts with file ids should succeed");
+            .expect("typed row inserts with file ids should succeed");
 
         let update = session
             .execute(
-                "UPDATE engine_file_scoped_entity_schema \
+                "UPDATE engine_file_scoped_row_schema \
                  SET name = 'after' \
                  WHERE lixcol_file_id = '66696c65-2d31-8000-8000-000000000000'",
                 &[],
             )
             .await
-            .expect("file id should be accepted in an entity write predicate");
+            .expect("file id should be accepted in a row write predicate");
         assert_eq!(update, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
                 "SELECT id, name, lixcol_file_id \
-                 FROM engine_file_scoped_entity_schema \
+                 FROM engine_file_scoped_row_schema \
                  ORDER BY id",
                 &[],
             )
             .await
-            .expect("entity file id should be readable");
+            .expect("row file id should be readable");
         assert_rows_eq(
             result,
             vec![
@@ -1528,7 +1528,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_update_accepts_parseable_json_text_identity_predicate,
+    typed_row_update_accepts_parseable_json_text_identity_predicate,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1560,13 +1560,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed entity insert should succeed");
+            .expect("typed row insert should succeed");
 
         let update = session
             .execute(
                 "UPDATE engine_identity_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_entity_pk = '[\"row-1\"]'",
+                 WHERE lixcol_row_pk = '[\"row-1\"]'",
                 &[],
             )
             .await
@@ -1579,13 +1579,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("updated typed entity should read");
+            .expect("updated typed row should read");
         assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
     }
 );
 
 simulation_test!(
-    typed_entity_update_accepts_parseable_json_text_identity_in_predicate,
+    typed_row_update_accepts_parseable_json_text_identity_in_predicate,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1617,13 +1617,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed entity insert should succeed");
+            .expect("typed row insert should succeed");
 
         let update = session
             .execute(
                 "UPDATE engine_identity_in_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_entity_pk IN ('[\"row-1\"]')",
+                 WHERE lixcol_row_pk IN ('[\"row-1\"]')",
                 &[],
             )
             .await
@@ -1636,13 +1636,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("updated typed entity should read");
+            .expect("updated typed row should read");
         assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
     }
 );
 
 simulation_test!(
-    typed_entity_base_update_cannot_override_active_branch_filter,
+    typed_row_base_update_cannot_override_active_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -1689,25 +1689,25 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("draft entity insert should succeed");
+            .expect("draft row insert should succeed");
 
         let error = main
             .execute(
                 "UPDATE engine_base_branch_filter_schema \
                  SET name = 'main-updated-draft' \
-                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
+                 WHERE lixcol_row_pk = '[\"row-1\"]' \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
             .await
-            .expect_err("base entity table should not expose lixcol_branch_id");
+            .expect_err("base row table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 "SELECT name \
                  FROM engine_base_branch_filter_schema_by_branch \
-                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
@@ -1718,7 +1718,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_base_insert_cannot_override_active_branch_scope,
+    typed_row_base_insert_cannot_override_active_branch_scope,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -1757,14 +1757,14 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("base entity table should not expose lixcol_branch_id");
+            .expect_err("base row table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 "SELECT name \
                  FROM engine_base_insert_branch_schema_by_branch \
-                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000e'",
                 &[],
             )
@@ -1775,7 +1775,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_insert_rejects_unknown_column,
+    typed_row_insert_rejects_unknown_column,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1807,7 +1807,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("typed entity insert should not ignore unknown columns");
+            .expect_err("typed row insert should not ignore unknown columns");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = session
@@ -1819,7 +1819,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_insert_rejects_duplicate_columns,
+    typed_row_insert_rejects_duplicate_columns,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1851,7 +1851,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("typed entity insert should not accept duplicate columns");
+            .expect_err("typed row insert should not accept duplicate columns");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = session
@@ -1863,7 +1863,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_insert_rejects_unresolved_qualified_table,
+    typed_row_insert_rejects_unresolved_qualified_table,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1906,7 +1906,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_base_insert_cannot_override_active_branch_filter,
+    typed_row_base_insert_cannot_override_active_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -1945,7 +1945,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("base entity table should not expose lixcol_branch_id");
+            .expect_err("base row table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
@@ -1962,7 +1962,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_by_branch_delete_requires_explicit_branch_filter,
+    typed_row_by_branch_delete_requires_explicit_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -2000,7 +2000,7 @@ simulation_test!(
             &[],
         )
         .await
-        .expect("main entity insert should succeed");
+        .expect("main row insert should succeed");
 
         let draft = sim.wrap_session(
             engine
@@ -2017,11 +2017,11 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("draft entity insert should succeed");
+            .expect("draft row insert should succeed");
 
         main.execute(
             "DELETE FROM engine_by_branch_delete_scope_schema_by_branch \
-             WHERE lixcol_entity_pk = '[\"row-1\"]'",
+             WHERE lixcol_row_pk = '[\"row-1\"]'",
             &[],
         )
         .await
@@ -2032,7 +2032,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_delete_scope_schema_by_branch \
-                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000010') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2058,7 +2058,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_by_branch_update_requires_explicit_branch_filter,
+    typed_row_by_branch_update_requires_explicit_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -2096,7 +2096,7 @@ simulation_test!(
             &[],
         )
         .await
-        .expect("main entity insert should succeed");
+        .expect("main row insert should succeed");
 
         let draft = sim.wrap_session(
             engine
@@ -2113,12 +2113,12 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("draft entity insert should succeed");
+            .expect("draft row insert should succeed");
 
         main.execute(
             "UPDATE engine_by_branch_update_scope_schema_by_branch \
              SET name = 'updated-all' \
-             WHERE lixcol_entity_pk = '[\"row-1\"]'",
+             WHERE lixcol_row_pk = '[\"row-1\"]'",
             &[],
         )
         .await
@@ -2129,7 +2129,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_update_scope_schema_by_branch \
-                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000011') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2155,7 +2155,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_by_branch_dml_rejects_branch_id_alias,
+    typed_row_by_branch_dml_rejects_branch_id_alias,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -2193,7 +2193,7 @@ simulation_test!(
             &[],
         )
         .await
-        .expect("main entity insert should succeed");
+        .expect("main row insert should succeed");
 
         let draft = sim.wrap_session(
             engine
@@ -2210,13 +2210,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("draft entity insert should succeed");
+            .expect("draft row insert should succeed");
 
         let update_error = main
             .execute(
                 "UPDATE engine_by_branch_alias_scope_schema_by_branch \
                  SET name = 'updated-via-alias' \
-                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
+                 WHERE lixcol_row_pk = '[\"row-1\"]' \
                    AND branch_id = '01930000-0000-7000-8000-00000000000f'",
                 &[],
             )
@@ -2227,7 +2227,7 @@ simulation_test!(
         let delete_error = main
             .execute(
                 "DELETE FROM engine_by_branch_alias_scope_schema_by_branch \
-                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
+                 WHERE lixcol_row_pk = '[\"row-1\"]' \
                    AND branch_id = '01930000-0000-7000-8000-00000000000f'",
                 &[],
             )
@@ -2240,7 +2240,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_alias_scope_schema_by_branch \
-                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-00000000000f') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2266,7 +2266,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_update_rejects_duplicate_assignments,
+    typed_row_update_rejects_duplicate_assignments,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2298,7 +2298,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity insert should succeed");
+            .expect("row insert should succeed");
 
         let error = session
             .execute(
@@ -2308,7 +2308,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("typed entity update should not accept duplicate assignments");
+            .expect_err("typed row update should not accept duplicate assignments");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = session
@@ -2323,7 +2323,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    primary_key_only_entity_metadata_update_keeps_internal_snapshot_projection,
+    primary_key_only_row_metadata_update_keeps_internal_snapshot_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2350,7 +2350,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_propertyless_update_schema \
-                 (id, lixcol_entity_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
+                 (id, lixcol_row_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
                  VALUES (\
                    'propertyless-row',\
                    CAST('[\"propertyless-row\"]' AS JSONB),\
@@ -2361,13 +2361,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("propertyless entity should insert");
+            .expect("propertyless row should insert");
 
         session
             .execute(
                 "UPDATE engine_propertyless_update_schema \
                  SET lixcol_metadata = CAST('{\"phase\":\"after\"}' AS JSONB) \
-                 WHERE lixcol_entity_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
+                 WHERE lixcol_row_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2378,18 +2378,18 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM engine_propertyless_update_schema \
-                     WHERE lixcol_entity_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
+                     WHERE lixcol_row_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
                     &[],
                 )
                 .await
-                .expect("updated propertyless entity should remain readable"),
+                .expect("updated propertyless row should remain readable"),
             vec![vec![Value::Json(json!({"phase": "after"}).into())]],
         );
     }
 );
 
 simulation_test!(
-    typed_entity_update_preserves_absent_optional_non_nullable_fields,
+    typed_row_update_preserves_absent_optional_non_nullable_fields,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2441,7 +2441,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed entity query should succeed");
+            .expect("typed row query should succeed");
         assert_rows_eq(
             result,
             vec![vec![Value::Text("after".to_string()), Value::Null]],

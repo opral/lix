@@ -240,7 +240,7 @@ test("undo and redo roundtrip tracked state through the local worker", async () 
 	await lix.close();
 });
 
-test("execute and executeBatch expose registered-entity RETURNING postimages", async () => {
+test("execute and executeBatch expose registered-row RETURNING postimages", async () => {
 	const lix = await openLix();
 	await registerCrmTaskSchema(lix);
 
@@ -1380,9 +1380,9 @@ test("merge conflicts expose structured preview details and merge error", async 
 	const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
 	expect(preview.conflicts).toHaveLength(1);
 	expect(preview.conflicts[0]).toMatchObject({
-		kind: "sameEntityChanged",
+		kind: "sameRowChanged",
 		schemaKey: "crm_task",
-		entityPk: ["conflict-task"],
+		rowPk: ["conflict-task"],
 	});
 	expect(preview.conflicts[0]?.target).toBeDefined();
 	expect(preview.conflicts[0]?.source).toBeDefined();

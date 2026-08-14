@@ -375,7 +375,7 @@ pub(super) struct PlannedDml {
 /// `plan_update`, with `validate_update_assignments`/`prepare_write_filters`
 /// for plan-time validation. Implement `plan_insert` instead of
 /// `stage_insert` only when the spec must inspect or reject the physical
-/// INSERT input plan before execution (lix_file, entity).
+/// INSERT input plan before execution (lix_file, row).
 #[async_trait]
 pub(super) trait TableSpec: Send + Sync + 'static {
     /// Name used in error messages and plan display.
@@ -385,7 +385,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     /// Public column that routes a history scan to an explicit commit.
     ///
-    /// This is provider identity, not a name heuristic: ordinary entity
+    /// This is provider identity, not a name heuristic: ordinary row
     /// schemas may legitimately expose a property with the same name.
     fn history_anchor_column(&self) -> Option<&'static str> {
         None

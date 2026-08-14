@@ -16,8 +16,7 @@ use tokio::sync::{
 
 use super::incremental::FileBytesSha256;
 use crate::plugin::runtime::{
-    WasmComponentActor, WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle,
-    WasmEntityKey,
+    WasmComponentActor, WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle, WasmRowKey,
 };
 use crate::{Blob, LixError};
 
@@ -35,33 +34,33 @@ pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
 /// mutation create context. Successors retain sparse persistent overlays rather
 /// than cloning the complete document-sized set for every tiny edit.
 #[derive(Clone)]
-pub(crate) struct PluginEntityAuthorities {
-    node: Arc<PluginEntityAuthorityNode>,
+pub(crate) struct PluginRowAuthorities {
+    node: Arc<PluginRowAuthorityNode>,
 }
 
-enum PluginEntityAuthorityNode {
+enum PluginRowAuthorityNode {
     Base {
-        ranges: Vec<PluginEntityAuthorityRange>,
-        inserted: BTreeSet<WasmEntityKey>,
-        removed: BTreeSet<WasmEntityKey>,
+        ranges: Vec<PluginRowAuthorityRange>,
+        inserted: BTreeSet<WasmRowKey>,
+        removed: BTreeSet<WasmRowKey>,
     },
     Delta {
-        parent: PluginEntityAuthorities,
-        inserted: BTreeSet<WasmEntityKey>,
-        removed: BTreeSet<WasmEntityKey>,
+        parent: PluginRowAuthorities,
+        inserted: BTreeSet<WasmRowKey>,
+        removed: BTreeSet<WasmRowKey>,
         depth: u8,
     },
 }
 
 #[derive(Clone)]
-pub(crate) struct PluginEntityAuthorityRange {
+pub(crate) struct PluginRowAuthorityRange {
     schema_key: String,
     namespace: [u8; 12],
     first_local_ref: u32,
     last_local_ref: u32,
 }
 
-impl PluginEntityAuthorityRange {
+impl PluginRowAuthorityRange {
     pub(crate) fn new(
         schema_key: String,
         creates: WasmCreateContext,
@@ -81,8 +80,8 @@ impl PluginEntityAuthorityRange {
         }
     }
 
-    fn contains(&self, key: &WasmEntityKey) -> bool {
-        let [id] = key.entity_pk.as_slice() else {
+    fn contains(&self, key: &WasmRowKey) -> bool {
+        let [id] = key.row_pk.as_slice() else {
             return false;
         };
         if key.schema_key.as_str() != self.schema_key {
@@ -103,16 +102,16 @@ impl PluginEntityAuthorityRange {
     }
 }
 
-impl PluginEntityAuthorities {
+impl PluginRowAuthorities {
     const MAX_DELTA_DEPTH: u8 = 16;
 
     pub(crate) fn empty() -> Self {
         Self::from_keys(BTreeSet::new())
     }
 
-    pub(crate) fn from_keys(keys: BTreeSet<WasmEntityKey>) -> Self {
+    pub(crate) fn from_keys(keys: BTreeSet<WasmRowKey>) -> Self {
         Self {
-            node: Arc::new(PluginEntityAuthorityNode::Base {
+            node: Arc::new(PluginRowAuthorityNode::Base {
                 ranges: Vec::new(),
                 inserted: keys,
                 removed: BTreeSet::new(),
@@ -120,14 +119,14 @@ impl PluginEntityAuthorities {
         }
     }
 
-    pub(crate) fn with_ranges(&self, ranges: Vec<PluginEntityAuthorityRange>) -> Self {
+    pub(crate) fn with_ranges(&self, ranges: Vec<PluginRowAuthorityRange>) -> Self {
         if ranges.is_empty() {
             return self.clone();
         }
         let (mut existing_ranges, inserted, removed) = self.flatten();
         existing_ranges.extend(ranges);
         Self {
-            node: Arc::new(PluginEntityAuthorityNode::Base {
+            node: Arc::new(PluginRowAuthorityNode::Base {
                 ranges: existing_ranges,
                 inserted,
                 removed,
@@ -135,9 +134,9 @@ impl PluginEntityAuthorities {
         }
     }
 
-    pub(crate) fn contains(&self, key: &WasmEntityKey) -> bool {
+    pub(crate) fn contains(&self, key: &WasmRowKey) -> bool {
         match self.node.as_ref() {
-            PluginEntityAuthorityNode::Base {
+            PluginRowAuthorityNode::Base {
                 ranges,
                 inserted,
                 removed,
@@ -150,7 +149,7 @@ impl PluginEntityAuthorities {
                     ranges.iter().any(|range| range.contains(key))
                 }
             }
-            PluginEntityAuthorityNode::Delta {
+            PluginRowAuthorityNode::Delta {
                 parent,
                 inserted,
                 removed,
@@ -169,15 +168,15 @@ impl PluginEntityAuthorities {
 
     pub(crate) fn with_delta(
         &self,
-        inserted: BTreeSet<WasmEntityKey>,
-        removed: BTreeSet<WasmEntityKey>,
+        inserted: BTreeSet<WasmRowKey>,
+        removed: BTreeSet<WasmRowKey>,
     ) -> Self {
         if inserted.is_empty() && removed.is_empty() {
             return self.clone();
         }
         let depth = match self.node.as_ref() {
-            PluginEntityAuthorityNode::Base { .. } => 1,
-            PluginEntityAuthorityNode::Delta { depth, .. } => depth.saturating_add(1),
+            PluginRowAuthorityNode::Base { .. } => 1,
+            PluginRowAuthorityNode::Delta { depth, .. } => depth.saturating_add(1),
         };
         if depth > Self::MAX_DELTA_DEPTH {
             let (ranges, mut base_inserted, mut base_removed) = self.flatten();
@@ -190,7 +189,7 @@ impl PluginEntityAuthorities {
                 base_inserted.insert(key);
             }
             return Self {
-                node: Arc::new(PluginEntityAuthorityNode::Base {
+                node: Arc::new(PluginRowAuthorityNode::Base {
                     ranges,
                     inserted: base_inserted,
                     removed: base_removed,
@@ -198,7 +197,7 @@ impl PluginEntityAuthorities {
             };
         }
         Self {
-            node: Arc::new(PluginEntityAuthorityNode::Delta {
+            node: Arc::new(PluginRowAuthorityNode::Delta {
                 parent: self.clone(),
                 inserted,
                 removed,
@@ -216,17 +215,17 @@ impl PluginEntityAuthorities {
     fn flatten(
         &self,
     ) -> (
-        Vec<PluginEntityAuthorityRange>,
-        BTreeSet<WasmEntityKey>,
-        BTreeSet<WasmEntityKey>,
+        Vec<PluginRowAuthorityRange>,
+        BTreeSet<WasmRowKey>,
+        BTreeSet<WasmRowKey>,
     ) {
         match self.node.as_ref() {
-            PluginEntityAuthorityNode::Base {
+            PluginRowAuthorityNode::Base {
                 ranges,
                 inserted,
                 removed,
             } => (ranges.clone(), inserted.clone(), removed.clone()),
-            PluginEntityAuthorityNode::Delta {
+            PluginRowAuthorityNode::Delta {
                 parent,
                 inserted,
                 removed,
@@ -261,8 +260,8 @@ impl PluginEntityAuthorities {
         }
         for key in inserted.iter().chain(removed.iter()) {
             push_authority_text(&mut output, key.schema_key.as_str())?;
-            push_authority_len(&mut output, key.entity_pk.len())?;
-            for component in &key.entity_pk {
+            push_authority_len(&mut output, key.row_pk.len())?;
+            for component in &key.row_pk {
                 push_authority_text(&mut output, component.as_str())?;
             }
         }
@@ -282,10 +281,10 @@ impl PluginEntityAuthorities {
             len.checked_add(4)?.checked_add(text.len())
         }
 
-        fn add_key(mut len: usize, key: &WasmEntityKey) -> Option<usize> {
+        fn add_key(mut len: usize, key: &WasmRowKey) -> Option<usize> {
             len = add_text(len, key.schema_key.as_str())?;
             len = len.checked_add(4)?;
-            for component in &key.entity_pk {
+            for component in &key.row_pk {
                 len = add_text(len, component.as_str())?;
             }
             Some(len)
@@ -293,7 +292,7 @@ impl PluginEntityAuthorities {
 
         fn add_keys<'a>(
             mut len: usize,
-            keys: impl Iterator<Item = &'a WasmEntityKey>,
+            keys: impl Iterator<Item = &'a WasmRowKey>,
         ) -> Option<usize> {
             for key in keys {
                 len = add_key(len, key)?;
@@ -301,9 +300,9 @@ impl PluginEntityAuthorities {
             Some(len)
         }
 
-        fn node_upper_bound(node: &PluginEntityAuthorityNode) -> Option<usize> {
+        fn node_upper_bound(node: &PluginRowAuthorityNode) -> Option<usize> {
             match node {
-                PluginEntityAuthorityNode::Base {
+                PluginRowAuthorityNode::Base {
                     ranges,
                     inserted,
                     removed,
@@ -315,7 +314,7 @@ impl PluginEntityAuthorities {
                     }
                     add_keys(len, inserted.iter().chain(removed.iter()))
                 }
-                PluginEntityAuthorityNode::Delta {
+                PluginRowAuthorityNode::Delta {
                     parent,
                     inserted,
                     removed,
@@ -350,23 +349,23 @@ impl PluginEntityAuthorities {
             if first_local_ref > last_local_ref {
                 return Err(invalid_authority_checkpoint());
             }
-            ranges.push(PluginEntityAuthorityRange {
+            ranges.push(PluginRowAuthorityRange {
                 schema_key,
                 namespace,
                 first_local_ref,
                 last_local_ref,
             });
         }
-        let mut read_keys = |count: usize| -> Result<BTreeSet<WasmEntityKey>, LixError> {
+        let mut read_keys = |count: usize| -> Result<BTreeSet<WasmRowKey>, LixError> {
             let mut keys = BTreeSet::new();
             for _ in 0..count {
                 let schema_key = reader.text()?;
                 let component_count = reader.len()?;
-                let mut entity_pk = Vec::new();
+                let mut row_pk = Vec::new();
                 for _ in 0..component_count {
-                    entity_pk.push(reader.text()?);
+                    row_pk.push(reader.text()?);
                 }
-                if !keys.insert(WasmEntityKey::from_owned_parts(schema_key, entity_pk)) {
+                if !keys.insert(WasmRowKey::from_owned_parts(schema_key, row_pk)) {
                     return Err(invalid_authority_checkpoint());
                 }
             }
@@ -378,7 +377,7 @@ impl PluginEntityAuthorities {
             return Err(invalid_authority_checkpoint());
         }
         Ok(Self {
-            node: Arc::new(PluginEntityAuthorityNode::Base {
+            node: Arc::new(PluginRowAuthorityNode::Base {
                 ranges,
                 inserted,
                 removed,
@@ -402,7 +401,7 @@ fn push_authority_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError
 fn invalid_authority_checkpoint() -> LixError {
     LixError::new(
         LixError::CODE_INVALID_PLUGIN,
-        "plugin entity authority checkpoint is corrupt",
+        "plugin row authority checkpoint is corrupt",
     )
 }
 
@@ -498,7 +497,7 @@ struct PluginActorAcceptedState {
     bytes: Blob,
     bytes_sha256: Option<FileBytesSha256>,
     semantic_root: Arc<str>,
-    entity_authorities: PluginEntityAuthorities,
+    row_authorities: PluginRowAuthorities,
     history: VecDeque<PluginActorHistoricalState>,
 }
 
@@ -940,7 +939,7 @@ impl PluginActorCache {
             document,
             bytes,
             semantic_root,
-            PluginEntityAuthorities::empty(),
+            PluginRowAuthorities::empty(),
         )
     }
 
@@ -951,7 +950,7 @@ impl PluginActorCache {
         document: WasmDocumentHandle,
         bytes: Blob,
         semantic_root: impl Into<Arc<str>>,
-        entity_authorities: PluginEntityAuthorities,
+        row_authorities: PluginRowAuthorities,
     ) -> PluginObservation {
         let semantic_root = semantic_root.into();
         let bytes_sha256 = Some(FileBytesSha256::compute(&bytes));
@@ -971,7 +970,7 @@ impl PluginActorCache {
                 bytes,
                 bytes_sha256,
                 semantic_root: Arc::clone(&semantic_root),
-                entity_authorities,
+                row_authorities,
                 history: VecDeque::new(),
             })),
         });
@@ -1012,7 +1011,7 @@ impl PluginActorCache {
             bytes,
             bytes_sha256,
             semantic_root,
-            PluginEntityAuthorities::empty(),
+            PluginRowAuthorities::empty(),
         )
         .await
     }
@@ -1026,7 +1025,7 @@ impl PluginActorCache {
         bytes: Blob,
         bytes_sha256: impl Into<Option<FileBytesSha256>>,
         semantic_root: impl Into<Arc<str>>,
-        entity_authorities: PluginEntityAuthorities,
+        row_authorities: PluginRowAuthorities,
     ) -> Result<PluginObservation, LixError> {
         let semantic_root = semantic_root.into();
         let bytes_sha256 = bytes_sha256.into();
@@ -1039,7 +1038,7 @@ impl PluginActorCache {
                 "cold plugin actor install token belongs to a different key",
             ));
         }
-        let mut candidate = Some((store, document, bytes, bytes_sha256, entity_authorities));
+        let mut candidate = Some((store, document, bytes, bytes_sha256, row_authorities));
         let expected_guard = match &cold_install.expected_stale {
             Some(expected) => Some(Arc::clone(&expected.slot.state).lock_owned().await),
             None => None,
@@ -1071,7 +1070,7 @@ impl PluginActorCache {
             if !may_install {
                 None
             } else {
-                let (store, document, bytes, bytes_sha256, entity_authorities) = candidate
+                let (store, document, bytes, bytes_sha256, row_authorities) = candidate
                     .take()
                     .expect("vacant cold install retains its candidate");
                 state.clock = state.clock.wrapping_add(1);
@@ -1089,7 +1088,7 @@ impl PluginActorCache {
                         bytes,
                         bytes_sha256,
                         semantic_root: Arc::clone(&semantic_root),
-                        entity_authorities,
+                        row_authorities,
                         history: VecDeque::new(),
                     })),
                 });
@@ -1447,7 +1446,7 @@ struct PluginActorSuccessor {
     bytes: Blob,
     bytes_sha256: Option<FileBytesSha256>,
     semantic_root: Arc<str>,
-    entity_authorities: PluginEntityAuthorities,
+    row_authorities: PluginRowAuthorities,
 }
 
 /// Opaque authority for one guest call based on the actor's latest private
@@ -1457,7 +1456,7 @@ pub(crate) struct PluginActorPendingCall {
     document: WasmDocumentHandle,
     bytes: Blob,
     semantic_root: Arc<str>,
-    entity_authorities: PluginEntityAuthorities,
+    row_authorities: PluginRowAuthorities,
     previous_successor: Option<PluginActorSuccessor>,
 }
 
@@ -1474,8 +1473,8 @@ impl PluginActorPendingCall {
         &self.semantic_root
     }
 
-    pub(crate) fn entity_authorities(&self) -> &PluginEntityAuthorities {
-        &self.entity_authorities
+    pub(crate) fn row_authorities(&self) -> &PluginRowAuthorities {
+        &self.row_authorities
     }
 }
 
@@ -1546,12 +1545,12 @@ impl PluginActorLease {
             .semantic_root
     }
 
-    pub(crate) fn accepted_entity_authorities(&self) -> &PluginEntityAuthorities {
+    pub(crate) fn accepted_row_authorities(&self) -> &PluginRowAuthorities {
         &self
             .guard
             .as_deref()
             .expect("actor lease guard exists")
-            .entity_authorities
+            .row_authorities
     }
 
     pub(crate) fn require_accepted_semantic_root(
@@ -1581,13 +1580,13 @@ impl PluginActorLease {
             ));
         }
         let previous_successor = self.successor.take();
-        let (document, bytes, semantic_root, entity_authorities) =
+        let (document, bytes, semantic_root, row_authorities) =
             if let Some(successor) = previous_successor.as_ref() {
                 (
                     successor.document,
                     successor.bytes.clone(),
                     Arc::clone(&successor.semantic_root),
-                    successor.entity_authorities.clone(),
+                    successor.row_authorities.clone(),
                 )
             } else {
                 let accepted = self.guard.as_deref().expect("actor lease guard exists");
@@ -1595,7 +1594,7 @@ impl PluginActorLease {
                     accepted.document,
                     accepted.bytes.clone(),
                     Arc::clone(&accepted.semantic_root),
-                    accepted.entity_authorities.clone(),
+                    accepted.row_authorities.clone(),
                 )
             };
         self.uncertain_guest_call = true;
@@ -1603,7 +1602,7 @@ impl PluginActorLease {
             document,
             bytes,
             semantic_root,
-            entity_authorities,
+            row_authorities,
             previous_successor,
         })
     }
@@ -1663,7 +1662,7 @@ impl PluginActorLease {
             bytes,
             bytes_sha256,
             semantic_root: semantic_root.into(),
-            entity_authorities: call.entity_authorities.clone(),
+            row_authorities: call.row_authorities.clone(),
         });
         if let Some(previous_successor) = previous_successor {
             if let Err(error) = self
@@ -1741,7 +1740,7 @@ impl PluginActorLease {
             bytes,
             bytes_sha256,
             semantic_root: semantic_root.into(),
-            entity_authorities: self.accepted_entity_authorities().clone(),
+            row_authorities: self.accepted_row_authorities().clone(),
         });
         Ok(())
     }
@@ -1749,9 +1748,9 @@ impl PluginActorLease {
     /// Replaces the host-proven identity set for the staged successor. This is
     /// called only after create materialization and exact validation have
     /// succeeded, so guest-provided keys never become authority by assertion.
-    pub(crate) fn set_successor_entity_authorities(
+    pub(crate) fn set_successor_row_authorities(
         &mut self,
-        entity_authorities: PluginEntityAuthorities,
+        row_authorities: PluginRowAuthorities,
     ) -> Result<(), LixError> {
         let successor = self.successor.as_mut().ok_or_else(|| {
             LixError::new(
@@ -1759,7 +1758,7 @@ impl PluginActorLease {
                 "plugin authority publication is missing a validated successor",
             )
         })?;
-        successor.entity_authorities = entity_authorities;
+        successor.row_authorities = row_authorities;
         Ok(())
     }
 
@@ -1789,10 +1788,10 @@ impl PluginActorLease {
         })
     }
 
-    pub(crate) fn successor_entity_authorities(&self) -> Option<&PluginEntityAuthorities> {
+    pub(crate) fn successor_row_authorities(&self) -> Option<&PluginRowAuthorities> {
         self.successor
             .as_ref()
-            .map(|successor| &successor.entity_authorities)
+            .map(|successor| &successor.row_authorities)
     }
 
     /// Publishes the successor only after durable commit. A failure here is a
@@ -1830,9 +1829,9 @@ impl PluginActorLease {
                 &mut accepted.semantic_root,
                 Arc::clone(&successor.semantic_root),
             );
-            let _old_entity_authorities = std::mem::replace(
-                &mut accepted.entity_authorities,
-                successor.entity_authorities.clone(),
+            let _old_row_authorities = std::mem::replace(
+                &mut accepted.row_authorities,
+                successor.row_authorities.clone(),
             );
             accepted.history.push_back(PluginActorHistoricalState {
                 revision: old_revision,
@@ -1904,8 +1903,8 @@ mod tests {
     use super::*;
     use crate::plugin::runtime::{
         WasmChangeCursorHandle, WasmChangePage, WasmComponentActor, WasmEditCursorHandle,
-        WasmEditPage, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
-        WasmOpenEntitiesInput, WasmOpenFileInput, WasmTransitionCounters, WasmTransitionHandle,
+        WasmEditPage, WasmFileTransition, WasmFileUpdate, WasmOpenFileInput, WasmOpenRowsInput,
+        WasmRowTransition, WasmRowUpdate, WasmTransitionCounters, WasmTransitionHandle,
         WasmTransitionLimits,
     };
 
@@ -1950,11 +1949,11 @@ mod tests {
             Err(unused())
         }
 
-        async fn open_entities(
+        async fn open_rows(
             &mut self,
             _limits: WasmTransitionLimits,
-            _input: WasmOpenEntitiesInput,
-        ) -> Result<WasmEntityTransition, LixError> {
+            _input: WasmOpenRowsInput,
+        ) -> Result<WasmRowTransition, LixError> {
             Err(unused())
         }
 
@@ -1967,12 +1966,12 @@ mod tests {
             Err(unused())
         }
 
-        async fn entities_changed(
+        async fn rows_changed(
             &mut self,
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
-            _update: WasmEntityUpdate,
-        ) -> Result<WasmEntityTransition, LixError> {
+            _update: WasmRowUpdate,
+        ) -> Result<WasmRowTransition, LixError> {
             Err(unused())
         }
 
@@ -2178,14 +2177,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entity_authority_delta_publishes_only_with_successor_commit() {
+    async fn row_authority_delta_publishes_only_with_successor_commit() {
         let cache = PluginActorCache::new(2).unwrap();
         let actor_key = key("main", "/data.json", "g1");
         let before_key =
-            WasmEntityKey::from_owned_parts("json_node".to_owned(), vec!["before".to_owned()]);
+            WasmRowKey::from_owned_parts("json_node".to_owned(), vec!["before".to_owned()]);
         let after_key =
-            WasmEntityKey::from_owned_parts("json_node".to_owned(), vec!["after".to_owned()]);
-        let before = PluginEntityAuthorities::from_keys(BTreeSet::from([before_key.clone()]));
+            WasmRowKey::from_owned_parts("json_node".to_owned(), vec!["after".to_owned()]);
+        let before = PluginRowAuthorities::from_keys(BTreeSet::from([before_key.clone()]));
         let observation = cache.install_with_authorities(
             actor_key,
             PluginActorStore::new(Box::new(TestActor::default()), cache.admit_store().unwrap()),
@@ -2205,34 +2204,28 @@ mod tests {
                 Arc::<str>::from("root-2"),
             )
             .unwrap();
-        let successor_authorities = lease.accepted_entity_authorities().with_delta(
+        let successor_authorities = lease.accepted_row_authorities().with_delta(
             BTreeSet::from([after_key.clone()]),
             BTreeSet::from([before_key.clone()]),
         );
         lease
-            .set_successor_entity_authorities(successor_authorities)
+            .set_successor_row_authorities(successor_authorities)
             .unwrap();
 
-        assert!(lease.accepted_entity_authorities().contains(&before_key));
-        assert!(!lease.accepted_entity_authorities().contains(&after_key));
+        assert!(lease.accepted_row_authorities().contains(&before_key));
+        assert!(!lease.accepted_row_authorities().contains(&after_key));
         let successor = lease.commit_successor().await.unwrap();
         let committed = cache.lease(&successor).await.unwrap();
-        assert!(
-            !committed
-                .accepted_entity_authorities()
-                .contains(&before_key)
-        );
-        assert!(committed.accepted_entity_authorities().contains(&after_key));
+        assert!(!committed.accepted_row_authorities().contains(&before_key));
+        assert!(committed.accepted_row_authorities().contains(&after_key));
     }
 
     #[test]
-    fn entity_authority_deltas_compact_without_losing_membership() {
-        let retained =
-            WasmEntityKey::from_owned_parts("node".to_owned(), vec!["retained".to_owned()]);
-        let mut authorities =
-            PluginEntityAuthorities::from_keys(BTreeSet::from([retained.clone()]));
-        for ordinal in 0..=PluginEntityAuthorities::MAX_DELTA_DEPTH {
-            let inserted = WasmEntityKey::from_owned_parts(
+    fn row_authority_deltas_compact_without_losing_membership() {
+        let retained = WasmRowKey::from_owned_parts("node".to_owned(), vec!["retained".to_owned()]);
+        let mut authorities = PluginRowAuthorities::from_keys(BTreeSet::from([retained.clone()]));
+        for ordinal in 0..=PluginRowAuthorities::MAX_DELTA_DEPTH {
+            let inserted = WasmRowKey::from_owned_parts(
                 "node".to_owned(),
                 vec![format!("inserted-{ordinal}")],
             );
@@ -2241,29 +2234,29 @@ mod tests {
         assert!(authorities.contains(&retained));
         assert_eq!(
             authorities.len(),
-            usize::from(PluginEntityAuthorities::MAX_DELTA_DEPTH) + 2
+            usize::from(PluginRowAuthorities::MAX_DELTA_DEPTH) + 2
         );
     }
 
     #[test]
-    fn compact_entity_authority_ranges_preserve_sparse_overrides() {
+    fn compact_row_authority_ranges_preserve_sparse_overrides() {
         let creates = WasmCreateContext {
             high: 0x0123_4567_89ab_cdef,
             low: 0xfedc_ba98,
         };
         let key = |local_ref| {
-            WasmEntityKey::from_owned_parts(
+            WasmRowKey::from_owned_parts(
                 "markdown_block".to_owned(),
                 creates
-                    .entity_pk(local_ref)
+                    .row_pk(local_ref)
                     .expect("test local ref should fit"),
             )
         };
         let inside = key(12);
         let removed = key(13);
         let outside = key(20);
-        let authorities = PluginEntityAuthorities::empty()
-            .with_ranges(vec![PluginEntityAuthorityRange::new(
+        let authorities = PluginRowAuthorities::empty()
+            .with_ranges(vec![PluginRowAuthorityRange::new(
                 "markdown_block".to_owned(),
                 creates,
                 10,
@@ -2279,22 +2272,22 @@ mod tests {
     }
 
     #[test]
-    fn entity_authority_checkpoint_roundtrips_ranges_and_sparse_overrides() {
+    fn row_authority_checkpoint_roundtrips_ranges_and_sparse_overrides() {
         let creates = WasmCreateContext {
             high: 0x0123_4567_89ab_cdef,
             low: 0xfedc_ba98,
         };
         let key = |local_ref| {
-            WasmEntityKey::from_owned_parts(
+            WasmRowKey::from_owned_parts(
                 "row".to_owned(),
-                creates.entity_pk(local_ref).expect("local ref should fit"),
+                creates.row_pk(local_ref).expect("local ref should fit"),
             )
         };
         let retained = key(2);
         let removed = key(3);
         let inserted = key(9);
-        let authorities = PluginEntityAuthorities::empty()
-            .with_ranges(vec![PluginEntityAuthorityRange::new(
+        let authorities = PluginRowAuthorities::empty()
+            .with_ranges(vec![PluginRowAuthorityRange::new(
                 "row".to_owned(),
                 creates,
                 1,
@@ -2304,7 +2297,7 @@ mod tests {
             .with_delta(BTreeSet::from([inserted.clone()]), BTreeSet::new());
 
         let decoded =
-            PluginEntityAuthorities::decode_checkpoint(&authorities.encode_checkpoint().unwrap())
+            PluginRowAuthorities::decode_checkpoint(&authorities.encode_checkpoint().unwrap())
                 .unwrap();
         assert!(decoded.contains(&retained));
         assert!(!decoded.contains(&removed));
@@ -2312,8 +2305,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_authority_checkpoint_respects_optional_byte_bound() {
-        let authorities = PluginEntityAuthorities::empty();
+    fn row_authority_checkpoint_respects_optional_byte_bound() {
+        let authorities = PluginRowAuthorities::empty();
         let encoded = authorities.encode_checkpoint().unwrap();
 
         assert!(

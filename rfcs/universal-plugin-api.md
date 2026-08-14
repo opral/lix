@@ -19,11 +19,11 @@ One required trait makes every file lifecycle visible at compile time:
 pub trait Plugin: 'static {
     fn open(input: &OpenFile<'_>, output: &mut Output<'_>) -> Result<()>;
     fn file_changed(input: &FileUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
-    fn entities_changed(input: &mut EntityUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
+    fn rows_changed(input: &mut RowUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
     fn restore(input: &mut RestoreFile<'_>, output: &mut Output<'_>) -> Result<()>;
     fn cold_file_changed(input: &mut ColdUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
 
-    fn resolve_conflict(conflict: EntityConflict<'_>) -> Result<ConflictResolution> {
+    fn resolve_conflict(conflict: RowConflict<'_>) -> Result<ConflictResolution> {
         Ok(conflict.take_b_or_delete())
     }
 }
@@ -41,22 +41,22 @@ The WIT has one stateful export, `apply(transition-request, transition)`, whose
 request variant uses the same five names. Conflict resolution is the only
 separate stateless export.
 
-Normal entity output is one typed call:
+Normal row output is one typed call:
 
 ```rust
 let id = input.creates.id(0);
 let snapshot = format!(r#"{{"body":"hello","id":"{id}"}}"#);
-output.entity(EntityMutation::Create {
+output.row(RowMutation::Create {
     schema_key: "note",
     local_ref: 0,
     snapshot: snapshot.as_bytes(),
 })?;
 ```
 
-`Output::entity` owns record framing, page limits, create-page separation,
+`Output::row` owns record framing, page limits, create-page separation,
 record counts, automatic flushing, and host errors. Authors do not implement a
 packet codec. Creates carry the complete canonical snapshot; the host validates
-its generated primary key against `local_ref`. This is the only entity output
+its generated primary key against `local_ref`. This is the only row output
 path for every format, including dense CSV imports.
 
 An ordinary snapshot is a duplicate-free, number-free JSON object in canonical
@@ -83,7 +83,7 @@ pub struct ColdUpdate<'a> {
     pub after_path: String,
     pub before: Snapshot<'a>,
     pub edits: Vec<FileEdit>,
-    pub entities: EntityReader<'a>,
+    pub rows: RowReader<'a>,
     pub creates: CreateContext,
 }
 ```
@@ -93,16 +93,16 @@ an absent path internally for unowned file states, but it rejects that state at
 the Component boundary instead of exposing an impossible `Option` branch to
 plugin authors. Restore remains descriptor-free by design.
 
-## One entity page in both directions
+## One row page in both directions
 
-Every entity input and output crosses the Component boundary as the same
-bounded `entity-page` byte envelope. A page has exactly one snapshot section;
+Every row input and output crosses the Component boundary as the same
+bounded `row-page` byte envelope. A page has exactly one snapshot section;
 the codec does not expose representations, layouts, or manual page sizing.
-The typed SDK batches `Output::entity` calls and flushes pages automatically.
+The typed SDK batches `Output::row` calls and flushes pages automatically.
 
 Large snapshots use a bounded attachment referenced by the page. Inputs and
-outputs remain paged; neither side requires a complete entity collection or a
-per-entity ABI call.
+outputs remain paged; neither side requires a complete row collection or a
+per-row ABI call.
 
 The SDK targets 256 KiB of records per normal output page. This is an internal
 batching choice, not author-facing API: a single record may grow to the host
@@ -110,8 +110,8 @@ page limit, and a larger snapshot automatically uses an attachment. Profiling
 showed that this target preserves sparse point reads while amortizing Component
 calls on dense imports.
 
-Restore and cold transitions expose `EntityReader`, whose items always contain
-a snapshot. Only `entities_changed` uses `EntityChangeReader` and can yield a
+Restore and cold transitions expose `RowReader`, whose items always contain
+a snapshot. Only `rows_changed` uses `RowChangeReader` and can yield a
 tombstone, so plugin authors do not repeat impossible-state checks.
 
 The engine validates complete typed creates generically; it does not branch on
@@ -120,13 +120,13 @@ CSV, Markdown, text, or any plugin/schema key.
 ### CSV A/B result
 
 The 10.68 MB / 220,001-row RocksDB import benchmark compared the removed dense
-row encoding with streaming `Output::entity` snapshots. The universal path
+row encoding with streaming `Output::row` snapshots. The universal path
 kept guest high-water memory unchanged at 28,639,232 bytes and changed median
 latency from 1,234.95 ms to 1,272.17 ms (+3.01%). P95 changed from 1,830.85 ms
 to 1,880.19 ms (+2.69%). Allocated bytes increased 0.13%, allocation count fell
 18.48%, and peak live bytes increased 7.49%.
 Boundary bytes increased 69.44%, but remained bounded and all exact hash,
-cardinality, and reopen checks passed. This measured trade buys one entity API
+cardinality, and reopen checks passed. This measured trade buys one row API
 for every plugin, so the dense authoring lane is removed.
 
 ## Manifest
@@ -157,15 +157,15 @@ and no format-specific selection rules.
 ## Structural acceptance gates
 
 - one guest export per stateful transition;
-- no per-entity Component calls;
-- one universal, bounded entity page in both directions;
-- no complete entity collection before output;
+- no per-row Component calls;
+- one universal, bounded row page in both directions;
+- no complete row collection before output;
 - direct cold update after eviction or restart;
 - lazy ranged file/state/attachment reads;
 - streamed file replacement;
 - conflict `take` does not copy selected snapshots through Wasm;
 - no engine/runtime branch on plugin keys, schema keys, or format names;
-- exact bytes, complete semantic entities, history, reopen, and cold successor
+- exact bytes, complete semantic rows, history, reopen, and cold successor
   remain correct.
 
 ## Performance protocol
@@ -176,7 +176,7 @@ generated fixtures or fixed source paths shared by both worktrees. Record
 p50/p95 latency, Rust cumulative and peak live
 allocation, process maximum RSS, guest linear-memory high-water, Component
 calls and charged boundary bytes, pages/records, source/state reads, reparses,
-renders, durable changes, and hashes of the complete output/entity/history
+renders, durable changes, and hashes of the complete output/row/history
 result.
 
 | Format | Required workloads |
@@ -213,14 +213,14 @@ five discarded warmups followed by 21 release samples pinned to CPUs 0-3.
 All scored ratios pass the gates above. Process RSS is an external maximum-RSS
 measurement around the complete 21-sample process; it is reported separately
 from the in-process allocation scorecard. Correctness tests cover exact output,
-entity cardinality and history, reopen, direct cold successor, generated-ID
+row cardinality and history, reopen, direct cold successor, generated-ID
 stability, and oversized attachment streaming for all applicable formats.
 
 The timing matrix measures import, sparse, and cold behavior for CSV and JSON,
 and representative warm sparse transitions for Markdown and Excalidraw. Cold
 and reopen behavior for Markdown and Excalidraw is correctness-tested but is not
-a dedicated timed lane. Universal entity pages are exercised in both ABI
-directions, but there is no isolated entity-to-file microbenchmark. Those are
+a dedicated timed lane. Universal row pages are exercised in both ABI
+directions, but there is no isolated row-to-file microbenchmark. Those are
 explicit coverage limits, not inferred performance claims.
 
 Machine-readable summaries, captured sample logs, external RSS records, and the

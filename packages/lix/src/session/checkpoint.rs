@@ -14,7 +14,7 @@ use super::context::SessionContext;
 pub struct CreateCheckpointReceipt {
     /// Commit containing the branch state captured by this checkpoint.
     pub commit_id: String,
-    /// Logical change that published the repository-global checkpoint entity.
+    /// Logical change that published the repository-global checkpoint row.
     pub change_id: String,
 }
 
@@ -106,9 +106,9 @@ where
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
                                 format!(
-                                    "working diff for schema '{}' entity {:?} has no target row",
+                                    "working diff for schema '{}' row {:?} has no target row",
                                     entry.identity.schema_key(),
-                                    entry.identity.entity_pk()
+                                    entry.identity.row_pk()
                                 ),
                             )
                         })?;
@@ -253,7 +253,7 @@ fn push_selected_change(
     kind: TrackedStateDiffKind,
 ) -> bool {
     // A changelog change durably stores one timestamp, which rebuild uses for
-    // both timestamps when the entity is absent from the parent checkpoint.
+    // both timestamps when the row is absent from the parent checkpoint.
     // Canonicalize newly added rows to that representation so checkpoint roots
     // remain content-equivalent after their compacted auto-commits are swept.
     let created_at = match kind {
@@ -284,7 +284,7 @@ mod tests {
     };
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::gc::CheckpointGcState;
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateDiffRow, TrackedStateKey,
@@ -302,7 +302,7 @@ mod tests {
                 identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
                     schema_key: "test_schema".to_string(),
                     file_id: None,
-                    entity_pk: EntityPk::single("entity"),
+                    row_pk: RowPk::single("row"),
                 }),
                 deleted: false,
                 created_at,

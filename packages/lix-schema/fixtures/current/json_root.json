@@ -19,7 +19,7 @@
       "name": "kind",
       "type": "text",
       "nullable": false,
-      "description": "The JSON node kind. Object and array roots carry their content in child entities."
+      "description": "The JSON node kind. Object and array roots carry their content in child rows."
     },
     {
       "name": "prefix_json",

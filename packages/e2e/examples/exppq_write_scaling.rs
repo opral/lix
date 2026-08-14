@@ -1,9 +1,9 @@
 //! Does an insert's cost depend on how many rows the collection already holds?
 //!
 //! `validate_committed_unique_constraints` scans committed rows with an empty
-//! `entity_pks` list and parses every snapshot it reads, so an insert into a
+//! `row_pks` list and parses every snapshot it reads, so an insert into a
 //! schema that declares `x-lix-unique` may already pay a full collection scan.
-//! Foreign keys that reference a parent primary key resolve to an entity-pk
+//! Foreign keys that reference a parent primary key resolve to a row-pk
 //! point lookup instead and should be flat.
 //!
 //! That difference decides whether a declared-column index is a read win paid

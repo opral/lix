@@ -50,7 +50,7 @@ optimization target is historical tracked-state analysis, not graph ancestry.
 
 The all-plugin path is bounded at the tested scales. Warm merge rose from 4.23
 ms for 5 affected files to 8.39 ms for 25, and from 4.23 ms at two semantic
-entities per primary file to 8.18 ms at 100. Incremental merge RSS stayed below
+rows per primary file to 8.18 ms at 100. Incremental merge RSS stayed below
 235 KiB. Installing all five plugins added about 55.5 MiB RSS. In cold merge,
 `merge_stage_semantic_rows` was the largest observed phase at roughly 10 ms;
 in the warm case it was about 1.7 ms.
@@ -82,7 +82,7 @@ a 2 ms absolute regression to avoid noise-only failures.
 | All-plugin warm | Preview p50 ≤ 5 ms, merge p50 ≤ 10 ms, incremental peak RSS ≤ 1 MiB. |
 | All-plugin cold reopen | Preview p50 ≤ 15 ms, merge p50 ≤ 25 ms, incremental peak RSS ≤ 2 MiB. |
 | Plugin baseline | Installing all five plugins adds ≤ 64 MiB RSS. |
-| File scaling | 25 affected files and 100 entities/file each remain ≤ 12 ms merge p50 and ≤ 2 MiB incremental peak RSS. |
+| File scaling | 25 affected files and 100 rows/file each remain ≤ 12 ms merge p50 and ≤ 2 MiB incremental peak RSS. |
 | Unaffected files | At five affected files, 500 unaffected files remain ≤ 2× the 5-file preview/merge p50 with identical plugin counters. |
 
 The current implementation fails the branch-creation and unrelated-history

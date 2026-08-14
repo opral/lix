@@ -1,7 +1,7 @@
-//! Registered-schema-bound columnar sidecars for immutable entity generations.
+//! Registered-schema-bound columnar sidecars for immutable row generations.
 //!
 //! The transaction boundary calls this adapter while validated canonical
-//! snapshots and typed entity identities are still available. SQL's existing
+//! snapshots and typed row identities are still available. SQL's existing
 //! projection decoder remains the single value-conversion contract; this
 //! module only chooses physical row groups and delegates their encoding.
 
@@ -19,21 +19,21 @@ use crate::columnar_row_group::{
     EncodedRowGroupSet, ROW_GROUP_MAX_ROWS, RowGroupRowLocation,
     encode_row_group_set_preserving_batches,
 };
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::sql2::{
-    EntityColumnType, EntityProjectionDecoder, EntitySurfaceSpec, entity_visible_fields,
+    SchemaColumnType, RowProjectionDecoder, SchemaSurfaceSpec, row_visible_fields,
 };
 
-pub(crate) const ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
-    "lix.entity_columnar.layout_fingerprint.v1";
-pub(crate) const ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
-    "lix.entity_columnar.base_coordinates.v1";
+pub(crate) const ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
+    "lix.row_columnar.layout_fingerprint.v1";
+pub(crate) const ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
+    "lix.row_columnar.base_coordinates.v1";
 pub(crate) use crate::hot_state::{
-    ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    ROW_COLUMNAR_ROW_PK_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
-const ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS: usize = 64;
+const ROW_COLUMNAR_MAX_CLUSTER_PARTITIONS: usize = 64;
 
 enum ClusterField<'a> {
     Boolean(&'a str),
@@ -41,30 +41,30 @@ enum ClusterField<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct EntityColumnarRowRef<'a> {
-    pub(crate) entity_pk: &'a EntityPk,
+pub(crate) struct RowColumnarRowRef<'a> {
+    pub(crate) row_pk: &'a RowPk,
     pub(crate) snapshot_bytes: &'a [u8],
     pub(crate) snapshot_value: &'a JsonValue,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct EncodedEntityRowGroups {
+pub(crate) struct EncodedRowGroups {
     encoded: EncodedRowGroupSet,
-    pub(crate) input_locations: EntityRowGroupLocations,
+    pub(crate) input_locations: RowGroupLocations,
 }
 
-/// Input-row to physical-row mapping for one sealed entity generation.
+/// Input-row to physical-row mapping for one sealed row generation.
 ///
 /// Identity-preserving batches use arithmetic coordinates and retain no
 /// row-cardinal location column. Clustered layouts keep the explicit
 /// permutation required to map their reordered rows back to statement order.
 #[derive(Clone, Debug)]
-pub(crate) enum EntityRowGroupLocations {
+pub(crate) enum RowGroupLocations {
     Dense { row_count: usize },
     Explicit(Vec<RowGroupRowLocation>),
 }
 
-impl EntityRowGroupLocations {
+impl RowGroupLocations {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Dense { row_count } => *row_count,
@@ -86,20 +86,20 @@ impl EntityRowGroupLocations {
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = RowGroupRowLocation> + '_ {
         (0..self.len()).map(|input_index| {
             self.location(input_index)
-                .expect("entity row-group location covers every input row")
+                .expect("row-group location covers every input row")
         })
     }
 }
 
-impl PartialEq for EntityRowGroupLocations {
+impl PartialEq for RowGroupLocations {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().eq(other.iter())
     }
 }
 
-impl Eq for EntityRowGroupLocations {}
+impl Eq for RowGroupLocations {}
 
-impl Deref for EncodedEntityRowGroups {
+impl Deref for EncodedRowGroups {
     type Target = EncodedRowGroupSet;
 
     fn deref(&self) -> &Self::Target {
@@ -107,18 +107,18 @@ impl Deref for EncodedEntityRowGroups {
     }
 }
 
-impl EncodedEntityRowGroups {
-    pub(crate) fn into_parts(self) -> (EncodedRowGroupSet, EntityRowGroupLocations) {
+impl EncodedRowGroups {
+    pub(crate) fn into_parts(self) -> (EncodedRowGroupSet, RowGroupLocations) {
         (self.encoded, self.input_locations)
     }
 }
 
-pub(crate) fn encode_registered_entity_row_groups<'a, I>(
-    spec: &EntitySurfaceSpec,
+pub(crate) fn encode_registered_row_groups<'a, I>(
+    spec: &SchemaSurfaceSpec,
     rows: I,
-) -> Result<Option<EncodedEntityRowGroups>, LixError>
+) -> Result<Option<EncodedRowGroups>, LixError>
 where
-    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
+    I: ExactSizeIterator<Item = RowColumnarRowRef<'a>>,
 {
     if rows.len() == 0 {
         return Ok(None);
@@ -127,7 +127,7 @@ where
     // failures must retain the authoritative row layout rather than reject an
     // otherwise-valid transaction.
     Ok(optional_derived_row_group_set(
-        encode_registered_entity_row_groups_impl(spec, rows),
+        encode_registered_row_groups_impl(spec, rows),
     ))
 }
 
@@ -136,19 +136,19 @@ where
 /// layouts whose established encoder would not reorder rows for clustering;
 /// clustered layouts retain the general encoder and identical physical
 /// behavior.
-pub(crate) fn encode_unclustered_registered_entity_row_groups(
-    spec: &EntitySurfaceSpec,
+pub(crate) fn encode_unclustered_registered_row_groups(
+    spec: &SchemaSurfaceSpec,
     mut columns: Vec<ArrayRef>,
-    entity_pks: ArrayRef,
-) -> Result<Option<EncodedEntityRowGroups>, LixError> {
+    row_pks: ArrayRef,
+) -> Result<Option<EncodedRowGroups>, LixError> {
     if columns.len() != spec.columns.len() {
-        return Err(entity_columnar_error(
+        return Err(row_columnar_error(
             "frontend column count does not match the registered schema",
         ));
     }
-    let row_count = entity_pks.len();
+    let row_count = row_pks.len();
     if row_count == 0 || columns.iter().any(|column| column.len() != row_count) {
-        return Err(entity_columnar_error(
+        return Err(row_columnar_error(
             "frontend columns are empty or have inconsistent row counts",
         ));
     }
@@ -158,10 +158,10 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
         .filter_map(|path| path.first().map(String::as_str))
         .collect::<std::collections::BTreeSet<_>>();
     for (spec_column, array) in spec.columns.iter().zip(&columns) {
-        if spec_column.column_type == EntityColumnType::Boolean {
+        if spec_column.column_type == SchemaColumnType::Boolean {
             return Ok(None);
         }
-        if spec_column.column_type != EntityColumnType::String
+        if spec_column.column_type != SchemaColumnType::String
             || primary_key_roots.contains(spec_column.name.as_str())
         {
             continue;
@@ -181,15 +181,15 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
         }
     }
 
-    let mut fields = entity_visible_fields(spec);
+    let mut fields = row_visible_fields(spec);
     fields.push(Field::new(
-        ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+        ROW_COLUMNAR_ROW_PK_FIELD,
         DataType::Utf8,
         false,
     ));
-    let metadata = entity_columnar_metadata(spec);
+    let metadata = row_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
-    columns.push(entity_pks);
+    columns.push(row_pks);
     let mut batches = Vec::with_capacity(row_count.div_ceil(ROW_GROUP_MAX_ROWS));
     for offset in (0..row_count).step_by(ROW_GROUP_MAX_ROWS) {
         let len = (row_count - offset).min(ROW_GROUP_MAX_ROWS);
@@ -201,33 +201,33 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
                     .map(|column| column.slice(offset, len))
                     .collect(),
             )
-            .map_err(|error| entity_columnar_error(error.to_string()))?,
+            .map_err(|error| row_columnar_error(error.to_string()))?,
         );
     }
     let encoded = encode_row_group_set_preserving_batches(&spec.schema_key, schema, &batches)?;
-    Ok(Some(EncodedEntityRowGroups {
+    Ok(Some(EncodedRowGroups {
         encoded,
-        input_locations: EntityRowGroupLocations::Dense { row_count },
+        input_locations: RowGroupLocations::Dense { row_count },
     }))
 }
 
-fn encode_registered_entity_row_groups_impl<'a, I>(
-    spec: &EntitySurfaceSpec,
+fn encode_registered_row_groups_impl<'a, I>(
+    spec: &SchemaSurfaceSpec,
     rows: I,
-) -> Result<EncodedEntityRowGroups, LixError>
+) -> Result<EncodedRowGroups, LixError>
 where
-    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
+    I: ExactSizeIterator<Item = RowColumnarRowRef<'a>>,
 {
-    let mut fields = entity_visible_fields(spec);
+    let mut fields = row_visible_fields(spec);
     fields.push(Field::new(
-        ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+        ROW_COLUMNAR_ROW_PK_FIELD,
         DataType::Utf8,
         false,
     ));
-    let metadata = entity_columnar_metadata(spec);
+    let metadata = row_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
     let decoder =
-        EntityProjectionDecoder::new(spec, spec.columns.iter().map(|column| column.name.as_str()))?;
+        RowProjectionDecoder::new(spec, spec.columns.iter().map(|column| column.name.as_str()))?;
 
     let rows = rows.enumerate().collect::<Vec<_>>();
     let primary_key_roots = spec
@@ -238,15 +238,15 @@ where
     let mut cluster_fields = Vec::new();
     let mut partition_budget = 1_usize;
     for column in &spec.columns {
-        if column.column_type == EntityColumnType::Boolean
-            && partition_budget.saturating_mul(3) <= ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS
+        if column.column_type == SchemaColumnType::Boolean
+            && partition_budget.saturating_mul(3) <= ROW_COLUMNAR_MAX_CLUSTER_PARTITIONS
         {
             cluster_fields.push(ClusterField::Boolean(column.name.as_str()));
             partition_budget *= 3;
         }
     }
     for column in &spec.columns {
-        if column.column_type != EntityColumnType::String
+        if column.column_type != SchemaColumnType::String
             || primary_key_roots.contains(column.name.as_str())
         {
             continue;
@@ -272,7 +272,7 @@ where
             // key domain keeps the global budget independent of row shape.
             let partition_count = bucket_count + 1;
             if partition_budget.saturating_mul(partition_count)
-                > ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS
+                > ROW_COLUMNAR_MAX_CLUSTER_PARTITIONS
             {
                 continue;
             }
@@ -293,7 +293,7 @@ where
     let partitions = if cluster_fields.is_empty() {
         vec![rows]
     } else {
-        let mut partitions = BTreeMap::<Vec<u8>, Vec<(usize, EntityColumnarRowRef<'_>)>>::new();
+        let mut partitions = BTreeMap::<Vec<u8>, Vec<(usize, RowColumnarRowRef<'_>)>>::new();
         for (input_index, row) in rows {
             let key = cluster_fields
                 .iter()
@@ -324,72 +324,72 @@ where
     for partition in partitions {
         for rows in partition.chunks(ROW_GROUP_MAX_ROWS) {
             let group_index = u32::try_from(batches.len())
-                .map_err(|_| entity_columnar_error("row-group index exceeds u32"))?;
+                .map_err(|_| row_columnar_error("row-group index exceeds u32"))?;
             for (row_index, (input_index, _)) in rows.iter().enumerate() {
                 input_locations[*input_index] = Some(RowGroupRowLocation {
                     group_index,
                     row_index: u32::try_from(row_index)
-                        .map_err(|_| entity_columnar_error("row index exceeds u32"))?,
+                        .map_err(|_| row_columnar_error("row index exceeds u32"))?,
                 });
             }
             let mut columns = decoder
                 .decode_arrow_columns(rows.iter().map(|(_, row)| Some(row.snapshot_bytes)))?;
-            let entity_pks = rows
+            let row_pks = rows
                 .iter()
-                .map(|(_, row)| row.entity_pk.as_json_array_text())
+                .map(|(_, row)| row.row_pk.as_json_array_text())
                 .collect::<Result<Vec<_>, _>>()?;
-            let entity_pks: ArrayRef = Arc::new(StringArray::from(entity_pks));
-            columns.push(entity_pks);
+            let row_pks: ArrayRef = Arc::new(StringArray::from(row_pks));
+            columns.push(row_pks);
             batches.push(
                 RecordBatch::try_new(Arc::clone(&schema), columns)
-                    .map_err(|error| entity_columnar_error(error.to_string()))?,
+                    .map_err(|error| row_columnar_error(error.to_string()))?,
             );
         }
     }
     let encoded = encode_row_group_set_preserving_batches(&spec.schema_key, schema, &batches)?;
-    Ok(EncodedEntityRowGroups {
+    Ok(EncodedRowGroups {
         encoded,
-        input_locations: EntityRowGroupLocations::Explicit(
+        input_locations: RowGroupLocations::Explicit(
             input_locations
                 .into_iter()
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| {
-                    entity_columnar_error("row-group permutation omitted an input row")
+                    row_columnar_error("row-group permutation omitted an input row")
                 })?,
         ),
     })
 }
 
 fn optional_derived_row_group_set(
-    encoded: Result<EncodedEntityRowGroups, LixError>,
-) -> Option<EncodedEntityRowGroups> {
+    encoded: Result<EncodedRowGroups, LixError>,
+) -> Option<EncodedRowGroups> {
     encoded.ok()
 }
 
-fn entity_columnar_metadata(spec: &EntitySurfaceSpec) -> HashMap<String, String> {
+fn row_columnar_metadata(spec: &SchemaSurfaceSpec) -> HashMap<String, String> {
     let mut metadata = HashMap::from([
         (
-            ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
+            ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
             spec.columnar_layout_fingerprint(),
         ),
         (
-            ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
+            ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
             "true".to_owned(),
         ),
     ]);
     if spec.columnar_snapshot_bijective {
         metadata.insert(
-            ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY.to_string(),
+            ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY.to_string(),
             "true".to_owned(),
         );
     }
     metadata
 }
 
-fn entity_columnar_error(message: impl Into<String>) -> LixError {
+fn row_columnar_error(message: impl Into<String>) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("entity columnar layout: {}", message.into()),
+        format!("row columnar layout: {}", message.into()),
     )
 }
 
@@ -399,12 +399,12 @@ mod tests {
 
     use super::*;
     use crate::columnar_row_group::RowGroupScalar;
-    use crate::entity_pk::EntityPk;
-    use crate::sql2::derive_entity_surface_spec_from_schema;
+    use crate::row_pk::RowPk;
+    use crate::sql2::derive_schema_surface_spec_from_schema;
 
     #[test]
     fn registered_types_and_hidden_identity_round_trip() {
-        let spec = derive_entity_surface_spec_from_schema(&json!({
+        let spec = derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "typed_sidecar",
             "columns": [
@@ -422,18 +422,18 @@ mod tests {
             json!({"id":"b","ordinal":2,"score":2,"active":false,"payload":null}),
         ];
         let identities = [
-            EntityPk::from_json_array_value(&json!(["a", 1])).expect("first identity"),
-            EntityPk::from_json_array_value(&json!(["b", 2])).expect("second identity"),
+            RowPk::from_json_array_value(&json!(["a", 1])).expect("first identity"),
+            RowPk::from_json_array_value(&json!(["b", 2])).expect("second identity"),
         ];
         let canonical = snapshots
             .iter()
             .map(JsonValue::to_string)
             .collect::<Vec<_>>();
-        let encoded = encode_registered_entity_row_groups(
+        let encoded = encode_registered_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
-                    entity_pk,
+                |((row_pk, snapshot), canonical)| RowColumnarRowRef {
+                    row_pk,
                     snapshot_bytes: canonical.as_bytes(),
                     snapshot_value: snapshot,
                 },
@@ -445,14 +445,14 @@ mod tests {
             encoded
                 .manifest
                 .metadata
-                .get(ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY),
+                .get(ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY),
             Some(&spec.columnar_layout_fingerprint())
         );
         assert_eq!(
             encoded
                 .manifest
                 .metadata
-                .get(ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY)
+                .get(ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY)
                 .map(String::as_str),
             Some("true")
         );
@@ -460,7 +460,7 @@ mod tests {
             .manifest
             .fields
             .iter()
-            .position(|field| field.name == ENTITY_COLUMNAR_ENTITY_PK_FIELD)
+            .position(|field| field.name == ROW_COLUMNAR_ROW_PK_FIELD)
             .expect("hidden identity field");
         assert_eq!(
             encoded.manifest.fields[identity_index].data_type.to_arrow(),
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn frontend_columns_match_canonical_encoding_when_clustering_is_absent() {
-        let spec = derive_entity_surface_spec_from_schema(&json!({
+        let spec = derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "direct_columns",
             "columns": [
@@ -512,13 +512,13 @@ mod tests {
             .expect("snapshots should encode");
         let identities = ids
             .iter()
-            .map(|id| EntityPk::from_validated_shared_string(id.as_str().into()))
+            .map(|id| RowPk::from_validated_shared_string(id.as_str().into()))
             .collect::<Vec<_>>();
-        let canonical_encoding = encode_registered_entity_row_groups(
+        let canonical_encoding = encode_registered_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
-                    entity_pk,
+                |((row_pk, snapshot), canonical)| RowColumnarRowRef {
+                    row_pk,
                     snapshot_bytes: canonical.as_bytes(),
                     snapshot_value: snapshot,
                 },
@@ -526,7 +526,7 @@ mod tests {
         )
         .expect("canonical encoding should succeed")
         .expect("canonical encoding should exist");
-        let direct_encoding = encode_unclustered_registered_entity_row_groups(
+        let direct_encoding = encode_unclustered_registered_row_groups(
             &spec,
             vec![
                 Arc::new(StringArray::from(ids.clone())),
@@ -535,7 +535,7 @@ mod tests {
             Arc::new(StringArray::from(
                 identities
                     .iter()
-                    .map(EntityPk::as_json_array_text)
+                    .map(RowPk::as_json_array_text)
                     .collect::<Result<Vec<_>, _>>()
                     .expect("identities should encode"),
             )),
@@ -544,7 +544,7 @@ mod tests {
         .expect("high-cardinality values should not cluster");
         assert!(matches!(
             &direct_encoding.input_locations,
-            EntityRowGroupLocations::Dense { row_count: 128 }
+            RowGroupLocations::Dense { row_count: 128 }
         ));
         assert_eq!(direct_encoding.manifest, canonical_encoding.manifest);
         assert_eq!(
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn frontend_json_columns_match_canonical_path_value_encoding() {
-        let spec = derive_entity_surface_spec_from_schema(&json!({
+        let spec = derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "path_value_columns",
             "columns": [
@@ -583,13 +583,13 @@ mod tests {
             .expect("snapshots should encode");
         let identities = paths
             .iter()
-            .map(|path| EntityPk::from_validated_shared_string(path.as_str().into()))
+            .map(|path| RowPk::from_validated_shared_string(path.as_str().into()))
             .collect::<Vec<_>>();
-        let canonical_encoding = encode_registered_entity_row_groups(
+        let canonical_encoding = encode_registered_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
-                    entity_pk,
+                |((row_pk, snapshot), canonical)| RowColumnarRowRef {
+                    row_pk,
                     snapshot_bytes: canonical.as_bytes(),
                     snapshot_value: snapshot,
                 },
@@ -597,7 +597,7 @@ mod tests {
         )
         .expect("canonical encoding should succeed")
         .expect("canonical encoding should exist");
-        let direct_encoding = encode_unclustered_registered_entity_row_groups(
+        let direct_encoding = encode_unclustered_registered_row_groups(
             &spec,
             vec![
                 Arc::new(StringArray::from(paths.clone())),
@@ -612,7 +612,7 @@ mod tests {
             Arc::new(StringArray::from(
                 identities
                     .iter()
-                    .map(EntityPk::as_json_array_text)
+                    .map(RowPk::as_json_array_text)
                     .collect::<Result<Vec<_>, _>>()
                     .expect("identities should encode"),
             )),
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn input_coordinates_follow_the_clustered_physical_permutation() {
-        let spec = derive_entity_surface_spec_from_schema(&json!({
+        let spec = derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "coordinate_fixture",
             "columns": [
@@ -647,16 +647,16 @@ mod tests {
             json!({"id":"c","active":true,"lane":"y"}),
             json!({"id":"d","active":false,"lane":"b"}),
         ];
-        let identities = ["a", "b", "c", "d"].map(EntityPk::single);
+        let identities = ["a", "b", "c", "d"].map(RowPk::single);
         let canonical = snapshots
             .iter()
             .map(JsonValue::to_string)
             .collect::<Vec<_>>();
-        let encoded = encode_registered_entity_row_groups(
+        let encoded = encode_registered_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
-                    entity_pk,
+                |((row_pk, snapshot), canonical)| RowColumnarRowRef {
+                    row_pk,
                     snapshot_bytes: canonical.as_bytes(),
                     snapshot_value: snapshot,
                 },
@@ -668,7 +668,7 @@ mod tests {
             .manifest
             .fields
             .iter()
-            .position(|field| field.name == ENTITY_COLUMNAR_ENTITY_PK_FIELD)
+            .position(|field| field.name == ROW_COLUMNAR_ROW_PK_FIELD)
             .expect("hidden identity field");
 
         assert_eq!(encoded.input_locations.len(), identities.len());
@@ -703,13 +703,13 @@ mod tests {
     #[test]
     fn derived_encoding_failure_falls_back_without_rejecting_authoritative_rows() {
         assert!(
-            optional_derived_row_group_set(Err(entity_columnar_error("physical limit"))).is_none()
+            optional_derived_row_group_set(Err(row_columnar_error("physical limit"))).is_none()
         );
     }
 
     #[test]
     fn any_json_property_encodes_in_registered_layout() {
-        let spec = derive_entity_surface_spec_from_schema(&json!({
+        let spec = derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "json_layout",
             "columns": [
@@ -721,12 +721,12 @@ mod tests {
         .expect("spec");
         let snapshot = json!({"path":"a","value":"value-a"});
         let canonical = snapshot.to_string();
-        let identity = EntityPk::single("a");
+        let identity = RowPk::single("a");
         assert!(
-            encode_registered_entity_row_groups(
+            encode_registered_row_groups(
                 &spec,
-                std::iter::once(EntityColumnarRowRef {
-                    entity_pk: &identity,
+                std::iter::once(RowColumnarRowRef {
+                    row_pk: &identity,
                     snapshot_bytes: canonical.as_bytes(),
                     snapshot_value: &snapshot,
                 }),
@@ -749,7 +749,7 @@ mod tests {
                 "name": format!("lane_{index}"), "type": "text", "nullable": true
             }));
         }
-        let spec = derive_entity_surface_spec_from_schema(&json!({
+        let spec = derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "wide_low_cardinality",
             "columns": columns,
@@ -759,7 +759,7 @@ mod tests {
         let snapshots = (0..1_024)
             .map(|row| {
                 let mut snapshot = serde_json::Map::new();
-                snapshot.insert("id".to_string(), json!(format!("entity-{row}")));
+                snapshot.insert("id".to_string(), json!(format!("row-{row}")));
                 for index in 0..2 {
                     snapshot.insert(format!("flag_{index}"), json!(((row >> index) & 1) == 1));
                 }
@@ -779,18 +779,18 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let identities = (0..snapshots.len())
-            .map(|row| EntityPk::from_json_array_value(&json!([format!("entity-{row}")])).unwrap())
+            .map(|row| RowPk::from_json_array_value(&json!([format!("row-{row}")])).unwrap())
             .collect::<Vec<_>>();
         let canonical = snapshots
             .iter()
             .map(JsonValue::to_string)
             .collect::<Vec<_>>();
 
-        let encoded = encode_registered_entity_row_groups(
+        let encoded = encode_registered_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
-                    entity_pk,
+                |((row_pk, snapshot), canonical)| RowColumnarRowRef {
+                    row_pk,
                     snapshot_bytes: canonical.as_bytes(),
                     snapshot_value: snapshot,
                 },
@@ -801,10 +801,10 @@ mod tests {
 
         assert!(encoded.manifest.groups.len() > 1);
         assert!(
-            encoded.manifest.groups.len() <= ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS,
+            encoded.manifest.groups.len() <= ROW_COLUMNAR_MAX_CLUSTER_PARTITIONS,
             "wide independent dimensions created {} groups despite a {}-partition budget",
             encoded.manifest.groups.len(),
-            ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS
+            ROW_COLUMNAR_MAX_CLUSTER_PARTITIONS
         );
     }
 }

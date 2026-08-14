@@ -205,7 +205,7 @@ async fn drop_all_tombstones(storage: &Memory) -> usize {
 async fn working_diff_rows(session: &SessionContext<Memory>, schema_key: &str) -> usize {
     session
         .execute(
-            "SELECT entity_pk FROM lix_working_diff WHERE schema_key = $1",
+            "SELECT row_pk FROM lix_working_diff WHERE schema_key = $1",
             &[crate::Value::Text(schema_key.to_string())],
         )
         .await

@@ -49,13 +49,13 @@ simulation_test!(
         assert_eq!(
             select_rows(&session, "SELECT commit_id FROM lix_checkpoint").await,
             vec![vec![Value::Text(initial_commit_id.clone())]],
-            "ordinary branch commits do not mutate the global checkpoint entity"
+            "ordinary branch commits do not mutate the global checkpoint row"
         );
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, schema_key, diff_type \
-                 FROM lix_working_diff ORDER BY schema_key, entity_pk",
+                "SELECT row_pk, schema_key, diff_type \
+                 FROM lix_working_diff ORDER BY schema_key, row_pk",
             )
             .await,
             vec![vec![
@@ -67,10 +67,10 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, schema_key, diff_type \
+                "SELECT row_pk, schema_key, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
             )
             .await,
             vec![vec![
@@ -82,7 +82,7 @@ simulation_test!(
         assert!(
             select_rows(
                 &session,
-                "SELECT entity_pk \
+                "SELECT row_pk \
                  FROM lix_working_diff \
                  WHERE schema_key = 'other_schema'",
             )
@@ -129,7 +129,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT schema_key, entity_pk FROM lix_change WHERE id = '{}'",
+                    "SELECT schema_key, row_pk FROM lix_change WHERE id = '{}'",
                     receipt.change_id
                 ),
             )
@@ -228,7 +228,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    checkpoint_surface_is_global_entity_and_read_only,
+    checkpoint_surface_is_global_row_and_read_only,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -307,10 +307,10 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, diff_type \
+                "SELECT row_pk, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                 ORDER BY entity_pk",
+                 ORDER BY row_pk",
             )
             .await,
             vec![
@@ -331,7 +331,7 @@ simulation_test!(
                 "SELECT diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"working-removed\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"working-removed\"]' AS JSONB)",
             )
             .await,
             vec![vec![Value::Text("removed".to_string())]],

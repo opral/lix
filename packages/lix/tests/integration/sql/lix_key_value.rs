@@ -32,7 +32,7 @@ simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
 });
 
 simulation_test!(
-    lix_key_value_persisted_tracked_entity_scan_preserves_canonical_json_through_global_branch_merge,
+    lix_key_value_persisted_tracked_row_scan_preserves_canonical_json_through_global_branch_merge,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -73,7 +73,7 @@ simulation_test!(
             .expect("tracked active insert should succeed");
 
         let result = session
-            // LIKE deliberately routes through the broad EntitySpec scan rather
+            // LIKE deliberately routes through the broad SchemaSpec scan rather
             // than the exact-primary-key native executor.
             .execute(
                 "SELECT key, CONCAT(value, '') AS value_text FROM lix_key_value \
@@ -81,7 +81,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("broad tracked entity scan should succeed");
+            .expect("broad tracked row scan should succeed");
         assert_eq!(
             result
                 .rows()

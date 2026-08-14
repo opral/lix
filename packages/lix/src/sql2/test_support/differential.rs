@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::common::serialize_row_metadata;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::hot_state::{
         HotStateFilter, HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateRowRef,
     };
@@ -432,9 +432,9 @@ mod tests {
         match probe {
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
                 name: "lix_registered_schema".to_string(),
-                sql: "SELECT lixcol_entity_pk, value, lixcol_metadata, lixcol_global, lixcol_untracked \
+                sql: "SELECT lixcol_row_pk, value, lixcol_metadata, lixcol_global, lixcol_untracked \
                  FROM lix_registered_schema \
-                 ORDER BY lixcol_entity_pk"
+                 ORDER BY lixcol_row_pk"
                     .to_string(),
                 params: Vec::new(),
                 branch_column_indexes: &[],
@@ -456,10 +456,10 @@ mod tests {
                 ProbeQuery {
                     name: format!("lix_registered_schema_by_branch:{branch_ids:?}"),
                     sql: format!(
-                        "SELECT lixcol_entity_pk, value, lixcol_branch_id, lixcol_metadata, lixcol_global, lixcol_untracked \
+                        "SELECT lixcol_row_pk, value, lixcol_branch_id, lixcol_metadata, lixcol_global, lixcol_untracked \
                          FROM lix_registered_schema_by_branch \
                          WHERE lixcol_branch_id IN ({placeholders}) \
-                         ORDER BY lixcol_entity_pk, lixcol_branch_id"
+                         ORDER BY lixcol_row_pk, lixcol_branch_id"
                     ),
                     params,
                     branch_column_indexes: &[2],
@@ -518,7 +518,7 @@ mod tests {
     async fn scan_transaction_hot_state(
         transaction: &mut crate::session::SessionTransaction,
         schema_key: &str,
-        entity_pks: &[&str],
+        row_pks: &[&str],
         branch_ids: &[&str],
         active_branch_id: &str,
     ) -> MaterializedHotStateBatch {
@@ -526,9 +526,9 @@ mod tests {
         .scan_hot_state_for_test(&HotStateScanRequest {
             filter: HotStateFilter {
                 schema_keys: vec![schema_key.to_string()],
-                entity_pks: entity_pks
+                row_pks: row_pks
                     .iter()
-                    .map(|entity_pk| EntityPk::single(*entity_pk))
+                    .map(|row_pk| RowPk::single(*row_pk))
                     .collect(),
                 branch_ids: branch_ids
                     .iter()
@@ -554,8 +554,8 @@ mod tests {
         ordinals.sort_by(|left, right| {
             let left = rows.row(*left);
             let right = rows.row(*right);
-            left.entity_pk()
-                .cmp(right.entity_pk())
+            left.row_pk()
+                .cmp(right.row_pk())
                 .then_with(|| left.branch_id().cmp(right.branch_id()))
         });
         ordinals
@@ -573,7 +573,7 @@ mod tests {
                     .unwrap_or(Value::Null);
                 canonical_probe_values(
                     &[
-                        entity_pk_value(row),
+                        row_pk_value(row),
                         value,
                         Value::Text(row.branch_id().to_string()),
                         row.metadata()
@@ -591,11 +591,11 @@ mod tests {
             .collect()
     }
 
-    fn entity_pk_value(row: MaterializedHotStateRowRef<'_>) -> Value {
+    fn row_pk_value(row: MaterializedHotStateRowRef<'_>) -> Value {
         Value::Text(
-            row.entity_pk()
+            row.row_pk()
                 .as_json_array_text()
-                .expect("materialized entity pk should encode"),
+                .expect("materialized row pk should encode"),
         )
     }
 

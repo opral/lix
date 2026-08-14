@@ -25,7 +25,7 @@ const REQUIRED_EXTERNAL_LANES: &[&str] = &[
 ];
 
 const REQUIRED_SUMMARIES: &[&str] = &[
-    "csv_ten_mib_universal_entity_benchmark/universal_entities",
+    "csv_ten_mib_universal_row_benchmark/universal_rows",
     "v3_file_changed_push_sink_benchmark/v3_push_sink",
     "v3_cold_successor_csv_and_json_benchmark/csv-220k-rows",
     "v3_json_ten_mib_push_sink_benchmark/v3_push_sink",

@@ -8,8 +8,8 @@ mod order_key;
 mod schemas;
 
 use core::{
-    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, EntityRecord, FileEdit, IdNamespace,
-    NODE_SCHEMA_KEY, PluginError,
+    ArenaMarkdownBlock, ChangeEffect, Document, FileEdit, IdNamespace, NODE_SCHEMA_KEY,
+    PluginError, RowChange, RowRecord,
 };
 use lix::plugin as sdk;
 use serde_json::Value;
@@ -34,14 +34,14 @@ impl sdk::Plugin for MarkdownPlugin {
     ) -> sdk::Result<()> {
         let accepted = update.before.read_all()?;
         let mut records = Vec::new();
-        while let Some(entity) = update.entities.next()? {
-            records.push(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = update.rows.next()? {
+            records.push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             });
         }
-        let (document, _) = Document::open_entities(records, Some(accepted)).map_err(core_error)?;
+        let (document, _) = Document::open_rows(records, Some(accepted)).map_err(core_error)?;
         let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
         let inserts = update
             .edits
@@ -67,16 +67,16 @@ impl sdk::Plugin for MarkdownPlugin {
         Ok(())
     }
 
-    fn entities_changed(
-        update: &mut sdk::EntityUpdate<'_>,
+    fn rows_changed(
+        update: &mut sdk::RowUpdate<'_>,
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.changes.next()? {
-            changes.push(EntityChange {
+            changes.push(RowChange {
                 schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
+                row_pk: change.row_pk,
                 snapshot: change.snapshot,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
@@ -85,7 +85,7 @@ impl sdk::Plugin for MarkdownPlugin {
             });
         }
         let document = load_markdown_document(&update.before, before.clone())?;
-        let (successor, edits) = document.entities_changed(changes).map_err(core_error)?;
+        let (successor, edits) = document.rows_changed(changes).map_err(core_error)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
         store_rendered_markdown_state(&update.before, sink, &successor)?;
         Ok(())
@@ -93,11 +93,11 @@ impl sdk::Plugin for MarkdownPlugin {
 
     fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(entity) = input.entities.next()? {
-            records.push(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = input.rows.next()? {
+            records.push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             });
         }
         let accepted = input
@@ -105,7 +105,7 @@ impl sdk::Plugin for MarkdownPlugin {
             .as_ref()
             .map(sdk::Snapshot::read_all)
             .transpose()?;
-        let (document, _) = Document::open_entities(records, accepted).map_err(core_error)?;
+        let (document, _) = Document::open_rows(records, accepted).map_err(core_error)?;
         store_markdown_state(sink, &document)?;
         if input.accepted.is_none() {
             sink.replace_file(&document.bytes())?;
@@ -113,7 +113,7 @@ impl sdk::Plugin for MarkdownPlugin {
         Ok(())
     }
 
-    fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
+    fn resolve_conflict(conflict: sdk::RowConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
         let Some(b) = conflict.b.as_ref() else {
             return Ok(sdk::ConflictResolution::Delete);
         };
@@ -130,7 +130,7 @@ impl sdk::Plugin for MarkdownPlugin {
         let a = a.read()?;
         let b = b.read()?;
         let resolved =
-            Document::resolve_entity_conflict(Some(base.clone()), Some(a.clone()), Some(b.clone()));
+            Document::resolve_row_conflict(Some(base.clone()), Some(a.clone()), Some(b.clone()));
         Ok(match resolved {
             None => sdk::ConflictResolution::Delete,
             Some(resolved) if resolved == b => sdk::ConflictResolution::TakeB,
@@ -277,7 +277,7 @@ fn store_markdown_state(successor: &sdk::Output, document: &Document) -> sdk::Re
     Ok(())
 }
 
-type SparseBlockResult = (Vec<EntityChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type SparseBlockResult = (Vec<RowChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn sparse_block_change(
     update: &sdk::FileUpdate<'_>,
@@ -688,7 +688,7 @@ fn core_error(error: PluginError) -> sdk::Error {
     }
 }
 
-fn strip_duplicated_lexical_fallback(changes: &mut [EntityChange]) -> sdk::Result<()> {
+fn strip_duplicated_lexical_fallback(changes: &mut [RowChange]) -> sdk::Result<()> {
     for change in changes {
         let Some(snapshot) = &mut change.snapshot else {
             continue;
@@ -740,7 +740,7 @@ fn strip_duplicated_lexical_fallback(changes: &mut [EntityChange]) -> sdk::Resul
 }
 
 fn emit_changes(
-    changes: impl IntoIterator<Item = EntityChange>,
+    changes: impl IntoIterator<Item = RowChange>,
     creates: sdk::CreateContext,
     create_from_ordinal: Option<u32>,
     sink: &mut sdk::Output<'_>,
@@ -749,23 +749,23 @@ fn emit_changes(
         match change.snapshot {
             Some(snapshot) => {
                 let local_ref = change
-                    .entity_pk
+                    .row_pk
                     .first()
-                    .filter(|_| change.entity_pk.len() == 1)
+                    .filter(|_| change.row_pk.len() == 1)
                     .and_then(|id| local_ref(creates, id))
                     .filter(|ordinal| {
                         create_from_ordinal.is_none_or(|minimum| *ordinal >= minimum)
                     });
                 if let Some(local_ref) = local_ref {
-                    sink.entity(sdk::EntityMutation::Create {
+                    sink.row(sdk::RowMutation::Create {
                         schema_key: &change.schema_key,
                         local_ref,
                         snapshot: &snapshot,
                     })?;
                 } else {
-                    sink.entity(sdk::EntityMutation::Upsert {
+                    sink.row(sdk::RowMutation::Upsert {
                         schema_key: &change.schema_key,
-                        entity_pk: &change.entity_pk,
+                        row_pk: &change.row_pk,
                         snapshot: &snapshot,
                         effect: match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
@@ -774,9 +774,9 @@ fn emit_changes(
                     })?;
                 }
             }
-            None => sink.entity(sdk::EntityMutation::Delete {
+            None => sink.row(sdk::RowMutation::Delete {
                 schema_key: &change.schema_key,
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
             })?,
         }
     }

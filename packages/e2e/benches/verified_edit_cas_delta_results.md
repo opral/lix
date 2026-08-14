@@ -88,7 +88,7 @@ the unprofiled hot loop uses 500 edits.
 | hot byte edit | 3.231 ms | 2.187 ms | -32.31% | 5.751 ms matched edit median |
 | cold materialized read | 0.722 ms | 0.573 ms | -20.64% | 1.260 ms |
 | semantic edit | 6.052 ms | 5.932 ms | -1.98% | 5.751 ms |
-| unrelated-entity merge | 6.744 ms | 6.714 ms | -0.44% | 10.326 ms |
+| unrelated-row merge | 6.744 ms | 6.714 ms | -0.44% | 10.326 ms |
 | initial import | 32.534 ms | 31.944 ms | -1.81% | 5.552 ms |
 
 The byte-edit path is 3.10x faster than Git and the cold materialized read is

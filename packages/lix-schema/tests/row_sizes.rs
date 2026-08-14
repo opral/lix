@@ -9,7 +9,7 @@
 //!
 //! Candidate format: 1-byte header + ceil(k_nullable/8) null bitmap +
 //!   fixed area (1/8/8/16 by type) + 2*(nvar-1) offsets + var payload, with
-//!   primary-key columns elided (they live in the envelope's `entity_pk`).
+//!   primary-key columns elided (they live in the envelope's `row_pk`).
 //!
 //! Values are SYNTHESISED, not sampled from a corpus: each column uses its
 //! declared `examples[0]` when the fixture provides one, otherwise a
@@ -69,7 +69,7 @@ fn synthesise(name: &str, data_type: DataType, example: Option<&Value>) -> (Body
             (BodyValue::Text(text.clone()), Value::String(text))
         }
         DataType::Jsonb => {
-            let json = if name.contains("entity_pk") {
+            let json = if name.contains("row_pk") {
                 serde_json::json!(["0191b7e4-1f2c-7c3a-9d4e-5f6a7b8c9d0e"])
             } else if name.contains("metadata") {
                 serde_json::json!({"author": "agent", "source": "cli"})

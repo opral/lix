@@ -123,7 +123,7 @@ where
                 && !unfiled_identities.insert((
                     row.branch_id.to_string(),
                     row.schema_key.to_string(),
-                    row.entity_pk.clone(),
+                    row.row_pk.clone(),
                 ))
             {
                 return false;
@@ -366,7 +366,7 @@ where
             let key = TrackedStateKey {
                 schema_key: row.schema_key.to_string(),
                 file_id: Some(file_id.to_string()),
-                entity_pk: row.entity_pk.clone(),
+                row_pk: row.row_pk.clone(),
             };
             group
                 .candidates
@@ -448,11 +448,11 @@ where
                             "cohort conflict batch exceeds the u32 ordinal limit",
                         )
                     })?;
-                    conflicts.push(WasmEntityConflict {
+                    conflicts.push(WasmRowConflict {
                         ordinal,
-                        key: WasmEntityKey::from_owned_parts(
+                        key: WasmRowKey::from_owned_parts(
                             key.schema_key.clone(),
-                            key.entity_pk.clone().into_parts(),
+                            key.row_pk.clone().into_parts(),
                         ),
                         base: stale_conflict_bytes(conflict.base.as_ref()),
                         a: stale_conflict_bytes(conflict.a.as_ref()),
@@ -467,7 +467,7 @@ where
                     target: "lix_transaction",
                     "lix.transaction.cohort.resolve_plugin",
                     plugin_key = group.plugin.key(),
-                    conflict_entities = semantic_conflicts.len(),
+                    conflict_rows = semantic_conflicts.len(),
                 ))
                 .await?;
             for (conflict, resolution) in
@@ -523,7 +523,7 @@ pub(super) fn push_cohort_payload(
     branch_id: &str,
 ) {
     rows.push_parts(
-        Some(key.entity_pk.clone()),
+        Some(key.row_pk.clone()),
         SharedStr::from(key.schema_key.as_str()),
         key.file_id.as_deref().map(SharedStr::from),
         payload.map(|payload| {
@@ -561,13 +561,13 @@ where
         .map(|file_id| TrackedStateKey {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
             file_id: Some(file_id.clone()),
-            entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+            row_pk: RowPk::single(PLUGIN_OWNER_KEY),
         })
         .collect::<Vec<_>>();
     let registry_key = TrackedStateKey {
         schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
         file_id: None,
-        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+        row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
     };
     let mut tracked = transaction.tracked_state.reader(read);
     let owners = tracked

@@ -87,7 +87,7 @@ pub(crate) async fn seed_branch_head_with_rows(
     .expect("tracked root should write");
 
     let branch_ref_change_id = test_change_id(&format!("branch-ref-{branch_id}"));
-    let branch_ref_entity_pk = crate::entity_pk::EntityPk::uuid_from_canonical(branch_id)
+    let branch_ref_row_pk = crate::row_pk::RowPk::uuid_from_canonical(branch_id)
         .expect("test branch ID must be a canonical UUID");
     let branch_ref_snapshot = serde_json::json!({
         "id": branch_id,
@@ -103,7 +103,7 @@ pub(crate) async fn seed_branch_head_with_rows(
                     format_version: 2,
                     change_id: branch_ref_change_id,
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                    entity_pk: branch_ref_entity_pk.clone(),
+                    row_pk: branch_ref_row_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
@@ -143,7 +143,7 @@ pub(crate) async fn seed_branch_head_with_rows(
         .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
             schema_key: &row.schema_key,
             file_id: row.file_id.as_deref(),
-            entity_pk: &row.entity_pk,
+            row_pk: &row.row_pk,
             change_id: Some(row.change_id),
             commit_id: Some(row.commit_id),
             untracked: false,
@@ -247,7 +247,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
                 deleted: change.snapshot.is_none(),
@@ -334,7 +334,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
                 deleted: change.snapshot.is_none(),
@@ -404,7 +404,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: *change_commit_id,
                 deleted: change.snapshot.is_none(),
@@ -743,13 +743,13 @@ fn final_state_row_winner_indices(
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<Vec<usize>, crate::LixError> {
     let mut winners =
-        BTreeMap::<(String, Option<String>, crate::entity_pk::EntityPk), usize>::new();
+        BTreeMap::<(String, Option<String>, crate::row_pk::RowPk), usize>::new();
     for (index, row) in rows.iter().enumerate() {
         winners.insert(
             (
                 row.schema_key.clone(),
                 row.file_id.clone(),
-                row.entity_pk.clone(),
+                row.row_pk.clone(),
             ),
             index,
         );
@@ -801,7 +801,7 @@ pub(crate) fn tracked_change_from_materialized(
         format_version: 1,
         change_id: row.change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-        entity_pk: row.entity_pk.clone(),
+        row_pk: row.row_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot: row

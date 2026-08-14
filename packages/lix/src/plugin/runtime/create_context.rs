@@ -3,7 +3,7 @@
 //! Components see a compact UUIDv7 create context. The engine retains the full
 //! operation proof, binds the context to the file authority, and writes one
 //! fixed-shape tracked reservation row when that context first creates an
-//! entity. A colliding context with a different proof is rejected before any
+//! row. A colliding context with a different proof is rejected before any
 //! semantic rows are staged.
 
 use serde::Deserialize;
@@ -14,12 +14,12 @@ use crate::binary_cas::BlobId;
 #[cfg(test)]
 use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
-use crate::entity_pk::EntityPk;
 use crate::hot_state::{MaterializedHotStateExactBatch, MaterializedHotStateRow};
 use crate::plugin::runtime::{
-    WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
-    WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
+    WasmChangeEffect, WasmCreateContext, WasmHostBytes, WasmHostRowChanges, WasmRow, WasmRowChange,
+    WasmRowChanges, WasmRowKey,
 };
+use crate::row_pk::RowPk;
 use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 
 use super::{PluginActorKey, PluginRegistryEntry};
@@ -141,19 +141,19 @@ pub(crate) struct CreateValidation {
     /// create the corresponding durable reservation before staging changes.
     pub(crate) requires_reservation: bool,
     /// Non-current compact identities are valid only when the exact durable
-    /// entity already exists.
-    pub(crate) existing_authorities: Vec<WasmEntityKey>,
+    /// row already exists.
+    pub(crate) existing_authorities: Vec<WasmRowKey>,
 }
 
 pub(crate) fn validate_create_changes<B>(
     plugin: &PluginRegistryEntry,
-    changes: &WasmEntityChanges<B>,
+    changes: &WasmRowChanges<B>,
 ) -> Result<CreateValidation, LixError> {
     let creatable = plugin.create_schema_keys();
     let mut validation = CreateValidation::default();
     for change in &changes.changes {
         match change {
-            WasmEntityChange::Create {
+            WasmRowChange::Create {
                 schema_key,
                 local_ref,
                 ..
@@ -174,16 +174,16 @@ pub(crate) fn validate_create_changes<B>(
                 })?;
                 validation.requires_reservation = true;
             }
-            WasmEntityChange::Upsert { entity, .. }
+            WasmRowChange::Upsert { row, .. }
                 if creatable
                     .binary_search_by(|candidate| {
-                        candidate.as_str().cmp(entity.key.schema_key.as_str())
+                        candidate.as_str().cmp(row.key.schema_key.as_str())
                     })
                     .is_ok() =>
             {
-                validation.existing_authorities.push(entity.key.clone());
+                validation.existing_authorities.push(row.key.clone());
             }
-            WasmEntityChange::Upsert { .. } | WasmEntityChange::Delete(_) => {}
+            WasmRowChange::Upsert { .. } | WasmRowChange::Delete(_) => {}
         }
     }
     validation.existing_authorities.sort();
@@ -192,11 +192,11 @@ pub(crate) fn validate_create_changes<B>(
 }
 
 pub(crate) fn materialize_keyless_creates(
-    changes: &mut WasmHostEntityChanges,
+    changes: &mut WasmHostRowChanges,
     creates: WasmCreateContext,
 ) -> Result<(), LixError> {
     for change in &mut changes.changes {
-        let WasmEntityChange::Create {
+        let WasmRowChange::Create {
             schema_key,
             local_ref,
             resolved_key,
@@ -219,8 +219,8 @@ pub(crate) fn materialize_keyless_creates(
             )
         })?;
         if key.schema_key.as_str() != schema_key
-            || key.entity_pk.len() != 1
-            || key.entity_pk[0].as_str() != id
+            || key.row_pk.len() != 1
+            || key.row_pk[0].as_str() != id
         {
             return Err(invalid_id(format!(
                 "resolved keyless create for schema '{schema_key}' does not match its create context"
@@ -232,8 +232,8 @@ pub(crate) fn materialize_keyless_creates(
                 "resolved keyless create did not retain its schema-validation certificate",
             ));
         }
-        *change = WasmEntityChange::Upsert {
-            entity: WasmEntity {
+        *change = WasmRowChange::Upsert {
+            row: WasmRow {
                 key,
                 snapshot_content: WasmHostBytes::CanonicalJson(canonical.clone()),
             },
@@ -245,7 +245,7 @@ pub(crate) fn materialize_keyless_creates(
 
 pub(crate) fn require_existing_id_authorities(
     plugin: &PluginRegistryEntry,
-    keys: &[WasmEntityKey],
+    keys: &[WasmRowKey],
     rows: &MaterializedHotStateExactBatch,
     file_id: &str,
     branch_id: &str,
@@ -262,9 +262,9 @@ pub(crate) fn require_existing_id_authorities(
             !row.deleted()
                 && row.snapshot_content().is_some()
                 && key.schema_key == row.schema_key()
-                && key.entity_pk.len() == 1
-                && EntityPk::uuid_from_canonical(&key.entity_pk[0])
-                    .is_ok_and(|entity_pk| row.entity_pk() == &entity_pk)
+                && key.row_pk.len() == 1
+                && RowPk::uuid_from_canonical(&key.row_pk[0])
+                    .is_ok_and(|row_pk| row.row_pk() == &row_pk)
                 && row.file_id() == Some(file_id)
                 && row.branch_id() == branch_id
                 && !row.global()
@@ -275,12 +275,12 @@ pub(crate) fn require_existing_id_authorities(
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
-                    "plugin '{}' emitted a keyed update for creatable schema '{}' entity {:?}, but that entity does not exist",
-                    plugin.key(), key.schema_key, key.entity_pk
+                    "plugin '{}' emitted a keyed update for creatable schema '{}' row {:?}, but that row does not exist",
+                    plugin.key(), key.schema_key, key.row_pk
                 ),
             )
             .with_hint(
-                "Use keyless Create for new entities and keyed Upsert only for existing entities.",
+                "Use keyless Create for new rows and keyed Upsert only for existing rows.",
             ));
         }
     }
@@ -331,7 +331,7 @@ pub(crate) fn reserve_create_row(
 /// Validates an already-reserved create context before entering a guest transition.
 ///
 /// This preflight is deliberately independent of whether the eventual sparse
-/// change set creates an entity. A client presenting a reserved context with a
+/// change set creates a row. A client presenting a reserved context with a
 /// different full proof has already violated the mutation-identity contract;
 /// rejecting it here prevents guest-local allocator errors from obscuring the
 /// public constraint violation.
@@ -429,7 +429,7 @@ fn reservation_row(
         ));
     }
     Ok(TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(key)),
+        row_pk: Some(RowPk::single(key)),
         schema_key: KEY_VALUE_SCHEMA_KEY.into(),
         file_id: Some(file_id.into()),
         snapshot: snapshot
@@ -455,7 +455,7 @@ fn validate_reservation_identity(
     untracked: bool,
 ) -> Result<(), LixError> {
     if row.schema_key != KEY_VALUE_SCHEMA_KEY
-        || row.entity_pk.as_single_string().ok() != Some(key)
+        || row.row_pk.as_single_string().ok() != Some(key)
         || row.file_id.as_deref() != Some(file_id)
         || row.branch_id.as_ref() != branch_id
         || row.global
@@ -512,7 +512,7 @@ fn invalid_id(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::plugin::runtime::{PluginRegistryEntryInput, PluginRuntime};
-    use crate::plugin::runtime::{WasmCanonicalJson, WasmChangeEffect, WasmEntity, WasmHostBytes};
+    use crate::plugin::runtime::{WasmCanonicalJson, WasmChangeEffect, WasmHostBytes, WasmRow};
 
     fn actor_key() -> PluginActorKey {
         PluginActorKey {
@@ -555,10 +555,10 @@ mod tests {
         .expect("plugin")
     }
 
-    fn upsert(id: String) -> WasmEntityChange<WasmHostBytes> {
-        WasmEntityChange::Upsert {
-            entity: WasmEntity {
-                key: WasmEntityKey::from_owned_parts("csv_row", vec![id]),
+    fn upsert(id: String) -> WasmRowChange<WasmHostBytes> {
+        WasmRowChange::Upsert {
+            row: WasmRow {
+                key: WasmRowKey::from_owned_parts("csv_row", vec![id]),
                 snapshot_content: WasmHostBytes::Inline(b"{}".to_vec().into()),
             },
             effect: WasmChangeEffect::Content,
@@ -581,8 +581,8 @@ mod tests {
         WasmHostBytes::CanonicalJson(canonical)
     }
 
-    fn create(local_ref: u64) -> WasmEntityChange<WasmHostBytes> {
-        WasmEntityChange::Create {
+    fn create(local_ref: u64) -> WasmRowChange<WasmHostBytes> {
+        WasmRowChange::Create {
             schema_key: "csv_row".to_string(),
             local_ref,
             resolved_key: None,
@@ -601,7 +601,7 @@ mod tests {
         .expect("reserve")
         .expect("new row");
         MaterializedHotStateRow {
-            entity_pk: write.entity_pk.expect("pk"),
+            row_pk: write.row_pk.expect("pk"),
             schema_key: write.schema_key.into(),
             file_id: write.file_id.map(Into::into),
             snapshot_content: write.snapshot.map(|snapshot| snapshot.normalized().into()),
@@ -647,15 +647,15 @@ mod tests {
         let old = BoundCreateContext::bind(mutation_identity(6, 5), &actor_key())
             .expect("valid UUIDv7 seed");
         let old_id = old.creates().component(1).unwrap();
-        let changes = WasmEntityChanges {
+        let changes = WasmRowChanges {
             changes: vec![create(0), upsert(old_id)],
         };
         let validation = validate_create_changes(&plugin(), &changes).expect("validate");
         assert!(validation.requires_reservation);
         assert_eq!(validation.existing_authorities.len(), 1);
 
-        let malformed = WasmEntityChanges {
-            changes: vec![WasmEntityChange::Create {
+        let malformed = WasmRowChanges {
+            changes: vec![WasmRowChange::Create {
                 schema_key: "other".to_string(),
                 local_ref: 0,
                 resolved_key: None,
@@ -672,9 +672,9 @@ mod tests {
             .creates()
             .component(1)
             .expect("generated UUID");
-        let key = WasmEntityKey::from_owned_parts("csv_row", vec![id.clone()]);
+        let key = WasmRowKey::from_owned_parts("csv_row", vec![id.clone()]);
         let row = MaterializedHotStateRow {
-            entity_pk: EntityPk::uuid_from_canonical(&id).expect("typed UUID primary key"),
+            row_pk: RowPk::uuid_from_canonical(&id).expect("typed UUID primary key"),
             schema_key: "csv_row".into(),
             file_id: Some("01920000-0000-7000-8000-0000000000a2".into()),
             snapshot_content: Some("{}".into()),
@@ -718,8 +718,8 @@ mod tests {
         let context = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
             .expect("valid UUIDv7 seed")
             .creates();
-        let mut changes = WasmEntityChanges {
-            changes: vec![WasmEntityChange::Create {
+        let mut changes = WasmRowChanges {
+            changes: vec![WasmRowChange::Create {
                 schema_key: "csv_row".to_string(),
                 local_ref: 42,
                 resolved_key: None,
@@ -793,7 +793,7 @@ mod tests {
         let actor_key = actor_key();
         let cold = BoundCreateContext::bind(mutation_identity(1, 2), &actor_key)
             .expect("valid UUIDv7 seed");
-        let cold_changes = WasmEntityChanges {
+        let cold_changes = WasmRowChanges {
             changes: (0..ROWS).map(create).collect(),
         };
         let plugin = plugin();
@@ -817,7 +817,7 @@ mod tests {
 
         let edit = BoundCreateContext::bind(mutation_identity(3, 4), &actor_key)
             .expect("valid UUIDv7 seed");
-        let edit_changes = WasmEntityChanges {
+        let edit_changes = WasmRowChanges {
             changes: vec![upsert(cold.creates().component(17).unwrap())],
         };
         let validation =
@@ -825,7 +825,7 @@ mod tests {
         assert!(!validation.requires_reservation);
         assert_eq!(validation.existing_authorities.len(), 1);
 
-        let insert_changes = WasmEntityChanges {
+        let insert_changes = WasmRowChanges {
             changes: vec![create(0)],
         };
         let validation =

@@ -35,11 +35,11 @@ await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
 ]);
 
 const working = await lix.execute(
-  "SELECT entity_pk, schema_key, diff_type FROM lix_working_diff",
+  "SELECT row_pk, schema_key, diff_type FROM lix_working_diff",
 );
 
 for (const row of working.rows) {
-  console.log(row.get("diff_type"), row.get("schema_key"), row.get("entity_pk"));
+  console.log(row.get("diff_type"), row.get("schema_key"), row.get("row_pk"));
 }
 
 const checkpoint = await lix.createCheckpoint();
@@ -70,7 +70,7 @@ Checkpointing has eight read-only SQL surfaces:
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
-| `lix_working_diff` | Active branch | `diff_id`, `entity_pk`, `schema_key`, `file_id`, `diff_type`, `before_change_id`, `after_change_id` |
+| `lix_working_diff` | Active branch | `diff_id`, `row_pk`, `schema_key`, `file_id`, `diff_type`, `before_change_id`, `after_change_id` |
 | `lix_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_file_working_diff` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
 | `lix_file_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |

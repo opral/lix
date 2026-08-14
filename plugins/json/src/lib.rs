@@ -4,8 +4,8 @@
 mod core;
 
 use core::{
-    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, EntityImportBuilder,
-    EntityRecord, FileEdit, IdNamespace,
+    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, FileEdit, IdNamespace, RowChange,
+    RowImportBuilder, RowRecord,
 };
 use lix::plugin as sdk;
 
@@ -14,9 +14,9 @@ struct JsonPlugin;
 const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts";
 const ID_NAMESPACE_STATE: &[u8] = b"json/id-namespace";
-const FALLBACK_ENTITIES_STATE: &[u8] = b"json/fallback-entities";
+const FALLBACK_ROWS_STATE: &[u8] = b"json/fallback-rows";
 const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS2";
-const FALLBACK_ENTITIES_MAGIC: &[u8; 4] = b"JFE2";
+const FALLBACK_ROWS_MAGIC: &[u8; 4] = b"JFE2";
 const SCALAR_INDEX_HEADER_BYTES: u32 = 16;
 const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
 const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
@@ -28,13 +28,13 @@ impl sdk::Plugin for JsonPlugin {
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let accepted = update.before.read_all()?;
-        let mut builder = EntityImportBuilder::new();
-        while let Some(entity) = update.entities.next()? {
+        let mut builder = RowImportBuilder::new();
+        while let Some(row) = update.rows.next()? {
             builder
-                .push(EntityRecord {
-                    schema_key: entity.schema_key,
-                    entity_pk: entity.entity_pk,
-                    snapshot: entity.snapshot,
+                .push(RowRecord {
+                    schema_key: row.schema_key,
+                    row_pk: row.row_pk,
+                    snapshot: row.snapshot,
                 })
                 .map_err(sdk::Error::invalid_input)?;
         }
@@ -70,26 +70,24 @@ impl sdk::Plugin for JsonPlugin {
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
         sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
-        store_fallback_entities_fresh(
+        store_fallback_rows_fresh(
             sink,
-            &document
-                .entity_records()
-                .map_err(sdk::Error::invalid_input)?,
+            &document.row_records().map_err(sdk::Error::invalid_input)?,
         )?;
         emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
         Ok(())
     }
 
-    fn entities_changed(
-        update: &mut sdk::EntityUpdate<'_>,
+    fn rows_changed(
+        update: &mut sdk::RowUpdate<'_>,
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.changes.next()? {
-            changes.push(EntityChange {
+            changes.push(RowChange {
                 schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
+                row_pk: change.row_pk,
                 snapshot: change.snapshot,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
@@ -107,21 +105,21 @@ impl sdk::Plugin for JsonPlugin {
             namespace,
         )?;
         let (successor, edits) = document
-            .entities_changed(&changes)
+            .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
-        store_fallback_entities(&update.before, sink, &successor)?;
+        store_fallback_rows(&update.before, sink, &successor)?;
         Ok(())
     }
 
     fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
-        let mut builder = EntityImportBuilder::new();
+        let mut builder = RowImportBuilder::new();
         let mut records = Vec::new();
-        while let Some(entity) = input.entities.next()? {
-            let record = EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = input.rows.next()? {
+            let record = RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             };
             builder
                 .push(record.clone())
@@ -129,7 +127,7 @@ impl sdk::Plugin for JsonPlugin {
             records.push(record);
         }
         let (document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
-        store_fallback_entities_fresh(sink, &records)?;
+        store_fallback_rows_fresh(sink, &records)?;
         if input.accepted.is_none() {
             sink.replace_file(&document.bytes())?;
         }
@@ -167,7 +165,7 @@ impl sdk::Plugin for JsonPlugin {
                 insert,
             })
             .collect::<Vec<_>>();
-        if update.before.state_len(FALLBACK_ENTITIES_STATE)?.is_none()
+        if update.before.state_len(FALLBACK_ROWS_STATE)?.is_none()
             && update.before_path == update.after_path
             && let [edit] = update.edits.as_slice()
             && let Some((change, shifts)) = sparse_scalar_change(update, edit, &inserts[0])?
@@ -193,7 +191,7 @@ impl sdk::Plugin for JsonPlugin {
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        store_fallback_entities_in_transaction(&update.before, sink, &document)?;
+        store_fallback_rows_in_transaction(&update.before, sink, &document)?;
         let (old_index_page_count, old_scalar_page_count) = scalar_page_counts(update)?;
         sink.delete_state(SCALAR_INDEX_STATE)?;
         for ordinal in 0..old_index_page_count {
@@ -214,7 +212,7 @@ fn read_fallback_document(
     path: Option<&str>,
     namespace: IdNamespace,
 ) -> sdk::Result<Document> {
-    let Some(manifest) = root.get_state(FALLBACK_ENTITIES_STATE)? else {
+    let Some(manifest) = root.get_state(FALLBACK_ROWS_STATE)? else {
         return Document::open_file(accepted, path, namespace)
             .map(|(document, _)| document)
             .map_err(sdk::Error::invalid_input);
@@ -223,11 +221,11 @@ fn read_fallback_document(
     let mut pages = Vec::with_capacity(page_count as usize);
     for ordinal in 0..page_count {
         pages.push(
-            root.get_state(&fallback_entity_page_key(ordinal))?
+            root.get_state(&fallback_row_page_key(ordinal))?
                 .ok_or_else(|| sdk::Error::invalid_input("JSON fallback page disappeared"))?,
         );
     }
-    let (document, _) = Document::open_entities(decode_entity_records(record_count, pages)?)
+    let (document, _) = Document::open_rows(decode_row_records(record_count, pages)?)
         .map_err(sdk::Error::invalid_input)?;
     let rendered = document.bytes();
     if rendered == accepted {
@@ -244,22 +242,20 @@ fn read_fallback_document(
         .map_err(sdk::Error::invalid_input)
 }
 
-fn store_fallback_entities(
+fn store_fallback_rows(
     before: &sdk::Snapshot<'_>,
     sink: &mut sdk::Output<'_>,
     document: &Document,
 ) -> sdk::Result<()> {
-    let records = document
-        .entity_records()
-        .map_err(sdk::Error::invalid_input)?;
-    let old_page_count = fallback_entity_page_count(before)?;
-    let (manifest, pages) = encode_entity_records(&records)?;
-    sink.put_state(FALLBACK_ENTITIES_STATE, &manifest)?;
+    let records = document.row_records().map_err(sdk::Error::invalid_input)?;
+    let old_page_count = fallback_row_page_count(before)?;
+    let (manifest, pages) = encode_row_records(&records)?;
+    sink.put_state(FALLBACK_ROWS_STATE, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
-        sink.put_state(&fallback_entity_page_key(ordinal as u32), page)?;
+        sink.put_state(&fallback_row_page_key(ordinal as u32), page)?;
     }
     for ordinal in pages.len() as u32..old_page_count {
-        sink.delete_state(&fallback_entity_page_key(ordinal))?;
+        sink.delete_state(&fallback_row_page_key(ordinal))?;
     }
     let (index_page_count, scalar_page_count) = scalar_page_counts_root(before)?;
     sink.delete_state(SCALAR_INDEX_STATE)?;
@@ -273,52 +269,50 @@ fn store_fallback_entities(
     Ok(())
 }
 
-fn store_fallback_entities_in_transaction(
+fn store_fallback_rows_in_transaction(
     before: &sdk::Snapshot<'_>,
     successor: &sdk::Output<'_>,
     document: &Document,
 ) -> sdk::Result<()> {
-    let records = document
-        .entity_records()
-        .map_err(sdk::Error::invalid_input)?;
-    let old_page_count = fallback_entity_page_count(before)?;
-    let (manifest, pages) = encode_entity_records(&records)?;
-    successor.put_state(FALLBACK_ENTITIES_STATE, &manifest)?;
+    let records = document.row_records().map_err(sdk::Error::invalid_input)?;
+    let old_page_count = fallback_row_page_count(before)?;
+    let (manifest, pages) = encode_row_records(&records)?;
+    successor.put_state(FALLBACK_ROWS_STATE, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
-        successor.put_state(&fallback_entity_page_key(ordinal as u32), page)?;
+        successor.put_state(&fallback_row_page_key(ordinal as u32), page)?;
     }
     for ordinal in pages.len() as u32..old_page_count {
-        successor.delete_state(&fallback_entity_page_key(ordinal))?;
+        successor.delete_state(&fallback_row_page_key(ordinal))?;
     }
     Ok(())
 }
 
-fn store_fallback_entities_fresh(
+fn store_fallback_rows_fresh(
     successor: &sdk::Output<'_>,
-    records: &[EntityRecord],
+    records: &[RowRecord],
 ) -> sdk::Result<()> {
-    let (manifest, pages) = encode_entity_records(records)?;
-    successor.put_state(FALLBACK_ENTITIES_STATE, &manifest)?;
+    let (manifest, pages) = encode_row_records(records)?;
+    successor.put_state(FALLBACK_ROWS_STATE, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
-        successor.put_state(&fallback_entity_page_key(ordinal as u32), page)?;
+        successor.put_state(&fallback_row_page_key(ordinal as u32), page)?;
     }
     Ok(())
 }
 
-fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+fn encode_row_records(records: &[RowRecord]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
     let record_count = u32::try_from(records.len())
-        .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback entities"))?;
+        .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback rows"))?;
     let mut pages = Vec::new();
     let mut page = Vec::with_capacity(STATE_PAGE_BYTES);
     for record in records {
         let mut encoded = Vec::new();
         push_text(&mut encoded, &record.schema_key)?;
         encoded.extend_from_slice(
-            &u32::try_from(record.entity_pk.len())
+            &u32::try_from(record.row_pk.len())
                 .map_err(|_| sdk::Error::limit_exceeded("too many JSON key components"))?
                 .to_le_bytes(),
         );
-        for component in &record.entity_pk {
+        for component in &record.row_pk {
             push_text(&mut encoded, component)?;
         }
         encoded.extend_from_slice(
@@ -333,7 +327,7 @@ fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<(Vec<u8>, Vec<
         pages.push(page);
     }
     let mut manifest = Vec::with_capacity(12);
-    manifest.extend_from_slice(FALLBACK_ENTITIES_MAGIC);
+    manifest.extend_from_slice(FALLBACK_ROWS_MAGIC);
     manifest.extend_from_slice(&record_count.to_le_bytes());
     manifest.extend_from_slice(
         &u32::try_from(pages.len())
@@ -359,9 +353,9 @@ fn push_paged_state(pages: &mut Vec<Vec<u8>>, page: &mut Vec<u8>, mut bytes: &[u
 }
 
 fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
-    if bytes.len() != 12 || bytes.get(..4) != Some(FALLBACK_ENTITIES_MAGIC) {
+    if bytes.len() != 12 || bytes.get(..4) != Some(FALLBACK_ROWS_MAGIC) {
         return Err(sdk::Error::invalid_input(
-            "unsupported JSON fallback entity manifest",
+            "unsupported JSON fallback row manifest",
         ));
     }
     Ok((
@@ -370,28 +364,28 @@ fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
     ))
 }
 
-fn fallback_entity_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
-    root.get_state(FALLBACK_ENTITIES_STATE)?
+fn fallback_row_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
+    root.get_state(FALLBACK_ROWS_STATE)?
         .map(|manifest| decode_fallback_manifest(&manifest).map(|(_, pages)| pages))
         .transpose()
         .map(Option::unwrap_or_default)
 }
 
-fn decode_entity_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<EntityRecord>> {
+fn decode_row_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<RowRecord>> {
     let mut input = PagedStateReader::new(pages);
     let mut records = Vec::with_capacity(record_count as usize);
     for _ in 0..record_count {
         let schema_key = input.text()?;
         let component_count = input.u32()? as usize;
-        let mut entity_pk = Vec::with_capacity(component_count.min(4));
+        let mut row_pk = Vec::with_capacity(component_count.min(4));
         for _ in 0..component_count {
-            entity_pk.push(input.text()?);
+            row_pk.push(input.text()?);
         }
         let snapshot_len = input.u32()? as usize;
         let snapshot = input.bytes(snapshot_len)?;
-        records.push(EntityRecord {
+        records.push(RowRecord {
             schema_key,
-            entity_pk,
+            row_pk,
             snapshot,
         });
     }
@@ -468,8 +462,8 @@ impl PagedStateReader {
     }
 }
 
-fn fallback_entity_page_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"json/fallback-entity-page/".to_vec();
+fn fallback_row_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"json/fallback-row-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
 }
@@ -489,10 +483,10 @@ fn read_namespace(root: &sdk::Snapshot<'_>, key: &[u8]) -> sdk::Result<Option<Id
     )))
 }
 
-fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
+fn namespace_from_changes(changes: &[RowChange]) -> Option<IdNamespace> {
     changes
         .iter()
-        .flat_map(|change| &change.entity_pk)
+        .flat_map(|change| &change.row_pk)
         .find_map(|component| uuid::Uuid::parse_str(component).ok())
         .map(|id| {
             let bytes = id.into_bytes();
@@ -563,7 +557,7 @@ fn sparse_scalar_change(
     update: &sdk::FileUpdate<'_>,
     edit: &sdk::FileEdit,
     insert: &[u8],
-) -> sdk::Result<Option<(EntityChange, Vec<u8>)>> {
+) -> sdk::Result<Option<(RowChange, Vec<u8>)>> {
     let manifest_len = match update.before.state_len(SCALAR_INDEX_STATE)? {
         Some(length) => length,
         None => return Ok(None),
@@ -744,7 +738,7 @@ fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<EncodedScalar
 
 fn encode_scalar_metadata(scalar: &ArenaJsonScalar) -> sdk::Result<Vec<u8>> {
     let mut output = Vec::new();
-    match (scalar.relation, scalar.entity_pk.as_slice()) {
+    match (scalar.relation, scalar.row_pk.as_slice()) {
         (ArenaJsonRelation::Snapshot, [id]) if id == "root" => output.push(0),
         (ArenaJsonRelation::Object, [parent_id, key]) => {
             output.push(1);
@@ -810,7 +804,7 @@ fn decode_scalar_metadata(bytes: &[u8]) -> sdk::Result<ArenaJsonScalar> {
         .first()
         .ok_or_else(|| sdk::Error::invalid_input("truncated JSON scalar state"))?;
     input = &input[1..];
-    let (relation, entity_pk, parent_id, order_key) = match relation {
+    let (relation, row_pk, parent_id, order_key) = match relation {
         0 => (
             ArenaJsonRelation::Snapshot,
             vec!["root".to_owned()],
@@ -862,7 +856,7 @@ fn decode_scalar_metadata(bytes: &[u8]) -> sdk::Result<ArenaJsonScalar> {
         start: 0,
         length: 0,
         relation,
-        entity_pk,
+        row_pk,
         parent_id,
         order_key,
         prefix_json,
@@ -1040,27 +1034,27 @@ fn emit_changes<I>(
     sink: &mut sdk::Output<'_>,
 ) -> sdk::Result<()>
 where
-    I: IntoIterator<Item = Result<EntityChange, String>>,
+    I: IntoIterator<Item = Result<RowChange, String>>,
 {
     for change in changes {
         let change = change.map_err(sdk::Error::invalid_input)?;
         match change.snapshot {
             Some(snapshot) => {
                 let local_ref = change
-                    .entity_pk
+                    .row_pk
                     .first()
-                    .filter(|_| change.entity_pk.len() == 1)
+                    .filter(|_| change.row_pk.len() == 1)
                     .and_then(|id| local_ref(creates, id));
                 if let Some(local_ref) = local_ref {
-                    sink.entity(sdk::EntityMutation::Create {
+                    sink.row(sdk::RowMutation::Create {
                         schema_key: &change.schema_key,
                         local_ref,
                         snapshot: &snapshot,
                     })?;
                 } else {
-                    sink.entity(sdk::EntityMutation::Upsert {
+                    sink.row(sdk::RowMutation::Upsert {
                         schema_key: &change.schema_key,
-                        entity_pk: &change.entity_pk,
+                        row_pk: &change.row_pk,
                         snapshot: &snapshot,
                         effect: match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
@@ -1069,9 +1063,9 @@ where
                     })?;
                 }
             }
-            None => sink.entity(sdk::EntityMutation::Delete {
+            None => sink.row(sdk::RowMutation::Delete {
                 schema_key: &change.schema_key,
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
             })?,
         }
     }
@@ -1123,7 +1117,7 @@ mod tests {
             start: 0,
             length: 4,
             relation: ArenaJsonRelation::Snapshot,
-            entity_pk: vec!["root".to_owned()],
+            row_pk: vec!["root".to_owned()],
             parent_id: None,
             order_key: None,
             prefix_json: None,
@@ -1145,23 +1139,23 @@ mod tests {
     }
 
     #[test]
-    fn fallback_entities_roundtrip_across_bounded_state_pages() {
+    fn fallback_rows_roundtrip_across_bounded_state_pages() {
         let records = (0..16_000)
-            .map(|ordinal| EntityRecord {
+            .map(|ordinal| RowRecord {
                 schema_key: "json_object_member".to_owned(),
-                entity_pk: vec!["root".to_owned(), format!("key-{ordinal}")],
+                row_pk: vec!["root".to_owned(), format!("key-{ordinal}")],
                 snapshot: vec![b'x'; 128],
             })
             .collect::<Vec<_>>();
 
-        let (manifest, pages) = encode_entity_records(&records).expect("large fallback state");
+        let (manifest, pages) = encode_row_records(&records).expect("large fallback state");
         let (record_count, page_count) =
             decode_fallback_manifest(&manifest).expect("fallback manifest");
         assert!(pages.len() > 1);
         assert_eq!(page_count as usize, pages.len());
         assert!(pages.iter().all(|page| page.len() <= STATE_PAGE_BYTES));
         assert_eq!(
-            decode_entity_records(record_count, pages).expect("paged fallback roundtrip"),
+            decode_row_records(record_count, pages).expect("paged fallback roundtrip"),
             records
         );
     }
@@ -1172,7 +1166,7 @@ mod tests {
             start: 5,
             length: 1,
             relation: ArenaJsonRelation::Object,
-            entity_pk: vec!["root".to_owned(), "a".to_owned()],
+            row_pk: vec!["root".to_owned(), "a".to_owned()],
             parent_id: None,
             order_key: Some("80".to_owned()),
             prefix_json: Some("\"a\":".to_owned()),

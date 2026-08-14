@@ -142,7 +142,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             },
         },
         DifferentialSqlCase {
-            seed: "known/base-entity-branch-override".into(),
+            seed: "known/base-row-branch-override".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
             sql: "UPDATE lix_registered_schema SET value = CAST('{\"x-lix-key\":\"x\",\"type\":\"object\"}' AS JSONB) WHERE lixcol_branch_id = '01920000-0000-7000-8000-0000000000b1'".into(),
@@ -154,7 +154,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             },
         },
         DifferentialSqlCase {
-            seed: "known/base-entity-insert-hidden-branch-column".into(),
+            seed: "known/base-row-insert-hidden-branch-column".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
             sql: "INSERT INTO lix_registered_schema (value, lixcol_branch_id) VALUES (CAST('{\"x-lix-key\":\"x\",\"type\":\"object\"}' AS JSONB), '01920000-0000-7000-8000-0000000000b1')".into(),
@@ -166,7 +166,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             },
         },
         DifferentialSqlCase {
-            seed: "known/unknown-typed-entity-insert-column".into(),
+            seed: "known/unknown-typed-row-insert-column".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
             sql: "INSERT INTO lix_registered_schema (value, unknown_column) VALUES (CAST('{\"x-lix-key\":\"x\",\"type\":\"object\"}' AS JSONB), 'x')".into(),
@@ -432,7 +432,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             expected_execution: ExpectedExecution::Ok,
         },
         DifferentialSqlCase {
-            seed: "generated/entity-base/reject-hidden-branch".into(),
+            seed: "generated/row-base/reject-hidden-branch".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
             sql: "DELETE FROM lix_registered_schema WHERE lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'".into(),

@@ -35,8 +35,8 @@ simulation_test!(
 
         let working = select_rows(
             &session,
-            "SELECT diff_id, entity_pk, diff_type FROM lix_working_diff \
-         WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+            "SELECT diff_id, row_pk, diff_type FROM lix_working_diff \
+         WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
         )
         .await;
         assert_eq!(working.len(), 2);
@@ -86,7 +86,7 @@ simulation_test!(
             "SELECT diff_id, before_change_id, after_change_id \
          FROM lix_diff('{baseline}', '{original_head}') \
          WHERE schema_key = 'lix_key_value' \
-           AND entity_pk = CAST('[\"a\"]' AS JSONB)"
+           AND row_pk = CAST('[\"a\"]' AS JSONB)"
         );
         let historical_rows = select_rows(&session, &historical_diff).await;
         assert_eq!(historical_rows.len(), 1);
@@ -98,7 +98,7 @@ simulation_test!(
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff($1, $2) \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"a\"]' AS JSONB) \
+                   AND row_pk = CAST('[\"a\"]' AS JSONB) \
                  RETURNING commit_id",
                 &[
                     Value::Text(baseline.clone()),
@@ -116,7 +116,7 @@ simulation_test!(
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff($1, $2) \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = CAST('[\"a\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"a\"]' AS JSONB)",
                 &[
                     Value::Text(baseline),
                     Value::Text(original_head.to_string()),
@@ -135,7 +135,7 @@ simulation_test!(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
              SELECT diff_id FROM lix_working_diff \
              WHERE schema_key = $1 \
-               AND entity_pk = CAST($2 AS JSONB) \
+               AND row_pk = CAST($2 AS JSONB) \
              RETURNING commit_id",
                 &[
                     Value::Text("lix_key_value".to_string()),
@@ -176,8 +176,8 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                "SELECT row_pk FROM lix_working_diff \
+             WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
             )
             .await,
             vec![vec![Value::Json(json!(["b"]).into())]]
@@ -258,7 +258,7 @@ simulation_test!(
         let fresh = select_rows(
             &session,
             "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' AND entity_pk = CAST('[\"fresh\"]' AS JSONB)",
+             WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"fresh\"]' AS JSONB)",
         )
         .await;
         assert_eq!(fresh.len(), 1);
@@ -313,7 +313,7 @@ simulation_test!(
         let recycled = select_rows(
             &session,
             "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' AND entity_pk = CAST('[\"recycled\"]' AS JSONB)",
+             WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"recycled\"]' AS JSONB)",
         )
         .await;
         assert_eq!(recycled.len(), 1);

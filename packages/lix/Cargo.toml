@@ -80,18 +80,18 @@ path = "benches/undo_redo.rs"
 harness = false
 
 [[bench]]
-name = "entity_default_values"
-path = "benches/entity_default_values.rs"
+name = "row_default_values"
+path = "benches/row_default_values.rs"
 harness = false
 
 [[bench]]
-name = "entity_pk_layout"
-path = "benches/entity_pk_layout.rs"
+name = "row_pk_layout"
+path = "benches/row_pk_layout.rs"
 harness = false
 
 [[bench]]
-name = "registered_entity_returning"
-path = "benches/registered_entity_returning.rs"
+name = "registered_row_returning"
+path = "benches/registered_row_returning.rs"
 harness = false
 
 # `lix::storage_adapter` is only `pub` behind `storage-benches`.

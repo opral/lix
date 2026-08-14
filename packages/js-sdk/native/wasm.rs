@@ -620,7 +620,7 @@ impl From<lix::MergeChangeStats> for MergeChangeStatsDto {
 struct MergeConflictDto {
     kind: &'static str,
     schema_key: String,
-    entity_pk: serde_json::Value,
+    row_pk: serde_json::Value,
     file_id: Option<String>,
     target: MergeConflictSideDto,
     source: MergeConflictSideDto,
@@ -629,9 +629,9 @@ struct MergeConflictDto {
 impl From<lix::MergeConflict> for MergeConflictDto {
     fn from(conflict: lix::MergeConflict) -> Self {
         Self {
-            kind: "sameEntityChanged",
+            kind: "sameRowChanged",
             schema_key: conflict.schema_key,
-            entity_pk: conflict.entity_pk,
+            row_pk: conflict.row_pk,
             file_id: conflict.file_id,
             target: conflict.target.into(),
             source: conflict.source.into(),

@@ -36,7 +36,7 @@
       "name": "payload_json",
       "type": "text",
       "nullable": false,
-      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because the durable entity profile does not admit JSON number nodes."
+      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because the durable row profile does not admit JSON number nodes."
     }
   ],
   "primary_key": [

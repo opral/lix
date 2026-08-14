@@ -344,7 +344,7 @@ mod tests {
         Ok(())
     }
 
-    /// A repository whose entity history a pre-fix sweep already took must
+    /// A repository whose row history a pre-fix sweep already took must
     /// still *reclaim*, not merely still *plan*.
     ///
     /// # Why a plan is not enough

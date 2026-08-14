@@ -93,8 +93,8 @@ macro_rules! simulation_test {
 mod checkpoint;
 mod delete_returning;
 mod diff_commands;
-mod entity_history;
-mod entity_view;
+mod schema_history;
+mod schema_view;
 mod errors;
 mod history_conformance;
 mod information_schema;

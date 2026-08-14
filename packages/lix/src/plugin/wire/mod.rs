@@ -1,4 +1,4 @@
-//! Host/guest-neutral encoding for the universal Lix plugin entity page.
+//! Host/guest-neutral encoding for the universal Lix plugin row page.
 //!
 //! Payloads precede a fixed descriptor and magic trailer. A guest can therefore turn
 //! its existing batch buffer into a page by appending metadata without copying

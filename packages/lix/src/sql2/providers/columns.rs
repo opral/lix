@@ -24,7 +24,7 @@ pub(super) enum Col<R: 'static> {
     Utf8(for<'a> fn(&'a R) -> Option<&'a str>),
     /// Owned text column (serialization, `to_string()` ids).
     Utf8Owned(fn(&R) -> Option<String>),
-    /// Owned text column whose accessor can fail (e.g. entity-pk projection).
+    /// Owned text column whose accessor can fail (e.g. row-pk projection).
     Utf8Fallible(fn(&R) -> Result<Option<String>, LixError>),
     Bool(fn(&R) -> Option<bool>),
     I64(fn(&R) -> Option<i64>),
@@ -50,7 +50,7 @@ pub(super) struct ColumnTable<R: 'static> {
 
 impl<R> ColumnTable<R> {
     /// Look up a column's accessor by name. Specs that mix table-driven
-    /// system columns with bespoke ones (entity surfaces) resolve the shared
+    /// system columns with bespoke ones (schema surfaces) resolve the shared
     /// accessor here and materialize it with [`build_array`].
     pub(super) fn col(&self, name: &str) -> Option<&Col<R>> {
         self.columns

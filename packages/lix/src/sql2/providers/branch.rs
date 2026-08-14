@@ -20,7 +20,7 @@ use crate::branch::{
     branch_ref_stage_row, branch_ref_tombstone_row,
 };
 use crate::changelog::CommitId;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
     HotStateReader, HotStateScanRequest, MaterializedHotStateRowRef,
@@ -712,13 +712,13 @@ async fn load_branch_rows_scoped(
     head_read_strategy: BranchHeadReadStrategy,
     descriptor_scope: BranchDescriptorScope,
 ) -> Result<Vec<BranchRow>, LixError> {
-    let entity_pks = match descriptor_scope {
+    let row_pks = match descriptor_scope {
         BranchDescriptorScope::All => Vec::new(),
         BranchDescriptorScope::Ids(ids) if ids.is_empty() => return Ok(Vec::new().into()),
         BranchDescriptorScope::Ids(ids) => ids
             .into_iter()
             .map(|id| {
-                EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                RowPk::uuid_from_canonical(&id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         format!("branch id must be a canonical UUID: {error}"),
@@ -732,7 +732,7 @@ async fn load_branch_rows_scoped(
             filter: HotStateFilter {
                 schema_keys: vec!["lix_branch_descriptor".to_string()],
                 branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
-                entity_pks,
+                row_pks,
                 ..HotStateFilter::default()
             },
             projection: HotStateProjection::default(),
@@ -797,7 +797,7 @@ fn exact_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
 fn exact_canonical_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
     let ids = exact_branch_ids_from_filters(filters)?;
     ids.iter()
-        .all(|id| EntityPk::uuid_from_canonical(id).is_ok())
+        .all(|id| RowPk::uuid_from_canonical(id).is_ok())
         .then_some(ids)
 }
 
@@ -1033,7 +1033,7 @@ async fn load_default_branch_id(write_ctx: &SqlWriteContext) -> Result<String> {
             rows: vec![HotStateExactRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(crate::init::DEFAULT_BRANCH_KEY),
+                row_pk: RowPk::single(crate::init::DEFAULT_BRANCH_KEY),
                 file_id: None,
             }],
             projection: HotStateProjection {
@@ -1336,8 +1336,8 @@ mod tests {
                 .rows
                 .iter()
                 .filter(|row| {
-                    request.filter.entity_pks.is_empty()
-                        || request.filter.entity_pks.contains(&row.entity_pk)
+                    request.filter.row_pks.is_empty()
+                        || request.filter.row_pks.contains(&row.row_pk)
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -1397,7 +1397,7 @@ mod tests {
 
     fn descriptor_row(id: &str, name: &str) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
-            entity_pk: EntityPk::uuid_from_canonical(id).expect("fixture branch ID"),
+            row_pk: RowPk::uuid_from_canonical(id).expect("fixture branch ID"),
             schema_key: "lix_branch_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -1518,9 +1518,9 @@ mod tests {
         let requests = hot_state.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].filter.entity_pks,
+            requests[0].filter.row_pks,
             vec![
-                EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
+                RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
                     .expect("fixture branch ID")
             ]
         );
@@ -1550,9 +1550,9 @@ mod tests {
         let requests = hot_state.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].filter.entity_pks,
+            requests[0].filter.row_pks,
             vec![
-                EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
+                RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
                     .expect("fixture branch ID")
             ]
         );
@@ -1590,7 +1590,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 3);
         let requests = hot_state.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].filter.entity_pks.is_empty());
+        assert!(requests[0].filter.row_pks.is_empty());
         assert_eq!(
             branch_ref.point_read_ids.lock().unwrap().as_slice(),
             &[

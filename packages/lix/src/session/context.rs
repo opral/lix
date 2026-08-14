@@ -16,7 +16,7 @@ use crate::branch::{
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::domain::Domain;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::{
@@ -54,7 +54,7 @@ pub(crate) async fn load_default_branch_id_from_index(
             rows: vec![HotStateExactRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(crate::init::DEFAULT_BRANCH_KEY),
+                row_pk: RowPk::single(crate::init::DEFAULT_BRANCH_KEY),
                 file_id: None,
             }],
             projection: HotStateProjection {
@@ -721,8 +721,8 @@ where
         Arc::new(self.hot_state.reader(self.read_store.clone())) as Arc<dyn HotStateReader>
     }
 
-    fn entity_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::EntitySnapshotReader>> {
-        Some(Arc::new(crate::sql2::CurrentEntitySnapshotReader::new(
+    fn row_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::RowSnapshotReader>> {
+        Some(Arc::new(crate::sql2::CurrentRowSnapshotReader::new(
             Arc::clone(&self.hot_state),
             self.read_store.clone(),
         )))

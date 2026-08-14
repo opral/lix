@@ -105,7 +105,7 @@ async fn profile_sample(rows: usize, sample: usize) {
                 "INSERT INTO lix_revert (diff_id) \
                  SELECT diff_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                 ORDER BY entity_pk LIMIT {selected}"
+                 ORDER BY row_pk LIMIT {selected}"
             ),
         )
         .await;
@@ -120,7 +120,7 @@ async fn profile_sample(rows: usize, sample: usize) {
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff('{baseline}', '{head}') \
                  WHERE schema_key = 'lix_key_value' \
-                 ORDER BY entity_pk LIMIT {selected}"
+                 ORDER BY row_pk LIMIT {selected}"
             ),
         )
         .await;
@@ -136,7 +136,7 @@ async fn profile_sample(rows: usize, sample: usize) {
                 "INSERT INTO lix_create_checkpoint (diff_id) \
                  SELECT diff_id FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                 ORDER BY entity_pk LIMIT {checkpoint_selected}"
+                 ORDER BY row_pk LIMIT {checkpoint_selected}"
             ),
         )
         .await;
@@ -211,7 +211,7 @@ fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usi
         "INSERT INTO {command} (diff_id) \
          SELECT diff_id FROM {source} \
          WHERE schema_key = 'lix_key_value' {extra_predicate} \
-         ORDER BY entity_pk LIMIT {selected}"
+         ORDER BY row_pk LIMIT {selected}"
     )
 }
 

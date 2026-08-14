@@ -604,7 +604,7 @@ where
             "plugins_enabled": ["text", "markdown", "json", "csv", "excalidraw"],
             "files_affected": cfg.changes,
             "unaffected_files": cfg.branches * 5,
-            "semantic_entities_per_file": cfg.rows,
+            "semantic_rows_per_file": cfg.rows,
             "payload_bytes": cfg.payload_bytes,
             "temperature": if cold_reopen { "cold_reopen" } else { "warm" },
         },
@@ -892,8 +892,8 @@ where
     let expected_diff = map_diff_oracle(&base, &target_before_preview);
     let diff_measure = measure_async(|| async {
         lix.execute(
-            "SELECT entity_pk, diff_type, before_change_id, after_change_id \
-             FROM lix_diff($1, $2) WHERE schema_key = 'branch_bench_row' ORDER BY entity_pk",
+            "SELECT row_pk, diff_type, before_change_id, after_change_id \
+             FROM lix_diff($1, $2) WHERE schema_key = 'branch_bench_row' ORDER BY row_pk",
             &[
                 Value::Text(preview.base_commit_id.clone()),
                 Value::Text(preview.target_head_commit_id.clone()),
@@ -908,10 +908,10 @@ where
         .rows()
         .iter()
         .map(|row| {
-            let entity_pk = row
-                .get::<serde_json::Value>("entity_pk")
-                .expect("diff entity identity");
-            let id = entity_pk
+            let row_pk = row
+                .get::<serde_json::Value>("row_pk")
+                .expect("diff row identity");
+            let id = row_pk
                 .as_array()
                 .and_then(|parts| parts.first())
                 .and_then(serde_json::Value::as_str)
@@ -1683,30 +1683,30 @@ fn plugin_control_files(cfg: &Config) -> BTreeMap<String, Vec<u8>> {
 }
 
 fn plugin_base_files(cfg: &Config) -> BTreeMap<String, Vec<u8>> {
-    let entities = cfg.rows.max(2);
-    let filler = |index: usize| payload("entity", index, cfg.payload_bytes);
-    let text = (0..entities)
+    let rows = cfg.rows.max(2);
+    let filler = |index: usize| payload("record", index, cfg.payload_bytes);
+    let text = (0..rows)
         .map(|index| match index {
             0 => "alpha".to_owned(),
-            index if index + 1 == entities => "beta".to_owned(),
+            index if index + 1 == rows => "beta".to_owned(),
             index => filler(index),
         })
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let markdown = (0..entities)
+    let markdown = (0..rows)
         .map(|index| match index {
             0 => "alpha".to_owned(),
-            index if index + 1 == entities => "beta".to_owned(),
+            index if index + 1 == rows => "beta".to_owned(),
             index => filler(index),
         })
         .collect::<Vec<_>>()
         .join("\n\n")
         + "\n";
-    let csv = (0..entities)
+    let csv = (0..rows)
         .map(|index| match index {
             0 => "alpha,one".to_owned(),
-            index if index + 1 == entities => "beta,two".to_owned(),
+            index if index + 1 == rows => "beta,two".to_owned(),
             index => format!("row-{index},{}", filler(index)),
         })
         .collect::<Vec<_>>()
@@ -1715,7 +1715,7 @@ fn plugin_base_files(cfg: &Config) -> BTreeMap<String, Vec<u8>> {
     let mut json_object = serde_json::Map::new();
     json_object.insert("pick".to_owned(), json!("base"));
     json_object.insert("stable".to_owned(), json!(true));
-    for index in 2..entities {
+    for index in 2..rows {
         json_object.insert(format!("key-{index}"), json!(filler(index)));
     }
     let mut files = BTreeMap::from([
@@ -1728,7 +1728,7 @@ fn plugin_base_files(cfg: &Config) -> BTreeMap<String, Vec<u8>> {
         ("/merge.csv".to_owned(), csv.into_bytes()),
         (
             "/merge.excalidraw".to_owned(),
-            excalidraw_bytes(1, 20, entities, cfg.payload_bytes),
+            excalidraw_bytes(1, 20, rows, cfg.payload_bytes),
         ),
     ]);
     files.extend(plugin_extra_base_files(cfg));
@@ -1762,11 +1762,11 @@ fn extra_plugin_file(index: usize, changed: bool) -> (String, Vec<u8>) {
     }
 }
 
-fn excalidraw_bytes(first_x: u64, second_x: u64, entities: usize, payload_bytes: usize) -> Vec<u8> {
+fn excalidraw_bytes(first_x: u64, second_x: u64, rows: usize, payload_bytes: usize) -> Vec<u8> {
     let mut elements = vec![
         json!({"id":"a","type":"rectangle","x":first_x,"y":2,"width":3,"height":4,"isDeleted":false}),
     ];
-    for index in 1..entities.saturating_sub(1) {
+    for index in 1..rows.saturating_sub(1) {
         elements.push(json!({"id":format!("shape-{index}"),"type":"rectangle","x":index,"y":index,"width":3,"height":4,"isDeleted":false,"label":payload("shape", index, payload_bytes)}));
     }
     elements.push(json!({"id":"b","type":"ellipse","x":second_x,"y":30,"width":5,"height":6,"isDeleted":false}));
@@ -1986,29 +1986,29 @@ where
             "extra affected file {path} did not merge"
         );
     }
-    let entities = cfg.rows.max(2) as i64;
+    let rows = cfg.rows.max(2) as i64;
     let extra_count = |remainder: usize| {
         (5..cfg.changes)
             .filter(|index| index % 5 == remainder)
             .count() as i64
     };
     for (table, expected) in [
-        ("text_line", entities + extra_count(0) + cfg.branches as i64),
+        ("text_line", rows + extra_count(0) + cfg.branches as i64),
         (
             "markdown_node",
-            entities + 1 + extra_count(1) * 2 + cfg.branches as i64 * 2,
+            rows + 1 + extra_count(1) * 2 + cfg.branches as i64 * 2,
         ),
         (
             "json_object_member",
-            entities + extra_count(2) * 2 + cfg.branches as i64,
+            rows + extra_count(2) * 2 + cfg.branches as i64,
         ),
         (
             "csv_row",
-            entities + extra_count(3) * 2 + cfg.branches as i64 * 2,
+            rows + extra_count(3) * 2 + cfg.branches as i64 * 2,
         ),
         (
             "excalidraw_element",
-            entities + extra_count(4) + cfg.branches as i64 * 2,
+            rows + extra_count(4) + cfg.branches as i64 * 2,
         ),
     ] {
         let sql = format!("SELECT COUNT(*) AS count FROM {table}");

@@ -1616,7 +1616,7 @@ pub(crate) async fn load_scoped_range_coverage_with_staged(
     }
 }
 
-/// Returns every part in one exact scope without inventing a sentinel entity
+/// Returns every part in one exact scope without inventing a sentinel row
 /// key. The synthetic route kind sorts after all part starts in that scope.
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn scan_scoped_range_scope(

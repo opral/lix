@@ -12,7 +12,7 @@ use crate::changelog::{
 };
 use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_snapshot};
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::{
     CurrentStateDeltaRef, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
@@ -20,7 +20,7 @@ use crate::hot_state::{
 };
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
-    registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
+    registered_schema_row_pk, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{PointReadPlan, SharedStorageAdapterRead, StorageAdapterRead};
@@ -138,7 +138,7 @@ struct InitSeedCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedChange {
     id: ChangeId,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: String,
     snapshot_content: String,
     created_at: LixTimestamp,
@@ -147,7 +147,7 @@ struct InitSeedChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedLiveRow {
     id: ChangeId,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: String,
     snapshot_content: String,
     created_at: LixTimestamp,
@@ -192,7 +192,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         let key = schema_key_from_definition(schema)?;
         registered_schema_changes.push(canonical_change(
             functions.call_uuid_v7(),
-            registered_schema_entity_pk(&key.schema_key)?,
+            registered_schema_row_pk(&key.schema_key)?,
             REGISTERED_SCHEMA_KEY,
             registered_schema_snapshot(schema)?,
             timestamp,
@@ -201,7 +201,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let global_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(GLOBAL_BRANCH_ID)
+        RowPk::uuid_from_canonical(GLOBAL_BRANCH_ID)
             .expect("global branch sentinel is a canonical UUID"),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(GLOBAL_BRANCH_ID, "global", true)?,
@@ -209,7 +209,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let main_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(&main_branch_id)
+        RowPk::uuid_from_canonical(&main_branch_id)
             .expect("generated main branch ID is a canonical UUID"),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(&main_branch_id, "main", false)?,
@@ -217,14 +217,14 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let kv_lix_id_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(LIX_ID_KEY),
+        RowPk::single(LIX_ID_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(LIX_ID_KEY, &lix_id)?,
         timestamp,
     );
     let initial_checkpoint_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(&initial_commit_id.to_string())
+        RowPk::uuid_from_canonical(&initial_commit_id.to_string())
             .expect("initial checkpoint commit ID is a canonical UUID"),
         CHECKPOINT_SCHEMA_KEY,
         checkpoint_snapshot(&initial_commit_id),
@@ -232,7 +232,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let system_account_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
+        RowPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
             .expect("system account ID is a canonical UUID"),
         "lix_account",
         account_snapshot(crate::SYSTEM_ACCOUNT_ID, "System", "system")?,
@@ -240,7 +240,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let anonymous_account_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(crate::ANONYMOUS_ACCOUNT_ID)
+        RowPk::uuid_from_canonical(crate::ANONYMOUS_ACCOUNT_ID)
             .expect("anonymous account ID is a canonical UUID"),
         "lix_account",
         account_snapshot(crate::ANONYMOUS_ACCOUNT_ID, "Anonymous", "anonymous")?,
@@ -299,7 +299,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     };
     let default_branch_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(DEFAULT_BRANCH_KEY),
+        RowPk::single(DEFAULT_BRANCH_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(DEFAULT_BRANCH_KEY, &main_branch_id)?,
         timestamp,
@@ -392,7 +392,7 @@ where
             .map(|change| TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: plan.commit.id,
                 deleted: change.snapshot.is_none(),
@@ -463,7 +463,7 @@ where
             .map(|change| CurrentStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: Some(change.change_id),
                 commit_id: Some(plan.commit.id),
                 untracked: false,
@@ -558,7 +558,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         format_version: 1,
         change_id: change.id,
         account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
-        entity_pk: change.entity_pk.clone(),
+        row_pk: change.row_pk.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
@@ -573,7 +573,7 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
         format_version: 2,
         change_id: row.id,
         account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
-        entity_pk: row.entity_pk.clone(),
+        row_pk: row.row_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&row.snapshot_content),
@@ -645,7 +645,7 @@ fn branch_ref_ledger_change(
 ) -> Result<InitSeedLiveRow, LixError> {
     Ok(InitSeedLiveRow {
         id: ChangeId::from(id),
-        entity_pk: EntityPk::uuid_from_canonical(branch_id)
+        row_pk: RowPk::uuid_from_canonical(branch_id)
             .expect("seed branch IDs are canonical UUIDs"),
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         snapshot_content: branch_ref_snapshot(branch_id, commit_id)?,
@@ -658,14 +658,14 @@ fn branch_ref_ledger_change(
 
 fn canonical_change(
     id: uuid::Uuid,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: &str,
     snapshot_content: String,
     created_at: LixTimestamp,
 ) -> InitSeedChange {
     InitSeedChange {
         id: ChangeId::from(id),
-        entity_pk,
+        row_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
         created_at,
@@ -843,7 +843,7 @@ mod tests {
             .iter()
             .find(|change| {
                 change.schema_key == KEY_VALUE_SCHEMA_KEY
-                    && change.entity_pk == EntityPk::single(DEFAULT_BRANCH_KEY)
+                    && change.row_pk == RowPk::single(DEFAULT_BRANCH_KEY)
             })
             .expect("tracked default branch change should exist");
 

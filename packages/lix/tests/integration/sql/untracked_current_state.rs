@@ -526,7 +526,7 @@ async fn change_count_for_key(
         .execute(
             &format!(
                 "SELECT id FROM lix_change WHERE schema_key = 'lix_key_value' \
-                 AND entity_pk ->> 0 = '{key}'"
+                 AND row_pk ->> 0 = '{key}'"
             ),
             &[],
         )

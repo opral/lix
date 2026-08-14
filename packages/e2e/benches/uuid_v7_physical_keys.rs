@@ -38,17 +38,17 @@ impl Backend {
 fn rows(count: usize) -> Vec<BenchTransactionRow> {
     (0..count)
         .map(|index| {
-            let entity_pk = format!("01920000-0000-7000-8000-{index:012x}");
+            let row_pk = format!("01920000-0000-7000-8000-{index:012x}");
             BenchTransactionRow {
                 schema_key: "lix_account".to_string(),
                 file_id: None,
-                entity_pk: entity_pk.clone(),
+                row_pk: row_pk.clone(),
                 value: Arc::new(json!({
-                    "id": &entity_pk,
+                    "id": &row_pk,
                     "name": format!("account-{index}"),
                 })),
                 updated_value: Arc::new(json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "name": format!("updated-account-{index}"),
                 })),
             }

@@ -1,4 +1,4 @@
-//! Compiled wire layouts for dense plugin entity rows.
+//! Compiled wire layouts for dense plugin rows.
 //!
 //! A layout describes a compact row wire shape and how its values map to a
 //! canonical JSON snapshot. Parsing resolves and validates every slot reference
@@ -406,7 +406,7 @@ impl CompiledLayout {
     }
 }
 
-/// Stateful renderer for one compact entity page.
+/// Stateful renderer for one compact row page.
 ///
 /// The renderer allocates its slot table once. [`Rows::render_next`] overwrites
 /// that table in place and appends one snapshot to the caller-owned output.

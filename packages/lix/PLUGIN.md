@@ -20,7 +20,7 @@ Wasm runtime. The WIT package is `lix:plugin@1.0.0`.
 ## Author contract
 
 A plugin implements five required callbacks: `open`, `file_changed`,
-`entities_changed`, `restore`, and `cold_file_changed`. These names match the
+`rows_changed`, `restore`, and `cold_file_changed`. These names match the
 variants passed to the one stateful WIT export. The required cold and restore callbacks prevent a plugin
 from compiling while silently omitting eviction, restart, history, or reopen
 behavior. Stateless conflict resolution has a canonical default.
@@ -33,7 +33,7 @@ complete minimal implementation is available in
 struct MyPlugin;
 
 impl lix::plugin::Plugin for MyPlugin {
-    // Implement open, file_changed, entities_changed, restore, and
+    // Implement open, file_changed, rows_changed, restore, and
     // cold_file_changed. Conflict resolution has a default.
 }
 
@@ -43,32 +43,32 @@ lix::plugin::export!(MyPlugin);
 The export macro is required; a trait implementation alone does not expose the
 Component entry point to the host.
 
-Use `Output::entity(EntityMutation)` for ordinary creates, upserts, and deletes.
+Use `Output::row(RowMutation)` for ordinary creates, upserts, and deletes.
 The SDK owns framing, bounded batching, create separation, counts, and final
-flush. This is the only entity output path for every format. State is opaque
+flush. This is the only row output path for every format. State is opaque
 byte state; file replacement is streamed through
 the same atomic output.
 
-Input entities and output mutations use the same bounded single-section entity
+Input rows and output mutations use the same bounded single-section row
 page envelope. Snapshot pages are the universal path. There are no
-author-selected representations, per-entity Component calls,
+author-selected representations, per-row Component calls,
 guest-owned cursors, or multi-section pages.
 
-Entity snapshots are compact, duplicate-free, number-free JSON objects with
+Row snapshots are compact, duplicate-free, number-free JSON objects with
 recursively lexicographically sorted keys. Use strings for numeric domain
-values. `Output::entity` batches snapshots automatically.
+values. `Output::row` batches snapshots automatically.
 
 Cold updates expose the accepted predecessor snapshot, sparse edits, durable
-entities, and create context directly. There is no materialization-dependent
+rows, and create context directly. There is no materialization-dependent
 source variant.
 
 Plugin-owned lifecycle paths are required strings. The host resolves and
 validates them before entering the guest, so plugins do not handle an absent
 path branch.
 
-`entities_changed` receives the predecessor path because entity edits cannot
+`rows_changed` receives the predecessor path because row edits cannot
 rename a file. `restore` receives only the optional accepted snapshot and
-durable entities; its descriptor is already fixed by the host. Conflict
+durable rows; its descriptor is already fixed by the host. Conflict
 replacement has one meaning—content replacement—so authors choose only
 `TakeBase`, `TakeA`, `TakeB`, `Replace`, or `Delete`.
 

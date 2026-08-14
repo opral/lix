@@ -1,28 +1,28 @@
-//! Entity-specific contract layered over generic immutable columnar row groups.
+//! Row-specific contract layered over generic immutable columnar row groups.
 
 use std::collections::BTreeMap;
 
 use crate::changelog::CommitId;
 use crate::columnar_row_group::{RowGroupRowLocation, RowGroupSetId};
 
-pub(crate) const ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY: &str =
-    "lix.entity_columnar.lossless_snapshot.v1";
-pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
+pub(crate) const ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY: &str =
+    "lix.row_columnar.lossless_snapshot.v1";
+pub(crate) const ROW_COLUMNAR_ROW_PK_FIELD: &str = "lixcol_row_pk";
 
-pub(crate) fn entity_identity_column_index(
+pub(crate) fn row_identity_column_index(
     manifest: &crate::columnar_row_group::RowGroupManifest,
 ) -> Option<usize> {
     (manifest
         .metadata
-        .get(ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
+        .get(ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
         .map(String::as_str)
         == Some("true"))
     .then(|| manifest.fields.len().checked_sub(1))
     .flatten()
-    .filter(|&index| manifest.fields[index].name == ENTITY_COLUMNAR_ENTITY_PK_FIELD)
+    .filter(|&index| manifest.fields[index].name == ROW_COLUMNAR_ROW_PK_FIELD)
 }
 
-pub(crate) struct EntityColumnarWriteSets {
+pub(crate) struct RowColumnarWriteSets {
     sets: BTreeMap<(CommitId, String), crate::columnar_row_group::EncodedRowGroupSet>,
     state_row_locations: StateRowLocations,
 }
@@ -33,7 +33,7 @@ enum StateRowLocations {
     Explicit(Vec<Option<RowGroupRowLocation>>),
 }
 
-impl EntityColumnarWriteSets {
+impl RowColumnarWriteSets {
     pub(crate) fn new() -> Self {
         Self {
             sets: BTreeMap::new(),
@@ -94,7 +94,7 @@ impl EntityColumnarWriteSets {
                 locations[state_row_index] = Some(location);
             }
             StateRowLocations::None | StateRowLocations::Dense { .. } => {
-                panic!("explicit entity row location requires an explicit location column")
+                panic!("explicit row location requires an explicit location column")
             }
         }
     }
@@ -122,9 +122,9 @@ impl EntityColumnarWriteSets {
     }
 }
 
-pub(crate) fn entity_row_group_set_id(commit_id: CommitId, schema_key: &str) -> RowGroupSetId {
+pub(crate) fn row_group_set_id(commit_id: CommitId, schema_key: &str) -> RowGroupSetId {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"lix.entity_columnar.v1");
+    digest.update(b"lix.row_columnar.v1");
     digest.update(commit_id.as_uuid().as_bytes());
     digest.update(&(schema_key.len() as u64).to_be_bytes());
     digest.update(schema_key.as_bytes());

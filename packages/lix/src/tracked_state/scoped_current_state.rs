@@ -923,7 +923,7 @@ mod tests {
 
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::json_store::JsonSlotRef;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::encode_key_ref;
@@ -985,11 +985,11 @@ mod tests {
         }
     }
 
-    fn encoded_key(schema_key: &str, entity: &EntityPk) -> Bytes {
+    fn encoded_key(schema_key: &str, row: &RowPk) -> Bytes {
         Bytes::from(encode_key_ref(TrackedStateKeyRef {
             schema_key,
             file_id: None,
-            entity_pk: entity,
+            row_pk: row,
         }))
     }
 
@@ -1013,11 +1013,11 @@ mod tests {
         let mut writes = storage.new_write_set();
         let replacement = stage_ordered_addressable_replacement_parts(
             &mut writes,
-            ["entity-000", "entity-001"].into_iter().map(|identity| {
+            ["row-000", "row-001"].into_iter().map(|identity| {
                 Ok(TrackedStateSingleStringReplacementRef {
                     schema_key,
                     file_id: None,
-                    entity_pk: identity,
+                    row_pk: identity,
                     commit_id,
                     created_at,
                     updated_at: created_at,
@@ -1075,7 +1075,7 @@ mod tests {
         ));
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
-        let identities = ["entity-000", "entity-001", "entity-002"];
+        let identities = ["row-000", "row-001", "row-002"];
         let replacement_scope = scope("scoped-publication");
         let generation = CommitDeltaReplacementGeneration {
             scope: replacement_scope.clone(),
@@ -1094,7 +1094,7 @@ mod tests {
                 Ok(TrackedStateSingleStringReplacementRef {
                     schema_key: "scoped-publication",
                     file_id: None,
-                    entity_pk: identity,
+                    row_pk: identity,
                     commit_id: parent_id,
                     created_at,
                     updated_at,
@@ -1148,8 +1148,8 @@ mod tests {
             .await
             .expect("parent authority should load")
             .expect("parent authority should exist");
-        let existing = EntityPk::single("entity-000");
-        let absent = EntityPk::single("entity-999");
+        let existing = RowPk::single("row-000");
+        let absent = RowPk::single("row-999");
         let parent_values = load_complete_current_state_values_from_scoped_root(
             &parent_read,
             parent.current_state_scoped_ranges.as_deref().unwrap(),
@@ -1167,14 +1167,14 @@ mod tests {
             "covered exact miss is authoritative"
         );
 
-        let deleted = EntityPk::single("entity-001");
-        let inserted = EntityPk::single("entity-003");
+        let deleted = RowPk::single("row-001");
+        let inserted = RowPk::single("row-003");
         let changes = [
             TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
                     schema_key: "scoped-publication",
                     file_id: None,
-                    entity_pk: &deleted,
+                    row_pk: &deleted,
                     change_id: ChangeId::for_test_label("scoped-delete"),
                     commit_id: child_id,
                     deleted: true,
@@ -1191,7 +1191,7 @@ mod tests {
                 delta: TrackedStateDeltaRef {
                     schema_key: "scoped-publication",
                     file_id: None,
-                    entity_pk: &inserted,
+                    row_pk: &inserted,
                     change_id: ChangeId::for_test_label("scoped-insert"),
                     commit_id: child_id,
                     deleted: false,
@@ -1322,14 +1322,14 @@ mod tests {
         let child_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_3050_0000_7000_8000_0000_0002_0000,
         ));
-        let entity = EntityPk::single("entity-000");
+        let row = RowPk::single("row-000");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let change = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: "certified-new-scope",
                 file_id: None,
-                entity_pk: &entity,
+                row_pk: &row,
                 change_id: ChangeId::for_test_label("certified-new-scope-change"),
                 commit_id: child_id,
                 deleted: false,
@@ -1427,14 +1427,14 @@ mod tests {
         let child_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_3100_0000_7000_8000_0000_0000_0000,
         ));
-        let entity = EntityPk::single("entity-000");
+        let row = RowPk::single("row-000");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let changes = ["alpha", "beta"].map(|schema_key| TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key,
                 file_id: None,
-                entity_pk: &entity,
+                row_pk: &row,
                 change_id: ChangeId::for_test_label(&format!("multi-scope-{schema_key}")),
                 commit_id: child_id,
                 deleted: false,
@@ -1497,7 +1497,7 @@ mod tests {
         let values = load_complete_current_state_values_from_scoped_root(
             &read,
             child.current_state_scoped_ranges.as_deref().unwrap(),
-            &[encoded_key("alpha", &entity), encoded_key("beta", &entity)],
+            &[encoded_key("alpha", &row), encoded_key("beta", &row)],
         )
         .await
         .expect("both rewritten scopes should route")
@@ -1522,15 +1522,15 @@ mod tests {
         let second_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_3200_0000_7000_8000_0001_0000_0000,
         ));
-        let first_entity = EntityPk::single("entity-000");
-        let second_entity = EntityPk::single("entity-001");
+        let first_row = RowPk::single("row-000");
+        let second_row = RowPk::single("row-001");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let first_change = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: "staged",
                 file_id: None,
-                entity_pk: &first_entity,
+                row_pk: &first_row,
                 change_id: ChangeId::for_test_label("staged-parent-first"),
                 commit_id: first_id,
                 deleted: false,
@@ -1547,7 +1547,7 @@ mod tests {
             delta: TrackedStateDeltaRef {
                 schema_key: "staged",
                 file_id: None,
-                entity_pk: &second_entity,
+                row_pk: &second_row,
                 change_id: ChangeId::for_test_label("staged-parent-second"),
                 commit_id: second_id,
                 deleted: false,
@@ -1642,8 +1642,8 @@ mod tests {
             &read,
             second.current_state_scoped_ranges.as_deref().unwrap(),
             &[
-                encoded_key("staged", &first_entity),
-                encoded_key("staged", &second_entity),
+                encoded_key("staged", &first_row),
+                encoded_key("staged", &second_row),
             ],
         )
         .await
@@ -1826,8 +1826,8 @@ mod tests {
         .unwrap();
         assert!(publication.root().is_none());
 
-        let left = EntityPk::single("a");
-        let right = EntityPk::single("z");
+        let left = RowPk::single("a");
+        let right = RowPk::single("z");
         let mut broad = CommitStateMutationInventory::default();
         broad.member_count = 1;
         broad.parts.push(CommitStateMutationPart {

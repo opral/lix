@@ -1,7 +1,7 @@
 use crate::NullableKeyFilter;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
@@ -22,12 +22,12 @@ impl TrackedStateRootId {
     }
 }
 
-/// Root-independent tracked entity primary key.
+/// Root-independent tracked row primary key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TrackedStateKey {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
 }
 
 /// Zero-copy view of primary tracked-state key.
@@ -35,7 +35,7 @@ pub(crate) struct TrackedStateKey {
 pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
 }
 
 /// Zero-copy tracked-state commit-root delta prepared from changelog facts.
@@ -43,7 +43,7 @@ pub(crate) struct TrackedStateKeyRef<'a> {
 pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) row_pk: &'a RowPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
@@ -51,7 +51,7 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
-/// Physical location of an entity snapshot in an immutable columnar base.
+/// Physical location of a row snapshot in an immutable columnar base.
 ///
 /// Commit deltas carry this coordinate alongside their authoritative payload,
 /// allowing exact identity lookups to reconcile an overlay row with its base
@@ -85,12 +85,12 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
 /// journal's dominant one-column string identity lane. Invalid mutation
 /// states (delete, selected-source payload, origin override) are deliberately
 /// unrepresentable, so immutable replacement parts can be sealed without
-/// constructing an `EntityPk` per row.
+/// constructing an `RowPk` per row.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateSingleStringReplacementRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a str,
+    pub(crate) row_pk: &'a str,
     pub(crate) commit_id: CommitId,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
@@ -193,7 +193,7 @@ pub(crate) struct CommitStateMutationPart {
     pub(crate) replacement_part: Option<StoredReplacementPart>,
 }
 
-/// One lossless entity-columnar generation used directly as authored history.
+/// One lossless row-columnar generation used directly as authored history.
 ///
 /// The row-group manifest binds every column digest. Uniform lifecycle and
 /// origin metadata remain in the commit authority instead of being repeated
@@ -311,7 +311,7 @@ pub(crate) enum CurrentStatePartSource {
         /// Digest of the part's compact JSON-reference summary.
         payload_refs_digest: [u8; 32],
     },
-    /// One authenticated page in a canonical entity row-group set.
+    /// One authenticated page in a canonical row-group set.
     ColumnarPage(ColumnarPageSource),
 }
 
@@ -326,7 +326,7 @@ pub(crate) struct ReplacementPartSource {
     pub(crate) uniform_updated_at: LixTimestamp,
 }
 
-/// Addressing for one page of a canonical entity row-group set.
+/// Addressing for one page of a canonical row-group set.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct ColumnarPageSource {
@@ -485,7 +485,7 @@ pub(crate) struct CommitStateManifest {
 /// projection with tracked rows, but never enter a commit root or changelog.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedTrackedStateRow {
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
@@ -503,7 +503,7 @@ pub(crate) struct TrackedStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) row_pks: Vec<RowPk>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
@@ -590,7 +590,7 @@ impl TrackedStateMutationBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) schema_keys: Vec<String>,
-    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) row_pks: Vec<RowPk>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
@@ -600,7 +600,7 @@ impl Default for TrackedStateTreeScanRequest {
     fn default() -> Self {
         Self {
             schema_keys: Vec::new(),
-            entity_pks: Vec::new(),
+            row_pks: Vec::new(),
             file_ids: Vec::new(),
             include_tombstones: true,
             limit: None,
@@ -614,7 +614,7 @@ impl TrackedStateTreeScanRequest {
             TrackedStateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             },
             value,
         )
@@ -640,7 +640,7 @@ impl TrackedStateTreeScanRequest {
         {
             return false;
         }
-        if !self.entity_pks.is_empty() && !self.entity_pks.contains(key.entity_pk) {
+        if !self.row_pks.is_empty() && !self.row_pks.contains(key.row_pk) {
             return false;
         }
         if !self.file_ids.is_empty()
@@ -672,7 +672,7 @@ pub(crate) struct TrackedStateTreeDiffEntry {
     ///
     /// Tree ordering already proves that a modified entry has the same
     /// encoded key on both sides. Keeping one decoded key avoids decoding and
-    /// allocating the schema/file/entity identity twice before diff and merge
+    /// allocating the schema/file/row identity twice before diff and merge
     /// immediately re-share it.
     pub(crate) key: TrackedStateKey,
     pub(crate) before: Option<TrackedStateIndexValue>,

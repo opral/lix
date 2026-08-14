@@ -10,14 +10,14 @@ wit_bindgen::generate!({
 });
 
 use self::lix::plugin::host::{
-    ConflictSide as WitConflictSide, ConflictSource, EntityPage as WitEntityPage, EntitySource,
-    HostError, ResolutionSink, Snapshot as WitSnapshot, Transition as WitTransition,
+    ConflictSide as WitConflictSide, ConflictSource, HostError, ResolutionSink,
+    RowPage as WitRowPage, RowSource, Snapshot as WitSnapshot, Transition as WitTransition,
 };
 use super::wire::{Operation, Page as WirePage, Representation, encode_single_section};
 use exports::lix::plugin::api::{
     ColdFileChangedRequest as WitColdFileChangedRequest, ConflictUpdate as WitConflictUpdate,
-    EntitiesChangedRequest as WitEntitiesChangedRequest, Guest, PluginError,
-    RestoreRequest as WitRestoreRequest, TransitionRequest,
+    Guest, PluginError, RestoreRequest as WitRestoreRequest,
+    RowsChangedRequest as WitRowsChangedRequest, TransitionRequest,
 };
 use std::marker::PhantomData;
 
@@ -204,9 +204,9 @@ pub struct Output<'a> {
     inner: &'a WitTransition,
     max_page_bytes: u32,
     max_batch_bytes: u32,
-    entity_payload: Vec<u8>,
-    entity_records: u32,
-    entity_creates_only: Option<bool>,
+    row_payload: Vec<u8>,
+    row_records: u32,
+    row_creates_only: Option<bool>,
 }
 
 impl std::fmt::Debug for Output<'_> {
@@ -224,20 +224,20 @@ impl<'a> Output<'a> {
         let snapshot_overhead = 24;
         if max_page_bytes <= snapshot_overhead {
             return Err(PluginError::LimitExceeded(
-                "max-batch-bytes cannot hold an entity page".to_owned(),
+                "max-batch-bytes cannot hold a row page".to_owned(),
             ));
         }
         Ok(Output {
             inner,
             max_page_bytes,
             max_batch_bytes: max_page_bytes - snapshot_overhead,
-            entity_payload: Vec::with_capacity(
+            row_payload: Vec::with_capacity(
                 usize::try_from(max_page_bytes - snapshot_overhead)
                     .expect("u32 fits usize")
                     .min(64 * 1024),
             ),
-            entity_records: 0,
-            entity_creates_only: None,
+            row_records: 0,
+            row_creates_only: None,
         })
     }
 
@@ -254,7 +254,7 @@ impl<'a> Output<'a> {
     }
 
     pub fn replace_file(&mut self, bytes: &[u8]) -> Result<()> {
-        self.flush_entities()?;
+        self.flush_rows()?;
         self.inner
             .begin_file_replacement(bytes.len() as u64)
             .map_err(|error| host_error("host rejected file replacement", error))?;
@@ -270,109 +270,107 @@ impl<'a> Output<'a> {
 
     /// Emits one typed mutation. The SDK owns record framing, bounded batching,
     /// create-page separation, record counts, and final flushing.
-    pub fn entity(&mut self, mutation: EntityMutation<'_>) -> Result<()> {
+    pub fn row(&mut self, mutation: RowMutation<'_>) -> Result<()> {
         let max_batch_bytes = self.max_batch_bytes as usize;
         // Smaller durable pages keep later point reads bounded without exposing
         // paging policy to authors. A single large record may still use the
         // full host limit; only multi-record batching uses this target.
         let target_page_bytes = max_batch_bytes.min(256 * 1024);
         let oversized_snapshot = match mutation {
-            EntityMutation::Create { snapshot, .. } | EntityMutation::Upsert { snapshot, .. } => {
+            RowMutation::Create { snapshot, .. } | RowMutation::Upsert { snapshot, .. } => {
                 snapshot.len() > max_batch_bytes
             }
-            EntityMutation::Delete { .. } => false,
+            RowMutation::Delete { .. } => false,
         };
         if oversized_snapshot {
-            return self.emit_attached_entity(mutation);
+            return self.emit_attached_row(mutation);
         }
 
-        let start = self.entity_payload.len();
-        let creates_only = encode_entity_mutation(&mut self.entity_payload, mutation, None)?;
-        if self.entity_records > 0
-            && (self.entity_payload.len() > target_page_bytes
-                || self.entity_creates_only != Some(creates_only))
+        let start = self.row_payload.len();
+        let creates_only = encode_row_mutation(&mut self.row_payload, mutation, None)?;
+        if self.row_records > 0
+            && (self.row_payload.len() > target_page_bytes
+                || self.row_creates_only != Some(creates_only))
         {
-            self.entity_payload.truncate(start);
-            self.flush_entities()?;
-            let repeated = encode_entity_mutation(&mut self.entity_payload, mutation, None)?;
+            self.row_payload.truncate(start);
+            self.flush_rows()?;
+            let repeated = encode_row_mutation(&mut self.row_payload, mutation, None)?;
             debug_assert_eq!(repeated, creates_only);
         }
-        if self.entity_payload.len() > max_batch_bytes {
-            self.entity_payload.clear();
-            return self.emit_attached_entity(mutation);
+        if self.row_payload.len() > max_batch_bytes {
+            self.row_payload.clear();
+            return self.emit_attached_row(mutation);
         }
-        self.entity_records = self
-            .entity_records
+        self.row_records = self
+            .row_records
             .checked_add(1)
-            .ok_or_else(|| Error::limit_exceeded("entity mutation count overflowed"))?;
-        self.entity_creates_only = Some(creates_only);
+            .ok_or_else(|| Error::limit_exceeded("row mutation count overflowed"))?;
+        self.row_creates_only = Some(creates_only);
         Ok(())
     }
 
-    fn emit_attached_entity(&mut self, mutation: EntityMutation<'_>) -> Result<()> {
-        self.flush_entities()?;
+    fn emit_attached_row(&mut self, mutation: RowMutation<'_>) -> Result<()> {
+        self.flush_rows()?;
         let snapshot = match mutation {
-            EntityMutation::Create { snapshot, .. } | EntityMutation::Upsert { snapshot, .. } => {
-                snapshot
-            }
-            EntityMutation::Delete { .. } => {
+            RowMutation::Create { snapshot, .. } | RowMutation::Upsert { snapshot, .. } => snapshot,
+            RowMutation::Delete { .. } => {
                 return Err(Error::limit_exceeded(
-                    "one entity key exceeds the host page limit",
+                    "one row key exceeds the host page limit",
                 ));
             }
         };
         let length = u64::try_from(snapshot.len())
-            .map_err(|_| Error::limit_exceeded("entity snapshot exceeds u64"))?;
+            .map_err(|_| Error::limit_exceeded("row snapshot exceeds u64"))?;
         let ordinal = self
             .inner
-            .begin_entity_attachment(length)
-            .map_err(|error| host_error("host rejected entity attachment", error))?;
+            .begin_row_attachment(length)
+            .map_err(|error| host_error("host rejected row attachment", error))?;
         for chunk in snapshot.chunks(self.max_page_bytes as usize) {
             self.inner
-                .write_entity_attachment(chunk)
-                .map_err(|error| host_error("host rejected entity attachment chunk", error))?;
+                .write_row_attachment(chunk)
+                .map_err(|error| host_error("host rejected row attachment chunk", error))?;
         }
         self.inner
-            .finish_entity_attachment()
-            .map_err(|error| host_error("host rejected entity attachment finish", error))?;
+            .finish_row_attachment()
+            .map_err(|error| host_error("host rejected row attachment finish", error))?;
         let creates_only =
-            encode_entity_mutation(&mut self.entity_payload, mutation, Some((ordinal, length)))?;
-        if self.entity_payload.len() > self.max_batch_bytes as usize {
-            self.entity_payload.clear();
+            encode_row_mutation(&mut self.row_payload, mutation, Some((ordinal, length)))?;
+        if self.row_payload.len() > self.max_batch_bytes as usize {
+            self.row_payload.clear();
             return Err(Error::limit_exceeded(
-                "one entity mutation metadata exceeds the host page limit",
+                "one row mutation metadata exceeds the host page limit",
             ));
         }
-        self.entity_records = 1;
-        self.entity_creates_only = Some(creates_only);
+        self.row_records = 1;
+        self.row_creates_only = Some(creates_only);
         Ok(())
     }
 
-    fn flush_entities(&mut self) -> Result<()> {
-        if self.entity_records == 0 {
+    fn flush_rows(&mut self) -> Result<()> {
+        if self.row_records == 0 {
             return Ok(());
         }
         let payload = std::mem::replace(
-            &mut self.entity_payload,
+            &mut self.row_payload,
             Vec::with_capacity((self.max_batch_bytes as usize).min(64 * 1024)),
         );
-        let records = std::mem::take(&mut self.entity_records);
-        self.entity_creates_only = None;
-        let page = EntityPage::snapshots(records, payload)?;
+        let records = std::mem::take(&mut self.row_records);
+        self.row_creates_only = None;
+        let page = RowPage::snapshots(records, payload)?;
         self.inner
-            .emit_entities(&WitEntityPage {
+            .emit_rows(&WitRowPage {
                 payload: page.payload,
             })
-            .map_err(|error| host_error("host rejected entity page", error))
+            .map_err(|error| host_error("host rejected row page", error))
     }
 
     fn finish(&mut self) -> Result<()> {
-        self.flush_entities()
+        self.flush_rows()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EntityMutation<'a> {
+pub enum RowMutation<'a> {
     Create {
         schema_key: &'a str,
         local_ref: u32,
@@ -380,25 +378,25 @@ pub enum EntityMutation<'a> {
     },
     Upsert {
         schema_key: &'a str,
-        entity_pk: &'a [String],
+        row_pk: &'a [String],
         snapshot: &'a [u8],
         effect: ChangeEffect,
     },
     Delete {
         schema_key: &'a str,
-        entity_pk: &'a [String],
+        row_pk: &'a [String],
     },
 }
 
-fn encode_entity_mutation(
+fn encode_row_mutation(
     output: &mut Vec<u8>,
-    mutation: EntityMutation<'_>,
+    mutation: RowMutation<'_>,
     attachment: Option<(u32, u64)>,
 ) -> Result<bool> {
     let start = output.len();
     output.extend_from_slice(&0_u32.to_le_bytes());
     let is_create = match mutation {
-        EntityMutation::Create {
+        RowMutation::Create {
             schema_key,
             local_ref,
             snapshot,
@@ -409,14 +407,14 @@ fn encode_entity_mutation(
             encode_snapshot(output, snapshot, attachment)?;
             true
         }
-        EntityMutation::Upsert {
+        RowMutation::Upsert {
             schema_key,
-            entity_pk,
+            row_pk,
             snapshot,
             effect,
         } => {
             output.push(0);
-            encode_key(output, schema_key, entity_pk)?;
+            encode_key(output, schema_key, row_pk)?;
             output.push(match effect {
                 ChangeEffect::Content => 0,
                 ChangeEffect::FormatOnly => 1,
@@ -424,29 +422,26 @@ fn encode_entity_mutation(
             encode_snapshot(output, snapshot, attachment)?;
             false
         }
-        EntityMutation::Delete {
-            schema_key,
-            entity_pk,
-        } => {
+        RowMutation::Delete { schema_key, row_pk } => {
             output.push(1);
-            encode_key(output, schema_key, entity_pk)?;
+            encode_key(output, schema_key, row_pk)?;
             false
         }
     };
     let length = u32::try_from(output.len() - start - 4)
-        .map_err(|_| Error::limit_exceeded("entity mutation exceeds u32 framing"))?;
+        .map_err(|_| Error::limit_exceeded("row mutation exceeds u32 framing"))?;
     output[start..start + 4].copy_from_slice(&length.to_le_bytes());
     Ok(is_create)
 }
 
-fn encode_key(output: &mut Vec<u8>, schema_key: &str, entity_pk: &[String]) -> Result<()> {
+fn encode_key(output: &mut Vec<u8>, schema_key: &str, row_pk: &[String]) -> Result<()> {
     encode_text(output, schema_key)?;
     output.extend_from_slice(
-        &u32::try_from(entity_pk.len())
-            .map_err(|_| Error::limit_exceeded("entity primary key has too many components"))?
+        &u32::try_from(row_pk.len())
+            .map_err(|_| Error::limit_exceeded("row primary key has too many components"))?
             .to_le_bytes(),
     );
-    for component in entity_pk {
+    for component in row_pk {
         encode_text(output, component)?;
     }
     Ok(())
@@ -455,7 +450,7 @@ fn encode_key(output: &mut Vec<u8>, schema_key: &str, entity_pk: &[String]) -> R
 fn encode_text(output: &mut Vec<u8>, value: &str) -> Result<()> {
     output.extend_from_slice(
         &u32::try_from(value.len())
-            .map_err(|_| Error::limit_exceeded("entity text exceeds u32 framing"))?
+            .map_err(|_| Error::limit_exceeded("row text exceeds u32 framing"))?
             .to_le_bytes(),
     );
     output.extend_from_slice(value.as_bytes());
@@ -475,7 +470,7 @@ fn encode_snapshot(
         output.push(0);
         output.extend_from_slice(
             &u32::try_from(snapshot.len())
-                .map_err(|_| Error::limit_exceeded("entity snapshot exceeds u32 framing"))?
+                .map_err(|_| Error::limit_exceeded("row snapshot exceeds u32 framing"))?
                 .to_le_bytes(),
         );
         output.extend_from_slice(snapshot);
@@ -483,13 +478,13 @@ fn encode_snapshot(
     Ok(())
 }
 
-/// One universal entity output page.
+/// One universal row output page.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct EntityPage {
+struct RowPage {
     payload: Vec<u8>,
 }
 
-impl EntityPage {
+impl RowPage {
     fn snapshots(record_count: u32, payload: Vec<u8>) -> Result<Self> {
         encode_single_section(
             Representation::Snapshots,
@@ -500,7 +495,7 @@ impl EntityPage {
             payload,
         )
         .map(|payload| Self { payload })
-        .map_err(|error| Error::invalid_input(format!("invalid entity page: {error:?}")))
+        .map_err(|error| Error::invalid_input(format!("invalid row page: {error:?}")))
     }
 }
 
@@ -595,15 +590,15 @@ impl ConflictValue<'_> {
 }
 
 #[derive(Debug)]
-pub struct EntityConflict<'a> {
+pub struct RowConflict<'a> {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub base: Option<ConflictValue<'a>>,
     pub a: Option<ConflictValue<'a>>,
     pub b: Option<ConflictValue<'a>>,
 }
 
-impl EntityConflict<'_> {
+impl RowConflict<'_> {
     pub fn take_b_or_delete(&self) -> ConflictResolution {
         if self.b.is_some() {
             ConflictResolution::TakeB
@@ -629,15 +624,15 @@ pub enum ChangeEffect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntityChange {
+pub struct RowChange {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Option<Vec<u8>>,
     pub effect: ChangeEffect,
 }
 
-pub struct EntityChangeReader<'a> {
-    source: &'a EntitySource,
+pub struct RowChangeReader<'a> {
+    source: &'a RowSource,
     page: Option<InputPage>,
     max_page_bytes: u32,
     next: u32,
@@ -645,53 +640,53 @@ pub struct EntityChangeReader<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Entity {
+pub struct Row {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Vec<u8>,
 }
 
-/// Validated current entities used by restore and cold transitions. Durable
+/// Validated current rows used by restore and cold transitions. Durable
 /// current state cannot contain tombstones, so plugins never branch on them.
-pub struct EntityReader<'a> {
-    changes: EntityChangeReader<'a>,
+pub struct RowReader<'a> {
+    changes: RowChangeReader<'a>,
 }
 
-impl std::fmt::Debug for EntityReader<'_> {
+impl std::fmt::Debug for RowReader<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("EntityReader")
+            .debug_struct("RowReader")
             .field("changes", &self.changes)
             .finish()
     }
 }
 
-impl EntityReader<'_> {
-    fn new(source: &EntitySource, max_page_bytes: u32) -> EntityReader<'_> {
-        EntityReader {
-            changes: EntityChangeReader::new(source, max_page_bytes),
+impl RowReader<'_> {
+    fn new(source: &RowSource, max_page_bytes: u32) -> RowReader<'_> {
+        RowReader {
+            changes: RowChangeReader::new(source, max_page_bytes),
         }
     }
 
-    pub fn next(&mut self) -> Result<Option<Entity>> {
+    pub fn next(&mut self) -> Result<Option<Row>> {
         let Some(change) = self.changes.next()? else {
             return Ok(None);
         };
         let snapshot = change.snapshot.ok_or_else(|| {
-            Error::invalid_input("durable current entities cannot contain tombstones")
+            Error::invalid_input("durable current rows cannot contain tombstones")
         })?;
-        Ok(Some(Entity {
+        Ok(Some(Row {
             schema_key: change.schema_key,
-            entity_pk: change.entity_pk,
+            row_pk: change.row_pk,
             snapshot,
         }))
     }
 }
 
-impl std::fmt::Debug for EntityChangeReader<'_> {
+impl std::fmt::Debug for RowChangeReader<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("EntityChangeReader")
+            .debug_struct("RowChangeReader")
             .field("next", &self.next)
             .field(
                 "buffered",
@@ -703,9 +698,9 @@ impl std::fmt::Debug for EntityChangeReader<'_> {
     }
 }
 
-impl EntityChangeReader<'_> {
-    fn new(source: &EntitySource, max_page_bytes: u32) -> EntityChangeReader<'_> {
-        EntityChangeReader {
+impl RowChangeReader<'_> {
+    fn new(source: &RowSource, max_page_bytes: u32) -> RowChangeReader<'_> {
+        RowChangeReader {
             source,
             page: None,
             max_page_bytes,
@@ -714,7 +709,7 @@ impl EntityChangeReader<'_> {
         }
     }
 
-    pub fn next(&mut self) -> Result<Option<EntityChange>> {
+    pub fn next(&mut self) -> Result<Option<RowChange>> {
         if self.page.as_ref().is_none_or(|page| page.remaining == 0) {
             if self.eof {
                 return Ok(None);
@@ -722,7 +717,7 @@ impl EntityChangeReader<'_> {
             let Some(page) = self
                 .source
                 .next_page(self.max_page_bytes)
-                .map_err(|error| host_error("host entity-change page read failed", error))?
+                .map_err(|error| host_error("host row-change page read failed", error))?
             else {
                 self.eof = true;
                 return Ok(None);
@@ -734,20 +729,22 @@ impl EntityChangeReader<'_> {
         let change = self
             .page
             .as_mut()
-            .expect("a non-empty entity-change page has a first record");
+            .expect("a non-empty row-change page has a first record");
         let change = change.next(index)?;
-        let snapshot =
-            match change.snapshot {
-                Some(InputSnapshot::Inline(bytes)) => Some(bytes),
-                Some(InputSnapshot::Attachment { ordinal, length }) => Some(
-                    read_entity_attachment(self.source, ordinal, length, self.max_page_bytes)?,
-                ),
-                None => None,
-            };
+        let snapshot = match change.snapshot {
+            Some(InputSnapshot::Inline(bytes)) => Some(bytes),
+            Some(InputSnapshot::Attachment { ordinal, length }) => Some(read_row_attachment(
+                self.source,
+                ordinal,
+                length,
+                self.max_page_bytes,
+            )?),
+            None => None,
+        };
         debug_assert_eq!(index, change.ordinal);
-        Ok(Some(EntityChange {
+        Ok(Some(RowChange {
             schema_key: change.schema_key,
-            entity_pk: change.entity_pk,
+            row_pk: change.row_pk,
             snapshot,
             effect: change.effect,
         }))
@@ -758,7 +755,7 @@ impl EntityChangeReader<'_> {
 struct InputChange {
     ordinal: u32,
     schema_key: String,
-    entity_pk: Vec<String>,
+    row_pk: Vec<String>,
     snapshot: Option<InputSnapshot>,
     effect: ChangeEffect,
 }
@@ -773,29 +770,29 @@ struct InputPage {
 impl InputPage {
     fn next(&mut self, ordinal: u32) -> Result<InputChange> {
         if self.remaining == 0 {
-            return Err(Error::invalid_input("entity input page is exhausted"));
+            return Err(Error::invalid_input("row input page is exhausted"));
         }
         let mut framed = InputReader::new(&self.payload[self.offset..]);
         let record_len = framed.u32()? as usize;
         let mut record = framed.reader(record_len)?;
         let tag = record.u8()?;
-        let (schema_key, entity_pk, snapshot, effect) = match tag {
+        let (schema_key, row_pk, snapshot, effect) = match tag {
             0 => {
-                let (schema_key, entity_pk) = record.key()?;
+                let (schema_key, row_pk) = record.key()?;
                 let effect = match record.u8()? {
                     0 => ChangeEffect::Content,
                     1 => ChangeEffect::FormatOnly,
-                    _ => return Err(Error::invalid_input("unknown entity change effect")),
+                    _ => return Err(Error::invalid_input("unknown row change effect")),
                 };
-                (schema_key, entity_pk, Some(record.snapshot()?), effect)
+                (schema_key, row_pk, Some(record.snapshot()?), effect)
             }
             1 => {
-                let (schema_key, entity_pk) = record.key()?;
-                (schema_key, entity_pk, None, ChangeEffect::Content)
+                let (schema_key, row_pk) = record.key()?;
+                (schema_key, row_pk, None, ChangeEffect::Content)
             }
             _ => {
                 return Err(Error::invalid_input(
-                    "entity input page contains an unresolved create",
+                    "row input page contains an unresolved create",
                 ));
             }
         };
@@ -803,15 +800,15 @@ impl InputPage {
         self.offset = self
             .offset
             .checked_add(4 + record_len)
-            .ok_or_else(|| Error::limit_exceeded("entity input page offset overflowed"))?;
+            .ok_or_else(|| Error::limit_exceeded("row input page offset overflowed"))?;
         self.remaining -= 1;
         if self.remaining == 0 && self.offset != self.payload.len() {
-            return Err(Error::invalid_input("entity input page has trailing bytes"));
+            return Err(Error::invalid_input("row input page has trailing bytes"));
         }
         Ok(InputChange {
             ordinal,
             schema_key,
-            entity_pk,
+            row_pk,
             snapshot,
             effect,
         })
@@ -826,17 +823,17 @@ enum InputSnapshot {
 
 fn decode_input_page(mut bytes: Vec<u8>) -> Result<InputPage> {
     let page = WirePage::decode(&bytes)
-        .map_err(|error| Error::invalid_input(format!("invalid entity page: {error:?}")))?;
+        .map_err(|error| Error::invalid_input(format!("invalid row page: {error:?}")))?;
     let section = page
         .section()
-        .map_err(|error| Error::invalid_input(format!("invalid entity page: {error:?}")))?;
+        .map_err(|error| Error::invalid_input(format!("invalid row page: {error:?}")))?;
     if section.representation != Representation::Snapshots
         || section.operation != Operation::Mixed
         || !section.schema_key.is_empty()
         || !section.layout.is_empty()
     {
         return Err(Error::invalid_input(
-            "entity input page must use the mixed snapshot representation",
+            "row input page must use the mixed snapshot representation",
         ));
     }
     let payload_len = section.payload.len();
@@ -864,7 +861,7 @@ impl<'a> InputReader<'a> {
             .offset
             .checked_add(length)
             .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| Error::invalid_input("truncated entity input page"))?;
+            .ok_or_else(|| Error::invalid_input("truncated row input page"))?;
         let bytes = &self.bytes[self.offset..end];
         self.offset = end;
         Ok(bytes)
@@ -889,7 +886,7 @@ impl<'a> InputReader<'a> {
     fn text(&mut self) -> Result<String> {
         let length = self.u32()? as usize;
         String::from_utf8(self.exact(length)?.to_vec())
-            .map_err(|_| Error::invalid_input("entity input text is not UTF-8"))
+            .map_err(|_| Error::invalid_input("row input text is not UTF-8"))
     }
 
     fn key(&mut self) -> Result<(String, Vec<String>)> {
@@ -897,14 +894,14 @@ impl<'a> InputReader<'a> {
         let count = self.u32()? as usize;
         if count > self.bytes.len().saturating_sub(self.offset) / 4 {
             return Err(Error::invalid_input(
-                "entity primary key count exceeds page bounds",
+                "row primary key count exceeds page bounds",
             ));
         }
-        let mut entity_pk = Vec::with_capacity(count);
+        let mut row_pk = Vec::with_capacity(count);
         for _ in 0..count {
-            entity_pk.push(self.text()?);
+            row_pk.push(self.text()?);
         }
-        Ok((schema_key, entity_pk))
+        Ok((schema_key, row_pk))
     }
 
     fn snapshot(&mut self) -> Result<InputSnapshot> {
@@ -917,7 +914,7 @@ impl<'a> InputReader<'a> {
                 ordinal: self.u32()?,
                 length: self.u64()?,
             }),
-            _ => Err(Error::invalid_input("unknown entity attachment tag")),
+            _ => Err(Error::invalid_input("unknown row attachment tag")),
         }
     }
 
@@ -927,34 +924,34 @@ impl<'a> InputReader<'a> {
 
     fn finish(self) -> Result<()> {
         if self.offset != self.bytes.len() {
-            return Err(Error::invalid_input("entity input page has trailing bytes"));
+            return Err(Error::invalid_input("row input page has trailing bytes"));
         }
         Ok(())
     }
 }
 
-fn read_entity_attachment(
-    source: &EntitySource,
+fn read_row_attachment(
+    source: &RowSource,
     ordinal: u32,
     length: u64,
     max_page_bytes: u32,
 ) -> Result<Vec<u8>> {
     const READ_BYTES: u32 = 1024 * 1024;
     let capacity = usize::try_from(length)
-        .map_err(|_| Error::limit_exceeded("entity snapshot exceeds guest address space"))?;
+        .map_err(|_| Error::limit_exceeded("row snapshot exceeds guest address space"))?;
     let mut output = Vec::with_capacity(capacity);
     while output.len() < capacity {
         let offset = output.len() as u64;
         let chunk =
             u32::try_from((capacity - output.len()).min(READ_BYTES.min(max_page_bytes) as usize))
-                .expect("bounded entity snapshot read fits u32");
+                .expect("bounded row snapshot read fits u32");
         let bytes = source
             .read_attachment(ordinal, offset, chunk)
-            .map_err(|error| host_error("host entity attachment read failed", error))?
-            .ok_or_else(|| Error::invalid_input("host entity attachment disappeared"))?;
+            .map_err(|error| host_error("host row attachment read failed", error))?
+            .ok_or_else(|| Error::invalid_input("host row attachment disappeared"))?;
         if bytes.is_empty() {
             return Err(Error::invalid_input(
-                "host entity attachment returned a short read",
+                "host row attachment returned a short read",
             ));
         }
         output.extend_from_slice(&bytes);
@@ -963,16 +960,16 @@ fn read_entity_attachment(
 }
 
 #[derive(Debug)]
-pub struct EntityUpdate<'a> {
+pub struct RowUpdate<'a> {
     pub before_path: String,
     pub before: Snapshot<'a>,
-    pub changes: EntityChangeReader<'a>,
+    pub changes: RowChangeReader<'a>,
 }
 
 #[derive(Debug)]
 pub struct RestoreFile<'a> {
     pub accepted: Option<Snapshot<'a>>,
-    pub entities: EntityReader<'a>,
+    pub rows: RowReader<'a>,
 }
 
 #[derive(Debug)]
@@ -981,7 +978,7 @@ pub struct ColdUpdate<'a> {
     pub after_path: String,
     pub before: Snapshot<'a>,
     pub edits: Vec<FileEdit>,
-    pub entities: EntityReader<'a>,
+    pub rows: RowReader<'a>,
     pub creates: CreateContext,
 }
 
@@ -990,15 +987,15 @@ pub trait Plugin: 'static {
 
     fn file_changed(update: &FileUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
 
-    fn resolve_conflict(conflict: EntityConflict<'_>) -> Result<ConflictResolution> {
+    fn resolve_conflict(conflict: RowConflict<'_>) -> Result<ConflictResolution> {
         Ok(conflict.take_b_or_delete())
     }
 
-    fn entities_changed(update: &mut EntityUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
+    fn rows_changed(update: &mut RowUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
 
     fn restore(input: &mut RestoreFile<'_>, output: &mut Output<'_>) -> Result<()>;
 
-    /// Reconciles a successor directly from durable entities and accepted
+    /// Reconciles a successor directly from durable rows and accepted
     /// bytes when no warm guest document is available.
     ///
     /// This is mandatory: the host may choose the cold route after eviction,
@@ -1057,7 +1054,7 @@ impl<P: Plugin> Guest for Component<P> {
                 P::file_changed(&input, &mut sink).map_err(plugin_error)?;
                 sink.finish().map_err(plugin_error)
             }
-            TransitionRequest::EntitiesChanged(input) => apply_entities::<P>(input, output),
+            TransitionRequest::RowsChanged(input) => apply_rows::<P>(input, output),
             TransitionRequest::Restore(input) => apply_restore::<P>(input, output),
             TransitionRequest::ColdFileChanged(input) => apply_cold_update::<P>(input, output),
         }
@@ -1086,9 +1083,9 @@ impl<P: Plugin> Guest for Component<P> {
                     len,
                 })
             };
-            let conflict = EntityConflict {
+            let conflict = RowConflict {
                 schema_key: meta.schema_key,
-                entity_pk: meta.entity_pk,
+                row_pk: meta.row_pk,
                 base: value(ConflictSide::Base, meta.base_len),
                 a: value(ConflictSide::A, meta.a_len),
                 b: value(ConflictSide::B, meta.b_len),
@@ -1134,20 +1131,20 @@ impl<P: Plugin> Guest for Component<P> {
     }
 }
 
-fn apply_entities<P: Plugin>(
-    input: WitEntitiesChangedRequest,
+fn apply_rows<P: Plugin>(
+    input: WitRowsChangedRequest,
     output: &WitTransition,
 ) -> std::result::Result<(), PluginError> {
     let max_batch_bytes = output.max_batch_bytes();
-    let mut update = EntityUpdate {
+    let mut update = RowUpdate {
         before_path: input.before_path,
         before: Snapshot {
             inner: &input.before,
         },
-        changes: EntityChangeReader::new(&input.changes, max_batch_bytes),
+        changes: RowChangeReader::new(&input.changes, max_batch_bytes),
     };
     let mut sink = Output::new(output)?;
-    P::entities_changed(&mut update, &mut sink).map_err(plugin_error)?;
+    P::rows_changed(&mut update, &mut sink).map_err(plugin_error)?;
     sink.finish().map_err(plugin_error)
 }
 
@@ -1162,7 +1159,7 @@ fn apply_restore<P: Plugin>(
         .map(|accepted| Snapshot { inner: accepted });
     let mut input = RestoreFile {
         accepted,
-        entities: EntityReader::new(&input.entities, max_batch_bytes),
+        rows: RowReader::new(&input.rows, max_batch_bytes),
     };
     let mut sink = Output::new(output)?;
     P::restore(&mut input, &mut sink).map_err(plugin_error)?;
@@ -1189,7 +1186,7 @@ fn apply_cold_update<P: Plugin>(
                 insert: edit.insert.clone(),
             })
             .collect(),
-        entities: EntityReader::new(&input.entities, max_batch_bytes),
+        rows: RowReader::new(&input.rows, max_batch_bytes),
         creates: CreateContext {
             high: input.creates.high,
             low: input.creates.low,

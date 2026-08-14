@@ -143,8 +143,8 @@ async fn main() {
             .expect("insert the first revision");
 
         // Two churn shapes, because they produce different change-id
-        // populations: an in-place rewrite stream reuses one entity key, while
-        // distinct inserts mint a new entity (and a new change) every time.
+        // populations: an in-place rewrite stream reuses one row key, while
+        // distinct inserts mint a new row (and a new change) every time.
         //
         // Checkpoints matter more than either. Without one the shipping sweep
         // proves nothing retirable — every commit stays a physical authority of

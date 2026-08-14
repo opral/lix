@@ -12,11 +12,11 @@ date: "2026-07-23"
 
 Lix file plugins remain sandboxed WebAssembly Components, but API v2 replaces
 the stateless whole-file/whole-state calls with persistent, immutable document
-resources. A localized byte edit can therefore produce sparse entity changes,
-and a localized entity change can produce sparse byte edits, without crossing
+resources. A localized byte edit can therefore produce sparse row changes,
+and a localized row change can produce sparse byte edits, without crossing
 the component boundary with the rest of the file.
 
-The production contract is WIT package `lix:plugin@2.1.0` and packet format
+The current production contract is WIT package `lix:plugin@1.0.0` and packet format
 `packet-v1`. The public Rust authoring surface and canonical WIT copy live in
 [`lix::plugin`](../../packages/lix/PLUGIN.md). The engine and
 Rust SDK retain package-local WIT mirrors for generated host bindings; CI
@@ -25,7 +25,7 @@ enforces byte-for-byte parity so every published crate remains self-contained.
 ## Motivation
 
 The predecessor stateless API reparses a complete file and materializes every
-plugin-owned entity for each edit and render. That is easy to understand, but
+plugin-owned row for each edit and render. That is easy to understand, but
 work and memory scale with document size even when one CSV cell or one JSON
 leaf changes.
 
@@ -43,15 +43,15 @@ instance and one accepted immutable document handle.
 The lifecycle has two cold constructors, two warm transitions, and one static
 merge-resolution phase:
 
-- `open-file` parses initial bytes and emits complete entity upserts.
-- `open-entities` reconstructs a document and canonical bytes from durable
-  entities after restart or eviction.
-- `file-changed` consumes byte splices and emits sparse entity changes.
-- `entities-changed` consumes merge-resolved entity changes and emits sparse
+- `open-file` parses initial bytes and emits complete row upserts.
+- `open-rows` reconstructs a document and canonical bytes from durable
+  rows after restart or eviction.
+- `file-changed` consumes byte splices and emits sparse row changes.
+- `rows-changed` consumes merge-resolved row changes and emits sparse
   byte edits.
-- `resolve-conflicts` consumes only colliding semantic entity triples and
+- `resolve-conflicts` consumes only colliding semantic row triples and
   returns aligned deterministic resolutions before the ordinary
-  `entities-changed` render phase.
+  `rows-changed` render phase.
 
 Every document transition returns a new document. `resolve-conflicts` returns
 only a resolution cursor and cannot mutate an actor. The engine retains the old
@@ -60,10 +60,10 @@ transaction. A trap, timeout, invalid packet, failed constraint, or rollback
 therefore cannot corrupt the accepted actor.
 
 File-scoped semantic SQL writes take the reverse path through
-`entities-changed` in the same database transaction. Multiple statements chain
+`rows-changed` in the same database transaction. Multiple statements chain
 from a private pending document and publish that document only once, at commit;
 rollback discards the complete chain. Writing both blob bytes and semantic
-entities for the same file in one transaction is rejected because neither side
+rows for the same file in one transaction is rejected because neither side
 has unambiguous authority.
 
 ## Boundary model
@@ -71,14 +71,14 @@ has unambiguous authority.
 WIT defines typed capabilities and resource lifetimes:
 
 - immutable byte sources with bounded random reads;
-- bounded cursors for entities, changes, and edits;
+- bounded cursors for rows, changes, and edits;
 - a lazy conflict source and aligned resolution cursor for static merge
   resolution;
 - immutable documents and explicit `fork`;
 - lazy output attachments for large replacement bytes; and
 - transition budgets and descriptor metadata.
 
-The packet format carries entity snapshots through a flat checked arena. It is
+The packet format carries row snapshots through a flat checked arena. It is
 a transient component-boundary representation, not a storage format and not a
 generic author-facing AST.
 
@@ -88,26 +88,26 @@ deadline or evade total-byte and record-count limits.
 
 ## Semantic changes
 
-An entity upsert contains a complete schema entity. A deletion is a distinct
+A row upsert contains a complete schema row. A deletion is a distinct
 operation. Render-effective facts such as order, parentage, and native
 references must be durable in the schema snapshot rather than hidden in
 ephemeral plugin metadata.
 
-A transition may mention an entity key only once. Each upsert is a complete
-schema entity and each deletion is explicit. Conflict resolution remains
-entity-granular; the API does not promise unsupported cross-entity atomic merge
+A transition may mention a row key only once. Each upsert is a complete
+schema row and each deletion is explicit. Conflict resolution remains
+row-granular; the API does not promise unsupported cross-row atomic merge
 groups.
 
 Plugins choose their own semantic granularity. For example:
 
-- CSV uses table and stable row entities.
-- JSON uses recursive object-member entities and stable array-item entities;
-  JSON Pointer is a locator derived from that graph, not entity identity.
-- Markdown can use block/container entities and keep inline syntax inside a
+- CSV uses table and stable rows.
+- JSON uses recursive object-member rows and stable array-item rows;
+  JSON Pointer is a locator derived from that graph, not row identity.
+- Markdown can use block/container rows and keep inline syntax inside a
   block snapshot.
-- Excalidraw can use scene, element, and file-asset entities.
+- Excalidraw can use scene, element, and file-asset rows.
 
-The API does not require one entity per top-level property or one universal
+The API does not require one row per top-level property or one universal
 syntax tree.
 
 The JSON reference deliberately narrows direct semantic mutation to one
@@ -120,7 +120,7 @@ objects are deferred.
 
 ## Plugin conflict resolution
 
-When merge analysis finds the same plugin-owned entity changed on both sides,
+When merge analysis finds the same plugin-owned row changed on both sides,
 the engine first proves a common live file incarnation (owner payload and
 incarnation ID), one identical descriptor and complete path, and one pinned
 plugin registry entry in all three roots, then invokes the plugin's static
@@ -151,7 +151,7 @@ ordinal in the exact same order. It may `take(base|a|b)` without
 copying the selected snapshot through Wasm memory, `replace` it with one
 complete merged snapshot, or `delete` it. The host validates exact cardinality
 and ordinal alignment, applies the result to the semantic merge plan, then uses the existing
-`entities-changed` path to materialize the file once. There is intentionally no
+`rows-changed` path to materialize the file once. There is intentionally no
 `document` parameter: resolving two small collisions must not cold-hydrate a
 large Markdown, CSV, or JSON file merely to access an actor-local index.
 
@@ -169,21 +169,21 @@ are intentionally deferred to a later data-model and protocol increment.
 
 ### Granularity guidance
 
-Resolution quality comes from choosing stable entities that match a format's
-independently editable units. A CSV row can be one entity and can compose two
+Resolution quality comes from choosing stable rows that match a format's
+independently editable units. A CSV row can be one row and can compose two
 changes that modify different same-index cells, provided identity, order,
 field count, quoting, and terminator layout still agree. Concurrent writes to
 the same cell, row moves, shape changes, and layout changes take `b` rather
 than pretending to implement a structural spreadsheet CRDT. A Markdown
 paragraph/block can apply a bounded three-way text heuristic for disjoint
 edits, then take `b` for overlap or syntax it cannot preserve. A giant
-value stored as one entity remains one merge unit; a plugin should take the
+value stored as one row remains one merge unit; a plugin should take the
 lazy fallback rather than materialize arbitrary large triples for a marginal
 heuristic.
 
-Entity keys stay stable identity, not current byte offsets, row positions, or
+Row keys stay stable identity, not current byte offsets, row positions, or
 array indices. The API permits a future JSON plugin to use recursive member
-entities, but it does not require every format to use that granularity.
+rows, but it does not require every format to use that granularity.
 
 ### API-shape decision
 
@@ -191,7 +191,7 @@ Three shapes were considered:
 
 1. A document-bound `document.resolve-conflicts` method would make an existing
    actor index available, but forces cold hydration or actor acquisition for a
-   merge whose inputs may be only a few entities.
+   merge whose inputs may be only a few rows.
 2. One top-level Component call per conflict is direct to describe, but makes
    boundary, resource, and trap overhead scale with the number of collisions
    and prevents a bounded multi-record packet/attachment strategy.
@@ -211,15 +211,15 @@ Schemas whose `/id` primary-key string property declares both
 `"format": "uuid"` and `"x-lix-default": "uuidv7()"` permit keyless
 creates. The plugin emits a transition-local `u32` reference and an ID-free
 snapshot. The host derives the canonical UUIDv7, completes and validates the
-snapshot, and converts the create to an ordinary keyed entity before storage.
-Plugins preserve acknowledged IDs for existing entities.
+snapshot, and converts the create to an ordinary keyed row before storage.
+Plugins preserve acknowledged IDs for existing rows.
 
 The create context is bound to the mutation, file incarnation, plugin, and
 generation. The engine durably reserves it before accepting creates. Remote
 transport retry and exactly-once replay are separate protocol concerns and are
 not introduced by this API.
 
-An array position, row number, or current byte offset is not an entity
+An array position, row number, or current byte offset is not a row
 identity.
 
 ## Concurrency and authority
@@ -246,7 +246,7 @@ The engine, not the plugin, owns:
 - observation authority and stale-view rejection;
 - actor scheduling, generation fencing, and eviction;
 - source/read/output limits, fuel, deadlines, and linear-memory limits; and
-- storage of plugin archives, schemas, entities, and component generations.
+- storage of plugin archives, schemas, rows, and component generations.
 
 Plugins never commit directly and receive no ambient filesystem or network
 capability from this API.
@@ -261,7 +261,7 @@ local deltas. There is no separate fast API.
 
 The first production plugins are executable references and consumers of the
 shared public `lix_plugin_api_v2` package. It exposes the four irreducible
-cold/warm × byte/entity transitions while retaining WIT resources, packet
+cold/warm × byte/row transitions while retaining WIT resources, packet
 codecs, paging, attachments, and bounds as runtime internals.
 
 ## Limits
@@ -315,7 +315,7 @@ localized row edit. On RocksDB, edit p50 fell from 6,507.439 ms in the
 predecessor implementation to 63.610 ms and exact-render p50 fell from
 2,317.470 ms to 18.013 ms. On
 cached SlateDB, edit p50 fell from 9,659.544 ms to 80.184 ms and exact-render
-p50 from 7,600.187 ms to 6.397 ms. The candidate emitted one durable entity
+p50 from 7,600.187 ms to 6.397 ms. The candidate emitted one durable row
 change, performed no warm source reads, full semantic materialization, reparse,
 or full render, and observed 58.3125 MiB guest high-water.
 
@@ -342,7 +342,7 @@ bytes. These are single-run acceptance measurements, not latency percentiles.
 An N=10 authorship evaluation of the immediately preceding WIT surface
 completed successfully for every participant, with median final score 76 (p25
 72.75, p75 82.75). The final contract keeps that lifecycle but removes two
-unused entity streams and the unsupported merge-group wrapper, so the result
+unused row streams and the unsupported merge-group wrapper, so the result
 is conservative directional evidence rather than an exact final-surface rerun.
 It supports the raw interface as implementable across formats, while repeated
 packet/binding glue in the four references remains evidence for a small future
@@ -359,7 +359,7 @@ does not claim a fresh 12-block paired timing campaign.
 ### Keep the stateless API
 
 This preserves the smallest surface but necessarily rematerializes complete
-files and entity sets. It cannot make localized large-file work proportional
+files and row sets. It cannot make localized large-file work proportional
 to the affected region.
 
 ### Core Wasm with a custom ABI

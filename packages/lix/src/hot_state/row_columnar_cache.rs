@@ -1,4 +1,4 @@
-//! Repository-scoped reconciliation artifacts for columnar entity scans.
+//! Repository-scoped reconciliation artifacts for columnar row scans.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -17,27 +17,27 @@ const RECONCILED_BATCH_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// `ArrayRef`. Pointer identity plus reference counts charges that allocation
 /// once; independently constructed (including sliced or filtered) arrays are
 /// conservatively separate allocations.
-pub(crate) struct EntityColumnarArrayBudget {
-    state: Mutex<EntityColumnarArrayBudgetState>,
+pub(crate) struct RowColumnarArrayBudget {
+    state: Mutex<RowColumnarArrayBudgetState>,
     max: usize,
 }
 
 #[derive(Default)]
-struct EntityColumnarArrayBudgetState {
+struct RowColumnarArrayBudgetState {
     used: usize,
     arrays: HashMap<usize, (usize, usize)>,
 }
 
-impl Default for EntityColumnarArrayBudget {
+impl Default for RowColumnarArrayBudget {
     fn default() -> Self {
         Self::new(RECONCILED_BATCH_CACHE_MAX_BYTES)
     }
 }
 
-impl EntityColumnarArrayBudget {
+impl RowColumnarArrayBudget {
     pub(crate) fn new(max: usize) -> Self {
         Self {
-            state: Mutex::new(EntityColumnarArrayBudgetState::default()),
+            state: Mutex::new(RowColumnarArrayBudgetState::default()),
             max,
         }
     }
@@ -120,13 +120,13 @@ impl EntityColumnarArrayBudget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct EntityColumnarBatchKey {
-    shadow: EntityColumnarShadowMaskKey,
+struct RowColumnarBatchKey {
+    shadow: RowColumnarShadowMaskKey,
     projection: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct EntityColumnarShadowMaskKey {
+pub(crate) struct RowColumnarShadowMaskKey {
     pub(crate) row_groups: crate::columnar_row_group::RowGroupSetId,
     pub(crate) branch_id: Arc<str>,
     pub(crate) head_commit_id: crate::changelog::CommitId,
@@ -135,22 +135,22 @@ pub(crate) struct EntityColumnarShadowMaskKey {
     pub(crate) group_index: usize,
 }
 
-pub(crate) struct EntityColumnarShadowMaskCache {
-    entries: HashMap<EntityColumnarShadowMaskKey, EntityColumnarShadowCacheEntry>,
-    insertion_order: VecDeque<EntityColumnarShadowMaskKey>,
-    batches: HashMap<EntityColumnarBatchKey, (Arc<RecordBatch>, usize)>,
-    batch_insertion_order: VecDeque<EntityColumnarBatchKey>,
+pub(crate) struct RowColumnarShadowMaskCache {
+    entries: HashMap<RowColumnarShadowMaskKey, RowColumnarShadowCacheEntry>,
+    insertion_order: VecDeque<RowColumnarShadowMaskKey>,
+    batches: HashMap<RowColumnarBatchKey, (Arc<RecordBatch>, usize)>,
+    batch_insertion_order: VecDeque<RowColumnarBatchKey>,
     batch_bytes: usize,
-    array_budget: Arc<EntityColumnarArrayBudget>,
+    array_budget: Arc<RowColumnarArrayBudget>,
 }
 
-impl Default for EntityColumnarShadowMaskCache {
+impl Default for RowColumnarShadowMaskCache {
     fn default() -> Self {
-        Self::with_array_budget(Arc::new(EntityColumnarArrayBudget::default()))
+        Self::with_array_budget(Arc::new(RowColumnarArrayBudget::default()))
     }
 }
 
-impl Drop for EntityColumnarShadowMaskCache {
+impl Drop for RowColumnarShadowMaskCache {
     fn drop(&mut self) {
         for (batch, _) in self.batches.values() {
             self.array_budget.release(batch.columns());
@@ -159,14 +159,14 @@ impl Drop for EntityColumnarShadowMaskCache {
     }
 }
 
-struct EntityColumnarShadowCacheEntry {
+struct RowColumnarShadowCacheEntry {
     mask: Arc<BooleanArray>,
     statistics_by_projection: HashMap<Vec<usize>, Statistics>,
     statistics_insertion_order: VecDeque<Vec<usize>>,
 }
 
-impl EntityColumnarShadowMaskCache {
-    pub(crate) fn with_array_budget(array_budget: Arc<EntityColumnarArrayBudget>) -> Self {
+impl RowColumnarShadowMaskCache {
+    pub(crate) fn with_array_budget(array_budget: Arc<RowColumnarArrayBudget>) -> Self {
         Self {
             entries: HashMap::new(),
             insertion_order: VecDeque::new(),
@@ -177,13 +177,13 @@ impl EntityColumnarShadowMaskCache {
         }
     }
 
-    pub(crate) fn get(&self, key: &EntityColumnarShadowMaskKey) -> Option<Arc<BooleanArray>> {
+    pub(crate) fn get(&self, key: &RowColumnarShadowMaskKey) -> Option<Arc<BooleanArray>> {
         self.entries.get(key).map(|entry| Arc::clone(&entry.mask))
     }
 
     pub(crate) fn insert(
         &mut self,
-        key: EntityColumnarShadowMaskKey,
+        key: RowColumnarShadowMaskKey,
         mask: Arc<BooleanArray>,
     ) -> Arc<BooleanArray> {
         if let Some(existing) = self.entries.get(&key) {
@@ -197,7 +197,7 @@ impl EntityColumnarShadowMaskCache {
         self.insertion_order.push_back(key.clone());
         self.entries.insert(
             key,
-            EntityColumnarShadowCacheEntry {
+            RowColumnarShadowCacheEntry {
                 mask: Arc::clone(&mask),
                 statistics_by_projection: HashMap::new(),
                 statistics_insertion_order: VecDeque::new(),
@@ -208,7 +208,7 @@ impl EntityColumnarShadowMaskCache {
 
     pub(crate) fn statistics(
         &self,
-        key: &EntityColumnarShadowMaskKey,
+        key: &RowColumnarShadowMaskKey,
         projection: &[usize],
     ) -> Option<Statistics> {
         self.entries
@@ -220,7 +220,7 @@ impl EntityColumnarShadowMaskCache {
 
     pub(crate) fn insert_statistics(
         &mut self,
-        key: &EntityColumnarShadowMaskKey,
+        key: &RowColumnarShadowMaskKey,
         projection: Vec<usize>,
         statistics: Statistics,
     ) {
@@ -243,11 +243,11 @@ impl EntityColumnarShadowMaskCache {
 
     pub(crate) fn batch(
         &self,
-        key: &EntityColumnarShadowMaskKey,
+        key: &RowColumnarShadowMaskKey,
         projection: &[usize],
     ) -> Option<Arc<RecordBatch>> {
         self.batches
-            .get(&EntityColumnarBatchKey {
+            .get(&RowColumnarBatchKey {
                 shadow: key.clone(),
                 projection: projection.to_vec(),
             })
@@ -256,7 +256,7 @@ impl EntityColumnarShadowMaskCache {
 
     pub(crate) fn insert_batch(
         &mut self,
-        key: EntityColumnarShadowMaskKey,
+        key: RowColumnarShadowMaskKey,
         projection: Vec<usize>,
         batch: Arc<RecordBatch>,
     ) -> Arc<RecordBatch> {
@@ -271,13 +271,13 @@ impl EntityColumnarShadowMaskCache {
 
     fn insert_batch_with_limits(
         &mut self,
-        key: EntityColumnarShadowMaskKey,
+        key: RowColumnarShadowMaskKey,
         projection: Vec<usize>,
         batch: Arc<RecordBatch>,
         max_entries: usize,
         max_bytes: usize,
     ) -> Arc<RecordBatch> {
-        let key = EntityColumnarBatchKey {
+        let key = RowColumnarBatchKey {
             shadow: key,
             projection,
         };
@@ -333,7 +333,7 @@ mod tests {
     fn shared_budget_charges_identical_arc_once_until_last_release() {
         let array = budget_array(8);
         let bytes = array.get_array_memory_size();
-        let budget = EntityColumnarArrayBudget::new(bytes);
+        let budget = RowColumnarArrayBudget::new(bytes);
         assert!(budget.try_reserve(&[Arc::clone(&array), Arc::clone(&array)]));
         assert_eq!(budget.used(), bytes);
         budget.release(std::slice::from_ref(&array));
@@ -351,7 +351,7 @@ mod tests {
             .get_array_memory_size()
             .saturating_add(slice.get_array_memory_size())
             .saturating_add(distinct.get_array_memory_size());
-        let budget = EntityColumnarArrayBudget::new(expected);
+        let budget = RowColumnarArrayBudget::new(expected);
         assert!(budget.try_reserve(&[
             Arc::clone(&base),
             Arc::clone(&slice),
@@ -367,7 +367,7 @@ mod tests {
         let first = budget_array(8);
         let second = budget_array(8);
         let bytes = first.get_array_memory_size();
-        let budget = Arc::new(EntityColumnarArrayBudget::new(bytes));
+        let budget = Arc::new(RowColumnarArrayBudget::new(bytes));
         assert!(!budget.try_reserve(&[Arc::clone(&first), second]));
         assert_eq!(budget.used(), 0);
 
@@ -401,7 +401,7 @@ mod tests {
         let array = budget_array(8);
         let bytes = array.get_array_memory_size();
         let identity = Arc::as_ptr(&array) as *const () as usize;
-        let budget = EntityColumnarArrayBudget::new(usize::MAX);
+        let budget = RowColumnarArrayBudget::new(usize::MAX);
         assert!(budget.try_reserve(std::slice::from_ref(&array)));
         {
             let mut state = budget.state.lock().expect("budget lock");
@@ -416,7 +416,7 @@ mod tests {
         }
         budget.release(std::slice::from_ref(&array));
 
-        let overflow = EntityColumnarArrayBudget::new(usize::MAX);
+        let overflow = RowColumnarArrayBudget::new(usize::MAX);
         overflow.state.lock().expect("budget lock").used = usize::MAX;
         assert!(!overflow.try_reserve(std::slice::from_ref(&array)));
         assert_eq!(overflow.used(), usize::MAX);
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn statistics_projections_are_bounded_per_mask() {
-        let key = EntityColumnarShadowMaskKey {
+        let key = RowColumnarShadowMaskKey {
             row_groups: crate::columnar_row_group::RowGroupSetId::new([7; 16]),
             branch_id: Arc::from("branch"),
             head_commit_id: crate::changelog::CommitId::for_test_label("scan-cache-head"),
@@ -432,7 +432,7 @@ mod tests {
             shadow_identity_digest: [9; 32],
             group_index: 1,
         };
-        let mut cache = EntityColumnarShadowMaskCache::default();
+        let mut cache = RowColumnarShadowMaskCache::default();
         cache.insert(key.clone(), Arc::new(BooleanArray::from(vec![true])));
         for projection in 0..(STATISTICS_PROJECTIONS_PER_MASK + 2) {
             let schema = Schema::new(vec![Field::new(
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn reconciled_batches_are_entry_bounded() {
-        let shadow = EntityColumnarShadowMaskKey {
+        let shadow = RowColumnarShadowMaskKey {
             row_groups: crate::columnar_row_group::RowGroupSetId::new([3; 16]),
             branch_id: Arc::from("branch"),
             head_commit_id: crate::changelog::CommitId::for_test_label("batch-cache-head"),
@@ -467,7 +467,7 @@ mod tests {
         let batch = Arc::new(
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).expect("batch"),
         );
-        let mut cache = EntityColumnarShadowMaskCache::default();
+        let mut cache = RowColumnarShadowMaskCache::default();
         for projection in 0..(RECONCILED_BATCH_CACHE_ENTRIES + 2) {
             cache.insert_batch(shadow.clone(), vec![projection], Arc::clone(&batch));
         }
@@ -486,7 +486,7 @@ mod tests {
             .iter()
             .map(|column| column.get_array_memory_size())
             .sum::<usize>();
-        let mut cache = EntityColumnarShadowMaskCache::default();
+        let mut cache = RowColumnarShadowMaskCache::default();
 
         cache.insert_batch_with_limits(shadow.clone(), vec![0], Arc::clone(&batch), 8, bytes);
         cache.insert_batch_with_limits(shadow.clone(), vec![1], Arc::clone(&batch), 8, bytes);
@@ -505,7 +505,7 @@ mod tests {
     fn batch_cache_key_covers_every_visibility_and_projection_dimension() {
         let base = batch_cache_key();
         let batch = test_batch(&[7]);
-        let mut cache = EntityColumnarShadowMaskCache::default();
+        let mut cache = RowColumnarShadowMaskCache::default();
         let resident = cache.insert_batch(base.clone(), vec![1, 3], Arc::clone(&batch));
         assert!(cache.batch(&base, &[1, 3]).is_some());
         let duplicate = cache.insert_batch(base.clone(), vec![1, 3], test_batch(&[8]));
@@ -513,27 +513,27 @@ mod tests {
         assert!(Arc::ptr_eq(&batch, &duplicate));
 
         let variants = [
-            EntityColumnarShadowMaskKey {
+            RowColumnarShadowMaskKey {
                 row_groups: crate::columnar_row_group::RowGroupSetId::new([8; 16]),
                 ..base.clone()
             },
-            EntityColumnarShadowMaskKey {
+            RowColumnarShadowMaskKey {
                 branch_id: Arc::from("other"),
                 ..base.clone()
             },
-            EntityColumnarShadowMaskKey {
+            RowColumnarShadowMaskKey {
                 head_commit_id: crate::changelog::CommitId::for_test_label("other-head"),
                 ..base.clone()
             },
-            EntityColumnarShadowMaskKey {
+            RowColumnarShadowMaskKey {
                 current_state_revision: 2,
                 ..base.clone()
             },
-            EntityColumnarShadowMaskKey {
+            RowColumnarShadowMaskKey {
                 shadow_identity_digest: [9; 32],
                 ..base.clone()
             },
-            EntityColumnarShadowMaskKey {
+            RowColumnarShadowMaskKey {
                 group_index: 1,
                 ..base.clone()
             },
@@ -545,8 +545,8 @@ mod tests {
         assert!(cache.batch(&base, &[1]).is_none());
     }
 
-    fn batch_cache_key() -> EntityColumnarShadowMaskKey {
-        EntityColumnarShadowMaskKey {
+    fn batch_cache_key() -> RowColumnarShadowMaskKey {
+        RowColumnarShadowMaskKey {
             row_groups: crate::columnar_row_group::RowGroupSetId::new([3; 16]),
             branch_id: Arc::from("branch"),
             head_commit_id: crate::changelog::CommitId::for_test_label("batch-cache-head"),

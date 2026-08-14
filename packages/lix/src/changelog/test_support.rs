@@ -1,5 +1,5 @@
 use crate::changelog::{ChangeId, ChangeRecord};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 
 pub(crate) fn test_change_record() -> ChangeRecord {
     ChangeRecord {
@@ -7,7 +7,7 @@ pub(crate) fn test_change_record() -> ChangeRecord {
         change_id: ChangeId::for_test_label("change-1"),
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         schema_key: "message".to_string(),
-        entity_pk: EntityPk::single("entity-1"),
+        row_pk: RowPk::single("row-1"),
         file_id: Some("file-1".to_string()),
         snapshot: crate::json_store::JsonSlot::None,
         metadata: crate::json_store::JsonSlot::None,

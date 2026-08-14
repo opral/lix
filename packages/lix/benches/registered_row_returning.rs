@@ -1,4 +1,4 @@
-//! Opt-in SQL profiling probe for registered-entity `RETURNING` writes.
+//! Opt-in SQL profiling probe for registered-row `RETURNING` writes.
 //!
 //! The timer encloses only the target write. Each sample receives a fresh
 //! in-memory lix, registered schema, and (for UPDATE) seeded rows before
@@ -6,11 +6,11 @@
 //! are rotated on every round to avoid a fixed run-order advantage.
 //!
 //! ```text
-//! LIX_RETURNING_PROFILE=1 cargo bench -p lix --bench registered_entity_returning
+//! LIX_RETURNING_PROFILE=1 cargo bench -p lix --bench registered_row_returning
 //!
 //! LIX_RETURNING_PROFILE=1 LIX_RETURNING_PROFILE_ROWS=10000 \
 //! LIX_RETURNING_PROFILE_ROUNDS=15 LIX_RETURNING_PROFILE_OPERATIONS=insert \
-//!   cargo bench -p lix --bench registered_entity_returning
+//!   cargo bench -p lix --bench registered_row_returning
 //! ```
 //!
 //! `LIX_RETURNING_PROFILE_ROWS`, `LIX_RETURNING_PROFILE_ROUNDS`, and
@@ -37,11 +37,11 @@ use lix::{Lix, open_lix};
 const DEFAULT_ROWS: usize = 1_000;
 const DEFAULT_ROUNDS: usize = 11;
 const DEFAULT_WARMUP_ROUNDS: usize = 1;
-const ENTITY_TABLE: &str = "benchmark_returning_entity";
+const ROW_TABLE: &str = "benchmark_returning_row";
 const REGISTER_SCHEMA_SQL: &str = "INSERT INTO lix_registered_schema \
     (schema_key, value, lixcol_global, lixcol_untracked) VALUES (\
-    'benchmark_returning_entity', CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\
-    \"key\":\"benchmark_returning_entity\",\"columns\":[\
+    'benchmark_returning_row', CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\
+    \"key\":\"benchmark_returning_row\",\"columns\":[\
     {\"name\":\"id\",\"type\":\"text\",\"nullable\":false},\
     {\"name\":\"payload\",\"type\":\"text\",\"nullable\":false}],\
     \"primary_key\":[\"id\"]}' AS JSONB), false, false)";
@@ -217,9 +217,9 @@ impl SqlPlans {
             write!(values, "('{}', 'before')", row_id(index)).expect("write benchmark INSERT row");
         }
 
-        let insert = format!("INSERT INTO {ENTITY_TABLE} (id, payload) VALUES {values}");
+        let insert = format!("INSERT INTO {ROW_TABLE} (id, payload) VALUES {values}");
         let insert_returning = format!("{insert} RETURNING {}", returning_projection.sql());
-        let update = format!("UPDATE {ENTITY_TABLE} SET payload = 'after'");
+        let update = format!("UPDATE {ROW_TABLE} SET payload = 'after'");
         let update_returning = format!("{update} RETURNING {}", returning_projection.sql());
         Self {
             rows,
@@ -251,21 +251,21 @@ fn main() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("create registered-entity RETURNING profile runtime");
+        .expect("create registered-row RETURNING profile runtime");
     runtime.block_on(run(config));
 }
 
 fn print_usage() {
     println!(
-        "registered_entity_returning is opt-in; run \
-         LIX_RETURNING_PROFILE=1 cargo bench -p lix --bench registered_entity_returning"
+        "registered_row_returning is opt-in; run \
+         LIX_RETURNING_PROFILE=1 cargo bench -p lix --bench registered_row_returning"
     );
 }
 
 async fn run(config: Config) {
     let plans = SqlPlans::new(config.rows, config.returning_projection);
     println!(
-        "registered_entity_returning suite=registered_entity_write rows={} rounds={} \
+        "registered_row_returning suite=registered_row_write rows={} rounds={} \
          warmup_rounds={} projection={} operations=insert:{},update:{}",
         config.rows,
         config.rounds,
@@ -292,7 +292,7 @@ async fn run(config: Config) {
         }
         let p50 = median_ns(sample_set);
         println!(
-            "registered_entity_returning summary operation={} returning={} rows={} \
+            "registered_row_returning summary operation={} returning={} rows={} \
              rounds={} p50_ns={p50} median_ns={p50} p50_ns_per_row={:.3}",
             case.operation.name(),
             case.returning,
@@ -326,7 +326,7 @@ async fn run_round(
         if let Some(samples) = samples.as_deref_mut() {
             samples[case_index].push(elapsed.as_nanos());
             println!(
-                "registered_entity_returning sample operation={} returning={} rows={} \
+                "registered_row_returning sample operation={} returning={} rows={} \
                  round={round} elapsed_ns={}",
                 case.operation.name(),
                 case.returning,
@@ -346,7 +346,7 @@ async fn measure_case(plans: &SqlPlans, case: Case) -> Duration {
     let started = Instant::now();
     let result = session.execute(sql, &[]).await.unwrap_or_else(|error| {
         panic!(
-            "registered-entity {} benchmark SQL failed: {error:?}\\nSQL: {sql}",
+            "registered-row {} benchmark SQL failed: {error:?}\\nSQL: {sql}",
             case.operation.name()
         )
     });
@@ -363,7 +363,7 @@ async fn measure_case(plans: &SqlPlans, case: Case) -> Duration {
 /// post-stage checkpoint path.
 async fn run_explicit_pre_staged_profile(plans: &SqlPlans, rounds: usize, warmup_rounds: usize) {
     println!(
-        "registered_entity_returning explicit_pre_staged rows={} rounds={} warmup_rounds={} \
+        "registered_row_returning explicit_pre_staged rows={} rounds={} warmup_rounds={} \
          projection={}",
         plans.rows,
         rounds,
@@ -387,7 +387,7 @@ async fn run_explicit_pre_staged_profile(plans: &SqlPlans, rounds: usize, warmup
             };
             samples.push(elapsed.as_nanos());
             println!(
-                "registered_entity_returning explicit_pre_staged sample returning={} \
+                "registered_row_returning explicit_pre_staged sample returning={} \
                  rows={} round={round} elapsed_ns={}",
                 returning_case,
                 plans.rows,
@@ -398,7 +398,7 @@ async fn run_explicit_pre_staged_profile(plans: &SqlPlans, rounds: usize, warmup
     let plain_p50 = median_ns(&plain);
     let returning_p50 = median_ns(&returning);
     println!(
-        "registered_entity_returning explicit_pre_staged comparison rows={} \
+        "registered_row_returning explicit_pre_staged comparison rows={} \
          projection={} non_returning_p50_ns={} returning_p50_ns={} \
          returning_to_non_returning_ratio={:.3}x",
         plans.rows,
@@ -414,18 +414,18 @@ async fn measure_explicit_pre_staged_case(plans: &SqlPlans, returning: bool) -> 
     let mut transaction = session
         .begin_transaction()
         .await
-        .expect("open explicit registered-entity RETURNING benchmark transaction");
+        .expect("open explicit registered-row RETURNING benchmark transaction");
     let seeded = transaction
         .execute(&plans.insert, &[])
         .await
-        .expect("seed explicit registered-entity RETURNING benchmark rows");
+        .expect("seed explicit registered-row RETURNING benchmark rows");
     assert_eq!(
         seeded.rows_affected(),
         u64::try_from(plans.rows).expect("benchmark row count fits u64")
     );
 
     let mut sql = format!(
-        "INSERT INTO {ENTITY_TABLE} (id, payload) \
+        "INSERT INTO {ROW_TABLE} (id, payload) \
          VALUES ('explicit-returning-checkpoint-target', 'after')"
     );
     if returning {
@@ -437,9 +437,7 @@ async fn measure_explicit_pre_staged_case(plans: &SqlPlans, returning: bool) -> 
         .execute(&sql, &[])
         .await
         .unwrap_or_else(|error| {
-            panic!(
-                "explicit registered-entity RETURNING benchmark SQL failed: {error:?}\nSQL: {sql}"
-            )
+            panic!("explicit registered-row RETURNING benchmark SQL failed: {error:?}\nSQL: {sql}")
         });
     let elapsed = started.elapsed();
 
@@ -453,7 +451,7 @@ async fn measure_explicit_pre_staged_case(plans: &SqlPlans, returning: bool) -> 
     transaction
         .rollback()
         .await
-        .expect("rollback explicit registered-entity RETURNING benchmark transaction");
+        .expect("rollback explicit registered-row RETURNING benchmark transaction");
     elapsed
 }
 
@@ -462,11 +460,11 @@ async fn new_fixture() -> Lix<Memory> {
     let session = open_lix()
         .with_storage(storage)
         .await
-        .expect("open registered-entity RETURNING benchmark lix");
+        .expect("open registered-row RETURNING benchmark lix");
     let registration = session
         .execute(REGISTER_SCHEMA_SQL, &[])
         .await
-        .expect("register benchmark entity schema");
+        .expect("register benchmark row schema");
     assert_eq!(registration.rows_affected(), 1);
     session
 }
@@ -476,7 +474,7 @@ async fn seeded_fixture(plans: &SqlPlans) -> Lix<Memory> {
     let seed = session
         .execute(&plans.insert, &[])
         .await
-        .expect("seed registered-entity UPDATE benchmark rows");
+        .expect("seed registered-row UPDATE benchmark rows");
     assert_eq!(
         seed.rows_affected(),
         u64::try_from(plans.rows).expect("benchmark row count fits u64")
@@ -544,7 +542,7 @@ fn print_returning_overhead(samples: &[Vec<u128>; CASES.len()], operation: Opera
     let plain_p50 = median_ns(plain);
     let returning_p50 = median_ns(returning);
     println!(
-        "registered_entity_returning comparison operation={} rows={rows} \
+        "registered_row_returning comparison operation={} rows={rows} \
          non_returning_p50_ns={plain_p50} returning_p50_ns={returning_p50} \
          returning_to_non_returning_ratio={:.3}x",
         operation.name(),

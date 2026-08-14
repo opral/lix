@@ -8,7 +8,7 @@ use tracing::Instrument as _;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::plugin::runtime::{
     ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
     load_plugin_registry_at_commit,
@@ -36,8 +36,8 @@ use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
 use crate::transaction::StagedCommitChangeBatchBuilder;
 use crate::plugin::runtime::{
-    WasmByteSource, WasmChangeEffect, WasmConflictResolution, WasmConflictTake, WasmEntityConflict,
-    WasmEntityKey, WasmFileDescriptor, WasmHostBytes, WasmPluginSelection, WasmSourceRange,
+    WasmByteSource, WasmChangeEffect, WasmConflictResolution, WasmConflictTake, WasmRowConflict,
+    WasmRowKey, WasmFileDescriptor, WasmHostBytes, WasmPluginSelection, WasmSourceRange,
     WasmSourceSlice,
 };
 
@@ -94,7 +94,7 @@ pub struct MergeBranchPreview {
 pub struct MergeConflict {
     pub kind: MergeConflictKind,
     pub schema_key: String,
-    pub entity_pk: JsonValue,
+    pub row_pk: JsonValue,
     pub file_id: Option<String>,
     pub target: MergeConflictSide,
     pub source: MergeConflictSide,
@@ -102,7 +102,7 @@ pub struct MergeConflict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeConflictKind {
-    SameEntityChanged,
+    SameRowChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,8 +555,8 @@ where
     // prove one *live, identical* owner across all three historical roots.
     //
     // A missing/tombstoned owner is a file-lifecycle conflict (for example,
-    // delete-vs-edit), not a semantic entity conflict. Letting a resolver
-    // choose an entity value in that case could silently pair a live semantic
+    // delete-vs-edit), not a semantic row conflict. Letting a resolver
+    // choose a row value in that case could silently pair a live semantic
     // row with a deleted file owner. Keep the whole conflict visible until a
     // first-class lifecycle conflict model exists.
     let Some(conflicts) = analysis.conflict_batch() else {
@@ -585,7 +585,7 @@ where
         .map(|file_id| TrackedStateKey {
             schema_key: "lix_key_value".to_owned(),
             file_id: Some(file_id.clone()),
-            entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+            row_pk: RowPk::single(PLUGIN_OWNER_KEY),
         })
         .collect::<Vec<_>>();
     let base_rows = reader
@@ -799,7 +799,7 @@ fn pick_is_derived_plugin_state(
             .any(|schema_key| schema_key == pick.selected_row.schema_key())
 }
 
-/// One historical triple for a plugin-owned semantic entity. The row identity
+/// One historical triple for a plugin-owned semantic row. The row identity
 /// remains host-owned; a Component can only choose or replace the aligned
 /// value and cannot invent a different key during a merge.
 #[derive(Debug, Clone)]
@@ -929,7 +929,7 @@ where
         .map(|conflict| TrackedStateKey {
             schema_key: conflict.identity.schema_key().to_owned(),
             file_id: conflict.identity.file_id().map(str::to_owned),
-            entity_pk: conflict.identity.entity_pk().clone(),
+            row_pk: conflict.identity.row_pk().clone(),
         })
         .collect::<Vec<_>>();
     let base_rows = reader
@@ -1078,7 +1078,7 @@ where
             Ok(TrackedStateKey {
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
                 file_id: Some(file_id.clone()),
-                entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                row_pk: RowPk::uuid_from_canonical(file_id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("validated file ID is not a canonical UUID: {error}"),
@@ -1219,7 +1219,7 @@ where
         let key = TrackedStateKey {
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned(),
             file_id: scope_file_id.map(str::to_owned),
-            entity_pk: EntityPk::uuid_from_canonical(&id).map_err(|error| {
+            row_pk: RowPk::uuid_from_canonical(&id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("validated directory ID is not a canonical UUID: {error}"),
@@ -1485,16 +1485,16 @@ where
             .iter()
             .enumerate()
             .map(|(ordinal, conflict)| {
-                Ok(WasmEntityConflict {
+                Ok(WasmRowConflict {
                     ordinal: u32::try_from(ordinal).map_err(|_| {
                         LixError::new(
                             LixError::CODE_INVALID_PLUGIN,
                             "plugin conflict batch exceeds the u32 ordinal limit",
                         )
                     })?,
-                    key: WasmEntityKey::from_owned_parts(
+                    key: WasmRowKey::from_owned_parts(
                         conflict.identity.schema_key().to_owned(),
-                        conflict.identity.entity_pk().clone().into_parts(),
+                        conflict.identity.row_pk().clone().into_parts(),
                     ),
                     base: conflict_host_snapshot(conflict.base.as_ref())?,
                     a: conflict_host_snapshot(conflict.a.as_ref())?,
@@ -1598,7 +1598,7 @@ fn push_plugin_transaction_row(
     target_branch_id: &SharedStr,
 ) {
     rows.push_parts(
-        Some(identity.entity_pk().clone()),
+        Some(identity.row_pk().clone()),
         identity.schema_key_shared(),
         identity.file_id_shared(),
         snapshot,
@@ -1648,7 +1648,7 @@ fn push_transaction_row_from_tracked_row_ref(
         .cloned()
         .map(TransactionJson::from_unvalidated_shared_normalized_content);
     rows.push_parts(
-        Some(row.entity_pk().clone()),
+        Some(row.row_pk().clone()),
         row.schema_key_shared(),
         row.file_id_shared(),
         snapshot,
@@ -1707,7 +1707,7 @@ where
         keys.push(TrackedStateKeyRef {
             schema_key: pick.selected_row.schema_key(),
             file_id: pick.selected_row.file_id(),
-            entity_pk: pick.selected_row.entity_pk(),
+            row_pk: pick.selected_row.row_pk(),
         });
     }
     debug_assert_eq!(keys.len(), key_count);
@@ -1758,10 +1758,10 @@ where
             Ok(TrackedStateKeyRef {
                 schema_key: row.schema_key.as_str(),
                 file_id: row.file_id.map(SharedStr::as_str),
-                entity_pk: row.entity_pk.ok_or_else(|| {
+                row_pk: row.row_pk.ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "plugin resolution row omitted its entity identity",
+                        "plugin resolution row omitted its row identity",
                     )
                 })?,
             })
@@ -1913,10 +1913,10 @@ fn merge_conflict_from_analysis(
 ) -> Result<MergeConflict, LixError> {
     Ok(MergeConflict {
         kind: match conflict.kind() {
-            AnalysisMergeConflictKind::SameEntityChanged => MergeConflictKind::SameEntityChanged,
+            AnalysisMergeConflictKind::SameRowChanged => MergeConflictKind::SameRowChanged,
         },
         schema_key: conflict.schema_key().to_owned(),
-        entity_pk: conflict.entity_pk().as_json_array_value()?,
+        row_pk: conflict.row_pk().as_json_array_value()?,
         file_id: conflict.file_id().map(str::to_owned),
         target: merge_conflict_side_from_analysis(conflict.target()),
         source: merge_conflict_side_from_analysis(conflict.source()),
@@ -1942,7 +1942,7 @@ fn merge_conflict_error(conflicts: &[MergeConflict]) -> Result<LixError, LixErro
         LixError::CODE_MERGE_CONFLICT,
         format!("merge_branch found {conflict_count} tracked-state conflict(s)"),
     )
-    .with_hint("Resolve the conflicting entities in the target branch, then retry the merge.")
+    .with_hint("Resolve the conflicting rows in the target branch, then retry the merge.")
     .with_details(json!({
         "conflicts": conflicts.iter()
             .map(merge_conflict_details)
@@ -1953,10 +1953,10 @@ fn merge_conflict_error(conflicts: &[MergeConflict]) -> Result<LixError, LixErro
 fn merge_conflict_details(conflict: &MergeConflict) -> serde_json::Value {
     json!({
         "kind": match conflict.kind {
-            MergeConflictKind::SameEntityChanged => "sameEntityChanged",
+            MergeConflictKind::SameRowChanged => "sameRowChanged",
         },
         "schemaKey": conflict.schema_key,
-        "entityPk": conflict.entity_pk,
+        "rowPk": conflict.row_pk,
         "fileId": conflict.file_id,
         "target": merge_conflict_side_details(&conflict.target),
         "source": merge_conflict_side_details(&conflict.source),
@@ -1987,7 +1987,7 @@ mod tests {
         name: &str,
     ) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_pk: EntityPk::single(file_id),
+            row_pk: RowPk::single(file_id),
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
             file_id: Some(file_id.to_string()),
             snapshot_content: Some(
@@ -2048,7 +2048,7 @@ mod tests {
         )
         .unwrap();
         MaterializedTrackedStateRow {
-            entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+            row_pk: RowPk::single(PLUGIN_OWNER_KEY),
             schema_key: "lix_key_value".to_owned(),
             file_id: Some(file_id.to_owned()),
             snapshot_content: Some(owner.to_snapshot().unwrap().to_string().into()),
@@ -2065,7 +2065,7 @@ mod tests {
     fn certified_rows_must_match_merge_analysis_roots() {
         let batch = crate::tracked_state::MaterializedTrackedStateBatch::from_rows(vec![
             MaterializedTrackedStateRow {
-                entity_pk: EntityPk::single("certified-row"),
+                row_pk: RowPk::single("certified-row"),
                 schema_key: "certified_schema".to_owned(),
                 file_id: Some("certified-file".to_owned()),
                 snapshot_content: Some(r#"{"value":"base"}"#.into()),
@@ -2172,7 +2172,7 @@ mod tests {
             identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
                 schema_key: "csv_row".to_owned(),
                 file_id: Some("01920000-0000-7000-8000-0000000000a2".to_owned()),
-                entity_pk: EntityPk::single("row-a"),
+                row_pk: RowPk::single("row-a"),
             }),
             base: None,
             a: None,
@@ -2208,7 +2208,7 @@ mod tests {
             identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
                 schema_key: "csv_row".to_owned(),
                 file_id: Some("01920000-0000-7000-8000-0000000000a2".to_owned()),
-                entity_pk: EntityPk::single("row-a"),
+                row_pk: RowPk::single("row-a"),
             }),
             base: None,
             a: None,
@@ -2269,14 +2269,14 @@ mod tests {
     #[test]
     fn ten_thousand_conflict_takes_lower_into_one_shared_raw_batch() {
         const ROW_COUNT: usize = 10_000;
-        let entity_pks = (0..ROW_COUNT)
-            .map(|index| EntityPk::single(format!("row-{index:05}")))
+        let row_pks = (0..ROW_COUNT)
+            .map(|index| RowPk::single(format!("row-{index:05}")))
             .collect::<Vec<_>>();
         let identities =
-            TrackedStateDiffIdentity::from_key_refs(entity_pks.len(), |index| TrackedStateKeyRef {
+            TrackedStateDiffIdentity::from_key_refs(row_pks.len(), |index| TrackedStateKeyRef {
                 schema_key: "csv_row",
                 file_id: Some("01920000-0000-7000-8000-0000000000a2"),
-                entity_pk: &entity_pks[index],
+                row_pk: &row_pks[index],
             })
             .expect("shared conflict identity batch should seal");
         let payload = PluginMergeConflictPayload {
@@ -2328,14 +2328,14 @@ mod tests {
         assert!(first.branch_id.shares_buffer_with(last.branch_id));
         assert_eq!(
             first
-                .entity_pk
+                .row_pk
                 .expect("first identity")
                 .as_single_string()
                 .expect("single first identity"),
             "row-00000"
         );
         assert_eq!(
-            last.entity_pk
+            last.row_pk
                 .expect("last identity")
                 .as_single_string()
                 .expect("single last identity"),

@@ -21,7 +21,7 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
@@ -325,7 +325,7 @@ impl ImmutableMutationJournalChunk {
         self.identity_offsets.len()
     }
 
-    pub(crate) fn materialized_entity_pks(&self) -> Arc<[EntityPk]> {
+    pub(crate) fn materialized_row_pks(&self) -> Arc<[RowPk]> {
         self.identity_offsets
             .iter()
             .map(|&(start, end)| {
@@ -333,7 +333,7 @@ impl ImmutableMutationJournalChunk {
                     .identity_arena
                     .slice(start as usize..end as usize)
                     .expect("validated immutable mutation identity remains in its arena");
-                EntityPk::from_validated_shared_string(value)
+                RowPk::from_validated_shared_string(value)
             })
             .collect::<Vec<_>>()
             .into()
@@ -515,14 +515,14 @@ impl ImmutableMutationJournalChunk {
         self,
         allow_missing_predecessors: bool,
     ) -> Result<PreparedStateBatch, LixError> {
-        let entity_pks = self.materialized_entity_pks();
+        let row_pks = self.materialized_row_pks();
         let offsets = self
             .snapshot_offsets
             .iter()
             .map(|&(start, end)| (start as usize, end as usize))
             .collect();
         let mut rows = CertifiedParameterReplacementBatch::new(
-            entity_pks.iter().cloned().collect(),
+            row_pks.iter().cloned().collect(),
             TransactionJson::from_certified_row_content_arena(
                 self.snapshot_arena.as_bytes().to_vec(),
                 offsets,
@@ -603,7 +603,7 @@ pub(crate) struct OrderedMutationJournalRows<'a> {
 pub(crate) struct ProvisionalMutationJournalDescriptor {
     schema_key: SharedStr,
     branch_id: SharedStr,
-    entity_pk_chunks: Vec<Arc<[EntityPk]>>,
+    row_pk_chunks: Vec<Arc<[RowPk]>>,
     predecessors_complete: bool,
 }
 
@@ -621,8 +621,8 @@ impl ProvisionalMutationJournalDescriptor {
         self.branch_id.as_str()
     }
 
-    pub(crate) fn entity_pk_chunks(&self) -> &[Arc<[EntityPk]>] {
-        &self.entity_pk_chunks
+    pub(crate) fn row_pk_chunks(&self) -> &[Arc<[RowPk]>] {
+        &self.row_pk_chunks
     }
 
     pub(crate) fn predecessors_complete(&self) -> bool {
@@ -758,14 +758,14 @@ struct StagedScanFileCandidates {
     null_slots: SmallVec<[RowSlot; 1]>,
 }
 
-/// Narrows entity- or file-constrained scans over an indexed transaction
+/// Narrows row- or file-constrained scans over an indexed transaction
 /// overlay without changing the journal's identity/coalescing semantics.
 /// Branch and durability remain post-filter checks because one indexed
 /// candidate can legitimately have multiple such physical rows while staged.
 #[derive(Clone, Default)]
 struct StagedScanCandidateIndex {
     slots_by_schema: HashMap<SharedStr, SmallVec<[RowSlot; 1]>>,
-    slots_by_schema_and_entity: HashMap<SharedStr, HashMap<EntityPk, SmallVec<[RowSlot; 1]>>>,
+    slots_by_schema_and_row: HashMap<SharedStr, HashMap<RowPk, SmallVec<[RowSlot; 1]>>>,
     slots_by_schema_and_file: HashMap<SharedStr, StagedScanFileCandidates>,
 }
 
@@ -775,10 +775,10 @@ impl StagedScanCandidateIndex {
             .entry(row.schema_key.clone())
             .or_default()
             .push(slot);
-        self.slots_by_schema_and_entity
+        self.slots_by_schema_and_row
             .entry(row.schema_key.clone())
             .or_default()
-            .entry(row.entity_pk.clone())
+            .entry(row.row_pk.clone())
             .or_default()
             .push(slot);
 
@@ -798,7 +798,7 @@ impl StagedScanCandidateIndex {
     }
 
     /// Returns a strict superset of the staged rows a scan can observe when
-    /// schema plus either entity or file identity are constrained. The
+    /// schema plus either row or file identity are constrained. The
     /// remaining scan filters are deliberately applied by the established
     /// matcher afterwards.
     fn slots_for_filter<'a>(
@@ -809,14 +809,14 @@ impl StagedScanCandidateIndex {
             return None;
         }
 
-        if !filter.entity_pks.is_empty() {
-            if let ([schema_key], [entity_pk]) =
-                (filter.schema_keys.as_slice(), filter.entity_pks.as_slice())
+        if !filter.row_pks.is_empty() {
+            if let ([schema_key], [row_pk]) =
+                (filter.schema_keys.as_slice(), filter.row_pks.as_slice())
             {
                 let slots = self
-                    .slots_by_schema_and_entity
+                    .slots_by_schema_and_row
                     .get(schema_key.as_str())
-                    .and_then(|by_entity| by_entity.get(entity_pk))
+                    .and_then(|by_row| by_row.get(row_pk))
                     .map(SmallVec::as_slice)
                     .unwrap_or(&[]);
                 return Some(Cow::Borrowed(slots));
@@ -824,12 +824,12 @@ impl StagedScanCandidateIndex {
 
             let mut slots = Vec::new();
             for schema_key in &filter.schema_keys {
-                let Some(by_entity) = self.slots_by_schema_and_entity.get(schema_key.as_str())
+                let Some(by_row) = self.slots_by_schema_and_row.get(schema_key.as_str())
                 else {
                     continue;
                 };
-                for entity_pk in &filter.entity_pks {
-                    if let Some(candidate_slots) = by_entity.get(entity_pk) {
+                for row_pk in &filter.row_pks {
+                    if let Some(candidate_slots) = by_row.get(row_pk) {
                         slots.extend(candidate_slots.iter().copied());
                     }
                 }
@@ -944,13 +944,13 @@ enum AppendOnlyStage {
 }
 
 /// The ordering used by the tracked-state tree. This deliberately differs
-/// from [`PreparedStateRowIdentity`], whose entity-first order is for exact
+/// from [`PreparedStateRowIdentity`], whose row-first order is for exact
 /// lookup rather than bulk root construction.
 #[derive(Clone)]
 struct TrackedStateKey {
     schema_key: SharedStr,
     file_id: Option<SharedStr>,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
 }
 
 impl TrackedStateKey {
@@ -958,7 +958,7 @@ impl TrackedStateKey {
         Self {
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.cloned(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
         }
     }
 }
@@ -981,7 +981,7 @@ pub(crate) struct DrainedMutationJournalDescriptor {
     pub(crate) commit_id: CommitId,
     pub(crate) schema_key: String,
     pub(crate) branch_id: String,
-    pub(crate) entity_pk_chunks: Vec<Arc<[EntityPk]>>,
+    pub(crate) row_pk_chunks: Vec<Arc<[RowPk]>>,
 }
 
 pub(crate) struct PreparedWriteValidationSet<'a> {
@@ -1005,7 +1005,7 @@ pub(crate) struct PreparedWriteValidationIndex<'a> {
 /// semantics after transaction-local coalescing. Original SQL origin metadata
 /// stays in one contiguous parallel column so an INSERT followed by an UPDATE
 /// retains the original primary-key error surface without cloning the row's
-/// schema, file, branch, or entity identity.
+/// schema, file, branch, or row identity.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparedInsertSelection {
     row_count: usize,
@@ -1262,9 +1262,9 @@ pub(crate) enum PreparedValidationRow<'a> {
 }
 
 impl<'a> PreparedValidationRow<'a> {
-    pub(crate) fn entity_pk(&self) -> &EntityPk {
+    pub(crate) fn row_pk(&self) -> &RowPk {
         match self {
-            Self::State(row) => row.entity_pk,
+            Self::State(row) => row.row_pk,
         }
     }
 
@@ -1353,7 +1353,7 @@ impl<'a> PreparedValidationRow<'a> {
         DomainRowIdentity::in_domain(
             self.domain(),
             self.schema_key().to_string(),
-            self.entity_pk().clone(),
+            self.row_pk().clone(),
         )
     }
 }
@@ -1430,10 +1430,10 @@ impl PreparedWriteSet {
                         commit_id: refs.commit_id,
                         schema_key: journal.schema_key().to_owned(),
                         branch_id: journal.branch_id().to_owned(),
-                        entity_pk_chunks: journal
+                        row_pk_chunks: journal
                             .chunks
                             .iter()
-                            .map(ImmutableMutationJournalChunk::materialized_entity_pks)
+                            .map(ImmutableMutationJournalChunk::materialized_row_pks)
                             .collect(),
                     })
             })
@@ -1921,10 +1921,10 @@ impl TransactionWriteBuffer {
             .map(|journal| ProvisionalMutationJournalDescriptor {
                 schema_key: journal.chunks[0].schema_key.clone(),
                 branch_id: journal.chunks[0].branch_id.clone(),
-                entity_pk_chunks: journal
+                row_pk_chunks: journal
                     .chunks
                     .iter()
-                    .map(ImmutableMutationJournalChunk::materialized_entity_pks)
+                    .map(ImmutableMutationJournalChunk::materialized_row_pks)
                     .collect(),
                 predecessors_complete: journal
                     .chunks
@@ -2332,7 +2332,7 @@ impl TransactionWriteBuffer {
         let Some(schema_key) = request.filter.schema_keys.iter().min() else {
             return Ok(false);
         };
-        let Some(entity_pk) = request.filter.entity_pks.iter().min() else {
+        let Some(row_pk) = request.filter.row_pks.iter().min() else {
             return Ok(false);
         };
         let file_id =
@@ -2354,7 +2354,7 @@ impl TransactionWriteBuffer {
                     .min()
             };
         Ok(
-            compare_tracked_key_to_parts(last_key, schema_key, file_id, entity_pk)
+            compare_tracked_key_to_parts(last_key, schema_key, file_id, row_pk)
                 == std::cmp::Ordering::Less,
         )
     }
@@ -2839,7 +2839,7 @@ impl TransactionWriteBuffer {
         branch_id: &str,
         schema_key: &str,
         file_id: Option<&str>,
-        entity_pk: &EntityPk,
+        row_pk: &RowPk,
     ) -> Result<bool, LixError> {
         let ordered = self.ordered_mutations.lock().map_err(|_| {
             LixError::new(
@@ -2848,7 +2848,7 @@ impl TransactionWriteBuffer {
             )
         })?;
         if ordered.as_ref().is_some_and(|journal| {
-            ordered_mutation_journal_row(journal, branch_id, schema_key, file_id, entity_pk)
+            ordered_mutation_journal_row(journal, branch_id, schema_key, file_id, row_pk)
                 .is_some()
         }) {
             return Ok(true);
@@ -2863,14 +2863,14 @@ impl TransactionWriteBuffer {
         Ok(match &*rows {
             StagedPreparedRows::AppendOnly { last_key, .. } => {
                 last_key.as_ref().is_some_and(|last_key| {
-                    compare_tracked_key_to_parts(last_key, schema_key, file_id, entity_pk)
+                    compare_tracked_key_to_parts(last_key, schema_key, file_id, row_pk)
                         != std::cmp::Ordering::Less
                 })
             }
             StagedPreparedRows::Indexed { by_identity, .. } => {
                 by_identity.contains_key(&PreparedStateRowIdentity {
                     schema_key: schema_key.into(),
-                    entity_pk: entity_pk.clone(),
+                    row_pk: row_pk.clone(),
                     file_id: file_id.map(Into::into),
                     branch_id: branch_id.into(),
                 })
@@ -3350,7 +3350,7 @@ fn compare_rows_by_tracked_key(
                 .map(|value| value.as_str())
                 .cmp(&right.file_id.map(SharedStr::as_str))
         })
-        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+        .then_with(|| left.row_pk.cmp(right.row_pk))
 }
 
 fn compare_tracked_key_to_row(
@@ -3365,7 +3365,7 @@ fn compare_tracked_key_to_row(
                 .map(SharedStr::as_str)
                 .cmp(&right.file_id.map(SharedStr::as_str))
         })
-        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+        .then_with(|| left.row_pk.cmp(right.row_pk))
 }
 
 fn compare_tracked_key_to_exact_request(
@@ -3376,7 +3376,7 @@ fn compare_tracked_key_to_exact_request(
         left,
         right.schema_key.as_str(),
         right.file_id.as_deref(),
-        &right.entity_pk,
+        &right.row_pk,
     )
 }
 
@@ -3384,13 +3384,13 @@ fn compare_tracked_key_to_parts(
     left: &TrackedStateKey,
     schema_key: &str,
     file_id: Option<&str>,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
 ) -> std::cmp::Ordering {
     left.schema_key
         .as_str()
         .cmp(schema_key)
         .then_with(|| left.file_id.as_ref().map(SharedStr::as_str).cmp(&file_id))
-        .then_with(|| left.entity_pk.cmp(entity_pk))
+        .then_with(|| left.row_pk.cmp(row_pk))
 }
 
 fn reorder_rows_by_source_permutation(
@@ -3527,9 +3527,9 @@ impl PreparedStateRowOverlay {
 
         if let Some(slots) = by_candidate.slots_for_filter(&request.filter) {
             // `slots_for_filter` already selected these rows by schema and,
-            // when present, entity primary key. Rechecking a large entity-PK
+            // when present, row primary key. Rechecking a large row-PK
             // predicate here turns a keyed transaction-overlay read into an
-            // O(candidates * entity_pks) scan. The remaining branch,
+            // O(candidates * row_pks) scan. The remaining branch,
             // retention, and file filters still need their established final
             // matching because candidate slots intentionally retain their
             // possible global fallbacks.
@@ -3692,7 +3692,7 @@ impl crate::hot_state::StagedHotStateRows for PreparedStateRowOverlay {
                 continue;
             }
             let (target_schema_key, target_file_id) =
-                crate::collection_generation::collection_scope_from_entity_pk(row.entity_pk)?;
+                crate::collection_generation::collection_scope_from_row_pk(row.row_pk)?;
             if target_schema_key == schema_key
                 && (target_file_id.is_none() || target_file_id.as_deref() == file_id)
             {
@@ -3708,15 +3708,15 @@ fn ordered_mutation_journal_row<'a>(
     branch_id: &str,
     schema_key: &str,
     file_id: Option<&str>,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
 ) -> Option<(&'a ImmutableMutationJournalChunk, usize)> {
     if file_id.is_some() || journal.branch_id() != branch_id || journal.schema_key() != schema_key {
         return None;
     }
-    let entity_pk = entity_pk.as_single_string().ok()?;
+    let row_pk = row_pk.as_single_string().ok()?;
     let chunk_index = journal
         .chunks
-        .partition_point(|chunk| chunk.len() > 0 && chunk.identity(chunk.len() - 1) < entity_pk);
+        .partition_point(|chunk| chunk.len() > 0 && chunk.identity(chunk.len() - 1) < row_pk);
     let chunk = journal.chunks.get(chunk_index)?;
     chunk
         .identity_offsets
@@ -3726,7 +3726,7 @@ fn ordered_mutation_journal_row<'a>(
                 .as_str()
                 .get(start as usize..end as usize)
                 .expect("validated immutable mutation identity UTF-8")
-                .cmp(entity_pk)
+                .cmp(row_pk)
         })
         .ok()
         .map(|index| (chunk, index))
@@ -3769,9 +3769,9 @@ fn push_ordered_mutation_materialized(
                 "immutable mutation identity escaped its shared arena",
             )
         })?;
-    let entity_pk = EntityPk::from_validated_shared_string(identity);
+    let row_pk = RowPk::from_validated_shared_string(identity);
     let ordinal = output.push_materialized_ref(
-        &entity_pk,
+        &row_pk,
         chunk.schema_key(),
         None,
         Some(snapshot),
@@ -3826,7 +3826,7 @@ fn append_matching_ordered_mutations(
     {
         return Ok(());
     }
-    if request.filter.entity_pks.is_empty() {
+    if request.filter.row_pks.is_empty() {
         for chunk in journal.chunks.iter() {
             for row_index in 0..chunk.len() {
                 push_ordered_mutation_materialized(output, journal, chunk, row_index)?;
@@ -3838,16 +3838,16 @@ fn append_matching_ordered_mutations(
     // Preserve the journal's identity order while routing each requested key
     // through the chunk directory. This avoids the previous O(journal rows ×
     // requested keys) membership loop for large IN predicates.
-    let mut requested = request.filter.entity_pks.iter().collect::<Vec<_>>();
+    let mut requested = request.filter.row_pks.iter().collect::<Vec<_>>();
     requested.sort_unstable();
     requested.dedup();
-    for entity_pk in requested {
+    for row_pk in requested {
         let Some((chunk, row_index)) = ordered_mutation_journal_row(
             journal,
             journal.branch_id(),
             journal.schema_key(),
             None,
-            entity_pk,
+            row_pk,
         ) else {
             continue;
         };
@@ -3882,7 +3882,7 @@ fn load_ordered_mutation_exact_batch(
                 &request_row.branch_id,
                 &request_row.schema_key,
                 request_row.file_id.as_deref(),
-                &request_row.entity_pk,
+                &request_row.row_pk,
             ) else {
                 return Ok(None);
             };
@@ -3912,7 +3912,7 @@ fn append_only_collection_replaced(
             continue;
         }
         let (target_schema_key, target_file_id) =
-            crate::collection_generation::collection_scope_from_entity_pk(row.entity_pk)?;
+            crate::collection_generation::collection_scope_from_row_pk(row.row_pk)?;
         if target_schema_key == schema_key
             && (target_file_id.is_none() || target_file_id.as_deref() == file_id)
         {
@@ -3957,7 +3957,7 @@ pub(crate) enum StagedExactRow {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PreparedStateRowIdentity {
     schema_key: SharedStr,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     file_id: Option<SharedStr>,
     branch_id: SharedStr,
 }
@@ -3966,7 +3966,7 @@ impl PreparedStateRowIdentity {
     fn from_staged_row(row: PreparedStateRowRef<'_>) -> Self {
         Self {
             schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.cloned(),
             branch_id: row.branch_id.clone(),
         }
@@ -3975,7 +3975,7 @@ impl PreparedStateRowIdentity {
     fn from_exact_request(request: &HotStateExactRowRequest) -> Self {
         Self {
             schema_key: request.schema_key.as_str().into(),
-            entity_pk: request.entity_pk.clone(),
+            row_pk: request.row_pk.clone(),
             file_id: request.file_id.as_deref().map(Into::into),
             branch_id: request.branch_id.as_str().into(),
         }
@@ -3991,7 +3991,7 @@ impl PreparedStateRowIdentity {
         };
         Some(Self {
             schema_key: request.schema_key.as_str().into(),
-            entity_pk: request.entity_pk.clone(),
+            row_pk: request.row_pk.clone(),
             file_id: file_id.map(Into::into),
             branch_id: request.branch_id.as_str().into(),
         })
@@ -4003,7 +4003,7 @@ impl From<&TestPreparedStateRow> for PreparedStateRowIdentity {
     fn from(row: &TestPreparedStateRow) -> Self {
         Self {
             schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.clone(),
             branch_id: row.branch_id.clone(),
         }
@@ -4027,7 +4027,7 @@ impl From<&MaterializedHotStateRow> for PreparedStateRowIdentity {
     fn from(row: &MaterializedHotStateRow) -> Self {
         Self {
             schema_key: row.schema_key.as_str().into(),
-            entity_pk: row.entity_pk.clone(),
+            row_pk: row.row_pk.clone(),
             file_id: row.file_id.as_deref().map(Into::into),
             branch_id: row.branch_id.as_ref().into(),
         }
@@ -4128,15 +4128,15 @@ fn retain_earliest_batch_identity_violation<'a>(
 }
 
 fn mixed_durability_error(row: PreparedStateRowRef<'_>) -> LixError {
-    let entity_pk = row
-        .entity_pk
+    let row_pk = row
+        .row_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_INVALID_PARAM,
         format!(
-            "cannot mix tracked and untracked writes for schema '{}' entity_pk '{}' in branch '{}' within one transaction; commit or roll back before changing durability",
-            row.schema_key, entity_pk, row.branch_id
+            "cannot mix tracked and untracked writes for schema '{}' row_pk '{}' in branch '{}' within one transaction; commit or roll back before changing durability",
+            row.schema_key, row_pk, row.branch_id
         ),
     )
 }
@@ -4148,12 +4148,12 @@ fn duplicate_staged_present_row_error(
     let message = logical_primary_key_violation_message(row.origin)
         .unwrap_or_else(|| {
             format!(
-                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_pk '{}' in branch '{}'",
+                "primary-key constraint violation on schema '{}': duplicate staged rows for row_pk '{}' in branch '{}'",
                 row.schema_key,
                 previous
-                    .entity_pk
+                    .row_pk
                     .as_json_array_text()
-                    .unwrap_or_else(|_| "<invalid entity_pk>".to_string()),
+                    .unwrap_or_else(|_| "<invalid row_pk>".to_string()),
                 row.branch_id
             )
         });
@@ -4162,22 +4162,22 @@ fn duplicate_staged_present_row_error(
 
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     branch_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
 ) -> String {
     if let Some(message) = logical_primary_key_violation_message(origin) {
         return message;
     }
-    let entity_pk = entity_pk
+    let row_pk = row_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     match branch_id {
         Some(branch_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}' in branch '{branch_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate row_pk '{row_pk}' in branch '{branch_id}'"
         ),
         None => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate row_pk '{row_pk}'"
         ),
     }
 }
@@ -4185,7 +4185,7 @@ pub(crate) fn duplicate_insert_identity_message(
 fn duplicate_insert_identity_error(row: PreparedStateRowRef<'_>) -> LixError {
     let message = duplicate_insert_identity_message(
         row.schema_key,
-        row.entity_pk,
+        row.row_pk,
         Some(row.branch_id),
         row.origin,
     );
@@ -4276,14 +4276,14 @@ fn append_matching_staged_rows(
     slots: impl IntoIterator<Item = RowSlot>,
     staged_rows: &PreparedStateBatch,
     request: &HotStateScanRequest,
-    candidate_index_matched_schema_and_entity: bool,
+    candidate_index_matched_schema_and_row: bool,
 ) {
     for slot in slots {
         let RowSlot::State(index) = slot;
         let Some(row) = staged_rows.get(index) else {
             continue;
         };
-        if staged_row_identity_matches_scan(row, request, candidate_index_matched_schema_and_entity)
+        if staged_row_identity_matches_scan(row, request, candidate_index_matched_schema_and_row)
         {
             push_prepared_materialized(output, row);
         }
@@ -4295,7 +4295,7 @@ fn push_prepared_materialized(
     row: PreparedStateRowRef<'_>,
 ) -> usize {
     output.push_materialized_ref(
-        row.entity_pk,
+        row.row_pk,
         row.schema_key.as_str(),
         row.file_id.map(SharedStr::as_str),
         row.snapshot.map(StageJson::materialize_shared),
@@ -4316,9 +4316,9 @@ fn push_prepared_materialized(
 fn staged_row_identity_matches_scan(
     row: PreparedStateRowRef<'_>,
     request: &HotStateScanRequest,
-    candidate_index_matched_schema_and_entity: bool,
+    candidate_index_matched_schema_and_row: bool,
 ) -> bool {
-    if !candidate_index_matched_schema_and_entity
+    if !candidate_index_matched_schema_and_row
         && !request.filter.schema_keys.is_empty()
         && !request
             .filter
@@ -4328,9 +4328,9 @@ fn staged_row_identity_matches_scan(
     {
         return false;
     }
-    if !candidate_index_matched_schema_and_entity
-        && !request.filter.entity_pks.is_empty()
-        && !request.filter.entity_pks.contains(row.entity_pk)
+    if !candidate_index_matched_schema_and_row
+        && !request.filter.row_pks.is_empty()
+        && !request.filter.row_pks.contains(row.row_pk)
     {
         return false;
     }
@@ -4584,12 +4584,12 @@ mod tests {
         let staged_writes = test_staged_writes();
         for rows in [
             prepared_rows![
-                tracked_append_row("entity-a", "first"),
-                tracked_append_row("entity-b", "second"),
+                tracked_append_row("row-a", "first"),
+                tracked_append_row("row-b", "second"),
             ],
             prepared_rows![
-                tracked_append_row("entity-c", "third"),
-                tracked_append_row("entity-d", "fourth"),
+                tracked_append_row("row-c", "third"),
+                tracked_append_row("row-d", "fourth"),
             ],
         ] {
             staged_writes
@@ -4625,21 +4625,21 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![tracked_append_row("entity-a", "first")],
+                rows: prepared_rows![tracked_append_row("row-a", "first")],
             })
             .expect("first ordered replacement should stage");
         let overlay = staged_writes
             .staging_overlay()
             .expect("ordered journal overlay should build");
-        let exact = |entity: &str| HotStateExactRowRequest {
+        let exact = |row: &str| HotStateExactRowRequest {
             schema_key: "lix_key_value".into(),
             branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
-            entity_pk: EntityPk::single(entity),
+            row_pk: RowPk::single(row),
             file_id: None,
         };
 
         let future_scan = overlay
-            .scan(&scan_request_for_key("entity-b", false))
+            .scan(&scan_request_for_key("row-b", false))
             .expect("future keyed scan should be proven absent");
         assert!(future_scan.is_empty());
         assert!(
@@ -4650,7 +4650,7 @@ mod tests {
         let future = StagedHotStateRows::load_exact_batch(
             &overlay,
             &HotStateExactBatchRequest {
-                rows: vec![exact("entity-b")],
+                rows: vec![exact("row-b")],
                 ..Default::default()
             },
         )
@@ -4664,7 +4664,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![tracked_append_row("entity-b", "second")],
+                rows: prepared_rows![tracked_append_row("row-b", "second")],
             })
             .expect("future ordered replacement should extend the journal");
         assert!(
@@ -4675,7 +4675,7 @@ mod tests {
         let overlap = StagedHotStateRows::load_exact_batch(
             &overlay,
             &HotStateExactBatchRequest {
-                rows: vec![exact("entity-a")],
+                rows: vec![exact("row-a")],
                 ..Default::default()
             },
         )
@@ -4694,7 +4694,7 @@ mod tests {
         ordinary_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![tracked_append_row("entity-a", "first")],
+                rows: prepared_rows![tracked_append_row("row-a", "first")],
             })
             .expect("ordinary replacement should stage");
         let ordinary_overlay = ordinary_writes
@@ -4750,12 +4750,12 @@ mod tests {
         let staged_writes = test_staged_writes();
         for rows in [
             prepared_rows![
-                tracked_append_row("entity-a", "first"),
-                tracked_append_row("entity-b", "second"),
+                tracked_append_row("row-a", "first"),
+                tracked_append_row("row-b", "second"),
             ],
             prepared_rows![
-                tracked_append_row("entity-c", "third"),
-                tracked_append_row("entity-d", "fourth"),
+                tracked_append_row("row-c", "third"),
+                tracked_append_row("row-d", "fourth"),
             ],
         ] {
             staged_writes
@@ -4794,8 +4794,8 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: prepared_rows![
-                    tracked_append_row("entity-a", "first"),
-                    tracked_append_row("entity-b", "second"),
+                    tracked_append_row("row-a", "first"),
+                    tracked_append_row("row-b", "second"),
                 ],
             })
             .expect("initial ordered insert batch should use the journal");
@@ -4804,8 +4804,8 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: prepared_rows![
-                    tracked_append_row("entity-a", "duplicate")
-                        .with_change_id("duplicate-entity-a"),
+                    tracked_append_row("row-a", "duplicate")
+                        .with_change_id("duplicate-row-a"),
                 ],
             })
             .expect_err("a later INSERT must reject a journaled identity");
@@ -4828,7 +4828,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
-                rows: prepared_rows![tracked_append_row("entity-a", "first")],
+                rows: prepared_rows![tracked_append_row("row-a", "first")],
             })
             .expect("initial INSERT should stage");
 
@@ -4836,9 +4836,9 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: prepared_rows![
-                    tracked_append_row("entity-c", "must-not-stage"),
-                    tracked_append_row("entity-a", "duplicate")
-                        .with_change_id("duplicate-entity-a"),
+                    tracked_append_row("row-c", "must-not-stage"),
+                    tracked_append_row("row-a", "duplicate")
+                        .with_change_id("duplicate-row-a"),
                 ],
             })
             .expect_err("the later duplicate must reject the whole incoming batch");
@@ -4851,7 +4851,7 @@ mod tests {
             overlay
                 .load_exact(&exact_request_for_branch_key(
                     "01920000-0000-7000-8000-0000000000a1",
-                    "entity-c",
+                    "row-c",
                 ))
                 .is_none(),
             "the successful prefix of a failed batch must not become a phantom overlay row"
@@ -4863,10 +4863,10 @@ mod tests {
             drained
                 .state_rows
                 .row(0)
-                .entity_pk
+                .row_pk
                 .as_single_string()
-                .expect("scalar entity"),
-            "entity-a"
+                .expect("scalar row"),
+            "row-a"
         );
         assert_eq!(drained.insert_selection.len(), 1);
         assert_eq!(
@@ -4901,8 +4901,8 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
-                    tracked_append_row("entity-a", "first"),
-                    tracked_append_row("entity-b", "second"),
+                    tracked_append_row("row-a", "first"),
+                    tracked_append_row("row-b", "second"),
                 ],
             })
             .expect("first tracked batch should still use the journal");
@@ -4916,8 +4916,8 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
-                    tracked_append_row("entity-a", "first"),
-                    tracked_append_row("entity-b", "second"),
+                    tracked_append_row("row-a", "first"),
+                    tracked_append_row("row-b", "second"),
                 ],
             })
             .expect("tracked batch should stage");
@@ -4929,7 +4929,7 @@ mod tests {
         let row = overlay
             .load_exact(&exact_request_for_branch_key(
                 "01920000-0000-7000-8000-0000000000a1",
-                "entity-b",
+                "row-b",
             ))
             .expect("staged row should answer the exact read");
         assert!(matches!(row, StagedExactRow::Row(_)));
@@ -4939,7 +4939,7 @@ mod tests {
             overlay
                 .load_exact(&exact_request_for_branch_key(
                     "01920000-0000-7000-8000-0000000000a1",
-                    "entity-a"
+                    "row-a"
                 ))
                 .is_some()
         );
@@ -4956,7 +4956,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![tracked_append_row("entity-a", "ordinary")],
+                rows: prepared_rows![tracked_append_row("row-a", "ordinary")],
             })
             .expect("ordinary row should stage");
         let overlay = staged_writes
@@ -4964,7 +4964,7 @@ mod tests {
             .expect("overlay should build");
         assert!(
             overlay
-                .load_exact(&exact_request_for_branch_key(branch_id, "entity-a"))
+                .load_exact(&exact_request_for_branch_key(branch_id, "row-a"))
                 .is_some()
         );
         assert!(staged_writes.uses_identity_index_for_tests());
@@ -5013,7 +5013,7 @@ mod tests {
         ordinary_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![tracked_append_row("entity-a", "ordinary")],
+                rows: prepared_rows![tracked_append_row("row-a", "ordinary")],
             })
             .expect("ordinary row should stage");
         assert!(
@@ -5053,8 +5053,8 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
-                    tracked_append_row("entity-a", "first"),
-                    tracked_append_row("entity-b", "before"),
+                    tracked_append_row("row-a", "first"),
+                    tracked_append_row("row-b", "before"),
                 ],
             })
             .expect("initial tracked batch should stage");
@@ -5064,7 +5064,7 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
-                    tracked_append_row("entity-b", "after").with_change_id("entity-b-after"),
+                    tracked_append_row("row-b", "after").with_change_id("row-b-after"),
                 ],
             })
             .expect("overlapping write should use the indexed fallback");
@@ -5073,9 +5073,9 @@ mod tests {
         let drained = staged_writes.drain().expect("writes should drain");
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == &EntityPk::single("entity-b")
+            row.row_pk == &RowPk::single("row-b")
                 && row.snapshot.as_ref().map(|snapshot| snapshot.normalized())
-                    == Some("{\"key\":\"entity-b\",\"value\":\"after\"}")
+                    == Some("{\"key\":\"row-b\",\"value\":\"after\"}")
         }));
         assert_eq!(
             drained
@@ -5088,19 +5088,19 @@ mod tests {
     }
 
     #[test]
-    fn tracked_append_order_uses_file_before_entity() {
+    fn tracked_append_order_uses_file_before_row() {
         let staged_writes = test_staged_writes();
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
-                    tracked_append_row("entity-z", "first")
+                    tracked_append_row("row-z", "first")
                         .with_file_id("01920000-0000-7000-8000-0000000000a2"),
-                    tracked_append_row("entity-a", "second")
+                    tracked_append_row("row-a", "second")
                         .with_file_id("01920000-0000-7000-8000-0000000000b2"),
                 ],
             })
-            .expect("tracked-tree order should accept file-before-entity rows");
+            .expect("tracked-tree order should accept file-before-rows");
         assert!(
             !staged_writes.uses_identity_index_for_tests(),
             "the journal must use tracked-tree order, not exact-lookup identity order"
@@ -5183,7 +5183,7 @@ mod tests {
             .load_exact(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                entity_pk: EntityPk::single("sql2-duplicate-key"),
+                row_pk: RowPk::single("sql2-duplicate-key"),
                 file_id: NullableKeyFilter::Null,
             })
             .expect("staged row should be visible");
@@ -5204,7 +5204,7 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
-                    state_row("entity-a", "cross-pair")
+                    state_row("row-a", "cross-pair")
                         .with_file_id("01920000-0000-7000-8000-0000000000b2"),
                     tombstone_row("deleted").with_file_id("deleted"),
                 ],
@@ -5213,18 +5213,18 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build");
-        let exact = |entity: &str, file_id: &str| HotStateExactRowRequest {
+        let exact = |row: &str, file_id: &str| HotStateExactRowRequest {
             schema_key: "lix_key_value".into(),
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".into(),
-            entity_pk: EntityPk::single(entity),
+            row_pk: RowPk::single(row),
             file_id: Some(file_id.to_string()),
         };
-        let cross_pair = exact("entity-a", "01920000-0000-7000-8000-0000000000b2");
+        let cross_pair = exact("row-a", "01920000-0000-7000-8000-0000000000b2");
         let exact_request = HotStateExactBatchRequest {
             rows: vec![
                 cross_pair.clone(),
-                exact("entity-a", "01920000-0000-7000-8000-0000000000a2"),
-                exact("entity-b", "01920000-0000-7000-8000-0000000000b2"),
+                exact("row-a", "01920000-0000-7000-8000-0000000000a2"),
+                exact("row-b", "01920000-0000-7000-8000-0000000000b2"),
                 cross_pair,
                 exact("missing", "missing"),
                 exact("deleted", "deleted"),
@@ -5235,7 +5235,7 @@ mod tests {
             .expect("exact staged batch should load directly");
         let first = batch.row(0).expect("first exact row");
         let duplicate = batch.row(3).expect("duplicate exact row");
-        assert_eq!(first.entity_pk(), duplicate.entity_pk());
+        assert_eq!(first.row_pk(), duplicate.row_pk());
         assert!(std::ptr::eq(first.schema_key(), duplicate.schema_key()));
         assert!(batch.row(1).is_none());
         assert!(batch.row(2).is_none());
@@ -5396,12 +5396,12 @@ mod tests {
 
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == &EntityPk::single("sql2-key-a")
+            row.row_pk == &RowPk::single("sql2-key-a")
                 && row.snapshot.as_ref().map(|snapshot| snapshot.normalized())
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == &EntityPk::single("sql2-key-b")
+            row.row_pk == &RowPk::single("sql2-key-b")
                 && row.snapshot.as_ref().map(|snapshot| snapshot.normalized())
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
@@ -5494,9 +5494,9 @@ mod tests {
     fn fresh_tracked_file_batch_reorders_once_and_stays_unindexed() {
         let staged_writes = test_staged_writes();
         let rows = prepared_rows![
-            tracked_append_row("entity-c", "third"),
-            tracked_append_row("entity-a", "first"),
-            tracked_append_row("entity-b", "second"),
+            tracked_append_row("row-c", "third"),
+            tracked_append_row("row-a", "first"),
+            tracked_append_row("row-b", "second"),
         ];
         let input_rows_allocation = rows.slot_allocation_ptr() as usize;
         let file_content = TransactionFileContent::new(
@@ -5532,9 +5532,9 @@ mod tests {
             drained
                 .state_rows
                 .iter()
-                .map(|row| row.entity_pk.as_single_string().unwrap())
+                .map(|row| row.row_pk.as_single_string().unwrap())
                 .collect::<Vec<_>>(),
-            ["entity-a", "entity-b", "entity-c"]
+            ["row-a", "row-b", "row-c"]
         );
         let refs = drained
             .commit_change_refs_by_branch
@@ -5553,9 +5553,9 @@ mod tests {
     #[test]
     fn cross_row_file_batch_keeps_source_order_in_the_generic_lane() {
         let staged_writes = test_staged_writes();
-        let mut first = tracked_append_row("entity-z", "first-source-row");
+        let mut first = tracked_append_row("row-z", "first-source-row");
         first.facts.requires_transaction_validation = true;
-        let mut second = tracked_append_row("entity-a", "second-source-row");
+        let mut second = tracked_append_row("row-a", "second-source-row");
         second.facts.requires_transaction_validation = true;
         let file_content = TransactionFileContent::new(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
@@ -5584,9 +5584,9 @@ mod tests {
             drained
                 .state_rows
                 .iter()
-                .map(|row| row.entity_pk.as_single_string().unwrap())
+                .map(|row| row.row_pk.as_single_string().unwrap())
                 .collect::<Vec<_>>(),
-            ["entity-z", "entity-a"],
+            ["row-z", "row-a"],
             "commit validation must observe source/cursor order"
         );
     }
@@ -5978,18 +5978,18 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![state_row("shared-entity", "base")],
+                rows: prepared_rows![state_row("shared-row", "base")],
             })
             .expect("initial same-identity row should stage");
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
-                    state_row("shared-entity", "latest"),
-                    state_row("shared-entity", "other-branch")
+                    state_row("shared-row", "latest"),
+                    state_row("shared-row", "other-branch")
                         .with_branch("01920000-0000-7000-8000-0000000000b1"),
-                    state_row("shared-entity", "other-schema").with_schema("other_schema"),
-                    state_row("shared-entity", "other-file")
+                    state_row("shared-row", "other-schema").with_schema("other_schema"),
+                    state_row("shared-row", "other-file")
                         .with_file_id("01920000-0000-7000-8000-0000000000a2"),
                 ],
             })
@@ -6001,7 +6001,7 @@ mod tests {
         let rows = overlay
             .scan(&HotStateScanRequest {
                 filter: HotStateFilter {
-                    entity_pks: vec![EntityPk::single("shared-entity")],
+                    row_pks: vec![RowPk::single("shared-row")],
                     include_tombstones: true,
                     ..HotStateFilter::default()
                 },
@@ -6012,7 +6012,7 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.iter()
-                .filter(|row| row.entity_pk == EntityPk::single("shared-entity")
+                .filter(|row| row.row_pk == RowPk::single("shared-row")
                     && row.branch_id.as_ref() == "ffffffff-ffff-7fff-bfff-ffffffffffff"
                     && row.schema_key == "lix_key_value"
                     && row.file_id.is_none())
@@ -6029,7 +6029,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
                     state_row("selected", "ffffffff-ffff-7fff-bfff-ffffffffffff"),
-                    state_row("other", "other-entity"),
+                    state_row("other", "other-row"),
                     state_row("selected", "active")
                         .with_branch("01920000-0000-7000-8000-0000000000a1"),
                     state_row("selected", "other-file")
@@ -6046,7 +6046,7 @@ mod tests {
             .scan_parts(&HotStateScanRequest {
                 filter: HotStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_pks: vec![EntityPk::single("selected")],
+                    row_pks: vec![RowPk::single("selected")],
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones: true,
@@ -6064,7 +6064,7 @@ mod tests {
         );
         assert!(rows.iter().all(|row| {
             row.schema_key == "lix_key_value"
-                && row.entity_pk == EntityPk::single("selected")
+                && row.row_pk == RowPk::single("selected")
                 && row.file_id.is_none()
                 && matches!(
                     row.branch_id.as_ref(),
@@ -6133,10 +6133,10 @@ mod tests {
 
         let filter = HotStateFilter {
             schema_keys: vec!["lix_key_value".to_string(), "lix_key_value".to_string()],
-            entity_pks: vec![
-                EntityPk::single("second"),
-                EntityPk::single("first"),
-                EntityPk::single("first"),
+            row_pks: vec![
+                RowPk::single("second"),
+                RowPk::single("first"),
+                RowPk::single("first"),
             ],
             ..HotStateFilter::default()
         };
@@ -6244,10 +6244,10 @@ mod tests {
         index.insert(row.borrowed(), RowSlot::State(7));
 
         let slots = index
-            .slots_by_schema_and_entity
+            .slots_by_schema_and_row
             .get(row.schema_key.as_str())
-            .and_then(|by_entity| by_entity.get(&row.entity_pk))
-            .expect("indexed entity should retain its candidate slot");
+            .and_then(|by_row| by_row.get(&row.row_pk))
+            .expect("indexed row should retain its candidate slot");
         assert_eq!(slots.as_slice(), &[RowSlot::State(7)]);
         assert!(
             !slots.spilled(),
@@ -6285,7 +6285,7 @@ mod tests {
         let request = HotStateScanRequest {
             filter: HotStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
-                entity_pks: vec![EntityPk::single("selected")],
+                row_pks: vec![RowPk::single("selected")],
                 branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones: true,
@@ -6421,7 +6421,7 @@ mod tests {
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            entity_pk: EntityPk::single(key),
+            row_pk: RowPk::single(key),
             schema_key: "lix_key_value".into(),
             file_id: None,
             snapshot: Some(snapshot),
@@ -6448,7 +6448,7 @@ mod tests {
         HotStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-            entity_pk: EntityPk::single(key),
+            row_pk: RowPk::single(key),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -6457,7 +6457,7 @@ mod tests {
         HotStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: branch_id.to_string(),
-            entity_pk: EntityPk::single(key),
+            row_pk: RowPk::single(key),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -6475,7 +6475,7 @@ mod tests {
         let staged_writes = test_staged_writes();
         let mut rows = PreparedStateBatch::with_capacity(ROW_COUNT);
         for row_index in 0..ROW_COUNT {
-            let key = format!("entity-{row_index:05}");
+            let key = format!("row-{row_index:05}");
             rows.push_test_row(tracked_append_row(&key, "value"));
         }
         staged_writes
@@ -6505,7 +6505,7 @@ mod tests {
         HotStateScanRequest {
             filter: HotStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
-                entity_pks: vec![EntityPk::single(key)],
+                row_pks: vec![RowPk::single(key)],
                 branch_ids: vec!["ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones,

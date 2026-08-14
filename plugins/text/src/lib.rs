@@ -1,6 +1,6 @@
 //! byte-exact line semantics for NUL-free text files.
 //!
-//! A line is a durable entity rather than a display-only diff hunk. The
+//! A line is a durable row rather than a display-only diff hunk. The
 //! component preserves source bytes exactly, including invalid UTF-8 and final
 //! unterminated lines, by storing each LF-delimited byte segment as base64.
 #![allow(dead_code)]
@@ -11,7 +11,7 @@ mod order_key;
 
 use core::{Document, FileEdit, LineIdentity};
 use lix::plugin as sdk;
-use model::{ChangeEffect, EntityChange, EntityRecord};
+use model::{ChangeEffect, RowChange, RowRecord};
 
 struct TextPlugin;
 
@@ -27,16 +27,16 @@ impl sdk::Plugin for TextPlugin {
     ) -> sdk::Result<()> {
         let accepted = update.before.read_all()?;
         let mut records = Vec::new();
-        while let Some(entity) = update.entities.next()? {
-            records.push(Ok(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = update.rows.next()? {
+            records.push(Ok(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             }));
         }
         let creates = update.creates;
         let mut document =
-            Document::open_entities_fallible(records).map_err(sdk::Error::invalid_input)?;
+            Document::open_rows_fallible(records).map_err(sdk::Error::invalid_input)?;
         if document.bytes() != accepted {
             let reconcile = [FileEdit {
                 offset: 0,
@@ -96,16 +96,16 @@ impl sdk::Plugin for TextPlugin {
         emit_changes(changes.into_iter().map(Ok), creates, sink)
     }
 
-    fn entities_changed(
-        update: &mut sdk::EntityUpdate<'_>,
+    fn rows_changed(
+        update: &mut sdk::RowUpdate<'_>,
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let before = read_document(&update.before)?;
         let mut changes = Vec::new();
         while let Some(change) = update.changes.next()? {
-            changes.push(EntityChange {
+            changes.push(RowChange {
                 schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
+                row_pk: change.row_pk,
                 snapshot: change.snapshot,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
@@ -114,7 +114,7 @@ impl sdk::Plugin for TextPlugin {
             });
         }
         let (after, _edits) = before
-            .entities_changed(changes)
+            .rows_changed(changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(after.bytes())?;
         replace_identities_from_sink(&update.before, sink, &after)
@@ -122,15 +122,14 @@ impl sdk::Plugin for TextPlugin {
 
     fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(entity) = input.entities.next()? {
-            records.push(Ok(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = input.rows.next()? {
+            records.push(Ok(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             }));
         }
-        let document =
-            Document::open_entities_fallible(records).map_err(sdk::Error::invalid_input)?;
+        let document = Document::open_rows_fallible(records).map_err(sdk::Error::invalid_input)?;
         store_identities_in_transaction(sink, &document)?;
         if input.accepted.is_none() {
             sink.replace_file(document.bytes())?;
@@ -364,22 +363,22 @@ fn emit_changes<I>(
     sink: &mut sdk::Output<'_>,
 ) -> sdk::Result<()>
 where
-    I: IntoIterator<Item = Result<EntityChange, String>>,
+    I: IntoIterator<Item = Result<RowChange, String>>,
 {
     for change in changes {
         let change = change.map_err(sdk::Error::invalid_input)?;
         match change.snapshot {
             Some(snapshot) => {
-                if let Some(local_ref) = create_local_ref(&change.entity_pk, creates) {
-                    sink.entity(sdk::EntityMutation::Create {
+                if let Some(local_ref) = create_local_ref(&change.row_pk, creates) {
+                    sink.row(sdk::RowMutation::Create {
                         schema_key: &change.schema_key,
                         local_ref,
                         snapshot: &snapshot,
                     })?;
                 } else {
-                    sink.entity(sdk::EntityMutation::Upsert {
+                    sink.row(sdk::RowMutation::Upsert {
                         schema_key: &change.schema_key,
-                        entity_pk: &change.entity_pk,
+                        row_pk: &change.row_pk,
                         snapshot: &snapshot,
                         effect: match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
@@ -388,17 +387,17 @@ where
                     })?;
                 }
             }
-            None => sink.entity(sdk::EntityMutation::Delete {
+            None => sink.row(sdk::RowMutation::Delete {
                 schema_key: &change.schema_key,
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
             })?,
         }
     }
     Ok(())
 }
 
-fn create_local_ref(entity_pk: &[String], creates: sdk::CreateContext) -> Option<u32> {
-    let [id] = entity_pk else {
+fn create_local_ref(row_pk: &[String], creates: sdk::CreateContext) -> Option<u32> {
+    let [id] = row_pk else {
         return None;
     };
     let bytes = uuid::Uuid::parse_str(id).ok()?.into_bytes();

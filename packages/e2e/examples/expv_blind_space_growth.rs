@@ -76,10 +76,10 @@ async fn main() {
             let rows = parse_usize(arguments.get(2), 10);
             checkpoints_scenario(&samples, rows).await;
         }
-        "entity_commits" => {
+        "row_commits" => {
             let samples = parse_samples(arguments.get(1));
             let rows = parse_usize(arguments.get(2), 10);
-            entity_commits_scenario(&samples, rows).await;
+            row_commits_scenario(&samples, rows).await;
         }
         "checkpoint_then_gc" => {
             let commits = parse_usize(arguments.get(1), 200);
@@ -203,16 +203,16 @@ async fn checkpoints_scenario(samples: &[usize], rows_per_commit: usize) {
     }
 }
 
-/// A strictly typed flat entity surface, which is what
-/// `encode_registered_entity_row_groups` needs before it publishes anything
-/// into the two `entity.columnar_row_group_*` spaces. The JSON-valued schema
+/// A strictly typed flat schema surface, which is what
+/// `encode_registered_row_groups` needs before it publishes anything
+/// into the two `row.columnar_row_group_*` spaces. The JSON-valued schema
 /// the other scenarios use never reaches that encoder, so those two spaces stay
 /// empty there and would be misread as "bounded" without this workload.
-async fn entity_commits_scenario(samples: &[usize], rows_per_commit: usize) {
+async fn row_commits_scenario(samples: &[usize], rows_per_commit: usize) {
     let fixture = Fixture::open().await;
     let schema = serde_json::json!({
         "$schema": "https://lix.dev/schema-v1.json",
-        "key": "expv_entity",
+        "key": "expv_row",
         "columns": [
             { "name": "id", "type": "text", "nullable": false },
             { "name": "name", "type": "text", "nullable": false },
@@ -227,7 +227,7 @@ async fn entity_commits_scenario(samples: &[usize], rows_per_commit: usize) {
             &[Value::Text(schema.to_string())],
         )
         .await
-        .expect("register entity schema");
+        .expect("register row schema");
     let mut committed = 0usize;
     for &target in samples {
         while committed < target {
@@ -239,7 +239,7 @@ async fn entity_commits_scenario(samples: &[usize], rows_per_commit: usize) {
             for index in 0..rows_per_commit {
                 transaction
                     .execute(
-                        "INSERT INTO expv_entity (id, name, amount) VALUES ($1, $2, $3)",
+                        "INSERT INTO expv_row (id, name, amount) VALUES ($1, $2, $3)",
                         &[
                             Value::Text(format!("{committed:08}-{index:08}")),
                             Value::Text(format!("name-{committed}-{index}")),
@@ -247,13 +247,13 @@ async fn entity_commits_scenario(samples: &[usize], rows_per_commit: usize) {
                         ],
                     )
                     .await
-                    .expect("insert entity row");
+                    .expect("insert row");
             }
-            transaction.commit().await.expect("commit entity batch");
+            transaction.commit().await.expect("commit row batch");
             committed += 1;
         }
         report(
-            "entity_commits",
+            "row_commits",
             "live",
             target as u64,
             &usage(&fixture.storage).await,

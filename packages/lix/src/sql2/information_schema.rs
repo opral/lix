@@ -175,7 +175,7 @@ impl LixInformationSchemaProvider {
         for surface in self.public_catalog.surfaces().filter(|surface| {
             matches!(
                 surface.kind,
-                PublicSurfaceKind::EntityHistory { .. }
+                PublicSurfaceKind::SchemaHistory { .. }
                     | PublicSurfaceKind::FileHistory
                     | PublicSurfaceKind::DirectoryHistory
             )

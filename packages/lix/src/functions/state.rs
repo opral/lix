@@ -8,7 +8,7 @@ use crate::branch::{
 };
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::hot_state::{
     CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRow,
@@ -79,7 +79,7 @@ pub(crate) async fn stage_sequence(
         )
     })?;
     let snapshot = NormalizedJson::from_arc_unchecked(Arc::from(snapshot_content.as_str()));
-    let entity_pk = EntityPk::single(DETERMINISTIC_SEQUENCE_KEY);
+    let row_pk = RowPk::single(DETERMINISTIC_SEQUENCE_KEY);
     let mut observations = BranchHeadControlContext::new()
         .reader(read)
         .load_observed(&[GLOBAL_BRANCH_ID.to_string()])
@@ -112,7 +112,7 @@ pub(crate) async fn stage_sequence(
             &[CurrentStateDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 // The caller already minted this id for the sequence row; this
                 // lane stages the head directly, so it must carry it rather
                 // than relying on the prepared-row path to supply one.
@@ -172,7 +172,7 @@ async fn load_key_value_row(
     let row = 'resolved: {
         let keys = [TrackedStateKey {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-            entity_pk: EntityPk::single(key),
+            row_pk: RowPk::single(key),
             file_id: None,
         }];
         let projection = ChangeRecordProjection {
@@ -184,7 +184,7 @@ async fn load_key_value_row(
             .iter()
             .map(|key| TrackedStateKeyRef {
                 schema_key: key.schema_key.as_str(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
                 file_id: key.file_id.as_deref(),
             })
             .collect::<Vec<_>>();
@@ -536,7 +536,7 @@ mod tests {
             .load_row(&HotStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                row_pk: RowPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -565,7 +565,7 @@ mod tests {
             "value": value,
         }))
         .expect("snapshot should serialize");
-        let entity_pk = EntityPk::single(key);
+        let row_pk = RowPk::single(key);
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -589,7 +589,7 @@ mod tests {
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: Some(ChangeId::for_test_label("functions-state-sequence")),
                     commit_id: None,
                     untracked: true,

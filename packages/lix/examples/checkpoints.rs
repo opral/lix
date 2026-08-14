@@ -16,19 +16,19 @@ async fn main() -> Result<(), LixError> {
 
     let working_diffs = lix
         .execute(
-            "SELECT entity_pk, schema_key, diff_type
+            "SELECT row_pk, schema_key, diff_type
              FROM lix_working_diff
-             ORDER BY schema_key, entity_pk",
+             ORDER BY schema_key, row_pk",
             &[],
         )
         .await?;
 
     for row in working_diffs.rows() {
         // Row::get<T> performs typed extraction from ExecuteResult.
-        let entity_pk = row.get::<serde_json::Value>("entity_pk")?;
+        let row_pk = row.get::<serde_json::Value>("row_pk")?;
         let schema_key = row.get::<String>("schema_key")?;
         let diff_type = row.get::<String>("diff_type")?;
-        println!("{diff_type} {schema_key} {entity_pk}");
+        println!("{diff_type} {schema_key} {row_pk}");
     }
     assert_eq!(working_diffs.len(), 1);
 

@@ -41,8 +41,8 @@ const MODULE_LAYERS: &[&[&str]] = &[
         "common",
         "json_store",
     ],
-    &["entity_pk"],
-    // The order-preserving key byte format. A pure encoding over `entity_pk`
+    &["row_pk"],
+    // The order-preserving key byte format. A pure encoding over `row_pk`
     // with no repository semantics, and the single authority for how a key
     // encodes. Both state planes store rows in the order it defines, so it must
     // sit below both and must never read either back.
@@ -53,10 +53,10 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // whether a generation can be replaced wholesale, so it must stay below
     // them and must never read either one back.
     &["collection_generation"],
-    // The entity-specific contract over generic columnar row groups. Addresses
+    // The row-specific contract over generic columnar row groups. Addresses
     // row groups by owning commit, so it sits above `changelog`, and is shared
     // by both state planes, so it sits below them.
-    &["entity_columnar"],
+    &["row_columnar"],
     // Canonical state: commit-state manifests, tree chunks, scoped ranges,
     // commit deltas. Sole writer of every canonical-state storage space.
     &["tracked_state"],
@@ -74,7 +74,7 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // `tracked_state` is the structural half of the "derived views are caches"
     // invariant: the compiler now rejects a canonical-side read of the cache.
     &["hot_state"],
-    // Entity-level overlays over the state planes.
+    // Row-level overlays over the state planes.
     &["checkpoint", "undo_redo"],
 ];
 
@@ -138,7 +138,7 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
         "sql2",
         "still cyclic with `transaction` (one reference, \
          `duplicate_insert_identity_message`) and with `transaction_types`, \
-         which names `sql2::EncodedEntityRowGroups`",
+         which names `sql2::EncodedRowGroups`",
     ),
     ("sql_profile", "feature-gated instrumentation"),
     ("sql_telemetry", "instrumentation, no layer semantics"),

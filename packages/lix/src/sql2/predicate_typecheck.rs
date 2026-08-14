@@ -468,7 +468,7 @@ fn is_json_expr<'a>(
 
 fn is_identity_json_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(column) => matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk"),
+        Expr::Column(column) => matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk"),
         Expr::Alias(alias) => is_identity_json_expr(&alias.expr),
         Expr::Cast(cast) => is_identity_json_expr(&cast.expr),
         Expr::TryCast(cast) => is_identity_json_expr(&cast.expr),

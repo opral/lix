@@ -22,7 +22,7 @@ const DEFAULT_STORAGE_BATCH_CHANGES: usize = 100_000;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_SAMPLES: usize = 5;
 const DEFAULT_EXACT_SAMPLES: usize = 1_001;
-const DEFAULT_LIVE_ENTITIES: usize = 10_000;
+const DEFAULT_LIVE_ROWS: usize = 10_000;
 const DEFAULT_LARGE_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -53,7 +53,7 @@ async fn run() {
     let commit_widths = env_usizes("LIX_PACKED_HISTORY_COMMIT_WIDTHS", DEFAULT_COMMIT_WIDTHS);
     let shapes = env_shapes();
     let payloads = env_payloads();
-    let live_entities = env_usize("LIX_PACKED_HISTORY_LIVE_ENTITIES", DEFAULT_LIVE_ENTITIES);
+    let live_rows = env_usize("LIX_PACKED_HISTORY_LIVE_ROWS", DEFAULT_LIVE_ROWS);
     let large_payload_bytes = env_usize(
         "LIX_PACKED_HISTORY_LARGE_PAYLOAD_BYTES",
         DEFAULT_LARGE_PAYLOAD_BYTES,
@@ -125,7 +125,7 @@ async fn run() {
                                     commit_width,
                                     shape,
                                     payload,
-                                    live_entities,
+                                    live_rows,
                                     large_payload_bytes,
                                     storage_batch_changes,
                                     warmups,
@@ -162,7 +162,7 @@ async fn run() {
                                     commit_width,
                                     shape,
                                     payload,
-                                    live_entities,
+                                    live_rows,
                                     large_payload_bytes,
                                     storage_batch_changes,
                                     warmups,
@@ -207,7 +207,7 @@ async fn run_case<S, Flush, FlushFuture>(
     commit_width: usize,
     shape: BenchPackedHistoryShape,
     payload: BenchPackedHistoryPayload,
-    live_entities: usize,
+    live_rows: usize,
     large_payload_bytes: usize,
     storage_batch_changes: usize,
     warmups: usize,
@@ -245,7 +245,7 @@ async fn run_case<S, Flush, FlushFuture>(
                 BenchPackedHistoryOptions {
                     shape,
                     payload,
-                    live_entities,
+                    live_rows,
                     shared_large_payload: shared_large_payload.as_deref(),
                 },
             )
@@ -321,7 +321,7 @@ async fn run_case<S, Flush, FlushFuture>(
 
     println!(
         "packed_history_scale,backend={backend},id_shape={id_shape},history_shape={},payload_shape={},\
-         live_entities={live_entities},large_payload_bytes={large_payload_bytes},\
+         live_rows={live_rows},large_payload_bytes={large_payload_bytes},\
          changes={changes},commits={},commit_width={commit_width},\
          storage_batch_changes={storage_batch_changes},flushed={flush},warmups={warmups},samples={samples},\
          memtable_flushed={memtable_flush},settle_ms={settle_ms},skip_seed={skip_seed},\

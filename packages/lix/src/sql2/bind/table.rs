@@ -141,37 +141,37 @@ mod tests {
     }
 
     #[test]
-    fn base_entity_table_does_not_expose_branch_column() {
+    fn base_row_table_does_not_expose_branch_column() {
         let catalog = catalog();
         let table = bind_public_table(&catalog, &table_name("SELECT * FROM test_state_schema"))
-            .expect("base entity table should bind");
+            .expect("base row table should bind");
 
         assert!(matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityBase { .. }
+            PublicSurfaceKind::SchemaBase { .. }
         ));
         assert!(require_public_column(&table, "name").is_ok());
         let error = require_public_column(&table, "lixcol_branch_id")
-            .expect_err("base entity surface should not expose branch column");
+            .expect_err("base schema surface should not expose branch column");
         assert!(error.message.contains("does not exist"));
     }
 
     #[test]
-    fn by_branch_entity_exposes_lixcol_branch_id_without_branch_id_alias() {
+    fn by_branch_row_exposes_lixcol_branch_id_without_branch_id_alias() {
         let catalog = catalog();
         let table = bind_public_table(
             &catalog,
             &table_name("SELECT * FROM test_state_schema_by_branch"),
         )
-        .expect("by-branch entity table should bind");
+        .expect("by-branch row table should bind");
 
         assert!(matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityByBranch { .. }
+            PublicSurfaceKind::SchemaByBranch { .. }
         ));
         assert!(require_public_column(&table, "lixcol_branch_id").is_ok());
         let error = require_public_column(&table, "branch_id")
-            .expect_err("by-branch entity surface should not alias branch_id");
+            .expect_err("by-branch schema surface should not alias branch_id");
         assert!(error.message.contains("does not exist"));
     }
 
@@ -215,10 +215,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_uses_validated_entity_surface_derivation() {
+    fn catalog_uses_validated_schema_surface_derivation() {
         let error = PublicCatalog::from_visible_schemas(&[json!({
             "$schema": "https://lix.dev/schema-v1.json",
-            "key": "bad_entity",
+            "key": "bad_row",
             "columns": [
                 { "name": "value", "type": "jsonb", "nullable": false },
             ],
@@ -348,32 +348,32 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_entity_history_surface_uses_provider_history_column_names() {
+    fn dynamic_row_history_surface_uses_provider_history_column_names() {
         let catalog = catalog();
         let table = bind_public_table(
             &catalog,
             &table_name("SELECT * FROM test_state_schema_history()"),
         )
-        .expect("entity history surface should bind");
+        .expect("schema history surface should bind");
 
         assert!(matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaHistory { .. }
         ));
-        assert!(require_public_column(&table, "lixcol_entity_pk").is_ok());
+        assert!(require_public_column(&table, "lixcol_row_pk").is_ok());
         assert!(require_public_column(&table, "lixcol_snapshot_content").is_err());
     }
 
     #[test]
-    fn dynamic_entity_file_id_is_public_and_insert_only() {
+    fn dynamic_row_file_id_is_public_and_insert_only() {
         let catalog = catalog();
         let table = bind_public_table(&catalog, &table_name("SELECT * FROM test_state_schema"))
-            .expect("entity surface should bind");
+            .expect("schema surface should bind");
 
         assert!(require_public_column(&table, "lixcol_file_id").is_ok());
         assert!(require_writable_column(&table, "lixcol_file_id", BoundWriteOp::Insert).is_ok());
         let error = require_writable_column(&table, "lixcol_file_id", BoundWriteOp::Update)
-            .expect_err("entity file id should remain immutable after insert");
+            .expect_err("row file id should remain immutable after insert");
         assert!(error.message.contains("is not writable"));
     }
 

@@ -15,7 +15,7 @@ AI products want a repository: files for agents, a SQL database for your app, an
 
 <img src="./website/public/assets/lix-repo.svg" alt="A Lix repo holds files, a SQL database, and version control in one system" width="760" />
 
-- 📄 **Files, in any format.** Store text and binary files. Plugins make supported formats queryable as versioned entities.
+- 📄 **Files, in any format.** Store text and binary files. Plugins make supported formats queryable as versioned rows.
 - 🗄️ **SQL database.** File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.
 - 🔀 **Version control.** Semantic changes: the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
@@ -102,7 +102,7 @@ await lix.execute("UPDATE orders SET status = 'shipped' WHERE id = 1002");
 
 // The history sidebar, diff view, and undo button are queries:
 const changes = await lix.execute(`
-  SELECT created_at, schema_key, entity_pk, snapshot_content
+  SELECT created_at, schema_key, row_pk, snapshot_content
   FROM lix_change
   ORDER BY created_at DESC
 `);
@@ -118,9 +118,9 @@ Update Lix files and rows in one ACID transaction. Lix records the history autom
 
 Plugins map files to SQL rows. A paragraph, cell, or property becomes a row Lix can version.
 
-With `FilesystemStorage`, the file stays available on disk. Its entities are queryable with SQL. Lix tracks changes to both.
+With `FilesystemStorage`, the file stays available on disk. Its rows are queryable with SQL. Lix tracks changes to both.
 
-<img src="./website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
+<img src="./website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with row, field, and value columns" width="760" />
 
 ### Runs in-process as part of your infrastructure
 

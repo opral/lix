@@ -614,7 +614,7 @@ mod tests {
         let repeated = "shared-json-field-value/".repeat(128);
         let payloads = (0..ROW_COUNT)
             .map(|index| {
-                format!(r#"{{"entity":"{index:08x}","kind":"bulk","payload":"{repeated}"}}"#)
+                format!(r#"{{"row":"{index:08x}","kind":"bulk","payload":"{repeated}"}}"#)
             })
             .collect::<Vec<_>>();
         let mut plan = StoredJsonBatchPlan::default();

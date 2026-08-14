@@ -42,7 +42,7 @@ pub(crate) mod option {
 /// cost 36 bytes where 16 carry the information. Each id is stored as a
 /// 1-byte tag followed by either the raw 16 UUID bytes or the original text.
 /// Only the exact canonical form takes the UUID arm, so decode re-hyphenates
-/// byte-identically; every other string (plugin-chosen entity keys, test
+/// byte-identically; every other string (plugin-chosen row keys, test
 /// labels) keeps its text form.
 pub(crate) mod id_string {
     use musli::Context;

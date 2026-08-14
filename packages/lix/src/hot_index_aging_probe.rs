@@ -350,7 +350,7 @@ fn composite_unique_schema(key: &str) -> serde_json::Value {
 /// for single-column unique groups, so every insert re-resolves whatever
 /// candidates have accumulated under the value being inserted.
 ///
-/// The loop recreates one logical slot: insert a fresh entity holding
+/// The loop recreates one logical slot: insert a fresh row holding
 /// `slug='dup'`, delete it, repeat. Each iteration leaves one more permanent
 /// candidate in the `dup` bucket while the live collection stays at one row.
 /// Insert latency is sampled at the requested checkpoints.

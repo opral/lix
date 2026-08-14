@@ -1,10 +1,10 @@
 //! What does creating a branch cost, as a function of the number of
 //! **plugin-backed files** already on the branch?
 //!
-//! `branch_storage_sharing` answers the same question for entity *rows* and
+//! `branch_storage_sharing` answers the same question for row *rows* and
 //! shows a flat curve: `hot_state.root_current_base.v1` publishes one 16-byte
 //! reference instead of copying hot rows. That plane does not cover the
-//! certified-entity-batch manifests, which are re-keyed from the source
+//! certified-row-batch manifests, which are re-keyed from the source
 //! generation to the new branch generation one row per (file, format) in
 //! `hot_state/tracked_head/hot.rs`. Those rows only exist for files a WASM
 //! plugin materialized, so no row-shaped fixture can see them.
@@ -16,7 +16,7 @@
 //!
 //! Files are plain-text documents handled by the `text` plugin, with a line
 //! count above `HOST_CERTIFIED_PACKET_MIN_ROWS` (64) so that every seeded file
-//! produces a real certified entity batch and therefore a certified manifest
+//! produces a real certified row batch and therefore a certified manifest
 //! row. A fixture whose files materialize into fewer rows leaves the manifest
 //! plane empty and cannot see the inheritance path at all.
 //!

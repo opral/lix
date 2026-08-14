@@ -11,7 +11,7 @@ use crate::LixError;
 use crate::NullableKeyFilter;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest};
 
 use super::SqlHistoryQuerySource;
@@ -21,18 +21,18 @@ use crate::storage_adapter::StorageAdapterRead;
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
 /// History providers differ in how they shape rows, but they should not drift
-/// in how they interpret filters such as `lixcol_as_of_commit_id IN (...)`, entity
+/// in how they interpret filters such as `lixcol_as_of_commit_id IN (...)`, row
 /// filters, or depth ranges.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HistoryRoute {
     pub(crate) as_of_commit_ids: Vec<String>,
-    pub(crate) entity_pks: Vec<String>,
+    pub(crate) row_pks: Vec<String>,
     /// Schema-resolved physical identities for traversal.
     ///
-    /// `entity_pks` remains the canonical JSON surface representation used to
+    /// `row_pks` remains the canonical JSON surface representation used to
     /// match projected rows. Keeping the typed form alongside it avoids
     /// re-inferring component types from values after routing.
-    pub(crate) resolved_entity_pks: Vec<EntityPk>,
+    pub(crate) resolved_row_pks: Vec<RowPk>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<i64>,
@@ -109,19 +109,19 @@ impl HistoryRoute {
             || self.max_depth.is_some_and(|depth| depth < 0)
     }
 
-    pub(crate) fn constrain_entity_pks(&mut self, entity_pks: Vec<String>) {
-        self.contradictory |= apply_conjunctive_values_filter(&mut self.entity_pks, entity_pks);
+    pub(crate) fn constrain_row_pks(&mut self, row_pks: Vec<String>) {
+        self.contradictory |= apply_conjunctive_values_filter(&mut self.row_pks, row_pks);
     }
 
-    pub(crate) fn set_resolved_entity_pks(&mut self, entity_pks: Vec<EntityPk>) {
-        self.resolved_entity_pks = entity_pks;
+    pub(crate) fn set_resolved_row_pks(&mut self, row_pks: Vec<RowPk>) {
+        self.resolved_row_pks = row_pks;
     }
 
     /// Checks filters that refer to the row exposed by a shaped history surface.
     pub(crate) fn matches_surface_row(
         &self,
         schema_key: &str,
-        entity_pk: &str,
+        row_pk: &str,
         file_id: Option<&str>,
         depth: u32,
     ) -> bool {
@@ -136,11 +136,11 @@ impl HistoryRoute {
         {
             return false;
         }
-        if !self.entity_pks.is_empty()
+        if !self.row_pks.is_empty()
             && !self
-                .entity_pks
+                .row_pks
                 .iter()
-                .any(|candidate| candidate == entity_pk)
+                .any(|candidate| candidate == row_pk)
         {
             return false;
         }
@@ -179,7 +179,7 @@ pub(crate) struct HistoryEntry {
     pub(crate) depth: u32,
 }
 
-pub(crate) const HISTORY_COL_ENTITY_PK: &str = "lixcol_entity_pk";
+pub(crate) const HISTORY_COL_ROW_PK: &str = "lixcol_row_pk";
 pub(crate) const HISTORY_COL_SCHEMA_KEY: &str = "lixcol_schema_key";
 pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
 pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
@@ -207,12 +207,12 @@ pub(crate) fn serialize_history_source_changes(
     let source_changes = ordered_changes
         .into_iter()
         .map(|change| {
-            let entity_pk =
-                serde_json::from_str::<serde_json::Value>(&change.entity_pk.as_json_array_text()?)
+            let row_pk =
+                serde_json::from_str::<serde_json::Value>(&change.row_pk.as_json_array_text()?)
                     .map_err(|error| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            format!("{surface_name} source entity_pk is invalid JSON: {error}"),
+                            format!("{surface_name} source row_pk is invalid JSON: {error}"),
                         )
                     })?;
             let snapshot_content = parse_optional_source_json(
@@ -224,7 +224,7 @@ pub(crate) fn serialize_history_source_changes(
                 parse_optional_source_json(change.metadata.as_deref(), surface_name, "metadata")?;
             Ok(serde_json::json!({
                 "id": change.id,
-                "entity_pk": entity_pk,
+                "row_pk": row_pk,
                 "schema_key": change.schema_key,
                 "file_id": change.file_id,
                 "snapshot_content": snapshot_content,
@@ -318,14 +318,14 @@ pub(crate) fn commit_graph_history_request(
     let schema_keys = effective_schema_keys(route, schema_keys)?;
     Some(CommitGraphChangeHistoryRequest {
         limit,
-        entity_pks: if route.resolved_entity_pks.is_empty() {
+        row_pks: if route.resolved_row_pks.is_empty() {
             route
-                .entity_pks
+                .row_pks
                 .iter()
-                .filter_map(|entity_pk| EntityPk::from_json_array_text(entity_pk).ok())
+                .filter_map(|row_pk| RowPk::from_json_array_text(row_pk).ok())
                 .collect()
         } else {
-            route.resolved_entity_pks.clone()
+            route.resolved_row_pks.clone()
         },
         schema_keys,
         file_ids: route.file_ids.clone(),
@@ -452,7 +452,7 @@ where
         let certified_request = TrackedStateScanRequest {
             filter: TrackedStateFilter {
                 schema_keys: request.schema_keys.clone(),
-                entity_pks: request.entity_pks.clone(),
+                row_pks: request.row_pks.clone(),
                 file_ids: request
                     .file_ids
                     .iter()
@@ -596,7 +596,7 @@ fn parse_history_disjunction(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryFilterTerm {
     AsOfCommitIds(Vec<String>),
-    EntityPks(Vec<String>),
+    RowPks(Vec<String>),
     SchemaKeys(Vec<String>),
     FileIds(Vec<String>),
     MinDepth(i64),
@@ -613,9 +613,9 @@ fn merge_history_disjunction_terms(
             extend_unique(&mut left, right);
             Some(HistoryFilterTerm::AsOfCommitIds(left))
         }
-        (HistoryFilterTerm::EntityPks(mut left), HistoryFilterTerm::EntityPks(right)) => {
+        (HistoryFilterTerm::RowPks(mut left), HistoryFilterTerm::RowPks(right)) => {
             extend_unique(&mut left, right);
-            Some(HistoryFilterTerm::EntityPks(left))
+            Some(HistoryFilterTerm::RowPks(left))
         }
         (HistoryFilterTerm::FileIds(mut left), HistoryFilterTerm::FileIds(right)) => {
             extend_unique(&mut left, right);
@@ -649,8 +649,8 @@ fn parse_history_binary_filter(
             "file_id" => HistoryFilterTerm::FileIds(vec![value.clone()]),
             _ => unreachable!(),
         }),
-        ("entity_pk", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
-            canonical_entity_pk_value(value).map(|value| HistoryFilterTerm::EntityPks(vec![value]))
+        ("row_pk", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
+            canonical_row_pk_value(value).map(|value| HistoryFilterTerm::RowPks(vec![value]))
         }
         ("depth", Operator::Eq, depth_expr) => {
             scalar_i64_literal(depth_expr).map(HistoryFilterTerm::ExactDepth)
@@ -723,7 +723,7 @@ fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
 
     match column_name {
         "as_of_commit_id" => Some(HistoryFilterTerm::AsOfCommitIds(values)),
-        "entity_pk" => canonical_entity_pk_values(values).map(HistoryFilterTerm::EntityPks),
+        "row_pk" => canonical_row_pk_values(values).map(HistoryFilterTerm::RowPks),
         "schema_key" => Some(HistoryFilterTerm::SchemaKeys(values)),
         "file_id" => Some(HistoryFilterTerm::FileIds(values)),
         _ => None,
@@ -737,9 +737,9 @@ fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute) {
                 route.contradictory |=
                     apply_conjunctive_values_filter(&mut route.as_of_commit_ids, values);
             }
-            HistoryFilterTerm::EntityPks(values) => {
+            HistoryFilterTerm::RowPks(values) => {
                 route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.entity_pks, values);
+                    apply_conjunctive_values_filter(&mut route.row_pks, values);
             }
             HistoryFilterTerm::SchemaKeys(values) => {
                 route.contradictory |=
@@ -777,15 +777,15 @@ fn apply_conjunctive_values_filter(bucket: &mut Vec<String>, incoming_values: Ve
     bucket.is_empty()
 }
 
-fn canonical_entity_pk_values(values: Vec<String>) -> Option<Vec<String>> {
+fn canonical_row_pk_values(values: Vec<String>) -> Option<Vec<String>> {
     values
         .into_iter()
-        .map(|value| canonical_entity_pk_value(&value))
+        .map(|value| canonical_row_pk_value(&value))
         .collect()
 }
 
-fn canonical_entity_pk_value(value: &str) -> Option<String> {
-    EntityPk::from_json_array_text(value)
+fn canonical_row_pk_value(value: &str) -> Option<String> {
+    RowPk::from_json_array_text(value)
         .ok()?
         .as_json_array_text()
         .ok()
@@ -794,7 +794,7 @@ fn canonical_entity_pk_value(value: &str) -> Option<String> {
 fn canonical_history_column_name(name: &str) -> Option<&str> {
     match name {
         HISTORY_COL_AS_OF_COMMIT_ID => Some("as_of_commit_id"),
-        HISTORY_COL_ENTITY_PK => Some("entity_pk"),
+        HISTORY_COL_ROW_PK => Some("row_pk"),
         HISTORY_COL_SCHEMA_KEY => Some("schema_key"),
         HISTORY_COL_FILE_ID => Some("file_id"),
         HISTORY_COL_DEPTH => Some("depth"),
@@ -851,7 +851,7 @@ mod tests {
         CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
         CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
     };
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::json_store::{JsonSlot, JsonStoreContext};
     use crate::sql2::HistoryQuerySource;
     use crate::storage_adapter::{
@@ -911,7 +911,7 @@ mod tests {
         for retired in [
             "start_commit_id",
             "lixcol_start_commit_id",
-            "entity_pk",
+            "row_pk",
             "depth",
         ] {
             let filter = eq(col(retired), str_lit("value"));
@@ -1114,7 +1114,7 @@ mod tests {
                 });
             Ok(crate::commit_graph::CommitGraphHistory {
                 entries: vec![CommitGraphChangeHistoryEntry {
-                    change: test_change("entity-change", event_timestamp()),
+                    change: test_change("row-change", event_timestamp()),
                     observed_commit_id: self.start_commit_id,
                     start_commit_id: self.start_commit_id,
                     depth: 0,
@@ -1139,7 +1139,7 @@ mod tests {
         CommitGraphChange {
             id: ChangeId::for_test_label(label),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            entity_pk: EntityPk::single("entity-1"),
+            row_pk: RowPk::single("row-1"),
             schema_key: "message".to_string(),
             file_id: None,
             snapshot: JsonSlot::None,

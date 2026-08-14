@@ -42,10 +42,10 @@ pub(crate) struct SqlReadProfile {
     /// filtering earlier in the plan changes `scan_rows` and leaves this
     /// unchanged.
     ///
-    /// Entity surfaces record it at every route they can take, so no scan is
+    /// Schema surfaces record it at every route they can take, so no scan is
     /// silently unaccounted: primary-key projection and direct-snapshot reads
     /// examine exactly what they emit, the generic row route examines the
-    /// whole scanned batch before `EntityRowFilter`s run, and the columnar
+    /// whole scanned batch before `RowFilter`s run, and the columnar
     /// route examines the rows of the row groups that survived manifest
     /// pruning plus its overlay rows.
     pub(crate) provider_rows_examined: u64,

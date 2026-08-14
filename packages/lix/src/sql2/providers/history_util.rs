@@ -2,12 +2,12 @@ use crate::LixError;
 use crate::common::SharedStr;
 use crate::tracked_state::{MaterializedTrackedStateBatch, MaterializedTrackedStateRowRef};
 
-/// Project a single-string history entity pk as the canonical JSON array
-/// text exposed by the `lixcol_entity_pk` column.
-pub(super) fn entity_pk_json_array(entity_pk: &str) -> Result<String, LixError> {
-    serde_json::to_string(&[entity_pk]).map_err(|error| {
+/// Project a single-string history row pk as the canonical JSON array
+/// text exposed by the `lixcol_row_pk` column.
+pub(super) fn row_pk_json_array(row_pk: &str) -> Result<String, LixError> {
+    serde_json::to_string(&[row_pk]).map_err(|error| {
         LixError::unknown(format!(
-            "failed to encode history entity pk as JSON: {error}"
+            "failed to encode history row pk as JSON: {error}"
         ))
     })
 }

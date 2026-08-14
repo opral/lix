@@ -6,7 +6,7 @@ use crate::LixError;
 use crate::catalog::{SchemaPlan, SchemaPlanId, TransactionCatalog};
 use crate::common::{format_json_pointer, validate_row_metadata};
 use crate::domain::Domain;
-use crate::entity_pk::{EntityPk, EntityPkError};
+use crate::row_pk::{RowPk, RowPkError};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{
     SchemaKey, schema_from_registered_snapshot, validate_lix_schema, validate_lix_schema_definition,
@@ -30,7 +30,7 @@ pub(crate) struct NormalizedRowFacts {
     pub(crate) facts: PreparedRowFacts,
 }
 
-/// Normalizes one incoming row into a row with final snapshot/entity primary key.
+/// Normalizes one incoming row into a row with final snapshot/row primary key.
 ///
 /// This is the canonical schema-semantics boundary for transaction writes. It owns
 /// schema default application, primary-key identity derivation, and explicit
@@ -93,11 +93,11 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 )),
             );
         } else {
-            if row.entity_pk != Some(certificate.entity_pk()) {
+            if row.row_pk != Some(certificate.row_pk()) {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "certified plugin identity does not match the staged entity_pk for schema '{}'",
+                        "certified plugin identity does not match the staged row_pk for schema '{}'",
                         row.schema_key
                     ),
                 ));
@@ -110,7 +110,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
                     )?;
                 }
             }
-            *rows.entity_pk_mut(row_index) = Some(certificate.entity_pk().clone());
+            *rows.row_pk_mut(row_index) = Some(certificate.row_pk().clone());
             rows.set_snapshot(
                 row_index,
                 Some(TransactionJson::from_certified_shared_normalized_row_content(normalized)),
@@ -131,10 +131,10 @@ pub(crate) fn normalize_raw_write_row_in_place(
         .snapshot
         .is_some_and(TransactionJson::row_content_certified)
     {
-        if row.entity_pk.is_none() {
+        if row.row_pk.is_none() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "certified replacement row is missing its proven entity identity",
+                "certified replacement row is missing its proven row identity",
             ));
         }
         canonicalize_descriptor_file_id(rows, row_index)?;
@@ -172,22 +172,22 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 default_timestamp,
             )?;
             let snapshot = JsonValue::Object(snapshot);
-            let entity_pk = resolve_entity_pk(row, schema_plan, &snapshot)?;
-            *rows.entity_pk_mut(row_index) = Some(entity_pk);
+            let row_pk = resolve_row_pk(row, schema_plan, &snapshot)?;
+            *rows.row_pk_mut(row_index) = Some(row_pk);
             Some(TransactionJson::from_value(
                 snapshot,
                 "normalized transaction snapshot_content",
             )?)
         } else {
-            let entity_pk = resolve_entity_pk(row, schema_plan, snapshot.value())?;
-            *rows.entity_pk_mut(row_index) = Some(entity_pk);
+            let row_pk = resolve_row_pk(row, schema_plan, snapshot.value())?;
+            *rows.row_pk_mut(row_index) = Some(row_pk);
             Some(snapshot)
         }
-    } else if rows.row(row_index).entity_pk.is_none() {
+    } else if rows.row(row_index).row_pk.is_none() {
         let schema_key = rows.row(row_index).schema_key.clone();
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!("tombstone for schema '{}' requires entity_pk", schema_key),
+            format!("tombstone for schema '{}' requires row_pk", schema_key),
         ));
     } else {
         None
@@ -281,11 +281,11 @@ fn canonicalize_descriptor_file_id(
     let row = rows.row(row_index);
     let file_id = match row.schema_key.as_str() {
         FILE_DESCRIPTOR_SCHEMA_KEY => {
-            let entity_pk = row
-                .entity_pk
-                .expect("normalized row has an entity identity");
+            let row_pk = row
+                .row_pk
+                .expect("normalized row has a row identity");
             Some(
-                entity_pk
+                row_pk
                     .as_single_string_owned()
                     .map_err(|error| {
                         LixError::new(
@@ -338,7 +338,7 @@ fn validate_normalized_row_content(
 }
 
 /// Engine-owned control rows have fixed schemas and are intentionally hidden
-/// from public entity surfaces. Internal producers may therefore validate
+/// from public schema surfaces. Internal producers may therefore validate
 /// them from the compile-time definition without first materializing that
 /// definition in the transaction's visible schema catalog.
 fn ensure_internal_control_schema(
@@ -411,17 +411,17 @@ fn apply_defaults(
         })
 }
 
-fn resolve_entity_pk(
+fn resolve_row_pk(
     row: RawWriteRowRef<'_>,
     schema_plan: &SchemaPlan,
     snapshot: &JsonValue,
-) -> Result<EntityPk, LixError> {
+) -> Result<RowPk, LixError> {
     let Some(primary_key_paths) = schema_plan.primary_key.as_ref() else {
-        return row.entity_pk.cloned().ok_or_else(|| {
+        return row.row_pk.cloned().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "write for schema '{}' requires entity_pk because the schema has no primary_key",
+                    "write for schema '{}' requires row_pk because the schema has no primary_key",
                     row.schema_key
                 ),
             )
@@ -431,15 +431,15 @@ fn resolve_entity_pk(
         .primary_key_component_types
         .as_deref()
         .expect("primary-key paths and component types are compiled together");
-    let derived = EntityPk::from_primary_key_plan(snapshot, primary_key_paths, component_types)
-        .map_err(|error| entity_pk_derivation_error(row, primary_key_paths, error))?;
-    if let Some(entity_pk) = row.entity_pk {
-        if entity_pk.as_json_array_value()? != derived.as_json_array_value()? {
+    let derived = RowPk::from_primary_key_plan(snapshot, primary_key_paths, component_types)
+        .map_err(|error| row_pk_derivation_error(row, primary_key_paths, error))?;
+    if let Some(row_pk) = row.row_pk {
+        if row_pk.as_json_array_value()? != derived.as_json_array_value()? {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "entity_pk '{}' does not match primary_key-derived entity_pk '{}' for schema '{}'",
-                    entity_pk.as_json_array_text()?,
+                    "row_pk '{}' does not match primary_key-derived row_pk '{}' for schema '{}'",
+                    row_pk.as_json_array_text()?,
                     derived.as_json_array_text()?,
                     row.schema_key
                 ),
@@ -449,34 +449,34 @@ fn resolve_entity_pk(
     Ok(derived)
 }
 
-fn entity_pk_derivation_error(
+fn row_pk_derivation_error(
     row: RawWriteRowRef<'_>,
     primary_key_paths: &[Vec<String>],
-    error: EntityPkError,
+    error: RowPkError,
 ) -> LixError {
     let detail = match error {
-        EntityPkError::EmptyPrimaryKey => "empty primary_key".to_string(),
-        EntityPkError::EmptyPrimaryKeyPath { index } => {
+        RowPkError::EmptyPrimaryKey => "empty primary_key".to_string(),
+        RowPkError::EmptyPrimaryKeyPath { index } => {
             format!("empty primary_key column at index {index}")
         }
-        EntityPkError::MissingPrimaryKeyValue { index } => {
+        RowPkError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("missing value at primary-key pointer '{pointer}'")
         }
-        EntityPkError::UnsupportedPrimaryKeyValue { index } => {
+        RowPkError::UnsupportedPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("unsupported value at primary-key pointer '{pointer}'")
         }
-        EntityPkError::InvalidPrimaryKeyValue { index, expected } => {
+        RowPkError::InvalidPrimaryKeyValue { index, expected } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("value at primary-key pointer '{pointer}' must be a valid {expected}")
         }
-        EntityPkError::InvalidEncodedEntityPk => "invalid encoded entity primary key".to_string(),
+        RowPkError::InvalidEncodedRowPk => "invalid encoded row primary key".to_string(),
     };
     LixError::new(
         LixError::CODE_SCHEMA_VALIDATION,
         format!(
-            "failed to derive entity_pk for schema '{}': {detail}",
+            "failed to derive row_pk for schema '{}': {detail}",
             row.schema_key
         ),
     )
@@ -540,13 +540,13 @@ mod tests {
     use crate::schema::seed_schema_definition;
 
     #[test]
-    fn normalization_derives_entity_pk_from_primary_key() {
+    fn normalization_derives_row_pk_from_primary_key() {
         let mut catalog = catalog_with(vec![schema_with_default_id()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "normalization_schema".into(),
             snapshot: Some(snapshot_json(
-                r#"{"id":"entity-from-snapshot","value":"hello"}"#,
+                r#"{"id":"row-from-snapshot","value":"hello"}"#,
             )),
             ..base_stage_row()
         };
@@ -554,17 +554,17 @@ mod tests {
         let row = normalize_test_row(row, &mut catalog, functions()).expect("normalize row");
 
         assert_eq!(
-            row.entity_pk.as_ref(),
-            Some(&EntityPk::single("entity-from-snapshot"))
+            row.row_pk.as_ref(),
+            Some(&RowPk::single("row-from-snapshot"))
         );
     }
 
     #[test]
     fn normalization_retains_complete_canonical_batch_rows() {
-        let normalized = br#"{"id":"entity-from-batch","value":"hello"}"#.to_vec();
+        let normalized = br#"{"id":"row-from-batch","value":"hello"}"#.to_vec();
         let end = u32::try_from(normalized.len()).expect("fixture length");
         let mut batch = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
-            vec![json!({"id": "entity-from-batch", "value": "hello"})],
+            vec![json!({"id": "row-from-batch", "value": "hello"})],
             normalized,
             vec![(0, end)],
             1,
@@ -574,7 +574,7 @@ mod tests {
         let batch_row = batch.pop().expect("canonical row");
         let mut catalog = catalog_with(vec![schema_with_default_id()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "normalization_schema".into(),
             snapshot: Some(TransactionJson::from_canonical_batch(batch_row.clone())),
             ..base_stage_row()
@@ -589,8 +589,8 @@ mod tests {
 
         assert!(batch_row.shares_batch_with(retained));
         assert_eq!(
-            normalized.entity_pk.as_ref(),
-            Some(&EntityPk::single("entity-from-batch"))
+            normalized.row_pk.as_ref(),
+            Some(&RowPk::single("row-from-batch"))
         );
         assert_eq!(retained.validation_counts(), (1, 1));
     }
@@ -603,10 +603,10 @@ mod tests {
             .snapshot()
             .plan_for_key("certificate_schema")
             .expect("old certificate schema");
-        let normalized = br#"{"id":"entity-1","value":"old-value"}"#.to_vec();
+        let normalized = br#"{"id":"row-1","value":"old-value"}"#.to_vec();
         let end = u32::try_from(normalized.len()).expect("fixture length");
         let certificate = crate::plugin::runtime::WasmCanonicalJsonCertificate::new(
-            EntityPk::single("entity-1"),
+            RowPk::single("row-1"),
             old_plan.shared_fingerprint(),
         );
         let mut batch = crate::plugin::runtime::WasmCanonicalJson::from_mixed_batch_parts(
@@ -623,7 +623,7 @@ mod tests {
         // A harmless amendment still forces the ordinary decoded path.
         let mut amended_catalog = catalog_with(vec![certificate_test_schema(Some("old-value"))]);
         let row = TransactionWriteRow {
-            entity_pk: Some(EntityPk::single("entity-1")),
+            row_pk: Some(RowPk::single("row-1")),
             schema_key: "certificate_schema".into(),
             snapshot: Some(TransactionJson::from_canonical_batch(batch_row.clone())),
             ..base_stage_row()
@@ -642,7 +642,7 @@ mod tests {
         // old plan's otherwise valid certificate.
         let mut rejecting_catalog = catalog_with(vec![certificate_test_schema(Some("new-value"))]);
         let row = TransactionWriteRow {
-            entity_pk: Some(EntityPk::single("entity-1")),
+            row_pk: Some(RowPk::single("row-1")),
             schema_key: "certificate_schema".into(),
             snapshot: Some(TransactionJson::from_canonical_batch(batch_row)),
             ..base_stage_row()
@@ -654,9 +654,9 @@ mod tests {
 
     #[test]
     fn historical_shared_snapshot_is_revalidated_after_schema_amendment() {
-        let canonical = crate::common::SharedStr::from(r#"{"id":"entity-1","value":"old-value"}"#);
+        let canonical = crate::common::SharedStr::from(r#"{"id":"row-1","value":"old-value"}"#);
         let row = || TransactionWriteRow {
-            entity_pk: Some(EntityPk::single("entity-1")),
+            row_pk: Some(RowPk::single("row-1")),
             schema_key: "certificate_schema".into(),
             snapshot: Some(TransactionJson::from_unvalidated_shared_normalized_content(
                 canonical.clone(),
@@ -686,9 +686,9 @@ mod tests {
     fn normalization_applies_schema_v1_literal_defaults() {
         let mut catalog = catalog_with(vec![schema_with_cel_field_default()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "cel_field_default_schema".into(),
-            snapshot: Some(snapshot_json(r#"{"id":"entity-1","name":"Sample"}"#)),
+            snapshot: Some(snapshot_json(r#"{"id":"row-1","name":"Sample"}"#)),
             ..base_stage_row()
         };
 
@@ -702,9 +702,9 @@ mod tests {
     fn normalization_applies_schema_v1_default_value() {
         let mut catalog = catalog_with(vec![schema_with_overridden_default()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "overridden_default_schema".into(),
-            snapshot: Some(snapshot_json(r#"{"id":"entity-1"}"#)),
+            snapshot: Some(snapshot_json(r#"{"id":"row-1"}"#)),
             ..base_stage_row()
         };
 
@@ -718,9 +718,9 @@ mod tests {
     fn normalization_does_not_overwrite_explicit_null_with_default() {
         let mut catalog = catalog_with(vec![schema_with_nullable_default()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "nullable_default_schema".into(),
-            snapshot: Some(snapshot_json(r#"{"id":"entity-1","status":null}"#)),
+            snapshot: Some(snapshot_json(r#"{"id":"row-1","status":null}"#)),
             ..base_stage_row()
         };
 
@@ -734,9 +734,9 @@ mod tests {
     fn normalization_applies_timestamp_function_default() {
         let mut catalog = catalog_with(vec![schema_with_timestamp_default()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "timestamp_default_schema".into(),
-            snapshot: Some(snapshot_json(r#"{"id":"entity-1"}"#)),
+            snapshot: Some(snapshot_json(r#"{"id":"row-1"}"#)),
             ..base_stage_row()
         };
 
@@ -747,10 +747,10 @@ mod tests {
     }
 
     #[test]
-    fn normalization_rejects_entity_pk_that_disagrees_with_primary_key() {
+    fn normalization_rejects_row_pk_that_disagrees_with_primary_key() {
         let mut catalog = catalog_with(vec![schema_with_default_id()]);
         let row = TransactionWriteRow {
-            entity_pk: Some(EntityPk::single("wrong-id")),
+            row_pk: Some(RowPk::single("wrong-id")),
             schema_key: "normalization_schema".into(),
             snapshot: Some(snapshot_json(r#"{"id":"right-id","value":"hello"}"#)),
             ..base_stage_row()
@@ -762,34 +762,34 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("does not match primary_key-derived entity_pk")
+                .contains("does not match primary_key-derived row_pk")
         );
     }
 
     #[test]
-    fn normalization_derives_json_array_entity_pk_for_composite_primary_key() {
+    fn normalization_derives_json_array_row_pk_for_composite_primary_key() {
         let mut catalog = catalog_with(vec![composite_key_schema()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "composite_key_schema".into(),
             snapshot: Some(snapshot_json(r#"{"namespace":"a~b","key":"1"}"#)),
             ..base_stage_row()
         };
 
         let row = normalize_test_row(row, &mut catalog, functions()).expect("normalize row");
-        let entity_pk = row.entity_pk.expect("composite entity pk");
-        let projected_entity_pk = entity_pk
+        let row_pk = row.row_pk.expect("composite row pk");
+        let projected_row_pk = row_pk
             .as_json_array_text()
-            .expect("entity pk should project");
+            .expect("row pk should project");
 
-        assert_eq!(projected_entity_pk, "[\"a~b\",\"1\"]");
+        assert_eq!(projected_row_pk, "[\"a~b\",\"1\"]");
     }
 
     #[test]
     fn normalization_rejects_non_string_primary_key_values() {
         let mut catalog = catalog_with(vec![composite_key_schema()]);
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "composite_key_schema".into(),
             snapshot: Some(snapshot_json(r#"{"namespace":"a~b","key":1}"#)),
             ..base_stage_row()
@@ -807,19 +807,19 @@ mod tests {
     }
 
     #[test]
-    fn normalization_validates_explicit_composite_entity_pk_against_projection() {
+    fn normalization_validates_explicit_composite_row_pk_against_projection() {
         let mut catalog = catalog_with(vec![composite_key_schema()]);
         let snapshot = json!({
             "namespace": "a~b",
             "key": "1",
         });
-        let derived = EntityPk::from_primary_key_paths(
+        let derived = RowPk::from_primary_key_paths(
             &snapshot,
             &[vec!["namespace".to_string()], vec!["key".to_string()]],
         )
         .expect("identity should derive");
         let row = TransactionWriteRow {
-            entity_pk: Some(derived.clone()),
+            row_pk: Some(derived.clone()),
             schema_key: "composite_key_schema".into(),
             snapshot: Some(transaction_json(snapshot.clone())),
             ..base_stage_row()
@@ -827,7 +827,7 @@ mod tests {
 
         let row = normalize_test_row(row, &mut catalog, functions()).expect("normalize row");
 
-        assert_eq!(row.entity_pk.as_ref(), Some(&derived));
+        assert_eq!(row.row_pk.as_ref(), Some(&derived));
     }
 
     #[test]
@@ -838,7 +838,7 @@ mod tests {
                 .clone(),
         ]);
         let registered = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: REGISTERED_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "value": dynamic_schema_definition(),
@@ -849,7 +849,7 @@ mod tests {
         normalize_test_row(registered, &mut catalog, functions()).expect("register schema");
 
         let dynamic = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: "dynamic_schema".into(),
             snapshot: Some(snapshot_json(r#"{"id":"dynamic-1"}"#)),
             ..base_stage_row()
@@ -857,8 +857,8 @@ mod tests {
         let dynamic = normalize_test_row(dynamic, &mut catalog, functions()).expect("dynamic row");
 
         assert_eq!(
-            dynamic.entity_pk.as_ref(),
-            Some(&EntityPk::single("dynamic-1"))
+            dynamic.row_pk.as_ref(),
+            Some(&RowPk::single("dynamic-1"))
         );
     }
 
@@ -880,7 +880,7 @@ mod tests {
             let mut schema = dynamic_schema_definition();
             schema["key"] = json!(schema_key);
             let registered = TransactionWriteRow {
-                entity_pk: None,
+                row_pk: None,
                 schema_key: REGISTERED_SCHEMA_KEY.into(),
                 snapshot: Some(transaction_json(json!({ "value": schema }))),
                 ..base_stage_row()
@@ -912,7 +912,7 @@ mod tests {
         let mut schema = dynamic_schema_definition();
         schema["key"] = json!("acme_plugin_note");
         let registered = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: REGISTERED_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({ "value": schema }))),
             ..base_stage_row()
@@ -931,7 +931,7 @@ mod tests {
         ]);
 
         let file = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "id": "01920000-0000-7000-8000-0000000000c1",
@@ -950,7 +950,7 @@ mod tests {
         );
 
         let directory = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "id": "01920000-0000-7000-8000-0000000000c2",
@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(directory.file_id, None);
 
         let bidi = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "id": "01920000-0000-7000-8000-0000000000c3",
@@ -984,7 +984,7 @@ mod tests {
         assert_eq!(bidi_snapshot["name"], "safe\u{202E}txt");
 
         let zero_width = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "id": "01920000-0000-7000-8000-0000000000d6",
@@ -1000,7 +1000,7 @@ mod tests {
         assert_eq!(zero_width_snapshot["name"], "zero\u{200D}width");
 
         let dotdot = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "id": "01920000-0000-7000-8000-0000000000e6",
@@ -1024,7 +1024,7 @@ mod tests {
 
         let row = normalize_test_row(
             TransactionWriteRow {
-                entity_pk: None,
+                row_pk: None,
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.into(),
                 snapshot: Some(transaction_json(json!({
                     "id": "01920000-0000-7000-8000-0000000000c4",
@@ -1050,7 +1050,7 @@ mod tests {
 
         let row = normalize_test_row(
             TransactionWriteRow {
-                entity_pk: None,
+                row_pk: None,
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.into(),
                 snapshot: Some(transaction_json(json!({
                     "id": "01920000-0000-7000-8000-0000000000c5",
@@ -1070,14 +1070,14 @@ mod tests {
     }
 
     #[test]
-    fn normalization_supports_global_checkpoint_entity() {
+    fn normalization_supports_global_checkpoint_row() {
         let mut catalog = catalog_with(vec![
             builtin_schema("lix_commit"),
             builtin_schema(crate::checkpoint::CHECKPOINT_SCHEMA_KEY),
         ]);
         let commit_id = "01920000-0000-7000-8000-0000000000c6";
         let row = TransactionWriteRow {
-            entity_pk: None,
+            row_pk: None,
             schema_key: crate::checkpoint::CHECKPOINT_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "id": commit_id,
@@ -1090,11 +1090,11 @@ mod tests {
         };
 
         let normalized = normalize_test_row(row, &mut catalog, functions())
-            .expect("checkpoint should normalize through its registered entity schema");
+            .expect("checkpoint should normalize through its registered row schema");
 
         assert_eq!(
-            normalized.entity_pk,
-            Some(EntityPk::uuid_from_canonical(commit_id).expect("checkpoint commit ID"))
+            normalized.row_pk,
+            Some(RowPk::uuid_from_canonical(commit_id).expect("checkpoint commit ID"))
         );
         assert!(
             catalog
@@ -1161,10 +1161,10 @@ mod tests {
 
     fn base_stage_row() -> TransactionWriteRow {
         TransactionWriteRow {
-            entity_pk: Some(EntityPk::single("entity-1")),
+            row_pk: Some(RowPk::single("row-1")),
             schema_key: "normalization_schema".into(),
             file_id: None,
-            snapshot: Some(snapshot_json(r#"{"id":"entity-1","value":"hello"}"#)),
+            snapshot: Some(snapshot_json(r#"{"id":"row-1","value":"hello"}"#)),
             metadata: None,
             origin: None,
             created_at: None,

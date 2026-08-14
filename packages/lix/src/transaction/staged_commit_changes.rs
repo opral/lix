@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::tracked_state::TrackedStateDiffIdentity;
 
 /// Transaction-local commit change refs accumulated while rows are staged.
@@ -38,7 +38,7 @@ pub(crate) struct StagedCommitChangeRefs {
     ///
     /// A branch normally owns exactly one batch. Multiple batches remain
     /// separate so staging/finalization clones only `Arc` owners rather than
-    /// copying schema/file/entity or metadata columns.
+    /// copying schema/file/row or metadata columns.
     selected_change_batches: Vec<StagedCommitChangeBatch>,
     /// Certified immutable mutation columns for this commit. This owner is
     /// attached only at drain, after complete-replacement certification, and
@@ -79,7 +79,7 @@ impl StagedCommitChangeRefs {
 /// Immutable typed columns for historical changes selected into a new commit.
 ///
 /// Identities retain the diff batch owner, so schema keys, file ids, and
-/// entity primary keys are never lowered into row-owned transaction strings.
+/// row primary keys are never lowered into row-owned transaction strings.
 /// All remaining metadata is stored in fixed typed columns allocated once per
 /// batch. Cloning this batch through transaction staging is O(1).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -264,8 +264,8 @@ impl<'a> StagedCommitChangeRef<'a> {
         self.identity.file_id()
     }
 
-    pub(crate) fn entity_pk(&self) -> &'a EntityPk {
-        self.identity.entity_pk()
+    pub(crate) fn row_pk(&self) -> &'a RowPk {
+        self.identity.row_pk()
     }
 }
 
@@ -341,11 +341,11 @@ impl StagedCommitChangeRefs {
             HashSet::with_capacity(self.selected_change_count().saturating_add(batch.len()));
         identities.extend(
             self.selected_changes()
-                .map(|change| (change.schema_key(), change.file_id(), change.entity_pk())),
+                .map(|change| (change.schema_key(), change.file_id(), change.row_pk())),
         );
         let mut selected: Option<Vec<u32>> = None;
         for (row_index, change) in batch.iter().enumerate() {
-            if identities.insert((change.schema_key(), change.file_id(), change.entity_pk())) {
+            if identities.insert((change.schema_key(), change.file_id(), change.row_pk())) {
                 if let Some(selected) = selected.as_mut() {
                     selected.push(
                         u32::try_from(row_index)
@@ -422,7 +422,7 @@ mod tests {
                 .map(|index| TrackedStateKey {
                     schema_key: "shared_schema".to_string(),
                     file_id: Some("shared_file".to_string()),
-                    entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                    row_pk: RowPk::single(format!("row-{index:05}")),
                 })
                 .collect(),
         )
@@ -473,12 +473,12 @@ mod tests {
         let source_commit = CommitId::for_test_label("shared-source");
         let shared_change = ChangeId::for_test_label("shared-change");
         let identities = TrackedStateDiffIdentity::from_key_batch(
-            ["entity-a", "entity-b"]
+            ["row-a", "row-b"]
                 .into_iter()
-                .map(|entity| TrackedStateKey {
+                .map(|row| TrackedStateKey {
                     schema_key: "schema".to_string(),
                     file_id: Some("file".to_string()),
-                    entity_pk: EntityPk::single(entity),
+                    row_pk: RowPk::single(row),
                 })
                 .collect(),
         )

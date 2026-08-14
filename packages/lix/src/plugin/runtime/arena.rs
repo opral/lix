@@ -3,7 +3,7 @@
 //! A [`Root`] names three independently persistent values:
 //!
 //! - exact accepted file bytes as a rope of immutable page slices;
-//! - durable semantic entities as a copy-on-write keyed map;
+//! - durable semantic rows as a copy-on-write keyed map;
 //! - opaque plugin state as a separate copy-on-write keyed map.
 //!
 //! Transactions stage all three successors and publish one content-addressed
@@ -663,7 +663,7 @@ impl MapArena {
 pub struct Root {
     pub generation: Arc<str>,
     pub bytes: ByteArena,
-    pub entities: MapArena,
+    pub rows: MapArena,
     pub state: MapArena,
     id: Digest,
     retained_heap_bytes: usize,
@@ -683,10 +683,10 @@ impl Root {
         store: Store,
         generation: impl Into<Arc<str>>,
         bytes: &[u8],
-        entities: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        rows: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
         state: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
     ) -> Self {
-        let entities = entities
+        let rows = rows
             .into_iter()
             .map(|(key, value)| (key, ByteArena::from_bytes(store.clone(), &value)))
             .collect();
@@ -697,29 +697,29 @@ impl Root {
         Self::new(
             generation.into(),
             ByteArena::from_bytes(store.clone(), bytes),
-            MapArena::from_entries(store.clone(), entities),
+            MapArena::from_entries(store.clone(), rows),
             MapArena::from_entries(store, state),
         )
     }
 
-    fn new(generation: Arc<str>, bytes: ByteArena, entities: MapArena, state: MapArena) -> Self {
+    fn new(generation: Arc<str>, bytes: ByteArena, rows: MapArena, state: MapArena) -> Self {
         let id = digest(
             b"lix-plugin-v3/root\0",
             [
                 generation.as_bytes(),
                 bytes.id.as_bytes(),
-                entities.id.as_bytes(),
+                rows.id.as_bytes(),
                 state.id.as_bytes(),
             ],
         );
         let retained_heap_bytes = size_of::<Root>()
             .saturating_add(bytes.retained_heap_bytes)
-            .saturating_add(entities.retained_heap_bytes)
+            .saturating_add(rows.retained_heap_bytes)
             .saturating_add(state.retained_heap_bytes);
         Self {
             generation,
             bytes,
-            entities,
+            rows,
             state,
             id,
             retained_heap_bytes,
@@ -732,7 +732,7 @@ impl Root {
 
     /// Approximate heap bytes retained by this immutable root.
     ///
-    /// This includes page payloads plus the per-entity keys, arenas,
+    /// This includes page payloads plus the per-row keys, arenas,
     /// segment arrays, and a conservative allowance for `BTreeMap` nodes and
     /// allocation headers. It deliberately overcounts shared pages and
     /// metadata so a decoded-root cache remains a hard memory bound. The value
@@ -744,9 +744,9 @@ impl Root {
     /// Returns the byte-and-state view needed to resume an accepted file
     /// transition after its Wasm Store is evicted.
     ///
-    /// Durable entities remain the engine's semantic authority; production
+    /// Durable rows remain the engine's semantic authority; production
     /// plugins keep their incremental indexes in `state` and do not consult
-    /// the entity arena while applying a byte successor. Retaining entity
+    /// the row arena while applying a byte successor. Retaining row
     /// snapshots here would therefore keep a second complete semantic copy
     /// solely as a cache optimization.
     pub fn successor_checkpoint(&self) -> Self {
@@ -759,7 +759,7 @@ impl Root {
     }
 
     /// Encodes only opaque plugin state. Accepted file bytes are already
-    /// durable in the engine's binary CAS and semantic entities remain in
+    /// durable in the engine's binary CAS and semantic rows remain in
     /// tracked state, so neither is duplicated in this checkpoint payload.
     pub fn successor_checkpoint_encoded_len(&self) -> Result<usize, Error> {
         let mut len = SUCCESSOR_CHECKPOINT_MAGIC
@@ -806,7 +806,7 @@ impl Root {
     }
 
     /// Reopens a successor checkpoint against independently loaded accepted
-    /// bytes. The entity arena intentionally starts empty; tracked-state
+    /// bytes. The row arena intentionally starts empty; tracked-state
     /// authority is validated by the engine before publication.
     pub fn decode_successor_checkpoint(accepted: &[u8], encoded: &[u8]) -> Result<Self, Error> {
         let payload_len = encoded
@@ -858,7 +858,7 @@ impl Root {
         Transaction {
             base: self.clone(),
             byte_edits: Vec::new(),
-            entity_changes: BTreeMap::new(),
+            row_changes: BTreeMap::new(),
             state_changes: BTreeMap::new(),
             generation: None,
         }
@@ -869,7 +869,7 @@ impl Root {
     pub fn archive(&self) -> Result<Archive, Error> {
         let mut reachable = BTreeMap::new();
         collect_byte_pages(&self.bytes, &mut reachable)?;
-        for value in self.entities.entries.values() {
+        for value in self.rows.entries.values() {
             collect_byte_pages(value, &mut reachable)?;
         }
         for value in self.state.entries.values() {
@@ -880,17 +880,17 @@ impl Root {
             pages: reachable.into_iter().collect(),
             generation: self.generation.clone(),
             bytes: self.bytes.archived(),
-            entities: self.entities.archived(),
+            rows: self.rows.archived(),
             state: self.state.archived(),
             id: self.id,
         })
     }
 
-    /// Deterministically merges durable entity values. Opaque state is not
+    /// Deterministically merges durable row values. Opaque state is not
     /// merge authority and is retained from `a`; callers may rebuild it.
     /// Concurrent unequal values use their content digest as a canonical,
     /// merge-direction-independent tie break.
-    pub fn merge_entities(base: &Self, a: &Self, b: &Self) -> Result<Self, Error> {
+    pub fn merge_rows(base: &Self, a: &Self, b: &Self) -> Result<Self, Error> {
         if !Arc::ptr_eq(&base.bytes.store.inner, &a.bytes.store.inner)
             || !Arc::ptr_eq(&base.bytes.store.inner, &b.bytes.store.inner)
         {
@@ -898,19 +898,19 @@ impl Root {
         }
         let mut keys = BTreeMap::<Vec<u8>, ()>::new();
         for key in base
-            .entities
+            .rows
             .entries
             .keys()
-            .chain(a.entities.entries.keys())
-            .chain(b.entities.entries.keys())
+            .chain(a.rows.entries.keys())
+            .chain(b.rows.entries.keys())
         {
             keys.insert(key.clone(), ());
         }
         let mut merged = BTreeMap::new();
         for key in keys.keys() {
-            let base_value = base.entities.entries.get(key);
-            let a_value = a.entities.entries.get(key);
-            let b_value = b.entities.entries.get(key);
+            let base_value = base.rows.entries.get(key);
+            let a_value = a.rows.entries.get(key);
+            let b_value = b.rows.entries.get(key);
             let selected = if same_value(a_value, b_value) {
                 a_value
             } else if same_value(a_value, base_value) {
@@ -1017,7 +1017,7 @@ pub struct Archive {
     pages: Vec<(Digest, Vec<u8>)>,
     generation: Arc<str>,
     bytes: ArchivedByteArena,
-    entities: ArchivedMap,
+    rows: ArchivedMap,
     state: ArchivedMap,
     id: Digest,
 }
@@ -1033,7 +1033,7 @@ impl Archive {
         let root = Root::new(
             self.generation.clone(),
             ByteArena::reopen(store.clone(), &self.bytes)?,
-            MapArena::reopen(store.clone(), &self.entities)?,
+            MapArena::reopen(store.clone(), &self.rows)?,
             MapArena::reopen(store.clone(), &self.state)?,
         );
         if root.id != self.id {
@@ -1047,7 +1047,7 @@ impl Archive {
 pub struct Transaction {
     base: Root,
     byte_edits: Vec<ByteEdit>,
-    entity_changes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    row_changes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     state_changes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     generation: Option<Arc<str>>,
 }
@@ -1057,8 +1057,8 @@ impl Transaction {
         self.byte_edits.push(edit);
     }
 
-    pub fn upsert_entity(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.entity_changes.insert(key, Some(value));
+    pub fn upsert_row(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.row_changes.insert(key, Some(value));
     }
 
     pub fn put_state(&mut self, key: Vec<u8>, value: Vec<u8>) {
@@ -1076,12 +1076,12 @@ impl Transaction {
     pub fn commit(mut self) -> Result<Root, Error> {
         self.byte_edits.sort_by_key(|edit| edit.offset);
         let bytes = self.base.bytes.apply(&self.byte_edits)?;
-        let entities = self.base.entities.apply(&self.entity_changes);
+        let rows = self.base.rows.apply(&self.row_changes);
         let state = self.base.state.apply(&self.state_changes);
         Ok(Root::new(
             self.generation.unwrap_or(self.base.generation),
             bytes,
-            entities,
+            rows,
             state,
         ))
     }
@@ -1177,7 +1177,7 @@ mod tests {
             delete_len: 1,
             insert: b"X".to_vec(),
         });
-        transaction.upsert_entity(b"row/1".to_vec(), b"{\"id\":1,\"v\":\"X\"}".to_vec());
+        transaction.upsert_row(b"row/1".to_vec(), b"{\"id\":1,\"v\":\"X\"}".to_vec());
         transaction.put_state(b"index/0".to_vec(), b"row/1@5".to_vec());
         let successor = transaction.commit().unwrap();
 
@@ -1252,10 +1252,10 @@ mod tests {
             delete_len: 1,
             insert: Vec::new(),
         });
-        transaction.upsert_entity(b"row/2".to_vec(), b"partial".to_vec());
+        transaction.upsert_row(b"row/2".to_vec(), b"partial".to_vec());
         assert!(matches!(transaction.commit(), Err(Error::InvalidEdits)));
         assert_eq!(root.id(), original);
-        assert!(root.entities.get(b"row/2").unwrap().is_none());
+        assert!(root.rows.get(b"row/2").unwrap().is_none());
     }
 
     #[test]
@@ -1269,7 +1269,7 @@ mod tests {
                 delete_len: 0,
                 insert: b"!".to_vec(),
             });
-            transaction.upsert_entity(b"row/2".to_vec(), b"{\"id\":2}".to_vec());
+            transaction.upsert_row(b"row/2".to_vec(), b"{\"id\":2}".to_vec());
             transaction.commit().unwrap()
         };
         let a = make_successor(&root);
@@ -1285,12 +1285,12 @@ mod tests {
     fn upgrade_changes_generation_without_rewriting_arenas() {
         let (_store, root) = fixture();
         let byte_id = root.bytes.id();
-        let entity_id = root.entities.id();
+        let row_id = root.rows.id();
         let mut transaction = root.transaction();
         transaction.upgrade_to("generation-b");
         let upgraded = transaction.commit().unwrap();
         assert_eq!(upgraded.bytes.id(), byte_id);
-        assert_eq!(upgraded.entities.id(), entity_id);
+        assert_eq!(upgraded.rows.id(), row_id);
         assert_ne!(upgraded.id(), root.id());
     }
 
@@ -1305,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_heap_accounting_includes_entity_index_overhead() {
+    fn retained_heap_accounting_includes_row_index_overhead() {
         let store = Store::new(64);
         let empty = Root::empty(store.clone(), "generation-a");
         let populated = Root::import(
@@ -1324,19 +1324,19 @@ mod tests {
         assert!(populated.retained_heap_bytes() > empty.retained_heap_bytes());
         assert!(
             populated.retained_heap_bytes() > 100_000,
-            "small entity snapshots still retain map, key, arena, and allocation metadata"
+            "small row snapshots still retain map, key, arena, and allocation metadata"
         );
     }
 
     #[test]
-    fn successor_checkpoint_retains_bytes_and_state_without_entities() {
+    fn successor_checkpoint_retains_bytes_and_state_without_rows() {
         let (_store, root) = fixture();
         let checkpoint = root.successor_checkpoint();
 
         assert_eq!(checkpoint.generation, root.generation);
         assert_eq!(checkpoint.bytes.id(), root.bytes.id());
         assert_eq!(checkpoint.state.id(), root.state.id());
-        assert!(checkpoint.entities.is_empty());
+        assert!(checkpoint.rows.is_empty());
         assert_eq!(
             checkpoint.state.get(b"index/0").unwrap(),
             Some(b"row/1".to_vec())
@@ -1363,7 +1363,7 @@ mod tests {
             reopened.state.get(b"index/0").unwrap(),
             Some(b"row/1".to_vec())
         );
-        assert!(reopened.entities.is_empty());
+        assert!(reopened.rows.is_empty());
 
         let mut corrupt = encoded;
         corrupt[8] ^= 1;
@@ -1376,11 +1376,11 @@ mod tests {
     #[test]
     fn unchanged_map_values_keep_stable_identity() {
         let (_store, root) = fixture();
-        let before = root.entities.value_id(b"row/1").unwrap();
+        let before = root.rows.value_id(b"row/1").unwrap();
         let mut transaction = root.transaction();
-        transaction.upsert_entity(b"row/2".to_vec(), b"{\"id\":2}".to_vec());
+        transaction.upsert_row(b"row/2".to_vec(), b"{\"id\":2}".to_vec());
         let successor = transaction.commit().unwrap();
-        assert_eq!(successor.entities.value_id(b"row/1"), Some(before));
+        assert_eq!(successor.rows.value_id(b"row/1"), Some(before));
     }
 
     #[test]
@@ -1394,14 +1394,14 @@ mod tests {
         });
         let successor = transaction.commit().unwrap();
         let expected_id = successor.id();
-        let expected_entity = successor.entities.value_id(b"row/1");
+        let expected_row = successor.rows.value_id(b"row/1");
         let archive = successor.archive().unwrap();
         drop(successor);
         drop(root);
 
         let (_reopened_store, reopened) = archive.reopen().unwrap();
         assert_eq!(reopened.id(), expected_id);
-        assert_eq!(reopened.entities.value_id(b"row/1"), expected_entity);
+        assert_eq!(reopened.rows.value_id(b"row/1"), expected_row);
         assert_eq!(
             reopened.bytes.read(0, reopened.bytes.len()).unwrap(),
             b"abcdefXYijkl"
@@ -1412,19 +1412,19 @@ mod tests {
     fn merge_is_direction_independent_and_preserves_disjoint_changes() {
         let (_store, base) = fixture();
         let mut a = base.transaction();
-        a.upsert_entity(b"row/a".to_vec(), b"A".to_vec());
-        a.upsert_entity(b"row/conflict".to_vec(), b"left".to_vec());
+        a.upsert_row(b"row/a".to_vec(), b"A".to_vec());
+        a.upsert_row(b"row/conflict".to_vec(), b"left".to_vec());
         let a = a.commit().unwrap();
         let mut b = base.transaction();
-        b.upsert_entity(b"row/b".to_vec(), b"B".to_vec());
-        b.upsert_entity(b"row/conflict".to_vec(), b"right".to_vec());
+        b.upsert_row(b"row/b".to_vec(), b"B".to_vec());
+        b.upsert_row(b"row/conflict".to_vec(), b"right".to_vec());
         let b = b.commit().unwrap();
 
-        let ab = Root::merge_entities(&base, &a, &b).unwrap();
-        let ba = Root::merge_entities(&base, &b, &a).unwrap();
-        assert_eq!(ab.entities.id(), ba.entities.id());
-        assert_eq!(ab.entities.get(b"row/a").unwrap().unwrap(), b"A");
-        assert_eq!(ab.entities.get(b"row/b").unwrap().unwrap(), b"B");
+        let ab = Root::merge_rows(&base, &a, &b).unwrap();
+        let ba = Root::merge_rows(&base, &b, &a).unwrap();
+        assert_eq!(ab.rows.id(), ba.rows.id());
+        assert_eq!(ab.rows.get(b"row/a").unwrap().unwrap(), b"A");
+        assert_eq!(ab.rows.get(b"row/b").unwrap().unwrap(), b"B");
     }
 
     #[test]

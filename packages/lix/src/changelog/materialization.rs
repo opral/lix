@@ -62,7 +62,7 @@ pub(crate) struct MaterializedChangePayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedChangeIdentity {
     pub(crate) schema_key: String,
-    pub(crate) entity_pk: crate::entity_pk::EntityPk,
+    pub(crate) row_pk: crate::row_pk::RowPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -226,7 +226,7 @@ where
             change_id,
             MaterializedChangeIdentity {
                 schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
+                row_pk: change.row_pk,
                 file_id: change.file_id,
             },
             materialized_json_slot(projection.snapshot_content, change.snapshot, &mut json_refs),
@@ -447,7 +447,7 @@ mod tests {
         let first = test_change_record();
         let mut second = first.clone();
         second.schema_key = "derived-row".to_owned();
-        second.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
+        second.row_pk = crate::row_pk::RowPk::single("row-2");
 
         let payloads = materialize_known_change_payloads_in_order(
             &read,

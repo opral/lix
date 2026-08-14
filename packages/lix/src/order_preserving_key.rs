@@ -10,7 +10,7 @@
 //! neither plane may declare its own tags or writers.
 //!
 //! NUL bytes are escaped as `00 ff`, so no encoded part can contain the
-//! terminator. Tags match `EntityPk`'s cross-type order. UUIDs use raw bytes and
+//! terminator. Tags match `RowPk`'s cross-type order. UUIDs use raw bytes and
 //! signed integers use sign-bit-flipped big endian, so lexical byte order is
 //! logical order.
 //!
@@ -43,11 +43,11 @@ pub(crate) const KEY_PART_FINAL: u8 = 0x00;
 pub(crate) const KEY_PART_MORE: u8 = 0x01;
 pub(crate) const FILE_ID_NONE: u8 = 0x00;
 pub(crate) const FILE_ID_SOME: u8 = 0x01;
-pub(crate) const ENTITY_PK_CODEC_V1: u8 = 0x01;
-pub(crate) const ENTITY_PK_UUID: u8 = 0x00;
-pub(crate) const ENTITY_PK_INTEGER: u8 = 0x01;
-pub(crate) const ENTITY_PK_STRING: u8 = 0x02;
-pub(crate) const ENTITY_PK_BYTES: u8 = 0x03;
+pub(crate) const ROW_PK_CODEC_V1: u8 = 0x01;
+pub(crate) const ROW_PK_UUID: u8 = 0x00;
+pub(crate) const ROW_PK_INTEGER: u8 = 0x01;
+pub(crate) const ROW_PK_STRING: u8 = 0x02;
+pub(crate) const ROW_PK_BYTES: u8 = 0x03;
 
 /// One scanned key part: where it ends, how it terminated, and how to get its
 /// bytes without copying when it contained no escape.
@@ -152,10 +152,10 @@ fn scan_key_part_escaped(
     }
 }
 
-/// Byte width of a UUID entity-primary-key component.
-pub(crate) const ENTITY_PK_UUID_BYTES: usize = 16;
-/// Byte width of an integer entity-primary-key component.
-pub(crate) const ENTITY_PK_INTEGER_BYTES: usize = 8;
+/// Byte width of a UUID row-primary-key component.
+pub(crate) const ROW_PK_UUID_BYTES: usize = 16;
+/// Byte width of an integer row-primary-key component.
+pub(crate) const ROW_PK_INTEGER_BYTES: usize = 8;
 
 /// A part terminator is either "more components follow" or "this was the last".
 /// Any other byte in that position is a malformed key.
@@ -177,37 +177,37 @@ pub(crate) fn i64_from_ordered_integer(ordered: u64) -> i64 {
 
 /// Encoding an empty primary key is deliberately not an assertion failure.
 /// Non-emptiness is enforced where it can produce a real error —
-/// `EntityPk::from_components` rejects it, and `decode_key` rejects the encoded
+/// `RowPk::from_components` rejects it, and `decode_key` rejects the encoded
 /// form — and `tracked_state::codec` relies on being able to encode one so that
 /// the decoder is what reports it. (The two former copies of this writer
 /// disagreed on exactly this point: the hot-head copy carried a `debug_assert`
 /// the tracked-state copy did not, so they produced the same bytes under
 /// different contracts. That divergence is the reason this module exists.)
-pub(crate) fn write_entity_pk(out: &mut Vec<u8>, entity_pk: &crate::entity_pk::EntityPk) {
-    out.push(ENTITY_PK_CODEC_V1);
-    for (index, component) in entity_pk.components.iter().enumerate() {
-        let terminator = if index + 1 == entity_pk.components.len() {
+pub(crate) fn write_row_pk(out: &mut Vec<u8>, row_pk: &crate::row_pk::RowPk) {
+    out.push(ROW_PK_CODEC_V1);
+    for (index, component) in row_pk.components.iter().enumerate() {
+        let terminator = if index + 1 == row_pk.components.len() {
             KEY_PART_FINAL
         } else {
             KEY_PART_MORE
         };
         match component {
-            crate::entity_pk::EntityPkComponent::Uuid(bytes) => {
-                out.push(ENTITY_PK_UUID);
+            crate::row_pk::RowPkComponent::Uuid(bytes) => {
+                out.push(ROW_PK_UUID);
                 out.extend_from_slice(bytes);
                 out.push(terminator);
             }
-            crate::entity_pk::EntityPkComponent::Integer(value) => {
-                out.push(ENTITY_PK_INTEGER);
+            crate::row_pk::RowPkComponent::Integer(value) => {
+                out.push(ROW_PK_INTEGER);
                 out.extend_from_slice(&ordered_integer_from_i64(*value).to_be_bytes());
                 out.push(terminator);
             }
-            crate::entity_pk::EntityPkComponent::String(value) => {
-                out.push(ENTITY_PK_STRING);
+            crate::row_pk::RowPkComponent::String(value) => {
+                out.push(ROW_PK_STRING);
                 write_key_bytes(out, value.as_bytes(), terminator);
             }
-            crate::entity_pk::EntityPkComponent::Bytes(value) => {
-                out.push(ENTITY_PK_BYTES);
+            crate::row_pk::RowPkComponent::Bytes(value) => {
+                out.push(ROW_PK_BYTES);
                 write_key_bytes(out, value, terminator);
             }
         }
@@ -242,13 +242,13 @@ pub(crate) fn write_key_bytes(out: &mut Vec<u8>, value: &[u8], terminator: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_pk::{EntityPk, EntityPkComponent};
+    use crate::row_pk::{RowPk, RowPkComponent};
 
-    fn encoded_entity_pk(components: Vec<EntityPkComponent>) -> Vec<u8> {
-        let entity_pk = EntityPk::from_components(components.into_iter().collect())
-            .expect("golden entity primary keys are non-empty");
+    fn encoded_row_pk(components: Vec<RowPkComponent>) -> Vec<u8> {
+        let row_pk = RowPk::from_components(components.into_iter().collect())
+            .expect("golden row primary keys are non-empty");
         let mut out = Vec::new();
-        write_entity_pk(&mut out, &entity_pk);
+        write_row_pk(&mut out, &row_pk);
         out
     }
 
@@ -259,21 +259,21 @@ mod tests {
     /// message, so malformed input is the interesting part.
     fn differential_corpus() -> Vec<Vec<u8>> {
         let seeds = vec![
-            encoded_entity_pk(vec![EntityPkComponent::String("x".into())]),
-            encoded_entity_pk(vec![EntityPkComponent::String("a-b".into())]),
-            encoded_entity_pk(vec![EntityPkComponent::Integer(-1)]),
-            encoded_entity_pk(vec![EntityPkComponent::Uuid([7; 16])]),
-            encoded_entity_pk(vec![EntityPkComponent::Bytes(bytes::Bytes::from_static(
+            encoded_row_pk(vec![RowPkComponent::String("x".into())]),
+            encoded_row_pk(vec![RowPkComponent::String("a-b".into())]),
+            encoded_row_pk(vec![RowPkComponent::Integer(-1)]),
+            encoded_row_pk(vec![RowPkComponent::Uuid([7; 16])]),
+            encoded_row_pk(vec![RowPkComponent::Bytes(bytes::Bytes::from_static(
                 &[0, 0xff],
             ))]),
-            encoded_entity_pk(vec![
-                EntityPkComponent::String("a".into()),
-                EntityPkComponent::Integer(7),
+            encoded_row_pk(vec![
+                RowPkComponent::String("a".into()),
+                RowPkComponent::Integer(7),
             ]),
-            encoded_entity_pk(vec![
-                EntityPkComponent::Uuid([0; 16]),
-                EntityPkComponent::Bytes(bytes::Bytes::from_static(&[9])),
-                EntityPkComponent::String("z".into()),
+            encoded_row_pk(vec![
+                RowPkComponent::Uuid([0; 16]),
+                RowPkComponent::Bytes(bytes::Bytes::from_static(&[9])),
+                RowPkComponent::String("z".into()),
             ]),
         ];
 
@@ -295,12 +295,12 @@ mod tests {
         }
         corpus.extend([
             vec![],
-            vec![ENTITY_PK_CODEC_V1],
+            vec![ROW_PK_CODEC_V1],
             vec![0x00],
-            vec![ENTITY_PK_CODEC_V1, ENTITY_PK_STRING, 0x00, 0x02],
-            vec![ENTITY_PK_CODEC_V1, ENTITY_PK_STRING, 0xff, 0x00, 0x00],
-            vec![ENTITY_PK_CODEC_V1, ENTITY_PK_STRING, 0x00, 0xff, 0x00, 0x00],
-            vec![ENTITY_PK_CODEC_V1, 0x05, 0x00, 0x00],
+            vec![ROW_PK_CODEC_V1, ROW_PK_STRING, 0x00, 0x02],
+            vec![ROW_PK_CODEC_V1, ROW_PK_STRING, 0xff, 0x00, 0x00],
+            vec![ROW_PK_CODEC_V1, ROW_PK_STRING, 0x00, 0xff, 0x00, 0x00],
+            vec![ROW_PK_CODEC_V1, 0x05, 0x00, 0x00],
         ]);
         corpus
     }
@@ -309,12 +309,12 @@ mod tests {
     /// depending on any plane's error strings — which deliberately differ, since
     /// each plane keeps its own error code and prefix. Decoding and re-encoding
     /// canonicalises the value.
-    fn render(decoded: Option<(EntityPk, usize)>) -> String {
+    fn render(decoded: Option<(RowPk, usize)>) -> String {
         match decoded {
             None => "rejected".to_string(),
-            Some((entity_pk, offset)) => {
+            Some((row_pk, offset)) => {
                 let mut out = Vec::new();
-                write_entity_pk(&mut out, &entity_pk);
+                write_row_pk(&mut out, &row_pk);
                 format!(
                     "accepted off={offset} {}",
                     out.iter().map(|b| format!("{b:02x}")).collect::<String>()
@@ -341,9 +341,9 @@ mod tests {
         );
         let mut accepted = 0usize;
         for (index, input) in corpus.iter().enumerate() {
-            let head = render(crate::hot_state::head_decode_entity_pk_probe(input));
-            let hot = render(crate::hot_state::hot_decode_entity_pk_probe(input));
-            let tree = render(crate::tracked_state::tree_decode_entity_pk_probe(input));
+            let head = render(crate::hot_state::head_decode_row_pk_probe(input));
+            let hot = render(crate::hot_state::hot_decode_row_pk_probe(input));
+            let tree = render(crate::tracked_state::tree_decode_row_pk_probe(input));
             assert_eq!(
                 head, hot,
                 "tracked_head and hot disagree on case {index}: {input:02x?}"
@@ -438,23 +438,23 @@ mod tests {
     }
 
     #[test]
-    fn entity_pk_encoding_is_byte_pinned() {
+    fn row_pk_encoding_is_byte_pinned() {
         assert_eq!(
-            encoded_entity_pk(vec![EntityPkComponent::String("x".into())]),
+            encoded_row_pk(vec![RowPkComponent::String("x".into())]),
             vec![0x01, 0x02, b'x', 0x00, 0x00]
         );
         assert_eq!(
-            encoded_entity_pk(vec![EntityPkComponent::Bytes(bytes::Bytes::from_static(
+            encoded_row_pk(vec![RowPkComponent::Bytes(bytes::Bytes::from_static(
                 &[0xaa]
             ))]),
             vec![0x01, 0x03, 0xaa, 0x00, 0x00]
         );
         assert_eq!(
-            encoded_entity_pk(vec![EntityPkComponent::Uuid([7; 16])]),
+            encoded_row_pk(vec![RowPkComponent::Uuid([7; 16])]),
             [vec![0x01, 0x00], vec![7; 16], vec![0x00]].concat()
         );
         assert_eq!(
-            encoded_entity_pk(vec![EntityPkComponent::Integer(1)]),
+            encoded_row_pk(vec![RowPkComponent::Integer(1)]),
             vec![0x01, 0x01, 0x80, 0, 0, 0, 0, 0, 0, 0x01, 0x00]
         );
 
@@ -462,9 +462,9 @@ mod tests {
         // KEY_PART_FINAL, so a shorter key never prefixes a longer one at the
         // same component boundary.
         assert_eq!(
-            encoded_entity_pk(vec![
-                EntityPkComponent::String("a".into()),
-                EntityPkComponent::String("b".into()),
+            encoded_row_pk(vec![
+                RowPkComponent::String("a".into()),
+                RowPkComponent::String("b".into()),
             ]),
             vec![0x01, 0x02, b'a', 0x00, 0x01, 0x02, b'b', 0x00, 0x00]
         );
@@ -476,7 +476,7 @@ mod tests {
     fn integer_components_encode_in_signed_order() {
         let ordered = [i64::MIN, -2, -1, 0, 1, 2, i64::MAX]
             .into_iter()
-            .map(|value| encoded_entity_pk(vec![EntityPkComponent::Integer(value)]))
+            .map(|value| encoded_row_pk(vec![RowPkComponent::Integer(value)]))
             .collect::<Vec<_>>();
         let mut sorted = ordered.clone();
         sorted.sort();
@@ -489,7 +489,7 @@ mod tests {
     fn escaped_strings_keep_lexical_order() {
         let ordered = ["a", "a-", "a-b", "ab", "b"]
             .into_iter()
-            .map(|value| encoded_entity_pk(vec![EntityPkComponent::String(value.into())]))
+            .map(|value| encoded_row_pk(vec![RowPkComponent::String(value.into())]))
             .collect::<Vec<_>>();
         let mut sorted = ordered.clone();
         sorted.sort();

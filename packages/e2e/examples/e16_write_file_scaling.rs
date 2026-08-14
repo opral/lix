@@ -10,10 +10,10 @@
 //! file count, then splits the write into four shapes so the term can be
 //! attributed:
 //!
-//! * `insert_file_80line` — a new plugin-backed file, 80 entity rows. The
+//! * `insert_file_80line` — a new plugin-backed file, 80 rows. The
 //!   original control shape.
-//! * `insert_file_1line`  — a new plugin-backed file, 1 entity row. Isolates
-//!   per-entity plugin work from per-write work.
+//! * `insert_file_1line`  — a new plugin-backed file, 1 row. Isolates
+//!   per-row plugin work from per-write work.
 //! * `update_file_1line`  — rewrite one already-resident file with a one-line
 //!   edit. The common agent-workload shape.
 //! * `key_value_write`    — a single `lix_key_value` row, touching no file at

@@ -9,7 +9,7 @@ import {
 
 const title = "Lix Plugins";
 const description =
-  "File plugins map formats into semantic entities. The public plugin directory is being rebuilt.";
+  "File plugins map formats into semantic rows. The public plugin directory is being rebuilt.";
 
 export const Route = createFileRoute("/plugins/$pluginKey")({
   head: () => {

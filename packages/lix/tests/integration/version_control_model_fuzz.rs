@@ -49,7 +49,7 @@
 //! # A defect this found
 //!
 //! On its first green run this harness found a checkpoint GC sweep truncating
-//! entity history that `gc.rs` documents as load-bearing. That is fixed;
+//! row history that `gc.rs` documents as load-bearing. That is fixed;
 //! [`assert_history_survived_gc`] is now the guard, and asserts equality.
 
 use std::collections::BTreeMap;
@@ -677,25 +677,25 @@ async fn assert_working_diff(
 ) {
     let rows = session
         .execute(
-            "SELECT entity_pk, diff_type FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+            "SELECT row_pk, diff_type FROM lix_working_diff \
+             WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
             &[],
         )
         .await
         .unwrap_or_else(|error| panic!("{label}: working diff read failed: {error:?}"));
     let mut actual = Vec::new();
     for row in rows.rows() {
-        // `entity_pk` is the JSON primary-key tuple, `["<key>"]` for
+        // `row_pk` is the JSON primary-key tuple, `["<key>"]` for
         // `lix_key_value`.
-        let entity_pk = row
-            .get::<JsonValue>("entity_pk")
-            .unwrap_or_else(|error| panic!("{label}: entity_pk should be json: {error:?}"));
-        let Some(key) = entity_pk
+        let row_pk = row
+            .get::<JsonValue>("row_pk")
+            .unwrap_or_else(|error| panic!("{label}: row_pk should be json: {error:?}"));
+        let Some(key) = row_pk
             .as_array()
             .and_then(|components| components.first())
             .and_then(JsonValue::as_str)
         else {
-            panic!("{label}: unexpected entity_pk shape {entity_pk:?}");
+            panic!("{label}: unexpected row_pk shape {row_pk:?}");
         };
         if !key.starts_with(prefix) {
             continue;
@@ -776,9 +776,9 @@ async fn assert_history(session: &SimSession, prefix: &str, model: &BranchModel,
 ///
 /// # The defect this guards
 ///
-/// A sweep used to damage entity history. `collect_ref_reachable_commit_ids`
+/// A sweep used to damage row history. `collect_ref_reachable_commit_ids`
 /// fed its result to the *semantic* retention only, so a graph-reachable commit
-/// kept its projection and lost its delta segments — and an entity history row
+/// kept its projection and lost its delta segments — and a row history row
 /// is served out of the delta.
 /// `load_commit_delta_members_with_payloads_for_schemas` returns an empty
 /// member list for a commit whose replay state is gone, so the damage raised no

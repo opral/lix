@@ -15,12 +15,12 @@
 //!                     shows first
 //!   * `file_schema` — `WHERE file_id = $1 AND schema_key = $2`, the shape of
 //!                     the one file-scoped working-diff test in the tree
-//!   * `point`       — `WHERE schema_key = $1 AND entity_pk = CAST($2 AS JSONB) AND
+//!   * `point`       — `WHERE schema_key = $1 AND row_pk = CAST($2 AS JSONB) AND
 //!                     file_id = $3`, which takes the finite-filter bypass in
 //!                     `hot_working_diff_entries` and therefore never reads the
 //!                     HOT_DIFF index or verifies its coverage proof. This is
 //!                     the control: it isolates the proof as the cost.
-//!   * `entity_scan` — the same file read through the ordinary entity surface,
+//!   * `row_scan` — the same file read through the ordinary schema surface,
 //!                     which does not push `lixcol_file_id` down at all.
 //!
 //! ```text
@@ -198,27 +198,27 @@ async fn run<StorageImpl>(
     dirty_rows(&session, &plan, changes_per_commit, rows_per_file).await;
 
     let probe_file = file_ids[0].clone();
-    let file_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
+    let file_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
                     FROM lix_working_diff WHERE file_id = $1";
-    let full_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
+    let full_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
                     FROM lix_working_diff";
     // `schema_key + file_id`, the shape of the only file-scoped working-diff
     // test in the tree. Still a full HOT_DIFF scan today.
-    let file_schema_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
+    let file_schema_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
                            FROM lix_working_diff WHERE file_id = $1 AND schema_key = $2";
     // Finite identity + file id: takes the existing bypass and resolves as a
     // point read. This is the floor a seekable file-scoped read aims at.
-    let point_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
+    let point_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
                      FROM lix_working_diff \
-                     WHERE schema_key = $1 AND entity_pk = CAST($2 AS JSONB) AND file_id = $3";
+                     WHERE schema_key = $1 AND row_pk = CAST($2 AS JSONB) AND file_id = $3";
     // Live-state read of the same file. HOT_ROW is keyed
-    // `schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` owns a
-    // file-first prefix route; the entity surface pushes `lixcol_file_id` into
+    // `schema_key ++ file_id ++ row_pk` and `hot_scan_entries` owns a
+    // file-first prefix route; the schema surface pushes `lixcol_file_id` into
     // `HotStateFilter::file_ids`, so this reaches that prefix seek and costs
-    // O(rows in the file). `entity_scan_rows` is fixed at `rows_per_file`, so
+    // O(rows in the file). `row_scan_rows` is fixed at `rows_per_file`, so
     // a flat latency across dirty-set sizes is the pass condition and a rising
     // one means the pushdown stopped reaching the seek.
-    let entity_scan_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
+    let row_scan_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
     let file_params = vec![Value::Text(probe_file.clone())];
     let file_schema_params = vec![
         Value::Text(probe_file.clone()),
@@ -235,23 +235,23 @@ async fn run<StorageImpl>(
     let full_rows = rows(&session, full_sql, &[]).await;
     let file_schema_rows = rows(&session, file_schema_sql, &file_schema_params).await;
     let point_rows = rows(&session, point_sql, &point_params).await;
-    let entity_scan_rows_count = rows(&session, &entity_scan_sql, &file_params).await;
+    let row_scan_rows_count = rows(&session, &row_scan_sql, &file_params).await;
 
     let file = sample(&session, file_sql, &file_params, reps).await;
     let full = sample(&session, full_sql, &[], reps).await;
     let file_schema = sample(&session, file_schema_sql, &file_schema_params, reps).await;
     let point = sample(&session, point_sql, &point_params, reps).await;
-    let entity_scan = sample(&session, &entity_scan_sql, &file_params, reps).await;
+    let row_scan = sample(&session, &row_scan_sql, &file_params, reps).await;
 
     println!(
         "working_diff_file_scope backend={backend} files={files} total_dirty={full_rows} \
          file_rows={file_rows} full_rows={full_rows} file_schema_rows={file_schema_rows} \
-         point_rows={point_rows} entity_scan_rows={entity_scan_rows_count} reps={reps} \
+         point_rows={point_rows} row_scan_rows={row_scan_rows_count} reps={reps} \
          file_p50_ms={:.3} file_min_ms={:.3} file_max_ms={:.3} \
          full_p50_ms={:.3} full_min_ms={:.3} full_max_ms={:.3} \
          file_schema_p50_ms={:.3} file_schema_min_ms={:.3} file_schema_max_ms={:.3} \
          point_p50_ms={:.3} point_min_ms={:.3} point_max_ms={:.3} \
-         entity_scan_p50_ms={:.3} entity_scan_min_ms={:.3} entity_scan_max_ms={:.3}",
+         row_scan_p50_ms={:.3} row_scan_min_ms={:.3} row_scan_max_ms={:.3}",
         millis(file.0),
         millis(file.1),
         millis(file.2),
@@ -264,9 +264,9 @@ async fn run<StorageImpl>(
         millis(point.0),
         millis(point.1),
         millis(point.2),
-        millis(entity_scan.0),
-        millis(entity_scan.1),
-        millis(entity_scan.2),
+        millis(row_scan.0),
+        millis(row_scan.1),
+        millis(row_scan.2),
     );
     drop(session);
     drop(lix);

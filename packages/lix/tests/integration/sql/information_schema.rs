@@ -180,7 +180,7 @@ simulation_test!(
             ]],
         );
 
-        let read_only_entity_contract = session
+        let read_only_row_contract = session
             .execute(
                 "SELECT table_name, column_name, lix_insert_policy \
                  FROM information_schema.columns \
@@ -190,9 +190,9 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("read-only generated entity surfaces should introspect");
+            .expect("read-only generated schema surfaces should introspect");
         assert_rows_eq(
-            read_only_entity_contract,
+            read_only_row_contract,
             vec![vec![
                 Value::Text("lix_commit".to_string()),
                 Value::Text("id".to_string()),
@@ -350,18 +350,18 @@ simulation_test!(
                    table_name = 'engine_column_contract' \
                    AND column_name IN (\
                      'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
-                     'lixcol_entity_pk', 'lixcol_global', 'lixcol_schema_key', \
+                     'lixcol_row_pk', 'lixcol_global', 'lixcol_schema_key', \
                      'lixcol_untracked', 'lixcol_updated_at'\
                    )\
                  ) OR (\
                    table_name = 'engine_no_pk_contract' \
-                   AND column_name = 'lixcol_entity_pk'\
+                   AND column_name = 'lixcol_row_pk'\
                  ) \
                  ORDER BY table_name, column_name",
                 &[],
             )
             .await
-            .expect("entity system-column contract query should succeed");
+            .expect("row system-column contract query should succeed");
         assert_rows_eq(
             identity_contract,
             vec![
@@ -388,17 +388,17 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_entity_pk".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("CONDITIONAL".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
                     Value::Text("lixcol_global".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("FALSE".to_string()),
                     Value::Text("DEFAULT".to_string()),
+                ],
+                vec![
+                    Value::Text("engine_column_contract".to_string()),
+                    Value::Text("lixcol_row_pk".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                    Value::Text("CONDITIONAL".to_string()),
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
@@ -423,7 +423,7 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_no_pk_contract".to_string()),
-                    Value::Text("lixcol_entity_pk".to_string()),
+                    Value::Text("lixcol_row_pk".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
                     Value::Text("CONDITIONAL".to_string()),
@@ -493,7 +493,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity history nullability contract query should succeed");
+            .expect("row history nullability contract query should succeed");
         assert_rows_eq(
             history_contract,
             vec![
@@ -633,7 +633,7 @@ simulation_test!(
                 }
             })
             .collect::<Vec<_>>();
-        assert_eq!(contracts.len(), 6, "expected five entity types plus BYTEA");
+        assert_eq!(contracts.len(), 6, "expected five row types plus BYTEA");
 
         for contract in &contracts {
             let expected_type = match contract.column_name.as_str() {
@@ -663,19 +663,19 @@ simulation_test!(
             assert_rows_eq(select_cast, vec![vec![select_expected]]);
         }
 
-        let entity_contracts = contracts
+        let row_contracts = contracts
             .iter()
             .filter(|contract| contract.table_name == "engine_scalar_cast_contract")
             .collect::<Vec<_>>();
-        let entity_columns = entity_contracts
+        let row_columns = row_contracts
             .iter()
             .map(|contract| contract.column_name.clone())
             .collect::<Vec<_>>();
-        let insert_params = entity_contracts
+        let insert_params = row_contracts
             .iter()
             .map(|contract| values_for_contract(contract).0)
             .collect::<Vec<_>>();
-        let insert_casts = entity_contracts
+        let insert_casts = row_contracts
             .iter()
             .enumerate()
             .map(|(index, contract)| format!("CAST(${} AS {})", index + 1, contract.data_type))
@@ -684,19 +684,19 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO engine_scalar_cast_contract ({}) VALUES ({})",
-                    entity_columns.join(", "),
+                    row_columns.join(", "),
                     insert_casts.join(", ")
                 ),
                 &insert_params,
             )
             .await
-            .expect("all advertised entity casts should work in a bound INSERT");
+            .expect("all advertised row casts should work in a bound INSERT");
 
         let inserted = session
             .execute(
                 &format!(
                     "SELECT {} FROM engine_scalar_cast_contract",
-                    entity_columns.join(", ")
+                    row_columns.join(", ")
                 ),
                 &[],
             )
@@ -705,18 +705,18 @@ simulation_test!(
         assert_rows_eq(
             inserted,
             vec![
-                entity_contracts
+                row_contracts
                     .iter()
                     .map(|contract| values_for_contract(contract).2)
                     .collect(),
             ],
         );
 
-        let update_params = entity_contracts
+        let update_params = row_contracts
             .iter()
             .map(|contract| values_for_contract(contract).3)
             .collect::<Vec<_>>();
-        let update_casts = entity_contracts
+        let update_casts = row_contracts
             .iter()
             .enumerate()
             .map(|(index, contract)| {
@@ -737,12 +737,12 @@ simulation_test!(
                 &update_params,
             )
             .await
-            .expect("all advertised entity casts should work in a bound UPDATE");
+            .expect("all advertised row casts should work in a bound UPDATE");
         let updated = session
             .execute(
                 &format!(
                     "SELECT {} FROM engine_scalar_cast_contract",
-                    entity_columns.join(", ")
+                    row_columns.join(", ")
                 ),
                 &[],
             )
@@ -751,7 +751,7 @@ simulation_test!(
         assert_rows_eq(
             updated,
             vec![
-                entity_contracts
+                row_contracts
                     .iter()
                     .map(|contract| values_for_contract(contract).4)
                     .collect(),
@@ -1080,7 +1080,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("omitted typed-entity primary key should generate");
+            .expect("omitted typed-row primary key should generate");
 
         let generated = session
             .execute(
@@ -1088,7 +1088,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("generated typed entity should be readable");
+            .expect("generated typed row should be readable");
         let [Value::Text(id)] = generated.rows()[0].values() else {
             panic!("expected generated text identity");
         };
@@ -1202,7 +1202,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_upsert_materializes_omitted_defaults_in_excluded,
+    typed_row_upsert_materializes_omitted_defaults_in_excluded,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1238,11 +1238,11 @@ simulation_test!(
                 "INSERT INTO engine_excluded_typed_default (id) VALUES ('same') \
                  ON CONFLICT (id) DO UPDATE \
                  SET mirror = excluded.status, \
-                     identity_copy = excluded.lixcol_entity_pk",
+                     identity_copy = excluded.lixcol_row_pk",
                 &[],
             )
             .await
-            .expect("typed entity upsert should succeed");
+            .expect("typed row upsert should succeed");
 
         assert_rows_eq(
             session
@@ -1262,7 +1262,7 @@ simulation_test!(
         let mismatched_identity = session
             .execute(
                 "INSERT INTO engine_excluded_typed_default \
-                 (id, status, lixcol_entity_pk) \
+                 (id, status, lixcol_row_pk) \
                  VALUES ('different', 'corrupted', CAST('[\"same\"]' AS JSONB)) \
                  ON CONFLICT (id) DO UPDATE SET status = excluded.status",
                 &[],
@@ -1303,7 +1303,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity INSERT RETURNING should expose its final snapshot");
+            .expect("row INSERT RETURNING should expose its final snapshot");
         assert_eq!(inserted_returning.rows_affected(), 1);
         assert_eq!(inserted_returning.columns(), ["id", "inserted_status"]);
         assert_rows_eq(
@@ -1321,7 +1321,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity UPDATE RETURNING should expose the post-update snapshot");
+            .expect("row UPDATE RETURNING should expose the post-update snapshot");
         assert_eq!(updated_returning.rows_affected(), 1);
         assert_eq!(updated_returning.columns(), ["id", "updated_status"]);
         assert_rows_eq(
@@ -1498,7 +1498,7 @@ simulation_test!(
             session
                 .execute(
                     "SELECT count FROM engine_bigint_contract_history() \
-                       WHERE lixcol_entity_pk = CAST('[\"integral-real\"]' AS JSONB)",
+                       WHERE lixcol_row_pk = CAST('[\"integral-real\"]' AS JSONB)",
                     &[],
                 )
                 .await

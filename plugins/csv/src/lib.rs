@@ -4,16 +4,17 @@
 mod core;
 
 use core::{
-    ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, EntityRecord, FileEdit,
-    IdNamespace, ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
+    ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, FileEdit, IdNamespace,
+    ROW_SCHEMA_KEY, RowChange, RowConflictResolution, RowRecord, TABLE_SCHEMA_KEY,
+    resolve_row_conflict,
 };
 use lix::plugin as sdk;
 
 struct CsvPlugin;
 
 const CSV_INDEX_KEY: &[u8] = b"csv/index";
-const CSV_FALLBACK_ENTITIES_KEY: &[u8] = b"csv/fallback-entities";
-const CSV_FALLBACK_ENTITIES_MAGIC: &[u8; 4] = b"CFE2";
+const CSV_FALLBACK_ROWS_KEY: &[u8] = b"csv/fallback-rows";
+const CSV_FALLBACK_ROWS_MAGIC: &[u8; 4] = b"CFE2";
 const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
 const CSV_INDEX_PAGE_BYTES: usize = 1024 * 1024;
@@ -25,13 +26,13 @@ impl sdk::Plugin for CsvPlugin {
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let accepted = update.before.read_all()?;
-        let mut builder = core::EntityImportBuilder::new();
-        while let Some(entity) = update.entities.next()? {
+        let mut builder = core::RowImportBuilder::new();
+        while let Some(row) = update.rows.next()? {
             builder
-                .push(EntityRecord {
-                    schema_key: entity.schema_key,
-                    entity_pk: entity.entity_pk,
-                    snapshot: entity.snapshot,
+                .push(RowRecord {
+                    schema_key: row.schema_key,
+                    row_pk: row.row_pk,
+                    snapshot: row.snapshot,
                 })
                 .map_err(sdk::Error::invalid_input)?;
         }
@@ -75,11 +76,9 @@ impl sdk::Plugin for CsvPlugin {
             store_csv_index(sink, &state)?;
         } else {
             sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
-            store_fallback_entities_fresh(
+            store_fallback_rows_fresh(
                 sink,
-                &successor
-                    .entity_records()
-                    .map_err(sdk::Error::invalid_input)?,
+                &successor.row_records().map_err(sdk::Error::invalid_input)?,
             )?;
         }
         for change in changes {
@@ -88,16 +87,16 @@ impl sdk::Plugin for CsvPlugin {
         Ok(())
     }
 
-    fn entities_changed(
-        update: &mut sdk::EntityUpdate<'_>,
+    fn rows_changed(
+        update: &mut sdk::RowUpdate<'_>,
         sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.changes.next()? {
-            changes.push(EntityChange {
+            changes.push(RowChange {
                 schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
+                row_pk: change.row_pk,
                 snapshot: change.snapshot,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
@@ -105,9 +104,9 @@ impl sdk::Plugin for CsvPlugin {
                 },
             });
         }
-        let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ENTITIES_KEY)? {
+        let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ROWS_KEY)? {
             let (record_count, page_count) = decode_fallback_manifest(&manifest)?;
-            Document::open_entities(decode_entity_records(
+            Document::open_rows(decode_row_records(
                 record_count,
                 read_fallback_pages(&update.before, page_count)?,
             )?)
@@ -122,36 +121,34 @@ impl sdk::Plugin for CsvPlugin {
                 .0
         };
         let (successor, edits) = document
-            .entities_changed(&changes)
+            .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
-        let records = successor
-            .entity_records()
-            .map_err(sdk::Error::invalid_input)?;
-        store_fallback_entities_from_sink(&update.before, sink, &records)?;
+        let records = successor.row_records().map_err(sdk::Error::invalid_input)?;
+        store_fallback_rows_from_sink(&update.before, sink, &records)?;
         delete_csv_index_from_sink(&update.before, sink)?;
         Ok(())
     }
 
     fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(entity) = input.entities.next()? {
-            records.push(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = input.rows.next()? {
+            records.push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             });
         }
         let (document, _) =
-            Document::open_entities(records.clone()).map_err(sdk::Error::invalid_input)?;
-        store_fallback_entities_fresh(sink, &records)?;
+            Document::open_rows(records.clone()).map_err(sdk::Error::invalid_input)?;
+        store_fallback_rows_fresh(sink, &records)?;
         if input.accepted.is_none() {
             sink.replace_file(&document.bytes())?;
         }
         Ok(())
     }
 
-    fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
+    fn resolve_conflict(conflict: sdk::RowConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
         if conflict.schema_key != ROW_SCHEMA_KEY {
             return Ok(conflict.take_b_or_delete());
         }
@@ -188,13 +185,13 @@ impl sdk::Plugin for CsvPlugin {
         loop {
             let id = input.creates.id(next_local_ref);
             let Some((local_ref, snapshot)) = import
-                .next_entity_snapshot(&id)
+                .next_row_snapshot(&id)
                 .map_err(sdk::Error::invalid_input)?
             else {
                 break;
             };
             debug_assert_eq!(local_ref, next_local_ref);
-            sink.entity(sdk::EntityMutation::Create {
+            sink.row(sdk::RowMutation::Create {
                 schema_key: ROW_SCHEMA_KEY,
                 local_ref,
                 snapshot: &snapshot,
@@ -207,10 +204,7 @@ impl sdk::Plugin for CsvPlugin {
     }
 
     fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
-        if update
-            .before
-            .state_len(CSV_FALLBACK_ENTITIES_KEY)?
-            .is_some()
+        if update.before.state_len(CSV_FALLBACK_ROWS_KEY)?.is_some()
             || update.before_path != update.after_path
             || update.edits.len() != 1
             || u64::try_from(update.edits[0].insert.len()).expect("usize fits u64")
@@ -359,10 +353,10 @@ fn fallback_file_changed(
     sink: &mut sdk::Output<'_>,
 ) -> sdk::Result<()> {
     let before_bytes = update.before.read_all()?;
-    let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ENTITIES_KEY)? {
+    let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ROWS_KEY)? {
         let (record_count, page_count) = decode_fallback_manifest(&manifest)?;
         let pages = read_fallback_pages(&update.before, page_count)?;
-        let (document, _) = Document::open_entities(decode_entity_records(record_count, pages)?)
+        let (document, _) = Document::open_rows(decode_row_records(record_count, pages)?)
             .map_err(sdk::Error::invalid_input)?;
         let rendered = document.bytes();
         if rendered == before_bytes {
@@ -409,10 +403,8 @@ fn fallback_file_changed(
             namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
-    let records = successor
-        .entity_records()
-        .map_err(sdk::Error::invalid_input)?;
-    store_fallback_entities_in_transaction(&update.before, sink, &records)?;
+    let records = successor.row_records().map_err(sdk::Error::invalid_input)?;
+    store_fallback_rows_in_transaction(&update.before, sink, &records)?;
     delete_csv_index(&update.before, sink)?;
     for change in changes {
         emit_change(change, update.creates, sink)?;
@@ -420,14 +412,14 @@ fn fallback_file_changed(
     Ok(())
 }
 
-fn store_fallback_entities_from_sink(
+fn store_fallback_rows_from_sink(
     before: &sdk::Snapshot<'_>,
     sink: &mut sdk::Output<'_>,
-    records: &[EntityRecord],
+    records: &[RowRecord],
 ) -> sdk::Result<()> {
-    let old_page_count = fallback_entity_page_count(before)?;
-    let (manifest, pages) = encode_entity_records(records)?;
-    sink.put_state(CSV_FALLBACK_ENTITIES_KEY, &manifest)?;
+    let old_page_count = fallback_row_page_count(before)?;
+    let (manifest, pages) = encode_row_records(records)?;
+    sink.put_state(CSV_FALLBACK_ROWS_KEY, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
         sink.put_state(&csv_fallback_page_key(ordinal as u32), page)?;
     }
@@ -437,14 +429,14 @@ fn store_fallback_entities_from_sink(
     Ok(())
 }
 
-fn store_fallback_entities_in_transaction(
+fn store_fallback_rows_in_transaction(
     before: &sdk::Snapshot<'_>,
     successor: &sdk::Output<'_>,
-    records: &[EntityRecord],
+    records: &[RowRecord],
 ) -> sdk::Result<()> {
-    let old_page_count = fallback_entity_page_count(before)?;
-    let (manifest, pages) = encode_entity_records(records)?;
-    successor.put_state(CSV_FALLBACK_ENTITIES_KEY, &manifest)?;
+    let old_page_count = fallback_row_page_count(before)?;
+    let (manifest, pages) = encode_row_records(records)?;
+    successor.put_state(CSV_FALLBACK_ROWS_KEY, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
         successor.put_state(&csv_fallback_page_key(ordinal as u32), page)?;
     }
@@ -454,32 +446,32 @@ fn store_fallback_entities_in_transaction(
     Ok(())
 }
 
-fn store_fallback_entities_fresh(
+fn store_fallback_rows_fresh(
     successor: &sdk::Output<'_>,
-    records: &[EntityRecord],
+    records: &[RowRecord],
 ) -> sdk::Result<()> {
-    let (manifest, pages) = encode_entity_records(records)?;
-    successor.put_state(CSV_FALLBACK_ENTITIES_KEY, &manifest)?;
+    let (manifest, pages) = encode_row_records(records)?;
+    successor.put_state(CSV_FALLBACK_ROWS_KEY, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
         successor.put_state(&csv_fallback_page_key(ordinal as u32), page)?;
     }
     Ok(())
 }
 
-fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+fn encode_row_records(records: &[RowRecord]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
     let record_count = u32::try_from(records.len())
-        .map_err(|_| sdk::Error::limit_exceeded("too many CSV fallback entities"))?;
+        .map_err(|_| sdk::Error::limit_exceeded("too many CSV fallback rows"))?;
     let mut pages = Vec::new();
     let mut page = Vec::with_capacity(CSV_STATE_PAGE_BYTES);
     for record in records {
         let mut encoded = Vec::new();
         push_text(&mut encoded, &record.schema_key)?;
         encoded.extend_from_slice(
-            &u32::try_from(record.entity_pk.len())
+            &u32::try_from(record.row_pk.len())
                 .map_err(|_| sdk::Error::limit_exceeded("too many CSV key components"))?
                 .to_le_bytes(),
         );
-        for component in &record.entity_pk {
+        for component in &record.row_pk {
             push_text(&mut encoded, component)?;
         }
         encoded.extend_from_slice(
@@ -494,7 +486,7 @@ fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<(Vec<u8>, Vec<
         pages.push(page);
     }
     let mut manifest = Vec::with_capacity(12);
-    manifest.extend_from_slice(CSV_FALLBACK_ENTITIES_MAGIC);
+    manifest.extend_from_slice(CSV_FALLBACK_ROWS_MAGIC);
     manifest.extend_from_slice(&record_count.to_le_bytes());
     manifest.extend_from_slice(
         &u32::try_from(pages.len())
@@ -504,21 +496,21 @@ fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<(Vec<u8>, Vec<
     Ok((manifest, pages))
 }
 
-fn decode_entity_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<EntityRecord>> {
+fn decode_row_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<RowRecord>> {
     let mut input = StateReader::new(pages);
     let mut records = Vec::with_capacity(record_count as usize);
     for _ in 0..record_count {
         let schema_key = input.text()?;
         let component_count = input.u32()? as usize;
-        let mut entity_pk = Vec::with_capacity(component_count.min(4));
+        let mut row_pk = Vec::with_capacity(component_count.min(4));
         for _ in 0..component_count {
-            entity_pk.push(input.text()?);
+            row_pk.push(input.text()?);
         }
         let snapshot_len = input.u32()? as usize;
         let snapshot = input.bytes(snapshot_len)?;
-        records.push(EntityRecord {
+        records.push(RowRecord {
             schema_key,
-            entity_pk,
+            row_pk,
             snapshot,
         });
     }
@@ -531,7 +523,7 @@ fn decode_entity_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<
 }
 
 fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
-    if bytes.len() != 12 || bytes.get(..4) != Some(CSV_FALLBACK_ENTITIES_MAGIC) {
+    if bytes.len() != 12 || bytes.get(..4) != Some(CSV_FALLBACK_ROWS_MAGIC) {
         return Err(sdk::Error::invalid_input("unsupported CSV fallback state"));
     }
     Ok((
@@ -544,8 +536,8 @@ fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
     ))
 }
 
-fn fallback_entity_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
-    let Some(manifest) = root.get_state(CSV_FALLBACK_ENTITIES_KEY)? else {
+fn fallback_row_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
+    let Some(manifest) = root.get_state(CSV_FALLBACK_ROWS_KEY)? else {
         return Ok(0);
     };
     decode_fallback_manifest(&manifest).map(|(_, page_count)| page_count)
@@ -563,7 +555,7 @@ fn read_fallback_pages(root: &sdk::Snapshot<'_>, page_count: u32) -> sdk::Result
 }
 
 fn csv_fallback_page_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"csv/fallback-entity-page/".to_vec();
+    let mut key = b"csv/fallback-row-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
 }
@@ -663,10 +655,10 @@ fn read_namespace(root: &sdk::Snapshot<'_>) -> sdk::Result<Option<IdNamespace>> 
     )))
 }
 
-fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
+fn namespace_from_changes(changes: &[RowChange]) -> Option<IdNamespace> {
     changes
         .iter()
-        .flat_map(|change| &change.entity_pk)
+        .flat_map(|change| &change.row_pk)
         .find_map(|component| uuid::Uuid::parse_str(component).ok())
         .map(|id| {
             let bytes = id.into_bytes();
@@ -698,7 +690,7 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
 }
 
 fn emit_change(
-    change: EntityChange,
+    change: RowChange,
     creates: sdk::CreateContext,
     sink: &mut sdk::Output<'_>,
 ) -> sdk::Result<()> {
@@ -713,20 +705,20 @@ fn emit_change(
     match change.snapshot {
         Some(snapshot) => {
             let local_ref = change
-                .entity_pk
+                .row_pk
                 .as_slice()
                 .first()
                 .and_then(|id| local_ref(creates, id));
             if change.schema_key == ROW_SCHEMA_KEY && local_ref.is_some() {
-                sink.entity(sdk::EntityMutation::Create {
+                sink.row(sdk::RowMutation::Create {
                     schema_key: &change.schema_key,
                     local_ref: local_ref.expect("checked above"),
                     snapshot: &snapshot,
                 })?;
             } else {
-                sink.entity(sdk::EntityMutation::Upsert {
+                sink.row(sdk::RowMutation::Upsert {
                     schema_key: &change.schema_key,
-                    entity_pk: &change.entity_pk,
+                    row_pk: &change.row_pk,
                     snapshot: &snapshot,
                     effect: match change.effect {
                         ChangeEffect::Content => sdk::ChangeEffect::Content,
@@ -735,9 +727,9 @@ fn emit_change(
                 })?;
             }
         }
-        None => sink.entity(sdk::EntityMutation::Delete {
+        None => sink.row(sdk::RowMutation::Delete {
             schema_key: &change.schema_key,
-            entity_pk: &change.entity_pk,
+            row_pk: &change.row_pk,
         })?,
     }
     Ok(())
@@ -791,18 +783,18 @@ mod tests {
     #[test]
     fn large_fallback_checkpoint_is_split_into_bounded_pages() {
         let records = (0..30_000)
-            .map(|ordinal| EntityRecord {
+            .map(|ordinal| RowRecord {
                 schema_key: ROW_SCHEMA_KEY.to_owned(),
-                entity_pk: vec![format!("row-{ordinal}")],
+                row_pk: vec![format!("row-{ordinal}")],
                 snapshot: vec![b'x'; 96],
             })
             .collect::<Vec<_>>();
 
-        let (manifest, pages) = encode_entity_records(&records).expect("encode fallback rows");
+        let (manifest, pages) = encode_row_records(&records).expect("encode fallback rows");
         let (record_count, page_count) =
             decode_fallback_manifest(&manifest).expect("decode manifest");
         let decoded =
-            decode_entity_records(record_count, pages.clone()).expect("decode fallback rows");
+            decode_row_records(record_count, pages.clone()).expect("decode fallback rows");
 
         assert!(pages.len() > 1);
         assert!(pages.iter().all(|page| page.len() <= CSV_STATE_PAGE_BYTES));

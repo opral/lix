@@ -8,7 +8,7 @@ Lix is a **version control system for files and data beyond code**. It combines 
 
 Lix is an embeddable library, not a CLI. Tools and agents work with normal files. Apps query and update SQL rows. Lix tracks every change with branches, history, review, rollback, and merge.
 
-Unlike Git, Lix tracks the entities inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
+Unlike Git, Lix tracks the rows inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
 
 <img src="../website/public/assets/filesystem-database-version-control.svg" alt="Lix combines a filesystem, a database, and version control" width="760" />
 
@@ -32,7 +32,7 @@ Build editors, knowledge bases, document workflows, and other file-based apps. E
 
 File plugins map parts of a file to rows. A row can represent a Markdown block, CSV record, spreadsheet cell, JSON property, or document clause.
 
-<img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
+<img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with row, field, and value columns" width="760" />
 
 Apps read and write these rows with SQL. Lix records their history. With
 `FilesystemStorage`, it also writes changes back to normal files on disk.
@@ -67,7 +67,7 @@ Permissions are on the roadmap. They will live inside the repository: per file, 
 
 - [Getting Started](./getting-started.md): choose the JavaScript or Rust quickstart.
 - [How Lix compares to Git](./comparison-to-git.md): files, databases, and version control side by side.
-- [Schemas](./schemas.md): define app rows and plugin entities.
+- [Schemas](./schemas.md): define app rows and plugin rows.
 - [Semantic Changes](./semantic-changes.md): track changes inside files.
 - [Files and Media](./files-and-media.md): store text, binary files, and large media.
 - [Real-time Collaboration](./realtime-collaboration.md): connect two clients to one repository.

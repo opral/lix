@@ -1,7 +1,7 @@
 use crate::LixError;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
 use crate::tracked_state::{
@@ -207,7 +207,7 @@ where
     for row in marker_delta.iter().filter(|row| !row.value().deleted) {
         let key = row.key_ref();
         match key.schema_key {
-            UNDO_REDO_MARKER_SCHEMA_KEY if key.entity_pk == &local_operation_key.entity_pk => {
+            UNDO_REDO_MARKER_SCHEMA_KEY if key.row_pk == &local_operation_key.row_pk => {
                 has_local_operation = true;
             }
             UNDO_REDO_MARKER_SCHEMA_KEY => has_foreign_operation = true,
@@ -232,7 +232,7 @@ where
 }
 
 fn semantic_key(branch_id: &str) -> Result<TrackedStateKey, LixError> {
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+    let branch_pk = RowPk::uuid_from_canonical(branch_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PARAM,
             format!("undo branch id must be a canonical UUID: {error}"),
@@ -241,7 +241,7 @@ fn semantic_key(branch_id: &str) -> Result<TrackedStateKey, LixError> {
     Ok(TrackedStateKey {
         schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
         file_id: None,
-        entity_pk: branch_pk,
+        row_pk: branch_pk,
     })
 }
 
@@ -338,7 +338,7 @@ async fn operation_marker_at<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id)
+    let branch_pk = RowPk::uuid_from_canonical(branch_id)
         .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, error.to_string()))?;
     let rows = {
         let mut tracked = transaction.tracked_state_reader().await;
@@ -348,7 +348,7 @@ where
                 &[TrackedStateKey {
                     schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    entity_pk: branch_pk,
+                    row_pk: branch_pk,
                 }],
                 &ChangeRecordProjection::from_columns(&[
                     "commit_id".to_string(),

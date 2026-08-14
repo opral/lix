@@ -17,7 +17,7 @@ use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobId};
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::plugin::runtime::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
@@ -28,7 +28,7 @@ use crate::tracked_state::{
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
+    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, row_pk_json_array,
 };
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::SqlHistoryQuerySource;
@@ -37,7 +37,7 @@ use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-    HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_ROW_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes, validate_history_anchor_filter,
@@ -441,7 +441,7 @@ impl FileHistoryPublicPredicate {
 }
 
 /// A conservative exact public `id` constraint that can be translated to the
-/// canonical descriptor/blob entity primary key. Unlike
+/// canonical descriptor/blob row primary key. Unlike
 /// [`FileHistoryPublicPredicate`], this deliberately declines disjunctions and
 /// non-literal `id` expressions: those retain the existing complete traversal
 /// and DataFusion residual evaluation.
@@ -453,8 +453,8 @@ impl FileHistoryLookupIds {
         predicate.exact_ids().cloned().map(Self)
     }
 
-    fn entity_pks(&self) -> Result<Vec<String>, LixError> {
-        self.0.iter().map(|id| entity_pk_json_array(id)).collect()
+    fn row_pks(&self) -> Result<Vec<String>, LixError> {
+        self.0.iter().map(|id| row_pk_json_array(id)).collect()
     }
 }
 
@@ -898,10 +898,10 @@ fn prepare_file_history_rows(
         if !public_predicate.matches(&id, path.as_deref()) {
             continue;
         }
-        let entity_pk = entity_pk_json_array(&descriptor.id).ok();
+        let row_pk = row_pk_json_array(&descriptor.id).ok();
         if !route.matches_surface_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            entity_pk.as_deref().unwrap_or(&descriptor.id),
+            row_pk.as_deref().unwrap_or(&descriptor.id),
             Some(&descriptor.id),
             event.depth,
         ) {
@@ -1076,7 +1076,7 @@ where
         // This is NOT a filter, and it is worth being precise about the
         // difference: a filter decides the answer, and deciding this answer
         // genuinely requires the parse -- that is why "filter earlier so fewer
-        // rows are parsed" does not work in `apply_entity_batch_filters`. This
+        // rows are parsed" does not work in `apply_row_batch_filters`. This
         // is a *necessary condition* on the raw bytes, evaluated before the
         // parse and never instead of it. A snapshot whose decoded `name` equals
         // one of the queried names must contain that name's JSON string token
@@ -1111,7 +1111,7 @@ where
         if !names.contains(snapshot.name.as_ref()) {
             continue;
         }
-        if EntityPk::uuid_from_canonical(&snapshot.id).is_err() {
+        if RowPk::uuid_from_canonical(&snapshot.id).is_err() {
             // The pruned readers key on a canonical UUID. A file ID that is not
             // one cannot be routed, so keep the complete traversal.
             return Ok(None);
@@ -1347,7 +1347,7 @@ where
         observed_commit_id,
         TrackedStateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-            entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
+            row_pks: vec![RowPk::single(PLUGIN_OWNER_KEY)],
             file_ids: lookup_ids
                 .map(|lookup_ids| {
                     lookup_ids
@@ -1372,11 +1372,11 @@ async fn load_selected_file_history_observed_rows<S>(
 where
     S: StorageAdapterRead,
 {
-    let entity_pks = lookup_ids
+    let row_pks = lookup_ids
         .0
         .iter()
         .map(|file_id| {
-            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+            RowPk::uuid_from_canonical(file_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history id must be a canonical UUID: {error}"),
@@ -1393,7 +1393,7 @@ where
                 FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 BLOB_REF_SCHEMA_KEY.to_string(),
             ],
-            entity_pks,
+            row_pks,
             file_ids: file_ids.clone(),
             include_tombstones: true,
         },
@@ -1446,10 +1446,10 @@ where
             observed_commit_id,
             TrackedStateFilter {
                 schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                entity_pks: ids
+                row_pks: ids
                     .iter()
                     .map(|directory_id| {
-                        EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+                        RowPk::uuid_from_canonical(directory_id).map_err(|error| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
                                 format!(
@@ -1512,7 +1512,7 @@ where
             &TrackedStateScanRequest {
                 filter: TrackedStateFilter {
                     schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-                    entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                    row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones: true,
                 },
@@ -1598,7 +1598,7 @@ where
         None,
     )
     .await?;
-    // Directory changes can rename or move a selected file. Their entity keys
+    // Directory changes can rename or move a selected file. Their row keys
     // are unrelated to the public file ID, so retain the complete directory
     // history and let `file_history_events` join only relevant directories.
     let directories = load_history_entries(
@@ -1620,7 +1620,7 @@ where
 
 /// Routes the descriptor + blob-ref traversal for a known set of file IDs.
 ///
-/// # Why this pins `file_ids` as well as the entity primary keys
+/// # Why this pins `file_ids` as well as the row primary keys
 ///
 /// `lix_binary_blob_ref` is touched by *every* content commit, so the
 /// touched-scope digest's schema-family test can never prove this projection
@@ -1640,7 +1640,7 @@ where
 /// cannot, for either of this route's two schema keys:
 ///
 /// * `lix_file_descriptor` — `canonicalize_descriptor_file_id` rewrites
-///   `file_id` to the row's own `entity_pk` on **every** normalized descriptor
+///   `file_id` to the row's own `row_pk` on **every** normalized descriptor
 ///   row, on all three exits of the row normalizer and for tombstones as well
 ///   as live rows, and errors if that identity is not a single value. The
 ///   planner really can hand it a descriptor row with `file_id: None` (an
@@ -1648,15 +1648,15 @@ where
 ///   closes that hole. `delete_restriction_source_domains` already depends on
 ///   the same invariant.
 /// * `lix_binary_blob_ref` — every producer (`BlobRefRowInput::append_to` and
-///   `append_blob_ref_tombstone_row`) sets `entity_pk` and `file_id` from the
+///   `append_blob_ref_tombstone_row`) sets `row_pk` and `file_id` from the
 ///   same file ID, and both schemas are read-only public surfaces, so no caller
 ///   can supply a divergent pair.
 ///
-/// Because `file_id == entity_pk` holds for both, and this route already pins
-/// `resolved_entity_pks` to the same IDs, the added predicate is implied by the
-/// one already applied: it cannot reject a change the existing entity-PK test
+/// Because `file_id == row_pk` holds for both, and this route already pins
+/// `resolved_row_pks` to the same IDs, the added predicate is implied by the
+/// one already applied: it cannot reject a change the existing row-PK test
 /// accepts. The identities compare byte-for-byte rather than merely
-/// semantically because `EntityPk::uuid_from_canonical` accepts only the exact
+/// semantically because `RowPk::uuid_from_canonical` accepts only the exact
 /// lowercase hyphenated form — a file ID that is not canonical already fails
 /// this function before any pinning happens.
 fn file_history_descriptor_blob_route(
@@ -1664,13 +1664,13 @@ fn file_history_descriptor_blob_route(
     lookup_ids: &FileHistoryLookupIds,
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
-    route.entity_pks = lookup_ids.entity_pks()?;
+    route.row_pks = lookup_ids.row_pks()?;
     route.file_ids = lookup_ids.0.iter().cloned().collect();
-    route.resolved_entity_pks = lookup_ids
+    route.resolved_row_pks = lookup_ids
         .0
         .iter()
         .map(|file_id| {
-            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+            RowPk::uuid_from_canonical(file_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history id must be a canonical UUID: {error}"),
@@ -1740,9 +1740,9 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let mut owner_route = file_history_plugin_route(event_route, lookup_ids);
-    let owner_pk = EntityPk::single(PLUGIN_OWNER_KEY);
-    owner_route.entity_pks = vec![owner_pk.as_json_array_text()?];
-    owner_route.resolved_entity_pks = vec![owner_pk];
+    let owner_pk = RowPk::single(PLUGIN_OWNER_KEY);
+    owner_route.row_pks = vec![owner_pk.as_json_array_text()?];
+    owner_route.resolved_row_pks = vec![owner_pk];
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
@@ -1915,12 +1915,12 @@ async fn discover_file_history_plugins<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let registry_pk = EntityPk::single(PLUGIN_REGISTRY_KEY);
+    let registry_pk = RowPk::single(PLUGIN_REGISTRY_KEY);
     let registry_pk_text = registry_pk.as_json_array_text()?;
 
     let mut registry_route = event_route.clone();
-    registry_route.entity_pks = vec![registry_pk_text.clone()];
-    registry_route.resolved_entity_pks = vec![registry_pk.clone()];
+    registry_route.row_pks = vec![registry_pk_text.clone()];
+    registry_route.resolved_row_pks = vec![registry_pk.clone()];
     let registry_events = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
@@ -1947,8 +1947,8 @@ where
     // bound, which restricts the rows that are emitted, not which plugins
     // existed.
     let mut schema_key_route = context_route.clone();
-    schema_key_route.entity_pks = vec![registry_pk_text];
-    schema_key_route.resolved_entity_pks = vec![registry_pk];
+    schema_key_route.row_pks = vec![registry_pk_text];
+    schema_key_route.resolved_row_pks = vec![registry_pk];
     let schema_key_entries = if schema_key_route == registry_route {
         registry_events.clone()
     } else {
@@ -2180,7 +2180,7 @@ fn parse_file_history_descriptors(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryDescriptorRecord {
-                    id: entry.change.entity_pk.as_single_string_owned()?,
+                    id: entry.change.row_pk.as_single_string_owned()?,
                     entry: entry.clone(),
                 });
             };
@@ -2208,7 +2208,7 @@ fn parse_file_history_directories(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryDirectoryRecord {
-                    id: entry.change.entity_pk.as_single_string_owned()?,
+                    id: entry.change.row_pk.as_single_string_owned()?,
                     parent_id: None,
                     name: None,
                     entry: entry.clone(),
@@ -2243,9 +2243,9 @@ fn parse_file_history_blobs(
                     file_id: entry.change.file_id.clone().unwrap_or_else(|| {
                         entry
                             .change
-                            .entity_pk
+                            .row_pk
                             .as_single_string_owned()
-                            .expect("canonical change entity primary key should project")
+                            .expect("canonical change row primary key should project")
                     }),
                     entry: entry.clone(),
                 });
@@ -2290,7 +2290,7 @@ fn parse_file_history_plugin_owners(
         .iter()
         .filter(|entry| {
             entry.change.schema_key == KEY_VALUE_SCHEMA_KEY
-                && entry.change.entity_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && entry.change.row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
         })
         .map(|entry| {
             let file_id = entry.change.file_id.clone().ok_or_else(|| {
@@ -2317,7 +2317,7 @@ fn parse_file_history_observed_descriptors(
             let row = observed.row();
             let Some(snapshot_content) = row.snapshot_content() else {
                 return Ok(FileHistoryObservedDescriptorRecord {
-                    id: row.entity_pk().as_single_string_owned()?,
+                    id: row.row_pk().as_single_string_owned()?,
                     directory_id: None,
                     name: None,
                     row: observed.ordinal(),
@@ -2349,7 +2349,7 @@ fn parse_file_history_observed_directories(
             let row = observed.row();
             let Some(snapshot_content) = row.snapshot_content() else {
                 return Ok(FileHistoryObservedDirectoryRecord {
-                    id: row.entity_pk().as_single_string_owned()?,
+                    id: row.row_pk().as_single_string_owned()?,
                     parent_id: None,
                     name: None,
                     row: observed.ordinal(),
@@ -2381,9 +2381,9 @@ fn parse_file_history_observed_blobs(
             let row = observed.row();
             let fallback_file_id = || {
                 row.file_id().map(str::to_owned).unwrap_or_else(|| {
-                    row.entity_pk()
+                    row.row_pk()
                         .as_single_string_owned()
-                        .expect("canonical change entity primary key should project")
+                        .expect("canonical change row primary key should project")
                 })
             };
             let Some(snapshot_content) = row.snapshot_content() else {
@@ -2416,7 +2416,7 @@ fn parse_file_history_observed_plugin_owners(
         .filter(|observed| {
             let row = observed.row();
             row.schema_key() == KEY_VALUE_SCHEMA_KEY
-                && row.entity_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && row.row_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
         })
         .map(|observed| {
             let row = observed.row();
@@ -2465,12 +2465,12 @@ fn file_history_event_affects_observed_file(
                     .as_deref()
                     .is_some_and(|file_id| file_id == descriptor.id)
                     || change
-                        .entity_pk
+                        .row_pk
                         .as_single_string_owned()
-                        .is_ok_and(|entity_id| entity_id == descriptor.id)
+                        .is_ok_and(|row_id| row_id == descriptor.id)
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                let Ok(changed_directory_id) = change.entity_pk.as_single_string_owned() else {
+                let Ok(changed_directory_id) = change.row_pk.as_single_string_owned() else {
                     return false;
                 };
                 let Some(directory_id) = descriptor.directory_id.as_deref() else {
@@ -2479,7 +2479,7 @@ fn file_history_event_affects_observed_file(
                 directory_tree.has_ancestor_including(directory_id, &changed_directory_id)
             }
             KEY_VALUE_SCHEMA_KEY
-                if change.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
+                if change.row_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
             {
                 event.file_id == descriptor.id
             }
@@ -2518,8 +2518,8 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
         ("name", Col::Utf8(|row| row.descriptor().name.as_deref())),
         ("content", Col::Binary(|row| row.data.clone())),
         (
-            HISTORY_COL_ENTITY_PK,
-            Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
+            HISTORY_COL_ROW_PK,
+            Col::Utf8Fallible(|row| row_pk_json_array(&row.descriptor().id).map(Some)),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,
@@ -2574,7 +2574,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
         Field::new("content", DataType::LargeBinary, true),
-        json_field(HISTORY_COL_ENTITY_PK, false),
+        json_field(HISTORY_COL_ROW_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
@@ -2604,7 +2604,7 @@ mod tests {
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::SharedStr;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::plugin::runtime::{
         PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
         plugin_storage_archive_file_id, plugin_storage_archive_path,
@@ -2631,7 +2631,7 @@ mod tests {
             change: MaterializedChange {
                 id: format!("change-{file_id}-{depth}"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                entity_pk: EntityPk::single(file_id),
+                row_pk: RowPk::single(file_id),
                 schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: Some(file_id.to_string()),
                 snapshot_content: snapshot_content.map(Into::into),
@@ -2738,7 +2738,7 @@ mod tests {
                 let change = entry.change;
                 let deleted = change.snapshot_content.is_none();
                 MaterializedTrackedStateRow {
-                    entity_pk: change.entity_pk,
+                    row_pk: change.row_pk,
                     schema_key: change.schema_key,
                     file_id: change.file_id,
                     snapshot_content: change.snapshot_content,
@@ -2831,7 +2831,7 @@ mod tests {
         let mut entry = history_entry(file_id, 0, Some(snapshot_content));
         entry.observed_commit_id = observed_commit_id.to_string();
         entry.change.id = format!("owner-{file_id}-{observed_commit_id}");
-        entry.change.entity_pk = EntityPk::single(super::PLUGIN_OWNER_KEY);
+        entry.change.row_pk = RowPk::single(super::PLUGIN_OWNER_KEY);
         entry.change.schema_key = super::KEY_VALUE_SCHEMA_KEY.to_string();
         FileHistoryPluginOwnerRecord {
             file_id: file_id.to_string(),
@@ -2847,7 +2847,7 @@ mod tests {
         let mut entry = history_entry(file_id, 0, None);
         entry.observed_commit_id = observed_commit_id.to_string();
         entry.change.id = format!("plugin-state-{schema_key}-{observed_commit_id}");
-        entry.change.entity_pk = EntityPk::single("plugin-state");
+        entry.change.row_pk = RowPk::single("plugin-state");
         entry.change.schema_key = schema_key.to_string();
         FileHistoryPluginStateRecord {
             file_id: file_id.to_string(),
@@ -3125,8 +3125,8 @@ mod tests {
             assert_eq!(event.file_id, format!("file-{index:04}"));
             assert_eq!(event.source_changes.len(), 1);
             assert_eq!(
-                event.source_changes[0].entity_pk,
-                EntityPk::single(format!("directory-{index:04}"))
+                event.source_changes[0].row_pk,
+                RowPk::single(format!("directory-{index:04}"))
             );
         }
 
@@ -3261,10 +3261,10 @@ mod tests {
             },
             &ids,
         )
-        .expect("file IDs should encode as canonical entity keys");
+        .expect("file IDs should encode as canonical row keys");
 
         assert_eq!(
-            route.entity_pks,
+            route.row_pks,
             vec![
                 r#"["01920000-0000-7000-8000-0000000000a2"]"#.to_string(),
                 r#"["01920000-0000-7000-8000-0000000000b2"]"#.to_string()

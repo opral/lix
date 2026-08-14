@@ -215,7 +215,7 @@ simulation_test!(
                     "SELECT file_id \
                      FROM lix_change \
                      WHERE schema_key = 'lix_directory_descriptor' \
-                       AND entity_pk = CAST('[\"{directory_id}\"]' AS JSONB) \
+                       AND row_pk = CAST('[\"{directory_id}\"]' AS JSONB) \
                      ORDER BY created_at"
                 ),
             )
@@ -1067,7 +1067,7 @@ simulation_test!(
             .execute(
                 "SELECT schema_key \
              FROM lix_change \
-             WHERE entity_pk = CAST('[\"66696c65-2d72-8561-846d-650000000000\"]' AS JSONB) \
+             WHERE row_pk = CAST('[\"66696c65-2d72-8561-846d-650000000000\"]' AS JSONB) \
                AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
              ORDER BY schema_key",
                 &[],
@@ -1663,7 +1663,7 @@ simulation_test!(
                 "SELECT id \
              FROM lix_change \
              WHERE schema_key = 'lix_binary_blob_ref' \
-               AND entity_pk = CAST('[\"656d7074-792d-8461-8461-2d66696c6500\"]' AS JSONB)",
+               AND row_pk = CAST('[\"656d7074-792d-8461-8461-2d66696c6500\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -3032,7 +3032,7 @@ async fn file_descriptor_event_count(
         .iter()
         .filter(|source| {
             source["schema_key"] == json!("lix_file_descriptor")
-                && source["entity_pk"] == json!([file_id])
+                && source["row_pk"] == json!([file_id])
         })
         .count()
 }
@@ -3070,7 +3070,7 @@ simulation_test!(
                 "SELECT id \
                  FROM lix_change \
                  WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = CAST('[\"616c7265-6164-892d-856d-7074792d6600\"]' AS JSONB)",
+                   AND row_pk = CAST('[\"616c7265-6164-892d-856d-7074792d6600\"]' AS JSONB)",
                 &[],
             )
             .await
