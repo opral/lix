@@ -287,7 +287,7 @@ where
     pub(crate) async fn load_commit_members(
         &self,
         commit: &CommitObjectV1,
-    ) -> Result<Vec<super::model::CommitMemberV1>, StorageError> {
+    ) -> Result<Vec<super::model::CommitMemberV3>, StorageError> {
         super::serving::load_commit_members(&self.read, commit).await
     }
 
@@ -308,7 +308,7 @@ where
         target_commit_object_id: ObjectId,
         target_generation: u64,
         target_ordinal: usize,
-        member: super::model::CommitMemberV1,
+        member: super::model::CommitMemberV3,
         entry: ChangeCatalogEntry,
     ) -> Result<(), StorageError> {
         super::serving::validate_member_catalog_owner(
@@ -604,21 +604,17 @@ where
                 let Some((value, source)) = value else {
                     return Ok(None);
                 };
-                    let (snapshot_content, deleted) = match value.cell {
-                        super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
-                        super::state::StateCell::NativeRow(_) => {
-                            return Err(crate::LixError::new(
-                                crate::LixError::CODE_STORAGE_ERROR,
-                                "historical native row requires its authenticated branch owner",
-                            ));
-                        }
-                        super::state::StateCell::Null => (None, false),
-                        super::state::StateCell::Tombstone => (None, true),
-                    };
+                    if matches!(value.cell, super::state::StateCell::Value(_) | super::state::StateCell::Null) {
+                        return Err(crate::LixError::new(
+                            crate::LixError::CODE_STORAGE_ERROR,
+                            "historical row uses the removed JSON state representation",
+                        ));
+                    }
+                    let deleted = matches!(value.cell, super::state::StateCell::Tombstone);
                     Ok(Some(super::state::HistoricalStateRow {
                         key: key.clone(),
                         global: source == super::serving::StateSource::Global,
-                        snapshot_content,
+                        cell: value.cell,
                         metadata: value.metadata,
                         deleted,
                         blob_manifest_object_ids: value.blob_manifest_object_ids,
@@ -1352,21 +1348,17 @@ fn historical_state_row_from_point(
     if !include_global && source == super::serving::StateSource::Global {
         return Ok(None);
     }
-    let (snapshot_content, deleted) = match value.cell {
-        super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
-        super::state::StateCell::NativeRow(_) => {
-            return Err(crate::LixError::new(
-                crate::LixError::CODE_STORAGE_ERROR,
-                "historical native row requires its authenticated branch owner",
-            ));
-        }
-        super::state::StateCell::Null => (None, false),
-        super::state::StateCell::Tombstone => (None, true),
-    };
+    if matches!(value.cell, super::state::StateCell::Value(_) | super::state::StateCell::Null) {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_STORAGE_ERROR,
+            "historical row uses the removed JSON state representation",
+        ));
+    }
+    let deleted = matches!(value.cell, super::state::StateCell::Tombstone);
     Ok(Some(super::state::HistoricalStateRow {
         key,
         global: source == super::serving::StateSource::Global,
-        snapshot_content,
+        cell: value.cell,
         metadata: value.metadata,
         deleted,
         blob_manifest_object_ids: value.blob_manifest_object_ids,
@@ -1524,21 +1516,17 @@ fn historical_state_rows_from_points(
                 return Ok(None);
             };
             let key = super::state::decode_state_key(encoded_key)?;
-            let (snapshot_content, deleted) = match value.cell {
-                super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
-                super::state::StateCell::NativeRow(_) => {
-                    return Err(crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "historical native row requires its authenticated branch owner",
-                    ));
-                }
-                super::state::StateCell::Null => (None, false),
-                super::state::StateCell::Tombstone => (None, true),
-            };
+            if matches!(value.cell, super::state::StateCell::Value(_) | super::state::StateCell::Null) {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "historical row uses the removed JSON state representation",
+                ));
+            }
+            let deleted = matches!(value.cell, super::state::StateCell::Tombstone);
             Ok(Some(super::state::HistoricalStateRow {
                 key,
                 global: source == super::serving::StateSource::Global,
-                snapshot_content,
+                cell: value.cell,
                 metadata: value.metadata,
                 deleted,
                 blob_manifest_object_ids: value.blob_manifest_object_ids,
@@ -1559,7 +1547,7 @@ fn historical_state_payloads_differ(
         (Some(left), Some(right)) => {
             left.key != right.key
                 || left.deleted != right.deleted
-                || left.snapshot_content != right.snapshot_content
+                || left.cell != right.cell
                 || left.metadata != right.metadata
         }
         (Some(_), None) | (None, Some(_)) => true,
@@ -1915,7 +1903,11 @@ mod tests {
             commit_id,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
             updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            snapshot_content: snapshot_content.map(Into::into),
+            cell: if deleted {
+                crate::forktree::StateCell::Tombstone
+            } else {
+                crate::forktree::StateCell::Value(snapshot_content.unwrap_or_default().into())
+            },
             metadata: None,
             deleted,
             blob_manifest_object_ids: Vec::new(),

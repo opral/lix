@@ -15,11 +15,11 @@ const KEY_PART_FINAL: u8 = 0x00;
 const KEY_PART_MORE: u8 = 0x01;
 const FILE_ID_NONE: u8 = 0x00;
 const FILE_ID_SOME: u8 = 0x01;
-const ENTITY_PK_CODEC_V1: u8 = 0x01;
-const ENTITY_PK_UUID: u8 = 0x00;
-const ENTITY_PK_INTEGER: u8 = 0x01;
-const ENTITY_PK_STRING: u8 = 0x02;
-const ENTITY_PK_BYTES: u8 = 0x03;
+const ROW_PK_CODEC_V1: u8 = 0x01;
+const ROW_PK_UUID: u8 = 0x00;
+const ROW_PK_INTEGER: u8 = 0x01;
+const ROW_PK_STRING: u8 = 0x02;
+const ROW_PK_BYTES: u8 = 0x03;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct StateKeyRef<'a> {
@@ -75,13 +75,24 @@ pub(crate) struct HistoricalStateRow {
     pub(crate) commit_id: crate::changelog::CommitId,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot_content: Option<SharedStr>,
+    /// Sole authenticated historical row body. Schema-v1 rows remain native
+    /// through history/diff/merge; JSON is constructed only by an explicitly
+    /// requested terminal public projection.
+    pub(crate) cell: StateCell,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) deleted: bool,
     /// Authenticated BlobManifest edges carried with the state value. A
     /// payload-free historical transition must preserve this edge when it
     /// republishes a prior blob-ref row.
     pub(crate) blob_manifest_object_ids: Vec<ObjectId>,
+}
+
+impl HistoricalStateRow {
+    /// Terminal projection for trusted built-in schemas. Core history, diff,
+    /// and merge code must consume `cell` directly and never call this helper.
+    pub(crate) fn seed_snapshot_content(&self) -> Result<Option<SharedStr>, LixError> {
+        self.cell.seed_logical_text(&self.key, self.global)
+    }
 }
 
 /// One semantic change between two authenticated historical ForkTree state
@@ -254,7 +265,7 @@ fn canonical_state_row_prefix(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
         .get(offset)
         .ok_or_else(|| state_error("state row primary key prefix is truncated"))?;
     offset += 1;
-    if version != ENTITY_PK_CODEC_V1 {
+    if version != ROW_PK_CODEC_V1 {
         return Err(state_error(format!(
             "state row primary key has unsupported codec version {version}"
         )));
@@ -294,7 +305,7 @@ pub(crate) fn validate_state_row_prefix(bytes: &[u8]) -> Result<(), LixError> {
 }
 
 fn write_row_pk(output: &mut Vec<u8>, row_pk: &RowPk) {
-    output.push(ENTITY_PK_CODEC_V1);
+    output.push(ROW_PK_CODEC_V1);
     for (index, component) in row_pk.components.iter().enumerate() {
         let terminator = if index + 1 == row_pk.components.len() {
             KEY_PART_FINAL
@@ -303,22 +314,22 @@ fn write_row_pk(output: &mut Vec<u8>, row_pk: &RowPk) {
         };
         match component {
             RowPkComponent::Uuid(bytes) => {
-                output.push(ENTITY_PK_UUID);
+                output.push(ROW_PK_UUID);
                 output.extend_from_slice(bytes);
                 output.push(terminator);
             }
             RowPkComponent::Integer(value) => {
-                output.push(ENTITY_PK_INTEGER);
+                output.push(ROW_PK_INTEGER);
                 let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
                 output.extend_from_slice(&ordered.to_be_bytes());
                 output.push(terminator);
             }
             RowPkComponent::String(value) => {
-                output.push(ENTITY_PK_STRING);
+                output.push(ROW_PK_STRING);
                 write_key_bytes(output, value.as_bytes(), terminator);
             }
             RowPkComponent::Bytes(value) => {
-                output.push(ENTITY_PK_BYTES);
+                output.push(ROW_PK_BYTES);
                 write_key_bytes(output, value, terminator);
             }
         }
@@ -536,7 +547,7 @@ fn read_row_pk(bytes: &[u8], offset: &mut usize) -> Result<RowPk, LixError> {
         .copied()
         .ok_or_else(|| state_error("state row primary key is truncated"))?;
     *offset += 1;
-    if version != ENTITY_PK_CODEC_V1 {
+    if version != ROW_PK_CODEC_V1 {
         return Err(state_error(format!(
             "state row primary key has unsupported codec version {version}"
         )));
@@ -562,11 +573,11 @@ fn read_row_pk_part(
         .ok_or_else(|| state_error("state row primary-key part tag is truncated"))?;
     *offset += 1;
     match tag {
-        ENTITY_PK_STRING => read_key_string(bytes, offset, "state string primary-key part")
+        ROW_PK_STRING => read_key_string(bytes, offset, "state string primary-key part")
             .map(|(value, terminator)| (RowPkComponent::String(value.into()), terminator)),
-        ENTITY_PK_BYTES => read_key_bytes(bytes, offset, "state bytes primary-key part")
+        ROW_PK_BYTES => read_key_bytes(bytes, offset, "state bytes primary-key part")
             .map(|(value, terminator)| (RowPkComponent::Bytes(value.into()), terminator)),
-        ENTITY_PK_UUID => {
+        ROW_PK_UUID => {
             let end = offset
                 .checked_add(16)
                 .ok_or_else(|| state_error("state UUID primary-key part overflows"))?;
@@ -579,7 +590,7 @@ fn read_row_pk_part(
             *offset = end + 1;
             Ok((RowPkComponent::Uuid(value), terminator))
         }
-        ENTITY_PK_INTEGER => {
+        ROW_PK_INTEGER => {
             let end = offset
                 .checked_add(8)
                 .ok_or_else(|| state_error("state integer primary-key part overflows"))?;

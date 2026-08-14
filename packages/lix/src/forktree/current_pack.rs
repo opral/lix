@@ -135,7 +135,7 @@ impl CurrentStatePackV1 {
 
     pub(crate) fn object_edges(&self) -> impl Iterator<Item = (ObjectId, ObjectDomain)> + '_ {
         self.rows.iter().flat_map(|row| {
-            std::iter::once((row.history_page_object_id, ObjectDomain::CommitChangePageV2)).chain(
+            std::iter::once((row.history_page_object_id, ObjectDomain::CommitChangePageV3)).chain(
                 row.value
                     .blob_manifest_object_ids
                     .iter()

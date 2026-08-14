@@ -139,3 +139,70 @@ where
         origin_key: change.origin_key,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RejectingReader;
+
+    #[async_trait::async_trait]
+    impl JsonPayloadReader for RejectingReader {
+        async fn load_slot(
+            &mut self,
+            _slot: &crate::json_store::JsonSlot,
+            _field: &str,
+        ) -> Result<Option<SharedStr>, LixError> {
+            panic!("unprojected JSON payload must not be hydrated")
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_projection_does_not_hydrate_snapshot_or_metadata() {
+        let change = crate::commit_graph::CommitGraphChange {
+            id: crate::changelog::ChangeId::for_test_label("projection-pruning"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            row_pk: RowPk::single("row"),
+            schema_key: "schema".to_owned(),
+            file_id: None,
+            snapshot: crate::json_store::JsonSlot::Inline("{\"value\":1}".into()),
+            metadata: crate::json_store::JsonSlot::Inline("{\"source\":true}".into()),
+            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(1),
+            origin_key: None,
+        };
+        let projected = materialize_commit_graph_change(
+            &mut RejectingReader,
+            change,
+            ChangePayloadProjection {
+                snapshot_content: false,
+                metadata: false,
+            },
+        )
+        .await
+        .expect("identity-only projection");
+        assert!(projected.snapshot_content.is_none());
+        assert!(projected.metadata.is_none());
+    }
+
+    #[test]
+    fn typed_history_diff_merge_sources_have_no_json_hydration_calls() {
+        for (name, source) in [
+            ("row_history", include_str!("providers/row_history.rs")),
+            ("diff", include_str!("providers/diff.rs")),
+            ("merge_analysis", include_str!("../session/merge/analysis.rs")),
+            ("merge_native", include_str!("../session/merge/native.rs")),
+        ] {
+            for forbidden in [
+                "seed_snapshot_content(",
+                "load_json_slot(",
+                "decode_forktree_change_payload(",
+                "parse_snapshot(",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} contains forbidden typed-history JSON hydration call {forbidden}"
+                );
+            }
+        }
+    }
+}

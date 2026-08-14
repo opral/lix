@@ -38,6 +38,7 @@ pub(super) struct ObservedStateOrdinal {
 #[derive(Debug)]
 struct ObservedStateBatch {
     observed_commit_id: SharedStr,
+    terminal_snapshots: Vec<Option<SharedStr>>,
     rows: Vec<HistoricalStateRow>,
 }
 
@@ -86,8 +87,13 @@ impl ObservedStateRows {
                 batch,
                 row: u32::try_from(row).expect("historical row count was checked above"),
             }));
+        let terminal_snapshots = rows
+            .iter()
+            .map(HistoricalStateRow::seed_snapshot_content)
+            .collect::<Result<Vec<_>, _>>()?;
         self.batches.push(ObservedStateBatch {
             observed_commit_id,
+            terminal_snapshots,
             rows,
         });
         Ok(())
@@ -145,6 +151,10 @@ impl ObservedStateRows {
             .expect("historical SQL batch ordinal belongs to its owner");
         ObservedStateRowRef {
             observed_commit_id: batch.observed_commit_id.as_str(),
+            snapshot_content: batch
+                .terminal_snapshots
+                .get(ordinal.row as usize)
+                .and_then(Option::as_ref),
             row: batch
                 .rows
                 .get(ordinal.row as usize)
@@ -170,6 +180,7 @@ impl ObservedStateRows {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ObservedStateRowRef<'a> {
     observed_commit_id: &'a str,
+    snapshot_content: Option<&'a SharedStr>,
     row: &'a HistoricalStateRow,
     ordinal: ObservedStateOrdinal,
 }
@@ -180,7 +191,10 @@ impl<'a> ObservedStateRowRef<'a> {
     }
 
     pub(super) fn row(self) -> HistoricalStateRowRef<'a> {
-        HistoricalStateRowRef { row: self.row }
+        HistoricalStateRowRef {
+            row: self.row,
+            snapshot_content: self.snapshot_content,
+        }
     }
 
     pub(super) fn ordinal(self) -> ObservedStateOrdinal {
@@ -191,6 +205,7 @@ impl<'a> ObservedStateRowRef<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct HistoricalStateRowRef<'a> {
     row: &'a HistoricalStateRow,
+    snapshot_content: Option<&'a SharedStr>,
 }
 
 impl<'a> HistoricalStateRowRef<'a> {
@@ -207,7 +222,7 @@ impl<'a> HistoricalStateRowRef<'a> {
     }
 
     pub(super) fn snapshot_content(self) -> Option<&'a SharedStr> {
-        self.row.snapshot_content.as_ref()
+        self.snapshot_content
     }
 
     pub(super) fn deleted(self) -> bool {

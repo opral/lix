@@ -323,13 +323,17 @@ fn certified_state_ranges(
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryEntry {
     pub(crate) change: MaterializedChange,
+    /// Authenticated Schema-v1 body for typed row-history projection.
+    /// This is populated only for the native row route; JSON payload
+    /// materialization is intentionally absent on that route.
+    pub(crate) native_row: Option<crate::forktree::HistoricalStateRow>,
     pub(crate) observed_commit_id: String,
     pub(crate) commit_created_at: Option<String>,
     pub(crate) as_of_commit_id: String,
     pub(crate) depth: u32,
 }
 
-pub(crate) const HISTORY_COL_ENTITY_PK: &str = "lixcol_row_pk";
+pub(crate) const HISTORY_COL_ROW_PK: &str = "lixcol_row_pk";
 pub(crate) const HISTORY_COL_SCHEMA_KEY: &str = "lixcol_schema_key";
 pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
 pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
@@ -420,6 +424,7 @@ pub(crate) struct HistoryViewDescriptor<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HistoryMetadataProjection {
     commit_created_at: bool,
+    native_row_rows: bool,
 }
 
 impl HistoryMetadataProjection {
@@ -432,7 +437,15 @@ impl HistoryMetadataProjection {
                     .iter()
                     .any(|column| column.name == column_name)
             });
-        Self { commit_created_at }
+        Self {
+            commit_created_at,
+            native_row_rows: false,
+        }
+    }
+
+    pub(crate) fn with_native_row_rows(mut self) -> Self {
+        self.native_row_rows = true;
+        self
     }
 
     #[cfg(test)]
@@ -599,6 +612,95 @@ where
                 (history.entries, reachable_by_id, Vec::new())
             }
         };
+        if metadata_projection.native_row_rows {
+            let mut existing_change_ids = std::collections::BTreeSet::new();
+            for certified_commit_id in certified_commit_ids {
+                let certified_depth = reachable_by_id
+                    .get(&certified_commit_id)
+                    .map(|(depth, _, _)| *depth)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("certified commit '{certified_commit_id}' is not reachable"),
+                        )
+                    })?;
+                let certified_rows = if let Some(keys) =
+                    certified_state_keys(&request, &entries, certified_commit_id)
+                {
+                    forktree_reader
+                        .load_state_rows_at_commit(&certified_commit_id.to_string(), &keys)
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                } else {
+                    let ranges = certified_state_ranges(&request, &entries, certified_commit_id);
+                    match ranges.as_deref() {
+                        None => {
+                            forktree_reader
+                                .scan_state_rows_at_commit(certified_commit_id)
+                                .await?
+                        }
+                        Some(ranges) => {
+                            let mut state_rows = Vec::new();
+                            for (lower, upper) in ranges {
+                                state_rows.extend(
+                                    forktree_reader
+                                        .scan_state_rows_at_commit_range(
+                                            certified_commit_id,
+                                            lower,
+                                            upper.as_deref(),
+                                        )
+                                        .await?,
+                                );
+                            }
+                            state_rows
+                        }
+                    }
+                };
+                for row in certified_rows {
+                    if !historical_row_matches_request(&row, &request)
+                        || request
+                            .min_depth
+                            .is_some_and(|minimum| certified_depth < minimum)
+                        || request
+                            .max_depth
+                            .is_some_and(|maximum| certified_depth > maximum)
+                    {
+                        continue;
+                    }
+                    let change_id = row.change_id.to_string();
+                    if !existing_change_ids.insert(change_id.clone()) {
+                        continue;
+                    }
+                    let source_commit = forktree_reader
+                        .load_required_commit_record(row.commit_id)
+                        .await?;
+                    let change = MaterializedChange {
+                        id: change_id,
+                        account_id: source_commit.account_id,
+                        row_pk: row.key.row_pk.clone(),
+                        schema_key: row.key.schema_key.clone(),
+                        file_id: row.key.file_id.clone(),
+                        snapshot_content: None,
+                        metadata: row.metadata.clone(),
+                        created_at: row.created_at.to_string(),
+                        origin_key: None,
+                    };
+                    rows.push(HistoryEntry {
+                        change,
+                        native_row: Some(row),
+                        observed_commit_id: source_commit.commit_id.to_string(),
+                        commit_created_at: metadata_projection
+                            .commit_created_at
+                            .then(|| source_commit.created_at.to_string()),
+                        as_of_commit_id: as_of_commit_id.to_string(),
+                        depth: certified_depth,
+                    });
+                }
+            }
+            continue;
+        }
         // A compacting checkpoint may carry selected Change members whose
         // authenticated source commit is not on the checkpoint's first-parent
         // walk.  Keep that existing member/source edge as the only additional
@@ -687,6 +789,7 @@ where
             rows.push(HistoryEntry {
                 commit_created_at,
                 change,
+                native_row: None,
                 observed_commit_id: entry.observed_commit_id.to_string(),
                 as_of_commit_id: entry.start_commit_id.to_string(),
                 depth: entry.depth,
@@ -869,6 +972,7 @@ where
                 if !existing_change_ids.insert(change_id.clone()) {
                     continue;
                 }
+                let snapshot_content = row.seed_snapshot_content()?;
                 rows.push(HistoryEntry {
                     change: MaterializedChange {
                         id: change_id,
@@ -876,11 +980,12 @@ where
                         row_pk: row.key.row_pk,
                         schema_key: row.key.schema_key,
                         file_id: row.key.file_id,
-                        snapshot_content: row.snapshot_content,
+                        snapshot_content,
                         metadata: row.metadata,
                         created_at: row.created_at.to_string(),
                         origin_key: None,
                     },
+                    native_row: None,
                     observed_commit_id: row.commit_id.to_string(),
                     commit_created_at: metadata_projection
                         .commit_created_at
@@ -916,7 +1021,8 @@ async fn validate_authenticated_member_row(
         ));
     }
     let snapshot = reader.load_json_slot(&record.snapshot).await?;
-    if snapshot.as_deref() != row.snapshot_content.as_deref() {
+    let native_snapshot = row.seed_snapshot_content()?;
+    if snapshot.as_deref() != native_snapshot.as_deref() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -1249,7 +1355,7 @@ fn canonical_row_pk_value(value: &str) -> Option<String> {
 fn canonical_history_column_name(name: &str) -> Option<&str> {
     match name {
         HISTORY_COL_AS_OF_COMMIT_ID => Some("as_of_commit_id"),
-        HISTORY_COL_ENTITY_PK => Some("row_pk"),
+        HISTORY_COL_ROW_PK => Some("row_pk"),
         HISTORY_COL_SCHEMA_KEY => Some("schema_key"),
         HISTORY_COL_FILE_ID => Some("file_id"),
         HISTORY_COL_DEPTH => Some("depth"),

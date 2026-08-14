@@ -593,20 +593,17 @@ impl PluginFileOwner {
                 "historical plugin owner row has an invalid storage identity",
             ));
         }
-        if row.deleted || row.snapshot_content.is_none() {
+        let snapshot_content = row.seed_snapshot_content()?;
+        if row.deleted || snapshot_content.is_none() {
             return Ok(None);
         }
-        let snapshot = serde_json::from_str(
-            row.snapshot_content
-                .as_ref()
-                .expect("checked above")
-                .as_str(),
-        )
-        .map_err(|error| {
-            invalid_registry(format!(
-                "historical plugin owner snapshot is invalid JSON: {error}"
-            ))
-        })?;
+        let snapshot =
+            serde_json::from_str(snapshot_content.as_ref().expect("checked above").as_str())
+                .map_err(|error| {
+                    invalid_registry(format!(
+                        "historical plugin owner snapshot is invalid JSON: {error}"
+                    ))
+                })?;
         Self::from_snapshot(file_id, &snapshot).map(Some)
     }
 

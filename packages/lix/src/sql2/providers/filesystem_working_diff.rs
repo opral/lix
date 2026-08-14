@@ -486,9 +486,10 @@ where
         .map(|row| {
             let row_id = row.key.row_pk.as_single_string_owned()?;
             validate_descriptor_row_identity(&row, schema_key, &row_id)?;
+            let snapshot_content = row.seed_snapshot_content()?;
             if row.deleted {
                 // An authenticated tombstone is logical absence, not a malformed descriptor.
-                if row.snapshot_content.is_some() {
+                if snapshot_content.is_some() {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("{schema_key} descriptor '{row_id}' tombstone has a payload"),
@@ -496,7 +497,7 @@ where
                 }
                 return Ok(None);
             }
-            let snapshot = row.snapshot_content.ok_or_else(|| {
+            let snapshot = snapshot_content.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("{schema_key} descriptor '{row_id}' has no authenticated payload"),
@@ -564,7 +565,7 @@ fn historical_rows_differ(
         (None, None) => false,
         (Some(left), Some(right)) => {
             left.deleted != right.deleted
-                || left.snapshot_content != right.snapshot_content
+                || left.cell != right.cell
                 || left.metadata != right.metadata
                 || left.key != right.key
         }

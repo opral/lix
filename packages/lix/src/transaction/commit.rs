@@ -7,7 +7,6 @@
 //! joins the resulting writes and exact preconditions to the existing single
 //! backend commit.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
@@ -25,11 +24,11 @@ use crate::transaction::types::PreparedStateRowRef;
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CheckpointCursorV1,
-    CommitCatalogEntry, CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1,
+    CommitCatalogEntry, CommitChangePageV3, CommitId as ForkTreeCommitId, CommitMemberV3,
     CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
     PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCell, StateKey,
     StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValue, StateValueRef,
-    encode_current_state_packs, encode_state_row_prefix_bounds, encode_state_key,
+    encode_current_state_packs, encode_state_entity_prefix_bounds, encode_state_key,
     encode_state_value, introduced_checkpoint_marker, load_commit, load_commit_summary,
     open_coherent_view_on_read, select_historical_commit_members, state_points,
 };
@@ -304,7 +303,7 @@ where
                 ));
             }
             let bounds =
-                encode_state_row_prefix_bounds(first.schema_key.as_str(), &RowPk::empty());
+                encode_state_entity_prefix_bounds(first.schema_key.as_str(), &RowPk::empty());
             Ok((bounds.lower, bounds.upper))
         })
         .transpose()?;
@@ -380,29 +379,6 @@ where
         let change_id = row
             .change_id
             .ok_or_else(|| writer_error("tracked row has no change identity"))?;
-        let canonical_snapshot = canonical_snapshot_for_row(
-            row,
-            &prepared_blob_manifests,
-            &prepared_writes.historical_blob_manifest_edges,
-        )?;
-        let snapshot = canonical_snapshot
-            .as_deref()
-            .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
-        let metadata = row.metadata.map_or(JsonSlot::None, |value| {
-            JsonSlot::Inline(value.normalized().into())
-        });
-        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-            format_version: 2,
-            change_id,
-            account_id: active_account_id.to_string(),
-            schema_key: row.schema_key.to_string(),
-            row_pk: row.row_pk.clone(),
-            file_id: row.file_id.map(ToString::to_string),
-            snapshot,
-            metadata,
-            created_at: row.created_at,
-            origin_key: row.origin_key.map(ToString::to_string),
-        })?;
         let blob_manifest_object_ids = blob_manifest_object_ids_for_row(
             row,
             &prepared_blob_manifests,
@@ -425,16 +401,33 @@ where
             origin_key: row.origin_key.map(ToString::to_string),
             blob_manifest_object_ids: blob_manifest_object_ids.clone(),
         };
-        members.push(CommitMemberV1::introduced(
+        let (layout_id, owner_digest, semantic_digest) = match &current_value.cell {
+            StateCell::NativeRow(native) => {
+                (native.layout_id, native.owner_digest, native.semantic_digest)
+            }
+            StateCell::Tombstone => ([0; 32], [0; 32], [0; 32]),
+            StateCell::Value(_) | StateCell::Null => {
+                return Err(writer_error(
+                    "tracked history row uses the removed JSON current-state representation",
+                ));
+            }
+        };
+        members.push(CommitMemberV3::introduced(
             forktree_change_id(change_id),
-            payload,
+            key.clone(),
+            layout_id,
             global,
+            owner_digest,
+            semantic_digest,
+            matches!(&current_value.cell, StateCell::Tombstone),
+            active_account_id.to_string(),
+            row.created_at,
             row.updated_at,
-            blob_manifest_object_ids.clone(),
+            row.origin_key.map(ToString::to_string),
         ));
         pending_rows.push((row, key, previous, blob_manifest_object_ids, current_value));
     }
-    let member_pages = CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?;
+    let member_pages = CommitChangePageV3::encode_pages(forktree_commit_id(commit_id), &members)?;
     let current_packs = encode_current_state_packs(
         forktree_commit_id(commit_id),
         global,
@@ -544,7 +537,7 @@ where
 
     let semantic_change_ids = members
         .iter()
-        .map(CommitMemberV1::change_id)
+        .map(CommitMemberV3::change_id)
         .collect::<Vec<_>>();
     let current_repository_root = publication.current_repository_root();
     let global_state_root = if global {
@@ -940,7 +933,7 @@ struct OrderedCommitDraft {
 struct OrderedCommitContent {
     draft: OrderedCommitDraft,
     mutations: Vec<StateTreeMutation>,
-    members: Vec<CommitMemberV1>,
+    members: Vec<CommitMemberV3>,
     member_page_object_ids: Vec<ObjectId>,
     current_pack_objects: Vec<(ObjectId, bytes::Bytes)>,
     max_selected_source_generation: Option<u64>,
@@ -1097,7 +1090,7 @@ where
     }
 
     let mut touched_presence = BTreeMap::<Vec<u8>, bool>::new();
-    // Fresh identitys are the only new catalog members in ordered history;
+    // Fresh identities are the only new catalog members in ordered history;
     // selected historical members already own catalog entries. Build the
     // unique authenticated key set before any fresh object is encoded.
     let mut catalog_change_ids = Vec::new();
@@ -1123,7 +1116,7 @@ where
 
     let mut contents = Vec::with_capacity(drafts.len());
     for draft in drafts {
-        let mut seen_identitys = BTreeSet::<Vec<u8>>::new();
+        let mut seen_identities = BTreeSet::<Vec<u8>>::new();
         let mut pending_mutations = Vec::new();
         let mut members = Vec::new();
         let mut max_selected_source_generation: Option<u64> = None;
@@ -1159,45 +1152,45 @@ where
                 file_id: row.file_id.map(|value| value.as_str()),
                 row_pk: row.row_pk,
             });
-            if !seen_identitys.insert(key.clone()) {
+            if !seen_identities.insert(key.clone()) {
                 return Err(writer_error(
                     "ordered history repeats one logical state identity",
                 ));
             }
-            let canonical_snapshot = canonical_snapshot_for_row(
-                row,
-                &prepared_blob_manifests,
-                &prepared.historical_blob_manifest_edges,
-            )?;
-            let snapshot = canonical_snapshot
-                .as_deref()
-                .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
-            let metadata = row.metadata.map_or(JsonSlot::None, |value| {
-                JsonSlot::Inline(value.normalized().into())
-            });
-            let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-                format_version: 2,
-                change_id,
-                account_id: active_account_id.to_string(),
-                schema_key: row.schema_key.to_string(),
-                row_pk: row.row_pk.clone(),
-                file_id: row.file_id.map(ToString::to_string),
-                snapshot,
-                metadata,
-                created_at: row.created_at,
-                origin_key: row.origin_key.map(ToString::to_string),
-            })?;
             let blob_manifest_object_ids = blob_manifest_object_ids_for_row(
                 row,
                 &prepared_blob_manifests,
                 &prepared.historical_blob_manifest_edges,
             )?;
-            members.push(CommitMemberV1::introduced(
+            let deleted = row.snapshot.is_none();
+            let (layout_id, owner_digest, semantic_digest) = match (deleted, row.native_row.as_ref()) {
+                (false, Some(native)) => {
+                    (native.layout_id, native.owner_digest, native.semantic_digest)
+                }
+                (true, None) => ([0; 32], [0; 32], [0; 32]),
+                (false, None) => {
+                    return Err(writer_error(
+                        "live ordered history row has no authenticated native tuple",
+                    ));
+                }
+                (true, Some(_)) => {
+                    return Err(writer_error(
+                        "ordered history tombstone unexpectedly carries a native tuple",
+                    ));
+                }
+            };
+            members.push(CommitMemberV3::introduced(
                 forktree_change_id(change_id),
-                payload,
+                key.clone(),
+                layout_id,
                 row.global,
+                owner_digest,
+                semantic_digest,
+                deleted,
+                active_account_id.to_string(),
+                row.created_at,
                 row.updated_at,
-                blob_manifest_object_ids.clone(),
+                row.origin_key.map(ToString::to_string),
             ));
 
             let existed = match touched_presence.get(&key) {
@@ -1247,7 +1240,7 @@ where
                     file_id: selected.file_id(),
                     row_pk: selected.row_pk(),
                 });
-                if !seen_identitys.insert(identity.clone()) {
+                if !seen_identities.insert(identity.clone()) {
                     return Err(writer_error(
                         "ordered history repeats one fresh/selected logical identity",
                     ));
@@ -1260,7 +1253,6 @@ where
                 let SelectedHistoricalMember {
                     member,
                     source_commit,
-                    source_change,
                     source_state: source_value,
                     source_domain,
                     sequence_state: sequence_value,
@@ -1272,27 +1264,11 @@ where
                         generation.max(source_commit.generation)
                     }),
                 );
-                let ChangeObjectV1::Semantic { payload, .. } = source_change else {
-                    return Err(writer_error(
-                        "selected history source member has the wrong Change domain",
-                    ));
-                };
-                let record =
-                    crate::changelog::decode_forktree_change_payload(&payload, selected.change_id)?;
-                if record.schema_key != selected.schema_key()
-                    || record.file_id.as_deref() != selected.file_id()
-                    || record.row_pk != *selected.row_pk()
-                    || record.snapshot.is_none() != selected.deleted
-                {
-                    return Err(writer_error(
-                        "selected history identity or lifecycle differs from its Change payload",
-                    ));
-                }
                 let selected_global = source_domain == StateSource::Global;
                 let sequence_semantically_absent = sequence_value
                     .as_ref()
                     .is_none_or(|(value, _)| value.cell.deleted());
-                let source_membership_exact = record.created_at == selected.created_at
+                let source_membership_exact = member.selected_created_at() == Some(selected.created_at)
                     && source_value.created_at == selected.created_at;
                 let canonical_checkpoint_add = !batch.source_membership_certified()
                     && sequence_semantically_absent
@@ -1349,7 +1325,7 @@ where
             }
         }
         let member_pages =
-            CommitChangePageV2::encode_pages(forktree_commit_id(draft.commit_id), &members)?;
+            CommitChangePageV3::encode_pages(forktree_commit_id(draft.commit_id), &members)?;
         if member_pages.member_locations.len() != pending_mutations.len() {
             return Err(writer_error(
                 "ordered history state mutations differ from commit membership",
@@ -2001,71 +1977,6 @@ fn blob_manifest_object_ids_for_row(
     Ok(edge.clone())
 }
 
-fn canonical_snapshot_for_row<'a>(
-    row: PreparedStateRowRef<'a>,
-    manifests: &PreparedBlobManifestMap,
-    historical_edges: &HistoricalBlobManifestEdges,
-) -> Result<Option<Cow<'a, str>>, LixError> {
-    let Some(snapshot) = row.snapshot else {
-        return Ok(None);
-    };
-    if row.schema_key.as_str() != "lix_binary_blob_ref" {
-        return Ok(Some(Cow::Borrowed(snapshot.normalized())));
-    }
-    let file_id = row
-        .file_id
-        .ok_or_else(|| writer_error("blob-ref state row has no file identity"))?;
-    let key = (
-        row.branch_id.to_string(),
-        file_id.to_string(),
-        row.global,
-        row.untracked,
-    );
-    let Some(manifest) = manifests.get(&key).copied() else {
-        let state_key = StateKey {
-            schema_key: row.schema_key.to_string(),
-            file_id: Some(file_id.to_string()),
-            row_pk: row.row_pk.clone(),
-        };
-        let owner = if row.global {
-            crate::GLOBAL_BRANCH_ID
-        } else {
-            row.branch_id.as_str()
-        };
-        let edge = historical_edges
-            .get(&(owner.to_owned(), state_key))
-            .ok_or_else(|| {
-                writer_error("blob-ref state row has no matching prepared ForkTree manifest")
-            })?;
-        if edge.is_empty() {
-            return Err(writer_error(
-                "historical blob-ref state row has an empty ForkTree manifest edge",
-            ));
-        }
-        return Ok(Some(Cow::Borrowed(snapshot.normalized())));
-    };
-    let mut value: serde_json::Value = serde_json::from_str(snapshot.normalized())
-        .map_err(|error| writer_error(format!("blob-ref state row JSON is malformed: {error}")))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| writer_error("blob-ref state row JSON is not an object"))?;
-    if object.get("id").and_then(serde_json::Value::as_str) != Some(file_id.as_str())
-        || object.get("size_bytes").and_then(serde_json::Value::as_u64)
-            != Some(manifest.logical_bytes)
-    {
-        return Err(writer_error(
-            "blob-ref state row identity or size does not match its prepared manifest",
-        ));
-    }
-    object.insert(
-        "blob_hash".to_owned(),
-        serde_json::Value::String(manifest.canonical_blob_id.to_hex()),
-    );
-    Ok(Some(Cow::Owned(serde_json::to_string(&value).map_err(
-        |error| writer_error(format!("failed to encode canonical blob-ref row: {error}")),
-    )?)))
-}
-
 fn sole_publication_branch(
     prepared: &PreparedWriteSet,
     runtime_checkpoint_present: bool,
@@ -2188,7 +2099,7 @@ fn collection_delete_range(
     if file_id.is_some() {
         return Ok(None);
     }
-    let bounds = encode_state_row_prefix_bounds(&schema_key, &RowPk::empty());
+    let bounds = encode_state_entity_prefix_bounds(&schema_key, &RowPk::empty());
     Ok(Some((bounds.lower, bounds.upper)))
 }
 

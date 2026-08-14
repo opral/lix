@@ -373,7 +373,7 @@ where
                 .get_mut(key)
                 .expect("candidate key originates from group");
             candidates.sort_by_key(|candidate| candidate.rank);
-            let base = stale_payload_from_historical(base_rows[slot].as_ref());
+            let base = stale_payload_from_historical(base_rows[slot].as_ref())?;
             candidates.retain(|candidate| candidate.payload != base);
             let mut seen = BTreeSet::new();
             candidates.retain(|candidate| seen.insert(candidate.payload.clone()));
@@ -550,15 +550,15 @@ where
                 "cohort plugin registry row is missing",
             )
         })?;
-    if registry_row.deleted || registry_row.snapshot_content.is_none() {
+    let registry_content = registry_row.seed_snapshot_content()?;
+    if registry_row.deleted || registry_content.is_none() {
         return Err(LixError::new(
             LixError::CODE_TRANSACTION_CONFLICT,
             "cohort plugin registry row is not an authenticated value",
         ));
     }
     let registry_snapshot: serde_json::Value = serde_json::from_str(
-        registry_row
-            .snapshot_content
+        registry_content
             .as_ref()
             .expect("checked above")
             .as_str(),

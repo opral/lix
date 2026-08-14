@@ -1932,8 +1932,8 @@ pub(super) fn validate_change_catalog_back_edge(
     key: ChangeId,
     entry: ChangeCatalogEntry,
     load: impl Fn(ObjectId) -> Result<Bytes, StorageError>,
-) -> Result<ChangeObjectV1, StorageError> {
-    let change = match entry.owner {
+) -> Result<(), StorageError> {
+    match entry.owner {
         ChangeCatalogOwner::CommitMember {
             commit_object_id,
             ordinal,
@@ -1943,18 +1943,16 @@ pub(super) fn validate_change_catalog_back_edge(
             let member = members
                 .get(ordinal as usize)
                 .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
-            let super::model::CommitMemberV1::Introduced {
-                change_id, payload, ..
-            } = member
+            let super::model::CommitMemberV3::Introduced { change_id, .. } = member
             else {
                 return Err(corruption(
                     "ChangeCatalog canonical owner points to a selected member",
                 ));
             };
-            ChangeObjectV1::Semantic {
-                change_id: *change_id,
-                payload: payload.clone(),
-                json_payload_object_ids: Vec::new(),
+            if *change_id != key {
+                return Err(corruption(
+                    "ChangeCatalog key does not match embedded ChangeId",
+                ));
             }
         }
         ChangeCatalogOwner::BranchRef {
@@ -1984,20 +1982,19 @@ pub(super) fn validate_change_catalog_back_edge(
             {
                 return Err(corruption("RefChange has no before or after target"));
             }
-            change
+            if change.change_id() != key {
+                return Err(corruption(
+                    "ChangeCatalog key does not match embedded ChangeId",
+                ));
+            }
         }
         ChangeCatalogOwner::PackedCommit { .. } => {
             return Err(corruption(
                 "packed commit marker has no standalone Change object",
             ));
         }
-    };
-    if change.change_id() != key {
-        return Err(corruption(
-            "ChangeCatalog key does not match embedded ChangeId",
-        ));
     }
-    Ok(change)
+    Ok(())
 }
 
 pub(super) fn validate_receipt_tree(

@@ -31,13 +31,10 @@ use crate::sql2::history_route::{
     HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
     parse_history_filter, validate_history_anchor_filter,
 };
-use crate::sql2::providers::schema::{
-    row_f64_value, row_i64_value, row_json_text_value, parse_snapshot,
-};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::schema::{RowPrimaryKeyFilterAnalyzer, row_pks_from_primary_key_filters};
+use super::row::{RowPrimaryKeyFilterAnalyzer, row_pks_from_primary_key_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 pub(super) fn register_row_history_surface<S>(
@@ -127,7 +124,8 @@ where
         let mut route = row_history_route_from_filters(&self.spec, filters)?;
         route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
         let schema = projected_schema(&self.schema, projection);
-        let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
+        let metadata_projection =
+            HistoryMetadataProjection::from_scan(&schema, filters).with_native_row_rows();
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -181,6 +179,7 @@ fn row_history_route_from_filters(
 #[derive(Debug, Clone)]
 struct RowHistoryRow {
     change: MaterializedChange,
+    native_values: Option<Vec<lix_schema::value_layout::BodyValue>>,
     observed_commit_id: String,
     commit_created_at: Option<String>,
     as_of_commit_id: String,
@@ -213,14 +212,45 @@ where
     .await?;
     let mut rows = entries
         .into_iter()
-        .map(|entry| RowHistoryRow {
-            change: entry.change,
-            observed_commit_id: entry.observed_commit_id,
-            commit_created_at: entry.commit_created_at,
-            as_of_commit_id: entry.as_of_commit_id,
-            depth: entry.depth,
+        .map(|entry| {
+            let native = entry.native_row.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "Schema-v1 history row '{}' has no authenticated native payload",
+                        entry.change.id
+                    ),
+                )
+            })?;
+            let native_values = match &native.cell {
+                crate::forktree::StateCell::NativeRow(cell) => Some(crate::native_row::decode(
+                    &spec.native_schema,
+                    &native.key.row_pk,
+                    native.global,
+                    native.key.file_id.as_deref(),
+                    cell,
+                )?),
+                crate::forktree::StateCell::Tombstone => None,
+                crate::forktree::StateCell::Value(_) | crate::forktree::StateCell::Null => {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "Schema-v1 history row '{}' uses a non-native payload",
+                            entry.change.id
+                        ),
+                    ));
+                }
+            };
+            Ok(RowHistoryRow {
+                change: entry.change,
+                native_values,
+                observed_commit_id: entry.observed_commit_id,
+                commit_created_at: entry.commit_created_at,
+                as_of_commit_id: entry.as_of_commit_id,
+                depth: entry.depth,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<std::result::Result<Vec<_>, LixError>>()?;
     if let Some(limit) = limit {
         rows.truncate(limit);
     }
@@ -283,7 +313,7 @@ static ENTITY_HISTORY_SYSTEM_COLS: ColumnTable<RowHistoryRow> = ColumnTable {
         ("lixcol_depth", Col::I64(|row| Some(i64::from(row.depth)))),
         (
             HISTORY_COL_IS_DELETED,
-            Col::Bool(|row| Some(row.change.snapshot_content.is_none())),
+            Col::Bool(|row| Some(row.native_values.is_none())),
         ),
     ],
 };
@@ -355,26 +385,26 @@ fn row_history_column_array(
         SchemaColumnType::String | SchemaColumnType::Json => Arc::new(StringArray::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_json_text_value(snapshot.as_ref(), column_type))
+                .map(|value| native_text_value(value.as_ref(), column_type))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         SchemaColumnType::Integer => Arc::new(Int64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_i64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|value| native_i64_value(value.as_ref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         SchemaColumnType::Number => Arc::new(Float64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_f64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|value| native_f64_value(value.as_ref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         SchemaColumnType::Boolean => Arc::new(BooleanArray::from(
             projected_values
                 .iter()
-                .map(|snapshot| snapshot.as_ref().and_then(JsonValue::as_bool))
-                .collect::<Vec<_>>(),
+                .map(|value| native_bool_value(value.as_ref(), &spec.schema_key, column_name))
+                .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         SchemaColumnType::Timestamptz => Arc::new(
             TimestampMicrosecondArray::from(
@@ -384,23 +414,16 @@ fn row_history_column_array(
                         let Some(value) = snapshot.as_ref() else {
                             return Ok(None);
                         };
-                        if value.is_null() {
-                            return Ok(None);
-                        }
-                        let text = value.as_str().ok_or_else(|| {
-                            DataFusionError::Execution(format!(
-                                "{}.{} expected timestamptz text",
+                        match value {
+                            lix_schema::value_layout::BodyValue::Timestamptz(value) => {
+                                Ok(Some(*value))
+                            }
+                            lix_schema::value_layout::BodyValue::Null => Ok(None),
+                            _ => Err(DataFusionError::Execution(format!(
+                                "{}.{} expected native timestamptz",
                                 spec.schema_key, column_name
-                            ))
-                        })?;
-                        chrono::DateTime::parse_from_rfc3339(text)
-                            .map(|timestamp| Some(timestamp.timestamp_micros()))
-                            .map_err(|error| {
-                                DataFusionError::Execution(format!(
-                                    "{}.{} contains invalid timestamptz: {error}",
-                                    spec.schema_key, column_name
-                                ))
-                            })
+                            ))),
+                        }
                     })
                     .collect::<Result<Vec<_>>>()?,
             )
@@ -413,10 +436,23 @@ fn row_history_column_value(
     row: &RowHistoryRow,
     spec: &SchemaSurfaceSpec,
     column_name: &str,
-) -> Result<Option<JsonValue>> {
-    let snapshot = parse_snapshot(row.change.snapshot_content.as_deref())?;
-    if let Some(snapshot) = snapshot {
-        return Ok(snapshot.get(column_name).cloned());
+) -> Result<Option<lix_schema::value_layout::BodyValue>> {
+    if let Some(values) = &row.native_values {
+        let mut value_ordinal = 0;
+        for column in &spec.native_schema.columns {
+            if spec.native_schema.primary_key.contains(&column.name) {
+                continue;
+            }
+            if column.name == column_name {
+                return values.get(value_ordinal).cloned().map(Some).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "{}.{} is absent from its authenticated native tuple",
+                        spec.schema_key, column_name
+                    ))
+                });
+            }
+            value_ordinal += 1;
+        }
     }
 
     let row_pk = row.change.row_pk.as_json_array_text().map_err(|error| {
@@ -430,6 +466,87 @@ fn row_history_column_value(
         HistoryIdentityProjection::PrimaryKeyPaths(&spec.primary_key_paths),
     )
     .map_err(|error| DataFusionError::Execution(error.to_string()))
+    .and_then(|value| value.map(body_value_from_json).transpose())
+}
+
+fn body_value_from_json(value: JsonValue) -> Result<lix_schema::value_layout::BodyValue> {
+    use lix_schema::value_layout::BodyValue;
+    Ok(match value {
+        JsonValue::Null => BodyValue::Null,
+        JsonValue::String(value) => BodyValue::Text(value),
+        JsonValue::Number(value) if value.as_i64().is_some() => {
+            BodyValue::Int8(value.as_i64().expect("checked int8"))
+        }
+        JsonValue::Number(value) => BodyValue::Float8(value.as_f64().ok_or_else(|| {
+            DataFusionError::Execution("history identity contains invalid number".to_owned())
+        })?),
+        JsonValue::Bool(value) => BodyValue::Boolean(value),
+        value => BodyValue::Jsonb(value),
+    })
+}
+
+fn native_text_value(
+    value: Option<&lix_schema::value_layout::BodyValue>,
+    column_type: SchemaColumnType,
+) -> Result<Option<String>> {
+    use lix_schema::value_layout::BodyValue;
+    match value {
+        None | Some(BodyValue::Null) => Ok(None),
+        Some(BodyValue::Text(value)) => Ok(Some(value.clone())),
+        Some(BodyValue::Uuid(value)) => Ok(Some(value.to_string())),
+        Some(BodyValue::Jsonb(value)) if column_type == SchemaColumnType::Json => {
+            serde_json::to_string(value).map(Some).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "native history jsonb projection failed: {error}"
+                ))
+            })
+        }
+        Some(_) => Err(DataFusionError::Execution(
+            "native history scalar does not match its declared text/jsonb type".to_owned(),
+        )),
+    }
+}
+
+fn native_i64_value(
+    value: Option<&lix_schema::value_layout::BodyValue>,
+    schema: &str,
+    column: &str,
+) -> Result<Option<i64>> {
+    match value {
+        None | Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+        Some(lix_schema::value_layout::BodyValue::Int8(value)) => Ok(Some(*value)),
+        Some(_) => Err(DataFusionError::Execution(format!(
+            "{schema}.{column} expected native int8"
+        ))),
+    }
+}
+
+fn native_f64_value(
+    value: Option<&lix_schema::value_layout::BodyValue>,
+    schema: &str,
+    column: &str,
+) -> Result<Option<f64>> {
+    match value {
+        None | Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+        Some(lix_schema::value_layout::BodyValue::Float8(value)) => Ok(Some(*value)),
+        Some(_) => Err(DataFusionError::Execution(format!(
+            "{schema}.{column} expected native float8"
+        ))),
+    }
+}
+
+fn native_bool_value(
+    value: Option<&lix_schema::value_layout::BodyValue>,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<Option<bool>> {
+    match value {
+        Some(lix_schema::value_layout::BodyValue::Boolean(value)) => Ok(Some(*value)),
+        Some(lix_schema::value_layout::BodyValue::Null) | None => Ok(None),
+        Some(_) => Err(DataFusionError::Execution(format!(
+            "{schema_key}.{column_name} expected native boolean"
+        ))),
+    }
 }
 
 #[cfg(test)]

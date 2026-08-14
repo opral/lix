@@ -236,13 +236,22 @@ struct StalePluginConflictGroup {
     conflicts: Vec<StaleSemanticConflict>,
 }
 
-fn stale_payload_from_historical(row: Option<&HistoricalStateRow>) -> Option<StaleConflictPayload> {
-    row.filter(|row| !row.deleted).and_then(|row| {
-        Some(StaleConflictPayload {
-            snapshot: row.snapshot_content.clone()?,
+fn stale_payload_from_historical(
+    row: Option<&HistoricalStateRow>,
+) -> Result<Option<StaleConflictPayload>, LixError> {
+    row.filter(|row| !row.deleted)
+        .map(|row| {
+            Ok(StaleConflictPayload {
+            snapshot: row.seed_snapshot_content()?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "live historical conflict row has no native payload",
+                )
+            })?,
             metadata: row.metadata.clone(),
         })
-    })
+        })
+        .transpose()
 }
 
 fn state_key_from_tracked(key: &StateKey) -> StateKey {
@@ -1091,9 +1100,12 @@ where
         {
             return Err(conflict_error());
         }
-        let registry_snapshot = current_registry_row
+        let registry_content = current_registry_row
             .filter(|row| !row.deleted)
-            .and_then(|row| row.snapshot_content.as_ref())
+            .ok_or_else(conflict_error)?
+            .seed_snapshot_content()?;
+        let registry_snapshot = registry_content
+            .as_ref()
             .ok_or_else(conflict_error)
             .and_then(|snapshot| {
                 serde_json::from_str(snapshot.as_str()).map_err(|error| {
@@ -1184,7 +1196,7 @@ where
                     .metadata
                     .map(|metadata| metadata.materialize_shared()),
             });
-            let target_payload = stale_payload_from_historical(target);
+            let target_payload = stale_payload_from_historical(target)?;
             let source_change_id = source.change_id.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1200,7 +1212,7 @@ where
             };
             group.conflicts.push(StaleSemanticConflict {
                 key: candidate_keys[slot].clone(),
-                base: stale_payload_from_historical(base_rows[slot].as_ref()),
+                base: stale_payload_from_historical(base_rows[slot].as_ref())?,
                 a,
                 b,
             });
@@ -3355,7 +3367,7 @@ where
             ));
             let schema_definitions = schema_rows
                 .iter()
-                .map(|row| {
+                .map(|row| -> Result<(String, serde_json::Value), LixError> {
                     let schema_key = row
                         .row_pk
                         .as_ref()
@@ -7120,13 +7132,17 @@ where
                 }
             }
             let expected_change_id = current.map(|row| row.change_id);
-            let target = desired.map(|row| TypedStateTransitionTarget {
-                change_id: row.change_id,
-                snapshot_content: row.snapshot_content.clone(),
-                metadata: row.metadata.clone(),
-                global: row.global,
-                blob_manifest_object_ids: row.blob_manifest_object_ids.clone(),
-            });
+            let target = desired
+                .map(|row| -> Result<TypedStateTransitionTarget, LixError> {
+                    Ok(TypedStateTransitionTarget {
+                        change_id: row.change_id,
+                        snapshot_content: row.seed_snapshot_content()?,
+                        metadata: row.metadata.clone(),
+                        global: row.global,
+                        blob_manifest_object_ids: row.blob_manifest_object_ids.clone(),
+                    })
+                })
+                .transpose()?;
             if expected_change_id != target.as_ref().map(|target| target.change_id) {
                 transitions.push(TypedStateTransition {
                     identity,

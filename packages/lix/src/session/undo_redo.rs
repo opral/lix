@@ -302,7 +302,8 @@ async fn semantic_state_for_record(
     if operation_row.key != operation_key {
         return Ok((SemanticState::default(), delta_rows));
     }
-    let marker = parse_marker(operation_row.snapshot_content.as_ref(), commit_id)?;
+    let marker_snapshot = operation_row.seed_snapshot_content()?;
+    let marker = parse_marker(marker_snapshot.as_ref(), commit_id)?;
     let state = semantic_state_from_marker(marker, commit_id);
     Ok((state, delta_rows))
 }
@@ -347,7 +348,8 @@ async fn operation_marker_at(
     else {
         return Ok(None);
     };
-    parse_marker(row.snapshot_content.as_ref(), commit_id).map(Some)
+    let snapshot = row.seed_snapshot_content()?;
+    parse_marker(snapshot.as_ref(), commit_id).map(Some)
 }
 
 fn parse_marker(

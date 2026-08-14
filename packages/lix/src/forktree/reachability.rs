@@ -20,7 +20,7 @@ use super::gc_index::{
 use super::merkle::authenticated_merkle_edges;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId,
+    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitChangePageV3, CommitId,
     CommitObjectV1, GcEdgeCursorV1, GcLiveBranchEntryV1, GcMarkEntryV2, GcPhaseV2,
     GcProgressSelectorV2, GcProgressV2, GcQueueEntryV1, GlobalSelectorV1, RepositoryRootV1,
     SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
@@ -886,7 +886,7 @@ where
                     .member_page_object_ids
                     .iter()
                     .copied()
-                    .map(|id| typed(id, ObjectDomain::CommitChangePageV2)),
+                    .map(|id| typed(id, ObjectDomain::CommitChangePageV3)),
             );
             edges.extend([
                 typed(value.global_state_root, ObjectDomain::OrderedTreeNode),
@@ -899,17 +899,9 @@ where
                     .map(|id| typed(id, ObjectDomain::CommitV2)),
             );
         }
-        ObjectDomain::CommitChangePageV2 => {
-            let page = CommitChangePageV2::decode(id, bytes)?;
+        ObjectDomain::CommitChangePageV3 => {
+            let page = CommitChangePageV3::decode(id, bytes)?;
             for member in page.members {
-                if let Some((_, _, _, blob_manifest_object_ids)) = member.introduced_payload() {
-                    edges.extend(
-                        blob_manifest_object_ids
-                            .iter()
-                            .copied()
-                            .map(|id| typed(id, ObjectDomain::BlobManifest)),
-                    );
-                }
                 if let Some((source_commit_object_id, _)) = member.source() {
                     edges.push(typed(source_commit_object_id, ObjectDomain::CommitV2));
                 }
