@@ -3372,6 +3372,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lix-schema-v1-public-qualification"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "lix",
+ "lix-storage-rocksdb",
+ "lix-storage-slatedb",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lix-storage-filesystem"
 version = "0.11.0"
 dependencies = [
