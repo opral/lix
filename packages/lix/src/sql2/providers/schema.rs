@@ -30,7 +30,8 @@ use crate::hot_state::MaterializedHotStateBatch;
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
-    HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
+    HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
@@ -112,6 +113,52 @@ pub(crate) async fn execute_exact_schema_point_read(
         columns: output_columns,
         notices: Vec::new(),
     }))
+}
+
+/// Executes a finite registered-schema identity set through one retained
+/// current-state batch. SQL routing has already proved that every predicate
+/// term is a complete primary key; the exact reader remains the sole
+/// visibility and branch/global precedence authority.
+pub(crate) async fn execute_exact_schema_batch_read(
+    spec: &SchemaSurfaceSpec,
+    active_branch_id: &str,
+    reader: Arc<dyn HotStateReader>,
+    identities: Vec<(RowPk, Option<String>)>,
+    projected_columns: &[String],
+    output_columns: Vec<String>,
+) -> Result<crate::SqlQueryResult, LixError> {
+    let request = HotStateExactBatchRequest {
+        rows: identities
+            .into_iter()
+            .map(|(row_pk, file_id)| HotStateExactRowRequest {
+                schema_key: spec.schema_key.clone(),
+                branch_id: active_branch_id.to_owned(),
+                row_pk,
+                file_id,
+            })
+            .collect(),
+        projection: HotStateProjection {
+            columns: vec!["snapshot_content".to_owned()],
+        },
+        untracked: None,
+        include_tombstones: false,
+    };
+    let exact = reader.load_exact_batch(&request).await?;
+    let decoder = RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?;
+    let mut rows = Vec::with_capacity(exact.len());
+    for slot in 0..exact.len() {
+        let Some(row) = exact.row(slot) else {
+            continue;
+        };
+        rows.push(decoder.decode_public_values(
+            row.snapshot_content().map(|snapshot| snapshot.as_bytes()),
+        )?);
+    }
+    Ok(crate::SqlQueryResult {
+        rows,
+        columns: output_columns,
+        notices: Vec::new(),
+    })
 }
 
 pub(crate) async fn register_row_providers<S>(
