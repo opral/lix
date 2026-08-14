@@ -90,6 +90,7 @@ pub(crate) use storage::{
     load_retained_commit_snapshots_for_schemas, scan_change_records_from_commit_deltas,
     scan_commit_delta_inventory, scan_commit_delta_values, scan_commit_state_manifest_commit_ids,
     selected_change_selection_fingerprint, stage_addressable_commit_deltas,
+    accelerator_root_set_digest,
     stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
@@ -140,10 +141,13 @@ pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
+    CurrentStateScopedRangeRoot,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
     TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
+    RebuildableAcceleratorDomain, RebuildableAcceleratorRoot,
+    RebuildableAcceleratorRootSet,
 };
 pub(crate) use types::CurrentStatePartSource;
 #[cfg(test)]

@@ -204,6 +204,8 @@ mod tests {
                     "test branch ref updated_at",
                     "2026-01-01T00:00:00Z",
                 ),
+                accelerator_root_set_digest:
+                    crate::tracked_state::accelerator_root_set_digest(None)?,
                 ref_change_id: ChangeId::for_test_label("test-branch-ref-change"),
             },
         )?;

@@ -5001,6 +5001,7 @@ mod tests {
             mutations: Default::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         storage::stage_commit_state_manifest(writes, &manifest)
@@ -9072,6 +9073,9 @@ mod tests {
                 "2026-01-01T00:00:00Z",
             ),
             ref_change_id: ChangeId::for_test_label("certified-branch-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
         let controls = BTreeMap::from([(BRANCH_ID.to_owned(), control)]);
         let commit_created_at = BTreeMap::from([(commit_id, control.created_at)]);

@@ -754,6 +754,8 @@ fn stage_test_current_control(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("tracked-head-test-control"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)?,
         },
     )
 }
@@ -2391,6 +2393,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("working-diff-branch-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         }
     }
 
@@ -3191,6 +3196,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
 
         let read = storage
@@ -3662,6 +3670,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
         let snapshot_content = r#"{"snapshot":true}"#;
         let long_metadata = format!("\"{}\"", "x".repeat(300));
@@ -3839,6 +3850,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
         let mut writes = StorageWriteSet::new();
         for (row, file_id) in [("a", "z-file"), ("b", "a-file")] {
@@ -3906,6 +3920,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
         let row_pk = RowPk::single("row");
         let second_row_pk = RowPk::single("row-2");

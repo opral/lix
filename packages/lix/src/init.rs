@@ -263,6 +263,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         initial_commit_id,
         timestamp,
     )?;
+    let empty_accelerator_root_set_digest =
+        crate::tracked_state::accelerator_root_set_digest(None)?;
     let global_branch_control = InitBranchHeadControl {
         branch_id: GLOBAL_BRANCH_ID.to_string(),
         control: BranchHeadControl {
@@ -274,6 +276,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
             schema_presence_bloom: [0; 4],
+            accelerator_root_set_digest: empty_accelerator_root_set_digest,
         },
         branch_ref_change: global_branch_ref_change,
     };
@@ -294,6 +297,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             updated_at: timestamp,
             ref_change_id: main_branch_ref_change.id,
             schema_presence_bloom: [0; 4],
+            accelerator_root_set_digest: empty_accelerator_root_set_digest,
         },
         branch_ref_change: main_branch_ref_change,
     };
@@ -449,6 +453,7 @@ where
                     mutations: initial_mutations,
                     touched_scope_filter: physical_publication.touched_scope_filter().clone(),
                     current_state_scoped_ranges: physical_publication.root(),
+                    accelerator_roots: None,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
                 &physical_publication,

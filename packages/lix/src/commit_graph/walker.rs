@@ -1509,6 +1509,7 @@ mod tests {
                 mutations: CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
+                accelerator_roots: None,
                 snapshot_root: None,
             },
         )

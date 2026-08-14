@@ -126,7 +126,7 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD16";
 // commit independently from semantic graph ancestry.
 // Version 10 splits the authority header from a separately keyed mutation
 // catalog and authenticates a content-addressed hierarchical part directory.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS10";
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS11";
 const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI1";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
@@ -632,6 +632,8 @@ struct StoredCommitStateManifest {
     touched_scope_filter: crate::tracked_state::types::CommitStateTouchedScopeFilter,
     #[musli(with = storage_codec::option)]
     current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    #[musli(with = storage_codec::option)]
+    accelerator_roots: Option<Box<crate::tracked_state::types::RebuildableAcceleratorRootSet>>,
     #[musli(with = storage_codec::option)]
     snapshot_root: Option<Box<TrackedStateCommitRoot>>,
 }
@@ -2564,6 +2566,12 @@ impl PublishedCommitStateTopology {
         self.header.current_state_scoped_ranges.as_deref()
     }
 
+    pub(crate) fn accelerator_roots(
+        &self,
+    ) -> Option<&crate::tracked_state::types::RebuildableAcceleratorRootSet> {
+        self.header.accelerator_roots.as_deref()
+    }
+
     fn topology_ref(&self) -> super::scoped_current_state::CommitStateTopologyRef<'_> {
         super::scoped_current_state::CommitStateTopologyRef {
             commit_id: self.header.commit_id,
@@ -3401,6 +3409,15 @@ async fn load_scoped_current_state_descriptor_rows(
                 owner_commit_id: source.owner_commit_id,
                 row_group_set_id: source.source_id,
                 manifest_digest: descriptor.content_digest,
+                layout_fingerprint: manifest
+                    .metadata
+                    .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+                    .cloned()
+                    .ok_or_else(|| {
+                        replacement_payload_error(
+                            "columnar current-state manifest omitted its layout fingerprint",
+                        )
+                    })?,
                 schema_key: manifest.namespace.clone(),
                 row_count: manifest.groups.iter().map(|group| group.row_count).sum(),
                 group_row_counts: manifest
@@ -13060,6 +13077,7 @@ fn encode_commit_state_manifest(
         mutation_directory_root: stored_inventory.directory_root.clone(),
         touched_scope_filter: manifest.touched_scope_filter.clone(),
         current_state_scoped_ranges: manifest.current_state_scoped_ranges.clone(),
+        accelerator_roots: manifest.accelerator_roots.clone(),
         snapshot_root: manifest.snapshot_root.clone(),
     };
     let header_payload = storage_codec::encode("tracked_state commit_state_manifest", &header)?;
@@ -13314,6 +13332,7 @@ fn assemble_commit_state_manifest(
         mutations,
         touched_scope_filter: stored.touched_scope_filter,
         current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        accelerator_roots: stored.accelerator_roots,
         snapshot_root: stored.snapshot_root,
     };
     if u32::try_from(manifest.mutations.part_count()).ok() != Some(stored.mutation_part_count) {
@@ -13400,6 +13419,7 @@ fn assemble_shallow_commit_state_manifest(
         mutations,
         touched_scope_filter: stored.touched_scope_filter,
         current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        accelerator_roots: stored.accelerator_roots,
         snapshot_root: stored.snapshot_root,
     })
 }
@@ -13523,6 +13543,11 @@ fn validate_commit_state_manifest_header(
             "tracked_state commit_state_manifest scoped-range transition disagrees with its header authority",
         ));
     }
+    validate_rebuildable_accelerator_roots(
+        stored.commit_id,
+        stored.current_state_scoped_ranges.as_deref(),
+        stored.accelerator_roots.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -13573,7 +13598,76 @@ fn validate_commit_state_manifest_inner(
 
     validate_commit_state_mutation_inventory(manifest.commit_id, &manifest.mutations)?;
     super::scoped_current_state::validate_touched_scope_filter(&manifest.touched_scope_filter)?;
-    validate_current_state_scoped_ranges(manifest, validate_scoped_range_attestation)
+    validate_current_state_scoped_ranges(manifest, validate_scoped_range_attestation)?;
+    validate_rebuildable_accelerator_roots(
+        manifest.commit_id,
+        manifest.current_state_scoped_ranges.as_deref(),
+        manifest.accelerator_roots.as_deref(),
+    )
+}
+
+const ACCELERATOR_ROOT_SET_DIGEST_CONTEXT: &str =
+    "lix rebuildable accelerator root set v1";
+
+/// Exact digest copied into the branch-keyed serving selector. The selected
+/// commit manifest remains the object authority; this digest binds that
+/// immutable selection to one branch/head/generation CAS record.
+pub(crate) fn accelerator_root_set_digest(
+    roots: Option<&crate::tracked_state::types::RebuildableAcceleratorRootSet>,
+) -> Result<[u8; 32], LixError> {
+    let mut hasher = blake3::Hasher::new_derive_key(ACCELERATOR_ROOT_SET_DIGEST_CONTEXT);
+    match roots {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(roots) => {
+            hasher.update(&[1]);
+            let encoded = storage_codec::encode("rebuildable accelerator root set", roots)?;
+            hasher.update(&(encoded.len() as u64).to_be_bytes());
+            hasher.update(&encoded);
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn validate_rebuildable_accelerator_roots(
+    commit_id: CommitId,
+    current_state_root: Option<&CurrentStateScopedRangeRoot>,
+    roots: Option<&crate::tracked_state::types::RebuildableAcceleratorRootSet>,
+) -> Result<(), LixError> {
+    let Some(roots) = roots else {
+        return Ok(());
+    };
+    if roots.publication_commit_id != commit_id
+        || roots.source_state_root_id == [0; 32]
+        || roots.source_state_root_digest == [0; 32]
+        || current_state_root.is_some_and(|current_state_root| {
+            roots.source_state_root_id != current_state_root.tree.root_id
+                || roots.source_state_root_digest != current_state_root.tree.root_digest
+        })
+        || roots.roots.is_empty()
+    {
+        return Err(replacement_payload_error(
+            "accelerator root set disagrees with selected canonical state",
+        ));
+    }
+    let mut previous = None;
+    for root in &roots.roots {
+        let key = (root.schema_key.as_str(), root.domain);
+        if previous.is_some_and(|previous| previous >= key)
+            || root.schema_key.is_empty()
+            || root.layout_fingerprint.is_empty()
+            || root.object_id == [0; 16]
+            || root.root_digest == [0; 32]
+            || root.complete_row_count == 0
+    {
+            return Err(replacement_payload_error(
+                "accelerator root set is noncanonical or incomplete",
+            ));
+        }
+        previous = Some(key);
+    }
+    Ok(())
 }
 
 fn validate_current_state_scoped_ranges(
@@ -13842,9 +13936,11 @@ mod tests {
     use crate::tracked_state::types::{
         CommitStateManifest, CommitStateMutationInventory,
         CommitStateMutationPart as FixtureMutationPart, CommitStateReplayDebt,
-        CurrentStatePartDescriptor, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
-        TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
-        TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
+        CurrentStatePartDescriptor, CurrentStateScopedRangeRoot, RebuildableAcceleratorDomain,
+        RebuildableAcceleratorRoot, RebuildableAcceleratorRootSet, TrackedStateBaseCoordinate,
+        TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateDeltaRef,
+        TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
+        TrackedStateRootId,
     };
 
     use super::{
@@ -14165,6 +14261,7 @@ mod tests {
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: None,
         }
     }
@@ -18114,6 +18211,7 @@ mod tests {
             },
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: None,
         }
     }
@@ -18170,6 +18268,7 @@ mod tests {
             },
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: None,
         }
     }
@@ -18388,7 +18487,7 @@ mod tests {
         )
         .expect("transition should hash");
         manifest.current_state_scoped_ranges =
-            Some(Box::new(super::super::types::CurrentStateScopedRangeRoot {
+            Some(Box::new(CurrentStateScopedRangeRoot {
                 tree,
                 serving_base_commit_id,
                 serving_base_root_id,
@@ -18484,13 +18583,115 @@ mod tests {
             b"LXCS7".as_slice(),
             b"LXCS8".as_slice(),
             b"LXCS9".as_slice(),
+            b"LXCS10".as_slice(),
         ] {
             let mut legacy = magic.to_vec();
             legacy.extend_from_slice(&payload);
             let error = decode_stored_commit_state_authority(&legacy, &[])
-                .expect_err("the hard cut must reject pre-v10 manifest formats");
+                .expect_err("the hard cut must reject pre-v11 manifest formats");
             assert!(error.message.contains("unsupported format"));
         }
+    }
+
+    #[test]
+    fn accelerator_root_set_is_bound_to_the_selected_canonical_state() {
+        let mut manifest = commit_state_manifest_fixture();
+        let mut state_root = CurrentStateScopedRangeRoot {
+            tree: super::super::scoped_range::ScopedRangeRoot {
+                root_id: [11; 32],
+                root_digest: [12; 32],
+                marker_count: 1,
+                part_count: 1,
+                row_count: 7,
+                tree_height: 1,
+            },
+            serving_base_commit_id: None,
+            serving_base_root_id: None,
+            transition_digest: [0; 32],
+        };
+        state_root.transition_digest =
+            super::super::scoped_current_state::scoped_range_transition_digest(
+                manifest.commit_id,
+                state_root.serving_base_commit_id,
+                state_root.serving_base_root_id,
+                &manifest.mutations,
+                &state_root.tree,
+            )
+            .expect("fixture transition should hash");
+        manifest.current_state_scoped_ranges = Some(Box::new(state_root.clone()));
+        manifest.accelerator_roots = Some(Box::new(RebuildableAcceleratorRootSet {
+            publication_commit_id: manifest.commit_id,
+            source_state_root_id: state_root.tree.root_id,
+            source_state_root_digest: state_root.tree.root_digest,
+            roots: vec![RebuildableAcceleratorRoot {
+                domain: RebuildableAcceleratorDomain::RowColumnarScalar,
+                schema_key: "manifest-schema".to_owned(),
+                layout_fingerprint: "layout-v1".to_owned(),
+                source_owner_commit_id: manifest.commit_id,
+                object_id: [14; 16],
+                root_digest: [15; 32],
+                complete_row_count: 7,
+            }],
+        }));
+        encode_commit_state_manifest(&manifest).expect("bound accelerator authority should encode");
+
+        let substitutions: [
+            (&str, fn(&mut RebuildableAcceleratorRootSet));
+            3
+        ] = [
+            (
+                "cross-head",
+                |roots: &mut RebuildableAcceleratorRootSet| {
+                    roots.publication_commit_id = CommitId::for_test_label("other-head")
+                },
+            ),
+            ("wrong-root", |roots: &mut RebuildableAcceleratorRootSet| {
+                roots.source_state_root_id[0] ^= 1
+            }),
+            ("wrong-root-digest", |roots: &mut RebuildableAcceleratorRootSet| {
+                roots.source_state_root_digest[0] ^= 1
+            }),
+        ];
+        for (label, mutate) in substitutions {
+            let mut corrupted = manifest.clone();
+            mutate(
+                corrupted
+                    .accelerator_roots
+                    .as_deref_mut()
+                    .expect("fixture has accelerator roots"),
+            );
+            let error = encode_commit_state_manifest(&corrupted)
+                .expect_err("substituted accelerator authority must fail closed");
+            assert!(error.message.contains("selected canonical state"), "{label}: {error}");
+        }
+
+        let mut incomplete = manifest.clone();
+        incomplete
+            .accelerator_roots
+            .as_deref_mut()
+            .unwrap()
+            .roots[0]
+            .complete_row_count = 0;
+        let error = encode_commit_state_manifest(&incomplete)
+            .expect_err("zero-count accelerator descriptor must fail closed");
+        assert!(error.message.contains("noncanonical or incomplete"));
+
+        let mut cross_schema = manifest;
+        let duplicate = cross_schema
+            .accelerator_roots
+            .as_deref()
+            .unwrap()
+            .roots[0]
+            .clone();
+        cross_schema
+            .accelerator_roots
+            .as_deref_mut()
+            .unwrap()
+            .roots
+            .push(duplicate);
+        let error = encode_commit_state_manifest(&cross_schema)
+            .expect_err("duplicate schema/domain authority must fail closed");
+        assert!(error.message.contains("noncanonical or incomplete"));
     }
 
     #[tokio::test]

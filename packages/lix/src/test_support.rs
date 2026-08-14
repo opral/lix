@@ -183,6 +183,9 @@ pub(crate) async fn seed_branch_head_with_rows(
             created_at: test_timestamp(),
             updated_at: test_timestamp(),
             ref_change_id: branch_ref_change_id,
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         },
     )
     .expect("direct branch-head control should stage");
@@ -530,6 +533,7 @@ fn stage_test_commit_state_manifest(
         mutations,
         touched_scope_filter: Default::default(),
         current_state_scoped_ranges: None,
+        accelerator_roots: None,
         snapshot_root: snapshot_root.map(Box::new),
     };
     crate::tracked_state::stage_commit_state_manifest(writes, &manifest)

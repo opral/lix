@@ -3206,6 +3206,49 @@ pub(crate) struct RowColumnarOverlayRow {
 const ROW_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES: usize = 128 * 1024 * 1024;
 const ROW_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES: usize = 128 * 1024 * 1024;
 
+fn selected_row_columnar_accelerator<'a>(
+    control: BranchHeadControl,
+    selected_manifest: &'a crate::tracked_state::CommitStateManifest,
+    base_commit_id: CommitId,
+    schema_key: &str,
+    id: crate::columnar_row_group::RowGroupSetId,
+) -> Result<Option<&'a crate::tracked_state::RebuildableAcceleratorRoot>, LixError> {
+    if selected_manifest.commit_id != control.head_commit_id {
+        return Err(head_value_error(
+            "selected accelerator manifest disagrees with the branch head",
+        ));
+    }
+    let selected_root_set_digest = crate::tracked_state::accelerator_root_set_digest(
+        selected_manifest.accelerator_roots.as_deref(),
+    )?;
+    if selected_root_set_digest != control.accelerator_root_set_digest {
+        return Err(head_value_error(
+            "selected branch control disagrees with its accelerator root set",
+        ));
+    }
+    let Some(root_set) = selected_manifest.accelerator_roots.as_deref() else {
+        return Ok(None);
+    };
+    let mut roots = root_set.roots.iter().filter(|root| {
+        root.domain == crate::tracked_state::RebuildableAcceleratorDomain::RowColumnarScalar
+            && root.schema_key == schema_key
+    });
+    let root = roots.next().ok_or_else(|| {
+        head_value_error(
+            "selected accelerator root set omits the advertised columnar collection",
+        )
+    })?;
+    if roots.next().is_some()
+        || root.source_owner_commit_id != base_commit_id
+        || root.object_id != id.as_bytes()
+    {
+        return Err(head_value_error(
+            "selected columnar accelerator has a substituted owner or object identity",
+        ));
+    }
+    Ok(Some(root))
+}
+
 fn materialized_columnar_overlay_admission_bytes(
     rows: &MaterializedHotStateBatch,
 ) -> Result<usize, LixError> {
@@ -5892,14 +5935,65 @@ where
             return Ok(None);
         };
         let id = crate::hot_state::row_group_set_id(base_commit_id, schema_key);
-        let Some(manifest) =
-            crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
-        else {
+        let selected_manifest = crate::tracked_state::load_commit_state_manifest(
+            &self.store,
+            control.head_commit_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            head_value_error("selected branch head has no commit-state manifest")
+        })?;
+        let Some(root) = selected_row_columnar_accelerator(
+            control,
+            &selected_manifest,
+            base_commit_id,
+            schema_key,
+            id,
+        )? else {
             return Ok(None);
         };
+        let source_manifest = crate::tracked_state::load_commit_state_manifest(
+            &self.store,
+            root.source_owner_commit_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            head_value_error("selected accelerator source authority is missing")
+        })?;
+        let source_roots = source_manifest
+            .accelerator_roots
+            .as_ref()
+            .ok_or_else(|| {
+                head_value_error("selected accelerator source has no root authority")
+            })?;
+        if source_manifest.commit_id != root.source_owner_commit_id
+            || source_roots.publication_commit_id != root.source_owner_commit_id
+            || source_roots.roots.iter().filter(|source| *source == root).count() != 1
+        {
+            return Err(head_value_error(
+                "selected accelerator source authority disagrees with its descriptor",
+            ));
+        }
+        let manifest = crate::columnar_row_group::load_row_group_manifest(&self.store, id)
+            .await?
+            .ok_or_else(|| head_value_error("selected columnar accelerator object is missing"))?;
+        let layout_fingerprint = manifest
+            .metadata
+            .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+            .ok_or_else(|| {
+                head_value_error("selected columnar accelerator omitted its layout fingerprint")
+            })?;
         if manifest.namespace != schema_key {
             return Err(head_value_error(
                 "row columnar sidecar disagrees with its collection publication",
+            ));
+        }
+        if root.layout_fingerprint != *layout_fingerprint
+            || root.root_digest != manifest.content_digest()?
+            || root.complete_row_count != manifest.row_count()
+        {
+            return Err(head_value_error(
+                "selected columnar accelerator disagrees with its authenticated descriptor",
             ));
         }
 
@@ -13683,6 +13777,99 @@ mod tests {
         StorageWriteOptions,
     };
 
+    fn selected_accelerator_fixture() -> (
+        BranchHeadControl,
+        crate::tracked_state::CommitStateManifest,
+        CommitId,
+        crate::columnar_row_group::RowGroupSetId,
+    ) {
+        let head = CommitId::for_test_label("selected-accelerator-head");
+        let base = CommitId::for_test_label("selected-accelerator-base");
+        let id = crate::hot_state::row_group_set_id(base, "schema");
+        let roots = crate::tracked_state::RebuildableAcceleratorRootSet {
+            publication_commit_id: head,
+            source_state_root_id: [1; 32],
+            source_state_root_digest: [2; 32],
+            roots: vec![crate::tracked_state::RebuildableAcceleratorRoot {
+                domain: crate::tracked_state::RebuildableAcceleratorDomain::RowColumnarScalar,
+                schema_key: "schema".to_owned(),
+                layout_fingerprint: "layout".to_owned(),
+                source_owner_commit_id: base,
+                object_id: id.as_bytes(),
+                root_digest: [3; 32],
+                complete_row_count: 7,
+            }],
+        };
+        let digest = crate::tracked_state::accelerator_root_set_digest(Some(&roots))
+            .expect("fixture root set should hash");
+        let manifest = crate::tracked_state::CommitStateManifest {
+            commit_id: head,
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            replay_debt: Default::default(),
+            mutations: Default::default(),
+            touched_scope_filter: Default::default(),
+            current_state_scoped_ranges: None,
+            accelerator_roots: Some(Box::new(roots)),
+            snapshot_root: None,
+        };
+        let timestamp = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id: head,
+            tracked_generation: head,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("selected-accelerator-ref"),
+            schema_presence_bloom: [u64::MAX; 4],
+            accelerator_root_set_digest: digest,
+        };
+        (control, manifest, base, id)
+    }
+
+    #[test]
+    fn selected_accelerator_rejects_cross_head_owner_and_control_substitution() {
+        let (control, manifest, base, id) = selected_accelerator_fixture();
+        assert!(
+            selected_row_columnar_accelerator(control, &manifest, base, "schema", id)
+                .expect("valid selected accelerator should authenticate")
+                .is_some()
+        );
+
+        let mut cross_head = manifest.clone();
+        cross_head.commit_id = CommitId::for_test_label("substituted-head");
+        let error = selected_row_columnar_accelerator(control, &cross_head, base, "schema", id)
+            .expect_err("cross-head manifest must fail closed");
+        assert!(error.to_string().contains("branch head"));
+
+        let mut wrong_control = control;
+        wrong_control.accelerator_root_set_digest[0] ^= 1;
+        let error = selected_row_columnar_accelerator(
+            wrong_control,
+            &manifest,
+            base,
+            "schema",
+            id,
+        )
+        .expect_err("substituted control binding must fail closed");
+        assert!(error.to_string().contains("root set"));
+
+        let wrong_base = CommitId::for_test_label("substituted-base");
+        let error = selected_row_columnar_accelerator(
+            control,
+            &manifest,
+            wrong_base,
+            "schema",
+            id,
+        )
+        .expect_err("substituted source owner must fail closed");
+        assert!(error.to_string().contains("owner or object"));
+
+        let error = selected_row_columnar_accelerator(control, &manifest, base, "other", id)
+            .expect_err("cross-schema selection must fail closed");
+        assert!(error.to_string().contains("omits"));
+    }
+
     /// `HotCollectionControl` is `#[musli(packed)]`: its fields are positional
     /// and the encoding carries no field tags or length prefix. Appending a
     /// fourth field therefore appends bytes that a three-field reader cannot
@@ -15163,6 +15350,9 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             ref_change_id: ChangeId::for_test_label("packed-system-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
         assert!(
             reader
@@ -15925,6 +16115,9 @@ mod tests {
             created_at,
             updated_at: created_at,
             ref_change_id: ChangeId::for_test_label("certified-inherited-donor-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
         let empty_control = BranchHeadControl {
             tracked_generation: CommitId::for_test_label("certified-inherited-empty"),
@@ -16180,6 +16373,9 @@ mod tests {
             created_at,
             updated_at: created_at,
             ref_change_id: ChangeId::for_test_label("paged-certified-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
 
         let file_ids = (0..PAGING_FILE_COUNT)
@@ -16289,6 +16485,9 @@ mod tests {
             created_at,
             updated_at: created_at,
             ref_change_id: ChangeId::for_test_label("schema-prune-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
 
         let wanted = [certified_batch_for_schema(WANTED_SCHEMA, 0)];
@@ -16421,6 +16620,9 @@ mod tests {
             created_at,
             updated_at: created_at,
             ref_change_id: ChangeId::for_test_label("limit-pushdown-ref"),
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
 
         let early = [certified_batch_for_schema(EARLY_FILE_SCHEMA, 0)];
@@ -17985,6 +18187,9 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 ref_change_id: ChangeId::for_test_label("active-ref"),
+                accelerator_root_set_digest:
+                    crate::tracked_state::accelerator_root_set_digest(None)
+                        .expect("empty accelerator selection should hash"),
             },
         )
         .expect("stage active control");
@@ -18011,6 +18216,9 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 ref_change_id: ChangeId::for_test_label("stale-ref"),
+                accelerator_root_set_digest:
+                    crate::tracked_state::accelerator_root_set_digest(None)
+                        .expect("empty accelerator selection should hash"),
             },
         )
         .expect("stage stale control");

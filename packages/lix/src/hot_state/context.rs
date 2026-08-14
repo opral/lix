@@ -2921,6 +2921,9 @@ mod tests {
                 created_at,
                 updated_at,
                 ref_change_id: ChangeId::for_test_label(&format!("test-branch-ref-{branch_id}")),
+                accelerator_root_set_digest:
+                    crate::tracked_state::accelerator_root_set_digest(None)
+                        .expect("empty accelerator selection should hash"),
             };
             control.note_schemas(schema_keys.iter().map(String::as_str));
             crate::branch::stage_branch_head_control(&mut writes, &branch_id, control)
@@ -3062,6 +3065,7 @@ mod tests {
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
+                    accelerator_roots: None,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )
@@ -3288,6 +3292,7 @@ mod tests {
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
+                    accelerator_roots: None,
                     snapshot_root: None,
                 },
             )
@@ -3499,6 +3504,7 @@ mod tests {
                     mutations: mutation_inventory,
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
+                    accelerator_roots: None,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )?;

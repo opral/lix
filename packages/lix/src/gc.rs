@@ -1955,6 +1955,45 @@ where
             }
         }
     }
+    for manifest in authority_manifests.values() {
+        let Some(root_set) = manifest.accelerator_roots.as_deref() else {
+            continue;
+        };
+        for root in &root_set.roots {
+            match root.domain {
+                crate::tracked_state::RebuildableAcceleratorDomain::RowColumnarScalar => {
+                    let authority = authority_manifests
+                        .get(&root.source_owner_commit_id)
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "selected columnar accelerator owner has no retained authority",
+                            )
+                        })?;
+                    let source_roots = authority.accelerator_roots.as_deref().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "selected columnar accelerator owner has no root authority",
+                        )
+                    })?;
+                    if source_roots.publication_commit_id != root.source_owner_commit_id
+                        || source_roots
+                            .roots
+                            .iter()
+                            .filter(|source| *source == root)
+                            .count()
+                            != 1
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "selected columnar accelerator disagrees with canonical owner metadata",
+                        ));
+                    }
+                    retained_authority_commits.insert(root.source_owner_commit_id);
+                }
+            }
+        }
+    }
     for (owner, source_id, content_digest) in live_columnar_sources {
         let authority = match authority_manifests.get(&owner) {
             Some(authority) => authority.clone(),
@@ -2521,6 +2560,9 @@ mod tests {
                 updated_at: timestamp,
                 ref_change_id: ChangeId::for_test_label("control-projection-ref"),
                 schema_presence_bloom: [u64::MAX; 4],
+                accelerator_root_set_digest:
+                    crate::tracked_state::accelerator_root_set_digest(None)
+                        .expect("empty accelerator selection should hash"),
             },
         )];
 
@@ -3846,6 +3888,7 @@ mod tests {
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: Some(Box::new(TrackedStateCommitRoot {
                 commit_id,
                 root_id: TrackedStateRootId::new(root_hash),
@@ -3867,6 +3910,9 @@ mod tests {
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("tree-sweep-ref"),
             schema_presence_bloom: [0; 4],
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         };
         let mut writes = storage.new_write_set();
         stage_commit_state_manifest(&mut writes, &manifest).expect("manifest should stage");
@@ -3980,6 +4026,7 @@ mod tests {
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
@@ -6211,6 +6258,9 @@ mod tests {
             updated_at: timestamp,
             ref_change_id,
             schema_presence_bloom: [0; 4],
+            accelerator_root_set_digest:
+                crate::tracked_state::accelerator_root_set_digest(None)
+                    .expect("empty accelerator selection should hash"),
         }
     }
 
@@ -6572,6 +6622,7 @@ mod tests {
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: None,
         }
     }

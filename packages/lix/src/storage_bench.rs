@@ -33,6 +33,7 @@ fn stage_bench_commit_deltas(
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            accelerator_roots: None,
             snapshot_root: None,
         },
     )?;
@@ -1788,6 +1789,7 @@ where
                 mutations: crate::tracked_state::CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
+                accelerator_roots: None,
                 snapshot_root: None,
             },
         )?;

@@ -205,6 +205,10 @@ pub(crate) struct ColumnarMutationPartSet {
     pub(crate) owner_commit_id: [u8; 16],
     pub(crate) row_group_set_id: [u8; 16],
     pub(crate) manifest_digest: [u8; 32],
+    /// Stable registered-schema layout identity carried into the selected
+    /// commit authority. Serving must never infer this from an independently
+    /// loaded accelerator object.
+    pub(crate) layout_fingerprint: String,
     pub(crate) schema_key: String,
     pub(crate) row_count: u32,
     pub(crate) group_row_counts: Vec<u32>,
@@ -218,6 +222,43 @@ pub(crate) struct ColumnarMutationPartSet {
     pub(crate) uniform_updated_at: LixTimestamp,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) origin_key: Option<String>,
+}
+
+/// Domain of one rebuildable physical accelerator selected by a commit-state
+/// manifest. The enum is deliberately closed: adding a domain is a storage
+/// protocol change, not a generic "try another index" escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
+pub(crate) enum RebuildableAcceleratorDomain {
+    RowColumnarScalar = 1,
+}
+
+/// One non-semantic physical root whose use is authorized by the selected
+/// commit-state manifest. Canonical state remains the sole semantic authority.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct RebuildableAcceleratorRoot {
+    pub(crate) domain: RebuildableAcceleratorDomain,
+    pub(crate) schema_key: String,
+    pub(crate) layout_fingerprint: String,
+    pub(crate) source_owner_commit_id: CommitId,
+    pub(crate) object_id: [u8; 16],
+    pub(crate) root_digest: [u8; 32],
+    pub(crate) complete_row_count: u64,
+}
+
+/// Complete accelerator selection for one immutable commit-state root.
+///
+/// `source_state_root_id` and `source_state_root_digest` are the exact
+/// authenticated scoped-tree identity. They bind every rebuildable object to
+/// the canonical state selected by `publication_commit_id` without making the
+/// accelerator a second semantic authority.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct RebuildableAcceleratorRootSet {
+    pub(crate) publication_commit_id: CommitId,
+    pub(crate) source_state_root_id: [u8; 32],
+    pub(crate) source_state_root_digest: [u8; 32],
+    pub(crate) roots: Vec<RebuildableAcceleratorRoot>,
 }
 
 /// One collection partition replaced by a certified immutable generation.
@@ -470,6 +511,11 @@ pub(crate) struct CommitStateManifest {
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    /// Rebuildable physical roots selected by this exact canonical state.
+    /// Absence means no accelerator is authorized; readers must not consult a
+    /// marker, self-signed object, or older format.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) accelerator_roots: Option<Box<RebuildableAcceleratorRootSet>>,
     /// Canonical snapshot metadata when this commit was published as a root
     /// fence. The tree chunks are rebuildable by content hash; this immutable
     /// pointer is the authority that permits readers to serve them.

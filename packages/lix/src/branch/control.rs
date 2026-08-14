@@ -19,7 +19,7 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v11";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v12";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0020),
     BRANCH_HEAD_CONTROL_NAMESPACE,
@@ -27,9 +27,9 @@ pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::declare
 );
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
-const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC1";
+const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC2";
 const BRANCH_HEAD_CONTROL_DIGEST_BYTES: usize = 32;
-const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
+const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v2";
 
 /// The one mutable publication record for a branch.
 ///
@@ -64,6 +64,10 @@ pub(crate) struct BranchHeadControl {
     /// therefore skip an otherwise-empty schema range scan; a collision only
     /// falls back to the normal scan.
     pub(crate) schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
+    /// Digest of the rebuildable accelerator root set in `head_commit_id`'s
+    /// authenticated commit-state manifest. The branch-keyed control digest
+    /// binds that immutable selection to this branch and serving generation.
+    pub(crate) accelerator_root_set_digest: [u8; 32],
 }
 
 /// Canonical classification of one authenticated branch control for
@@ -427,6 +431,8 @@ mod tests {
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("first-ref-change"),
+            accelerator_root_set_digest: crate::tracked_state::accelerator_root_set_digest(None)
+                .expect("empty accelerator selection should hash"),
         };
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
@@ -437,6 +443,8 @@ mod tests {
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("second-ref-change"),
+            accelerator_root_set_digest: crate::tracked_state::accelerator_root_set_digest(None)
+                .expect("empty accelerator selection should hash"),
         };
         let branch_a = "01920000-0000-7000-8000-0000000000a1".to_string();
         let branch_b = "01920000-0000-7000-8000-0000000000b1".to_string();
