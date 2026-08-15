@@ -19,7 +19,6 @@ use std::{
     sync::Arc,
 };
 
-use crate::client_state::ClientState;
 use crate::engine::{Engine, EngineOptions};
 use crate::session::{CoherentReadBatch, ExecuteOptions};
 use crate::session::SessionContext;
@@ -75,10 +74,9 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
 
 /// Starts configuring the primary session for a Lix repository.
 ///
-/// The primary session restores `lix_primary_session_branch_id` from client
-/// state. When that preference is absent or names a deleted branch, it starts
-/// on the repository's tracked `lix_default_branch_id` and records the result
-/// in client state.
+/// The primary session starts on the repository's tracked
+/// `lix_default_branch_id`. Applications own window- or session-specific
+/// branch selection and can switch explicitly after opening.
 ///
 /// Await the returned builder to open a new in-memory Lix:
 ///
@@ -102,8 +100,7 @@ where
     fn into_future(self) -> Self::IntoFuture {
         // SAFETY: the builder owns Send storage/runtime/telemetry values, and
         // the returned Lix contains only Send synchronization primitives. The
-        // compiler cannot prove the deeply nested SQL futures are Send across
-        // the primary-session client-state restoration path.
+        // compiler cannot prove all deeply nested SQL futures are Send.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 open_lix_inner(self.storage, self.wasm_runtime, self.telemetry).await
@@ -139,7 +136,7 @@ where
     }
 
     /// Opens the additional session on `branch_id` without changing the
-    /// primary session or its persisted branch preference.
+    /// primary session or repository default.
     pub fn with_branch(mut self, branch_id: impl Into<String>) -> Self {
         self.branch_id = Some(branch_id.into());
         self
@@ -285,65 +282,17 @@ where
 {
     let engine = open_or_initialize_engine(storage, wasm_runtime, telemetry, None).await?;
     let session = engine.open_session().await?;
-    let lix = Lix {
+    Ok(Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
-    };
-    // A point read on the same context `load_branch_head_commit_id` uses.
-    // Opening must not build a SQL context to answer one key.
-    let stored_branch_id = lix
-        .engine
-        .load_untracked_global_key_value(
-            &crate::client_state::primary_session_branch_physical_key(),
-        )
-        .await?
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .filter(|value| !value.is_empty());
-    if let Some(branch_id) = stored_branch_id.as_deref()
-        && lix
-            .engine
-            .load_branch_head_commit_id(branch_id)
-            .await?
-            .is_some()
-        && branch_id != lix.active_branch_id().await?
-    {
-        lix.session
-            .switch_branch(SwitchBranchOptions {
-                branch_id: branch_id.to_string(),
-            })
-            .await?;
-    }
-    // The writeback stays on the open path. It only runs when the stored key
-    // does not already name the active branch, so it costs nothing after the
-    // first open -- and `ClientState::entries`/`get` are public API, so making
-    // the key appear only after an explicit switch would change observable
-    // output for a repository that has never switched.
-    let active_branch_id = lix.active_branch_id().await?;
-    if stored_branch_id.as_deref() != Some(active_branch_id.as_str()) {
-        lix.client_state()
-            .set(
-                crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
-                serde_json::Value::String(active_branch_id),
-            )
-            .await?;
-    }
-    Ok(lix)
+    })
 }
 
 impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    /// Returns a borrowed handle to JSON state owned by this client storage.
-    ///
-    /// Remote SDK integrations should expose this handle from a separate
-    /// client-only local Lix while continuing to route repository operations
-    /// to the remote Lix.
-    pub fn client_state(&self) -> ClientState<'_, StorageImpl> {
-        ClientState::new(self)
-    }
-
     /// Starts configuring another independent session for this repository.
     ///
     /// Await the returned builder directly, or call
@@ -705,24 +654,15 @@ where
         options: SwitchBranchOptions,
     ) -> impl Future<Output = Result<SwitchBranchReceipt, LixError>> + Send + '_ {
         // SAFETY: the future borrows a Send + Sync Lix handle and owns its
-        // switch options. The compiler cannot prove the nested client-state
-        // SQL future is Send for every storage read lifetime.
+        // switch options. The compiler cannot prove the nested switch SQL
+        // future is Send for every storage read lifetime.
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let _primary_switch_guard = match &self.primary_switch_gate {
                     Some(gate) => Some(gate.lock().await),
                     None => None,
                 };
-                let receipt = self.session.switch_branch(options).await?;
-                if self.primary_switch_gate.is_some() {
-                    self.client_state()
-                        .set(
-                            crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
-                            serde_json::Value::String(receipt.branch_id.clone()),
-                        )
-                        .await?;
-                }
-                Ok(receipt)
+                self.session.switch_branch(options).await
             })
         }
     }
@@ -986,86 +926,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_session_restores_its_branch_without_changing_repository_default() {
-        let storage = Memory::new();
-        let primary = open_lix()
-            .with_storage(storage.clone())
-            .await
-            .expect("open primary session");
-        let main_branch_id = primary.active_branch_id().await.expect("main branch");
-        let draft = primary
-            .create_branch(CreateBranchOptions {
-                id: Some("01920000-0000-7000-8000-000000000502".to_string()),
-                name: "Primary draft".to_string(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("create draft");
-
-        primary
-            .switch_branch(SwitchBranchOptions {
-                branch_id: draft.id.clone(),
-            })
-            .await
-            .expect("switch primary session");
-        let secondary = primary
-            .open_another_session()
-            .await
-            .expect("open secondary session");
-        secondary
-            .switch_branch(SwitchBranchOptions {
-                branch_id: main_branch_id.clone(),
-            })
-            .await
-            .expect("switch secondary session");
-        secondary.close().await.expect("close secondary session");
-        primary.close().await.expect("close primary session");
-
-        let reopened = open_lix()
-            .with_storage(storage.clone())
-            .await
-            .expect("reopen primary session");
-        assert_eq!(reopened.active_branch_id().await.unwrap(), draft.id);
-
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("reopen repository engine");
-        let repository_default = engine.open_session().await.expect("open default session");
-        assert_eq!(
-            repository_default.active_branch_id().await.unwrap(),
-            main_branch_id,
-            "primary-session switching must not mutate lix_default_branch_id"
-        );
-
-        repository_default
-            .execute(
-                "DELETE FROM lix_branch WHERE id = $1",
-                &[Value::Text(draft.id)],
-            )
-            .await
-            .expect("non-default draft should delete");
-        reopened
-            .close()
-            .await
-            .expect("close restored primary session");
-        repository_default
-            .close()
-            .await
-            .expect("close repository-default session");
-        drop(engine);
-
-        let fallback = open_lix()
-            .with_storage(storage)
-            .await
-            .expect("missing primary preference should fall back");
-        assert_eq!(
-            fallback.active_branch_id().await.unwrap(),
-            main_branch_id,
-            "a deleted primary preference must fall back to lix_default_branch_id"
-        );
-    }
-
-    #[tokio::test]
     async fn accounts_are_mutable_and_changes_have_one_required_account() {
         const AUTHOR_ID: &str = "01920000-0000-7000-8000-000000000601";
         const UNUSED_ID: &str = "01920000-0000-7000-8000-000000000602";
@@ -1246,16 +1106,7 @@ mod assume_send_future_proofs {
                 Some(gate) => Some(gate.lock().await),
                 None => None,
             };
-            let receipt = lix.session.switch_branch(options).await?;
-            if lix.primary_switch_gate.is_some() {
-                lix.client_state()
-                    .set(
-                        crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
-                        serde_json::Value::String(receipt.branch_id.clone()),
-                    )
-                    .await?;
-            }
-            Ok::<_, LixError>(receipt)
+            lix.session.switch_branch(options).await
         });
     }
 

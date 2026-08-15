@@ -12,7 +12,6 @@ import type {
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	LixTelemetrySpan,
-	JsonValue,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
 import type { LixStorageAdapterConfig } from "./storage-adapter.js";
@@ -58,9 +57,6 @@ export type LixBinding = {
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
-	clientStateGet?(key: string): Promise<JsonValue | undefined>;
-	clientStateSet?(key: string, value: JsonValue): Promise<void>;
-	clientStateDelete?(key: string): Promise<void>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
 	createCheckpoint(): Promise<CreateCheckpointReceipt>;
 	undo(): Promise<UndoReceipt>;

@@ -58,7 +58,6 @@ pub mod changelog;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod changelog;
 pub(crate) mod checkpoint;
-mod client_state;
 pub(crate) mod collection_generation;
 pub(crate) mod columnar_row_group;
 pub(crate) mod commit_graph;
@@ -136,7 +135,6 @@ pub(crate) mod transaction_types;
 pub(crate) mod undo_redo;
 pub mod wasm;
 
-pub use client_state::ClientState;
 #[cfg(feature = "default_wasm_runtime")]
 #[doc(hidden)]
 pub use plugin::runtime::default::runtime as default_wasm_runtime;

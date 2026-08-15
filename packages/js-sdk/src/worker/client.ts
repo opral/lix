@@ -122,10 +122,6 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 		},
 		activeBranchId: () => request({ kind: "activeBranchId" }),
 		activeAccountId: () => request({ kind: "activeAccountId" }),
-		clientStateGet: (key) => request({ kind: "clientState.get", key }),
-		clientStateSet: (key, value) =>
-			request({ kind: "clientState.set", key, value }),
-		clientStateDelete: (key) => request({ kind: "clientState.delete", key }),
 		createBranch: (options) => request({ kind: "createBranch", options }),
 		createCheckpoint: () => request({ kind: "createCheckpoint" }),
 		undo: () => request({ kind: "undo" }),

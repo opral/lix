@@ -55,13 +55,17 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 
 	const restored = await openMemoryLix({ snapshot });
 	try {
-		expect(await restored.activeBranchId()).toBe(SNAPSHOT_DRAFT_BRANCH_ID);
+		// Branch selection belongs to the opening session, not the repository
+		// snapshot. A restored repository therefore starts on its default branch;
+		// callers explicitly select another branch for that tab/session.
+		expect(await restored.activeBranchId()).not.toBe(SNAPSHOT_DRAFT_BRANCH_ID);
 		expect(
 			await restored.execute(
 				"SELECT id, name FROM lix_branch WHERE id = $1",
 				[{ kind: "text", value: SNAPSHOT_DRAFT_BRANCH_ID }],
 			),
 		).toEqual(branchBefore);
+		await restored.switchBranch({ branchId: SNAPSHOT_DRAFT_BRANCH_ID });
 		const result = await restored.execute(
 			"SELECT path, content, lixcol_change_id FROM lix_file WHERE path = '/snapshot.txt'",
 			noParams,

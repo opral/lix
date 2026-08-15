@@ -1,6 +1,4 @@
 import { invalidArgument } from "./errors.js";
-import type { LixClientState, ManagedClientState } from "./client-state.js";
-import { unavailableClientState } from "./client-state.js";
 import type {
 	BindingObserveEvent,
 	LixBinding,
@@ -27,7 +25,6 @@ import type {
 	MergeBranchPreview,
 	MergeBranchReceipt,
 	ObserveEvent,
-	JsonValue,
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
@@ -55,7 +52,6 @@ const observeFinalizer = new FinalizationRegistry<{
 
 export class Lix {
 	private closePromise: Promise<void> | undefined;
-	readonly clientState: LixClientState;
 	readonly #activeBranchListeners = new Set<() => void>();
 	readonly #inFlightOperations = new Set<Promise<unknown>>();
 	readonly #observations = new Map<number, WeakRef<ObserveEvents>>();
@@ -64,25 +60,7 @@ export class Lix {
 	#activeTransactions = 0;
 	#acceptingOperations = true;
 
-	constructor(
-		private readonly binding: LixBinding,
-		private readonly managedClientState?: ManagedClientState,
-	) {
-		this.clientState = managedClientState
-			? {
-					get: <T extends JsonValue = JsonValue>(key: string) =>
-						this.#runOperation(() => managedClientState.get<T>(key)),
-					set: (key, value) =>
-						this.#runOperation(() => managedClientState.set(key, value)),
-					delete: (key) =>
-						this.#runOperation(() => managedClientState.delete(key)),
-					subscribe: (listener) => {
-						this.#assertAcceptingOperations();
-						return managedClientState.subscribe(listener);
-					},
-				}
-			: unavailableClientState();
-	}
+	constructor(private readonly binding: LixBinding) {}
 
 	async execute(
 		sql: string,
@@ -240,7 +218,6 @@ export class Lix {
 				await Promise.allSettled([...this.#inFlightOperations]);
 				const results = await Promise.allSettled([
 					Promise.resolve().then(() => this.binding.close()),
-					Promise.resolve().then(() => this.managedClientState?.close()),
 				]);
 				this.#activeBranchListeners.clear();
 				const failure = results.find(
