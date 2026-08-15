@@ -67,6 +67,25 @@ try {
 		)
 	).trim();
 	assert.match(nodeEntry, /\/dist\/index\.js$/);
+	const nodeFallback = JSON.parse(
+		await output(
+			process.execPath,
+			[
+				"--input-type=module",
+				"--eval",
+				`import { openLix } from "@lix-js/sdk";
+				const lix = await openLix();
+				try {
+					const query = await lix.execute("SELECT $1 AS message", ["node-wasm"]);
+					console.log(JSON.stringify({ message: query.rows[0]?.get("message") }));
+				} finally {
+					await lix.close();
+				}`,
+			],
+			{ cwd: fixtureDir },
+		),
+	);
+	assert.deepEqual(nodeFallback, { message: "node-wasm" });
 	await run(
 		process.execPath,
 		[
