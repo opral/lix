@@ -30,6 +30,9 @@ jobs:
       - name: Validate change fragments
         run: node scripts/validate-changes.mjs
 
+      - name: Validate server protocol docs
+        run: node scripts/validate-server-protocol-docs.mjs
+
   cargo-config:
     name: Cargo config (${{ matrix.name }})
     if: github.event_name == 'push' || github.event.pull_request.draft == false
