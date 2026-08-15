@@ -4238,6 +4238,18 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
+                (
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE.id.0,
+                    10,
+                ), // authenticated native current-state bodies
+                (
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE.id.0,
+                    10,
+                ), // native body payload-ref summaries
+                (
+                    crate::tracked_state::SCOPED_RANGE_NODE_SPACE.id.0,
+                    10,
+                ), // scoped current-state authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
             ]
@@ -4260,20 +4272,25 @@ mod tests {
         const FENCE_KEY_BYTES: usize =
             crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        // Canonical-record deletes are UUID keyed. Checkpoint rotation also
-        // retires the fixture's fixed-width working-diff identities and the
-        // branch-ref marker through their authenticated physical encodings.
+        // Canonical-record deletes are UUID keyed, while native bodies, refs,
+        // and scoped authority are addressed by 32-byte content digests.
+        // Checkpoint rotation also retires the fixture's fixed-width
+        // working-diff identities and branch-ref marker.
         const UUID_KEY_BYTES: usize = 16;
+        const CONTENT_KEY_BYTES: usize = 32;
         const WORKING_DIFF_KEY_BYTES: usize = 121;
         const WORKING_DIFF_MARKER_KEY_BYTES: usize = 37;
         let working_diff_deletes = 100;
         let marker_deletes = 1;
+        let content_deletes = 30;
         let uuid_deletes = first.staged_deletes as usize
             - working_diff_deletes
-            - marker_deletes;
+            - marker_deletes
+            - content_deletes;
         assert_eq!(
             first.key_shared_bytes,
             uuid_deletes * UUID_KEY_BYTES
+                + content_deletes * CONTENT_KEY_BYTES
                 + working_diff_deletes * WORKING_DIFF_KEY_BYTES
                 + marker_deletes * WORKING_DIFF_MARKER_KEY_BYTES
                 + FENCE_KEY_BYTES

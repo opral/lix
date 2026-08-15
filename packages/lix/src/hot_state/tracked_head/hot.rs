@@ -15205,12 +15205,14 @@ mod tests {
         .expect("reuse admitted packed mutation predecessor");
         assert!(reused[0].is_some());
         assert_eq!(
-            (
-                get_many_calls.load(Ordering::Relaxed),
-                scan_calls.load(Ordering::Relaxed),
-            ),
-            admitted_read_counts,
-            "a transaction snapshot must reuse an admitted packed segment by immutable address"
+            scan_calls.load(Ordering::Relaxed),
+            admitted_read_counts.1,
+            "a transaction snapshot must reuse an admitted packed segment without rescanning"
+        );
+        assert_eq!(
+            get_many_calls.load(Ordering::Relaxed),
+            admitted_read_counts.0 + 1,
+            "LXCD17 packed reuse must perform only the bounded authenticated history-body read"
         );
         let (_, change, _) = entries[0].as_ref().expect("packed predecessor exists");
         assert!(

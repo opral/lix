@@ -4654,9 +4654,22 @@ mod tests {
         register_payload_schema(&session, "gc_payload_row").await;
         register_payload_schema(&session, "gc_payload_mirror").await;
 
+        let first_owner_branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-0000000000b1".to_owned()),
+                name: "gc-payload-first-owner".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("first-owner branch should create");
+        let first_owner = engine
+            .open_session_at(first_owner_branch.id.clone())
+            .await
+            .expect("first-owner branch session should open");
+
         let shared = out_of_band_payload(0);
         let shared_ref = payload_ref_added_by(&backend, || async {
-            session
+            first_owner
                 .execute(
                     "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
                     &[Value::Text(shared.clone())],
@@ -4679,25 +4692,17 @@ mod tests {
             "the premise of this test is that identical content dedups onto one row"
         );
 
-        // Churn only the first owner, so the commit that authored the shared
-        // payload becomes retirable while the mirror row keeps naming it.
-        for revision in 1..=8 {
-            session
-                .execute(
-                    "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/shared'",
-                    &[Value::Text(out_of_band_payload(revision))],
-                )
-                .await
-                .expect("churn should publish");
-            session
-                .create_checkpoint()
-                .await
-                .expect("churn checkpoint should publish");
-        }
+        // Retire only the branch that authored the shared payload. The mirror
+        // row remains independently reachable from main and keeps naming the
+        // same content-addressed JSON row.
+        drop(first_owner);
         session
-            .create_checkpoint()
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(first_owner_branch.id)],
+            )
             .await
-            .expect("releasing checkpoint should publish");
+            .expect("first-owner branch should retire");
 
         let plan = run_shipping_repository_gc(&backend).await;
         assert!(
