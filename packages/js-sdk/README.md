@@ -155,6 +155,9 @@ try {
 - The package uses conditional ESM imports internally: Node.js resolves the
   native N-API binding, while browsers and other runtimes resolve the portable
   WebAssembly binding. Vite follows this split without consumer configuration.
+- If the native addon cannot load in Node.js, in-memory Lix instances fall back
+  to the bundled WebAssembly engine. Filesystem storage and Component API v1
+  plugin execution still require the native addon.
 - Every browser `openLix()` owns one dedicated worker, so database work does
   not block the page's main thread. Node.js uses the native binding's actor.
 - Node.js executes installed Component API v1 plugins with the Rust SDK's
