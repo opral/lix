@@ -22,6 +22,28 @@ Give each agent task its own branch. The agent can edit files and SQL rows witho
 
 See [Lix for AI Agents](./lix-for-ai-agents.md).
 
+### Sync local files
+
+Sync the local files that coding agents and applications work on, to make them collaborative or cloud-based.
+
+<img src="../website/public/assets/file-sync.svg" alt="Client A and client B each hold the same project files on their own filesystem and synchronize them with a Lix server" width="760" />
+
+```ts
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
+
+// ./project stays a normal directory. Lix syncs it through the server.
+const lix = await openLix({
+  storage: new FilesystemStorage({ path: "./project" }),
+  server: {
+    mode: "remote",
+    url: "https://lixray.com/@acme/project",
+  },
+});
+```
+
+See [Hosting](./hosting.md).
+
 ### File-based apps with SQL and version control
 
 Build editors, knowledge bases, document workflows, and other file-based apps. Existing tools keep using files while your app uses SQL for queries and transactions. Lix versions everything both sides write.
@@ -38,10 +60,6 @@ Apps read and write these rows with SQL. Lix records their history. With
 `FilesystemStorage`, it also writes changes back to normal files on disk.
 
 Diffs are row-level: review the clause, cell, or row that changed, not lines of text. See [Diffs](./diffs.md).
-
-The JavaScript SDK includes Markdown and CSV plugins. Other formats, including JSON, XLSX, DOCX, and PDF, need a plugin.
-
-App data does not have to come from a file. Register a schema and Lix creates a SQL table. That table gets the same history and branches as file-backed rows.
 
 ## Pluggable storage
 
