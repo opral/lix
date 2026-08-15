@@ -346,7 +346,7 @@ impl PublicCatalog {
                 ),
             )
             .with_hint(
-                "Custom `lix` and `lix_*` schema keys are incompatible with this Lix version. Migrate the workspace with application-specific tooling before upgrading.",
+                "The `lix` and `lix_*` schema namespaces are reserved for Lix. Register this schema under an owner-specific prefix such as `acme_task`.",
             ));
         }
 
@@ -741,7 +741,7 @@ mod tests {
                 error
                     .hint
                     .as_deref()
-                    .is_some_and(|hint| hint.contains("application-specific tooling")),
+                    .is_some_and(|hint| hint.contains("owner-specific prefix")),
                 "{error:?}"
             );
         }
