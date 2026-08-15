@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.12.0 - 2026-08-15
+
+### Minor
+
+- Added first-class browser and filesystem storage backends.
+
+  Browser applications can persist repositories with `IndexedDbStorage`, while filesystem storage is available through the dedicated `@lix-js/storage-filesystem` package.
+- Plugin authoring and the Lix Server Protocol are now provided directly by Lix.
+
+  Rust plugins use `lix::plugin`, server hosts can use the canonical Server Protocol API, and plugins can read and edit untracked files as rows.
+- Lix SQL now uses the PostgreSQL dialect.
+
+  Queries use PostgreSQL syntax and numbered parameters such as `$1`. Row tables expose native SQL types, including `jsonb` and `timestamptz`, with consistent row terminology and typed columns instead of raw snapshots.
+- Removed `lix.clientState` and remote client-storage composition.
+
+  Applications now own browser-local UI persistence explicitly, while remote Lix handles remain focused on repository operations and independent branch-pinned sessions.
+
+### Patch
+
+- History, branch, and merge operations now scale with the relevant changes instead of the total repository size.
+
+  History traversal skips unrelated work, file history prunes irrelevant paths and plugin states, and branch-head moves reuse existing state instead of copying the complete working set.
+- SQL queries and everyday CRUD operations are substantially faster.
+
+  Lix now reuses SQL sessions and prepared plans, seeks directly for indexed and file-scoped lookups, and avoids unnecessary intermediate materialization when returning typed and JSON results.
+- Fixed several correctness and reliability issues across storage, branches, and files.
+
+  This includes stale SlateDB reads, truncated scans, false transaction conflicts, incorrect branch reverts, subquery failures, and directory operations that could leave invalid state.
+- Files and repositories use storage more efficiently.
+
+  Binary edits reuse unchanged content, SlateDB durable writes complete faster, deleted branches release their serving storage, and commits retain less internal bookkeeping.
+
 ## 0.11.0 - 2026-08-09
 
 ### Minor

@@ -114,9 +114,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
 [target.'cfg(any(not(target_arch = "wasm32"), all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
-lix-plugin-bindings-column-merger = { path = "../lix-plugin-bindings-column-merger", version = "=0.11.0" }
-lix-plugin-bindings-combined = { path = "../lix-plugin-bindings-combined", version = "=0.11.0" }
-lix-plugin-bindings-file-projection = { path = "../lix-plugin-bindings-file-projection", version = "=0.11.0" }
+lix-plugin-bindings-column-merger = { path = "../lix-plugin-bindings-column-merger", version = "=0.12.0" }
+lix-plugin-bindings-combined = { path = "../lix-plugin-bindings-combined", version = "=0.12.0" }
+lix-plugin-bindings-file-projection = { path = "../lix-plugin-bindings-file-projection", version = "=0.12.0" }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))'.dependencies]
 uuid = { version = "1", features = ["std"] }
