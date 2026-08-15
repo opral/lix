@@ -2997,17 +2997,74 @@ mod tests {
             let record = records
                 .get(&typed_commit_id)
                 .expect("empty commit record should exist");
-            stage_commit_state_manifest(
+            let seed_pk = RowPk::single(format!("empty-current-state-seed-{commit_id}"));
+            let seed_delta = [TrackedStateCommitDeltaRef {
+                delta: TrackedStateDeltaRef {
+                    schema_key: "hot-state-fixture-seed",
+                    file_id: None,
+                    row_pk: &seed_pk,
+                    change_id: ChangeId::for_test_label(&format!(
+                        "empty-current-state-seed-{commit_id}"
+                    )),
+                    commit_id: record.commit_id,
+                    deleted: false,
+                    created_at: record.created_at,
+                    updated_at: record.created_at,
+                },
+                snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+            }];
+            let staged = stage_commit_deltas_for_commit_state(&mut writes, &seed_delta)
+                .expect("empty fixture current-state seed should stage");
+            let mutations = staged.mutation_inventory().clone();
+            let certified_body = crate::tracked_state::certify_authored_current_state_body(
+                read,
+                &mut writes,
+                record.commit_id,
+                &record.account_id,
+                &mutations,
+                true,
+                seed_delta.iter().copied(),
+            )
+            .await
+            .expect("empty fixture current-state seed should certify");
+            let mut publication = crate::tracked_state::
+                stage_current_state_scoped_ranges_from_published_topology_parent(
+                    read,
+                    &mut writes,
+                    None,
+                    record.commit_id,
+                    &record.account_id,
+                    &mutations,
+                    certified_body,
+                )
+                .await
+                .expect("empty current-state authority should certify");
+            publication
+                .certify_authored_history_bodies(
+                    read,
+                    &mut writes,
+                    &record.account_id,
+                    &mutations,
+                )
+                .await
+                .expect("empty history body inventory should certify");
+            crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
                 &mut writes,
                 &CommitStateManifest {
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
-                    mutations: Default::default(),
-                    touched_scope_filter: Default::default(),
-                    current_state_scoped_ranges: None,
+                    mutations,
+                    touched_scope_filter: publication.touched_scope_filter().clone(),
+                    current_state_scoped_ranges: publication.root(),
+                    authored_history_bodies: publication.authored_history_bodies(),
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
+                &publication,
             )
             .expect("empty commit-state authority should stage");
         }
@@ -3232,6 +3289,7 @@ mod tests {
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
+                    authored_history_bodies: None,
                     snapshot_root: None,
                 },
             )
@@ -3337,6 +3395,10 @@ mod tests {
         }
 
         let mut generations = std::collections::BTreeMap::<String, u64>::new();
+        let mut staged_authorities = std::collections::BTreeMap::<
+            String,
+            crate::tracked_state::StagedCommitStateManifest,
+        >::new();
         for (commit_id, rows) in tracked_rows_by_commit {
             let parent_commit_id = parent_by_commit.remove(&commit_id).flatten();
             let parent_ids = parent_commit_id
@@ -3409,7 +3471,7 @@ mod tests {
                     updated_at: *updated_at,
                 })
                 .collect::<Vec<_>>();
-            let commit_deltas = rows
+            let mut commit_deltas = rows
                 .iter()
                 .zip(&root_deltas)
                 .map(|((change, _, _), delta)| TrackedStateCommitDeltaRef {
@@ -3421,6 +3483,13 @@ mod tests {
                     authored: true,
                 })
                 .collect::<Vec<_>>();
+            commit_deltas.sort_by_key(|delta| {
+                crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+                    schema_key: delta.delta.schema_key,
+                    file_id: delta.delta.file_id,
+                    row_pk: delta.delta.row_pk,
+                })
+            });
             let staged_delta = stage_commit_deltas_for_commit_state(writes, &commit_deltas)?;
             let mutation_inventory = staged_delta.mutation_inventory().clone();
             let tracked_state = TrackedStateContext::new();
@@ -3434,18 +3503,85 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| LixError::unknown("test materialization did not stage a root"))?;
             drop(root_writer);
-            stage_commit_state_manifest(
+            let certified_body = crate::tracked_state::certify_authored_current_state_body(
+                store,
+                writes,
+                record.commit_id,
+                &record.account_id,
+                &mutation_inventory,
+                parent_commit_id.is_none(),
+                commit_deltas.iter().copied(),
+            )
+            .await?;
+            let mut publication = if let Some(parent_id) = parent_commit_id.as_ref() {
+                if let Some(parent) = staged_authorities.get(parent_id) {
+                    crate::tracked_state::stage_current_state_scoped_ranges_from_staged_parent(
+                        store,
+                        writes,
+                        parent,
+                        record.commit_id,
+                        &record.account_id,
+                        &mutation_inventory,
+                        certified_body,
+                    )
+                    .await?
+                } else {
+                    let parent = crate::tracked_state::load_published_commit_state_topology(
+                        store,
+                        CommitId::for_test_label(parent_id),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::unknown("test current-state parent authority is missing")
+                    })?;
+                    crate::tracked_state::
+                        stage_current_state_scoped_ranges_from_published_topology_parent(
+                            store,
+                            writes,
+                            Some(&parent),
+                            record.commit_id,
+                            &record.account_id,
+                            &mutation_inventory,
+                            certified_body,
+                        )
+                        .await?
+                }
+            } else {
+                crate::tracked_state::
+                    stage_current_state_scoped_ranges_from_published_topology_parent(
+                        store,
+                        writes,
+                        None,
+                        record.commit_id,
+                        &record.account_id,
+                        &mutation_inventory,
+                        certified_body,
+                    )
+                    .await?
+            };
+            publication
+                .certify_authored_history_bodies(
+                    store,
+                    writes,
+                    &record.account_id,
+                    &mutation_inventory,
+                )
+                .await?;
+            let authority = crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
                 writes,
                 &CommitStateManifest {
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: mutation_inventory,
-                    touched_scope_filter: Default::default(),
-                    current_state_scoped_ranges: None,
+                    touched_scope_filter: publication.touched_scope_filter().clone(),
+                    current_state_scoped_ranges: publication.root(),
+                    authored_history_bodies: publication.authored_history_bodies(),
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
+                &publication,
             )?;
+            staged_authorities.insert(commit_id, authority);
         }
 
         Ok(())

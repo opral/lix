@@ -10,7 +10,8 @@ use crate::storage_adapter::{
     StorageWriteSetError,
 };
 
-fn stage_bench_commit_deltas(
+async fn stage_bench_commit_deltas(
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],
 ) -> Result<Vec<crate::tracked_state::CommitDeltaChangeLocator>, crate::LixError> {
@@ -20,7 +21,36 @@ fn stage_bench_commit_deltas(
         .map(|delta| delta.delta.commit_id)
         .unwrap_or_default();
     let mutations = staged.mutation_inventory().clone();
-    crate::tracked_state::stage_commit_state_manifest(
+    let certified_body = crate::tracked_state::certify_authored_current_state_body(
+        read,
+        writes,
+        commit_id,
+        crate::ANONYMOUS_ACCOUNT_ID,
+        &mutations,
+        true,
+        deltas.iter().copied(),
+    )
+    .await?;
+    let mut publication = crate::tracked_state::
+        stage_current_state_scoped_ranges_from_published_topology_parent(
+            read,
+            writes,
+            None,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            &mutations,
+            certified_body,
+        )
+        .await?;
+    publication
+        .certify_authored_history_bodies(
+            read,
+            writes,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            &mutations,
+        )
+        .await?;
+    crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
         writes,
         &crate::tracked_state::CommitStateManifest {
             commit_id,
@@ -31,10 +61,12 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
+            touched_scope_filter: publication.touched_scope_filter().clone(),
+            current_state_scoped_ranges: publication.root(),
+            authored_history_bodies: publication.authored_history_bodies(),
             snapshot_root: None,
         },
+        &publication,
     )?;
     Ok(staged.locators)
 }
@@ -1765,6 +1797,7 @@ where
                 mutations: crate::tracked_state::CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
+                authored_history_bodies: None,
                 snapshot_root: None,
             },
         )?;
@@ -1953,6 +1986,7 @@ pub async fn seed_commit_graph_members_for_bench<StorageImpl>(
 where
     StorageImpl: Storage,
 {
+    let read = storage.begin_read(ReadOptions::default()).await?;
     let mut writes = storage.new_write_set();
     let created_at = crate::common::LixTimestamp::expect_parse(
         "commit graph benchmark timestamp",
@@ -1969,6 +2003,7 @@ where
             "x".repeat(192)
         ));
         stage_bench_commit_deltas(
+            &read,
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
                 delta: crate::tracked_state::TrackedStateDeltaRef {
@@ -1989,7 +2024,8 @@ where
                 base_coordinate: None,
                 authored: true,
             }],
-        )?;
+        )
+        .await?;
     }
     storage
         .commit_write_set(writes, StorageWriteOptions::default())

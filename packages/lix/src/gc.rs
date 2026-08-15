@@ -3167,8 +3167,7 @@ mod tests {
         // is the finite selected-source owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("selected-owner-base", 0, None, timestamp);
-        let owner =
-            replay_commit_record("selected-owner-source", 1, Some(base.commit_id), timestamp);
+        let owner = replay_commit_record("selected-owner-source", 0, None, timestamp);
         let checkpoint = replay_commit_record(
             "selected-owner-checkpoint",
             1,
@@ -3216,15 +3215,70 @@ mod tests {
             stage_commit_deltas_for_commit_state(&mut writes, &checkpoint_deltas)
                 .expect("finite selected checkpoint member should stage");
 
-        let mut owner_manifest =
-            test_commit_state_manifest(&owner, owner_stage.mutation_inventory().clone());
-        owner_manifest.replay_debt = CommitStateReplayDebt::default();
-        owner_manifest.snapshot_root = Some(Box::new(test_snapshot_root(owner.commit_id)));
+        let owner_mutations = owner_stage.mutation_inventory().clone();
+        let owner_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("selected owner certification read should open");
+        let owner_body = crate::tracked_state::certify_authored_current_state_body(
+            &owner_read,
+            &mut writes,
+            owner.commit_id,
+            &owner.account_id,
+            &owner_mutations,
+            true,
+            owner_deltas.iter().copied(),
+        )
+        .await
+        .expect("selected owner body should certify");
+        let mut owner_publication = crate::tracked_state::
+            stage_current_state_scoped_ranges_from_published_topology_parent(
+                &owner_read,
+                &mut writes,
+                None,
+                owner.commit_id,
+                &owner.account_id,
+                &owner_mutations,
+                owner_body,
+            )
+            .await
+            .expect("selected owner current state should publish");
+        owner_publication
+            .certify_authored_history_bodies(
+                &owner_read,
+                &mut writes,
+                &owner.account_id,
+                &owner_mutations,
+            )
+            .await
+            .expect("selected owner history body should certify");
+        crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+            &mut writes,
+            &CommitStateManifest {
+                commit_id: owner.commit_id,
+                change_account_id: owner.account_id.clone(),
+                replay_debt: CommitStateReplayDebt::default(),
+                mutations: owner_mutations,
+                touched_scope_filter: owner_publication.touched_scope_filter().clone(),
+                current_state_scoped_ranges: owner_publication.root(),
+                authored_history_bodies: owner_publication.authored_history_bodies(),
+                snapshot_root: Some(Box::new(test_snapshot_root(owner.commit_id))),
+            },
+            &owner_publication,
+        )
+        .expect("selected owner certified manifest should stage");
+        drop(owner_read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected owner certified authority should commit");
+        let mut writes = storage.new_write_set();
         let mut checkpoint_manifest =
             test_commit_state_manifest(&checkpoint, checkpoint_stage.mutation_inventory().clone());
         checkpoint_manifest.replay_debt = CommitStateReplayDebt::default();
         checkpoint_manifest.snapshot_root =
             Some(Box::new(test_snapshot_root(checkpoint.commit_id)));
+        stage_empty_current_state_root(&mut writes, &mut checkpoint_manifest, None);
         let mut released_manifest =
             test_commit_state_manifest(&released, CommitStateMutationInventory::default());
         released_manifest.replay_debt = CommitStateReplayDebt::default();
@@ -3246,7 +3300,7 @@ mod tests {
                 checkpoint.clone(),
                 released.clone(),
             ],
-            &[base_manifest, owner_manifest, checkpoint_manifest],
+            &[base_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3347,7 +3401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_gc_releases_scoped_descriptor_owner_only_after_root_release() {
+    async fn ordinary_gc_keeps_certified_scoped_descriptor_body_owner_after_root_release() {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("scoped owner timestamp", "2026-01-01T00:00:00Z");
@@ -3495,12 +3549,6 @@ mod tests {
         publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
-            released_plan
-                .sweep
-                .tracked_commit_roots
-                .contains(&owner.commit_id)
-        );
-        assert!(
             !released_plan
                 .sweep
                 .tracked_commit_roots
@@ -3514,13 +3562,14 @@ mod tests {
         assert!(
             crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
                 .await
-                .expect("released scoped owner absence should load")
-                .is_none()
+                .expect("certified scoped owner should load after descriptor release")
+                .is_some(),
+            "the owner's certified native body remains independent physical authority"
         );
     }
 
     #[tokio::test]
-    async fn ordinary_gc_releases_native_row_owner_only_after_scoped_root_release() {
+    async fn ordinary_gc_keeps_native_row_owner_for_reachable_checkpoint_authority() {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("native row owner timestamp", "2026-01-01T00:00:00Z");
@@ -3603,9 +3652,9 @@ mod tests {
         );
         writes.put(
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-            StorageKey(Bytes::copy_from_slice(&encoded.refs_digest)),
+            StorageKey(Bytes::copy_from_slice(&encoded.digest)),
             StorageValue {
-                bytes: encoded.refs_bytes,
+                bytes: encoded.refs_bytes.clone(),
             },
         );
         let tree = crate::tracked_state::scoped_range::stage_scoped_range_tree(
@@ -3773,6 +3822,13 @@ mod tests {
                 bytes: encoded.bytes.clone(),
             },
         );
+        restore.put(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+            StorageKey(Bytes::copy_from_slice(&encoded.digest)),
+            StorageValue {
+                bytes: encoded.refs_bytes.clone(),
+            },
+        );
         storage
             .commit_write_set(restore, StorageWriteOptions::default())
             .await
@@ -3801,12 +3857,6 @@ mod tests {
 
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
-            released_plan
-                .sweep
-                .tracked_commit_roots
-                .contains(&owner.commit_id)
-        );
-        assert!(
             !released_plan
                 .sweep
                 .tracked_commit_roots
@@ -3820,8 +3870,9 @@ mod tests {
         assert!(
             crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
                 .await
-                .expect("released native owner absence should load")
-                .is_none()
+                .expect("reachable-checkpoint native owner should load")
+                .is_some(),
+            "the reachable checkpoint remains authenticated native body authority"
         );
     }
 
@@ -3846,6 +3897,7 @@ mod tests {
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            authored_history_bodies: None,
             snapshot_root: Some(Box::new(TrackedStateCommitRoot {
                 commit_id,
                 root_id: TrackedStateRootId::new(root_hash),
@@ -3980,6 +4032,7 @@ mod tests {
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            authored_history_bodies: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
@@ -5341,7 +5394,7 @@ mod tests {
                 scoped_nodes: &BTreeSet::new(),
                 native_parts: &BTreeSet::new(),
             },
-            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
         )
         .await
         .expect("orphan physical state should retire");
@@ -5719,6 +5772,18 @@ mod tests {
         .expect("source serving root should attest");
         let mut source_manifest = test_commit_state_manifest(&commits[0], source_inventory);
         source_manifest.current_state_scoped_ranges = Some(Box::new(source_root.clone()));
+        source_manifest.authored_history_bodies =
+            crate::tracked_state::certify_authored_history_body_inventory_for_test(
+                &read,
+                &mut writes,
+                source_commit,
+                &commits[0].account_id,
+                &source_manifest.mutations,
+                &source_root,
+            )
+            .await
+            .expect("source tombstone body inventory should certify")
+            .map(Box::new);
         crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
             &mut writes,
             &source_manifest,
@@ -5730,10 +5795,22 @@ mod tests {
             alias_commit,
             Some((source_commit, &source_root)),
             &alias_inventory,
-            tree,
+            tree.clone(),
         )
         .expect("selected-source serving root should attest");
         let mut alias_manifest = test_commit_state_manifest(&commits[1], alias_inventory);
+        alias_manifest.authored_history_bodies =
+            crate::tracked_state::certify_authored_history_body_inventory_for_test(
+                &read,
+                &mut writes,
+                alias_commit,
+                &commits[1].account_id,
+                &alias_manifest.mutations,
+                &alias_root,
+            )
+            .await
+            .expect("selected-source local tombstone body inventory should certify")
+            .map(Box::new);
         alias_manifest.current_state_scoped_ranges = Some(Box::new(alias_root));
         crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
             &mut writes,
@@ -5742,13 +5819,39 @@ mod tests {
         .expect("selected-source serving authority should stage");
 
         for record in &commits[2..] {
-            let manifest = test_commit_state_manifest(
+            let mut manifest = test_commit_state_manifest(
                 record,
                 inventories
                     .get(&record.commit_id)
                     .cloned()
                     .unwrap_or_default(),
             );
+            if record.commit_id == authority_commit {
+                manifest.current_state_scoped_ranges = Some(Box::new(
+                    crate::tracked_state::attest_scoped_range_root(
+                        authority_commit,
+                        None,
+                        &manifest.mutations,
+                        tree.clone(),
+                    )
+                    .expect("tombstone authority serving root should attest"),
+                ));
+                manifest.authored_history_bodies = crate::tracked_state::
+                    certify_authored_history_body_inventory_for_test(
+                        &read,
+                        &mut writes,
+                        authority_commit,
+                        &record.account_id,
+                        &manifest.mutations,
+                        manifest
+                            .current_state_scoped_ranges
+                            .as_deref()
+                            .expect("tombstone authority root should exist"),
+                    )
+                    .await
+                    .expect("authority tombstone body inventory should certify")
+                    .map(Box::new);
+            }
             crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
                 &mut writes,
                 &manifest,
@@ -5907,28 +6010,79 @@ mod tests {
         // The surviving copy is a merge/checkpoint selection. Once the
         // original owner dies, GC promotes it through locator relocation.
         live_deltas[0].authored = false;
-        let live_stage = stage_commit_deltas_for_commit_state(&mut writes, &live_deltas)
-            .expect("live packed member should stage");
+        live_deltas.sort_by_key(|delta| {
+            crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                row_pk: delta.delta.row_pk,
+            })
+        });
         let dead_members = vec![dead_shared_member.clone(), dead_only_member.clone()];
-        let dead_deltas = commit_delta_refs(dead_commit, &dead_members);
+        let mut dead_deltas = commit_delta_refs(dead_commit, &dead_members);
+        dead_deltas.sort_by_key(|delta| {
+            crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                row_pk: delta.delta.row_pk,
+            })
+        });
         let dead_stage = stage_commit_deltas_for_commit_state(&mut writes, &dead_deltas)
             .expect("dead packed members should stage");
         let dead_locators = dead_stage.locators.clone();
-        let inventories = BTreeMap::from([
-            (live_parent, live_stage.mutation_inventory().clone()),
-            (dead_commit, dead_stage.mutation_inventory().clone()),
-        ]);
-        for record in &commits {
-            let mutations = inventories
-                .get(&record.commit_id)
-                .cloned()
-                .unwrap_or_default();
-            let mut manifest = test_commit_state_manifest(record, mutations);
-            manifest.replay_debt = CommitStateReplayDebt::default();
-            manifest.snapshot_root = Some(Box::new(test_snapshot_root(record.commit_id)));
-            stage_commit_state_manifest(&mut writes, &manifest)
-                .expect("rooted GC fixture commit-state manifest should stage");
-        }
+        let dead_record = commits
+            .iter()
+            .find(|record| record.commit_id == dead_commit)
+            .expect("dead GC fixture record should exist");
+        let mut dead_manifest = test_commit_state_manifest(
+            dead_record,
+            dead_stage.mutation_inventory().clone(),
+        );
+        dead_manifest.replay_debt = CommitStateReplayDebt::default();
+        dead_manifest.snapshot_root = Some(Box::new(test_snapshot_root(dead_commit)));
+        let dead_authority = stage_certified_native_manifest_fixture(
+            &read,
+            &mut writes,
+            &mut dead_manifest,
+            &dead_deltas,
+            None,
+        )
+        .await;
+
+        let live_stage = stage_commit_deltas_for_commit_state(&mut writes, &live_deltas)
+            .expect("live selected packed member should stage");
+        let live_record = commits
+            .iter()
+            .find(|record| record.commit_id == live_parent)
+            .expect("live GC fixture record should exist");
+        let mut live_manifest = test_commit_state_manifest(
+            live_record,
+            live_stage.mutation_inventory().clone(),
+        );
+        live_manifest.replay_debt = CommitStateReplayDebt::default();
+        live_manifest.snapshot_root = Some(Box::new(test_snapshot_root(live_parent)));
+        stage_certified_native_manifest_fixture(
+            &read,
+            &mut writes,
+            &mut live_manifest,
+            &live_deltas,
+            Some(crate::tracked_state::CertifiedCommitStateTopologyParent::Staged(
+                &dead_authority,
+            )),
+        )
+        .await;
+
+        let live_head_record = commits
+            .iter()
+            .find(|record| record.commit_id == live_head)
+            .expect("live-head GC fixture record should exist");
+        let mut live_head_manifest = test_commit_state_manifest(
+            live_head_record,
+            CommitStateMutationInventory::default(),
+        );
+        live_head_manifest.replay_debt = CommitStateReplayDebt::default();
+        live_head_manifest.snapshot_root = Some(Box::new(test_snapshot_root(live_head)));
+        stage_commit_state_manifest(&mut writes, &live_head_manifest)
+            .expect("empty rooted GC fixture commit-state manifest should stage");
         let sidecar_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Utf8,
@@ -6272,10 +6426,36 @@ mod tests {
             })
             .await
             .expect("replay fixture commits should stage");
+        let mut serving_manifests = BTreeMap::new();
         for manifest in manifests {
+            let mut manifest = manifest.clone();
+            if (manifest.mutations.member_count != 0
+                || manifest.mutations.selected_source_commit_id().is_some())
+                && manifest.current_state_scoped_ranges.is_none()
+            {
+                let serving_base = manifest
+                    .mutations
+                    .selected_source_commit_id()
+                    .map(|source_commit_id| {
+                        serving_manifests
+                            .get(&source_commit_id)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                panic!("replay fixture selected source has no serving root")
+                            })
+                    });
+                stage_empty_current_state_root(
+                    &mut writes,
+                    &mut manifest,
+                    serving_base.as_ref(),
+                );
+            }
+            if manifest.current_state_scoped_ranges.is_some() {
+                serving_manifests.insert(manifest.commit_id, manifest.clone());
+            }
             crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
                 &mut writes,
-                manifest,
+                &manifest,
             )
             .expect("replay fixture manifest should stage");
             if let Some(root) = manifest.snapshot_root.as_ref() {
@@ -6572,8 +6752,98 @@ mod tests {
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            authored_history_bodies: None,
             snapshot_root: None,
         }
+    }
+
+    async fn stage_certified_native_manifest_fixture(
+        read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        manifest: &mut CommitStateManifest,
+        deltas: &[TrackedStateCommitDeltaRef<'_>],
+        serving_parent: Option<crate::tracked_state::CertifiedCommitStateTopologyParent<'_>>,
+    ) -> crate::tracked_state::StagedCommitStateManifest {
+        let certified_body = crate::tracked_state::certify_authored_current_state_body(
+            read,
+            writes,
+            manifest.commit_id,
+            &manifest.change_account_id,
+            &manifest.mutations,
+            serving_parent.is_none(),
+            deltas.iter().copied(),
+        )
+        .await
+        .expect("GC fixture authored current-state body should certify");
+        let mut publication = crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
+            read,
+            writes,
+            serving_parent.as_slice(),
+            None,
+            manifest.commit_id,
+            &manifest.change_account_id,
+            &manifest.mutations,
+            certified_body,
+        )
+        .await
+        .expect("GC fixture native current-state root should publish");
+        publication
+            .certify_authored_history_bodies(
+                read,
+                writes,
+                &manifest.change_account_id,
+                &manifest.mutations,
+            )
+            .await
+            .expect("GC fixture authored history body inventory should certify");
+        manifest.touched_scope_filter = publication.touched_scope_filter().clone();
+        manifest.current_state_scoped_ranges = publication.root();
+        manifest.authored_history_bodies = publication.authored_history_bodies();
+        crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+            writes,
+            manifest,
+            &publication,
+        )
+        .expect("certified GC fixture manifest should stage")
+    }
+
+    fn stage_empty_current_state_root(
+        writes: &mut StorageWriteSet,
+        manifest: &mut CommitStateManifest,
+        serving_base: Option<&CommitStateManifest>,
+    ) {
+        let scope = crate::tracked_state::scoped_range::ScopedRangePrefix::try_from_components([
+            b"gc-fixture-empty".as_slice(),
+        ])
+        .expect("GC fixture scope should encode");
+        let tree = crate::tracked_state::scoped_range::stage_scoped_range_tree(
+            writes,
+            [(
+                crate::tracked_state::scoped_range::ScopedRangeCoverageMarker {
+                    scope,
+                    row_count: 0,
+                    part_count: 0,
+                },
+                Vec::new(),
+            )],
+        )
+        .expect("GC fixture empty serving tree should stage");
+        manifest.current_state_scoped_ranges = Some(Box::new(
+            crate::tracked_state::attest_scoped_range_root(
+                manifest.commit_id,
+                serving_base.map(|base| {
+                    (
+                        base.commit_id,
+                        base.current_state_scoped_ranges
+                            .as_deref()
+                            .expect("GC fixture serving base should have a root"),
+                    )
+                }),
+                &manifest.mutations,
+                tree,
+            )
+            .expect("GC fixture serving root should attest"),
+        ));
     }
 
     fn test_snapshot_chunk(commit_id: CommitId) -> ([u8; 32], Bytes) {

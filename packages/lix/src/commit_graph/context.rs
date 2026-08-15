@@ -1145,6 +1145,7 @@ mod tests {
                 mutations: CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
+                authored_history_bodies: None,
                 snapshot_root: None,
             },
         )
@@ -1567,10 +1568,68 @@ mod tests {
         let alpha_second_pk = crate::row_pk::RowPk::single("alpha-second-row");
         let beta_pk = crate::row_pk::RowPk::single("beta-row");
         let created_at = ts("2026-01-02T00:00:00Z");
-        let mut read = storage
+        let source_commit_id = CommitId::for_test_label("selected-tombstone-source");
+        let source_pk = crate::row_pk::RowPk::single("selected-source-seed");
+        let source_delta = [TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: "selected-source-seed",
+                file_id: None,
+                row_pk: &source_pk,
+                change_id: change_id("selected-source-seed"),
+                commit_id: source_commit_id,
+                deleted: false,
+                created_at,
+                updated_at: created_at,
+            },
+            snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
+            metadata: crate::json_store::JsonSlotRef::None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        }];
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let source_stage = stage_commit_deltas_for_commit_state(&mut writes, &source_delta)
+            .expect("selected tombstone source should stage");
+        stage_test_commit_manifest(
+            &read,
+            &mut writes,
+            &CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 3,
+                commit_id: source_commit_id,
+                generation: 0,
+                parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: source_commit_id,
+                first_parent_jump_span: 0,
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+                created_at,
+            },
+            source_stage.mutation_inventory().clone(),
+            &source_delta,
+            None,
+        )
+        .await;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected tombstone source should commit");
+        drop(read);
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("selected tombstone read should open");
+        let source_topology = crate::tracked_state::load_published_commit_state_topology(
+            &read,
+            source_commit_id,
+        )
+        .await
+        .expect("selected tombstone source topology should load")
+        .expect("selected tombstone source topology should exist");
         let mut writes = storage.new_write_set();
         ChangelogContext::new()
             .writer(&mut read, &mut writes)
@@ -1590,7 +1649,7 @@ mod tests {
             })
             .await
             .expect("commit should stage");
-        let deltas = [
+        let mut deltas = vec![
             TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
                     schema_key: "alpha",
@@ -1643,25 +1702,39 @@ mod tests {
                 authored: false,
             },
         ];
-        let staged = stage_commit_deltas_for_commit_state(&mut writes, &deltas)
-            .expect("selected tombstones should stage");
-        stage_commit_state_manifest(
+        deltas.sort_by_key(|delta| {
+            crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                row_pk: delta.delta.row_pk,
+            })
+        });
+        let staged = crate::tracked_state::stage_addressable_commit_deltas_with_selected_source(
             &mut writes,
-            &CommitStateManifest {
-                commit_id,
-                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                replay_debt: CommitStateReplayDebt {
-                    depth: 1,
-                    rows: 3,
-                    bytes: 0,
-                },
-                mutations: staged.mutation_inventory().clone(),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
-            },
+            &deltas,
+            &vec![false; deltas.len()],
+            source_commit_id,
         )
-        .expect("selected tombstone commit-state manifest should stage");
+            .expect("selected tombstones should stage");
+        stage_test_commit_manifest(
+            &read,
+            &mut writes,
+            &CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 3,
+                commit_id,
+                generation: 0,
+                parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: commit_id,
+                first_parent_jump_span: 0,
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+                created_at,
+            },
+            staged.mutation_inventory().clone(),
+            &deltas,
+            Some(&source_topology),
+        )
+        .await;
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -2138,9 +2211,13 @@ mod tests {
             .await
             .expect("changelog append should stage");
         drop(writer);
-        let mut inventories = BTreeMap::new();
+        let records_by_id = commit_records
+            .iter()
+            .map(|record| (record.commit_id, record))
+            .collect::<BTreeMap<_, _>>();
+        let mut staged_manifests = BTreeSet::new();
         for (commit_id, members) in &commit_members {
-            let deltas = members
+            let mut deltas = members
                 .iter()
                 .map(|change| TrackedStateCommitDeltaRef {
                     delta: TrackedStateDeltaRef {
@@ -2160,16 +2237,49 @@ mod tests {
                     authored: true,
                 })
                 .collect::<Vec<_>>();
+            deltas.sort_by_key(|delta| {
+                crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+                    schema_key: delta.delta.schema_key,
+                    file_id: delta.delta.file_id,
+                    row_pk: delta.delta.row_pk,
+                })
+            });
             let staged = stage_commit_deltas_for_commit_state(&mut writes, &deltas)
                 .expect("packed commit members should stage");
-            inventories.insert(*commit_id, staged.mutation_inventory().clone());
+            stage_test_commit_manifest(
+                &read,
+                &mut writes,
+                records_by_id[commit_id],
+                staged.mutation_inventory().clone(),
+                &deltas,
+                None,
+            )
+            .await;
+            staged_manifests.insert(*commit_id);
         }
         for record in &commit_records {
-            stage_test_commit_manifest(
+            if staged_manifests.contains(&record.commit_id) {
+                continue;
+            }
+            stage_commit_state_manifest(
                 &mut writes,
-                record,
-                inventories.remove(&record.commit_id).unwrap_or_default(),
-            );
+                &CommitStateManifest {
+                    commit_id: record.commit_id,
+                    change_account_id: record.account_id.clone(),
+                    replay_debt: CommitStateReplayDebt {
+                        depth: u16::try_from(record.generation + 1)
+                            .expect("test generation should fit replay depth"),
+                        rows: 0,
+                        bytes: 0,
+                    },
+                    mutations: CommitStateMutationInventory::default(),
+                    touched_scope_filter: Default::default(),
+                    current_state_scoped_ranges: None,
+                    authored_history_bodies: None,
+                    snapshot_root: None,
+                },
+            )
+            .expect("empty test commit-state manifest should stage");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2177,12 +2287,43 @@ mod tests {
             .expect("commit should succeed");
     }
 
-    fn stage_test_commit_manifest(
+    async fn stage_test_commit_manifest(
+        read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
         writes: &mut crate::storage_adapter::StorageWriteSet,
         record: &CommitRecord,
         mutations: CommitStateMutationInventory,
+        deltas: &[TrackedStateCommitDeltaRef<'_>],
+        selected_source: Option<&crate::tracked_state::PublishedCommitStateTopology>,
     ) {
-        stage_commit_state_manifest(
+        let certified_body = crate::tracked_state::certify_authored_current_state_body(
+            read,
+            writes,
+            record.commit_id,
+            &record.account_id,
+            &mutations,
+            selected_source.is_none(),
+            deltas.iter().copied(),
+        )
+        .await
+        .expect("test authored current-state body should certify");
+        let mut publication = crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
+            read,
+            writes,
+            &[],
+            selected_source
+                .map(crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology),
+            record.commit_id,
+            &record.account_id,
+            &mutations,
+            certified_body,
+        )
+        .await
+        .expect("test native current-state root should publish");
+        publication
+            .certify_authored_history_bodies(read, writes, &record.account_id, &mutations)
+            .await
+            .expect("test authored history body inventory should certify");
+        crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             writes,
             &CommitStateManifest {
                 commit_id: record.commit_id,
@@ -2194,10 +2335,12 @@ mod tests {
                     bytes: 0,
                 },
                 mutations,
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
+                touched_scope_filter: publication.touched_scope_filter().clone(),
+                current_state_scoped_ranges: publication.root(),
+                authored_history_bodies: publication.authored_history_bodies(),
                 snapshot_root: None,
             },
+            &publication,
         )
         .expect("test commit-state manifest should stage");
     }
