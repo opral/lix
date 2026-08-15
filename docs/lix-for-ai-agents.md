@@ -53,7 +53,7 @@ Use remote mode when the repository runs on a server. See
 
 - Run agents in parallel without changing main.
 - Compare proposed results side by side.
-- Review semantic changes instead of rereading every file.
+- Review the [diff](./diffs.md) instead of rereading every file.
 - Discard a bad attempt without manual cleanup.
 
 ## Inspect the work
@@ -67,7 +67,7 @@ WHERE lixcol_branch_id = $1
 ORDER BY id;
 ```
 
-Pass the task branch id as `$1`. Note that `<schema>_history()` anchors to the active branch head, so run from main it does not show the agent's unmerged work.
+Pass the task branch id as `$1`. `<schema>_history()` anchors to the active branch head. Run it from main and it will not show the agent's unmerged work.
 
 Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole repository. It is not limited to the active branch.
 
@@ -81,4 +81,4 @@ See [Branching](./branching.md) for preview results and conflict handling.
 
 - [Getting Started](./getting-started.md): the basic setup.
 - [Branching](./branching.md): previews, conflicts, and side-by-side reads.
-- [Change History](./history.md): SQL for review and undo.
+- [History](./history.md): SQL for review and undo.

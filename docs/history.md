@@ -1,8 +1,8 @@
 ---
-description: Query typed history for branch-reachable row states and lix_change for workspace-wide activity.
+description: Query typed history for branch-reachable row states and lix_change for repository-wide activity.
 ---
 
-# Change History
+# History
 
 Typed history answers what a row looked like across the commits reachable
 from the current head. The common query needs no arguments:
@@ -30,11 +30,11 @@ the question:
 | Surface | What it answers |
 | :-- | :-- |
 | `<schema>_history()`, `lix_file_history()`, `lix_directory_history()` | Which logical revisions are reachable from a commit? |
-| `lix_change` | Which retained changes exist anywhere in this workspace? |
+| `lix_change` | Which retained changes exist anywhere in this repository? |
 
 Typed history is exposed through table-valued functions. It is schema-specific
 and commit-reachability scoped. `lix_change` is heterogeneous and
-workspace-wide. A change on an unmerged sibling branch can appear in
+repository-wide. A change on an unmerged sibling branch can appear in
 `lix_change` without appearing in history read from the active branch.
 
 For the full surface grid, insert policies, and the
@@ -108,7 +108,7 @@ ORDER BY lixcol_depth;
 ## File and directory history
 
 `lix_file_history()` and `lix_directory_history()` expose logical filesystem
-history. Their storage descriptors are not public SQL relations.
+history. Lix does not expose the underlying storage rows as SQL relations.
 
 Both follow the same active-head and explicit-anchor convention:
 
@@ -140,11 +140,12 @@ Each row records all same-commit causes in the structured
 `lixcol_source_changes` JSON array. It deliberately does not expose singular
 `lixcol_change_id`, `lixcol_schema_key`, or `lixcol_origin_key` columns.
 
-Rows are reconstructed through the anchor commit's ancestry. Equal-depth
-sibling commits are not treated as ancestors, and recursive deletion
-provenance retains the relevant ancestor tombstones.
+Lix reconstructs rows through the anchor commit's ancestry. It does not treat
+equal-depth sibling commits as ancestors. When a directory is deleted
+recursively, Lix retains the ancestor tombstones that explain each descendant
+revision.
 
-## Workspace activity with `lix_change`
+## Repository activity with `lix_change`
 
 `lix_change` contains every retained change across branches, without proving
 branch reachability. Ordinary untracked writes do not create change rows.

@@ -14,20 +14,21 @@ Lix exposes logical application data through typed SQL relations:
 | Working diffs                     | `lix_working_diff`           | `lix_working_diff_by_branch`           | `lix_diff(from_commit, to_commit)` |
 | File working diffs                | `lix_file_working_diff`      | `lix_file_working_diff_by_branch`      | —                                  |
 | Directory working diffs           | `lix_directory_working_diff` | `lix_directory_working_diff_by_branch` | —                                  |
-| Checkpoints                       | `lix_checkpoint`             | `lix_checkpoint_by_branch`             | —                                  |
+| Checkpoints                       | `lix_checkpoint`             | —                                    | `lix_checkpoint_history()`         |
 
 The history functions read revisions reachable from a commit; `lix_diff`
 compares two arbitrary commits. `lix_registered_schema*` provides schema
 discovery and `lix_key_value*` provides shared repository metadata.
-`lix_change` records repository-wide activity; [Change History](./history.md)
+`lix_change` records repository-wide activity; [History](./history.md)
 documents it together with the history functions.
 
 `lix_file` represents regular file contents only. Its public columns are `id`,
 `path`, `directory_id`, `name`, and `content`, plus the standard `lixcol_*`
 bookkeeping columns. `path` is an absolute, literal UTF-8 path and `content` is
 the file's bytes. Path characters such as spaces, `%`, `#`, `?`, and `@` are
-not URL-encoded. Symbolic links, device nodes, sockets, and other non-regular
-filesystem entries are not represented as `lix_file` rows. Executable and
+not URL-encoded. Lix does not represent symbolic
+links, device nodes, sockets, or other non-regular filesystem entries as
+`lix_file` rows. Executable and
 other permission bits are not part of the file contract.
 
 The engine defines a Lix logical path as an absolute `/`-separated sequence of
@@ -114,7 +115,7 @@ implicitly to the active branch; `_by_branch` adds `lixcol_branch_id`.
 
 Every public history read calls its table-valued function with zero or one
 commit-id argument; there are no bare history table aliases.
-[Change History](./history.md) documents the history columns, depth ordering,
+[History](./history.md) documents the history columns, depth ordering,
 composite-key lookups, and tombstones.
 
 ## Schema discovery and interoperability
@@ -175,7 +176,7 @@ for example, `aé—` has length `3` and octet length `6`.
 
 File history records revisions of the composed file projection with structured
 `lixcol_source_changes` provenance; see
-[Change History](./history.md#file-and-directory-history).
+[History](./history.md#file-and-directory-history).
 
 ## Directories
 
@@ -195,4 +196,4 @@ Inserting a file at `/a/b/c.txt` creates `/a` and `/a/b` when needed. Insert
 directories explicitly only when they should exist before any file.
 
 Directory history follows the same composed-projection semantics as file
-history; see [Change History](./history.md#file-and-directory-history).
+history; see [History](./history.md#file-and-directory-history).

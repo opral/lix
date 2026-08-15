@@ -57,7 +57,7 @@ async fn main() -> Result<(), lix::LixError> {
 ```
 
 Lix records both writes automatically. You do not need to create commits.
-Depth `0` is the current version. Higher numbers are older versions.
+Depth `0` is the state at the head. Higher numbers walk back through history.
 
 The repository is in memory and disappears when the process ends. For native
 persistence, use `lix-storage-rocksdb` or `lix-storage-filesystem`. See

@@ -12,7 +12,7 @@ operators; there are no public `lix_json_*` functions.
 | `lix_active_account_id()` | text | Active SQL-session account. |
 | `lix_active_branch_id()` | text | Active branch. |
 | `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
-| `uuidv7()` | uuid | Generate a UUIDv7 value using PostgreSQL 18 syntax. |
+| `uuidv7()` | uuid | Generate a UUIDv7 value. |
 | `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
 
 ## JSONB

@@ -4,10 +4,10 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 
 # JavaScript API Reference
 
-The main JavaScript SDK exports `openLix()` and `IndexedDbStorage` from
-`@lix-js/sdk`. Filesystem storage is provided separately by
-`@lix-js/storage-filesystem`. `openLix()` returns a `Lix` instance connected to
-a local or remote repository.
+`@lix-js/sdk` exports `openLix()`, `IndexedDbStorage`, `Row`, `Value`, and
+`bundledPluginArchives`. `@lix-js/storage-filesystem` provides filesystem
+storage. `openLix()` returns a `Lix` instance connected to a local or remote
+repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -25,7 +25,7 @@ Options:
 
 | Option      | Type                                  | Description                                                                         |
 | ----------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
-| `storage`   | `FilesystemStorage \| IndexedDbStorage` | Local storage. Omit it for memory.                                                  |
+| `storage`   | `LixStorage \| IndexedDbStorage`      | Local storage. `FilesystemStorage` and any adapter implementing `LixStorage` qualify. Omit it for memory. |
 | `server`    | `RemoteLixServerOptions`              | Connect to a remote Lix server. When present, `storage` contains only client state. |
 | `telemetry` | `LixTelemetryOptions`                 | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only.    |
 
@@ -328,6 +328,10 @@ await lix.switchBranch({ branchId });
 
 Switches the Lix instance to another branch. Plain SQL tables read and write the active branch.
 
+```ts
+type SwitchBranchReceipt = { branchId: string };
+```
+
 ### mergeBranchPreview()
 
 ```ts
@@ -401,6 +405,12 @@ type MergeConflict = {
   target: MergeConflictSide;
   source: MergeConflictSide;
 };
+
+type MergeConflictSide = {
+  kind: "added" | "modified" | "removed";
+  beforeChangeId: string | null;
+  afterChangeId: string | null;
+};
 ```
 
 ### close()
@@ -432,7 +442,7 @@ Transactions expose:
 
 ## Row
 
-Rows are returned by `execute()`.
+`execute()` returns rows.
 
 ```ts
 const row = result.rows[0]!;

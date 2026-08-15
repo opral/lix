@@ -51,7 +51,7 @@ for (const row of history.rows) {
 }
 ```
 
-Depth `0` is the current version. Higher numbers are older versions.
+Depth `0` is the state at the head. Higher numbers walk back through history.
 
 ## Undo the update
 

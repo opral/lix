@@ -11,7 +11,7 @@ You use normal file paths and bytes. Lix handles the storage details.
 
 ## Write a file
 
-Write file content through SQL in every SDK:
+Write file content with SQL. In JavaScript:
 
 ```ts
 await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
@@ -35,23 +35,22 @@ lix.execute(
 
 ## How large files are stored
 
-Lix stores file bytes in a content-addressed store. Large files are split into
-chunks. Equal chunks are stored once, even when they appear in several files,
-versions, or branches.
+Lix stores file bytes in a content-addressed store. Lix splits large files into
+chunks. It stores equal chunks once, even when they appear in several files or
+branches.
 
-This gives large files:
+The chunk store gives Lix three properties:
 
-- content verification;
+- integrity checks on stored content;
 - chunk-level deduplication;
 - garbage collection when content is no longer reachable.
 
-The content-addressed store and the server's binary transfer paths are
-implementation details. Applications use `lix_file` through SQL instead of
-calling storage or protocol internals.
+Applications never call the chunk store or the server's transfer protocol
+directly. Read and write `lix_file` with SQL.
 
 ## What belongs in the repository
 
-Store source files and the metadata needed to understand them in Lix. Derived
+Store source files in Lix, along with the metadata needed to understand them. Derived
 data such as thumbnails, waveform caches, and temporary render files can stay
 outside the repository when your application can rebuild them.
 
