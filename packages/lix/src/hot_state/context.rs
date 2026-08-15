@@ -2998,9 +2998,20 @@ mod tests {
                 .get(&typed_commit_id)
                 .expect("empty commit record should exist");
             let seed_pk = RowPk::single(format!("empty-current-state-seed-{commit_id}"));
+            let seed_schema_key = "hot_state_fixture_seed";
+            let seed_schema = serde_json::json!({
+                "$schema": lix_schema::SCHEMA_V1_URI,
+                "key": seed_schema_key,
+                "columns": [{"name":"id", "type":"text", "nullable":false}],
+                "primary_key": ["id"]
+            });
+            let seed_snapshot = serde_json::json!({
+                "id": format!("empty-current-state-seed-{commit_id}")
+            })
+            .to_string();
             let seed_delta = [TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
-                    schema_key: "hot-state-fixture-seed",
+                    schema_key: seed_schema_key,
                     file_id: None,
                     row_pk: &seed_pk,
                     change_id: ChangeId::for_test_label(&format!(
@@ -3011,8 +3022,11 @@ mod tests {
                     created_at: record.created_at,
                     updated_at: record.created_at,
                 },
-                snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
+                snapshot: crate::json_store::JsonSlotRef::Inline(&seed_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
+                snapshot_content: Some(&seed_snapshot),
+                metadata_content: None,
+                schema_definition: Some(&seed_schema),
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -3031,7 +3045,7 @@ mod tests {
             )
             .await
             .expect("empty fixture current-state seed should certify");
-            let mut publication = crate::tracked_state::
+            let publication = crate::tracked_state::
                 stage_current_state_scoped_ranges_from_published_topology_parent(
                     read,
                     &mut writes,
@@ -3043,15 +3057,6 @@ mod tests {
                 )
                 .await
                 .expect("empty current-state authority should certify");
-            publication
-                .certify_authored_history_bodies(
-                    read,
-                    &mut writes,
-                    &record.account_id,
-                    &mutations,
-                )
-                .await
-                .expect("empty history body inventory should certify");
             crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
                 &mut writes,
                 &CommitStateManifest {
@@ -3061,7 +3066,6 @@ mod tests {
                     mutations,
                     touched_scope_filter: publication.touched_scope_filter().clone(),
                     current_state_scoped_ranges: publication.root(),
-                    authored_history_bodies: publication.authored_history_bodies(),
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
                 &publication,
@@ -3289,7 +3293,6 @@ mod tests {
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
-                    authored_history_bodies: None,
                     snapshot_root: None,
                 },
             )
@@ -3358,6 +3361,9 @@ mod tests {
                 ChangeRecord,
                 crate::common::LixTimestamp,
                 crate::common::LixTimestamp,
+                Option<String>,
+                Option<String>,
+                Option<serde_json::Value>,
             )>,
         >::new();
         let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
@@ -3383,6 +3389,17 @@ mod tests {
             if row.schema_key != COMMIT_SCHEMA_KEY {
                 let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
                 stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
+                let snapshot_content = materialized.snapshot_content.as_deref();
+                let schema_definition = snapshot_content
+                    .map(|snapshot| {
+                        crate::test_support::fixture_schema_for_snapshot(
+                            &materialized.schema_key,
+                            &materialized.row_pk,
+                            snapshot,
+                        )
+                        .cloned()
+                    })
+                    .transpose()?;
                 tracked_rows_by_commit
                     .entry(commit_id_text)
                     .or_default()
@@ -3390,6 +3407,12 @@ mod tests {
                         change,
                         ts(&materialized.created_at),
                         ts(&materialized.updated_at),
+                        materialized.snapshot_content.as_deref().map(str::to_owned),
+                        materialized
+                            .metadata
+                            .as_ref()
+                            .map(|metadata| crate::serialize_row_metadata(metadata)),
+                        schema_definition,
                     ));
             }
         }
@@ -3407,7 +3430,7 @@ mod tests {
                 .unwrap_or_default();
             let commit_created_at = rows
                 .first()
-                .map(|(change, _, _)| change.created_at)
+                .map(|(change, ..)| change.created_at)
                 .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
             let generation = if let Some(parent) = parent_ids.first() {
                 let parent_generation = if let Some(generation) = generations.get(parent) {
@@ -3460,7 +3483,7 @@ mod tests {
             let typed_commit_id = CommitId::for_test_label(&commit_id);
             let root_deltas = rows
                 .iter()
-                .map(|(change, created_at, updated_at)| TrackedStateDeltaRef {
+                .map(|(change, created_at, updated_at, ..)| TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),
                     row_pk: &change.row_pk,
@@ -3474,10 +3497,13 @@ mod tests {
             let mut commit_deltas = rows
                 .iter()
                 .zip(&root_deltas)
-                .map(|((change, _, _), delta)| TrackedStateCommitDeltaRef {
+                .map(|((change, _, _, snapshot_content, metadata_content, schema), delta)| TrackedStateCommitDeltaRef {
                     delta: *delta,
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),
+                    snapshot_content: snapshot_content.as_deref(),
+                    metadata_content: metadata_content.as_deref(),
+                    schema_definition: schema.as_ref(),
                     origin_key: change.origin_key.as_deref(),
                     base_coordinate: None,
                     authored: true,
@@ -3513,7 +3539,7 @@ mod tests {
                 commit_deltas.iter().copied(),
             )
             .await?;
-            let mut publication = if let Some(parent_id) = parent_commit_id.as_ref() {
+            let publication = if let Some(parent_id) = parent_commit_id.as_ref() {
                 if let Some(parent) = staged_authorities.get(parent_id) {
                     crate::tracked_state::stage_current_state_scoped_ranges_from_staged_parent(
                         store,
@@ -3559,14 +3585,6 @@ mod tests {
                     )
                     .await?
             };
-            publication
-                .certify_authored_history_bodies(
-                    store,
-                    writes,
-                    &record.account_id,
-                    &mutation_inventory,
-                )
-                .await?;
             let authority = crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
                 writes,
                 &CommitStateManifest {
@@ -3576,7 +3594,6 @@ mod tests {
                     mutations: mutation_inventory,
                     touched_scope_filter: publication.touched_scope_filter().clone(),
                     current_state_scoped_ranges: publication.root(),
-                    authored_history_bodies: publication.authored_history_bodies(),
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
                 &publication,

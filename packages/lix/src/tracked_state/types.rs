@@ -76,6 +76,13 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) delta: TrackedStateDeltaRef<'a>,
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    /// Canonical authored bytes used to build the self-contained LXCD17
+    /// native body. A `JsonSlotRef::Ref` alone is intentionally insufficient:
+    /// history publication may not defer body authority to the JSON store.
+    pub(crate) snapshot_content: Option<&'a str>,
+    pub(crate) metadata_content: Option<&'a str>,
+    /// Exact Schema-v1 definition selected by the transaction catalog.
+    pub(crate) schema_definition: Option<&'a serde_json::Value>,
     pub(crate) origin_key: Option<&'a str>,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     pub(crate) authored: bool,
@@ -94,8 +101,9 @@ pub(crate) struct TrackedStateSingleStringReplacementRef<'a> {
     pub(crate) commit_id: CommitId,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) snapshot_content: Option<&'a str>,
+    pub(crate) metadata_content: Option<&'a str>,
+    pub(crate) schema_definition: Option<&'a serde_json::Value>,
 }
 
 /// One ordered tracked-root mutation with its insert-collision contract.
@@ -292,44 +300,6 @@ pub(crate) struct CurrentStatePartDescriptor {
     pub(crate) fragmented: bool,
 }
 
-/// Stable coordinate of one authored history body inside a canonical native
-/// current-state source descriptor.
-///
-/// The descriptor and source bytes remain the sole body authority. History
-/// stores only this authenticated coordinate so GC may reclaim obsolete
-/// scoped-range tree nodes without retaining every historical serving root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct AuthoredHistoryBodyCoordinate {
-    pub(crate) descriptor_index: u32,
-    pub(crate) row_index: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct AuthoredHistoryBodyEntry {
-    pub(crate) change_id: ChangeId,
-    pub(crate) binding_digest: [u8; 32],
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) coordinate: Option<AuthoredHistoryBodyCoordinate>,
-}
-
-/// Manifest-bound locator inventory for authored LXCD17 native bodies.
-///
-/// Entries are in exact authored-member order. Tombstones carry no coordinate;
-/// live members reference one canonical descriptor and row. The closure digest
-/// binds this inventory to the commit, mutation authority, selected serving
-/// root and complete ordered authored-member identity.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct AuthoredHistoryBodyInventory {
-    pub(crate) source_root_id: [u8; 32],
-    pub(crate) source_transition_digest: [u8; 32],
-    pub(crate) closure_digest: [u8; 32],
-    pub(crate) descriptors: Vec<CurrentStatePartDescriptor>,
-    pub(crate) entries: Vec<AuthoredHistoryBodyEntry>,
-}
-
 /// Physical source of one current-state part, with the addressing fields that
 /// source actually uses.
 ///
@@ -504,10 +474,6 @@ pub(crate) struct CommitStateManifest {
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
-    /// Exact canonical body-object coordinates for this commit's authored
-    /// history members. This is locator authority, never a second body copy.
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) authored_history_bodies: Option<Box<AuthoredHistoryBodyInventory>>,
     /// Canonical snapshot metadata when this commit was published as a root
     /// fence. The tree chunks are rebuildable by content hash; this immutable
     /// pointer is the authority that permits readers to serve them.

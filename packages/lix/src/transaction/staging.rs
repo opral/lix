@@ -387,105 +387,11 @@ impl ImmutableMutationJournalChunk {
         finalize_tail: bool,
         compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
     ) -> Result<(), LixError> {
-        if self.sealed_replacement_parts.is_some() {
-            return Ok(());
-        }
-        if !finalize_tail
-            && !self
-                .len()
-                .is_multiple_of(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS)
-        {
-            return Ok(());
-        }
-        let mut parts = Vec::with_capacity(
-            self.len()
-                .div_ceil(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS),
-        );
-        #[cfg(feature = "storage-benches")]
-        let mut generated_key_bytes = 0usize;
-        let mut first = 0usize;
-        while first < self.len() {
-            let max_candidate_len =
-                (self.len() - first).min(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS);
-            let mut key_arena = Vec::new();
-            let mut key_offsets = Vec::with_capacity(max_candidate_len);
-            for index in first..first + max_candidate_len {
-                let start = key_arena.len();
-                crate::tracked_state::encode_single_string_key_ref_into(
-                    &mut key_arena,
-                    self.schema_key(),
-                    None,
-                    self.identity(index),
-                );
-                #[cfg(feature = "storage-benches")]
-                {
-                    generated_key_bytes =
-                        generated_key_bytes.saturating_add(key_arena.len().saturating_sub(start));
-                }
-                key_offsets.push((start, key_arena.len()));
-            }
-            let mut candidate_len = max_candidate_len;
-            let encoded = loop {
-                let rows = key_offsets[..candidate_len]
-                    .iter()
-                    .enumerate()
-                    .map(
-                        |(offset, &(start, end))| crate::tracked_state::ReplacementPartRowRef {
-                            encoded_key: &key_arena[start..end],
-                            snapshot: self.snapshot_slot(first + offset),
-                            metadata: crate::json_store::JsonSlotRef::None,
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                match crate::tracked_state::encode_replacement_part_with_compressor(
-                    &rows, compressor,
-                ) {
-                    Ok(encoded)
-                        if encoded.bytes().len()
-                            <= crate::tracked_state::REPLACEMENT_PART_TARGET_BYTES
-                            || candidate_len == 1 =>
-                    {
-                        break encoded;
-                    }
-                    Ok(_) | Err(_) if candidate_len > 1 => {
-                        // The canonical commit encoder retains the rejected
-                        // suffix and admits following rows into it. A
-                        // non-final journal chunk cannot reproduce that
-                        // state across its boundary, so leave this chunk and
-                        // every later chunk for the one-pass commit encoder.
-                        if !finalize_tail {
-                            return Ok(());
-                        }
-                        candidate_len = candidate_len.div_ceil(2);
-                    }
-                    Err(error) => return Err(error),
-                    Ok(_) => unreachable!("single-row replacement part satisfies the size guard"),
-                }
-            };
-            first += candidate_len;
-            parts.push(encoded);
-        }
-        #[cfg(feature = "storage-benches")]
-        {
-            let encoded_bytes = parts.iter().map(|part| part.bytes().len()).sum::<usize>();
-            crate::storage_bench::record_crud_ownership(
-                crate::storage_bench::CRUD_OWNERSHIP_JOURNAL_SEAL,
-                self.len(),
-                generated_key_bytes,
-                encoded_bytes,
-                parts.len(),
-                0,
-                0,
-            );
-            crate::storage_bench::record_crud_ownership_transfer(
-                crate::storage_bench::CRUD_OWNERSHIP_JOURNAL_SEAL,
-                generated_key_bytes.saturating_add(encoded_bytes),
-                0,
-                encoded_bytes,
-                generated_key_bytes,
-            );
-        }
-        self.sealed_replacement_parts = Some(parts.into());
+        let _ = (finalize_tail, compressor);
+        // The removed JSON-bearing format cannot be sealed without the
+        // transaction's authenticated Schema-v1 plan. Commit lowering owns
+        // the single native encoding pass instead.
+        self.sealed_replacement_parts = None;
         Ok(())
     }
 
@@ -584,9 +490,6 @@ impl<'a> OrderedMutationJournalRowRef<'a> {
         self.chunk.snapshot(self.row_index)
     }
 
-    pub(crate) fn snapshot_slot(&self) -> crate::json_store::JsonSlotRef<'a> {
-        self.chunk.snapshot_slot(self.row_index)
-    }
 }
 
 #[derive(Clone)]
@@ -670,21 +573,6 @@ impl OrderedMutationJournal {
 
     pub(crate) fn row_count(&self) -> usize {
         self.row_count
-    }
-
-    pub(crate) fn sealed_replacement_prefix(
-        &self,
-    ) -> (usize, Vec<crate::tracked_state::EncodedReplacementPart>) {
-        let mut parts = Vec::new();
-        let mut row_count = 0usize;
-        for chunk in self.chunks.iter() {
-            let Some(sealed) = chunk.sealed_replacement_parts() else {
-                break;
-            };
-            parts.extend_from_slice(sealed);
-            row_count += chunk.len();
-        }
-        (row_count, parts)
     }
 
     pub(crate) fn commit_id(&self) -> CommitId {
@@ -4691,7 +4579,10 @@ mod tests {
         chunk
             .seal_replacement_parts(true, &mut compressor)
             .expect("final canonical sealing");
-        assert!(chunk.sealed_replacement_parts().is_some());
+        assert!(
+            chunk.sealed_replacement_parts().is_none(),
+            "the removed JSON-bearing replacement format must not be sealed"
+        );
     }
 
     #[test]

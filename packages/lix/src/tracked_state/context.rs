@@ -5227,7 +5227,6 @@ mod tests {
             mutations: Default::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
-            authored_history_bodies: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         storage::stage_commit_state_manifest(writes, &manifest)

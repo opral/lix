@@ -15,7 +15,7 @@ use crate::tracked_state::scoped_range::{
     stage_replace_scoped_range, stage_scoped_range_tree, validate_scoped_range_tree_with_staged,
 };
 use crate::tracked_state::types::{
-    AuthoredHistoryBodyInventory, ColumnarPageSource, CommitDeltaReplacementScope,
+    ColumnarPageSource, CommitDeltaReplacementScope,
     CommitStateManifest, CommitStateMutationInventory, CommitStateTouchedScopeFilter,
     CurrentStatePartDescriptor, CurrentStatePartSource, CurrentStateScopedRangeRoot,
     ReplacementPartSource,
@@ -515,7 +515,6 @@ pub(crate) struct CertifiedCommitStatePhysicalPublication {
     selected_source_commit_id: Option<CommitId>,
     root: Option<CurrentStateScopedRangeRoot>,
     touched_scope_filter: CommitStateTouchedScopeFilter,
-    authored_history_bodies: Option<AuthoredHistoryBodyInventory>,
 }
 
 impl CertifiedCommitStatePhysicalPublication {
@@ -539,34 +538,6 @@ impl CertifiedCommitStatePhysicalPublication {
         &self.touched_scope_filter
     }
 
-    pub(crate) fn authored_history_bodies(&self) -> Option<Box<AuthoredHistoryBodyInventory>> {
-        self.authored_history_bodies.clone().map(Box::new)
-    }
-
-    pub(crate) async fn certify_authored_history_bodies(
-        &mut self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        writes: &mut StorageWriteSet,
-        account_id: &str,
-        inventory: &CommitStateMutationInventory,
-    ) -> Result<(), LixError> {
-        if self.write_set_id != writes.identity() {
-            return Err(scoped_state_error(
-                "history-body locator certification belongs to another write set",
-            ));
-        }
-        self.authored_history_bodies =
-            super::storage::certify_authored_history_body_inventory(
-                store,
-                writes,
-                self.commit_id,
-                account_id,
-                inventory,
-                self.root.as_ref(),
-            )
-            .await?;
-        Ok(())
-    }
 }
 
 /// Certifies cumulative schema-family absence authority when a serving range
@@ -608,7 +579,6 @@ pub(super) fn certify_topology_touched_scope_filter_from_manifests(
             selected_source,
             filter_touched.as_deref(),
         )?,
-        authored_history_bodies: None,
     })
 }
 
@@ -884,7 +854,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 selected_source_commit_id,
                 root,
                 touched_scope_filter,
-                authored_history_bodies: None,
             });
         }
         // A disjoint columnar publication can decline when the authenticated
@@ -968,7 +937,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root: Some(initial_root),
             touched_scope_filter,
-            authored_history_bodies: None,
         });
     }
 
@@ -991,7 +959,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root,
             touched_scope_filter,
-            authored_history_bodies: None,
         });
     }
 
@@ -1010,7 +977,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                     parent_root.tree.clone(),
                 )?),
                 touched_scope_filter,
-                authored_history_bodies: None,
             });
         }
         if inventory.member_count != 0 || inventory.selected_source_commit_id.is_some() {
@@ -1024,7 +990,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root: None,
             touched_scope_filter,
-            authored_history_bodies: None,
         });
     };
     let Some(parent_root) = parent_root else {
@@ -1039,7 +1004,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root: None,
             touched_scope_filter,
-            authored_history_bodies: None,
         });
     };
     // Sustain half: the fall-through, not the `else` above. Reaching here means
@@ -1059,7 +1023,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 parent_root.tree.clone(),
             )?),
             touched_scope_filter,
-            authored_history_bodies: None,
         });
     }
     touched.sort();
@@ -1168,7 +1131,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 selected_source_commit_id,
                 root: None,
                 touched_scope_filter,
-                authored_history_bodies: None,
             });
         };
         tree = rewritten;
@@ -1194,7 +1156,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             tree,
         )?),
         touched_scope_filter,
-        authored_history_bodies: None,
     })
 }
 
@@ -1306,6 +1267,28 @@ mod tests {
         }
     }
 
+    fn native_fixture(
+        schema_key: &str,
+        row_pk: &str,
+        version: i64,
+    ) -> (&'static str, &'static serde_json::Value) {
+        let snapshot = Box::leak(
+            serde_json::json!({"id": row_pk, "version": version})
+                .to_string()
+                .into_boxed_str(),
+        );
+        let schema = Box::leak(Box::new(serde_json::json!({
+            "$schema": lix_schema::SCHEMA_V1_URI,
+            "key": schema_key,
+            "columns": [
+                {"name":"id", "type":"text", "nullable":false},
+                {"name":"version", "type":"int8", "nullable":false}
+            ],
+            "primary_key": ["id"]
+        })));
+        (snapshot, schema)
+    }
+
     fn manifest(
         commit_id: CommitId,
         _parent_commit_id: Option<CommitId>,
@@ -1322,7 +1305,6 @@ mod tests {
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
-            authored_history_bodies: None,
             snapshot_root: None,
         }
     }
@@ -1387,9 +1369,23 @@ mod tests {
             },
         };
         let mut writes = storage.new_write_set();
+        let schema = serde_json::json!({
+            "$schema": lix_schema::SCHEMA_V1_URI,
+            "key": schema_key,
+            "columns": [
+                {"name":"id", "type":"text", "nullable":false},
+                {"name":"version", "type":"int8", "nullable":false}
+            ],
+            "primary_key": ["id"]
+        });
+        let rows = ["row-000", "row-001"];
+        let snapshots = rows
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "version": 1}).to_string())
+            .collect::<Vec<_>>();
         let replacement = stage_ordered_addressable_replacement_parts(
             &mut writes,
-            ["row-000", "row-001"].into_iter().map(|identity| {
+            rows.into_iter().zip(&snapshots).map(|(identity, snapshot)| {
                 Ok(TrackedStateSingleStringReplacementRef {
                     schema_key,
                     file_id: None,
@@ -1397,8 +1393,9 @@ mod tests {
                     commit_id,
                     created_at,
                     updated_at: created_at,
-                    snapshot: JsonSlotRef::Inline("{\"version\":1}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot_content: Some(snapshot),
+                    metadata_content: None,
+                    schema_definition: Some(&schema),
                 })
             }),
             &generation,
@@ -1452,7 +1449,7 @@ mod tests {
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let identities = ["row-000", "row-001", "row-002"];
-        let replacement_scope = scope("scoped-publication");
+        let replacement_scope = scope("scoped_publication");
         let generation = CommitDeltaReplacementGeneration {
             scope: replacement_scope.clone(),
             fallback_commit_id: None,
@@ -1467,15 +1464,17 @@ mod tests {
         let replacement = stage_ordered_addressable_replacement_parts(
             &mut parent_writes,
             identities.iter().map(|identity| {
+                let (snapshot, schema) = native_fixture("scoped_publication", identity, 1);
                 Ok(TrackedStateSingleStringReplacementRef {
-                    schema_key: "scoped-publication",
+                    schema_key: "scoped_publication",
                     file_id: None,
                     row_pk: identity,
                     commit_id: parent_id,
                     created_at,
                     updated_at,
-                    snapshot: JsonSlotRef::Inline("{\"version\":1}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot_content: Some(snapshot),
+                    metadata_content: None,
+                    schema_definition: Some(schema),
                 })
             }),
             &generation,
@@ -1530,8 +1529,8 @@ mod tests {
             &parent_read,
             parent.current_state_scoped_ranges.as_deref().unwrap(),
             &[
-                encoded_key("scoped-publication", &existing),
-                encoded_key("scoped-publication", &absent),
+                encoded_key("scoped_publication", &existing),
+                encoded_key("scoped_publication", &absent),
             ],
         )
         .await
@@ -1545,10 +1544,12 @@ mod tests {
 
         let deleted = RowPk::single("row-001");
         let inserted = RowPk::single("row-003");
+        let (insert_snapshot, insert_schema) =
+            native_fixture("scoped_publication", "row-003", 2);
         let changes = [
             TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
-                    schema_key: "scoped-publication",
+                    schema_key: "scoped_publication",
                     file_id: None,
                     row_pk: &deleted,
                     change_id: ChangeId::for_test_label("scoped-delete"),
@@ -1559,13 +1560,16 @@ mod tests {
                 },
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
+                snapshot_content: None,
+                metadata_content: None,
+                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
             },
             TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
-                    schema_key: "scoped-publication",
+                    schema_key: "scoped_publication",
                     file_id: None,
                     row_pk: &inserted,
                     change_id: ChangeId::for_test_label("scoped-insert"),
@@ -1574,8 +1578,11 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: JsonSlotRef::Inline("{\"version\":2}"),
+                snapshot: JsonSlotRef::Inline(insert_snapshot),
                 metadata: JsonSlotRef::None,
+                snapshot_content: Some(insert_snapshot),
+                metadata_content: None,
+                schema_definition: Some(insert_schema),
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -1642,10 +1649,10 @@ mod tests {
             &child_read,
             child.current_state_scoped_ranges.as_deref().unwrap(),
             &[
-                encoded_key("scoped-publication", &existing),
-                encoded_key("scoped-publication", &deleted),
-                encoded_key("scoped-publication", &inserted),
-                encoded_key("scoped-publication", &absent),
+                encoded_key("scoped_publication", &existing),
+                encoded_key("scoped_publication", &deleted),
+                encoded_key("scoped_publication", &inserted),
+                encoded_key("scoped_publication", &absent),
             ],
         )
         .await
@@ -1659,8 +1666,8 @@ mod tests {
         );
         assert!(values[3].is_none(), "covered exact miss must not replay");
 
-        let first = encoded_key("scoped-publication", &existing);
-        let last = encoded_key("scoped-publication", &inserted);
+        let first = encoded_key("scoped_publication", &existing);
+        let last = encoded_key("scoped_publication", &inserted);
         let interval = scan_scoped_range_interval(
             &child_read,
             &child.current_state_scoped_ranges.as_deref().unwrap().tree,
@@ -1703,16 +1710,17 @@ mod tests {
         let parent_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_3050_0000_7000_8000_0000_0001_0000,
         ));
-        let parent = publish_replacement_scope(&storage, None, parent_id, "covered-scope").await;
+        let parent = publish_replacement_scope(&storage, None, parent_id, "covered_scope").await;
         let child_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_3050_0000_7000_8000_0000_0002_0000,
         ));
         let row = RowPk::single("row-000");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
+        let (snapshot, schema) = native_fixture("certified_new_scope", "row-000", 1);
         let change = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
-                schema_key: "certified-new-scope",
+                schema_key: "certified_new_scope",
                 file_id: None,
                 row_pk: &row,
                 change_id: ChangeId::for_test_label("certified-new-scope-change"),
@@ -1721,8 +1729,11 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":1}"),
+            snapshot: JsonSlotRef::Inline(snapshot),
             metadata: JsonSlotRef::None,
+            snapshot_content: Some(snapshot),
+            metadata_content: None,
+            schema_definition: Some(schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1797,7 +1808,7 @@ mod tests {
             .root()
             .expect("certified scope should keep serving root");
         let new_scope = crate::tracked_state::current_state_envelope::current_state_scope_prefix(
-            &scope("certified-new-scope"),
+            &scope("certified_new_scope"),
         )
         .unwrap();
         let marker = load_scoped_range_coverage_with_staged(
@@ -1829,7 +1840,9 @@ mod tests {
         let row = RowPk::single("row-000");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
-        let changes = ["alpha", "beta"].map(|schema_key| TrackedStateCommitDeltaRef {
+        let changes = ["alpha", "beta"].map(|schema_key| {
+            let (snapshot, schema) = native_fixture(schema_key, "row-000", 2);
+            TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key,
                 file_id: None,
@@ -1840,12 +1853,15 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":2}"),
+            snapshot: JsonSlotRef::Inline(snapshot),
             metadata: JsonSlotRef::None,
+            snapshot_content: Some(snapshot),
+            metadata_content: None,
+            schema_definition: Some(schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
-        });
+        }});
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -1928,6 +1944,8 @@ mod tests {
         let second_row = RowPk::single("row-001");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
+        let (first_snapshot, first_schema) = native_fixture("staged", "row-000", 2);
+        let (second_snapshot, second_schema) = native_fixture("staged", "row-001", 3);
         let first_change = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: "staged",
@@ -1939,8 +1957,11 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":2}"),
+            snapshot: JsonSlotRef::Inline(first_snapshot),
             metadata: JsonSlotRef::None,
+            snapshot_content: Some(first_snapshot),
+            metadata_content: None,
+            schema_definition: Some(first_schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1956,8 +1977,11 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":3}"),
+            snapshot: JsonSlotRef::Inline(second_snapshot),
             metadata: JsonSlotRef::None,
+            snapshot_content: Some(second_snapshot),
+            metadata_content: None,
+            schema_definition: Some(second_schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,

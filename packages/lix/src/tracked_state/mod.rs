@@ -16,14 +16,13 @@ pub(crate) mod current_state_envelope;
 mod diff;
 mod diff_id;
 mod merge;
+mod native_history_body;
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
 mod row_materialization;
 mod scoped_current_state;
 pub(crate) mod scoped_range;
 mod storage;
-#[cfg(test)]
-pub(crate) use storage::certify_authored_history_body_inventory_for_test;
 mod tree;
 mod types;
 
@@ -57,10 +56,7 @@ pub(crate) use merge::{
 pub(crate) use mutation_directory::{
     MUTATION_DIRECTORY_NODE_SPACE, collect_mutation_directory_node_ids,
 };
-pub(crate) use replacement_part::{
-    EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
-    ReplacementPartRowRef, encode_replacement_part_with_compressor,
-};
+pub(crate) use replacement_part::{EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS};
 pub(crate) use row_materialization::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
@@ -102,8 +98,6 @@ pub(crate) use storage::{
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_ordered_addressable_commit_deltas,
     stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
-    stage_preencoded_ordered_addressable_replacement_parts,
-    stage_prefixed_ordered_addressable_replacement_parts,
 };
 pub(crate) use storage::{
     RetainedPhysicalState, collect_current_state_part_json_refs,
@@ -118,8 +112,6 @@ pub(crate) use storage::{
 // deleting a manifest is a footgun that would outlive the fixture it was added
 // for. This attribute belongs to the `use` on the next line and nothing else;
 // do not insert between them.
-#[cfg(test)]
-pub(crate) use storage::stage_delete_commit_state_manifest_for_gc;
 // The storage-space constants are what the space registry
 // (`crate::storage_spaces`) and its layout invariants are built from. The
 // registry is compiled in every configuration, so these are too.

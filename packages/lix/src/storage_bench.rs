@@ -31,7 +31,7 @@ async fn stage_bench_commit_deltas(
         deltas.iter().copied(),
     )
     .await?;
-    let mut publication = crate::tracked_state::
+    let publication = crate::tracked_state::
         stage_current_state_scoped_ranges_from_published_topology_parent(
             read,
             writes,
@@ -40,14 +40,6 @@ async fn stage_bench_commit_deltas(
             crate::ANONYMOUS_ACCOUNT_ID,
             &mutations,
             certified_body,
-        )
-        .await?;
-    publication
-        .certify_authored_history_bodies(
-            read,
-            writes,
-            crate::ANONYMOUS_ACCOUNT_ID,
-            &mutations,
         )
         .await?;
     crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
@@ -63,7 +55,6 @@ async fn stage_bench_commit_deltas(
             mutations,
             touched_scope_filter: publication.touched_scope_filter().clone(),
             current_state_scoped_ranges: publication.root(),
-            authored_history_bodies: publication.authored_history_bodies(),
             snapshot_root: None,
         },
         &publication,
@@ -1797,7 +1788,6 @@ where
                 mutations: crate::tracked_state::CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
-                authored_history_bodies: None,
                 snapshot_root: None,
             },
         )?;
@@ -2020,6 +2010,9 @@ where
                 },
                 snapshot: snapshot.as_ref_slot(),
                 metadata: crate::json_store::JsonSlotRef::None,
+                snapshot_content: None,
+                metadata_content: None,
+                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,

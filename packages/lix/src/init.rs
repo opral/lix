@@ -403,11 +403,15 @@ where
             .collect::<Vec<_>>();
         let mut commit_deltas = authored_changes
             .iter()
+            .zip(&plan.changes)
             .zip(root_deltas.iter().copied())
-            .map(|(change, delta)| TrackedStateCommitDeltaRef {
+            .map(|((change, seed), delta)| TrackedStateCommitDeltaRef {
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                snapshot_content: Some(seed.snapshot_content.as_str()),
+                metadata_content: None,
+                schema_definition: crate::schema::seed_schema_definition(&change.schema_key),
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -447,7 +451,7 @@ where
             commit_deltas.iter().copied(),
         )
         .await?;
-        let mut physical_publication = crate::tracked_state::
+        let physical_publication = crate::tracked_state::
             stage_current_state_scoped_ranges_from_published_topology_parent(
                 &read,
                 &mut writes,
@@ -456,14 +460,6 @@ where
                 &plan.commit.account_id,
                 &initial_mutations,
                 initial_body,
-            )
-            .await?;
-        physical_publication
-            .certify_authored_history_bodies(
-                &read,
-                &mut writes,
-                &plan.commit.account_id,
-                &initial_mutations,
             )
             .await?;
         let _initial_state =
@@ -476,7 +472,6 @@ where
                     mutations: initial_mutations,
                     touched_scope_filter: physical_publication.touched_scope_filter().clone(),
                     current_state_scoped_ranges: physical_publication.root(),
-                    authored_history_bodies: physical_publication.authored_history_bodies(),
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
                 &physical_publication,

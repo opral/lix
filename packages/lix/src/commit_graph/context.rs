@@ -1145,7 +1145,6 @@ mod tests {
                 mutations: CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
-                authored_history_bodies: None,
                 snapshot_root: None,
             },
         )
@@ -1570,9 +1569,17 @@ mod tests {
         let created_at = ts("2026-01-02T00:00:00Z");
         let source_commit_id = CommitId::for_test_label("selected-tombstone-source");
         let source_pk = crate::row_pk::RowPk::single("selected-source-seed");
+        let source_schema_key = "selected_source_seed";
+        let source_schema = serde_json::json!({
+            "$schema": lix_schema::SCHEMA_V1_URI,
+            "key": source_schema_key,
+            "columns": [{"name":"id", "type":"text", "nullable":false}],
+            "primary_key": ["id"]
+        });
+        let source_snapshot = r#"{"id":"selected-source-seed"}"#;
         let source_delta = [TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
-                schema_key: "selected-source-seed",
+                schema_key: source_schema_key,
                 file_id: None,
                 row_pk: &source_pk,
                 change_id: change_id("selected-source-seed"),
@@ -1581,8 +1588,11 @@ mod tests {
                 created_at,
                 updated_at: created_at,
             },
-            snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
+            snapshot: crate::json_store::JsonSlotRef::Inline(source_snapshot),
             metadata: crate::json_store::JsonSlotRef::None,
+            snapshot_content: Some(source_snapshot),
+            metadata_content: None,
+            schema_definition: Some(&source_schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1663,6 +1673,9 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                snapshot_content: None,
+                metadata_content: None,
+                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1680,6 +1693,9 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                snapshot_content: None,
+                metadata_content: None,
+                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1697,6 +1713,9 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                snapshot_content: None,
+                metadata_content: None,
+                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -2030,6 +2049,7 @@ mod tests {
     #[derive(Clone)]
     struct TestChange {
         change: CommitGraphChange,
+        schema_definition: Option<serde_json::Value>,
         commit_change_ids: Vec<ChangeId>,
         parent_commit_ids: Vec<CommitId>,
     }
@@ -2054,6 +2074,7 @@ mod tests {
                     created_at: ts("2026-01-01T00:00:00Z"),
                     origin_key: None,
                 },
+                schema_definition: None,
                 commit_change_ids: change_ids
                     .iter()
                     .map(|id| ChangeId::for_test_label(id))
@@ -2073,6 +2094,14 @@ mod tests {
             snapshot_content: Option<&str>,
             created_at: &str,
         ) -> Self {
+            let snapshot_content = snapshot_content.map(|content| {
+                serde_json::json!({
+                    "id": row_pk,
+                    "payload": serde_json::from_str::<serde_json::Value>(content)
+                        .expect("test row payload should be JSON"),
+                })
+                .to_string()
+            });
             Self {
                 change: CommitGraphChange {
                     id: ChangeId::for_test_label(change_id),
@@ -2082,6 +2111,7 @@ mod tests {
                     file_id: file_id.map(str::to_string),
                     deleted: snapshot_content.is_none(),
                     snapshot: snapshot_content
+                        .as_deref()
                         .map_or(crate::json_store::JsonSlot::None, |content| {
                             crate::json_store::JsonSlot::from_json(content)
                         }),
@@ -2089,6 +2119,15 @@ mod tests {
                     created_at: ts(created_at),
                     origin_key: None,
                 },
+                schema_definition: Some(serde_json::json!({
+                    "$schema": lix_schema::SCHEMA_V1_URI,
+                    "key": schema_key,
+                    "columns": [
+                        {"name":"id", "type":"text", "nullable":false},
+                        {"name":"payload", "type":"jsonb", "nullable":false}
+                    ],
+                    "primary_key": ["id"]
+                })),
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
             }
@@ -2232,6 +2271,17 @@ mod tests {
                     },
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),
+                    snapshot_content: match change.snapshot.as_ref_slot() {
+                        crate::json_store::JsonSlotRef::Inline(content) => Some(content),
+                        crate::json_store::JsonSlotRef::None => None,
+                        crate::json_store::JsonSlotRef::Ref(_) => {
+                            panic!("test authored body must remain inline")
+                        }
+                    },
+                    metadata_content: None,
+                    schema_definition: changes_by_id
+                        .get(&change.change_id)
+                        .and_then(|change| change.schema_definition.as_ref()),
                     origin_key: change.origin_key.as_deref(),
                     base_coordinate: None,
                     authored: true,
@@ -2275,7 +2325,6 @@ mod tests {
                     mutations: CommitStateMutationInventory::default(),
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
-                    authored_history_bodies: None,
                     snapshot_root: None,
                 },
             )
@@ -2306,7 +2355,7 @@ mod tests {
         )
         .await
         .expect("test authored current-state body should certify");
-        let mut publication = crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
+        let publication = crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
             read,
             writes,
             &[],
@@ -2319,10 +2368,6 @@ mod tests {
         )
         .await
         .expect("test native current-state root should publish");
-        publication
-            .certify_authored_history_bodies(read, writes, &record.account_id, &mutations)
-            .await
-            .expect("test authored history body inventory should certify");
         crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             writes,
             &CommitStateManifest {
@@ -2337,7 +2382,6 @@ mod tests {
                 mutations,
                 touched_scope_filter: publication.touched_scope_filter().clone(),
                 current_state_scoped_ranges: publication.root(),
-                authored_history_bodies: publication.authored_history_bodies(),
                 snapshot_root: None,
             },
             &publication,

@@ -916,51 +916,32 @@ where
         .chain(history_dependencies.iter())
         .copied()
         .collect::<BTreeSet<_>>();
+    let history_manifests_missing = 0;
     let mut physical_authorities = chronology_roots.clone();
     let mut physical_dependencies = serving_dependencies.clone();
     physical_dependencies.extend(history_dependencies.iter().copied());
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
-    // Retain the delta of every graph-reachable commit that still has one.
-    //
-    // Tolerating absence is deliberate, and it is scoped to exactly this set.
-    // A repository swept by the code that shipped before this fix has commits
-    // that are graph-reachable and have no manifest, because that sweep deleted
-    // it; those manifests are gone and cannot be recomputed. Demanding one here
-    // would abort every future sweep on such a repository -- silently, because
-    // `collect_checkpoint_garbage_best_effort` swallows the error, so
-    // collection would simply stop forever while writes kept succeeding.
-    //
-    // Nothing else is relaxed. Serving dependencies, selected-source owners and
-    // physical authorities keep their existing hard demand, so a manifest
-    // missing from any of those classes still fails the sweep exactly as it
-    // does today. Within this set we *cannot* tell a commit swept before the
-    // fix from a manifest missing for a reason that should not happen -- after
-    // this fix no graph-reachable commit is ever swept, so absence is either
-    // legacy or corruption and nothing at hand separates them. Both are
-    // tolerated and both are counted, so the condition is observable rather
-    // than silent.
+    // Every graph-reachable commit is an authenticated history authority in
+    // LXCD17. A missing physical manifest is corruption; the hard-format cut
+    // deliberately has no legacy compatibility state that can be treated as an
+    // empty commit.
     let graph_reachable_ids = graph_reachable.iter().copied().collect::<Vec<_>>();
     let graph_reachable_manifests =
         crate::tracked_state::load_commit_state_manifests(store, &graph_reachable_ids).await?;
-    let mut history_manifests_missing = 0u64;
     for (commit_id, manifest) in graph_reachable_ids
         .into_iter()
         .zip(graph_reachable_manifests)
     {
-        if manifest.is_some() {
-            physical_dependencies.insert(commit_id);
-        } else {
-            history_manifests_missing += 1;
-        }
-    }
-    if history_manifests_missing > 0 {
-        tracing::warn!(
-            history_manifests_missing,
-            "repository contains commits whose history delta was reclaimed by a garbage \
-             collection sweep predating the history-retention fix; their row history is \
-             permanently truncated and cannot be recovered"
-        );
+        manifest.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "graph-reachable history commit '{commit_id}' has no authenticated physical manifest"
+                ),
+            )
+        })?;
+        physical_dependencies.insert(commit_id);
     }
     semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
@@ -1094,11 +1075,7 @@ where
                     .map(|root| root.tree.clone())
             })
             .collect::<Vec<_>>();
-        let mut descriptors = manifests
-            .values()
-            .filter_map(|manifest| manifest.authored_history_bodies.as_ref())
-            .flat_map(|inventory| inventory.descriptors.iter().cloned())
-            .collect::<Vec<_>>();
+        let mut descriptors = Vec::new();
         if !scoped_roots.is_empty() {
             let reachable =
                 crate::tracked_state::validate_scoped_range_trees(store, &scoped_roots).await?;
@@ -2613,7 +2590,9 @@ mod tests {
     /// Builds `old_root -> active` with the head at `active`, optionally
     /// omitting `old_root`'s physical manifest to model a repository already
     /// swept by the code that shipped before the history-retention fix.
-    async fn history_retention_fixture(with_old_manifest: bool) -> super::RepositoryGcPlan {
+    async fn history_retention_fixture(
+        with_old_manifest: bool,
+    ) -> Result<super::RepositoryGcPlan, LixError> {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("history retention timestamp", "2026-01-01T00:00:00Z");
@@ -2651,7 +2630,20 @@ mod tests {
         )
         .await;
 
-        let plan = run_ordinary_repository_gc(&storage).await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("history retention read should open"),
+        );
+        let mut staged = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let plan = super::stage_repository_gc_with_preconditions(
+            read,
+            &mut staged,
+            &mut preconditions,
+        )
+        .await?;
         assert!(
             !plan
                 .sweep
@@ -2659,7 +2651,7 @@ mod tests {
                 .contains(&old_root.commit_id),
             "an ancestor of the live head is what _history() reads; it must not be retired"
         );
-        plan
+        Ok(plan)
     }
 
     /// The fix: a commit reachable from the head through parent links keeps its
@@ -2667,31 +2659,24 @@ mod tests {
     /// served out of.
     #[tokio::test]
     async fn ordinary_gc_retains_the_delta_of_a_graph_reachable_commit() {
-        let plan = history_retention_fixture(true).await;
+        let plan = history_retention_fixture(true)
+            .await
+            .expect("intact graph history should remain valid");
         assert_eq!(
             plan.profile.history_manifests_missing, 0,
             "a repository with intact history reports nothing missing"
         );
     }
 
-    /// The tolerance, and its inversion against the test above: the same
-    /// repository with that manifest already reclaimed by a pre-fix sweep must
-    /// still complete a sweep, and must say so rather than tolerating silently.
-    ///
-    /// Demanding the manifest here would abort every future sweep on such a
-    /// repository, and `collect_checkpoint_garbage_best_effort` swallows the
-    /// error, so collection would stop permanently while writes kept
-    /// succeeding. Worse, `checkpoint_gc_due` derives its age limit from
-    /// `last_gc_sequence`, which only a *successful* sweep advances, so the
-    /// due-predicate would latch: every later checkpoint would pay for a
-    /// doomed full-repository sweep, forever.
+    /// The hard-format inverse: a graph-reachable commit without its LXCD17
+    /// physical manifest is corruption, never an empty-history compatibility
+    /// state.
     #[tokio::test]
-    async fn ordinary_gc_tolerates_and_counts_history_reclaimed_before_the_fix() {
-        let plan = history_retention_fixture(false).await;
-        assert_eq!(
-            plan.profile.history_manifests_missing, 1,
-            "the commit whose delta a pre-fix sweep reclaimed must be counted, not swallowed"
-        );
+    async fn ordinary_gc_rejects_graph_history_without_its_physical_manifest() {
+        let error = history_retention_fixture(false)
+            .await
+            .expect_err("missing graph history authority must fail closed");
+        assert!(error.message.contains("no authenticated physical manifest"));
     }
 
     #[tokio::test]
@@ -3273,7 +3258,7 @@ mod tests {
         )
         .await
         .expect("selected owner body should certify");
-        let mut owner_publication = crate::tracked_state::
+        let owner_publication = crate::tracked_state::
             stage_current_state_scoped_ranges_from_published_topology_parent(
                 &owner_read,
                 &mut writes,
@@ -3285,15 +3270,6 @@ mod tests {
             )
             .await
             .expect("selected owner current state should publish");
-        owner_publication
-            .certify_authored_history_bodies(
-                &owner_read,
-                &mut writes,
-                &owner.account_id,
-                &owner_mutations,
-            )
-            .await
-            .expect("selected owner history body should certify");
         crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             &mut writes,
             &CommitStateManifest {
@@ -3303,7 +3279,6 @@ mod tests {
                 mutations: owner_mutations,
                 touched_scope_filter: owner_publication.touched_scope_filter().clone(),
                 current_state_scoped_ranges: owner_publication.root(),
-                authored_history_bodies: owner_publication.authored_history_bodies(),
                 snapshot_root: Some(Box::new(test_snapshot_root(owner.commit_id))),
             },
             &owner_publication,
@@ -3939,7 +3914,6 @@ mod tests {
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
-            authored_history_bodies: None,
             snapshot_root: Some(Box::new(TrackedStateCommitRoot {
                 commit_id,
                 root_id: TrackedStateRootId::new(root_hash),
@@ -4074,7 +4048,6 @@ mod tests {
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
-            authored_history_bodies: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
@@ -5819,18 +5792,6 @@ mod tests {
         .expect("source serving root should attest");
         let mut source_manifest = test_commit_state_manifest(&commits[0], source_inventory);
         source_manifest.current_state_scoped_ranges = Some(Box::new(source_root.clone()));
-        source_manifest.authored_history_bodies =
-            crate::tracked_state::certify_authored_history_body_inventory_for_test(
-                &read,
-                &mut writes,
-                source_commit,
-                &commits[0].account_id,
-                &source_manifest.mutations,
-                &source_root,
-            )
-            .await
-            .expect("source tombstone body inventory should certify")
-            .map(Box::new);
         crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
             &mut writes,
             &source_manifest,
@@ -5846,18 +5807,6 @@ mod tests {
         )
         .expect("selected-source serving root should attest");
         let mut alias_manifest = test_commit_state_manifest(&commits[1], alias_inventory);
-        alias_manifest.authored_history_bodies =
-            crate::tracked_state::certify_authored_history_body_inventory_for_test(
-                &read,
-                &mut writes,
-                alias_commit,
-                &commits[1].account_id,
-                &alias_manifest.mutations,
-                &alias_root,
-            )
-            .await
-            .expect("selected-source local tombstone body inventory should certify")
-            .map(Box::new);
         alias_manifest.current_state_scoped_ranges = Some(Box::new(alias_root));
         crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
             &mut writes,
@@ -5883,21 +5832,6 @@ mod tests {
                     )
                     .expect("tombstone authority serving root should attest"),
                 ));
-                manifest.authored_history_bodies = crate::tracked_state::
-                    certify_authored_history_body_inventory_for_test(
-                        &read,
-                        &mut writes,
-                        authority_commit,
-                        &record.account_id,
-                        &manifest.mutations,
-                        manifest
-                            .current_state_scoped_ranges
-                            .as_deref()
-                            .expect("tombstone authority root should exist"),
-                    )
-                    .await
-                    .expect("authority tombstone body inventory should certify")
-                    .map(Box::new);
             }
             crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
                 &mut writes,
@@ -5969,10 +5903,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authority_gc_retains_immutable_packed_owner_and_sweeps_dead_standalone_fact() {
+    async fn authority_gc_retains_native_packed_owner_and_sweeps_unowned_json() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage.clone());
-        let shared_ref = stage_bare_json(&storage, r#"{"payload":"shared"}"#).await;
         let dead_only_ref = stage_bare_json(&storage, r#"{"payload":"dead-only"}"#).await;
         let live_standalone_ref =
             stage_bare_json(&storage, r#"{"payload":"live-standalone"}"#).await;
@@ -5983,13 +5916,13 @@ mod tests {
         let live_member = packed_change(
             "authority-gc-live-member",
             "live-member",
-            JsonSlot::Ref(shared_ref),
+            JsonSlot::Inline(r#"{"payload":"shared"}"#.into()),
         );
         let dead_shared_member = live_member.clone();
         let dead_only_member = packed_change(
             "authority-gc-dead-only-member",
             "dead-only-member",
-            JsonSlot::Ref(dead_only_ref),
+            JsonSlot::Inline(r#"{"payload":"dead-only"}"#.into()),
         );
         let live_standalone = packed_change(
             "authority-gc-live-standalone",
@@ -6181,14 +6114,7 @@ mod tests {
         .expect("authority GC should plan");
         assert_eq!(plan.sweep.commits, vec![dead_commit]);
         assert_eq!(plan.sweep.changes, vec![dead_standalone.change_id]);
-        assert!(
-            !plan.sweep.json_payloads.contains(&shared_ref),
-            "a payload shared with live packed history must stay live"
-        );
-        assert!(
-            !plan.sweep.json_payloads.contains(&dead_only_ref),
-            "co-resident immutable part members and their payloads remain reachable"
-        );
+        assert!(plan.sweep.json_payloads.contains(&dead_only_ref));
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -6299,15 +6225,12 @@ mod tests {
             "sidecars co-owned by retained immutable authority must survive"
         );
         drop(read);
-        assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await);
-        assert!(
-            json_ref_exists(
-                &storage,
-                crate::json_store::store::JSON_SPACE,
-                dead_only_ref,
-            )
-            .await
-        );
+        assert!(!json_ref_exists(
+            &storage,
+            crate::json_store::store::JSON_SPACE,
+            dead_only_ref,
+        )
+        .await);
         assert!(
             json_ref_exists(
                 &storage,
@@ -6340,6 +6263,19 @@ mod tests {
     }
 
     fn packed_change(change_label: &str, row_label: &str, snapshot: JsonSlot) -> ChangeRecord {
+        let snapshot = match snapshot {
+            JsonSlot::Inline(payload) => JsonSlot::Inline(
+                serde_json::json!({
+                    "id": row_label,
+                    "payload": serde_json::from_str::<serde_json::Value>(&payload)
+                        .expect("GC fixture payload should be JSON")
+                })
+                .to_string()
+                .into_boxed_str(),
+            ),
+            JsonSlot::None => JsonSlot::None,
+            JsonSlot::Ref(reference) => JsonSlot::Ref(reference),
+        };
         ChangeRecord {
             format_version: 2,
             change_id: ChangeId::for_test_label(change_label),
@@ -6435,6 +6371,12 @@ mod tests {
                 uniform_created_at: timestamp,
             },
         };
+        let schema = serde_json::json!({
+            "$schema": lix_schema::SCHEMA_V1_URI,
+            "key": "authority_gc",
+            "columns": [{"name":"id", "type":"text", "nullable":false}],
+            "primary_key": ["id"]
+        });
         let staged = stage_ordered_addressable_replacement_parts(
             writes,
             std::iter::once(Ok(TrackedStateSingleStringReplacementRef {
@@ -6444,8 +6386,9 @@ mod tests {
                 commit_id,
                 created_at: timestamp,
                 updated_at: timestamp,
-                snapshot: JsonSlotRef::Inline("{}"),
-                metadata: JsonSlotRef::None,
+                snapshot_content: Some(r#"{"id":"row"}"#),
+                metadata_content: None,
+                schema_definition: Some(&schema),
             })),
             &generation,
         )
@@ -6762,6 +6705,18 @@ mod tests {
         commit_id: CommitId,
         changes: &'a [ChangeRecord],
     ) -> Vec<TrackedStateCommitDeltaRef<'a>> {
+        static AUTHORITY_GC_SCHEMA: std::sync::LazyLock<serde_json::Value> =
+            std::sync::LazyLock::new(|| {
+                serde_json::json!({
+                    "$schema": lix_schema::SCHEMA_V1_URI,
+                    "key": "authority_gc",
+                    "columns": [
+                        {"name":"id", "type":"text", "nullable":false},
+                        {"name":"payload", "type":"jsonb", "nullable":false}
+                    ],
+                    "primary_key": ["id"]
+                })
+            });
         changes
             .iter()
             .map(|change| TrackedStateCommitDeltaRef {
@@ -6777,6 +6732,13 @@ mod tests {
                 },
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                snapshot_content: match change.snapshot.as_ref_slot() {
+                    JsonSlotRef::Inline(content) => Some(content),
+                    JsonSlotRef::None => None,
+                    JsonSlotRef::Ref(_) => panic!("authored GC fixture body must remain inline"),
+                },
+                metadata_content: None,
+                schema_definition: (!change.snapshot.is_none()).then_some(&*AUTHORITY_GC_SCHEMA),
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -6799,7 +6761,6 @@ mod tests {
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
-            authored_history_bodies: None,
             snapshot_root: None,
         }
     }
@@ -6822,7 +6783,7 @@ mod tests {
         )
         .await
         .expect("GC fixture authored current-state body should certify");
-        let mut publication = crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
+        let publication = crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
             read,
             writes,
             serving_parent.as_slice(),
@@ -6834,18 +6795,8 @@ mod tests {
         )
         .await
         .expect("GC fixture native current-state root should publish");
-        publication
-            .certify_authored_history_bodies(
-                read,
-                writes,
-                &manifest.change_account_id,
-                &manifest.mutations,
-            )
-            .await
-            .expect("GC fixture authored history body inventory should certify");
         manifest.touched_scope_filter = publication.touched_scope_filter().clone();
         manifest.current_state_scoped_ranges = publication.root();
-        manifest.authored_history_bodies = publication.authored_history_bodies();
         crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             writes,
             manifest,

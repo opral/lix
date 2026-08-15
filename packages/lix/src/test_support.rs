@@ -44,6 +44,80 @@ fn test_change_id(value: &str) -> ChangeId {
     ChangeId::for_test_label(value)
 }
 
+fn materialized_fixture_schema(
+    row: &MaterializedTrackedStateRow,
+) -> Result<&'static serde_json::Value, crate::LixError> {
+    let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+        crate::LixError::unknown("live materialized fixture omitted snapshot_content")
+    })?;
+    fixture_schema_for_snapshot(&row.schema_key, &row.row_pk, snapshot)
+}
+
+pub(crate) fn fixture_schema_for_snapshot(
+    _schema_key: &str,
+    row_pk: &crate::row_pk::RowPk,
+    snapshot: &str,
+) -> Result<&'static serde_json::Value, crate::LixError> {
+    let value: serde_json::Value = serde_json::from_str(snapshot)
+        .map_err(|error| crate::LixError::unknown(format!("fixture row is invalid JSON: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| crate::LixError::unknown("fixture row is not a JSON object"))?;
+    let pk = row_pk.as_json_array_value()?;
+    let pk = pk.as_array().expect("RowPk JSON is always an array");
+    let mut used = BTreeSet::new();
+    let mut synthetic_pk_columns = Vec::new();
+    let primary_key = pk
+        .iter()
+        .enumerate()
+        .map(|(ordinal, component)| {
+            let name = object
+                .iter()
+                .find(|(name, value)| !used.contains(name.as_str()) && *value == component)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| {
+                    let name = format!("fixture_pk_{ordinal}");
+                    synthetic_pk_columns.push(serde_json::json!({
+                        "name": name,
+                        "type": fixture_column_type(component),
+                        "nullable": false
+                    }));
+                    name
+                });
+            used.insert(name.clone());
+            name
+        })
+        .collect::<Vec<_>>();
+    let columns = synthetic_pk_columns
+        .into_iter()
+        .chain(object.iter().map(|(name, value)| {
+            serde_json::json!({
+                "name": name,
+                "type": fixture_column_type(value),
+                "nullable": value.is_null()
+            })
+        }))
+        .collect::<Vec<_>>();
+    Ok(Box::leak(Box::new(serde_json::json!({
+        "$schema": lix_schema::SCHEMA_V1_URI,
+        "key": "test_fixture",
+        "columns": columns,
+        "primary_key": primary_key
+    }))))
+}
+
+fn fixture_column_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() => "int8",
+        serde_json::Value::Number(_) => "float8",
+        serde_json::Value::String(_) => "text",
+        serde_json::Value::Null
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => "jsonb",
+    }
+}
+
 /// Seeds a branch head and matching tracked root for unit tests.
 ///
 /// A branch ref that points at a commit without a tracked root is invalid for
@@ -272,16 +346,24 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
         .zip(root_deltas.iter().copied())
         .map(|((row_index, _), delta)| {
             let change = &changes[*row_index];
-            TrackedStateCommitDeltaRef {
+            let row = &rows[*row_index];
+            Ok(TrackedStateCommitDeltaRef {
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                snapshot_content: row.snapshot_content.as_deref(),
+                metadata_content: row.metadata.as_deref(),
+                schema_definition: row
+                    .snapshot_content
+                    .is_some()
+                    .then(|| materialized_fixture_schema(row))
+                    .transpose()?,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, crate::LixError>>()?;
     commit_deltas.sort_by_key(|delta| {
         crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
             schema_key: delta.delta.schema_key,
@@ -329,7 +411,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
         ),
         None => None,
     };
-    let mut publication =
+    let publication =
         crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
             &*read,
             writes,
@@ -340,9 +422,6 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
             certified_body,
         )
         .await?;
-    publication
-        .certify_authored_history_bodies(&*read, writes, &staged.record.account_id, &mutations)
-        .await?;
     crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
         writes,
         &CommitStateManifest {
@@ -352,7 +431,6 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
             mutations,
             touched_scope_filter: publication.touched_scope_filter().clone(),
             current_state_scoped_ranges: publication.root(),
-            authored_history_bodies: publication.authored_history_bodies(),
             snapshot_root: Some(Box::new(snapshot_root)),
         },
         &publication,
@@ -414,16 +492,24 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .zip(root_deltas.iter().copied())
         .map(|((row_index, _), delta)| {
             let change = &changes[*row_index];
-            TrackedStateCommitDeltaRef {
+            let row = &rows[*row_index];
+            Ok(TrackedStateCommitDeltaRef {
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                snapshot_content: row.snapshot_content.as_deref(),
+                metadata_content: row.metadata.as_deref(),
+                schema_definition: row
+                    .snapshot_content
+                    .is_some()
+                    .then(|| materialized_fixture_schema(row))
+                    .transpose()?,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, crate::LixError>>()?;
     let typed_commit_id = test_commit_id(&commit_id_text);
     let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
     let mutations = inventories.remove(&typed_commit_id).unwrap_or_default();
@@ -477,7 +563,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         ),
         None => None,
     };
-    let mut publication =
+    let publication =
         crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
             &*read,
             writes,
@@ -488,9 +574,6 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             certified_body,
         )
         .await?;
-    publication
-        .certify_authored_history_bodies(&*read, writes, &staged.record.account_id, &mutations)
-        .await?;
     crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
         writes,
         &CommitStateManifest {
@@ -500,7 +583,6 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             mutations,
             touched_scope_filter: publication.touched_scope_filter().clone(),
             current_state_scoped_ranges: publication.root(),
-            authored_history_bodies: publication.authored_history_bodies(),
             snapshot_root: Some(Box::new(snapshot_root)),
         },
         &publication,
@@ -567,7 +649,6 @@ fn stage_test_commit_state_manifest(
         mutations,
         touched_scope_filter: Default::default(),
         current_state_scoped_ranges: None,
-        authored_history_bodies: None,
         snapshot_root: snapshot_root.map(Box::new),
     };
     crate::tracked_state::stage_commit_state_manifest(writes, &manifest)

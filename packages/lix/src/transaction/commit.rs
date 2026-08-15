@@ -623,6 +623,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &replacement_generations,
         &ordered_replacements,
         &checkpoint_commit_ids,
+        row_schema_catalog,
     ))
     .await?;
 
@@ -676,26 +677,16 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let selected_change_payloads =
         materialize_selected_change_payloads(read, &selected_change_records).await?;
 
-    stage_state_json_payloads(
+    // Current-state HOT rows still use the authenticated JsonStore for large
+    // projected cells. LXCD17 history bodies are self-contained native rows
+    // and never enter this writer.
+    stage_current_state_json_payloads(
         &mut json_writer,
         &mut writes,
         &state_rows,
         &certified_packet_root_rows,
         &certified_packet_json_refs,
     )?;
-    for journal in ordered_replacements.values() {
-        json_writer.stage_batch(
-            &mut writes,
-            JsonWritePlacementRef::OutOfBand,
-            journal.iter().filter_map(|row| match row.snapshot_slot() {
-                crate::json_store::JsonSlotRef::Ref(json_ref) => Some(
-                    NormalizedJsonRef::trusted_prehashed(row.snapshot(), *json_ref),
-                ),
-                crate::json_store::JsonSlotRef::Inline(_)
-                | crate::json_store::JsonSlotRef::None => None,
-            }),
-        )?;
-    }
 
     let branch_control_observations =
         observe_branch_head_controls(read, &tracked_roots, &state_rows, &engine_rows).await?;
@@ -744,6 +735,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &staged_commits,
         &staged_snapshot_roots,
         &external_parent_manifests,
+        row_schema_catalog,
     )
     .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
@@ -996,7 +988,7 @@ fn retain_untracked_rows_not_superseded_by_engine(
     }
 }
 
-fn stage_state_json_payloads(
+fn stage_current_state_json_payloads(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
@@ -1008,7 +1000,7 @@ fn stage_state_json_payloads(
         JsonWritePlacementRef::OutOfBand,
         state_rows
             .iter()
-            .flat_map(json_payloads_from_state_row)
+            .flat_map(current_state_json_payloads_from_row)
             .chain(
                 certified_rows_by_commit
                     .iter()
@@ -1029,6 +1021,16 @@ fn stage_state_json_payloads(
             ),
     )?;
     Ok(())
+}
+
+fn current_state_json_payloads_from_row(
+    row: PreparedStateRowRef<'_>,
+) -> impl Iterator<Item = NormalizedJsonRef<'_>> {
+    row.snapshot
+        .into_iter()
+        .chain(row.metadata)
+        .filter(|json| !json.is_inline())
+        .map(|json| NormalizedJsonRef::trusted_prehashed(json.normalized(), json.json_ref))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1060,16 +1062,6 @@ fn certified_root_json_refs(
         refs_by_commit.insert(commit_id, refs);
     }
     refs_by_commit
-}
-
-fn json_payloads_from_state_row(
-    row: PreparedStateRowRef<'_>,
-) -> impl Iterator<Item = NormalizedJsonRef<'_>> {
-    row.snapshot
-        .into_iter()
-        .chain(row.metadata)
-        .filter(|json| !json.is_inline())
-        .map(|json| NormalizedJsonRef::trusted_prehashed(json.normalized(), json.json_ref))
 }
 
 struct PreparedRowIndex {
@@ -1837,9 +1829,20 @@ fn tracked_delta_from_state_row(
     })
 }
 
-fn tracked_commit_delta_from_state_row(
-    row: PreparedStateRowRef<'_>,
-) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
+fn tracked_commit_delta_from_state_row<'a>(
+    row: PreparedStateRowRef<'a>,
+    row_schema_catalog: Option<&'a crate::catalog::CatalogSnapshot>,
+) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
+    let schema_definition = row_schema_catalog.and_then(|catalog| catalog.schema(row.schema_key));
+    #[cfg(test)]
+    let schema_definition = match (schema_definition, row.snapshot) {
+        (Some(_), _) | (None, None) => schema_definition,
+        (None, Some(snapshot)) => Some(crate::test_support::fixture_schema_for_snapshot(
+            row.schema_key,
+            row.row_pk,
+            snapshot.normalized(),
+        )?),
+    };
     Ok(TrackedStateCommitDeltaRef {
         delta: tracked_delta_from_state_row(row)?,
         snapshot: row.snapshot.map_or(
@@ -1850,6 +1853,13 @@ fn tracked_commit_delta_from_state_row(
             crate::json_store::JsonSlotRef::None,
             crate::transaction_types::StageJson::slot_ref,
         ),
+        snapshot_content: row
+            .snapshot
+            .map(crate::transaction_types::StageJson::normalized),
+        metadata_content: row
+            .metadata
+            .map(crate::transaction_types::StageJson::normalized),
+        schema_definition,
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         base_coordinate: None,
         authored: true,
@@ -1884,7 +1894,18 @@ fn tracked_delta_from_certified_root_row(
 fn tracked_commit_delta_from_certified_root_row<'a>(
     row: &'a MaterializedHotStateRow,
     json_refs: &'a CertifiedRootJsonRefs,
+    row_schema_catalog: Option<&'a crate::catalog::CatalogSnapshot>,
 ) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
+    let schema_definition = row_schema_catalog.and_then(|catalog| catalog.schema(&row.schema_key));
+    #[cfg(test)]
+    let schema_definition = match (schema_definition, row.snapshot_content.as_deref()) {
+        (Some(_), _) | (None, None) => schema_definition,
+        (None, Some(snapshot)) => Some(crate::test_support::fixture_schema_for_snapshot(
+            &row.schema_key,
+            &row.row_pk,
+            snapshot,
+        )?),
+    };
     Ok(TrackedStateCommitDeltaRef {
         delta: tracked_delta_from_certified_root_row(row)?,
         snapshot: row.snapshot_content.as_ref().map_or(
@@ -1905,6 +1926,9 @@ fn tracked_commit_delta_from_certified_root_row<'a>(
                     crate::json_store::JsonSlotRef::Ref,
                 )
             }),
+        snapshot_content: row.snapshot_content.as_deref(),
+        metadata_content: row.metadata.as_deref(),
+        schema_definition,
         origin_key: None,
         base_coordinate: None,
         authored: true,
@@ -1961,6 +1985,9 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
         metadata: record.map_or(crate::json_store::JsonSlotRef::None, |record| {
             record.metadata.as_ref_slot()
         }),
+        snapshot_content: None,
+        metadata_content: None,
+        schema_definition: None,
         origin_key: record.and_then(|record| record.origin_key.as_deref()),
         base_coordinate: None,
         authored: false,
@@ -2264,6 +2291,7 @@ async fn stage_tracked_commit_delta_index(
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     checkpoint_commit_ids: &BTreeSet<CommitId>,
+    row_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
@@ -2302,56 +2330,37 @@ async fn stage_tracked_commit_delta_index(
                         "immutable replacement journal has no lifecycle generation",
                     )
                 })?;
-            let (sealed_rows, parts) = journal.sealed_replacement_prefix();
             let created_at = generation.lifecycle_summary.uniform_created_at;
-            let stage = if sealed_rows == journal.row_count() {
-                crate::tracked_state::stage_preencoded_ordered_addressable_replacement_parts(
-                    writes,
-                    root.commit_id,
-                    journal.timestamp(),
-                    journal.row_count(),
-                    parts,
-                    generation,
-                )?
-            } else if sealed_rows > 0 {
-                crate::tracked_state::stage_prefixed_ordered_addressable_replacement_parts(
-                    writes,
-                    root.commit_id,
-                    journal.timestamp(),
-                    sealed_rows,
-                    parts,
-                    journal.iter().skip(sealed_rows).map(|row| {
-                        Ok(TrackedStateSingleStringReplacementRef {
-                            schema_key: journal.schema_key(),
-                            file_id: None,
-                            row_pk: row.identity(),
-                            commit_id: root.commit_id,
-                            created_at,
-                            updated_at: journal.timestamp(),
-                            snapshot: row.snapshot_slot(),
-                            metadata: crate::json_store::JsonSlotRef::None,
-                        })
-                    }),
-                    generation,
-                )?
-            } else {
-                crate::tracked_state::stage_ordered_addressable_replacement_parts(
-                    writes,
-                    journal.iter().map(|row| {
-                        Ok(TrackedStateSingleStringReplacementRef {
-                            schema_key: journal.schema_key(),
-                            file_id: None,
-                            row_pk: row.identity(),
-                            commit_id: root.commit_id,
-                            created_at,
-                            updated_at: journal.timestamp(),
-                            snapshot: row.snapshot_slot(),
-                            metadata: crate::json_store::JsonSlotRef::None,
-                        })
-                    }),
-                    generation,
-                )?
-            };
+            let schema_definition = row_schema_catalog
+                .and_then(|catalog| catalog.schema(journal.schema_key()))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "immutable replacement journal schema '{}' has no Schema-v1 body plan",
+                            journal.schema_key()
+                        ),
+                    )
+                })?;
+            // Sealed prefixes used the removed JSON-bearing replacement format.
+            // Re-encode the complete journal once into the sole native format.
+            let stage = crate::tracked_state::stage_ordered_addressable_replacement_parts(
+                writes,
+                journal.iter().map(|row| {
+                    Ok(TrackedStateSingleStringReplacementRef {
+                        schema_key: journal.schema_key(),
+                        file_id: None,
+                        row_pk: row.identity(),
+                        commit_id: root.commit_id,
+                        created_at,
+                        updated_at: journal.timestamp(),
+                        snapshot_content: Some(row.snapshot()),
+                        metadata_content: None,
+                        schema_definition: Some(schema_definition),
+                    })
+                }),
+                generation,
+            )?;
             inventories.insert(root.commit_id, stage.mutation_inventory().clone());
             ordered_addressable_commits.insert(root.commit_id);
             continue;
@@ -2436,7 +2445,8 @@ async fn stage_tracked_commit_delta_index(
                 } else {
                     let make_delta = |row_index| {
                         let row = state_rows.row(row_index);
-                        let mut delta = tracked_commit_delta_from_state_row(row)?;
+                        let mut delta =
+                            tracked_commit_delta_from_state_row(row, row_schema_catalog)?;
                         if let Some(created_at) = lifecycle_created_at {
                             delta.delta.created_at = created_at;
                         }
@@ -2500,7 +2510,7 @@ async fn stage_tracked_commit_delta_index(
         for &row_index in state_row_indices {
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
-            let mut delta = tracked_commit_delta_from_state_row(row)?;
+            let mut delta = tracked_commit_delta_from_state_row(row, row_schema_catalog)?;
             delta.base_coordinate =
                 row_columnar_write_sets
                     .state_row_location(row_index)
@@ -2515,7 +2525,9 @@ async fn stage_tracked_commit_delta_index(
         }
         for (row, json_refs) in certified_root_rows.iter().zip(certified_root_json_refs) {
             deltas.push(tracked_commit_delta_from_certified_root_row(
-                row, json_refs,
+                row,
+                json_refs,
+                row_schema_catalog,
             )?);
             // Certified rows are addressed by commit plus identity. They do
             // not need standalone change locators in the public ledger.
@@ -6114,6 +6126,7 @@ fn stage_commit_state_manifests<'a, S>(
         CommitId,
         crate::tracked_state::PublishedCommitStateTopology,
     >,
+    row_schema_catalog: Option<&'a crate::catalog::CatalogSnapshot>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
@@ -6187,12 +6200,23 @@ where
                 .unwrap_or_default();
             let mut deltas = indices
                 .iter()
-                .map(|&index| tracked_commit_delta_from_state_row(state_rows.row(index)))
+                .map(|&index| {
+                    tracked_commit_delta_from_state_row(
+                        state_rows.row(index),
+                        row_schema_catalog,
+                    )
+                })
                 .chain(
                     certified_rows
                         .iter()
                         .zip(certified_refs)
-                        .map(|(row, refs)| tracked_commit_delta_from_certified_root_row(row, refs)),
+                        .map(|(row, refs)| {
+                            tracked_commit_delta_from_certified_root_row(
+                                row,
+                                refs,
+                                row_schema_catalog,
+                            )
+                        }),
                 )
                 .collect::<Result<Vec<_>, LixError>>()?;
             deltas.sort_by_key(|delta| {
@@ -6218,7 +6242,7 @@ where
                 deltas,
             )
             .await?;
-            let mut catalog_publication = if record.parent_commit_ids.len() <= 1
+            let catalog_publication = if record.parent_commit_ids.len() <= 1
                 && mutations.selected_source_commit_id.is_none()
             {
                 Some(if let Some(parent) = staged_parent {
@@ -6326,22 +6350,9 @@ where
                     .await?,
                 )
             };
-            if let Some(publication) = catalog_publication.as_mut() {
-                publication
-                    .certify_authored_history_bodies(
-                        read,
-                        writes,
-                        &record.account_id,
-                        &mutations,
-                    )
-                    .await?;
-            }
             let current_state_scoped_ranges = catalog_publication
                 .as_ref()
                 .and_then(|publication| publication.root());
-            let authored_history_bodies = catalog_publication
-                .as_ref()
-                .and_then(|publication| publication.authored_history_bodies());
             let touched_scope_filter = catalog_publication.as_ref().map_or_else(
                 crate::tracked_state::incomplete_touched_scope_filter,
                 |publication| publication.touched_scope_filter().clone(),
@@ -6360,7 +6371,6 @@ where
                 mutations,
                 touched_scope_filter,
                 current_state_scoped_ranges,
-                authored_history_bodies,
                 snapshot_root: snapshot_root.map(Box::new),
             };
             let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
@@ -7591,8 +7601,8 @@ mod tests {
             0x0192_0000_0000_7000_8000_4321_0000_0000,
         ));
         let timestamp = ts("2026-01-01T00:00:00Z");
-        let mut large_snapshot = String::with_capacity(4 * 1024 * 1024 + 2);
-        large_snapshot.push('"');
+        let mut large_snapshot = String::with_capacity(4 * 1024 * 1024 + 16);
+        large_snapshot.push_str("{\"payload\":\"");
         let mut random = 0x9e37_79b9_u32;
         for _ in 0..(4 * 1024 * 1024) {
             random ^= random << 13;
@@ -7600,7 +7610,7 @@ mod tests {
             random ^= random << 5;
             large_snapshot.push(char::from(b'a' + (random % 26) as u8));
         }
-        large_snapshot.push('"');
+        large_snapshot.push_str("\"}");
         let large_snapshot = crate::common::SharedStr::from(large_snapshot);
         let mut state_rows = PreparedStateBatch::new();
         state_rows.push_parts_with_change_addressability(
@@ -7670,14 +7680,6 @@ mod tests {
             .expect("mixed certified read should open");
         let mut writes = StorageWriteSet::new();
         let certified_json_refs = certified_root_json_refs(&certified_rows);
-        stage_state_json_payloads(
-            &mut JsonStoreContext::new().writer(),
-            &mut writes,
-            &state_rows,
-            &certified_rows,
-            &certified_json_refs,
-        )
-        .expect("duplicate large ordinary and certified payload should stage once");
         let large_snapshot_ref = certified_json_refs[&commit_id][0]
             .snapshot
             .expect("large certified snapshot should use a JSON ref");
@@ -7697,6 +7699,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            None,
         )
         .await
         .expect("mixed certified delta should stage");
@@ -7704,12 +7707,13 @@ mod tests {
             .inventories
             .get(&commit_id)
             .expect("mixed certified inventory should stage");
-        let mut deltas = vec![tracked_commit_delta_from_state_row(state_rows.row(0))
+        let mut deltas = vec![tracked_commit_delta_from_state_row(state_rows.row(0), None)
             .expect("ordinary rooted delta should materialize")];
         deltas.push(
             tracked_commit_delta_from_certified_root_row(
                 &certified_rows[&commit_id][0],
                 &certified_json_refs[&commit_id][0],
+                None,
             )
             .expect("certified rooted delta should materialize"),
         );
@@ -7747,7 +7751,7 @@ mod tests {
         )
         .await
         .expect("mixed certified current-state body should certify");
-        let mut publication =
+        let publication =
             crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
                 &read,
                 &mut writes,
@@ -7759,15 +7763,6 @@ mod tests {
             )
             .await
             .expect("mixed certified current-state root should stage");
-        publication
-            .certify_authored_history_bodies(
-                &read,
-                &mut writes,
-                crate::ANONYMOUS_ACCOUNT_ID,
-                inventory,
-            )
-            .await
-            .expect("mixed certified history bodies should certify");
         crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             &mut writes,
             &CommitStateManifest {
@@ -7777,7 +7772,6 @@ mod tests {
                 mutations: inventory.clone(),
                 touched_scope_filter: publication.touched_scope_filter().clone(),
                 current_state_scoped_ranges: publication.root(),
-                authored_history_bodies: publication.authored_history_bodies(),
                 snapshot_root: Some(Box::new(snapshot_root)),
             },
             &publication,
@@ -7808,7 +7802,7 @@ mod tests {
             .expect("certified payload should be a commit member");
         assert_eq!(
             certified.change.snapshot,
-            crate::json_store::JsonSlot::Ref(large_snapshot_ref)
+            crate::json_store::JsonSlot::Inline(large_snapshot.as_str().into())
         );
         let loaded = JsonStoreContext::new()
             .load_bytes_many(
@@ -7823,8 +7817,8 @@ mod tests {
             .into_values();
         assert_eq!(
             loaded[0].as_deref(),
-            Some(large_snapshot.as_bytes()),
-            "large certified history payload must round-trip exactly"
+            None,
+            "self-contained native history must not retain a second whole-row JSON object"
         );
     }
 
@@ -9986,6 +9980,7 @@ mod tests {
             &staged,
             &BTreeMap::new(),
             &external_parent_manifests,
+            None,
         )
         .await
         .expect("child-before-parent manifests should publish parent authority first");
