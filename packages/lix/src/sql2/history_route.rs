@@ -15,7 +15,10 @@ use crate::row_pk::RowPk;
 use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest};
 
 use super::SqlHistoryQuerySource;
-use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
+use crate::sql2::change_materialization::{
+    ChangePayloadProjection, MaterializedChange, materialize_located_history_change,
+    materialize_located_history_change_with_projection,
+};
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
@@ -136,12 +139,7 @@ impl HistoryRoute {
         {
             return false;
         }
-        if !self.row_pks.is_empty()
-            && !self
-                .row_pks
-                .iter()
-                .any(|candidate| candidate == row_pk)
-        {
+        if !self.row_pks.is_empty() && !self.row_pks.iter().any(|candidate| candidate == row_pk) {
             return false;
         }
         if !self.file_ids.is_empty() {
@@ -332,6 +330,7 @@ pub(crate) fn commit_graph_history_request(
         min_depth: route.min_depth.and_then(nonnegative_u32),
         max_depth: route.max_depth.and_then(nonnegative_u32),
         include_tombstones: true,
+        hydrate_member_payloads: true,
     })
 }
 
@@ -355,6 +354,32 @@ pub(crate) async fn load_history_entries<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    load_history_entries_with_payload_projection(
+        descriptor,
+        commit_graph,
+        query_source,
+        route,
+        schema_keys,
+        metadata_projection,
+        limit,
+        ChangePayloadProjection::ALL,
+    )
+    .await
+}
+
+pub(crate) async fn load_history_entries_with_payload_projection<S>(
+    descriptor: HistoryViewDescriptor<'_>,
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    route: &HistoryRoute,
+    schema_keys: Vec<String>,
+    metadata_projection: HistoryMetadataProjection,
+    limit: Option<usize>,
+    payload_projection: ChangePayloadProjection,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     if route.invalid_as_of_commit_filter {
         return Err(invalid_history_anchor_error(
             descriptor.as_of_commit_column,
@@ -364,9 +389,11 @@ where
     if route.is_contradictory() {
         return Ok(Vec::new());
     }
-    let Some(request) = commit_graph_history_request(route, schema_keys, limit) else {
+    let Some(mut request) = commit_graph_history_request(route, schema_keys, limit) else {
         return Ok(Vec::new());
     };
+    request.hydrate_member_payloads =
+        payload_projection.snapshot_content || payload_projection.metadata;
     let as_of_commit_ids = if route.as_of_commit_ids.is_empty() {
         std::slice::from_ref(&query_source.default_as_of_commit_id)
     } else {
@@ -408,7 +435,16 @@ where
             .collect::<BTreeMap<_, _>>();
 
         for entry in entries {
-            let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
+            let change = if request.hydrate_member_payloads {
+                materialize_located_history_change(&mut json_reader, entry.change).await?
+            } else {
+                materialize_located_history_change_with_projection(
+                    &mut json_reader,
+                    entry.change,
+                    payload_projection,
+                )
+                .await?
+            };
             let commit_created_at = if metadata_projection.commit_created_at {
                 Some(
                     reachable_by_id
@@ -740,8 +776,7 @@ fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute) {
                     apply_conjunctive_values_filter(&mut route.as_of_commit_ids, values);
             }
             HistoryFilterTerm::RowPks(values) => {
-                route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.row_pks, values);
+                route.contradictory |= apply_conjunctive_values_filter(&mut route.row_pks, values);
             }
             HistoryFilterTerm::SchemaKeys(values) => {
                 route.contradictory |=
@@ -853,8 +888,8 @@ mod tests {
         CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
         CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
     };
-    use crate::row_pk::RowPk;
     use crate::json_store::{JsonSlot, JsonStoreContext};
+    use crate::row_pk::RowPk;
     use crate::sql2::HistoryQuerySource;
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
@@ -1144,6 +1179,7 @@ mod tests {
             row_pk: RowPk::single("row-1"),
             schema_key: "message".to_string(),
             file_id: None,
+            deleted: true,
             snapshot: JsonSlot::None,
             metadata: JsonSlot::None,
             created_at,

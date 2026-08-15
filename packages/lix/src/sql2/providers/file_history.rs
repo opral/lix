@@ -2642,6 +2642,7 @@ mod tests {
                 row_pk: RowPk::single(file_id),
                 schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: Some(file_id.to_string()),
+                deleted: snapshot_content.is_none(),
                 snapshot_content: snapshot_content.map(Into::into),
                 metadata: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),

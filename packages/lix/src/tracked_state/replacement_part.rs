@@ -1,8 +1,8 @@
 //! Point- and range-addressable immutable identity parts for complete replacements.
 //!
-//! A replacement part contains the ordered tracked key and canonical
-//! snapshot/metadata authority. Small JSON remains inline; large JSON keeps
-//! its content-addressed reference to avoid duplicate storage.
+//! A replacement part contains the ordered tracked key and the canonical
+//! self-contained native LXCD17 body. JSON exists only as a decoded in-memory
+//! projection; replacement storage never owns a whole-row JSON encoding.
 //! Commit-wide timestamps, change identifiers, lifecycle metadata, and the
 //! row-group set identity belong to the publishing manifest.
 
@@ -21,8 +21,8 @@ pub(crate) const REPLACEMENT_PART_MAX_ROWS: usize = 512;
 pub(crate) const REPLACEMENT_PART_TARGET_BYTES: usize = 64 * 1024;
 pub(crate) const REPLACEMENT_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI003";
-const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ003";
+const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI004";
+const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ004";
 const REPLACEMENT_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const REPLACEMENT_DIRECTORY_MAGIC: &[u8; 8] = b"LXRPD001";
 const REPLACEMENT_PART_DIGEST_CONTEXT: &str = "lix tracked-state replacement identity part v1";
@@ -35,8 +35,8 @@ const DIRECTORY_FIXED_ENTRY_BYTES: usize = DIGEST_BYTES + 4 + 2 + 4 + 4;
 pub(crate) struct ReplacementPartRowRef<'a> {
     /// Canonical bytes produced by the tracked-state key codec.
     pub(crate) encoded_key: &'a [u8],
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) native_body: &'a [u8],
+    pub(crate) native_metadata: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +86,8 @@ pub(crate) struct DecodedReplacementPart {
     key_ranges: Vec<Range<usize>>,
     snapshots: Vec<crate::json_store::JsonSlot>,
     metadata: Vec<crate::json_store::JsonSlot>,
+    native_bodies: Vec<Bytes>,
+    native_metadata: Vec<Option<Bytes>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +131,17 @@ impl DecodedReplacementPart {
         ordinal: usize,
     ) -> Result<Option<crate::json_store::JsonSlotRef<'_>>, LixError> {
         Ok(self.metadata.get(ordinal).map(|slot| slot.as_ref_slot()))
+    }
+
+    pub(crate) fn native_body(&self, ordinal: usize) -> Option<&[u8]> {
+        self.native_bodies.get(ordinal).map(Bytes::as_ref)
+    }
+
+    pub(crate) fn native_metadata(&self, ordinal: usize) -> Option<&[u8]> {
+        self.native_metadata
+            .get(ordinal)
+            .and_then(Option::as_ref)
+            .map(Bytes::as_ref)
     }
 
     pub(crate) fn find(
@@ -488,8 +501,14 @@ pub(crate) fn encode_replacement_part_with_compressor(
                 .to_be_bytes(),
         );
         encoded.extend_from_slice(suffix);
-        encode_json_slot(&mut encoded, row.snapshot, true)?;
-        encode_json_slot(&mut encoded, row.metadata, false)?;
+        encode_native_bytes(&mut encoded, row.native_body)?;
+        match row.native_metadata {
+            Some(metadata) => {
+                encoded.push(1);
+                encode_native_bytes(&mut encoded, metadata)?;
+            }
+            None => encoded.push(0),
+        }
         previous_key = row.encoded_key;
     }
     if encoded.len() > REPLACEMENT_PART_MAX_DECODED_BYTES {
@@ -598,6 +617,8 @@ pub(crate) fn decode_replacement_part(
     let mut key_ranges = Vec::with_capacity(row_count);
     let mut snapshots = Vec::with_capacity(row_count);
     let mut metadata = Vec::with_capacity(row_count);
+    let mut native_bodies = Vec::with_capacity(row_count);
+    let mut native_metadata = Vec::with_capacity(row_count);
     let mut previous_key = Vec::new();
     for _ in 0..row_count {
         let shared = usize::from(decode_u16(body, &mut cursor)?);
@@ -619,8 +640,27 @@ pub(crate) fn decode_replacement_part(
         let start = key_arena.len();
         key_arena.extend_from_slice(&key);
         key_ranges.push(start..key_arena.len());
-        snapshots.push(decode_json_slot(body, &mut cursor, true)?);
-        metadata.push(decode_json_slot(body, &mut cursor, false)?);
+        let native_body = Bytes::copy_from_slice(decode_native_bytes(body, &mut cursor)?);
+        let encoded_metadata = match *take_exact(body, &mut cursor, 1)?
+            .first()
+            .expect("one metadata tag byte")
+        {
+            0 => None,
+            1 => Some(Bytes::copy_from_slice(decode_native_bytes(body, &mut cursor)?)),
+            _ => return Err(replacement_part_error("replacement metadata tag is invalid")),
+        };
+        let decoded_key = super::codec::decode_key(&key)?;
+        snapshots.push(crate::json_store::JsonSlot::from_json(
+            &super::native_history_body::decode(&decoded_key.row_pk, &native_body)?,
+        ));
+        metadata.push(match encoded_metadata.as_deref() {
+            Some(encoded) => crate::json_store::JsonSlot::from_json(
+                &super::native_history_body::decode_metadata(encoded)?,
+            ),
+            None => crate::json_store::JsonSlot::None,
+        });
+        native_bodies.push(native_body);
+        native_metadata.push(encoded_metadata);
         previous_key = key;
     }
     if cursor != body.len() {
@@ -633,6 +673,8 @@ pub(crate) fn decode_replacement_part(
         key_ranges,
         snapshots,
         metadata,
+        native_bodies,
+        native_metadata,
     })
 }
 
@@ -666,73 +708,22 @@ fn encode_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
     Ok(())
 }
 
-fn encode_u32_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
+fn encode_native_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
     let len = u32::try_from(bytes.len())
-        .map_err(|_| replacement_part_error("replacement payload exceeds u32"))?;
+        .map_err(|_| replacement_part_error("replacement native body exceeds u32"))?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-fn encode_json_slot(
-    out: &mut Vec<u8>,
-    slot: crate::json_store::JsonSlotRef<'_>,
-    required: bool,
-) -> Result<(), LixError> {
-    match slot {
-        crate::json_store::JsonSlotRef::None if required => Err(replacement_part_error(
-            "replacement snapshot payload is missing",
-        )),
-        crate::json_store::JsonSlotRef::None => {
-            out.push(0);
-            Ok(())
-        }
-        crate::json_store::JsonSlotRef::Ref(json_ref) => {
-            out.push(1);
-            out.extend_from_slice(json_ref.as_hash_bytes());
-            Ok(())
-        }
-        crate::json_store::JsonSlotRef::Inline(json) => {
-            out.push(2);
-            encode_u32_bytes(out, json.as_bytes())
-        }
-    }
-}
-
-fn decode_json_slot(
-    encoded: &[u8],
+fn decode_native_bytes<'a>(
+    encoded: &'a [u8],
     cursor: &mut usize,
-    required: bool,
-) -> Result<crate::json_store::JsonSlot, LixError> {
-    let tag = *take_exact(encoded, cursor, 1)?
-        .first()
-        .expect("one tag byte");
-    match tag {
-        0 if required => Err(replacement_part_error(
-            "replacement snapshot payload is missing",
-        )),
-        0 => Ok(crate::json_store::JsonSlot::None),
-        1 => Ok(crate::json_store::JsonSlot::Ref(
-            crate::json_store::JsonRef::from_hash_bytes(
-                take_exact(encoded, cursor, 32)?
-                    .try_into()
-                    .expect("JSON reference width checked"),
-            ),
-        )),
-        2 => {
-            let bytes = decode_u32_bytes(encoded, cursor)?;
-            let json = std::str::from_utf8(bytes)
-                .map_err(|_| replacement_part_error("replacement inline JSON is not UTF-8"))?;
-            Ok(crate::json_store::JsonSlot::Inline(json.to_owned().into()))
-        }
-        _ => Err(replacement_part_error(
-            "replacement JSON slot has an invalid tag",
-        )),
-    }
-}
-
-fn decode_u32_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], LixError> {
+) -> Result<&'a [u8], LixError> {
     let len = usize::try_from(decode_u32(encoded, cursor)?).expect("u32 length fits usize");
+    if len == 0 {
+        return Err(replacement_part_error("replacement native body is empty"));
+    }
     take_exact(encoded, cursor, len)
 }
 
@@ -787,27 +778,50 @@ mod tests {
         decode_replacement_part_for_entry, encode_replacement_part,
     };
 
-    fn rows<'a>(keys: &'a [&'a [u8]]) -> Vec<ReplacementPartRowRef<'a>> {
-        keys.iter()
-            .map(|key| ReplacementPartRowRef {
+    fn fixture(id: &str) -> (Vec<u8>, Vec<u8>) {
+        let schema = serde_json::json!({
+            "$schema": lix_schema::SCHEMA_V1_URI,
+            "key": "replacement_fixture",
+            "columns": [
+                {"name":"id", "type":"text", "nullable":false},
+                {"name":"value", "type":"int8", "nullable":false}
+            ],
+            "primary_key": ["id"]
+        });
+        let row_pk = crate::row_pk::RowPk::single(id);
+        let key = crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+            schema_key: "replacement_fixture",
+            file_id: None,
+            row_pk: &row_pk,
+        });
+        let snapshot = serde_json::json!({"id":id, "value":1}).to_string();
+        let body = super::super::native_history_body::encode(&schema, &row_pk, &snapshot)
+            .expect("fixture native body should encode");
+        (key, body)
+    }
+
+    fn rows(fixtures: &[(Vec<u8>, Vec<u8>)]) -> Vec<ReplacementPartRowRef<'_>> {
+        fixtures.iter()
+            .map(|(key, body)| ReplacementPartRowRef {
                 encoded_key: key,
-                snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
-                metadata: crate::json_store::JsonSlotRef::None,
+                native_body: body,
+                native_metadata: None,
             })
             .collect()
     }
 
     #[test]
     fn part_round_trips_exact_points_and_rejects_wrong_digest() {
-        let encoded = encode_replacement_part(&rows(&[b"alpha", b"beta", b"gamma"]))
+        let fixtures = [fixture("alpha"), fixture("beta"), fixture("gamma")];
+        let encoded = encode_replacement_part(&rows(&fixtures))
             .expect("encode replacement part");
         let decoded = decode_replacement_part(encoded.digest(), encoded.bytes())
             .expect("decode replacement part");
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded.first_key(), Some(b"alpha".as_slice()));
-        assert_eq!(decoded.last_key(), Some(b"gamma".as_slice()));
+        assert_eq!(decoded.first_key(), Some(fixtures[0].0.as_slice()));
+        assert_eq!(decoded.last_key(), Some(fixtures[2].0.as_slice()));
         assert_eq!(
-            decoded.find(b"beta").expect("point lookup"),
+            decoded.find(&fixtures[1].0).expect("point lookup"),
             Some(super::ReplacementPartMatch { ordinal: 1 })
         );
         assert_eq!(decoded.find(b"delta").expect("missing point"), None);
@@ -819,9 +833,10 @@ mod tests {
 
     #[test]
     fn part_rejects_unsorted_rows_and_physical_corruption() {
-        assert!(encode_replacement_part(&rows(&[b"beta", b"alpha"])).is_err());
-        let encoded =
-            encode_replacement_part(&rows(&[b"alpha", b"beta"])).expect("encode replacement part");
+        let unsorted = [fixture("beta"), fixture("alpha")];
+        assert!(encode_replacement_part(&rows(&unsorted)).is_err());
+        let fixtures = [fixture("alpha"), fixture("beta")];
+        let encoded = encode_replacement_part(&rows(&fixtures)).expect("encode replacement part");
         let mut corrupt = encoded.bytes().to_vec();
         let last = corrupt.last_mut().expect("encoded part is non-empty");
         *last ^= 1;
@@ -829,34 +844,28 @@ mod tests {
     }
 
     #[test]
-    fn part_preserves_content_references_without_inlining_payloads() {
-        let snapshot_ref = crate::json_store::JsonRef::for_content(&vec![b'x'; 8 * 1024 * 1024]);
-        let metadata_ref = crate::json_store::JsonRef::for_content(&vec![b'y'; 2 * 1024 * 1024]);
+    fn part_preserves_native_metadata() {
+        let fixture = fixture("alpha");
+        let metadata = super::super::native_history_body::encode_metadata("{\"source\":\"test\"}")
+            .expect("fixture metadata should encode");
         let rows = [ReplacementPartRowRef {
-            encoded_key: b"alpha",
-            snapshot: crate::json_store::JsonSlotRef::Ref(&snapshot_ref),
-            metadata: crate::json_store::JsonSlotRef::Ref(&metadata_ref),
+            encoded_key: &fixture.0,
+            native_body: &fixture.1,
+            native_metadata: Some(&metadata),
         }];
-        let encoded = encode_replacement_part(&rows).expect("encode referenced replacement part");
-        assert!(encoded.bytes().len() < 256);
+        let encoded = encode_replacement_part(&rows).expect("encode native replacement part");
         let decoded = decode_replacement_part(encoded.digest(), encoded.bytes())
-            .expect("decode referenced replacement part");
-        assert_eq!(
-            decoded.snapshot(0).expect("snapshot slot"),
-            Some(crate::json_store::JsonSlotRef::Ref(&snapshot_ref))
-        );
-        assert_eq!(
-            decoded.metadata(0).expect("metadata slot"),
-            Some(crate::json_store::JsonSlotRef::Ref(&metadata_ref))
-        );
+            .expect("decode native replacement part");
+        assert_eq!(decoded.native_body(0), Some(fixture.1.as_slice()));
+        assert_eq!(decoded.native_metadata(0), Some(metadata.as_slice()));
     }
 
     #[test]
     fn directory_round_trips_and_routes_points_ordinals_and_ranges() {
-        let first =
-            encode_replacement_part(&rows(&[b"alpha", b"beta"])).expect("encode first part");
-        let second =
-            encode_replacement_part(&rows(&[b"delta", b"omega"])).expect("encode second part");
+        let first_fixtures = [fixture("alpha"), fixture("beta")];
+        let second_fixtures = [fixture("delta"), fixture("omega")];
+        let first = encode_replacement_part(&rows(&first_fixtures)).expect("encode first part");
+        let second = encode_replacement_part(&rows(&second_fixtures)).expect("encode second part");
         let directory = ReplacementPartDirectory::try_new(
             vec![first.directory_entry(0), second.directory_entry(2)],
             4,
@@ -870,31 +879,42 @@ mod tests {
             directory.digest().unwrap()
         );
         assert_eq!(
-            decoded.route_key(b"beta").expect("beta route").digest(),
+            decoded
+                .route_key(&first_fixtures[1].0)
+                .expect("beta route")
+                .digest(),
             first.digest()
         );
-        assert!(decoded.route_key(b"charlie").is_none());
+        let charlie = fixture("charlie");
+        assert!(decoded.route_key(&charlie.0).is_none());
         let ordinal = decoded.route_ordinal(3).expect("ordinal route");
         assert_eq!(ordinal.entry.digest(), second.digest());
         assert_eq!(ordinal.local_ordinal, 1);
         assert!(decoded.route_ordinal(4).is_none());
         assert_eq!(
-            decoded.parts_overlapping(Some(b"beta"), Some(b"omega")),
+            decoded.parts_overlapping(
+                Some(&first_fixtures[1].0),
+                Some(&second_fixtures[1].0),
+            ),
             0..2
         );
         assert_eq!(
-            decoded.parts_overlapping(Some(b"charlie"), Some(b"delta")),
+            decoded.parts_overlapping(Some(&charlie.0), Some(&second_fixtures[0].0)),
             1..1
         );
-        assert_eq!(decoded.parts_overlapping(Some(b"delta"), None), 1..2);
+        assert_eq!(
+            decoded.parts_overlapping(Some(&second_fixtures[0].0), None),
+            1..2
+        );
     }
 
     #[test]
     fn directory_rejects_gaps_overlaps_and_tampering() {
-        let first =
-            encode_replacement_part(&rows(&[b"alpha", b"beta"])).expect("encode first part");
-        let overlapping =
-            encode_replacement_part(&rows(&[b"beta", b"delta"])).expect("encode overlapping part");
+        let first_fixtures = [fixture("alpha"), fixture("beta")];
+        let overlapping_fixtures = [fixture("beta"), fixture("delta")];
+        let first = encode_replacement_part(&rows(&first_fixtures)).expect("encode first part");
+        let overlapping = encode_replacement_part(&rows(&overlapping_fixtures))
+            .expect("encode overlapping part");
         assert!(
             ReplacementPartDirectory::try_new(
                 vec![first.directory_entry(0), overlapping.directory_entry(2)],
@@ -903,8 +923,8 @@ mod tests {
             .is_err()
         );
 
-        let second =
-            encode_replacement_part(&rows(&[b"delta", b"omega"])).expect("encode second part");
+        let second_fixtures = [fixture("delta"), fixture("omega")];
+        let second = encode_replacement_part(&rows(&second_fixtures)).expect("encode second part");
         assert!(
             ReplacementPartDirectory::try_new(
                 vec![first.directory_entry(0), second.directory_entry(3)],

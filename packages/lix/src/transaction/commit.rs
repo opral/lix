@@ -20,7 +20,6 @@ use crate::changelog::{
     TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
-use crate::row_pk::RowPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::hot_state::{
@@ -31,9 +30,8 @@ use crate::hot_state::{
 use crate::json_store::{
     JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-#[cfg(test)]
-use crate::tracked_state::stage_commit_state_manifest;
 use crate::tracked_state::{
     CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
@@ -206,12 +204,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
-    Box::pin(validate_active_account_and_account_rows(
-        read,
-        &prepared_writes,
-        active_account_id,
-    ))
-    .await?;
+    validate_active_account_and_account_rows(read, &prepared_writes, active_account_id).await?;
     Box::pin(validate_account_deletions(
         read,
         &prepared_writes,
@@ -354,11 +347,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         deleted_checkpoint_files.remove(&(write.branch_id.clone(), write.file_id.clone()));
     }
     let mut insert_selection = prepared_writes.insert_selection;
-    let mut row_columnar_write_sets = prepare_row_columnar_write_sets(
-        &mut state_rows,
-        &insert_selection,
-        row_schema_catalog,
-    )?;
+    let mut row_columnar_write_sets =
+        prepare_row_columnar_write_sets(&mut state_rows, &insert_selection, row_schema_catalog)?;
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_content_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -633,6 +623,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &replacement_generations,
         &ordered_replacements,
         &checkpoint_commit_ids,
+        row_schema_catalog,
     ))
     .await?;
 
@@ -686,26 +677,16 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let selected_change_payloads =
         materialize_selected_change_payloads(read, &selected_change_records).await?;
 
-    stage_state_json_payloads(
+    // Current-state HOT rows still use the authenticated JsonStore for large
+    // projected cells. LXCD17 history bodies are self-contained native rows
+    // and never enter this writer.
+    stage_current_state_json_payloads(
         &mut json_writer,
         &mut writes,
         &state_rows,
         &certified_packet_root_rows,
         &certified_packet_json_refs,
     )?;
-    for journal in ordered_replacements.values() {
-        json_writer.stage_batch(
-            &mut writes,
-            JsonWritePlacementRef::OutOfBand,
-            journal.iter().filter_map(|row| match row.snapshot_slot() {
-                crate::json_store::JsonSlotRef::Ref(json_ref) => Some(
-                    NormalizedJsonRef::trusted_prehashed(row.snapshot(), *json_ref),
-                ),
-                crate::json_store::JsonSlotRef::Inline(_)
-                | crate::json_store::JsonSlotRef::None => None,
-            }),
-        )?;
-    }
 
     let branch_control_observations =
         observe_branch_head_controls(read, &tracked_roots, &state_rows, &engine_rows).await?;
@@ -746,10 +727,15 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut writes,
         &commit_rows,
         &staged_delta_index.inventories,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &certified_packet_root_rows,
+        &certified_packet_json_refs,
         &rootless_ordered_commits,
         &staged_commits,
         &staged_snapshot_roots,
         &external_parent_manifests,
+        row_schema_catalog,
     )
     .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
@@ -906,10 +892,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     })
 }
 
-fn certified_batch_requires_root_expansion(batch: &crate::plugin::runtime::WasmCertifiedRowBatch) -> bool {
+fn certified_batch_requires_root_expansion(
+    batch: &crate::plugin::runtime::WasmCertifiedRowBatch,
+) -> bool {
     !matches!(
         batch.format,
-        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+            | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
     )
 }
 
@@ -999,7 +988,7 @@ fn retain_untracked_rows_not_superseded_by_engine(
     }
 }
 
-fn stage_state_json_payloads(
+fn stage_current_state_json_payloads(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
@@ -1011,7 +1000,7 @@ fn stage_state_json_payloads(
         JsonWritePlacementRef::OutOfBand,
         state_rows
             .iter()
-            .flat_map(json_payloads_from_state_row)
+            .flat_map(current_state_json_payloads_from_row)
             .chain(
                 certified_rows_by_commit
                     .iter()
@@ -1032,6 +1021,16 @@ fn stage_state_json_payloads(
             ),
     )?;
     Ok(())
+}
+
+fn current_state_json_payloads_from_row(
+    row: PreparedStateRowRef<'_>,
+) -> impl Iterator<Item = NormalizedJsonRef<'_>> {
+    row.snapshot
+        .into_iter()
+        .chain(row.metadata)
+        .filter(|json| !json.is_inline())
+        .map(|json| NormalizedJsonRef::trusted_prehashed(json.normalized(), json.json_ref))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1063,16 +1062,6 @@ fn certified_root_json_refs(
         refs_by_commit.insert(commit_id, refs);
     }
     refs_by_commit
-}
-
-fn json_payloads_from_state_row(
-    row: PreparedStateRowRef<'_>,
-) -> impl Iterator<Item = NormalizedJsonRef<'_>> {
-    row.snapshot
-        .into_iter()
-        .chain(row.metadata)
-        .filter(|json| !json.is_inline())
-        .map(|json| NormalizedJsonRef::trusted_prehashed(json.normalized(), json.json_ref))
 }
 
 struct PreparedRowIndex {
@@ -1840,9 +1829,20 @@ fn tracked_delta_from_state_row(
     })
 }
 
-fn tracked_commit_delta_from_state_row(
-    row: PreparedStateRowRef<'_>,
-) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
+fn tracked_commit_delta_from_state_row<'a>(
+    row: PreparedStateRowRef<'a>,
+    row_schema_catalog: Option<&'a crate::catalog::CatalogSnapshot>,
+) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
+    let schema_definition = row_schema_catalog.and_then(|catalog| catalog.schema(row.schema_key));
+    #[cfg(test)]
+    let schema_definition = match (schema_definition, row.snapshot) {
+        (Some(_), _) | (None, None) => schema_definition,
+        (None, Some(snapshot)) => Some(crate::test_support::fixture_schema_for_snapshot(
+            row.schema_key,
+            row.row_pk,
+            snapshot.normalized(),
+        )?),
+    };
     Ok(TrackedStateCommitDeltaRef {
         delta: tracked_delta_from_state_row(row)?,
         snapshot: row.snapshot.map_or(
@@ -1853,6 +1853,13 @@ fn tracked_commit_delta_from_state_row(
             crate::json_store::JsonSlotRef::None,
             crate::transaction_types::StageJson::slot_ref,
         ),
+        snapshot_content: row
+            .snapshot
+            .map(crate::transaction_types::StageJson::normalized),
+        metadata_content: row
+            .metadata
+            .map(crate::transaction_types::StageJson::normalized),
+        schema_definition,
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         base_coordinate: None,
         authored: true,
@@ -1887,7 +1894,18 @@ fn tracked_delta_from_certified_root_row(
 fn tracked_commit_delta_from_certified_root_row<'a>(
     row: &'a MaterializedHotStateRow,
     json_refs: &'a CertifiedRootJsonRefs,
+    row_schema_catalog: Option<&'a crate::catalog::CatalogSnapshot>,
 ) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
+    let schema_definition = row_schema_catalog.and_then(|catalog| catalog.schema(&row.schema_key));
+    #[cfg(test)]
+    let schema_definition = match (schema_definition, row.snapshot_content.as_deref()) {
+        (Some(_), _) | (None, None) => schema_definition,
+        (None, Some(snapshot)) => Some(crate::test_support::fixture_schema_for_snapshot(
+            &row.schema_key,
+            &row.row_pk,
+            snapshot,
+        )?),
+    };
     Ok(TrackedStateCommitDeltaRef {
         delta: tracked_delta_from_certified_root_row(row)?,
         snapshot: row.snapshot_content.as_ref().map_or(
@@ -1908,6 +1926,9 @@ fn tracked_commit_delta_from_certified_root_row<'a>(
                     crate::json_store::JsonSlotRef::Ref,
                 )
             }),
+        snapshot_content: row.snapshot_content.as_deref(),
+        metadata_content: row.metadata.as_deref(),
+        schema_definition,
         origin_key: None,
         base_coordinate: None,
         authored: true,
@@ -1964,6 +1985,9 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
         metadata: record.map_or(crate::json_store::JsonSlotRef::None, |record| {
             record.metadata.as_ref_slot()
         }),
+        snapshot_content: None,
+        metadata_content: None,
+        schema_definition: None,
         origin_key: record.and_then(|record| record.origin_key.as_deref()),
         base_coordinate: None,
         authored: false,
@@ -2267,6 +2291,7 @@ async fn stage_tracked_commit_delta_index(
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     checkpoint_commit_ids: &BTreeSet<CommitId>,
+    row_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
@@ -2305,56 +2330,37 @@ async fn stage_tracked_commit_delta_index(
                         "immutable replacement journal has no lifecycle generation",
                     )
                 })?;
-            let (sealed_rows, parts) = journal.sealed_replacement_prefix();
             let created_at = generation.lifecycle_summary.uniform_created_at;
-            let stage = if sealed_rows == journal.row_count() {
-                crate::tracked_state::stage_preencoded_ordered_addressable_replacement_parts(
-                    writes,
-                    root.commit_id,
-                    journal.timestamp(),
-                    journal.row_count(),
-                    parts,
-                    generation,
-                )?
-            } else if sealed_rows > 0 {
-                crate::tracked_state::stage_prefixed_ordered_addressable_replacement_parts(
-                    writes,
-                    root.commit_id,
-                    journal.timestamp(),
-                    sealed_rows,
-                    parts,
-                    journal.iter().skip(sealed_rows).map(|row| {
-                        Ok(TrackedStateSingleStringReplacementRef {
-                            schema_key: journal.schema_key(),
-                            file_id: None,
-                            row_pk: row.identity(),
-                            commit_id: root.commit_id,
-                            created_at,
-                            updated_at: journal.timestamp(),
-                            snapshot: row.snapshot_slot(),
-                            metadata: crate::json_store::JsonSlotRef::None,
-                        })
-                    }),
-                    generation,
-                )?
-            } else {
-                crate::tracked_state::stage_ordered_addressable_replacement_parts(
-                    writes,
-                    journal.iter().map(|row| {
-                        Ok(TrackedStateSingleStringReplacementRef {
-                            schema_key: journal.schema_key(),
-                            file_id: None,
-                            row_pk: row.identity(),
-                            commit_id: root.commit_id,
-                            created_at,
-                            updated_at: journal.timestamp(),
-                            snapshot: row.snapshot_slot(),
-                            metadata: crate::json_store::JsonSlotRef::None,
-                        })
-                    }),
-                    generation,
-                )?
-            };
+            let schema_definition = row_schema_catalog
+                .and_then(|catalog| catalog.schema(journal.schema_key()))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "immutable replacement journal schema '{}' has no Schema-v1 body plan",
+                            journal.schema_key()
+                        ),
+                    )
+                })?;
+            // Sealed prefixes used the removed JSON-bearing replacement format.
+            // Re-encode the complete journal once into the sole native format.
+            let stage = crate::tracked_state::stage_ordered_addressable_replacement_parts(
+                writes,
+                journal.iter().map(|row| {
+                    Ok(TrackedStateSingleStringReplacementRef {
+                        schema_key: journal.schema_key(),
+                        file_id: None,
+                        row_pk: row.identity(),
+                        commit_id: root.commit_id,
+                        created_at,
+                        updated_at: journal.timestamp(),
+                        snapshot_content: Some(row.snapshot()),
+                        metadata_content: None,
+                        schema_definition: Some(schema_definition),
+                    })
+                }),
+                generation,
+            )?;
             inventories.insert(root.commit_id, stage.mutation_inventory().clone());
             ordered_addressable_commits.insert(root.commit_id);
             continue;
@@ -2439,7 +2445,8 @@ async fn stage_tracked_commit_delta_index(
                 } else {
                     let make_delta = |row_index| {
                         let row = state_rows.row(row_index);
-                        let mut delta = tracked_commit_delta_from_state_row(row)?;
+                        let mut delta =
+                            tracked_commit_delta_from_state_row(row, row_schema_catalog)?;
                         if let Some(created_at) = lifecycle_created_at {
                             delta.delta.created_at = created_at;
                         }
@@ -2503,21 +2510,24 @@ async fn stage_tracked_commit_delta_index(
         for &row_index in state_row_indices {
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
-            let mut delta = tracked_commit_delta_from_state_row(row)?;
-            delta.base_coordinate = row_columnar_write_sets
-                .state_row_location(row_index)
-                .map(
-                    |location| crate::tracked_state::TrackedStateBaseCoordinate {
-                        base_commit_id: root.commit_id,
-                        group_index: location.group_index,
-                        row_index: location.row_index,
-                    },
-                );
+            let mut delta = tracked_commit_delta_from_state_row(row, row_schema_catalog)?;
+            delta.base_coordinate =
+                row_columnar_write_sets
+                    .state_row_location(row_index)
+                    .map(
+                        |location| crate::tracked_state::TrackedStateBaseCoordinate {
+                            base_commit_id: root.commit_id,
+                            group_index: location.group_index,
+                            row_index: location.row_index,
+                        },
+                    );
             deltas.push(delta);
         }
         for (row, json_refs) in certified_root_rows.iter().zip(certified_root_json_refs) {
             deltas.push(tracked_commit_delta_from_certified_root_row(
-                row, json_refs,
+                row,
+                json_refs,
+                row_schema_catalog,
             )?);
             // Certified rows are addressed by commit plus identity. They do
             // not need standalone change locators in the public ledger.
@@ -2748,11 +2758,8 @@ fn try_stage_lossless_columnar_mutations(
     }
     let parts = crate::tracked_state::ColumnarMutationPartSet {
         owner_commit_id: *commit_id.as_uuid().as_bytes(),
-        row_group_set_id: crate::hot_state::row_group_set_id(
-            commit_id,
-            first.schema_key.as_str(),
-        )
-        .as_bytes(),
+        row_group_set_id: crate::hot_state::row_group_set_id(commit_id, first.schema_key.as_str())
+            .as_bytes(),
         manifest_digest: encoded.manifest.content_digest()?,
         schema_key: first.schema_key.to_string(),
         row_count: u32::try_from(state_row_indices.len()).map_err(|_| {
@@ -3712,8 +3719,13 @@ async fn stage_tracked_head(
     let mut controls = BTreeMap::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
-    let transaction_global_schema_keys =
-        global_branch_schema_keys(state_rows, engine_rows, tracked_roots, staged_commits, &tracked_snapshots);
+    let transaction_global_schema_keys = global_branch_schema_keys(
+        state_rows,
+        engine_rows,
+        tracked_roots,
+        staged_commits,
+        &tracked_snapshots,
+    );
 
     for root in tracked_roots_parent_first(tracked_roots)?
         .into_iter()
@@ -5577,10 +5589,9 @@ fn prepare_row_columnar_write_sets(
                     crate::hot_state::RowColumnarWriteSets::with_dense_state_rows(row_count)
                 }
                 crate::sql2::RowGroupLocations::Explicit(locations) => {
-                    let mut encoded =
-                        crate::hot_state::RowColumnarWriteSets::with_state_row_count(
-                            state_rows.len(),
-                        );
+                    let mut encoded = crate::hot_state::RowColumnarWriteSets::with_state_row_count(
+                        state_rows.len(),
+                    );
                     for (state_row_index, location) in locations.into_iter().enumerate() {
                         encoded.set_state_row_location(state_row_index, location);
                     }
@@ -5592,8 +5603,7 @@ fn prepare_row_columnar_write_sets(
         }
     }
     if let Some((commit_id, schema_key, snapshots)) = state_rows.dense_row_columnar_input() {
-        let Some(schema) = row_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
-        else {
+        let Some(schema) = row_schema_catalog.and_then(|catalog| catalog.schema(schema_key)) else {
             return Ok(crate::hot_state::RowColumnarWriteSets::new());
         };
         let Ok(spec) = crate::sql2::derive_schema_surface_spec_from_schema(schema) else {
@@ -6105,6 +6115,10 @@ fn stage_commit_state_manifests<'a, S>(
     writes: &'a mut StorageWriteSet,
     commit_rows: &'a [FinalizedCommitRow],
     mutation_inventories: &'a BTreeMap<CommitId, CommitStateMutationInventory>,
+    state_rows: &'a PreparedStateBatch,
+    tracked_row_indices_by_commit: &'a BTreeMap<CommitId, Vec<RowIndex>>,
+    certified_packet_root_rows: &'a BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
+    certified_packet_json_refs: &'a BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
     rootless_commit_ids: &'a BTreeSet<CommitId>,
     staged_commits: &'a BTreeMap<CommitId, StagedChangelogCommit>,
     snapshot_roots: &'a BTreeMap<CommitId, TrackedStateCommitRoot>,
@@ -6112,6 +6126,7 @@ fn stage_commit_state_manifests<'a, S>(
         CommitId,
         crate::tracked_state::PublishedCommitStateTopology,
     >,
+    row_schema_catalog: Option<&'a crate::catalog::CatalogSnapshot>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
@@ -6171,6 +6186,62 @@ where
             } else {
                 None
             };
+            let indices = tracked_row_indices_by_commit
+                .get(&record.commit_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let certified_rows = certified_packet_root_rows
+                .get(&record.commit_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let certified_refs = certified_packet_json_refs
+                .get(&record.commit_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut deltas = indices
+                .iter()
+                .map(|&index| {
+                    tracked_commit_delta_from_state_row(
+                        state_rows.row(index),
+                        row_schema_catalog,
+                    )
+                })
+                .chain(
+                    certified_rows
+                        .iter()
+                        .zip(certified_refs)
+                        .map(|(row, refs)| {
+                            tracked_commit_delta_from_certified_root_row(
+                                row,
+                                refs,
+                                row_schema_catalog,
+                            )
+                        }),
+                )
+                .collect::<Result<Vec<_>, LixError>>()?;
+            deltas.sort_by_key(|delta| {
+                encode_key_ref(TrackedStateKeyRef {
+                    schema_key: delta.delta.schema_key,
+                    file_id: delta.delta.file_id,
+                    row_pk: delta.delta.row_pk,
+                })
+            });
+            // Root minting is confined to an actual graph genesis. Every
+            // descendant and selected-source publication must inherit its
+            // authenticated serving root; a missing parent root is never
+            // repaired by silently constructing a partial replacement.
+            let stage_initial_root = record.parent_commit_ids.is_empty()
+                && mutations.selected_source_commit_id().is_none();
+            let certified_body = crate::tracked_state::certify_authored_current_state_body(
+                read,
+                writes,
+                record.commit_id,
+                &record.account_id,
+                &mutations,
+                stage_initial_root,
+                deltas,
+            )
+            .await?;
             let catalog_publication = if record.parent_commit_ids.len() <= 1
                 && mutations.selected_source_commit_id.is_none()
             {
@@ -6182,6 +6253,7 @@ where
                         record.commit_id,
                         &record.account_id,
                         &mutations,
+                        certified_body,
                     )
                     .await?
                 } else {
@@ -6192,6 +6264,7 @@ where
                         record.commit_id,
                         &record.account_id,
                         &mutations,
+                        certified_body,
                     )
                     .await?
                 })
@@ -6272,6 +6345,7 @@ where
                         record.commit_id,
                         &record.account_id,
                         &mutations,
+                        certified_body,
                     )
                     .await?,
                 )
@@ -6650,11 +6724,15 @@ fn merge_parent_commit_ids(mut base: Vec<CommitId>, extra: Vec<CommitId>) -> Vec
     base
 }
 
-async fn validate_active_account_and_account_rows(
-    read: &mut impl StorageAdapterRead,
-    prepared_writes: &PreparedWriteSet,
-    active_account_id: &str,
-) -> Result<(), LixError> {
+fn validate_active_account_and_account_rows<'a, R>(
+    read: &'a mut R,
+    prepared_writes: &'a PreparedWriteSet,
+    active_account_id: &'a str,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+where
+    R: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(async move {
     let account_pk = RowPk::uuid_from_canonical(active_account_id).map_err(|_| {
         LixError::new(
             "LIX_INVALID_ACCOUNT_ID",
@@ -6723,7 +6801,8 @@ async fn validate_active_account_and_account_rows(
         ));
     }
 
-    validate_prepared_account_rows(prepared_writes)
+        validate_prepared_account_rows(prepared_writes)
+    })
 }
 
 /// Shape rules for account rows carried by this commit. These read nothing and
@@ -7522,8 +7601,8 @@ mod tests {
             0x0192_0000_0000_7000_8000_4321_0000_0000,
         ));
         let timestamp = ts("2026-01-01T00:00:00Z");
-        let mut large_snapshot = String::with_capacity(4 * 1024 * 1024 + 2);
-        large_snapshot.push('"');
+        let mut large_snapshot = String::with_capacity(4 * 1024 * 1024 + 16);
+        large_snapshot.push_str("{\"payload\":\"");
         let mut random = 0x9e37_79b9_u32;
         for _ in 0..(4 * 1024 * 1024) {
             random ^= random << 13;
@@ -7531,7 +7610,7 @@ mod tests {
             random ^= random << 5;
             large_snapshot.push(char::from(b'a' + (random % 26) as u8));
         }
-        large_snapshot.push('"');
+        large_snapshot.push_str("\"}");
         let large_snapshot = crate::common::SharedStr::from(large_snapshot);
         let mut state_rows = PreparedStateBatch::new();
         state_rows.push_parts_with_change_addressability(
@@ -7601,14 +7680,6 @@ mod tests {
             .expect("mixed certified read should open");
         let mut writes = StorageWriteSet::new();
         let certified_json_refs = certified_root_json_refs(&certified_rows);
-        stage_state_json_payloads(
-            &mut JsonStoreContext::new().writer(),
-            &mut writes,
-            &state_rows,
-            &certified_rows,
-            &certified_json_refs,
-        )
-        .expect("duplicate large ordinary and certified payload should stage once");
         let large_snapshot_ref = certified_json_refs[&commit_id][0]
             .snapshot
             .expect("large certified snapshot should use a JSON ref");
@@ -7628,30 +7699,84 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            None,
         )
         .await
         .expect("mixed certified delta should stage");
-        stage_commit_state_manifest(
+        let inventory = staged_index
+            .inventories
+            .get(&commit_id)
+            .expect("mixed certified inventory should stage");
+        let mut deltas = vec![tracked_commit_delta_from_state_row(state_rows.row(0), None)
+            .expect("ordinary rooted delta should materialize")];
+        deltas.push(
+            tracked_commit_delta_from_certified_root_row(
+                &certified_rows[&commit_id][0],
+                &certified_json_refs[&commit_id][0],
+                None,
+            )
+            .expect("certified rooted delta should materialize"),
+        );
+        deltas.sort_by_key(|delta| {
+            encode_key_ref(TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                row_pk: delta.delta.row_pk,
+            })
+        });
+        let tracked_state = TrackedStateContext::new();
+        let mut root_writer = tracked_state.writer(&read, &mut writes);
+        root_writer
+            .stage_commit_root(
+                &commit_id.to_string(),
+                None,
+                deltas.iter().map(|delta| delta.delta),
+            )
+            .await
+            .expect("mixed certified snapshot root should stage");
+        let snapshot_root = root_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == commit_id)
+            .cloned()
+            .expect("mixed certified snapshot root should exist");
+        drop(root_writer);
+        let certified_body = crate::tracked_state::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            inventory,
+            true,
+            deltas.iter().copied(),
+        )
+        .await
+        .expect("mixed certified current-state body should certify");
+        let publication =
+            crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
+                &read,
+                &mut writes,
+                None,
+                commit_id,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                inventory,
+                certified_body,
+            )
+            .await
+            .expect("mixed certified current-state root should stage");
+        crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             &mut writes,
             &CommitStateManifest {
                 commit_id,
-                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                replay_debt: CommitStateReplayDebt {
-                    depth: 1,
-                    rows: 2,
-                    bytes: 2,
-                },
-                mutations: staged_index
-                    .inventories
-                    .get(&commit_id)
-                    .cloned()
-                    .expect("mixed certified inventory should stage"),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                replay_debt: CommitStateReplayDebt::default(),
+                mutations: inventory.clone(),
+                touched_scope_filter: publication.touched_scope_filter().clone(),
+                current_state_scoped_ranges: publication.root(),
+                snapshot_root: Some(Box::new(snapshot_root)),
             },
+            &publication,
         )
-        .expect("mixed certified authority should stage");
+        .expect("mixed certified rooted authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -7665,10 +7790,7 @@ mod tests {
             .expect("mixed certified records should load");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].0.schema_key, "certified_schema");
-        assert_eq!(
-            records[0].1.change_id, certified_change_id,
-            "certified packet identity must be present in the commit delta"
-        );
+        assert_eq!(records[0].1.change_id, certified_change_id);
         assert_eq!(records[1].0.schema_key, "ordinary_schema");
         let packed_members =
             crate::tracked_state::load_commit_delta_members_with_payloads(&read, commit_id)
@@ -7680,7 +7802,7 @@ mod tests {
             .expect("certified payload should be a commit member");
         assert_eq!(
             certified.change.snapshot,
-            crate::json_store::JsonSlot::Ref(large_snapshot_ref)
+            crate::json_store::JsonSlot::Inline(large_snapshot.as_str().into())
         );
         let loaded = JsonStoreContext::new()
             .load_bytes_many(
@@ -7695,8 +7817,8 @@ mod tests {
             .into_values();
         assert_eq!(
             loaded[0].as_deref(),
-            Some(large_snapshot.as_bytes()),
-            "large certified history payload must round-trip exactly"
+            None,
+            "self-contained native history must not retain a second whole-row JSON object"
         );
     }
 
@@ -9841,15 +9963,24 @@ mod tests {
             .iter()
             .map(|commit| (commit.commit_id, CommitStateMutationInventory::default()))
             .collect::<BTreeMap<_, _>>();
+        let state_rows = PreparedStateBatch::new();
+        let tracked_row_indices = BTreeMap::new();
+        let certified_rows = BTreeMap::new();
+        let certified_refs = BTreeMap::new();
         stage_commit_state_manifests(
             &read,
             &mut writes,
             &commits,
             &mutation_inventories,
+            &state_rows,
+            &tracked_row_indices,
+            &certified_rows,
+            &certified_refs,
             &rootless_commit_ids,
             &staged,
             &BTreeMap::new(),
             &external_parent_manifests,
+            None,
         )
         .await
         .expect("child-before-parent manifests should publish parent authority first");
@@ -10068,7 +10199,15 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
-        crate::test_support::seed_global_branch_head(storage.clone()).await;
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            GLOBAL_BRANCH_ID,
+            crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
+            &[materialized_seed_row(
+                crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
+            )],
+        )
+        .await;
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -10362,10 +10501,13 @@ mod tests {
         let branch_ctx = BranchContext::new();
         crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
             .await;
-        crate::test_support::seed_branch_head(
+        crate::test_support::seed_branch_head_with_rows(
             storage.clone(),
             "01920000-0000-7000-8000-0000000000a1",
             "01920000-0000-7000-8000-0000000000a1-before",
+            &[materialized_seed_row(
+                "01920000-0000-7000-8000-0000000000a1-before",
+            )],
         )
         .await;
 
@@ -10839,6 +10981,21 @@ mod tests {
 
     fn tracked_global_row(change_id: &str) -> TestPreparedStateRow {
         tracked_branch_row(GLOBAL_BRANCH_ID, change_id)
+    }
+
+    fn materialized_seed_row(commit_id: &str) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
+            row_pk: RowPk::single("seed"),
+            schema_key: "test_schema".to_owned(),
+            file_id: None,
+            snapshot_content: Some(r#"{"value":0}"#.into()),
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            change_id: ChangeId::for_test_label(&format!("{commit_id}-seed")),
+            commit_id: CommitId::for_test_label(commit_id),
+        }
     }
 
     fn tracked_branch_row(branch_id: &str, change_id: &str) -> TestPreparedStateRow {

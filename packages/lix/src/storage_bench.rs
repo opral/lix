@@ -10,7 +10,8 @@ use crate::storage_adapter::{
     StorageWriteSetError,
 };
 
-fn stage_bench_commit_deltas(
+async fn stage_bench_commit_deltas(
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],
 ) -> Result<Vec<crate::tracked_state::CommitDeltaChangeLocator>, crate::LixError> {
@@ -20,7 +21,28 @@ fn stage_bench_commit_deltas(
         .map(|delta| delta.delta.commit_id)
         .unwrap_or_default();
     let mutations = staged.mutation_inventory().clone();
-    crate::tracked_state::stage_commit_state_manifest(
+    let certified_body = crate::tracked_state::certify_authored_current_state_body(
+        read,
+        writes,
+        commit_id,
+        crate::ANONYMOUS_ACCOUNT_ID,
+        &mutations,
+        true,
+        deltas.iter().copied(),
+    )
+    .await?;
+    let publication = crate::tracked_state::
+        stage_current_state_scoped_ranges_from_published_topology_parent(
+            read,
+            writes,
+            None,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            &mutations,
+            certified_body,
+        )
+        .await?;
+    crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
         writes,
         &crate::tracked_state::CommitStateManifest {
             commit_id,
@@ -31,10 +53,11 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
+            touched_scope_filter: publication.touched_scope_filter().clone(),
+            current_state_scoped_ranges: publication.root(),
             snapshot_root: None,
         },
+        &publication,
     )?;
     Ok(staged.locators)
 }
@@ -1868,6 +1891,7 @@ where
                     min_depth: None,
                     max_depth,
                     include_tombstones: true,
+                    hydrate_member_payloads: true,
                     limit,
                 },
             )
@@ -1952,6 +1976,7 @@ pub async fn seed_commit_graph_members_for_bench<StorageImpl>(
 where
     StorageImpl: Storage,
 {
+    let read = storage.begin_read(ReadOptions::default()).await?;
     let mut writes = storage.new_write_set();
     let created_at = crate::common::LixTimestamp::expect_parse(
         "commit graph benchmark timestamp",
@@ -1968,6 +1993,7 @@ where
             "x".repeat(192)
         ));
         stage_bench_commit_deltas(
+            &read,
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
                 delta: crate::tracked_state::TrackedStateDeltaRef {
@@ -1984,11 +2010,15 @@ where
                 },
                 snapshot: snapshot.as_ref_slot(),
                 metadata: crate::json_store::JsonSlotRef::None,
+                snapshot_content: None,
+                metadata_content: None,
+                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
             }],
-        )?;
+        )
+        .await?;
     }
     storage
         .commit_write_set(writes, StorageWriteOptions::default())
@@ -2926,7 +2956,7 @@ pub struct CommitDeltaSegmentSimilarity {
 /// Cap on distinct same-length values compared pairwise per length bucket.
 const SEGMENT_SIMILARITY_BUCKET_CAP: usize = 128;
 /// How much per-segment identity a redesigned payload is allowed to hoist out.
-/// The LXCD16 direct leaf carries a 16-byte commit id, a 4-byte packed base and
+/// The direct leaf carries a 16-byte commit id, a 4-byte packed base and
 /// a small timestamp-tail dictionary; 128 bytes is a generous allowance for all
 /// of it, so this over-counts rather than under-counts the achievable win.
 const SEGMENT_IDENTITY_WINDOW_BYTES: usize = 128;
@@ -4201,6 +4231,18 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
+                (
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE.id.0,
+                    10,
+                ), // authenticated native current-state bodies
+                (
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE.id.0,
+                    10,
+                ), // native body payload-ref summaries
+                (
+                    crate::tracked_state::SCOPED_RANGE_NODE_SPACE.id.0,
+                    10,
+                ), // scoped current-state authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
             ]
@@ -4223,20 +4265,25 @@ mod tests {
         const FENCE_KEY_BYTES: usize =
             crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        // Canonical-record deletes are UUID keyed. Checkpoint rotation also
-        // retires the fixture's fixed-width working-diff identities and the
-        // branch-ref marker through their authenticated physical encodings.
+        // Canonical-record deletes are UUID keyed, while native bodies, refs,
+        // and scoped authority are addressed by 32-byte content digests.
+        // Checkpoint rotation also retires the fixture's fixed-width
+        // working-diff identities and branch-ref marker.
         const UUID_KEY_BYTES: usize = 16;
+        const CONTENT_KEY_BYTES: usize = 32;
         const WORKING_DIFF_KEY_BYTES: usize = 121;
         const WORKING_DIFF_MARKER_KEY_BYTES: usize = 37;
         let working_diff_deletes = 100;
         let marker_deletes = 1;
+        let content_deletes = 30;
         let uuid_deletes = first.staged_deletes as usize
             - working_diff_deletes
-            - marker_deletes;
+            - marker_deletes
+            - content_deletes;
         assert_eq!(
             first.key_shared_bytes,
             uuid_deletes * UUID_KEY_BYTES
+                + content_deletes * CONTENT_KEY_BYTES
                 + working_diff_deletes * WORKING_DIFF_KEY_BYTES
                 + marker_deletes * WORKING_DIFF_MARKER_KEY_BYTES
                 + FENCE_KEY_BYTES

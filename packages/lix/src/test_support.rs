@@ -44,6 +44,80 @@ fn test_change_id(value: &str) -> ChangeId {
     ChangeId::for_test_label(value)
 }
 
+fn materialized_fixture_schema(
+    row: &MaterializedTrackedStateRow,
+) -> Result<&'static serde_json::Value, crate::LixError> {
+    let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+        crate::LixError::unknown("live materialized fixture omitted snapshot_content")
+    })?;
+    fixture_schema_for_snapshot(&row.schema_key, &row.row_pk, snapshot)
+}
+
+pub(crate) fn fixture_schema_for_snapshot(
+    _schema_key: &str,
+    row_pk: &crate::row_pk::RowPk,
+    snapshot: &str,
+) -> Result<&'static serde_json::Value, crate::LixError> {
+    let value: serde_json::Value = serde_json::from_str(snapshot)
+        .map_err(|error| crate::LixError::unknown(format!("fixture row is invalid JSON: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| crate::LixError::unknown("fixture row is not a JSON object"))?;
+    let pk = row_pk.as_json_array_value()?;
+    let pk = pk.as_array().expect("RowPk JSON is always an array");
+    let mut used = BTreeSet::new();
+    let mut synthetic_pk_columns = Vec::new();
+    let primary_key = pk
+        .iter()
+        .enumerate()
+        .map(|(ordinal, component)| {
+            let name = object
+                .iter()
+                .find(|(name, value)| !used.contains(name.as_str()) && *value == component)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| {
+                    let name = format!("fixture_pk_{ordinal}");
+                    synthetic_pk_columns.push(serde_json::json!({
+                        "name": name,
+                        "type": fixture_column_type(component),
+                        "nullable": false
+                    }));
+                    name
+                });
+            used.insert(name.clone());
+            name
+        })
+        .collect::<Vec<_>>();
+    let columns = synthetic_pk_columns
+        .into_iter()
+        .chain(object.iter().map(|(name, value)| {
+            serde_json::json!({
+                "name": name,
+                "type": fixture_column_type(value),
+                "nullable": value.is_null()
+            })
+        }))
+        .collect::<Vec<_>>();
+    Ok(Box::leak(Box::new(serde_json::json!({
+        "$schema": lix_schema::SCHEMA_V1_URI,
+        "key": "test_fixture",
+        "columns": columns,
+        "primary_key": primary_key
+    }))))
+}
+
+fn fixture_column_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() => "int8",
+        serde_json::Value::Number(_) => "float8",
+        serde_json::Value::String(_) => "text",
+        serde_json::Value::Null
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => "jsonb",
+    }
+}
+
 /// Seeds a branch head and matching tracked root for unit tests.
 ///
 /// A branch ref that points at a commit without a tracked root is invalid for
@@ -266,22 +340,37 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
     // including commits that also receive a durable root. Keep rooted test
     // fixtures faithful to that invariant so deleting a root exercises the
     // same rootless recovery lane as a real repository.
-    let commit_deltas = staged
+    let mut commit_deltas = staged
         .change_commit_ids
         .iter()
         .zip(root_deltas.iter().copied())
         .map(|((row_index, _), delta)| {
             let change = &changes[*row_index];
-            TrackedStateCommitDeltaRef {
+            let row = &rows[*row_index];
+            Ok(TrackedStateCommitDeltaRef {
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                snapshot_content: row.snapshot_content.as_deref(),
+                metadata_content: row.metadata.as_deref(),
+                schema_definition: row
+                    .snapshot_content
+                    .is_some()
+                    .then(|| materialized_fixture_schema(row))
+                    .transpose()?,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, crate::LixError>>()?;
+    commit_deltas.sort_by_key(|delta| {
+        crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+            schema_key: delta.delta.schema_key,
+            file_id: delta.delta.file_id,
+            row_pk: delta.delta.row_pk,
+        })
+    });
     let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
     let mut root_writer = tracked_state.writer(read, writes);
     root_writer
@@ -301,74 +390,52 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
     drop(root_writer);
     let mutations = inventories.remove(&commit_id).unwrap_or_default();
     reject_unconsumed_test_inventories(&inventories, commit_id)?;
-    stage_test_commit_state_manifest(writes, &staged, mutations, Some(snapshot_root))?;
+    let certified_body = crate::tracked_state::certify_authored_current_state_body(
+        &*read,
+        writes,
+        commit_id,
+        &staged.record.account_id,
+        &mutations,
+        parent_commit_id_text.is_none(),
+        commit_deltas.iter().copied(),
+    )
+    .await?;
+    let parent = match parent_commit_id_text.as_deref() {
+        Some(parent_id) => Some(
+            crate::tracked_state::load_published_commit_state_topology(
+                &*read,
+                test_commit_id(parent_id),
+            )
+            .await?
+            .ok_or_else(|| crate::LixError::unknown("test current-state parent is missing"))?,
+        ),
+        None => None,
+    };
+    let publication =
+        crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
+            &*read,
+            writes,
+            parent.as_ref(),
+            commit_id,
+            &staged.record.account_id,
+            &mutations,
+            certified_body,
+        )
+        .await?;
+    crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+        writes,
+        &CommitStateManifest {
+            commit_id,
+            change_account_id: staged.record.account_id.clone(),
+            replay_debt: CommitStateReplayDebt::default(),
+            mutations,
+            touched_scope_filter: publication.touched_scope_filter().clone(),
+            current_state_scoped_ranges: publication.root(),
+            snapshot_root: Some(Box::new(snapshot_root)),
+        },
+        &publication,
+    )?;
     Ok(())
-}
-
-#[cfg(test)]
-pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
-    read: &mut (impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    commit_id: &str,
-    parent_commit_id: Option<&str>,
-    rows: &[MaterializedTrackedStateRow],
-) -> Result<(), crate::LixError> {
-    let commit_id = test_commit_id(commit_id);
-    let commit_id_text = commit_id.to_string();
-    let parent_id_texts = parent_commit_id
-        .map(|parent| vec![test_commit_id(parent).to_string()])
-        .unwrap_or_default();
-    let changes = rows
-        .iter()
-        .map(tracked_change_from_materialized)
-        .collect::<Result<Vec<_>, _>>()?;
-    let staged =
-        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_id_texts, rows, true)
-            .await?;
-    let root_deltas = staged
-        .change_commit_ids
-        .iter()
-        .map(|(row_index, _)| {
-            let change = &changes[*row_index];
-            let row = &rows[*row_index];
-            TrackedStateDeltaRef {
-                schema_key: &change.schema_key,
-                file_id: change.file_id.as_deref(),
-                row_pk: &change.row_pk,
-                change_id: change.change_id,
-                commit_id,
-                deleted: change.snapshot.is_none(),
-                created_at: crate::common::LixTimestamp::expect_parse(
-                    "created_at",
-                    &row.created_at,
-                ),
-                updated_at: crate::common::LixTimestamp::expect_parse(
-                    "updated_at",
-                    &row.updated_at,
-                ),
-            }
-        })
-        .collect::<Vec<_>>();
-    let commit_deltas = staged
-        .change_commit_ids
-        .iter()
-        .zip(root_deltas.iter().copied())
-        .map(|((row_index, _), delta)| {
-            let change = &changes[*row_index];
-            TrackedStateCommitDeltaRef {
-                delta,
-                snapshot: change.snapshot.as_ref_slot(),
-                metadata: change.metadata.as_ref_slot(),
-                origin_key: change.origin_key.as_deref(),
-                base_coordinate: None,
-                authored: true,
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
-    let mutations = inventories.remove(&commit_id).unwrap_or_default();
-    reject_unconsumed_test_inventories(&inventories, commit_id)?;
-    stage_test_commit_state_manifest(writes, &staged, mutations, None)
 }
 
 #[cfg(test)]
@@ -425,16 +492,24 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .zip(root_deltas.iter().copied())
         .map(|((row_index, _), delta)| {
             let change = &changes[*row_index];
-            TrackedStateCommitDeltaRef {
+            let row = &rows[*row_index];
+            Ok(TrackedStateCommitDeltaRef {
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                snapshot_content: row.snapshot_content.as_deref(),
+                metadata_content: row.metadata.as_deref(),
+                schema_definition: row
+                    .snapshot_content
+                    .is_some()
+                    .then(|| materialized_fixture_schema(row))
+                    .transpose()?,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, crate::LixError>>()?;
     let typed_commit_id = test_commit_id(&commit_id_text);
     let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
     let mutations = inventories.remove(&typed_commit_id).unwrap_or_default();
@@ -467,7 +542,51 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .cloned()
         .ok_or_else(|| crate::LixError::unknown("test rooted commit did not stage a root"))?;
     drop(root_writer);
-    stage_test_commit_state_manifest(writes, &staged, mutations, Some(snapshot_root))?;
+    let certified_body = crate::tracked_state::certify_authored_current_state_body(
+        &*read,
+        writes,
+        typed_commit_id,
+        &staged.record.account_id,
+        &mutations,
+        commit_root_parent_commit_id_text.is_none(),
+        commit_deltas.iter().copied(),
+    )
+    .await?;
+    let parent = match commit_root_parent_commit_id_text.as_deref() {
+        Some(parent_id) => Some(
+            crate::tracked_state::load_published_commit_state_topology(
+                &*read,
+                test_commit_id(parent_id),
+            )
+            .await?
+            .ok_or_else(|| crate::LixError::unknown("test current-state parent is missing"))?,
+        ),
+        None => None,
+    };
+    let publication =
+        crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
+            &*read,
+            writes,
+            parent.as_ref(),
+            typed_commit_id,
+            &staged.record.account_id,
+            &mutations,
+            certified_body,
+        )
+        .await?;
+    crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+        writes,
+        &CommitStateManifest {
+            commit_id: typed_commit_id,
+            change_account_id: staged.record.account_id.clone(),
+            replay_debt: CommitStateReplayDebt::default(),
+            mutations,
+            touched_scope_filter: publication.touched_scope_filter().clone(),
+            current_state_scoped_ranges: publication.root(),
+            snapshot_root: Some(Box::new(snapshot_root)),
+        },
+        &publication,
+    )?;
     Ok(())
 }
 
@@ -742,8 +861,7 @@ struct TestStagedChangelogCommit {
 fn final_state_row_winner_indices(
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<Vec<usize>, crate::LixError> {
-    let mut winners =
-        BTreeMap::<(String, Option<String>, crate::row_pk::RowPk), usize>::new();
+    let mut winners = BTreeMap::<(String, Option<String>, crate::row_pk::RowPk), usize>::new();
     for (index, row) in rows.iter().enumerate() {
         winners.insert(
             (

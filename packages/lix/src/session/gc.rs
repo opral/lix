@@ -144,13 +144,12 @@ mod tests {
     use tokio::time::{Duration, Instant};
 
     use super::checkpoint_gc_due;
-    use crate::changelog::CommitId;
     use crate::engine::Engine;
     use crate::gc::{load_checkpoint_gc_state, stage_repository_gc_with_preconditions};
     use crate::session::SessionContext;
     use crate::storage::Memory;
-    use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
-    use crate::{LixError, Value};
+    use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions};
+    use crate::Value;
 
     /// Checkpoints a fresh repository must accumulate before the staleness
     /// backstop makes a sweep due. Mirrors `RECLAIM_MAX_STALENESS` in
@@ -311,40 +310,7 @@ mod tests {
         );
     }
 
-    /// Deletes one commit's physical delta the way the sweep that shipped
-    /// before the history-retention fix did, leaving the commit record itself
-    /// in place. This is `pub(crate)` on purpose and stays that way: a
-    /// publicly reachable way to delete a manifest is a footgun that would
-    /// outlive the fixture it was added for, so this test lives in-crate
-    /// rather than in the integration suite.
-    async fn reclaim_history_delta_like_a_pre_fix_sweep(
-        session: &SessionContext<Memory>,
-        commit_id: CommitId,
-    ) -> Result<(), LixError> {
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
-            .await?
-            .expect("a commit on the head's first-parent chain still owns its physical delta");
-        let mut writes = session.storage.new_write_set();
-        crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
-            &read,
-            &mut writes,
-            commit_id,
-            &manifest,
-        )
-        .await?;
-        drop(read);
-        session
-            .storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await?;
-        Ok(())
-    }
-
-    /// A repository whose row history a pre-fix sweep already took must
+    /// A current-format repository with self-contained native history must
     /// still *reclaim*, not merely still *plan*.
     ///
     /// # Why a plan is not enough
@@ -373,7 +339,7 @@ mod tests {
     /// head's first-parent chain, and a test asserting they leave would encode
     /// a false invariant and pass for the wrong reason.
     #[tokio::test]
-    async fn checkpoint_gc_reclaims_on_a_repository_already_swept_before_the_history_fix() {
+    async fn checkpoint_gc_reclaims_interior_commits_with_self_contained_history() {
         let (engine, session) = open().await;
         let branch_id = session.branch.get().expect("session branch resolves");
 
@@ -412,16 +378,6 @@ mod tests {
         }
         assert_eq!(interior_commits.len(), ROUNDS - 1);
 
-        // Make this a legacy repository: take the physical delta of a commit
-        // that is still on the head's first-parent chain, which is exactly
-        // what the pre-fix sweep did and what cannot be recomputed.
-        let legacy_commit_id = checkpoints[1].clone();
-        let legacy = CommitId::parse_lix(&legacy_commit_id, "legacy checkpoint commit id")
-            .expect("checkpoint commit id parses");
-        reclaim_history_delta_like_a_pre_fix_sweep(&session, legacy)
-            .await
-            .expect("the pre-fix reclaim stages and commits");
-
         // Cross the collection interval.
         for _ in 0..RECLAIM_MAX_STALENESS {
             session
@@ -433,8 +389,7 @@ mod tests {
         // `create_checkpoint` spawns the sweep, so drive one here rather than
         // racing it; an explicit call is a no-op once the debt is clear, so
         // whichever runs first, the assertions below read the same committed
-        // outcome. Without the tolerance this call is what fails, loudly:
-        // the sweep hard-errors on the missing manifest.
+        // outcome.
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             session
@@ -485,25 +440,22 @@ mod tests {
             "a checkpoint commit stays on the head's first-parent chain across a sweep"
         );
 
-        // And the sweep that ran was the tolerant one. Planning the same
-        // repository again still finds the reclaimed delta and counts it,
-        // rather than demanding it.
+        // Planning the same current-format repository again must find no
+        // missing history authority: LXCD17 manifests are self-contained and
+        // checkpoint collection retires only unreachable commits.
         let read = SharedStorageAdapterRead::new(
             session
                 .storage
                 .begin_read(StorageReadOptions::default())
                 .await
-                .expect("tolerance plan read opens"),
+                .expect("current-format plan read opens"),
         );
         let mut writes = session.storage.new_write_set();
         let mut preconditions = Vec::new();
         let plan = stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
             .await
-            .expect("a legacy repository must still plan");
-        assert!(
-            plan.profile.history_manifests_missing >= 1,
-            "the delta this test reclaimed by hand must be counted as tolerated, not swallowed"
-        );
+            .expect("a current-format repository must still plan");
+        assert_eq!(plan.profile.history_manifests_missing, 0);
     }
 }
 

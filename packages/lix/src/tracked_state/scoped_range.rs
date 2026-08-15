@@ -1672,6 +1672,26 @@ pub(crate) async fn validate_scoped_range_trees(
     store: &(impl StorageAdapterRead + ?Sized),
     roots: &[ScopedRangeRoot],
 ) -> Result<ScopedRangeReachability, LixError> {
+    validate_scoped_range_trees_inner(store, roots, None).await
+}
+
+/// Authenticates one tree while accepting immutable nodes staged by the same
+/// publication. This is used only by owner-side transitions that must derive
+/// exact cascade scopes before the write set is committed.
+pub(crate) async fn validate_scoped_range_tree_with_staged(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &StorageWriteSet,
+    root: &ScopedRangeRoot,
+) -> Result<ScopedRangeReachability, LixError> {
+    let staged = snapshot_staged_scoped_range_nodes(writes)?;
+    validate_scoped_range_trees_inner(store, std::slice::from_ref(root), Some(&staged.nodes)).await
+}
+
+async fn validate_scoped_range_trees_inner(
+    store: &(impl StorageAdapterRead + ?Sized),
+    roots: &[ScopedRangeRoot],
+    staged_nodes: Option<&BTreeMap<[u8; 32], ScopedRangeNode>>,
+) -> Result<ScopedRangeReachability, LixError> {
     for root in roots {
         validate_root_digest(root)?;
     }
@@ -1683,7 +1703,28 @@ pub(crate) async fn validate_scoped_range_trees(
     while !frontier.is_empty() {
         let node_ids = frontier.iter().copied().collect::<Vec<_>>();
         frontier.clear();
-        let loaded = load_authenticated_nodes(store, &node_ids).await?;
+        let loaded = if let Some(staged_nodes) = staged_nodes {
+            let staged = node_ids
+                .iter()
+                .filter_map(|node_id| {
+                    staged_nodes
+                        .get(node_id)
+                        .cloned()
+                        .map(|node| (*node_id, node))
+                })
+                .collect();
+            load_nodes_with_staged(store, &node_ids, staged)
+                .await?
+                .into_iter()
+                .zip(node_ids.iter().copied())
+                .map(|(node, node_id)| {
+                    let summary = authenticated_node_summary(&node, node_id)?;
+                    Ok(LoadedScopedRangeNode { node, summary })
+                })
+                .collect::<Result<Vec<_>, LixError>>()?
+        } else {
+            load_authenticated_nodes(store, &node_ids).await?
+        };
         for (node_id, loaded) in node_ids.into_iter().zip(loaded) {
             for child in &loaded.node.children {
                 if let Some(existing) = cache.get(&child.node_id) {
