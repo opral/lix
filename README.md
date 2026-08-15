@@ -74,7 +74,9 @@ See the [Hosting guide](./docs/hosting.md) for LixRay and for running your own h
 
 ### Give each customer a repository
 
-Your product gives every customer their own repository: their files, their data, and the automations LLMs now write for them. Lix is simpler than git here: it embeds in your product, and your customers review and undo changes without branch, merge, or pull request vocabulary.
+Your product gives every customer their own repository: their files, their data, and the automations LLMs now write for them.
+
+Lix handles any file format, collaborates in real time, and embeds in your product. Non-technical users get accept and undo, not branches and pull requests. Permissions are coming.
 
 <img src="./website/public/assets/customer-repositories.svg" alt="Your product creates one Lix repository per customer, each holding a different mix of automations, handbooks, pricing, and knowledge files" width="760" />
 
@@ -96,13 +98,33 @@ await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 // Your UI shows the diff. The customer clicks accept or undo.
 ```
 
+### Sync local files
+
+Sync the local files that coding agents and applications work on, to make them collaborative or cloud-based.
+
+<img src="./website/public/assets/file-sync.svg" alt="Client A and client B each hold the same project files on their own filesystem and synchronize them with a Lix server" width="760" />
+
+```ts
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
+
+// ./project stays a normal directory. Lix syncs it through the server.
+const lix = await openLix({
+  storage: new FilesystemStorage({ path: "./project" }),
+  server: {
+    mode: "remote",
+    url: "https://lixray.com/@acme/project",
+  },
+});
+```
+
+Use [LixRay](https://lixray.com) or [run your own server](./docs/hosting.md).
+
 ### Apps with version control
 
-Build apps on a repository instead of a bare database. The app reads and writes SQL rows and normal files. History, review, rollback, and isolated branches for agents come from the substrate instead of app code.
+Your app reads and writes SQL rows and normal files. Lix records every change with its author, so history, blame, branching, and rollback are queries instead of features you build.
 
 <img src="./website/public/assets/app-with-history.svg" alt="An app window with a document diff, an accept and undo control, and a history sidebar with checkpoints, all provided by Lix" width="760" />
-
-App logic is plain SQL. History comes with it:
 
 ```ts
 // A normal app write. Lix records the change automatically.
@@ -110,13 +132,13 @@ await lix.execute("UPDATE orders SET status = 'shipped' WHERE id = 1002");
 
 // The history sidebar, diff view, and undo button are queries:
 const changes = await lix.execute(`
-  SELECT created_at, schema_key, row_pk, snapshot_content
+  SELECT created_at, account_id, schema_key, row_pk, snapshot_content
   FROM lix_change
   ORDER BY created_at DESC
 `);
 ```
 
-Update Lix files and rows in one ACID transaction. Lix records the history automatically.
+Files and rows update in one ACID transaction.
 
 [Read more about diffs →](https://lix.dev/docs/diffs)
 

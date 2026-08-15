@@ -63,9 +63,24 @@ const GoLogo = ({ className = "" }) => (
 );
 
 const sdkLanguages = [
-  { label: "Python", href: "https://github.com/opral/lix/issues/373", Logo: PythonLogo },
-  { label: "Rust", href: "https://github.com/opral/lix/issues/371", Logo: RustLogo },
-  { label: "Go", href: "https://github.com/opral/lix/issues/370", Logo: GoLogo },
+  {
+    label: "Rust",
+    href: "https://crates.io/crates/lix",
+    title: "The Rust SDK on crates.io.",
+    Logo: RustLogo,
+  },
+  {
+    label: "Python",
+    href: "https://github.com/opral/lix/issues/373",
+    title: "The Python SDK is planned. Upvote the issue on GitHub.",
+    Logo: PythonLogo,
+  },
+  {
+    label: "Go",
+    href: "https://github.com/opral/lix/issues/370",
+    title: "The Go SDK is planned. Upvote the issue on GitHub.",
+    Logo: GoLogo,
+  },
 ];
 
 /**
@@ -583,13 +598,13 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 <JsLogo className="h-3.5 w-3.5" />
                 JavaScript
               </span>
-              {sdkLanguages.map(({ label, href, Logo }) => (
+              {sdkLanguages.map(({ label, href, title, Logo }) => (
                 <a
                   key={label}
                   href={href}
                   target="_blank"
                   rel="noopener noreferrer"
-                  title={`The ${label} SDK is planned. Upvote the issue on GitHub.`}
+                  title={title}
                   className="flex items-center gap-1.5 border-b-2 border-transparent pb-0.5 text-[13px] text-ink-muted transition-colors hover:text-cyan-deep"
                 >
                   <Logo className="h-3.5 w-3.5" />
