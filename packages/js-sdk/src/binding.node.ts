@@ -76,24 +76,31 @@ export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
 ): Promise<LixBinding> {
+	try {
+		return await openNativeLixBinding(storage, telemetry);
+	} catch (nativeError) {
+		if (storage.kind !== "memory") throw nativeError;
+		try {
+			const { openMemoryWasmBinding } = await import(
+				"./binding.node-wasm.js"
+			);
+			return await openMemoryWasmBinding(telemetry);
+		} catch (wasmError) {
+			throw new AggregateError(
+				[nativeError, wasmError],
+				"Failed to open in-memory Lix with either the native or WebAssembly binding.",
+			);
+		}
+	}
+}
+
+export async function openNativeLixBinding(
+	storage: LixStorageConfig,
+	telemetry?: TelemetryDispatch,
+): Promise<LixBinding> {
 	switch (storage.kind) {
 		case "memory": {
-			let nativeAddon: NativeAddon;
-			try {
-				nativeAddon = loadNativeAddon();
-			} catch (nativeError) {
-				try {
-					const { openMemoryWasmBinding } = await import(
-						"./binding.node-wasm.js"
-					);
-					return await openMemoryWasmBinding(telemetry);
-				} catch (wasmError) {
-					throw new AggregateError(
-						[nativeError, wasmError],
-						"Failed to open in-memory Lix with either the native or WebAssembly binding.",
-					);
-				}
-			}
+			const nativeAddon = loadNativeAddon();
 			const nativeTelemetry = telemetry
 				? (spanJson: string) => telemetry(JSON.parse(spanJson))
 				: undefined;
