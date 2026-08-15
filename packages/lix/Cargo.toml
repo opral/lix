@@ -49,10 +49,6 @@ name = "third_party_storage_adapter"
 path = "tests/third_party_storage_adapter.rs"
 
 [[test]]
-name = "client_state"
-path = "tests/client_state.rs"
-
-[[test]]
 name = "runtime_contract"
 path = "tests/runtime_contract.rs"
 

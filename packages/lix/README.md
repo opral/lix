@@ -25,15 +25,14 @@ let lix = open_lix().with_storage(storage).await?;
 # }
 ```
 
-`open_lix()` opens the client's primary session. Its active branch is restored
-from client state (`lix_primary_session_branch_id`) and falls back to the
-repository's tracked `lix_default_branch_id`, which points to `main` in a new
-repository. `lix.open_another_session().await?` creates an independent session
+`open_lix()` opens the client's primary session on the repository's tracked
+`lix_default_branch_id`, which points to `main` in a new repository. Applications
+own window- or session-specific branch selection and switch explicitly.
+`lix.open_another_session().await?` creates an independent session
 on the primary session's current branch. Add
 `.with_account(account_id).await?` when that session represents another
 account. Switch the returned repository handle when it should work on another
-branch. Switching an independent session never changes the primary-session
-preference or the repository default.
+branch. Switching any session never changes the repository default.
 
 Storage adapters implement the public `lix::storage` contract and release on
 their own cadence. The official packages are `lix-storage-rocksdb`,

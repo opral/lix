@@ -40,8 +40,7 @@ export type OpenLixOptions =
 			telemetry?: LixTelemetryOptions;
 	  }
 	| {
-			/** Optional local storage for `lix.clientState`. */
-			storage?: import("./open-lix.js").IndexedDbStorage;
+			storage?: never;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
 	  };

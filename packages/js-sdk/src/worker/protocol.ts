@@ -6,7 +6,6 @@ import type {
 import type {
 	CreateBranchOptions,
 	ExecuteOptions,
-	JsonValue,
 	LixBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
@@ -43,9 +42,6 @@ export type WorkerOperation =
 	| { kind: "transaction.rollback"; transactionId: number }
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
-	| { kind: "clientState.get"; key: string }
-	| { kind: "clientState.set"; key: string; value: JsonValue }
-	| { kind: "clientState.delete"; key: string }
 	| { kind: "createBranch"; options: CreateBranchOptions }
 	| { kind: "createCheckpoint" }
 	| { kind: "undo" }

@@ -1746,7 +1746,7 @@ where
             },
         };
         // Validate and open the pinned child before evicting any idle session.
-        // A stale client branch preference therefore cannot consume capacity or
+        // An invalid requested branch therefore cannot consume capacity or
         // evict another client.
         let active_account_id =
             initial_active_account_id.unwrap_or_else(|| lix::ANONYMOUS_ACCOUNT_ID.to_string());

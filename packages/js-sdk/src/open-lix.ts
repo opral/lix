@@ -1,8 +1,4 @@
 import type { LixBinding } from "./binding-types.js";
-import {
-	ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
-	openClientState,
-} from "./client-state.js";
 import { Lix } from "./lix.js";
 import { isLixStorage, type LixStorage } from "./storage-adapter.js";
 import type { IndexedDbStorageOptions, OpenLixOptions } from "./types.js";
@@ -41,50 +37,10 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	}
 	if (options.server !== undefined) {
 		const { openRemoteLixBinding } = await import("./remote/client.js");
-		if (options.storage === undefined) {
-			return new Lix(await openRemoteLixBinding(options.server));
+		if ("storage" in options && options.storage !== undefined) {
+			throw new TypeError("openLix() remote mode does not accept storage");
 		}
-		assertIndexedDbStorage(options.storage);
-		const storage = options.storage;
-		const databaseName = remoteIndexedDbName(storage.name, options.server.url);
-		const { openLixWorkerBinding } = await import("./worker/client.js");
-		if (openIndexedDbStorageNames.has(databaseName)) {
-			throw new Error("IndexedDbStorage is already open");
-		}
-		openIndexedDbStorageNames.add(databaseName);
-		let clientBinding: LixBinding | undefined;
-		let clientState: ReturnType<typeof openClientState> | undefined;
-		try {
-			clientBinding = await openLixWorkerBinding(
-				{ kind: "indexedDb", name: databaseName },
-				() => openIndexedDbStorageNames.delete(databaseName),
-			);
-			clientState = openClientState({
-				binding: clientBinding,
-				closeBinding: true,
-			});
-		} catch (error) {
-			openIndexedDbStorageNames.delete(databaseName);
-			await clientBinding?.close().catch(() => undefined);
-			throw error;
-		}
-
-		let remoteBinding: LixBinding | undefined;
-		try {
-			const restoredAccountId = await clientState.get<string>(
-				ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
-			);
-			remoteBinding = await openRemoteLixBinding(options.server);
-			const activeAccountId = await remoteBinding.activeAccountId();
-			if (activeAccountId !== restoredAccountId) {
-				await clientState.set(ACTIVE_ACCOUNT_CLIENT_STATE_KEY, activeAccountId);
-			}
-			return new Lix(remoteBinding, clientState);
-		} catch (error) {
-			await remoteBinding?.close().catch(() => undefined);
-			await clientState.close().catch(() => undefined);
-			throw error;
-		}
+		return new Lix(await openRemoteLixBinding(options.server));
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
@@ -139,8 +95,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				() => openIndexedDbStorageNames.delete(databaseName),
 				options.telemetry,
 			);
-			const clientState = openClientState({ binding });
-			return new Lix(binding, clientState);
+			return new Lix(binding);
 		} catch (error) {
 			openIndexedDbStorageNames.delete(databaseName);
 			await binding?.close().catch(() => undefined);
@@ -159,23 +114,4 @@ function storageAlreadyOpen(): Error & { code: string } {
 	error.name = "LixError";
 	error.code = "LIX_STORAGE_IN_USE";
 	return error;
-}
-
-function assertIndexedDbStorage(value: unknown): asserts value is IndexedDbStorage {
-	if (!(value instanceof IndexedDbStorage)) {
-		throw new TypeError("openLix() remote storage must be IndexedDbStorage");
-	}
-}
-
-function remoteIndexedDbName(storageName: string, value: string | URL): string {
-	let url: URL;
-	try {
-		url = new URL(value);
-	} catch {
-		throw new TypeError("openLix() remote server url must be an absolute URL");
-	}
-	url.pathname = url.pathname.replace(/\/$/, "");
-	url.search = "";
-	url.hash = "";
-	return `${storageName}:remote:${url.href}`;
 }
