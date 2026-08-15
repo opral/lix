@@ -12,9 +12,11 @@ use serde_json::Value as JsonValue;
 use crate::row_pk::RowPk;
 use crate::{LixError, storage_codec};
 
-const FORMAT_VERSION: u8 = 1;
-const SEMANTIC_DOMAIN: &str = "lix tracked history native row semantic v1";
-const LAYOUT_DOMAIN: &str = "lix tracked history native row layout v1";
+const FORMAT_VERSION: u8 = 2;
+const SEMANTIC_DOMAIN: &str = "lix tracked history native row semantic v2";
+const LAYOUT_DOMAIN: &str = "lix tracked history native row layout v2";
+const TEXT_ESCAPE: char = '\u{1}';
+const TEXT_ESCAPED_NUL: char = '\u{2}';
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -278,7 +280,9 @@ fn body_value(
     let invalid = || body_error(format!("{schema_key}.{name} disagrees with its declared type"));
     Ok(match (kind, value) {
         (_, JsonValue::Null) => BodyValue::Null,
-        (lix_schema::DataType::Text, JsonValue::String(value)) => BodyValue::Text(value.clone()),
+        (lix_schema::DataType::Text, JsonValue::String(value)) => {
+            BodyValue::Text(escape_history_text(value))
+        }
         (lix_schema::DataType::Uuid, JsonValue::String(value)) => {
             BodyValue::Uuid(uuid::Uuid::parse_str(value).map_err(|_| invalid())?)
         }
@@ -307,7 +311,7 @@ fn logical_body_value(
     use lix_schema::value_layout::BodyValue;
     Ok(match value {
         BodyValue::Null => JsonValue::Null,
-        BodyValue::Text(value) => JsonValue::String(value),
+        BodyValue::Text(value) => JsonValue::String(unescape_history_text(&value)?),
         BodyValue::Uuid(value) => JsonValue::String(value.to_string()),
         BodyValue::Int8(value) => JsonValue::from(value),
         BodyValue::Float8(value) => serde_json::Number::from_f64(value)
@@ -321,6 +325,48 @@ fn logical_body_value(
                 .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         ),
     })
+}
+
+/// History preserves text values that predate Schema-v1's public NUL policy.
+///
+/// The shared typed-row codec deliberately rejects NUL in newly-authored SQL
+/// `text`, while plugin/file history already contains length-delimited text
+/// with embedded NUL bytes. LXCD17 therefore uses one injective, canonical
+/// history-only transform before invoking that codec. This remains a typed
+/// text slot; it is not JSON, a fallback representation, or a second reader.
+fn escape_history_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\0' => {
+                escaped.push(TEXT_ESCAPE);
+                escaped.push(TEXT_ESCAPED_NUL);
+            }
+            TEXT_ESCAPE => {
+                escaped.push(TEXT_ESCAPE);
+                escaped.push(TEXT_ESCAPE);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn unescape_history_text(value: &str) -> Result<String, LixError> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != TEXT_ESCAPE {
+            decoded.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some(TEXT_ESCAPE) => decoded.push(TEXT_ESCAPE),
+            Some(TEXT_ESCAPED_NUL) => decoded.push('\0'),
+            _ => return Err(body_error("contains a non-canonical text escape")),
+        }
+    }
+    Ok(decoded)
 }
 
 fn body_kind(kind: lix_schema::DataType) -> lix_schema::value_layout::BodyKind {
@@ -428,5 +474,25 @@ mod tests {
         for end in 0..encoded.len() {
             assert!(decode(&row_pk, &encoded[..end]).is_err());
         }
+    }
+
+    #[test]
+    fn native_history_text_losslessly_carries_nul_and_escape_code_points() {
+        let schema = serde_json::json!({
+            "$schema": lix_schema::SCHEMA_V1_URI,
+            "key": "native_history_text",
+            "columns": [
+                {"name":"id", "type":"text", "nullable":false},
+                {"name":"payload", "type":"text", "nullable":false}
+            ],
+            "primary_key": ["id"]
+        });
+        let row_pk = RowPk::from_validated_shared_string("row".into());
+        let text = "{\"id\":\"row\",\"payload\":\"left\\u0000middle\\u0001right\"}";
+        let encoded = encode(&schema, &row_pk, text).expect("encode history text");
+        assert_eq!(
+            decode(&row_pk, &encoded).expect("decode history text"),
+            text
+        );
     }
 }

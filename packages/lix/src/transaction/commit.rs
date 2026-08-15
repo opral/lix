@@ -7359,7 +7359,7 @@ mod tests {
     // be the drift `storage_spaces` exists to prevent.
     const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
-        "tracked_state.commit_state_manifest.v7",
+        "tracked_state.commit_state_manifest.v8",
     );
     // V11 has no tracked-head marker space. Keep the retired v10 ID here only
     // as a negative test sentinel: normal serving and staging must never read

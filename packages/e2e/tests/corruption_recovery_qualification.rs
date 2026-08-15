@@ -24,7 +24,7 @@ const CHECKPOINT_FILE_ID: &str = "01920000-0000-7000-8000-000010000000";
 // mismatch, it makes the inventory come back empty.
 const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v11";
 const PLUGIN_CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
-const COMMIT_MANIFEST_SPACE: &str = "tracked_state.commit_state_manifest.v7";
+const COMMIT_MANIFEST_SPACE: &str = "tracked_state.commit_state_manifest.v8";
 const TREE_CHUNK_SPACE: &str = "tracked_state.tree_chunk";
 const BINARY_CHUNK_SPACE: &str = "binary_cas.chunk";
 
