@@ -6,22 +6,22 @@
 use crate::LixError;
 use crate::changelog::CommitId;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use crate::tracked_state::current_state_envelope::{
-    current_state_descriptor_from_scoped_range_part,
-    scoped_range_part_from_current_state_descriptor,
-};
+use crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor;
 use crate::tracked_state::scoped_range::{
-    ScopedRangeCoverageMarker, ScopedRangeRoot, load_scoped_range_coverage_with_staged,
-    stage_replace_scoped_range, stage_scoped_range_tree, validate_scoped_range_tree_with_staged,
+    ScopedRangeCoverageMarker, ScopedRangeRoot, load_scoped_range_coverage,
+    load_scoped_range_coverage_with_staged, stage_replace_scoped_range, stage_scoped_range_tree,
 };
 use crate::tracked_state::types::{
-    ColumnarPageSource, CommitDeltaReplacementScope,
-    CommitStateManifest, CommitStateMutationInventory, CommitStateTouchedScopeFilter,
-    CurrentStatePartDescriptor, CurrentStatePartSource, CurrentStateScopedRangeRoot,
-    ReplacementPartSource,
+    ColumnarPageSource, CommitDeltaReplacementScope, CommitStateManifest,
+    CommitStateMutationInventory, CommitStateTouchedScopeFilter, CurrentStatePartDescriptor,
+    CurrentStatePartSource, CurrentStateScopedRangeRoot, ReplacementPartSource,
 };
 
 const TRANSITION_CONTEXT: &str = "lix current-state scoped-range transition v2";
+const TOUCHED_SCOPE_FILTER_BYTES: usize = 128;
+const TOUCHED_SCOPE_FILTER_HASHES: usize = 4;
+const TOUCHED_SCOPE_FILTER_CONTEXT: &str = "lix cumulative touched collection scope v1";
+
 #[derive(Clone, Copy)]
 pub(super) struct CommitStateTopologyRef<'a> {
     pub(super) commit_id: CommitId,
@@ -171,72 +171,13 @@ async fn stage_disjoint_columnar_current_state_pages(
         // seed a scope only when absence is certified; an already covered
         // scope waits for the bounded sparse range-rewrite path.
         if let Some(parent) = parent
-            && load_scoped_range_coverage_with_staged(store, writes, &parent.tree, &prefix)
+            && load_scoped_range_coverage(store, &parent.tree, &prefix)
                 .await?
                 .is_some()
         {
-            let reachable =
-                validate_scoped_range_tree_with_staged(store, writes, &parent.tree).await?;
-            let mut inherited = reachable
-                .parts
-                .iter()
-                .filter(|part| part.scope == prefix)
-                .map(current_state_descriptor_from_scoped_range_part)
-                .collect::<Result<Vec<_>, LixError>>()?;
-            inherited.sort_by(|left, right| left.first_key.cmp(&right.first_key));
-            let overlaps = inherited.iter().any(|old| {
-                descriptors.iter().any(|new| {
-                    old.first_key.as_slice() <= new.last_key.as_slice()
-                        && new.first_key.as_slice() <= old.last_key.as_slice()
-                })
-            });
-            if overlaps {
-                inherited = merge_columnar_current_state_descriptors(
-                    store,
-                    writes,
-                    inherited,
-                    descriptors,
-                )
-                .await?;
-            } else {
-                inherited.extend(descriptors);
-            }
-            inherited.sort_by(|left, right| left.first_key.cmp(&right.first_key));
-            let row_count = inherited.iter().try_fold(0u64, |count, descriptor| {
-                count
-                    .checked_add(u64::from(descriptor.row_count))
-                    .ok_or_else(|| scoped_state_error("columnar scope row count overflows"))
-            })?;
-            let scoped_parts = inherited
-                .iter()
-                .map(|descriptor| {
-                    scoped_range_part_from_current_state_descriptor(&scope, descriptor)
-                })
-                .collect::<Result<Vec<_>, LixError>>()?;
-            let marker = ScopedRangeCoverageMarker {
-                scope: prefix,
-                row_count,
-                part_count: u32::try_from(scoped_parts.len())
-                    .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
-            };
-            let tree = stage_replace_scoped_range(
-                store,
-                writes,
-                &parent.tree,
-                marker,
-                scoped_parts,
-            )
-            .await?
-            .root;
-            return Ok(Some(attest_scoped_range_root(
-                commit_id,
-                parent_manifest.map(|manifest| (manifest.commit_id, parent)),
-                inventory,
-                tree,
-            )?));
+            return Ok(None);
         }
-        validate_touched_scope_filter(inherited_scope_filter)?;
-        if !inherited_scope_filter.complete {
+        if !touched_scope_filter_proves_absent(inherited_scope_filter, &scope)? {
             return Ok(None);
         }
         let marker = ScopedRangeCoverageMarker {
@@ -264,118 +205,6 @@ async fn stage_disjoint_columnar_current_state_pages(
     )?))
 }
 
-/// Merges an interleaved columnar mutation into one covered scope without
-/// copying either generation's immutable row bodies. Only authenticated row
-/// identities are decoded; the resulting descriptors retain exact source
-/// coordinates. An update keeps the previous current-state `created_at`
-/// while taking the new authored `updated_at` and body.
-async fn merge_columnar_current_state_descriptors(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    inherited: Vec<CurrentStatePartDescriptor>,
-    authored: Vec<CurrentStatePartDescriptor>,
-) -> Result<Vec<CurrentStatePartDescriptor>, LixError> {
-    #[derive(Clone)]
-    struct LocatedRow {
-        descriptor: CurrentStatePartDescriptor,
-        source_index: u16,
-        row: crate::tracked_state::current_state_data_part::CurrentStateDataRow,
-    }
-
-    let mut rows = std::collections::BTreeMap::<Vec<u8>, LocatedRow>::new();
-    for descriptor in inherited {
-        let loaded = crate::tracked_state::storage::load_scoped_current_state_descriptor_rows(
-            store,
-            writes,
-            &descriptor,
-        )
-        .await?;
-        for (index, row) in loaded.into_iter().enumerate() {
-            let source_index = u16::try_from(index)
-                .map_err(|_| scoped_state_error("current-state source index exceeds u16"))?;
-            if rows
-                .insert(
-                    row.encoded_key.clone(),
-                    LocatedRow {
-                        descriptor: descriptor.clone(),
-                        source_index,
-                        row,
-                    },
-                )
-                .is_some()
-            {
-                return Err(scoped_state_error(
-                    "inherited current-state scope contains duplicate identities",
-                ));
-            }
-        }
-    }
-    for descriptor in authored {
-        let loaded = crate::tracked_state::storage::load_scoped_current_state_descriptor_rows(
-            store,
-            writes,
-            &descriptor,
-        )
-        .await?;
-        for (index, mut row) in loaded.into_iter().enumerate() {
-            let source_index = u16::try_from(index)
-                .map_err(|_| scoped_state_error("current-state source index exceeds u16"))?;
-            if let Some(previous) = rows.get(&row.encoded_key) {
-                row.value.created_at = previous.row.value.created_at;
-            }
-            let mut retained = descriptor.clone();
-            let CurrentStatePartSource::ColumnarPage(source) = &mut retained.source else {
-                return Err(scoped_state_error(
-                    "columnar current-state merge received a non-columnar authored source",
-                ));
-            };
-            source.uniform_created_at = row.value.created_at;
-            source.uniform_updated_at = row.value.updated_at;
-            rows.insert(
-                row.encoded_key.clone(),
-                LocatedRow {
-                    descriptor: retained,
-                    source_index,
-                    row,
-                },
-            );
-        }
-    }
-
-    let mut merged = Vec::<CurrentStatePartDescriptor>::new();
-    for located in rows.into_values() {
-        let absolute_offset = located
-            .descriptor
-            .source_row_offset
-            .checked_add(located.source_index)
-            .ok_or_else(|| scoped_state_error("current-state source offset overflows"))?;
-        if let Some(previous) = merged.last_mut()
-            && previous.content_digest == located.descriptor.content_digest
-            && previous.source == located.descriptor.source
-            && previous
-                .source_row_offset
-                .checked_add(previous.row_count)
-                == Some(absolute_offset)
-        {
-            previous.last_key = located.row.encoded_key;
-            previous.row_count = previous
-                .row_count
-                .checked_add(1)
-                .ok_or_else(|| scoped_state_error("current-state merged part overflows"))?;
-            previous.fragmented = true;
-            continue;
-        }
-        let mut descriptor = located.descriptor;
-        descriptor.first_key = located.row.encoded_key.clone();
-        descriptor.last_key = located.row.encoded_key;
-        descriptor.source_row_offset = absolute_offset;
-        descriptor.row_count = 1;
-        descriptor.fragmented = true;
-        merged.push(descriptor);
-    }
-    Ok(merged)
-}
-
 /// Proves one collection has never been authored in the certified linear
 /// lineage. Bloom false positives only disable publication; a negative is an
 /// exact absence proof because every exactly bounded mutation contributes its
@@ -394,7 +223,7 @@ fn parent_scope_is_proven_empty(
 fn empty_complete_touched_scope_filter() -> CommitStateTouchedScopeFilter {
     CommitStateTouchedScopeFilter {
         complete: true,
-        scopes: Vec::new(),
+        bits: vec![0; TOUCHED_SCOPE_FILTER_BYTES],
     }
 }
 
@@ -423,19 +252,17 @@ fn advance_touched_scope_filter_from_topology(
         match parents.split_first() {
             None => empty_complete_touched_scope_filter(),
             Some((first, rest)) => {
-                let mut scopes = first
-                    .touched_scope_filter
-                    .scopes
-                    .iter()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
+                let mut filter = first.touched_scope_filter.clone();
                 for parent in rest {
-                    scopes.extend(parent.touched_scope_filter.scopes.iter().cloned());
+                    for (target, inherited) in filter
+                        .bits
+                        .iter_mut()
+                        .zip(&parent.touched_scope_filter.bits)
+                    {
+                        *target |= *inherited;
+                    }
                 }
-                CommitStateTouchedScopeFilter {
-                    complete: true,
-                    scopes: scopes.into_iter().collect(),
-                }
+                filter
             }
         }
     };
@@ -469,11 +296,11 @@ fn extend_touched_scope_filter(
     if !filter.complete {
         return Ok(filter);
     }
-    let mut scopes = filter.scopes.into_iter().collect::<std::collections::BTreeSet<_>>();
     for scope in touched {
-        scopes.insert(scope.clone());
+        for bit in touched_scope_filter_bits(scope.schema_key.as_bytes()) {
+            filter.bits[bit / 8] |= 1 << (bit % 8);
+        }
     }
-    filter.scopes = scopes.into_iter().collect();
     Ok(filter)
 }
 
@@ -485,23 +312,40 @@ fn touched_scope_filter_proves_absent(
     if !filter.complete {
         return Ok(false);
     }
-    Ok(filter
-        .scopes
-        .binary_search(scope)
-        .is_err())
+    Ok(touched_scope_filter_bits(scope.schema_key.as_bytes())
+        .into_iter()
+        .any(|bit| filter.bits[bit / 8] & (1 << (bit % 8)) == 0))
+}
+
+fn touched_scope_filter_bits(scope: &[u8]) -> [usize; TOUCHED_SCOPE_FILTER_HASHES] {
+    let digest = blake3::Hasher::new_derive_key(TOUCHED_SCOPE_FILTER_CONTEXT)
+        .update(&(scope.len() as u64).to_be_bytes())
+        .update(scope)
+        .finalize();
+    let bytes = digest.as_bytes();
+    std::array::from_fn(|index| {
+        let offset = index * 8;
+        let hash = u64::from_be_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("BLAKE3 supplies four u64 filter hashes"),
+        );
+        hash as usize % (TOUCHED_SCOPE_FILTER_BYTES * 8)
+    })
 }
 
 pub(crate) fn validate_touched_scope_filter(
     filter: &CommitStateTouchedScopeFilter,
 ) -> Result<(), LixError> {
-    if !filter.complete && !filter.scopes.is_empty() {
+    if filter.complete {
+        if filter.bits.len() != TOUCHED_SCOPE_FILTER_BYTES {
+            return Err(scoped_state_error(
+                "complete touched-scope filter has the wrong length",
+            ));
+        }
+    } else if !filter.bits.is_empty() {
         return Err(scoped_state_error(
-            "incomplete touched-scope filter carries unauthoritative scopes",
-        ));
-    }
-    if filter.scopes.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(scoped_state_error(
-            "touched-scope filter scopes are not canonical and unique",
+            "incomplete touched-scope filter carries unauthoritative bits",
         ));
     }
     Ok(())
@@ -537,7 +381,6 @@ impl CertifiedCommitStatePhysicalPublication {
     pub(crate) fn touched_scope_filter(&self) -> &CommitStateTouchedScopeFilter {
         &self.touched_scope_filter
     }
-
 }
 
 /// Certifies cumulative schema-family absence authority when a serving range
@@ -803,7 +646,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     commit_id: CommitId,
     account_id: &str,
     inventory: &CommitStateMutationInventory,
-    certified_body: Option<super::storage::CertifiedAuthoredCurrentStateBody>,
 ) -> Result<CertifiedCommitStatePhysicalPublication, LixError> {
     let selected_source_commit_id = selected_source.map(|source| source.commit_id);
     if selected_source_commit_id != inventory.selected_source_commit_id() {
@@ -812,7 +654,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         ));
     }
     let parent_root = serving_base.and_then(|parent| parent.current_state_scoped_ranges);
-    let mut touched = crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
+    let touched = crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
         commit_id,
         inventory,
         serving_base.is_none(),
@@ -831,8 +673,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     };
     let inherited_scope_filter =
         advance_touched_scope_filter_from_topology(graph_parents, selected_source, Some(&[]))?;
-    let touched_scope_filter =
-        extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
     if inventory.columnar_parts.is_some() {
         // Bootstrap half of the accelerator: this is the only arm that can
         // mint a scoped root with no parent root in hand.
@@ -847,98 +687,18 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             inventory,
         )
         .await?;
-        if root.is_some() {
-            return Ok(CertifiedCommitStatePhysicalPublication {
-                write_set_id: writes.identity(),
-                commit_id,
-                selected_source_commit_id,
-                root,
-                touched_scope_filter,
-            });
-        }
-        // A disjoint columnar publication can decline when the authenticated
-        // parent already covers the touched scope. That is not permission to
-        // drop the selected current-state root: continue through the canonical
-        // certified sparse rewrite below, or fail there before publication.
-    }
-
-    let (initial_root, certified_members, mut certified_rows) = match certified_body {
-        Some(certified) => certified.into_publication_parts(writes, commit_id, inventory)?,
-        None => (None, Vec::new(), std::collections::BTreeMap::new()),
-    };
-    let mut cleared_scopes = std::collections::BTreeSet::new();
-    let mut cascade_file_ids = std::collections::BTreeSet::new();
-    let mut certified_scopes = std::collections::BTreeSet::new();
-    for (encoded_key, row) in &certified_rows {
-        let key = crate::tracked_state::codec::decode_key(encoded_key)?;
-        certified_scopes.insert(CommitDeltaReplacementScope {
-            schema_key: key.schema_key.clone(),
-            file_id: key.file_id.clone(),
-        });
-        if key.schema_key == "lix_file_descriptor" && row.is_none() {
-            cascade_file_ids.insert(key.row_pk.as_single_string_owned().map_err(|error| {
-                scoped_state_error(format!(
-                    "file descriptor tombstone has invalid identity: {error}"
-                ))
-            })?);
-        }
-        if key.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
-            let (schema_key, file_id) =
-                crate::collection_generation::collection_scope_from_row_pk(&key.row_pk)?;
-            cleared_scopes.insert(CommitDeltaReplacementScope {
-                schema_key,
-                file_id,
-            });
-        }
-    }
-    if !cascade_file_ids.is_empty()
-        && let Some(parent_root) = parent_root
-    {
-        let reachable =
-            validate_scoped_range_tree_with_staged(store, writes, &parent_root.tree).await?;
-        for part in reachable.parts {
-            let key = crate::tracked_state::codec::decode_key(&part.first_key)?;
-            if key
-                .file_id
-                .as_ref()
-                .is_some_and(|file_id| cascade_file_ids.contains(file_id))
-            {
-                cleared_scopes.insert(CommitDeltaReplacementScope {
-                    schema_key: key.schema_key,
-                    file_id: key.file_id,
-                });
-            }
-        }
-    }
-    // A physical mutation part may span several schema/file scopes even
-    // though its same-publication body certificate enumerates every authored
-    // identity exactly. Recover those exact scopes from the private
-    // certificate instead of dropping the serving root. Owner-side cascade
-    // handling above additionally clears every authenticated file/scope run
-    // retired by descriptor or generation semantics before sparse authored
-    // post-images are applied.
-    if !certified_scopes.is_empty() || !cleared_scopes.is_empty() {
-        let mut exact = touched.take().unwrap_or_default();
-        exact.extend(certified_scopes);
-        exact.extend(cleared_scopes.iter().cloned());
-        exact.sort();
-        exact.dedup();
-        touched = Some(exact);
-    }
-    if let Some(initial_root) = initial_root {
-        if parent_root.is_some() || graph_parents.len() > 1 || selected_source.is_some() {
-            return Err(scoped_state_error(
-                "initial current-state body certification overlaps inherited state authority",
-            ));
-        }
+        let touched_scope_filter =
+            extend_touched_scope_filter(inherited_scope_filter, filter_touched.as_deref())?;
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             commit_id,
             selected_source_commit_id,
-            root: Some(initial_root),
+            root,
             touched_scope_filter,
         });
     }
+    let touched_scope_filter =
+        extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
 
     if inventory.replacement_generation.is_some() {
         let root = stage_complete_replacement_scoped_range_root(
@@ -963,27 +723,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     }
 
     let Some(mut touched) = touched else {
-        if let Some(parent_root) = parent_root
-            && certified_rows.is_empty()
-        {
-            return Ok(CertifiedCommitStatePhysicalPublication {
-                write_set_id: writes.identity(),
-                commit_id,
-                selected_source_commit_id,
-                root: Some(attest_scoped_range_root(
-                    commit_id,
-                    serving_base.map(|parent| (parent.commit_id, parent_root)),
-                    inventory,
-                    parent_root.tree.clone(),
-                )?),
-                touched_scope_filter,
-            });
-        }
-        if inventory.member_count != 0 || inventory.selected_source_commit_id.is_some() {
-            return Err(scoped_state_error(
-                "non-empty LXCD17 history cannot publish without a current-state root",
-            ));
-        }
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             commit_id,
@@ -993,11 +732,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         });
     };
     let Some(parent_root) = parent_root else {
-        if inventory.member_count != 0 || inventory.selected_source_commit_id.is_some() {
-            return Err(scoped_state_error(
-                "non-empty LXCD17 history has no authenticated serving root",
-            ));
-        }
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             commit_id,
@@ -1027,30 +761,22 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     }
     touched.sort();
     touched.dedup();
-    let members = if certified_members.is_empty() {
-        let staged_segments = crate::tracked_state::storage::staged_commit_delta_segment_bytes(
-            writes, commit_id, inventory,
-        )?;
-        crate::tracked_state::storage::staged_commit_delta_members(
-            store,
-            writes,
-            commit_id,
-            account_id,
-            inventory,
-            staged_segments,
-        )
-        .await?
-    } else {
-        certified_members
-    };
+    let staged_segments = crate::tracked_state::storage::staged_commit_delta_segment_bytes(
+        writes, commit_id, inventory,
+    )?;
+    let members = crate::tracked_state::storage::staged_commit_delta_members(
+        store,
+        commit_id,
+        account_id,
+        inventory,
+        staged_segments,
+    )
+    .await?;
     let mut members_by_scope = std::collections::BTreeMap::<
         CommitDeltaReplacementScope,
         Vec<crate::tracked_state::storage::CommitDeltaMember>,
     >::new();
     for member in members {
-        if !member.authored {
-            continue;
-        }
         members_by_scope
             .entry(CommitDeltaReplacementScope {
                 schema_key: member.key.schema_key.clone(),
@@ -1060,28 +786,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             .push(member);
     }
     let mut tree = parent_root.tree.clone();
-    for scope in &cleared_scopes {
-        let prefix =
-            crate::tracked_state::current_state_envelope::current_state_scope_prefix(scope)?;
-        if load_scoped_range_coverage_with_staged(store, writes, &tree, &prefix)
-            .await?
-            .is_some()
-        {
-            tree = stage_replace_scoped_range(
-                store,
-                writes,
-                &tree,
-                ScopedRangeCoverageMarker {
-                    scope: prefix,
-                    row_count: 0,
-                    part_count: 0,
-                },
-                Vec::new(),
-            )
-            .await?
-            .root;
-        }
-    }
     for scope in touched {
         let prefix =
             crate::tracked_state::current_state_envelope::current_state_scope_prefix(&scope)?;
@@ -1089,11 +793,15 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             .await?
             .is_none()
         {
-            // The authenticated complete scoped-range tree is stronger than
-            // the cumulative touched-scope summary. An exact marker miss
-            // proves this scope is absent and permits inserting its empty
-            // coverage marker; the summary must never turn that proof into a
-            // false-positive rejection.
+            if !touched_scope_filter_proves_absent(&inherited_scope_filter, &scope)? {
+                return Ok(CertifiedCommitStatePhysicalPublication {
+                    write_set_id: writes.identity(),
+                    commit_id,
+                    selected_source_commit_id,
+                    root: None,
+                    touched_scope_filter,
+                });
+            }
             tree = stage_replace_scoped_range(
                 store,
                 writes,
@@ -1121,7 +829,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 &transient,
                 &scope,
                 members_by_scope.remove(&scope).unwrap_or_default(),
-                &mut certified_rows,
             )
             .await?
         else {
@@ -1138,11 +845,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     if !members_by_scope.is_empty() {
         return Err(scoped_state_error(
             "exact touched scopes omitted materialized mutation members",
-        ));
-    }
-    if !certified_rows.is_empty() {
-        return Err(scoped_state_error(
-            "certified authored current-state rows escaped their touched scopes",
         ));
     }
     Ok(CertifiedCommitStatePhysicalPublication {
@@ -1183,7 +885,6 @@ pub(crate) async fn stage_current_state_scoped_ranges(
         commit_id,
         account_id,
         inventory,
-        None,
     )
     .await
 }
@@ -1220,11 +921,10 @@ fn scoped_state_error(message: impl std::fmt::Display) -> LixError {
 mod tests {
     use bytes::Bytes;
 
-    use crate::LixError;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::json_store::JsonSlotRef;
     use crate::row_pk::RowPk;
+    use crate::json_store::JsonSlotRef;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::encode_key_ref;
     use crate::tracked_state::scoped_range::{
@@ -1234,11 +934,9 @@ mod tests {
         stage_scoped_range_part_splice, stage_scoped_range_tree, validate_scoped_range_tree,
     };
     use crate::tracked_state::storage::{
-        CertifiedAuthoredCurrentStateBody, CertifiedCommitStateTopologyParent,
-        CommitDeltaReplacementGeneration, OrderedAddressableCommitDeltaStage,
-        PublishedCommitStateManifest, certify_authored_current_state_body,
-        load_complete_current_state_values_from_scoped_root, load_published_commit_state_manifest,
-        sparse_current_state_materialization_count_for_test,
+        CertifiedCommitStateTopologyParent, CommitDeltaReplacementGeneration,
+        PublishedCommitStateManifest, load_complete_current_state_values_from_scoped_root,
+        load_published_commit_state_manifest, sparse_current_state_materialization_count_for_test,
         stage_certified_commit_state_manifest, stage_certified_commit_state_manifest_with_handle,
         stage_current_state_scoped_ranges_from_published_parent,
         stage_current_state_scoped_ranges_from_staged_parent,
@@ -1254,7 +952,7 @@ mod tests {
     };
 
     use super::{
-        advance_touched_scope_filter, attest_scoped_range_root,
+        TOUCHED_SCOPE_FILTER_BYTES, advance_touched_scope_filter, attest_scoped_range_root,
         certify_topology_touched_scope_filter_from_manifests, parent_scope_is_proven_empty,
         stage_current_state_scoped_ranges, touched_scope_filter_proves_absent,
         validate_scoped_range_attestation, validate_touched_scope_filter,
@@ -1265,28 +963,6 @@ mod tests {
             schema_key: schema_key.to_owned(),
             file_id: None,
         }
-    }
-
-    fn native_fixture(
-        schema_key: &str,
-        row_pk: &str,
-        version: i64,
-    ) -> (&'static str, &'static serde_json::Value) {
-        let snapshot = Box::leak(
-            serde_json::json!({"id": row_pk, "version": version})
-                .to_string()
-                .into_boxed_str(),
-        );
-        let schema = Box::leak(Box::new(serde_json::json!({
-            "$schema": lix_schema::SCHEMA_V1_URI,
-            "key": schema_key,
-            "columns": [
-                {"name":"id", "type":"text", "nullable":false},
-                {"name":"version", "type":"int8", "nullable":false}
-            ],
-            "primary_key": ["id"]
-        })));
-        (snapshot, schema)
     }
 
     fn manifest(
@@ -1317,40 +993,6 @@ mod tests {
         }))
     }
 
-    async fn certify_fixture_body<'a>(
-        store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
-        writes: &mut crate::storage_adapter::StorageWriteSet,
-        stage: &OrderedAddressableCommitDeltaStage,
-        deltas: &[TrackedStateCommitDeltaRef<'a>],
-    ) -> Option<CertifiedAuthoredCurrentStateBody> {
-        let adjusted = deltas
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, mut delta)| {
-                if let Some(change_id) = stage.change_id_at(index) {
-                    delta.delta.change_id = change_id;
-                }
-                delta
-            })
-            .collect::<Vec<_>>();
-        certify_authored_current_state_body(
-            store,
-            writes,
-            deltas
-                .first()
-                .expect("fixture body requires at least one delta")
-                .delta
-                .commit_id,
-            crate::ANONYMOUS_ACCOUNT_ID,
-            stage.mutation_inventory(),
-            false,
-            adjusted,
-        )
-        .await
-        .expect("fixture authored bodies should certify")
-    }
-
     async fn publish_replacement_scope(
         storage: &StorageAdapter<Memory>,
         parent: Option<&PublishedCommitStateManifest>,
@@ -1369,23 +1011,9 @@ mod tests {
             },
         };
         let mut writes = storage.new_write_set();
-        let schema = serde_json::json!({
-            "$schema": lix_schema::SCHEMA_V1_URI,
-            "key": schema_key,
-            "columns": [
-                {"name":"id", "type":"text", "nullable":false},
-                {"name":"version", "type":"int8", "nullable":false}
-            ],
-            "primary_key": ["id"]
-        });
-        let rows = ["row-000", "row-001"];
-        let snapshots = rows
-            .iter()
-            .map(|id| serde_json::json!({"id": id, "version": 1}).to_string())
-            .collect::<Vec<_>>();
         let replacement = stage_ordered_addressable_replacement_parts(
             &mut writes,
-            rows.into_iter().zip(&snapshots).map(|(identity, snapshot)| {
+            ["row-000", "row-001"].into_iter().map(|identity| {
                 Ok(TrackedStateSingleStringReplacementRef {
                     schema_key,
                     file_id: None,
@@ -1393,9 +1021,8 @@ mod tests {
                     commit_id,
                     created_at,
                     updated_at: created_at,
-                    snapshot_content: Some(snapshot),
-                    metadata_content: None,
-                    schema_definition: Some(&schema),
+                    snapshot: JsonSlotRef::Inline("{\"version\":1}"),
+                    metadata: JsonSlotRef::None,
                 })
             }),
             &generation,
@@ -1449,7 +1076,7 @@ mod tests {
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let identities = ["row-000", "row-001", "row-002"];
-        let replacement_scope = scope("scoped_publication");
+        let replacement_scope = scope("scoped-publication");
         let generation = CommitDeltaReplacementGeneration {
             scope: replacement_scope.clone(),
             fallback_commit_id: None,
@@ -1464,17 +1091,15 @@ mod tests {
         let replacement = stage_ordered_addressable_replacement_parts(
             &mut parent_writes,
             identities.iter().map(|identity| {
-                let (snapshot, schema) = native_fixture("scoped_publication", identity, 1);
                 Ok(TrackedStateSingleStringReplacementRef {
-                    schema_key: "scoped_publication",
+                    schema_key: "scoped-publication",
                     file_id: None,
                     row_pk: identity,
                     commit_id: parent_id,
                     created_at,
                     updated_at,
-                    snapshot_content: Some(snapshot),
-                    metadata_content: None,
-                    schema_definition: Some(schema),
+                    snapshot: JsonSlotRef::Inline("{\"version\":1}"),
+                    metadata: JsonSlotRef::None,
                 })
             }),
             &generation,
@@ -1529,8 +1154,8 @@ mod tests {
             &parent_read,
             parent.current_state_scoped_ranges.as_deref().unwrap(),
             &[
-                encoded_key("scoped_publication", &existing),
-                encoded_key("scoped_publication", &absent),
+                encoded_key("scoped-publication", &existing),
+                encoded_key("scoped-publication", &absent),
             ],
         )
         .await
@@ -1544,12 +1169,10 @@ mod tests {
 
         let deleted = RowPk::single("row-001");
         let inserted = RowPk::single("row-003");
-        let (insert_snapshot, insert_schema) =
-            native_fixture("scoped_publication", "row-003", 2);
         let changes = [
             TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
-                    schema_key: "scoped_publication",
+                    schema_key: "scoped-publication",
                     file_id: None,
                     row_pk: &deleted,
                     change_id: ChangeId::for_test_label("scoped-delete"),
@@ -1560,16 +1183,13 @@ mod tests {
                 },
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
-                snapshot_content: None,
-                metadata_content: None,
-                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
             },
             TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
-                    schema_key: "scoped_publication",
+                    schema_key: "scoped-publication",
                     file_id: None,
                     row_pk: &inserted,
                     change_id: ChangeId::for_test_label("scoped-insert"),
@@ -1578,11 +1198,8 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: JsonSlotRef::Inline(insert_snapshot),
+                snapshot: JsonSlotRef::Inline("{\"version\":2}"),
                 metadata: JsonSlotRef::None,
-                snapshot_content: Some(insert_snapshot),
-                metadata_content: None,
-                schema_definition: Some(insert_schema),
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -1597,22 +1214,13 @@ mod tests {
         )
         .expect("sparse mutations should stage")
         .expect("sparse mutations should be addressable");
-        let child_body = certify_fixture_body(
+        let child_publication = stage_current_state_scoped_ranges_from_published_parent(
             &parent_read,
             &mut child_writes,
-            &child_stage,
-            &changes,
-        )
-        .await;
-        let child_publication = stage_current_state_scoped_ranges_from_topology(
-            &parent_read,
-            &mut child_writes,
-            &[CertifiedCommitStateTopologyParent::Published(&parent)],
-            None,
+            Some(&parent),
             child_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             child_stage.mutation_inventory(),
-            child_body,
         )
         .await
         .expect("sparse post-image should path-copy");
@@ -1649,10 +1257,10 @@ mod tests {
             &child_read,
             child.current_state_scoped_ranges.as_deref().unwrap(),
             &[
-                encoded_key("scoped_publication", &existing),
-                encoded_key("scoped_publication", &deleted),
-                encoded_key("scoped_publication", &inserted),
-                encoded_key("scoped_publication", &absent),
+                encoded_key("scoped-publication", &existing),
+                encoded_key("scoped-publication", &deleted),
+                encoded_key("scoped-publication", &inserted),
+                encoded_key("scoped-publication", &absent),
             ],
         )
         .await
@@ -1666,8 +1274,8 @@ mod tests {
         );
         assert!(values[3].is_none(), "covered exact miss must not replay");
 
-        let first = encoded_key("scoped_publication", &existing);
-        let last = encoded_key("scoped_publication", &inserted);
+        let first = encoded_key("scoped-publication", &existing);
+        let last = encoded_key("scoped-publication", &inserted);
         let interval = scan_scoped_range_interval(
             &child_read,
             &child.current_state_scoped_ranges.as_deref().unwrap().tree,
@@ -1710,17 +1318,16 @@ mod tests {
         let parent_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_3050_0000_7000_8000_0000_0001_0000,
         ));
-        let parent = publish_replacement_scope(&storage, None, parent_id, "covered_scope").await;
+        let parent = publish_replacement_scope(&storage, None, parent_id, "covered-scope").await;
         let child_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_3050_0000_7000_8000_0000_0002_0000,
         ));
         let row = RowPk::single("row-000");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
-        let (snapshot, schema) = native_fixture("certified_new_scope", "row-000", 1);
         let change = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
-                schema_key: "certified_new_scope",
+                schema_key: "certified-new-scope",
                 file_id: None,
                 row_pk: &row,
                 change_id: ChangeId::for_test_label("certified-new-scope-change"),
@@ -1729,11 +1336,8 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline(snapshot),
+            snapshot: JsonSlotRef::Inline("{\"version\":1}"),
             metadata: JsonSlotRef::None,
-            snapshot_content: Some(snapshot),
-            metadata_content: None,
-            schema_definition: Some(schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1754,7 +1358,7 @@ mod tests {
         )
         .expect("unproven sparse mutation should stage")
         .expect("unproven sparse mutation should be addressable");
-        let error = match stage_current_state_scoped_ranges(
+        let fallback = stage_current_state_scoped_ranges(
             &read,
             &mut fallback_writes,
             &[&unproven_parent],
@@ -1765,15 +1369,10 @@ mod tests {
             fallback_stage.mutation_inventory(),
         )
         .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("an unproven non-empty publication must be rejected"),
-        };
+        .expect("unproven missing scope should fall back without failing the commit");
         assert!(
-            error
-                .message
-                .contains("omitted its same-publication body certification"),
-            "unexpected error: {error}"
+            fallback.root().is_none(),
+            "a missing marker without cumulative absence authority must use canonical replay"
         );
 
         let mut certified_writes = storage.new_write_set();
@@ -1785,22 +1384,13 @@ mod tests {
         )
         .expect("certified sparse mutation should stage")
         .expect("certified sparse mutation should be addressable");
-        let certified_body = certify_fixture_body(
+        let certified = stage_current_state_scoped_ranges_from_published_parent(
             &read,
             &mut certified_writes,
-            &certified_stage,
-            &[change],
-        )
-        .await;
-        let certified = stage_current_state_scoped_ranges_from_topology(
-            &read,
-            &mut certified_writes,
-            &[CertifiedCommitStateTopologyParent::Published(&parent)],
-            None,
+            Some(&parent),
             child_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             certified_stage.mutation_inventory(),
-            certified_body,
         )
         .await
         .expect("certified absent scope should seed an authenticated marker");
@@ -1808,7 +1398,7 @@ mod tests {
             .root()
             .expect("certified scope should keep serving root");
         let new_scope = crate::tracked_state::current_state_envelope::current_state_scope_prefix(
-            &scope("certified_new_scope"),
+            &scope("certified-new-scope"),
         )
         .unwrap();
         let marker = load_scoped_range_coverage_with_staged(
@@ -1840,9 +1430,7 @@ mod tests {
         let row = RowPk::single("row-000");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
-        let changes = ["alpha", "beta"].map(|schema_key| {
-            let (snapshot, schema) = native_fixture(schema_key, "row-000", 2);
-            TrackedStateCommitDeltaRef {
+        let changes = ["alpha", "beta"].map(|schema_key| TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key,
                 file_id: None,
@@ -1853,15 +1441,12 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline(snapshot),
+            snapshot: JsonSlotRef::Inline("{\"version\":2}"),
             metadata: JsonSlotRef::None,
-            snapshot_content: Some(snapshot),
-            metadata_content: None,
-            schema_definition: Some(schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
-        }});
+        });
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -1875,16 +1460,13 @@ mod tests {
         )
         .expect("multi-scope mutations should stage")
         .expect("multi-scope mutations should be addressable");
-        let certified_body = certify_fixture_body(&read, &mut writes, &staged, &changes).await;
-        let publication = stage_current_state_scoped_ranges_from_topology(
+        let publication = stage_current_state_scoped_ranges_from_published_parent(
             &read,
             &mut writes,
-            &[CertifiedCommitStateTopologyParent::Published(&beta)],
-            None,
+            Some(&beta),
             child_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             staged.mutation_inventory(),
-            certified_body,
         )
         .await
         .expect("both scope rewrites should see earlier staged nodes");
@@ -1944,8 +1526,6 @@ mod tests {
         let second_row = RowPk::single("row-001");
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
-        let (first_snapshot, first_schema) = native_fixture("staged", "row-000", 2);
-        let (second_snapshot, second_schema) = native_fixture("staged", "row-001", 3);
         let first_change = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: "staged",
@@ -1957,11 +1537,8 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline(first_snapshot),
+            snapshot: JsonSlotRef::Inline("{\"version\":2}"),
             metadata: JsonSlotRef::None,
-            snapshot_content: Some(first_snapshot),
-            metadata_content: None,
-            schema_definition: Some(first_schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1977,11 +1554,8 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline(second_snapshot),
+            snapshot: JsonSlotRef::Inline("{\"version\":3}"),
             metadata: JsonSlotRef::None,
-            snapshot_content: Some(second_snapshot),
-            metadata_content: None,
-            schema_definition: Some(second_schema),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1999,17 +1573,13 @@ mod tests {
         )
         .expect("first child mutation should stage")
         .expect("first child mutation should be addressable");
-        let first_body =
-            certify_fixture_body(&read, &mut writes, &first_stage, &[first_change]).await;
-        let first_publication = stage_current_state_scoped_ranges_from_topology(
+        let first_publication = stage_current_state_scoped_ranges_from_published_parent(
             &read,
             &mut writes,
-            &[CertifiedCommitStateTopologyParent::Published(&base)],
-            None,
+            Some(&base),
             first_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             first_stage.mutation_inventory(),
-            first_body,
         )
         .await
         .expect("first child root should stage");
@@ -2035,8 +1605,6 @@ mod tests {
         )
         .expect("second child mutation should stage")
         .expect("second child mutation should be addressable");
-        let second_body =
-            certify_fixture_body(&read, &mut writes, &second_stage, &[second_change]).await;
         let second_publication = stage_current_state_scoped_ranges_from_staged_parent(
             &read,
             &mut writes,
@@ -2044,7 +1612,6 @@ mod tests {
             second_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             second_stage.mutation_inventory(),
-            second_body,
         )
         .await
         .expect("staged child must read its parent's staged scoped nodes");
@@ -2245,7 +1812,7 @@ mod tests {
         unknown.selected_source_commit_id = Some(*selected_id.as_uuid().as_bytes());
         let selected = manifest(selected_id, None, CommitStateMutationInventory::default());
         let mut writes = storage.new_write_set();
-        let error = match stage_current_state_scoped_ranges(
+        let publication = stage_current_state_scoped_ranges(
             &read,
             &mut writes,
             &[],
@@ -2256,11 +1823,8 @@ mod tests {
             &unknown,
         )
         .await
-        {
-            Ok(_) => panic!("selected history without an authenticated source root must fail"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        .unwrap();
+        assert!(publication.root().is_none());
 
         let left = RowPk::single("a");
         let right = RowPk::single("z");
@@ -2272,7 +1836,7 @@ mod tests {
             replacement_part: None,
         });
         let mut writes = storage.new_write_set();
-        let error = match stage_current_state_scoped_ranges(
+        let publication = stage_current_state_scoped_ranges(
             &read,
             &mut writes,
             &[],
@@ -2283,11 +1847,11 @@ mod tests {
             &broad,
         )
         .await
-        {
-            Ok(_) => panic!("broad history without an authenticated source root must fail"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        .unwrap();
+        assert!(
+            publication.root().is_none(),
+            "cross-scope mutation must not inherit serving authority"
+        );
     }
 
     #[tokio::test]
@@ -2336,7 +1900,7 @@ mod tests {
             crate::storage_codec::encode("scope-filter size candidate", &parent)
                 .unwrap()
                 .len();
-        assert!(complete_manifest_bytes > incomplete_manifest_bytes);
+        assert_eq!(complete_manifest_bytes - incomplete_manifest_bytes, 129);
         let child_filter = advance_touched_scope_filter(
             &[&parent],
             None,
@@ -2349,7 +1913,7 @@ mod tests {
 
         let incomplete = advance_touched_scope_filter(&[&parent], None, None).unwrap();
         assert!(!incomplete.complete);
-        assert!(incomplete.scopes.is_empty());
+        assert!(incomplete.bits.is_empty());
         assert!(!touched_scope_filter_proves_absent(&incomplete, &absent).unwrap());
     }
 
@@ -2462,7 +2026,6 @@ mod tests {
             merge_commit,
             crate::ANONYMOUS_ACCOUNT_ID,
             &merge_inventory,
-            None,
         )
         .await
         .unwrap();
@@ -2486,7 +2049,6 @@ mod tests {
             alias_commit,
             crate::ANONYMOUS_ACCOUNT_ID,
             &alias_inventory,
-            None,
         )
         .await
         .unwrap();
@@ -2506,14 +2068,14 @@ mod tests {
         assert!(
             validate_touched_scope_filter(&CommitStateTouchedScopeFilter {
                 complete: false,
-                scopes: vec![scope("foreign")],
+                bits: vec![1],
             })
             .is_err()
         );
         assert!(
             validate_touched_scope_filter(&CommitStateTouchedScopeFilter {
                 complete: true,
-                scopes: vec![scope("z"), scope("a")],
+                bits: vec![0; TOUCHED_SCOPE_FILTER_BYTES - 1],
             })
             .is_err()
         );

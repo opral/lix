@@ -15089,7 +15089,7 @@ mod tests {
                 row_pk: row_pk.clone(),
                 schema_key: "lix_key_value".to_owned(),
                 file_id: None,
-                snapshot_content: Some(snapshot.clone().into()),
+                snapshot_content: Some(snapshot.into()),
                 metadata: None,
                 deleted: false,
                 created_at: timestamp().to_string(),
@@ -15205,20 +15205,17 @@ mod tests {
         .expect("reuse admitted packed mutation predecessor");
         assert!(reused[0].is_some());
         assert_eq!(
-            scan_calls.load(Ordering::Relaxed),
-            admitted_read_counts.1,
-            "a transaction snapshot must reuse an admitted packed segment without rescanning"
-        );
-        assert_eq!(
-            get_many_calls.load(Ordering::Relaxed),
-            admitted_read_counts.0,
-            "self-contained LXCD17 packed reuse must not perform another object read"
+            (
+                get_many_calls.load(Ordering::Relaxed),
+                scan_calls.load(Ordering::Relaxed),
+            ),
+            admitted_read_counts,
+            "a transaction snapshot must reuse an admitted packed segment by immutable address"
         );
         let (_, change, _) = entries[0].as_ref().expect("packed predecessor exists");
-        assert_eq!(
-            change.snapshot,
-            JsonSlot::Inline(snapshot.into()),
-            "native history owns the self-contained large row body"
+        assert!(
+            matches!(change.snapshot, JsonSlot::Ref(_)),
+            "mutation lookup must retain the out-of-band slot instead of materializing its payload"
         );
         assert_eq!(
             json_get_many_calls.load(Ordering::Relaxed),
@@ -18252,7 +18249,7 @@ mod tests {
                 row_pk: shadowed_pk.clone(),
                 schema_key: SHADOWED_SCHEMA.to_owned(),
                 file_id: None,
-                snapshot_content: Some(r#"{"key":"shadowed-row"}"#.into()),
+                snapshot_content: Some(r#"{"key":"global-row"}"#.into()),
                 metadata: None,
                 deleted: false,
                 created_at: created_at.to_string(),
@@ -18283,7 +18280,7 @@ mod tests {
                     row_pk: shadowed_pk.clone(),
                     schema_key: SHADOWED_SCHEMA.to_owned(),
                     file_id: None,
-                    snapshot_content: Some(r#"{"key":"shadowed-row"}"#.into()),
+                    snapshot_content: Some(r#"{"key":"branch-row"}"#.into()),
                     metadata: None,
                     deleted: false,
                     created_at: created_at.to_string(),

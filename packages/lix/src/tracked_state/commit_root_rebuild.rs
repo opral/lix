@@ -324,9 +324,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitRootRebuildPlan {
     pub(crate) commit_id: CommitId,
-    parent_commit_id: Option<CommitId>,
-    replacement_generation: Option<storage::CommitDeltaReplacementGeneration>,
-    deltas: Vec<CommitRootRebuildDelta>,
+    pub(crate) parent_commit_id: Option<CommitId>,
+    pub(crate) deltas: Vec<CommitRootRebuildDelta>,
 }
 
 async fn load_commit_root_rebuild_plan<S>(
@@ -364,40 +363,17 @@ where
                 )
             })?
     };
-    // Rebuild needs the authenticated authored/selected discriminator but not
-    // payload bodies. This bounded member load decodes immutable identities
-    // without hydrating terminal JSON/public projections.
-    let manifest = storage::load_commit_state_manifest(store, commit.commit_id)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "cannot rebuild tracked_state root for commit '{}' without its commit-state manifest",
-                    commit.commit_id
-                ),
-            )
-        })?;
-    let replacement_generation =
-        storage::commit_delta_replay_metadata_from_inventory(&manifest.mutations)
-            .replacement_generation;
-    let members = storage::load_commit_delta_members_for_schemas(
-        store,
-        commit.commit_id,
-        &[],
-        &[],
-        usize::MAX,
-        false,
-    )
-    .await?
-    .expect("unbounded authenticated member load is complete");
+    // Commit roots contain only identity/index facts. Avoid hydrating JSON
+    // sidecars while rebuilding them; the packed delta index already carries
+    // deletion, owner ids, and original timestamps.
+    let members = storage::scan_commit_delta_members(store, commit.commit_id).await?;
     #[cfg(feature = "root-replay-trace")]
     let member_bytes = members
         .iter()
-        .map(|member| {
-            (member.key.schema_key.len()
-                + member.key.file_id.as_ref().map(String::len).unwrap_or(0)
-                + member.key.row_pk.estimated_heap_bytes()) as u64
+        .map(|(key, _)| {
+            (key.schema_key.len()
+                + key.file_id.as_ref().map(String::len).unwrap_or(0)
+                + key.row_pk.estimated_heap_bytes()) as u64
         })
         .sum::<u64>();
     #[cfg(feature = "root-replay-trace")]
@@ -408,41 +384,21 @@ where
     );
     let deltas = members
         .into_iter()
-        .map(|member| CommitRootRebuildDelta {
-            schema_key: member.key.schema_key,
-            file_id: member.key.file_id,
-            row_pk: member.key.row_pk,
-            change_id: member.value.change_id,
-            commit_id: member.value.commit_id,
-            deleted: member.value.deleted,
-            created_at: member.value.created_at,
-            updated_at: member.value.updated_at,
+        .map(|(key, value)| CommitRootRebuildDelta {
+            schema_key: key.schema_key,
+            file_id: key.file_id,
+            row_pk: key.row_pk,
+            change_id: value.change_id,
+            commit_id: value.commit_id,
+            deleted: value.deleted,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
         })
         .collect();
 
-    let parent_commit_id = manifest
-        .mutations
-        .selected_source_commit_id()
-        .or_else(|| {
-            manifest
-                .snapshot_root
-                .as_ref()
-                .and_then(|root| root.parent_roots.first().map(|parent| parent.commit_id))
-        })
-        .or_else(|| first_parent_commit_id(&commit))
-        // The replacement fallback is scope-local replay authority, not the
-        // whole-root ancestry. It is usable only when the commit has no graph
-        // parent/root metadata from which unaffected scopes can be retained.
-        .or_else(|| {
-            replacement_generation
-                .as_ref()
-                .and_then(|generation| generation.fallback_commit_id)
-        });
-
     Ok(CommitRootRebuildPlan {
         commit_id: commit.commit_id,
-        parent_commit_id,
-        replacement_generation,
+        parent_commit_id: first_parent_commit_id(&commit),
         deltas,
     })
 }
@@ -474,34 +430,8 @@ where
     // canonical root writer. The ordered bulk merge is a publication
     // optimization whose parent-stream assumptions are not sufficient for a
     // repair frontier containing shuffled filesystem lifecycle changes.
-    let lifecycle_override_keys = plan
-        .deltas
-        .iter()
-        .filter(|delta| {
-            plan.replacement_generation
-                .as_ref()
-                .is_some_and(|generation| {
-                    generation.scope.schema_key == delta.schema_key
-                        && generation.scope.file_id == delta.file_id
-                })
-        })
-        .map(|delta| TrackedStateKey {
-            schema_key: delta.schema_key.clone(),
-            file_id: delta.file_id.clone(),
-            row_pk: delta.row_pk.clone(),
-        })
-        .collect::<std::collections::BTreeSet<_>>();
     writer
-        .stage_commit_root_from_authenticated_rebuild(
-            &commit_id,
-            parent_commit_id.as_deref(),
-            deltas,
-            &std::collections::BTreeSet::new(),
-            plan.replacement_generation
-                .as_ref()
-                .map(|generation| &generation.scope),
-            &lifecycle_override_keys,
-        )
+        .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
         .await
 }
 
@@ -536,15 +466,10 @@ where
             ));
         }
     }
-    if plans
-        .iter()
-        .any(|plan| plan.replacement_generation.is_some())
-        || plans.iter().flat_map(|plan| &plan.deltas).any(|delta| {
-            (delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-                || delta.schema_key
-                    == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-        })
-    {
+    if plans.iter().flat_map(|plan| &plan.deltas).any(|delta| {
+        (delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            || delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+    }) {
         return Ok(None);
     }
 
@@ -634,7 +559,6 @@ mod tests {
         CommitRootRebuildPlan {
             commit_id: CommitId::for_test_label(commit),
             parent_commit_id: parent.map(CommitId::for_test_label),
-            replacement_generation: None,
             deltas,
         }
     }

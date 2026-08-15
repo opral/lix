@@ -198,7 +198,6 @@ where
                     row_pk: row.row_pk,
                     schema_key: row.schema_key,
                     file_id: row.file_id,
-                    deleted: row.snapshot_content.is_none(),
                     snapshot_content: row.snapshot_content,
                     metadata: row.metadata,
                     created_at: row.created_at.to_string(),

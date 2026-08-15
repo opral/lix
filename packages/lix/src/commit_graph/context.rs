@@ -80,7 +80,7 @@ where
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
     member_changes_cache:
-        HashMap<(Vec<String>, Vec<String>, bool), HashMap<CommitId, Vec<CommitGraphChange>>>,
+        HashMap<(Vec<String>, Vec<String>), HashMap<CommitId, Vec<CommitGraphChange>>>,
 }
 
 enum LinearMergeBase {
@@ -580,7 +580,6 @@ where
                 node.commit_id,
                 &shaping.member_schema_keys,
                 &shaping.member_file_ids,
-                request.hydrate_member_payloads,
             )
             .await?
         {
@@ -604,13 +603,8 @@ where
         commit_id: CommitId,
         schema_keys: &[String],
         file_ids: &[String],
-        hydrate_member_payloads: bool,
     ) -> Result<Vec<CommitGraphChange>, LixError> {
-        let cache_key = (
-            schema_keys.to_vec(),
-            file_ids.to_vec(),
-            hydrate_member_payloads,
-        );
+        let cache_key = (schema_keys.to_vec(), file_ids.to_vec());
         if let Some(changes) = self
             .member_changes_cache
             .get(&cache_key)
@@ -618,21 +612,18 @@ where
         {
             return Ok(changes.clone());
         }
-        let members = crate::tracked_state::load_commit_delta_members_for_schemas(
+        let members = crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
             &self.store,
             commit_id,
             schema_keys,
             file_ids,
             usize::MAX,
-            hydrate_member_payloads,
         )
         .await?
         .expect("unbounded commit member load cannot exceed its segment limit");
         let mut changes = members
             .into_iter()
-            .map(|member| {
-                commit_graph_change_from_change_record(member.change, member.value.deleted)
-            })
+            .map(|member| commit_graph_change_from_change_record(member.change))
             .collect::<Vec<_>>();
         changes.sort_by_key(|change| change.id);
         self.member_changes_cache
@@ -698,17 +689,13 @@ struct HistoryCollection {
     seen_changes: BTreeSet<(ChangeId, String, Option<String>, RowPk)>,
 }
 
-fn commit_graph_change_from_change_record(
-    change: ChangeRecord,
-    deleted: bool,
-) -> CommitGraphChange {
+fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphChange {
     CommitGraphChange {
         id: change.change_id,
         account_id: change.account_id,
         row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
-        deleted,
         snapshot: change.snapshot,
         metadata: change.metadata,
         created_at: change.created_at,
@@ -963,7 +950,6 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
-        deleted: false,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: node.created_at,
@@ -1567,79 +1553,10 @@ mod tests {
         let alpha_second_pk = crate::row_pk::RowPk::single("alpha-second-row");
         let beta_pk = crate::row_pk::RowPk::single("beta-row");
         let created_at = ts("2026-01-02T00:00:00Z");
-        let source_commit_id = CommitId::for_test_label("selected-tombstone-source");
-        let source_pk = crate::row_pk::RowPk::single("selected-source-seed");
-        let source_schema_key = "selected_source_seed";
-        let source_schema = serde_json::json!({
-            "$schema": lix_schema::SCHEMA_V1_URI,
-            "key": source_schema_key,
-            "columns": [{"name":"id", "type":"text", "nullable":false}],
-            "primary_key": ["id"]
-        });
-        let source_snapshot = r#"{"id":"selected-source-seed"}"#;
-        let source_delta = [TrackedStateCommitDeltaRef {
-            delta: TrackedStateDeltaRef {
-                schema_key: source_schema_key,
-                file_id: None,
-                row_pk: &source_pk,
-                change_id: change_id("selected-source-seed"),
-                commit_id: source_commit_id,
-                deleted: false,
-                created_at,
-                updated_at: created_at,
-            },
-            snapshot: crate::json_store::JsonSlotRef::Inline(source_snapshot),
-            metadata: crate::json_store::JsonSlotRef::None,
-            snapshot_content: Some(source_snapshot),
-            metadata_content: None,
-            schema_definition: Some(&source_schema),
-            origin_key: None,
-            base_coordinate: None,
-            authored: true,
-        }];
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        let source_stage = stage_commit_deltas_for_commit_state(&mut writes, &source_delta)
-            .expect("selected tombstone source should stage");
-        stage_test_commit_manifest(
-            &read,
-            &mut writes,
-            &CommitRecord {
-                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
-                format_version: 3,
-                commit_id: source_commit_id,
-                generation: 0,
-                parent_commit_ids: Vec::new(),
-                first_parent_jump_commit_id: source_commit_id,
-                first_parent_jump_span: 0,
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at,
-            },
-            source_stage.mutation_inventory().clone(),
-            &source_delta,
-            None,
-        )
-        .await;
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("selected tombstone source should commit");
-        drop(read);
-
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("selected tombstone read should open");
-        let source_topology = crate::tracked_state::load_published_commit_state_topology(
-            &read,
-            source_commit_id,
-        )
-        .await
-        .expect("selected tombstone source topology should load")
-        .expect("selected tombstone source topology should exist");
+            .expect("read should open");
         let mut writes = storage.new_write_set();
         ChangelogContext::new()
             .writer(&mut read, &mut writes)
@@ -1659,7 +1576,7 @@ mod tests {
             })
             .await
             .expect("commit should stage");
-        let mut deltas = vec![
+        let deltas = [
             TrackedStateCommitDeltaRef {
                 delta: TrackedStateDeltaRef {
                     schema_key: "alpha",
@@ -1673,9 +1590,6 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
-                snapshot_content: None,
-                metadata_content: None,
-                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1693,9 +1607,6 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
-                snapshot_content: None,
-                metadata_content: None,
-                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1713,47 +1624,30 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
-                snapshot_content: None,
-                metadata_content: None,
-                schema_definition: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
             },
         ];
-        deltas.sort_by_key(|delta| {
-            crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
-                schema_key: delta.delta.schema_key,
-                file_id: delta.delta.file_id,
-                row_pk: delta.delta.row_pk,
-            })
-        });
-        let staged = crate::tracked_state::stage_addressable_commit_deltas_with_selected_source(
-            &mut writes,
-            &deltas,
-            &vec![false; deltas.len()],
-            source_commit_id,
-        )
+        let staged = stage_commit_deltas_for_commit_state(&mut writes, &deltas)
             .expect("selected tombstones should stage");
-        stage_test_commit_manifest(
-            &read,
+        stage_commit_state_manifest(
             &mut writes,
-            &CommitRecord {
-                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
-                format_version: 3,
+            &CommitStateManifest {
                 commit_id,
-                generation: 0,
-                parent_commit_ids: Vec::new(),
-                first_parent_jump_commit_id: commit_id,
-                first_parent_jump_span: 0,
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at,
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+                replay_debt: CommitStateReplayDebt {
+                    depth: 1,
+                    rows: 3,
+                    bytes: 0,
+                },
+                mutations: staged.mutation_inventory().clone(),
+                touched_scope_filter: Default::default(),
+                current_state_scoped_ranges: None,
+                snapshot_root: None,
             },
-            staged.mutation_inventory().clone(),
-            &deltas,
-            Some(&source_topology),
         )
-        .await;
+        .expect("selected tombstone commit-state manifest should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -2049,7 +1943,6 @@ mod tests {
     #[derive(Clone)]
     struct TestChange {
         change: CommitGraphChange,
-        schema_definition: Option<serde_json::Value>,
         commit_change_ids: Vec<ChangeId>,
         parent_commit_ids: Vec<CommitId>,
     }
@@ -2068,13 +1961,11 @@ mod tests {
                     row_pk: crate::row_pk::RowPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    deleted: false,
                     snapshot: crate::json_store::JsonSlot::None,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     origin_key: None,
                 },
-                schema_definition: None,
                 commit_change_ids: change_ids
                     .iter()
                     .map(|id| ChangeId::for_test_label(id))
@@ -2094,14 +1985,6 @@ mod tests {
             snapshot_content: Option<&str>,
             created_at: &str,
         ) -> Self {
-            let snapshot_content = snapshot_content.map(|content| {
-                serde_json::json!({
-                    "id": row_pk,
-                    "payload": serde_json::from_str::<serde_json::Value>(content)
-                        .expect("test row payload should be JSON"),
-                })
-                .to_string()
-            });
             Self {
                 change: CommitGraphChange {
                     id: ChangeId::for_test_label(change_id),
@@ -2109,9 +1992,7 @@ mod tests {
                     row_pk: crate::row_pk::RowPk::single(row_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
-                    deleted: snapshot_content.is_none(),
                     snapshot: snapshot_content
-                        .as_deref()
                         .map_or(crate::json_store::JsonSlot::None, |content| {
                             crate::json_store::JsonSlot::from_json(content)
                         }),
@@ -2119,15 +2000,6 @@ mod tests {
                     created_at: ts(created_at),
                     origin_key: None,
                 },
-                schema_definition: Some(serde_json::json!({
-                    "$schema": lix_schema::SCHEMA_V1_URI,
-                    "key": schema_key,
-                    "columns": [
-                        {"name":"id", "type":"text", "nullable":false},
-                        {"name":"payload", "type":"jsonb", "nullable":false}
-                    ],
-                    "primary_key": ["id"]
-                })),
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
             }
@@ -2250,13 +2122,9 @@ mod tests {
             .await
             .expect("changelog append should stage");
         drop(writer);
-        let records_by_id = commit_records
-            .iter()
-            .map(|record| (record.commit_id, record))
-            .collect::<BTreeMap<_, _>>();
-        let mut staged_manifests = BTreeSet::new();
+        let mut inventories = BTreeMap::new();
         for (commit_id, members) in &commit_members {
-            let mut deltas = members
+            let deltas = members
                 .iter()
                 .map(|change| TrackedStateCommitDeltaRef {
                     delta: TrackedStateDeltaRef {
@@ -2271,64 +2139,21 @@ mod tests {
                     },
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),
-                    snapshot_content: match change.snapshot.as_ref_slot() {
-                        crate::json_store::JsonSlotRef::Inline(content) => Some(content),
-                        crate::json_store::JsonSlotRef::None => None,
-                        crate::json_store::JsonSlotRef::Ref(_) => {
-                            panic!("test authored body must remain inline")
-                        }
-                    },
-                    metadata_content: None,
-                    schema_definition: changes_by_id
-                        .get(&change.change_id)
-                        .and_then(|change| change.schema_definition.as_ref()),
                     origin_key: change.origin_key.as_deref(),
                     base_coordinate: None,
                     authored: true,
                 })
                 .collect::<Vec<_>>();
-            deltas.sort_by_key(|delta| {
-                crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
-                    schema_key: delta.delta.schema_key,
-                    file_id: delta.delta.file_id,
-                    row_pk: delta.delta.row_pk,
-                })
-            });
             let staged = stage_commit_deltas_for_commit_state(&mut writes, &deltas)
                 .expect("packed commit members should stage");
-            stage_test_commit_manifest(
-                &read,
-                &mut writes,
-                records_by_id[commit_id],
-                staged.mutation_inventory().clone(),
-                &deltas,
-                None,
-            )
-            .await;
-            staged_manifests.insert(*commit_id);
+            inventories.insert(*commit_id, staged.mutation_inventory().clone());
         }
         for record in &commit_records {
-            if staged_manifests.contains(&record.commit_id) {
-                continue;
-            }
-            stage_commit_state_manifest(
+            stage_test_commit_manifest(
                 &mut writes,
-                &CommitStateManifest {
-                    commit_id: record.commit_id,
-                    change_account_id: record.account_id.clone(),
-                    replay_debt: CommitStateReplayDebt {
-                        depth: u16::try_from(record.generation + 1)
-                            .expect("test generation should fit replay depth"),
-                        rows: 0,
-                        bytes: 0,
-                    },
-                    mutations: CommitStateMutationInventory::default(),
-                    touched_scope_filter: Default::default(),
-                    current_state_scoped_ranges: None,
-                    snapshot_root: None,
-                },
-            )
-            .expect("empty test commit-state manifest should stage");
+                record,
+                inventories.remove(&record.commit_id).unwrap_or_default(),
+            );
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2336,39 +2161,12 @@ mod tests {
             .expect("commit should succeed");
     }
 
-    async fn stage_test_commit_manifest(
-        read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    fn stage_test_commit_manifest(
         writes: &mut crate::storage_adapter::StorageWriteSet,
         record: &CommitRecord,
         mutations: CommitStateMutationInventory,
-        deltas: &[TrackedStateCommitDeltaRef<'_>],
-        selected_source: Option<&crate::tracked_state::PublishedCommitStateTopology>,
     ) {
-        let certified_body = crate::tracked_state::certify_authored_current_state_body(
-            read,
-            writes,
-            record.commit_id,
-            &record.account_id,
-            &mutations,
-            selected_source.is_none(),
-            deltas.iter().copied(),
-        )
-        .await
-        .expect("test authored current-state body should certify");
-        let publication = crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
-            read,
-            writes,
-            &[],
-            selected_source
-                .map(crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology),
-            record.commit_id,
-            &record.account_id,
-            &mutations,
-            certified_body,
-        )
-        .await
-        .expect("test native current-state root should publish");
-        crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+        stage_commit_state_manifest(
             writes,
             &CommitStateManifest {
                 commit_id: record.commit_id,
@@ -2380,11 +2178,10 @@ mod tests {
                     bytes: 0,
                 },
                 mutations,
-                touched_scope_filter: publication.touched_scope_filter().clone(),
-                current_state_scoped_ranges: publication.root(),
+                touched_scope_filter: Default::default(),
+                current_state_scoped_ranges: None,
                 snapshot_root: None,
             },
-            &publication,
         )
         .expect("test commit-state manifest should stage");
     }

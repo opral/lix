@@ -1,7 +1,7 @@
 use crate::changelog::ChangeRecord;
 use crate::common::SharedStr;
-use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
 use crate::row_pk::RowPk;
+use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, parse_row_metadata};
 
@@ -18,7 +18,6 @@ pub(crate) struct MaterializedChange {
     pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) deleted: bool,
     pub(crate) snapshot_content: Option<SharedStr>,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) created_at: String,
@@ -53,17 +52,6 @@ where
     materialize_commit_graph_change(json_reader, change, ChangePayloadProjection::ALL).await
 }
 
-pub(crate) async fn materialize_located_history_change_with_projection<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    change: crate::commit_graph::CommitGraphChange,
-    payload_projection: ChangePayloadProjection,
-) -> Result<MaterializedChange, LixError>
-where
-    S: StorageAdapterRead,
-{
-    materialize_commit_graph_change(json_reader, change, payload_projection).await
-}
-
 pub(crate) async fn materialize_changelog_change_record<S>(
     json_reader: &mut JsonStoreReader<S>,
     change: ChangeRecord,
@@ -72,7 +60,6 @@ pub(crate) async fn materialize_changelog_change_record<S>(
 where
     S: StorageAdapterRead,
 {
-    let deleted = matches!(&change.snapshot, crate::json_store::JsonSlot::None);
     materialize_commit_graph_change(
         json_reader,
         crate::commit_graph::CommitGraphChange {
@@ -81,7 +68,6 @@ where
             row_pk: change.row_pk,
             schema_key: change.schema_key,
             file_id: change.file_id,
-            deleted,
             snapshot: change.snapshot,
             metadata: change.metadata,
             created_at: change.created_at,
@@ -121,7 +107,6 @@ where
         row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
-        deleted: change.deleted,
         snapshot_content,
         metadata,
         created_at: change.created_at.to_string(),
@@ -172,10 +157,10 @@ mod tests {
     use crate::changelog::ChangeId;
     use crate::commit_graph::CommitGraphChange;
     use crate::common::LixTimestamp;
+    use crate::row_pk::RowPk;
     use crate::json_store::{
         JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
     };
-    use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     use super::{ChangePayloadProjection, materialize_commit_graph_change};
@@ -187,7 +172,6 @@ mod tests {
             row_pk: RowPk::single("row-1"),
             schema_key: "example".to_string(),
             file_id: Some("file-1".to_string()),
-            deleted: matches!(&snapshot, JsonSlot::None),
             snapshot,
             metadata,
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),

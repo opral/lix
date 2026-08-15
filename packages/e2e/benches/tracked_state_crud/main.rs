@@ -1,4 +1,3 @@
-#![recursion_limit = "256"]
 #![allow(clippy::large_futures)]
 
 use std::time::{Duration, Instant};

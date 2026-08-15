@@ -673,18 +673,22 @@ mod tests {
         // The point write keeps the compact current-state certificate,
         // publishes its authenticated branch control, and rotates the two
         // mandatory publication epochs — binary-CAS and json_store. It touches
-        // eleven spaces: those epochs and the tracked mutation fence
+        // eight spaces, not eleven: those epochs and the tracked mutation fence
         // are all keys in the one revision space, the retirement candidates a
         // sweep needs are derived from the commit graph instead of being
         // published into a reachability delta row plus its queue control, and
         // the commit-derived change id is computed from the commit id instead
         // of being mirrored into a reverse-index space.
         //
-        // The three additional puts/spaces are the rooted publication's
-        // authoritative current-state range and authored-history body objects.
-        assert_eq!(point_update.staged_puts, 13, "{point_update:?}");
-        assert_eq!(point_update.touched_spaces, 11, "{point_update:?}");
-        assert_eq!(point_update.put_batches, 11, "{point_update:?}");
+        // The json_store epoch is the tenth staged put and is why this is 10
+        // rather than 9. It costs no extra space, batch, or storage call — the
+        // revision space is already in this write set and its one-byte keys are
+        // adjacent — and it is what lets the payload sweep reclaim superseded
+        // out-of-band JSON at all: those rows are content addressed, so a
+        // publisher can resolve onto a row an earlier sweep plan marked dead.
+        assert_eq!(point_update.staged_puts, 10, "{point_update:?}");
+        assert_eq!(point_update.touched_spaces, 8, "{point_update:?}");
+        assert_eq!(point_update.put_batches, 8, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement
