@@ -1,16 +1,17 @@
 {
   "Start": [
     { "path": "./what-is-lix.md", "label": "What is Lix?" },
+    { "path": "./comparison-to-git.md", "label": "Comparison to Git" },
     { "path": "./getting-started.md", "label": "Getting Started" },
     { "path": "./javascript-quickstart.md", "label": "JavaScript Quickstart" },
     { "path": "./rust-quickstart.md", "label": "Rust Quickstart" }
   ],
-  "Build": [
-    { "path": "./schemas.md", "label": "Store Application Data" },
-    { "path": "./semantic-changes.md", "label": "Semantic Changes" },
+  "Concepts": [
+    { "path": "./schemas.md", "label": "Schemas" },
+    { "path": "./diffs.md", "label": "Diffs" },
     { "path": "./files-and-media.md", "label": "Files and Media" },
     { "path": "./branching.md", "label": "Branching" },
-    { "path": "./history.md", "label": "Change History" },
+    { "path": "./history.md", "label": "History" },
     {
       "path": "./realtime-collaboration.md",
       "label": "Real-time Collaboration"
@@ -19,14 +20,14 @@
   ],
   "Guides": [
     { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" },
-    { "path": "./comparison-to-git.md", "label": "Comparison to Git" },
-    { "path": "./server-protocol.md", "label": "Host a Repository" }
+    { "path": "./hosting.md", "label": "Hosting" }
   ],
   "Reference": [
     { "path": "./checkpoints.md", "label": "Checkpoints" },
     { "path": "./diff-commands.md", "label": "Diff Commands" },
     { "path": "./surfaces.md", "label": "SQL Surfaces" },
     { "path": "./js-api-reference.md", "label": "JavaScript API" },
-    { "path": "./sql-functions.md", "label": "SQL Functions" }
+    { "path": "./sql-functions.md", "label": "SQL Functions" },
+    { "path": "./server-protocol.md", "label": "Server Protocol" }
   ]
 }
