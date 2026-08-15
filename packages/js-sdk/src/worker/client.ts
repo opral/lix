@@ -66,26 +66,28 @@ export async function openLixWorkerBinding(
 				}
 			: undefined;
 		const binding = await openDirectLixBinding(storage, telemetryDispatch);
-		if (!onDisposed) return binding;
-		let disposed = false;
-		return new Proxy(binding, {
-			get(target, property, receiver) {
-				if (property === "close") {
-					return async () => {
-						try {
-							await target.close();
-						} finally {
-							if (!disposed) {
-								disposed = true;
-								onDisposed();
+		if (binding) {
+			if (!onDisposed) return binding;
+			let disposed = false;
+			return new Proxy(binding, {
+				get(target, property, receiver) {
+					if (property === "close") {
+						return async () => {
+							try {
+								await target.close();
+							} finally {
+								if (!disposed) {
+									disposed = true;
+									onDisposed();
+								}
 							}
-						}
-					};
+						};
+					}
+					const value = Reflect.get(target, property, receiver) as unknown;
+					return typeof value === "function" ? value.bind(target) : value;
 				}
-				const value = Reflect.get(target, property, receiver) as unknown;
-				return typeof value === "function" ? value.bind(target) : value;
-			},
-		});
+			});
+		}
 	}
 	const client = await openLixWorker(storage, onDisposed, telemetry);
 	return workerBinding(client);

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.2 - 2026-08-15
+
+### Patch
+
+- Fixed in-memory Lix on Node.js when the native addon is unavailable by falling back to the bundled WebAssembly engine.
+
+  This restores compatibility for memory-backed consumers on musl-based Linux distributions such as Alpine while keeping native-only features unchanged.
+
 ## 0.12.1 - 2026-08-15
 
 ### Patch
