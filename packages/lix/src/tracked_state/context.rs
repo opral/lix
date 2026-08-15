@@ -8295,32 +8295,29 @@ mod tests {
             .await
             .expect("certified commit should commit");
     }
-
-
-
     /// Builds `gen -> a1 -> a2 -> a3 -> b1 -> b2 -> b3` where every commit
     /// after `gen` is a rootless bounded-replay layout, then optionally seals
     /// `a3` as a durable interval root so a replay of the `b` interval has a
     /// resume point.
-
+    ///
     /// Publishes the canonical root for `commit_id` into its immutable
     /// commit-state authority, turning a rootless commit into an interval root.
-
+    ///
     /// Replays `commit_id` the way the commit path closes a rootless interval
     /// and returns `(replay-set size, resulting root)`.
-
+    ///
     /// The resume point is the previous interval root named by immutable
     /// commit-state authority. Resuming from it must produce exactly the root
     /// a from-genesis replay of the same history produces.
-
+    ///
     /// Teeth for the assertion above: pointing the resume point at a readable
     /// but wrong root must change the resulting state root, so a silently bad
     /// resume point cannot pass the byte-identity check.
-
+    ///
     /// A resume point whose chunk closure is damaged must not be resumed from.
     /// Repair stays total: the walk continues past it and the replay rebuilds
     /// the canonical root from the changelog.
-
+    ///
     /// The commit-path availability probe proves the resume point is
     /// *addressable*, not that its whole chunk closure is intact; explicit
     /// repair still proves the whole closure. Pins both halves, because the
