@@ -76,13 +76,6 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) delta: TrackedStateDeltaRef<'a>,
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
-    /// Canonical authored bytes used to build the self-contained LXCD17
-    /// native body. A `JsonSlotRef::Ref` alone is intentionally insufficient:
-    /// history publication may not defer body authority to the JSON store.
-    pub(crate) snapshot_content: Option<&'a str>,
-    pub(crate) metadata_content: Option<&'a str>,
-    /// Exact Schema-v1 definition selected by the transaction catalog.
-    pub(crate) schema_definition: Option<&'a serde_json::Value>,
     pub(crate) origin_key: Option<&'a str>,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     pub(crate) authored: bool,
@@ -101,9 +94,8 @@ pub(crate) struct TrackedStateSingleStringReplacementRef<'a> {
     pub(crate) commit_id: CommitId,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot_content: Option<&'a str>,
-    pub(crate) metadata_content: Option<&'a str>,
-    pub(crate) schema_definition: Option<&'a serde_json::Value>,
+    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
 }
 
 /// One ordered tracked-root mutation with its insert-collision contract.
@@ -368,21 +360,25 @@ pub(crate) struct CurrentStateScopedRangeRoot {
 
 /// Cumulative negative-membership certificate for collection scopes.
 ///
-/// A complete certificate carries the exact canonical set of collection
-/// scopes authored by the effective graph-parent or selected-source lineage.
-/// Incomplete certificates fail closed and carry no scopes.
+/// A complete filter may have false positives, but never false negatives: a
+/// missing schema-family bit therefore proves that no effective graph-parent
+/// or selected-source lineage authored any scope for that schema. Coarsening
+/// file-scoped collections to their schema avoids cardinality-driven
+/// saturation while remaining conservative. Incomplete filters fail closed
+/// and carry no bits.
 #[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateTouchedScopeFilter {
     pub(crate) complete: bool,
-    pub(crate) scopes: Vec<CommitDeltaReplacementScope>,
+    #[musli(bytes)]
+    pub(crate) bits: Vec<u8>,
 }
 
 /// Point-addressable immutable mutation inventory owned by one commit.
 ///
 /// The fields intentionally mirror the existing commit-delta directory. This
 /// lets the hard-cut manifest become authoritative without changing the
-/// bounded LXCD17 native-member segment and payload-sidecar codec in the same step.
+/// bounded LXCD16 segment and payload-sidecar codec in the same step.
 #[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateMutationInventory {

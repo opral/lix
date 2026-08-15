@@ -2392,15 +2392,9 @@ mod tests {
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
             .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "target",
-            None,
-            &[row_with_value("seed", None, "target-seed", "seed")],
-        )
-        .await
-        .expect("target rooted publication should write");
+        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
+            .await
+            .expect("target root should write");
         write_root_committed_for_test(
             &storage,
             &tracked_state,
@@ -2635,15 +2629,9 @@ mod tests {
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
             .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "target",
-            None,
-            &[row_with_value("seed", None, "target-seed", "seed")],
-        )
-        .await
-        .expect("target rooted publication should write");
+        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
+            .await
+            .expect("target root should write");
         write_root_committed_for_test(
             &storage,
             &tracked_state,
@@ -2675,10 +2663,7 @@ mod tests {
         let child_row = child_diff
             .entries
             .iter()
-            .find_map(|entry| {
-                let after = entry.after.as_ref()?;
-                (after.row_pk() == &RowPk::single("row-a")).then(|| after.clone())
-            })
+            .find_map(|entry| entry.after.clone())
             .expect("child row should appear");
         let (child_key, child_value) = child_row.into_index_entry();
 
@@ -2815,6 +2800,90 @@ mod tests {
             kinds(&diff),
             vec![("row-a".to_string(), TrackedStateDiffKind::Added)]
         );
+    }
+
+    #[tokio::test]
+    async fn diff_commits_allows_source_update_with_source_created_at() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
+            .await
+            .expect("target root should write");
+        write_root_committed_for_test(
+            &storage,
+            &tracked_state,
+            "source-add",
+            None,
+            &[row_with_times(
+                "row-a",
+                None,
+                "source-add-a",
+                "old",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            )],
+        )
+        .await
+        .expect("source add root should write");
+        let mut source_update = row_with_times(
+            "row-a",
+            None,
+            "source-update-a",
+            "new",
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        source_update.commit_id = CommitId::for_test_label("source-update");
+        write_root_committed_for_test(
+            &storage,
+            &tracked_state,
+            "source-update",
+            Some("source-add"),
+            std::slice::from_ref(&source_update),
+        )
+        .await
+        .expect("source update root should write");
+        {
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open");
+            let mut writes = storage.new_write_set();
+            crate::test_support::stage_tracked_root_from_materialized_with_parents(
+                &mut read,
+                &mut writes,
+                &tracked_state,
+                "merge",
+                &["target".to_string(), "source-update".to_string()],
+                Some("target"),
+                std::slice::from_ref(&source_update),
+            )
+            .await
+            .expect("merge root should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("merge root should commit");
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let diff = tracked_state
+            .reader(read)
+            .diff_commits("target", "merge", &TrackedStateDiffRequest::default())
+            .await
+            .expect("source update should validate");
+
+        assert_eq!(
+            kinds(&diff),
+            vec![("row-a".to_string(), TrackedStateDiffKind::Added)]
+        );
+        let row = diff.entries[0].after.as_ref().expect("after row");
+        assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.000Z");
+        assert_eq!(row.updated_at.to_string(), "2026-01-02T00:00:00.000Z");
+        assert_eq!(row.change_id, "source-update-a");
     }
 
     #[tokio::test]

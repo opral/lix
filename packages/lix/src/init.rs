@@ -30,8 +30,7 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, TrackedStateKeyRef, encode_key_ref,
-    stage_commit_deltas_for_commit_state,
+    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
 };
 use bytes::Bytes;
 use serde_json::json;
@@ -401,29 +400,18 @@ where
                 updated_at: change.created_at,
             })
             .collect::<Vec<_>>();
-        let mut commit_deltas = authored_changes
+        let commit_deltas = authored_changes
             .iter()
-            .zip(&plan.changes)
             .zip(root_deltas.iter().copied())
-            .map(|((change, seed), delta)| TrackedStateCommitDeltaRef {
+            .map(|(change, delta)| TrackedStateCommitDeltaRef {
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
-                snapshot_content: Some(seed.snapshot_content.as_str()),
-                metadata_content: None,
-                schema_definition: crate::schema::seed_schema_definition(&change.schema_key),
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
             })
             .collect::<Vec<_>>();
-        commit_deltas.sort_by_key(|delta| {
-            encode_key_ref(TrackedStateKeyRef {
-                schema_key: delta.delta.schema_key,
-                file_id: delta.delta.file_id,
-                row_pk: delta.delta.row_pk,
-            })
-        });
         let staged_delta = stage_commit_deltas_for_commit_state(&mut writes, &commit_deltas)?;
         crate::tracked_state::stage_change_locators(&mut writes, &staged_delta.locators);
         let mut tracked_writer = tracked_state.writer(&read, &mut writes);
@@ -441,25 +429,14 @@ where
                 )
             })?;
         let initial_mutations = staged_delta.mutation_inventory().clone();
-        let initial_body = crate::tracked_state::certify_authored_current_state_body(
-            &read,
-            &mut writes,
-            plan.commit.id,
-            &plan.commit.account_id,
-            &initial_mutations,
-            true,
-            commit_deltas.iter().copied(),
-        )
-        .await?;
-        let physical_publication = crate::tracked_state::
-            stage_current_state_scoped_ranges_from_published_topology_parent(
+        let physical_publication =
+            crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
                 &read,
                 &mut writes,
                 None,
                 plan.commit.id,
                 &plan.commit.account_id,
                 &initial_mutations,
-                initial_body,
             )
             .await?;
         let _initial_state =

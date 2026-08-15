@@ -1,7 +1,6 @@
 // This parity test includes the benchmark-only fixture modules directly.
 // Most of their CRUD helpers are intentionally unused by this one focused
 // assertion.
-#![recursion_limit = "256"]
 #![allow(dead_code)]
 
 const READ_MANY_PK_COUNT: usize = 4;

@@ -12,8 +12,6 @@ pub(crate) struct CommitGraphChange {
     pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    /// Authenticated lifecycle state carried independently of payload projection.
-    pub(crate) deleted: bool,
     pub(crate) snapshot: crate::json_store::JsonSlot,
     pub(crate) metadata: crate::json_store::JsonSlot,
     pub(crate) created_at: LixTimestamp,
@@ -89,7 +87,7 @@ pub(crate) fn commit_edges(commits: &[CommitGraphNode]) -> Vec<CommitGraphEdge> 
 /// stops walking the commit graph as soon as neither can produce another row,
 /// so a narrow history query never pays for the unreachable remainder of the
 /// graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
     pub(crate) row_pks: Vec<RowPk>,
     pub(crate) schema_keys: Vec<String>,
@@ -97,29 +95,12 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
     pub(crate) min_depth: Option<u32>,
     pub(crate) max_depth: Option<u32>,
     pub(crate) include_tombstones: bool,
-    /// Whether member payload bodies are needed by the terminal projection.
-    pub(crate) hydrate_member_payloads: bool,
     /// Maximum number of history rows the caller will consume.
     ///
     /// Only set this when the caller returns the produced entries 1:1 as its
     /// output rows. Row-shaping surfaces must leave it unset because they can
     /// collapse or drop entries after the graph read.
     pub(crate) limit: Option<usize>,
-}
-
-impl Default for CommitGraphChangeHistoryRequest {
-    fn default() -> Self {
-        Self {
-            row_pks: Vec::new(),
-            schema_keys: Vec::new(),
-            file_ids: Vec::new(),
-            min_depth: None,
-            max_depth: None,
-            include_tombstones: false,
-            hydrate_member_payloads: true,
-            limit: None,
-        }
-    }
 }
 
 /// Canonical change observed while walking commit history from a start commit.

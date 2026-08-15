@@ -850,7 +850,10 @@ impl EncodedReplayFileIdDictionary {
     }
 }
 
-fn append_single_row_pk_external(arena: &mut String, row_pk: &RowPk) -> Result<(), LixError> {
+fn append_single_row_pk_external(
+    arena: &mut String,
+    row_pk: &RowPk,
+) -> Result<(), LixError> {
     let [component] = row_pk.components.as_slice() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1419,45 +1422,6 @@ where
         let row_refs = rows.iter().map(|(row, _)| *row).collect::<Vec<_>>();
         let changes = self.load_and_validate_diff_row_changes(&row_refs).await?;
         let mut validation_cache = DiffCommitRootValidationCache::new();
-        // Total repair validation may cover tens of thousands of rows from
-        // one commit. Prefetch the first-parent lifecycle values once per
-        // authenticated root instead of issuing one tree point traversal per
-        // row. The cache is operation-local and keyed by the exact root/key.
-        let mut keys_by_commit = BTreeMap::<String, Vec<TrackedStateKey>>::new();
-        for (row, expected_commit_id) in rows {
-            keys_by_commit
-                .entry((*expected_commit_id).to_owned())
-                .or_default()
-                .push(TrackedStateKey {
-                    schema_key: row.schema_key().to_owned(),
-                    file_id: row.file_id().map(str::to_owned),
-                    row_pk: row.row_pk().clone(),
-                });
-        }
-        for (commit_id, keys) in keys_by_commit {
-            if self
-                .load_cached_commit_root_optional(&commit_id, &mut validation_cache)
-                .await?
-                .is_none()
-            {
-                continue;
-            }
-            let metadata = self
-                .load_cached_commit_root_metadata(&commit_id, &mut validation_cache)
-                .await?;
-            let Some(parent) = metadata.parent_roots.first() else {
-                continue;
-            };
-            let values = self
-                .tree
-                .get_many(&self.store, &parent.root_id, &keys)
-                .await?;
-            for (key, value) in keys.into_iter().zip(values) {
-                validation_cache
-                    .tree_values
-                    .insert((parent.root_id.clone(), key), value);
-            }
-        }
         for (row, expected_commit_id) in rows {
             let change = changes.get(&row.change_id).ok_or_else(|| {
                 LixError::unknown(format!(
@@ -1671,7 +1635,6 @@ where
                         &key,
                         &current_commit_id,
                         change_created_at,
-                        cache,
                     )
                     .await?;
                     return Ok(());
@@ -1714,11 +1677,10 @@ where
                     .load_cached_commit_root_optional(&current_commit_id, cache)
                     .await?;
                 debug_assert!(root_id.is_none());
-                let encoded_key = Bytes::from(encode_key(&key));
                 let current_value = self
-                    .replay_index_values_for_encoded_keys_at_commit(
+                    .replay_index_values_for_keys_at_commit(
                         &current_commit_id,
-                        std::slice::from_ref(&encoded_key),
+                        std::slice::from_ref(&key),
                     )
                     .await?
                     .into_iter()
@@ -1735,7 +1697,6 @@ where
                     proof.change_id == row_value.change_id
                         && proof.commit_id == row_value.commit_id
                         && proof.deleted == row_value.deleted
-                        && proof.created_at == row_value.created_at
                         && proof.updated_at == row_value.updated_at
                 });
                 if !structurally_equal {
@@ -1746,10 +1707,11 @@ where
                         tracked_state_identity_from_key(&key)
                     )));
                 }
+                self.validate_diff_row_created_at(row, &key, &current_commit_id, change_created_at)
+                    .await?;
                 // Point replay already proved the row against the complete
-                // bounded interval, including lifecycle identity. A rootless
-                // manifest deliberately has no per-commit snapshot ancestry
-                // to reconstruct beyond that proof.
+                // bounded interval. A rootless manifest deliberately has no
+                // per-commit snapshot ancestry to walk beyond that proof.
                 return Ok(());
             }
             if parent_value.as_ref() != Some(&row_value) {
@@ -2005,23 +1967,19 @@ where
         key: &TrackedStateKey,
         commit_id: &str,
         change_created_at: crate::common::LixTimestamp,
-        cache: &mut DiffCommitRootValidationCache,
     ) -> Result<(), LixError> {
         #[cfg(test)]
         DIFF_ROW_CREATED_AT_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut expected_created_at = change_created_at;
-        if self
-            .load_cached_commit_root_optional(commit_id, cache)
-            .await?
-            .is_some()
-        {
-            let metadata = self
-                .load_cached_commit_root_metadata(commit_id, cache)
-                .await?;
+        if let Some(metadata) = storage::load_snapshot_commit_root(&self.store, commit_id).await? {
             if let Some(parent) = metadata.parent_roots.first() {
                 let parent_value = self
-                    .load_cached_tree_value(&parent.root_id, key, cache)
-                    .await?;
+                    .tree
+                    .get_many(&self.store, &parent.root_id, std::slice::from_ref(key))
+                    .await?
+                    .into_iter()
+                    .next()
+                    .flatten();
                 if let Some(parent_value) = parent_value {
                     expected_created_at = parent_value.created_at();
                 }
@@ -2037,14 +1995,16 @@ where
                 return Err(missing_commit_root_error(commit_id));
             }
             if let Some(parent_commit_id) = self
-                .load_cached_changelog_first_parent(commit_id, cache)
+                .load_cached_changelog_first_parent(
+                    commit_id,
+                    &mut DiffCommitRootValidationCache::new(),
+                )
                 .await?
             {
-                let encoded_key = Bytes::from(encode_key(key));
                 if let Some(parent_value) = self
-                    .replay_index_values_for_encoded_keys_at_commit(
+                    .replay_index_values_for_keys_at_commit(
                         &parent_commit_id.to_string(),
-                        std::slice::from_ref(&encoded_key),
+                        std::slice::from_ref(key),
                     )
                     .await?
                     .into_iter()
@@ -4027,58 +3987,6 @@ where
     where
         I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
     {
-        self.stage_commit_root_inner(
-            commit_id,
-            parent_commit_id,
-            deltas,
-            absence_guards,
-            certified_replacement_markers,
-            None,
-            &BTreeSet::new(),
-        )
-        .await
-    }
-
-    /// Replays immutable commit deltas whose replacement lifecycle is sealed
-    /// by the same authenticated commit-state manifest that selected the
-    /// fallback parent. Callers cannot use this to stage live mutations.
-    pub(super) async fn stage_commit_root_from_authenticated_rebuild<'a, I>(
-        &mut self,
-        commit_id: &str,
-        parent_commit_id: Option<&str>,
-        deltas: I,
-        certified_replacement_markers: &BTreeSet<TrackedStateKey>,
-        certified_replacement_scope: Option<&storage::CommitDeltaReplacementScope>,
-        lifecycle_override_keys: &BTreeSet<TrackedStateKey>,
-    ) -> Result<TrackedStateWriteReport, LixError>
-    where
-        I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
-    {
-        self.stage_commit_root_inner(
-            commit_id,
-            parent_commit_id,
-            deltas,
-            &BTreeSet::new(),
-            certified_replacement_markers,
-            certified_replacement_scope,
-            lifecycle_override_keys,
-        )
-        .await
-    }
-
-    async fn stage_commit_root_inner<'a, I>(
-        &mut self,
-        commit_id: &str,
-        parent_commit_id: Option<&str>,
-        deltas: I,
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        certified_replacement_markers: &BTreeSet<TrackedStateKey>,
-        certified_replacement_scope: Option<&storage::CommitDeltaReplacementScope>,
-        lifecycle_override_keys: &BTreeSet<TrackedStateKey>,
-    ) -> Result<TrackedStateWriteReport, LixError>
-    where
-        I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
-    {
         let deltas = deltas.into_iter().collect::<Vec<_>>();
         let typed_commit_id =
             CommitId::parse_lix(commit_id, "tracked-state commit root commit_id")?;
@@ -4108,142 +4016,6 @@ where
         let base_root = parent_metadata
             .as_ref()
             .map(|metadata| metadata.root_id.clone());
-        if let Some(scope) = certified_replacement_scope {
-            use crate::collection_generation::{CollectionScopeRef, collection_scope_key};
-
-            // Replacement-generation authority describes a complete scope,
-            // not a row-shaped marker member. Rebuild that scope exactly from
-            // its authenticated LXCD17 members while retaining every other
-            // parent identity. This physically removes omitted rows instead
-            // of fabricating marker provenance or silently carrying them.
-            let staged_read = storage::TrackedStateStagedRead::new(self.store, &self.chunk_overlay);
-            let parent_rows = match base_root.as_ref() {
-                Some(root) => {
-                    self.tree
-                        .scan(
-                            &staged_read,
-                            root,
-                            &TrackedStateTreeScanRequest {
-                                include_tombstones: true,
-                                ..TrackedStateTreeScanRequest::default()
-                            },
-                        )
-                        .await?
-                }
-                None => Vec::new(),
-            };
-            let marker_key = TrackedStateKey {
-                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-                    .to_owned(),
-                file_id: None,
-                row_pk: RowPk::single(collection_scope_key(CollectionScopeRef {
-                    schema_key: &scope.schema_key,
-                    file_id: scope.file_id.as_deref(),
-                })),
-            };
-            let retained = parent_rows
-                .iter()
-                .filter(|(key, _)| {
-                    !((key.schema_key == scope.schema_key && key.file_id == scope.file_id)
-                        || *key == marker_key)
-                })
-                .count();
-            let mut mutation_batch = TrackedStateMutationBatchBuilder::with_row_capacity(
-                retained.saturating_add(deltas.len()),
-            );
-            for (key, value) in parent_rows.iter().filter(|(key, _)| {
-                !((key.schema_key == scope.schema_key && key.file_id == scope.file_id)
-                    || *key == marker_key)
-            }) {
-                mutation_batch.push(
-                    TrackedStateKeyRef {
-                        schema_key: &key.schema_key,
-                        file_id: key.file_id.as_deref(),
-                        row_pk: &key.row_pk,
-                    },
-                    TrackedStateIndexValueRef {
-                        change_id: value.change_id,
-                        commit_id: value.commit_id,
-                        deleted: value.deleted,
-                        created_at: value.created_at,
-                        updated_at: value.updated_at,
-                    },
-                );
-            }
-            for delta in &deltas {
-                if delta.schema_key != scope.schema_key || delta.file_id != scope.file_id.as_deref()
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "authenticated replacement generation contains a member outside its exact scope",
-                    ));
-                }
-                mutation_batch.push(
-                    TrackedStateKeyRef {
-                        schema_key: delta.schema_key,
-                        file_id: delta.file_id,
-                        row_pk: delta.row_pk,
-                    },
-                    TrackedStateIndexValueRef {
-                        change_id: delta.change_id,
-                        commit_id: delta.commit_id,
-                        deleted: delta.deleted,
-                        created_at: delta.created_at,
-                        updated_at: delta.updated_at,
-                    },
-                );
-            }
-            let changed_rows = parent_rows.len().saturating_sub(retained) + deltas.len();
-            let result = self
-                .tree
-                .apply_mutations_with_overlay(
-                    self.store,
-                    self.writes,
-                    &mut self.chunk_overlay,
-                    None,
-                    mutation_batch.finish(),
-                    Some(commit_id),
-                )
-                .await?;
-            let metadata = TrackedStateCommitRoot {
-                commit_id: typed_commit_id,
-                root_id: result.root_id.clone(),
-                parent_roots: typed_parent_commit_id
-                    .zip(base_root.as_ref())
-                    .map(|(parent_commit_id, root_id)| {
-                        vec![TrackedStateCommitRootParent {
-                            commit_id: parent_commit_id,
-                            root_id: root_id.clone(),
-                        }]
-                    })
-                    .unwrap_or_default(),
-                changed_key_count: u64::try_from(changed_rows).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state replacement changed key count exceeds u64",
-                    )
-                })?,
-                row_count_estimate: u64::try_from(result.row_count).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state replacement row count exceeds u64",
-                    )
-                })?,
-                tree_height: u32::try_from(result.tree_height).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state replacement tree height exceeds u32",
-                    )
-                })?,
-            };
-            self.staged_roots.insert(commit_id.to_owned(), metadata);
-            return Ok(TrackedStateWriteReport {
-                commit_id: typed_commit_id,
-                root_id: result.root_id,
-                changed_rows,
-                primary_chunk_puts: result.chunk_count,
-            });
-        }
         if deltas.is_empty()
             && let Some(parent_metadata) = parent_metadata.as_ref()
         {
@@ -4270,10 +4042,9 @@ where
         let mut cascade_mutations = BTreeMap::<Vec<u8>, Vec<u8>>::new();
         if let Some(base_root) = base_root.as_ref() {
             let staged_read = storage::TrackedStateStagedRead::new(self.store, &self.chunk_overlay);
-            if deltas
-                .iter()
-                .any(|delta| delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && delta.deleted)
-            {
+            if deltas.iter().any(|delta| {
+                delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && delta.deleted
+            }) {
                 cascade_mutations = self
                     .file_cascade_mutations(&staged_read, base_root, &deltas)
                     .await?;
@@ -4299,7 +4070,9 @@ where
                     })
             }) {
                 let (schema_key, file_id) =
-                    crate::collection_generation::collection_scope_from_row_pk(marker.row_pk)?;
+                    crate::collection_generation::collection_scope_from_row_pk(
+                        marker.row_pk,
+                    )?;
                 let rows = self
                     .tree
                     .scan(
@@ -4445,9 +4218,7 @@ where
                     ),
                 ));
             }
-            let parent_created_at = (!lifecycle_override_keys.contains(&key))
-                .then(|| parent_value.as_ref().map(|value| value.created_at()))
-                .flatten();
+            let parent_created_at = parent_value.as_ref().map(|value| value.created_at());
             let created_at = parent_created_at.unwrap_or(delta.created_at);
             let key = TrackedStateKeyRef {
                 schema_key: delta.schema_key,
@@ -5024,7 +4795,8 @@ fn cascade_payload_key(file_id: &str) -> TrackedStateKey {
     TrackedStateKey {
         schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
         file_id: Some(file_id.to_string()),
-        row_pk: RowPk::uuid_from_canonical(file_id).unwrap_or_else(|_| RowPk::single(file_id)),
+        row_pk: RowPk::uuid_from_canonical(file_id)
+            .unwrap_or_else(|_| RowPk::single(file_id)),
     }
 }
 
@@ -5123,11 +4895,16 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
+    use std::time::Instant;
+
     use super::*;
     use crate::NullableKeyFilter;
+    use crate::branch::BranchHeadControl;
     use crate::changelog::CommitRecord;
+    use crate::hot_state::CertifiedRowBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmCreateContext};
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
@@ -5208,6 +4985,53 @@ mod tests {
         for (index, commit_id) in commits.iter().enumerate() {
             assert_eq!(cache[commit_id].commits(), &commits[index..]);
         }
+    }
+
+    #[tokio::test]
+    async fn point_replay_interval_reuses_cached_suffix_and_commit_topology() {
+        const COMMIT_COUNT: usize = 32;
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, "interval-base", None, &[])
+            .await
+            .expect("baseline root should write");
+        let mut parent = "interval-base".to_string();
+        let mut commits = Vec::with_capacity(COMMIT_COUNT);
+        for index in 0..COMMIT_COUNT {
+            let commit = format!("interval-rootless-{index}");
+            write_rootless_commit_for_test(&storage, &commit, &parent, &[]).await;
+            commits.push(CommitId::for_test_label(&commit));
+            parent = commit;
+        }
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("interval read should open"),
+        );
+
+        let head = reader
+            .point_replay_interval(&parent)
+            .await
+            .expect("head interval should load");
+        assert_eq!(head.commits().len(), COMMIT_COUNT);
+        assert!(head.baseline_root.is_some());
+        assert_eq!(reader.point_replay_intervals.len(), COMMIT_COUNT);
+        assert_eq!(reader.point_replay_commits.len(), COMMIT_COUNT + 1);
+
+        let middle_commit = commits[COMMIT_COUNT / 2];
+        let middle_offset = head
+            .commits()
+            .iter()
+            .position(|commit_id| *commit_id == middle_commit)
+            .expect("middle commit should belong to the head interval");
+        let middle = reader
+            .point_replay_interval(&middle_commit.to_string())
+            .await
+            .expect("cached suffix should load");
+        assert_eq!(middle.commits(), &head.commits()[middle_offset..]);
+        assert!(Arc::ptr_eq(&head.commits, &middle.commits));
+        assert_eq!(reader.point_replay_commits.len(), COMMIT_COUNT + 1);
     }
 
     fn commit_root_key(label: &str) -> crate::storage_adapter::StorageKey {
@@ -5883,8 +5707,16 @@ mod tests {
     #[test]
     fn ordered_root_batch_rejects_duplicate_encoded_keys() {
         let rows = [
-            row("row-duplicate", "change-duplicate-a", "ordered-duplicate"),
-            row("row-duplicate", "change-duplicate-b", "ordered-duplicate"),
+            row(
+                "row-duplicate",
+                "change-duplicate-a",
+                "ordered-duplicate",
+            ),
+            row(
+                "row-duplicate",
+                "change-duplicate-b",
+                "ordered-duplicate",
+            ),
         ];
         let error = build_ordered_root_mutation_batch(
             rows.len(),
@@ -6854,7 +6686,12 @@ mod tests {
         let (storage, tracked_state) = seed_merge_roots(
             &[row_with_value("row-a", "change-base", "base", "base")],
             &[row_with_value("row-a", "change-base", "base", "base")],
-            &[row_with_value("row-a", "change-source", "source", "source")],
+            &[row_with_value(
+                "row-a",
+                "change-source",
+                "source",
+                "source",
+            )],
         )
         .await;
 
@@ -6911,8 +6748,18 @@ mod tests {
     async fn plan_merge_from_roots_reports_divergent_modification_conflict() {
         let (storage, tracked_state) = seed_merge_roots(
             &[row_with_value("row-a", "change-base", "base", "base")],
-            &[row_with_value("row-a", "change-target", "target", "target")],
-            &[row_with_value("row-a", "change-source", "source", "source")],
+            &[row_with_value(
+                "row-a",
+                "change-target",
+                "target",
+                "target",
+            )],
+            &[row_with_value(
+                "row-a",
+                "change-source",
+                "source",
+                "source",
+            )],
         )
         .await;
 
@@ -7034,7 +6881,12 @@ mod tests {
             &tracked_state,
             "middle",
             Some("base"),
-            &[row_with_value("row-a", "change-middle", "middle", "middle")],
+            &[row_with_value(
+                "row-a",
+                "change-middle",
+                "middle",
+                "middle",
+            )],
         )
         .await
         .expect("middle root should write");
@@ -7104,7 +6956,12 @@ mod tests {
             &tracked_state,
             "middle",
             Some("base"),
-            &[row_with_value("row-a", "change-middle", "middle", "middle")],
+            &[row_with_value(
+                "row-a",
+                "change-middle",
+                "middle",
+                "middle",
+            )],
         )
         .await
         .expect("middle root should write");
@@ -7157,7 +7014,12 @@ mod tests {
             &tracked_state,
             "commit-a",
             None,
-            &[row_with_value("row-a", "commit-a:change", "commit-a", "a")],
+            &[row_with_value(
+                "row-a",
+                "commit-a:change",
+                "commit-a",
+                "a",
+            )],
         )
         .await
         .expect("commit-a should commit");
@@ -7166,7 +7028,12 @@ mod tests {
             &tracked_state,
             "commit-b",
             Some("commit-a"),
-            &[row_with_value("row-b", "commit-b:change", "commit-b", "b")],
+            &[row_with_value(
+                "row-b",
+                "commit-b:change",
+                "commit-b",
+                "b",
+            )],
         )
         .await
         .expect("commit-b should commit");
@@ -7470,7 +7337,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].row_pk.as_single_string_owned().expect("row pk"),
+            rows[0]
+                .row_pk
+                .as_single_string_owned()
+                .expect("row pk"),
             "row-a"
         );
         assert_eq!(
@@ -7581,7 +7451,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].row_pk.as_single_string_owned().expect("row pk"),
+            rows[0]
+                .row_pk
+                .as_single_string_owned()
+                .expect("row pk"),
             "row-a"
         );
     }
@@ -7687,7 +7560,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].row_pk.as_single_string_owned().expect("row pk"),
+            rows[0]
+                .row_pk
+                .as_single_string_owned()
+                .expect("row pk"),
             "row-live"
         );
     }
@@ -7839,7 +7715,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].row_pk.as_single_string_owned().expect("row pk"),
+            rows[0]
+                .row_pk
+                .as_single_string_owned()
+                .expect("row pk"),
             "row-b"
         );
     }
@@ -7884,7 +7763,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].row_pk.as_single_string_owned().expect("row pk"),
+            rows[0]
+                .row_pk
+                .as_single_string_owned()
+                .expect("row pk"),
             "row-b"
         );
     }
@@ -7936,6 +7818,59 @@ mod tests {
         assert_eq!(scanned[0].snapshot_content, row.snapshot_content);
     }
 
+    #[tokio::test]
+    async fn missing_packed_authority_for_live_row_errors_clearly() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let row = row("row-a", "change-a", "commit-1");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "commit-1",
+            None,
+            std::slice::from_ref(&row),
+        )
+        .await
+        .expect("root should write");
+
+        // Corrupt immutable authority so its snapshot still exposes the live
+        // row while its canonical mutation inventory no longer owns the
+        // referenced change id.
+        let commit_id = CommitId::for_test_label("commit-1");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authority read should open");
+        let published = storage::load_commit_state_manifest(&read, commit_id)
+            .await
+            .expect("authority should load")
+            .expect("authority should exist");
+        let mut corrupt = published.clone();
+        corrupt.mutations = Default::default();
+        drop(read);
+        let mut writes = storage.new_write_set();
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &corrupt)
+            .expect("corrupt authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("delete should commit");
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open"),
+        );
+        let error = reader
+            .scan_batch_at_commit("commit-1", &test_schema_scan_request())
+            .await
+            .expect_err("materialization must reject missing packed authority");
+        assert!(
+            error.message.contains("missing from owning commit"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn inline_threshold_boundary_routes_payloads_deterministically() {
@@ -7949,7 +7884,12 @@ mod tests {
         let at_len = crate::json_store::JSON_INLINE_MAX_BYTES;
         let over_len = at_len + 1;
         let rows = [
-            row_with_value("row-at", "change-at", "commit-1", &"a".repeat(at_len - 12)),
+            row_with_value(
+                "row-at",
+                "change-at",
+                "commit-1",
+                &"a".repeat(at_len - 12),
+            ),
             row_with_value(
                 "row-over",
                 "change-over",
@@ -8006,7 +7946,10 @@ mod tests {
                 .clone()
         };
         assert_eq!(by_pk("row-at").as_deref(), Some(at_threshold.as_str()));
-        assert_eq!(by_pk("row-over").as_deref(), Some(over_threshold.as_str()));
+        assert_eq!(
+            by_pk("row-over").as_deref(),
+            Some(over_threshold.as_str())
+        );
     }
 
     #[tokio::test]
@@ -8268,7 +8211,7 @@ mod tests {
         Ok(())
     }
 
-    async fn write_certified_commit_for_test(
+    async fn write_rootless_commit_for_test(
         storage: &StorageAdapter,
         commit_id: &str,
         parent_commit_id: &str,
@@ -8279,45 +8222,484 @@ mod tests {
             .await
             .expect("rootless commit read should open");
         let mut writes = storage.new_write_set();
-        crate::test_support::stage_tracked_root_from_materialized_with_parents(
+        crate::test_support::stage_rootless_tracked_commit_from_materialized(
             &mut read,
             &mut writes,
-            &TrackedStateContext::new(),
             commit_id,
-            &[parent_commit_id.to_owned()],
             Some(parent_commit_id),
             rows,
         )
         .await
-        .expect("certified commit should stage");
+        .expect("rootless commit should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("certified commit should commit");
+            .expect("rootless commit should commit");
     }
+
+    #[tokio::test]
+    async fn explicit_rebuild_audits_rootless_commit_without_publishing_unreachable_chunks() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("row-a", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "rootless",
+            "base",
+            &[row_with_value(
+                "row-a",
+                "rootless-a",
+                "rootless",
+                "updated",
+            )],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuild read should open");
+        let mut writes = storage.new_write_set();
+        let report = tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("rootless")
+            .await
+            .expect("rootless state should pass transient rebuild audit");
+
+        assert_eq!(report.commit_id, CommitId::for_test_label("rootless"));
+        assert_eq!(writes.stats().staged_puts, 0);
+        assert_eq!(writes.stats().staged_deletes, 0);
+        assert_eq!(writes.stats().written_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn rooted_rebuild_promotes_only_reachable_chunks_from_rootless_ancestor() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("row-base", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        let rootless_rows = (0..300)
+            .map(|index| {
+                row_with_value(
+                    &format!("row-{index:04}"),
+                    &format!("rootless-{index:04}"),
+                    "rootless",
+                    "rootless",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, "rootless", "base", &rootless_rows).await;
+        write_rootless_commit_for_test(
+            &storage,
+            "child",
+            "rootless",
+            &[row_with_value(
+                "row-0150",
+                "child-0150",
+                "child",
+                "child",
+            )],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fixture rebuild read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            "child",
+            true,
+        )
+        .await
+        .expect("fixture plans should load");
+        let mut fixture_writes = storage.new_write_set();
+        let mut fixture_writer = tracked_state.writer(&read, &mut fixture_writes);
+        for plan in plans.iter().rev() {
+            crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
+                &mut fixture_writer,
+                plan,
+            )
+            .await
+            .expect("fixture root should stage");
+        }
+        let child_commit_id = CommitId::for_test_label("child");
+        let child_snapshot_root = fixture_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == child_commit_id)
+            .cloned()
+            .expect("fixture child root should exist");
+        drop(fixture_writer);
+        let mut child_manifest = storage::load_commit_state_manifest(&read, child_commit_id)
+            .await
+            .expect("child manifest should load")
+            .expect("child manifest should exist");
+        child_manifest.replay_debt = crate::tracked_state::CommitStateReplayDebt::default();
+        child_manifest.snapshot_root = Some(Box::new(child_snapshot_root));
+        storage::stage_resealed_commit_state_manifest_for_test(
+            &mut fixture_writes,
+            &child_manifest,
+        )
+        .expect("rooted child authority should reseal");
+        drop(read);
+        storage
+            .commit_write_set(fixture_writes, StorageWriteOptions::default())
+            .await
+            .expect("rooted child fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reachability read should open");
+        let base_root = storage::load_root(&read, "base")
+            .await
+            .expect("base root should load")
+            .expect("base root should exist");
+        let child_root = storage::load_root(&read, "child")
+            .await
+            .expect("child root should load")
+            .expect("child root should exist");
+        let empty_overlay = storage::TrackedStateChunkOverlay::new();
+        let tree = TrackedStateTree::new();
+        let base_reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &empty_overlay, &base_root)
+            .await
+            .expect("base reachability should load");
+        let child_reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &empty_overlay, &child_root)
+            .await
+            .expect("child reachability should load");
+        drop(read);
+
+        let all_chunks = stored_tree_chunk_hashes_for_test(&storage).await;
+        let mut deletes = storage.new_write_set();
+        for hash in all_chunks.difference(&base_reachable) {
+            deletes.delete(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash)),
+            );
+        }
+        storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("child-only chunks should delete");
+        let before = stored_tree_chunk_hashes_for_test(&storage).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuild read should open");
+        let mut writes = storage.new_write_set();
+        tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("child")
+            .await
+            .expect("rooted descendant should rebuild through rootless authority");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("reachable rebuilt chunks should commit");
+
+        let after = stored_tree_chunk_hashes_for_test(&storage).await;
+        let added = after.difference(&before).copied().collect::<HashSet<_>>();
+        let expected = child_reachable
+            .difference(&before)
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(added, expected);
+        let rows = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("verification read should open"),
+            )
+            .scan_batch_at_commit("child", &test_schema_scan_request())
+            .await
+            .expect("rebuilt child should scan");
+        assert_eq!(rows.len(), 301);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.row_pk() == &RowPk::single("row-0150"))
+                .and_then(|row| row.snapshot_content())
+                .map(AsRef::as_ref),
+            Some("{\"value\":\"child\"}")
+        );
+    }
+
     /// Builds `gen -> a1 -> a2 -> a3 -> b1 -> b2 -> b3` where every commit
     /// after `gen` is a rootless bounded-replay layout, then optionally seals
     /// `a3` as a durable interval root so a replay of the `b` interval has a
     /// resume point.
-    ///
+    async fn write_two_interval_history_for_test(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        seal_midpoint: bool,
+    ) {
+        write_root_for_test(
+            storage,
+            tracked_state,
+            "gen",
+            None,
+            &[row_with_value("row-gen", "gen-change", "gen", "gen")],
+        )
+        .await
+        .expect("genesis root should write");
+        let mut parent = "gen".to_owned();
+        for commit in ["a1", "a2", "a3"] {
+            write_rootless_commit_for_test(
+                storage,
+                commit,
+                &parent,
+                &[
+                    row_with_value(
+                        &format!("row-{commit}"),
+                        &format!("{commit}-change"),
+                        commit,
+                        commit,
+                    ),
+                    // Rewrite a shared key in every commit so the interval is
+                    // order sensitive rather than a disjoint insert stream.
+                    row_with_value("row-shared", &format!("{commit}-shared"), commit, commit),
+                ],
+            )
+            .await;
+            parent = commit.to_owned();
+        }
+        if seal_midpoint {
+            seal_rooted_commit_for_test(storage, tracked_state, "a3").await;
+        }
+        for commit in ["b1", "b2", "b3"] {
+            write_rootless_commit_for_test(
+                storage,
+                commit,
+                &parent,
+                &[
+                    row_with_value(
+                        &format!("row-{commit}"),
+                        &format!("{commit}-change"),
+                        commit,
+                        commit,
+                    ),
+                    row_with_value("row-shared", &format!("{commit}-shared"), commit, commit),
+                ],
+            )
+            .await;
+            parent = commit.to_owned();
+        }
+    }
+
     /// Publishes the canonical root for `commit_id` into its immutable
     /// commit-state authority, turning a rootless commit into an interval root.
-    ///
+    async fn seal_rooted_commit_for_test(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("seal read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            commit_id,
+            true,
+        )
+        .await
+        .expect("seal plans should load");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        for plan in plans.iter().rev() {
+            crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
+                &mut writer,
+                plan,
+            )
+            .await
+            .expect("seal root should stage");
+        }
+        let typed_commit_id = CommitId::for_test_label(commit_id);
+        let snapshot_root = writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == typed_commit_id)
+            .cloned()
+            .expect("sealed root should be staged");
+        drop(writer);
+        let mut manifest = storage::load_commit_state_manifest(&read, typed_commit_id)
+            .await
+            .expect("sealed manifest should load")
+            .expect("sealed manifest should exist");
+        manifest.replay_debt = crate::tracked_state::CommitStateReplayDebt::default();
+        manifest.snapshot_root = Some(Box::new(snapshot_root));
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("sealed authority should reseal");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("sealed root should commit");
+    }
+
     /// Replays `commit_id` the way the commit path closes a rootless interval
     /// and returns `(replay-set size, resulting root)`.
-    ///
+    async fn replay_root_for_test(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+    ) -> (usize, TrackedStateRootId) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replay read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            commit_id,
+            true,
+        )
+        .await
+        .expect("replay plans should load");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        let mut report = None;
+        for plan in plans.iter().rev() {
+            report = Some(
+                crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
+                    &mut writer,
+                    plan,
+                )
+                .await
+                .expect("replay root should stage"),
+            );
+        }
+        (
+            plans.len(),
+            report.expect("replay stages at least one root").root_id,
+        )
+    }
+
     /// The resume point is the previous interval root named by immutable
     /// commit-state authority. Resuming from it must produce exactly the root
     /// a from-genesis replay of the same history produces.
-    ///
+    #[tokio::test]
+    async fn resumed_interval_root_is_identical_to_from_genesis_root() {
+        let tracked_state = TrackedStateContext::new();
+
+        let from_genesis = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&from_genesis, &tracked_state, false).await;
+        let (genesis_plans, genesis_root) =
+            replay_root_for_test(&from_genesis, &tracked_state, "b3").await;
+
+        let resumed = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&resumed, &tracked_state, true).await;
+        let (resumed_plans, resumed_root) =
+            replay_root_for_test(&resumed, &tracked_state, "b3").await;
+
+        assert_eq!(
+            genesis_plans, 6,
+            "without a sealed interval root the replay set is the whole history"
+        );
+        assert_eq!(
+            resumed_plans, 3,
+            "a sealed interval root bounds the replay set to its own interval"
+        );
+        assert_eq!(
+            resumed_root, genesis_root,
+            "resumed replay must produce a byte-identical state root"
+        );
+    }
+
     /// Teeth for the assertion above: pointing the resume point at a readable
     /// but wrong root must change the resulting state root, so a silently bad
     /// resume point cannot pass the byte-identity check.
-    ///
+    #[tokio::test]
+    async fn byte_identical_root_check_rejects_a_broken_resume_point() {
+        let tracked_state = TrackedStateContext::new();
+
+        let from_genesis = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&from_genesis, &tracked_state, false).await;
+        let (_, genesis_root) = replay_root_for_test(&from_genesis, &tracked_state, "b3").await;
+
+        let broken = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&broken, &tracked_state, true).await;
+        // Repoint `a3`'s immutable root pointer at `gen`'s root: present,
+        // readable, content-addressed — and wrong.
+        let read = broken
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("broken resume read should open");
+        let genesis_metadata = storage::load_snapshot_commit_root(&read, "gen")
+            .await
+            .expect("genesis root metadata should load")
+            .expect("genesis root metadata should exist");
+        let mut manifest =
+            storage::load_commit_state_manifest(&read, CommitId::for_test_label("a3"))
+                .await
+                .expect("midpoint manifest should load")
+                .expect("midpoint manifest should exist");
+        let mut broken_root = *manifest
+            .snapshot_root
+            .clone()
+            .expect("midpoint is sealed by the fixture");
+        broken_root.root_id = genesis_metadata.root_id.clone();
+        manifest.snapshot_root = Some(Box::new(broken_root));
+        let mut writes = broken.new_write_set();
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("broken authority should reseal");
+        drop(read);
+        broken
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("broken resume point should commit");
+
+        let (broken_plans, broken_root_id) =
+            replay_root_for_test(&broken, &tracked_state, "b3").await;
+        assert_eq!(broken_plans, 3, "the broken pointer is still readable");
+        assert_ne!(
+            broken_root_id, genesis_root,
+            "a wrong resume point must not reproduce the canonical state root"
+        );
+    }
+
     /// A resume point whose chunk closure is damaged must not be resumed from.
     /// Repair stays total: the walk continues past it and the replay rebuilds
     /// the canonical root from the changelog.
-    ///
+    #[tokio::test]
+    async fn damaged_resume_point_falls_back_to_total_replay() {
+        let tracked_state = TrackedStateContext::new();
+
+        let from_genesis = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&from_genesis, &tracked_state, false).await;
+        let (_, genesis_root) = replay_root_for_test(&from_genesis, &tracked_state, "b3").await;
+
+        let damaged = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&damaged, &tracked_state, true).await;
+        delete_root_chunk_for_test(&damaged, "a3").await;
+
+        let (damaged_plans, damaged_root) =
+            replay_root_for_test(&damaged, &tracked_state, "b3").await;
+        assert_eq!(
+            damaged_plans, 6,
+            "a damaged interval root must not bound the replay set"
+        );
+        assert_eq!(
+            damaged_root, genesis_root,
+            "total replay must still produce the canonical state root"
+        );
+    }
+
     /// The commit-path availability probe proves the resume point is
     /// *addressable*, not that its whole chunk closure is intact; explicit
     /// repair still proves the whole closure. Pins both halves, because the
@@ -8361,11 +8743,11 @@ mod tests {
             write_root_for_test(&storage, &tracked_state, "gen", None, rows)
                 .await
                 .expect("wide genesis root should write");
-            write_certified_commit_for_test(
+            write_rootless_commit_for_test(
                 &storage,
                 "a1",
                 "gen",
-                &[],
+                &[row_with_value("row-a1", "a1-change", "a1", "a1")],
             )
             .await;
             storage
@@ -8514,12 +8896,737 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn first_parent_generation_write_set_deduplicates_touched_identities() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("row-a", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "generation-1",
+            "base",
+            &[
+                row_with_value("row-a", "generation-1-a", "generation-1", "middle"),
+                row_with_value("row-b", "generation-1-b", "generation-1", "created"),
+            ],
+        )
+        .await;
+        write_rootless_commit_for_test(
+            &storage,
+            "generation-2",
+            "generation-1",
+            &[
+                // The endpoint payload returns to the base value, but stale
+                // admission must still know that this identity was touched.
+                row_with_value("row-a", "generation-2-a", "generation-2", "base"),
+                row_with_value("row-c", "generation-2-c", "generation-2", "created"),
+            ],
+        )
+        .await;
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("write-set read should open");
+        let identities = tracked_state
+            .reader(read)
+            .changed_identities_in_first_parent_interval("base", "generation-2")
+            .await
+            .expect("generation write set should load")
+            .expect("rootless first-parent interval should be supported");
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| { identity.row_pk().as_single_string().unwrap().to_owned() })
+                .collect::<Vec<_>>(),
+            ["row-a", "row-b", "row-c"]
+        );
+    }
 
+    #[tokio::test]
+    #[ignore = "release-only generation write-set benchmark probe"]
+    async fn generation_write_set_benchmark_probe() {
+        let rows = std::env::var("LIX_GENERATION_WRITE_SET_BENCH_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5_000);
+        let rounds = std::env::var("LIX_GENERATION_WRITE_SET_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let base_rows = (0..rows)
+            .map(|index| {
+                row_with_value(
+                    &format!("row-{index:05}"),
+                    &format!("base-change-{index:05}"),
+                    "base",
+                    "base",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked_state, "base", None, &base_rows)
+            .await
+            .expect("benchmark base should write");
+        let changed_rows = (0..rows)
+            .map(|index| {
+                row_with_value(
+                    &format!("row-{index:05}"),
+                    &format!("changed-{index:05}"),
+                    "after",
+                    "after",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, "after", "base", &changed_rows).await;
 
+        let mut write_set_samples = Vec::with_capacity(rounds);
+        let mut diff_samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("write-set benchmark read should open");
+            let started = Instant::now();
+            let identities = tracked_state
+                .reader(read)
+                .changed_identities_in_first_parent_interval("base", "after")
+                .await
+                .expect("generation write set should load")
+                .expect("benchmark interval should be rootless");
+            write_set_samples.push(started.elapsed());
+            assert_eq!(identities.len(), rows);
 
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("diff benchmark read should open");
+            let started = Instant::now();
+            let diff = tracked_state
+                .reader(read)
+                .diff_commits("base", "after", &TrackedStateDiffRequest::default())
+                .await
+                .expect("general diff should load");
+            diff_samples.push(started.elapsed());
+            assert_eq!(diff.entries.len(), rows);
+        }
+        write_set_samples.sort_unstable();
+        diff_samples.sort_unstable();
+        let p50 = |samples: &[std::time::Duration]| samples[(samples.len() - 1) / 2];
+        let write_set_p50 = p50(&write_set_samples);
+        let diff_p50 = p50(&diff_samples);
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "lix.generation-write-set.v1",
+                "rows": rows,
+                "rounds": rounds,
+                "general_diff_p50_us": diff_p50.as_micros(),
+                "generation_write_set_p50_us": write_set_p50.as_micros(),
+                "speedup": diff_p50.as_secs_f64() / write_set_p50.as_secs_f64(),
+            })
+        );
+        assert!(
+            write_set_p50 < diff_p50,
+            "generation write-set discovery should beat general endpoint diffing"
+        );
+    }
 
+    #[tokio::test]
+    async fn large_rootless_exact_batch_uses_encoded_replay_and_preserves_input_slots() {
+        const COMMIT_ID: &str = "rootless-bulk-exact";
+        const ROW_COUNT: usize = HISTORICAL_ENCODED_LOOKUP_MIN_ROWS;
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, "base", None, &[])
+            .await
+            .expect("base root should write");
 
+        let rows = (0..ROW_COUNT)
+            .map(|index| {
+                row_with_value(
+                    &format!("row-{index:03}"),
+                    &format!("rootless-bulk-change-{index:03}"),
+                    COMMIT_ID,
+                    &format!("value-{index:03}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, COMMIT_ID, "base", &rows).await;
+
+        let key_for_row = |row: &MaterializedTrackedStateRow| TrackedStateKey {
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            row_pk: row.row_pk.clone(),
+        };
+        let duplicate_key = key_for_row(&rows[ROW_COUNT / 2]);
+        let mut requested = Vec::with_capacity(ROW_COUNT + 3);
+        requested.push(duplicate_key.clone());
+        requested.push(TrackedStateKey {
+            schema_key: "test_schema".to_owned(),
+            file_id: None,
+            row_pk: RowPk::single("missing-row"),
+        });
+        requested.extend(rows.iter().rev().map(key_for_row));
+        requested.push(duplicate_key);
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("bulk historical read should open"),
+        );
+        assert!(reader.point_value_cache.is_empty());
+        let exact = reader
+            .load_projected_batch_at_commit(COMMIT_ID, &requested, &ChangeRecordProjection::full())
+            .await
+            .expect("large rootless exact batch should materialize");
+
+        assert_eq!(exact.len(), requested.len());
+        assert!(exact.row(1).is_none(), "missing input must retain its slot");
+        for (offset, expected) in rows.iter().rev().enumerate() {
+            let actual = exact
+                .row(offset + 2)
+                .expect("every committed input should remain present");
+            assert_eq!(actual.row_pk(), &expected.row_pk);
+            assert_eq!(
+                actual.snapshot_content().map(SharedStr::as_str),
+                expected.snapshot_content.as_deref()
+            );
+        }
+        let first_duplicate = exact.row(0).expect("first duplicate should be present");
+        let last_duplicate = exact
+            .row(exact.len() - 1)
+            .expect("last duplicate should be present");
+        assert!(
+            std::ptr::eq(first_duplicate.row_pk(), last_duplicate.row_pk()),
+            "duplicate input slots should select the same materialized batch row"
+        );
+        assert!(
+            reader.point_value_cache.is_empty(),
+            "64+ unique keys must stay on encoded bulk replay instead of populating the row-owned point cache"
+        );
+        assert!(
+            reader.commit_delta_value_cache.is_empty(),
+            "encoded bulk replay must not populate the row-owned commit-delta cache"
+        );
+        assert!(
+            reader
+                .tree
+                .load_root(&reader.store, COMMIT_ID)
+                .await
+                .expect("root probe should succeed")
+                .is_none(),
+            "the batch must resolve from rootless deltas, not a rebuilt durable tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_exact_read_uses_self_contained_commit_payload() {
+        const COMMIT_LABEL: &str = "certified-historical-exact";
+        const BRANCH_ID: &str = "certified-branch";
+        const FILE_ID: &str = "certified.csv";
+        const SCHEMA_KEY: &str = "certified_row";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, COMMIT_LABEL, None, &[])
+            .await
+            .expect("empty tracked root should write");
+
+        let commit_id = CommitId::for_test_label(COMMIT_LABEL);
+        let creates = WasmCreateContext {
+            high: 0x0192_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let local_ref = 7_u32;
+        let mut page = Vec::new();
+        page.extend_from_slice(&local_ref.to_le_bytes());
+        page.extend_from_slice(&1_u64.to_le_bytes());
+        page.push(0);
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u16.to_le_bytes());
+        page.extend_from_slice(&5_u32.to_le_bytes());
+        page.extend_from_slice(b"value");
+        let page = crate::plugin::wire::encode_single_section(
+            crate::plugin::wire::Representation::SchemaRows,
+            crate::plugin::wire::Operation::Create,
+            SCHEMA_KEY,
+            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
+            1,
+            page,
+        )
+        .expect("test schema-row page");
+        let batches = [WasmCertifiedRowBatch {
+            format: 1,
+            schema_keys: vec![SCHEMA_KEY.to_owned()],
+            row_count: 1,
+            creates,
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: vec![Bytes::from(page)],
+        }];
+        let files = [CertifiedRowBatchFileRef {
+            branch_id: BRANCH_ID,
+            file_id: FILE_ID,
+            batches: &batches,
+        }];
+        let control = BranchHeadControl {
+            head_commit_id: commit_id,
+            tracked_generation: commit_id,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "certified test timestamp",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "certified test timestamp",
+                "2026-01-01T00:00:00Z",
+            ),
+            ref_change_id: ChangeId::for_test_label("certified-branch-ref"),
+        };
+        let controls = BTreeMap::from([(BRANCH_ID.to_owned(), control)]);
+        let commit_created_at = BTreeMap::from([(commit_id, control.created_at)]);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified batch read should open");
+        let mut writes = storage.new_write_set();
+        crate::hot_state::stage_certified_row_batches(
+            &read,
+            &mut writes,
+            &files,
+            &controls,
+            &BTreeMap::new(),
+            &commit_created_at,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("certified batch should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("certified batch should commit");
+
+        let id = creates
+            .component_uuid_bytes(u64::from(local_ref))
+            .expect("certified local reference should form an id");
+        let key = TrackedStateKey {
+            schema_key: SCHEMA_KEY.to_owned(),
+            file_id: Some(FILE_ID.to_owned()),
+            row_pk: RowPk::uuid_from_bytes(id),
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified authority read should open");
+        let certified = crate::hot_state::scan_certified_history_rows(
+            &read,
+            &BTreeSet::from([commit_id]),
+            &TrackedStateScanRequest {
+                filter: crate::tracked_state::TrackedStateFilter {
+                    schema_keys: vec![SCHEMA_KEY.to_owned()],
+                    row_pks: vec![key.row_pk.clone()],
+                    file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_owned())],
+                    row_pk_lower: None,
+                    row_pk_upper: None,
+                    include_tombstones: true,
+                },
+                read_columns: crate::tracked_state::TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+                },
+                limit: None,
+            },
+        )
+        .await
+        .expect("certified authority should scan");
+        let certified_change_id = certified[0]
+            .change_id
+            .expect("certified row should carry a change id");
+        let durable_change_id = ChangeId::for_test_label("certified-reference-durable-change-id");
+        assert_ne!(durable_change_id, certified_change_id);
+        let mut authority = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+            .await
+            .expect("commit-state authority should load")
+            .expect("root fixture should publish commit-state authority");
+        let mut writes = storage.new_write_set();
+        let staged = crate::tracked_state::stage_commit_deltas_for_commit_state(
+            &mut writes,
+            &[crate::tracked_state::TrackedStateCommitDeltaRef {
+                delta: TrackedStateDeltaRef {
+                    schema_key: SCHEMA_KEY,
+                    file_id: Some(FILE_ID),
+                    row_pk: &key.row_pk,
+                    change_id: durable_change_id,
+                    commit_id,
+                    deleted: false,
+                    created_at: control.created_at,
+                    updated_at: control.created_at,
+                },
+                snapshot: crate::json_store::JsonSlotRef::Inline(
+                    certified[0]
+                        .snapshot_content
+                        .as_ref()
+                        .expect("certified fixture has a snapshot")
+                        .as_str(),
+                ),
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: Some("certified-origin"),
+                base_coordinate: None,
+                authored: true,
+            }],
+        )
+        .expect("certified commit delta should stage");
+        crate::tracked_state::stage_change_locators(&mut writes, &staged.locators);
+        authority.mutations = staged.mutation_inventory().clone();
+        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
+            &mut writes,
+            &authority,
+        )
+        .expect("certified commit-state authority should update atomically");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("certified commit delta should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified locator read should open");
+        let inventory = crate::tracked_state::scan_commit_delta_inventory(&read)
+            .await
+            .expect("authored inventory should load");
+        let inventory_member = inventory
+            .commits
+            .get(&commit_id)
+            .and_then(|entry| entry.members.first())
+            .expect("authored inventory member should exist");
+        assert!(inventory_member.change.snapshot.is_some());
+        let canonical = crate::tracked_state::load_change_record_by_id(&read, durable_change_id)
+            .await
+            .expect("authored locator should load")
+            .expect("authored locator should exist");
+        assert!(canonical.snapshot.is_some());
+        assert_eq!(canonical.origin_key.as_deref(), Some("certified-origin"));
+        drop(read);
+        let exact = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("historical exact read should open"),
+            )
+            .load_projected_batch_at_commit(
+                &commit_id.to_string(),
+                &[key],
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("certified historical exact row should load");
+        assert!(
+            exact.row(0).is_none(),
+            "certified packet authority must not fabricate an identity omitted from the commit root"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_rootless_scan_materializes_from_flat_replay_without_row_caches_or_tree() {
+        const COMMIT_ID: &str = "rootless-flat-scan";
+        const ROW_COUNT: usize = HISTORICAL_ENCODED_LOOKUP_MIN_ROWS;
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, "base", None, &[])
+            .await
+            .expect("base root should write");
+        let rows = (0..ROW_COUNT)
+            .map(|index| {
+                row_with_value(
+                    &format!("scan-row-{index:03}"),
+                    &format!("rootless-scan-change-{index:03}"),
+                    COMMIT_ID,
+                    &format!("scan-value-{index:03}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, COMMIT_ID, "base", &rows).await;
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("rootless scan read should open"),
+        );
+        let batch = reader
+            .scan_batch_at_commit(
+                COMMIT_ID,
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_owned()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("large rootless scan should materialize");
+
+        assert_eq!(batch.len(), ROW_COUNT);
+        assert!(reader.point_value_cache.is_empty());
+        assert!(reader.commit_delta_value_cache.is_empty());
+        assert!(
+            reader
+                .tree
+                .load_root(&reader.store, COMMIT_ID)
+                .await
+                .expect("root probe should succeed")
+                .is_none(),
+            "flat replay must not rebuild or consult a head tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn rootless_diff_applies_file_cascade_before_same_commit_explicit_row() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000624";
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
+        descriptor.row_pk =
+            RowPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
+        descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        descriptor.file_id = Some(FILE_ID.to_string());
+        let mut semantic = row("line-1", "semantic-create", "initial");
+        semantic.file_id = Some(FILE_ID.to_string());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "initial",
+            None,
+            &[descriptor.clone(), semantic.clone()],
+        )
+        .await
+        .expect("initial root should write");
+
+        let mut descriptor_delete = descriptor;
+        descriptor_delete.snapshot_content = None;
+        descriptor_delete.deleted = true;
+        descriptor_delete.change_id = ChangeId::for_test_label("descriptor-delete");
+        descriptor_delete.commit_id = CommitId::for_test_label("mixed");
+        descriptor_delete.updated_at = "2026-01-02T00:00:00Z".to_string();
+        let mut semantic_edit = semantic;
+        semantic_edit.snapshot_content = Some(r#"{"value":"explicit"}"#.into());
+        semantic_edit.change_id = ChangeId::for_test_label("semantic-explicit");
+        semantic_edit.commit_id = CommitId::for_test_label("mixed");
+        semantic_edit.updated_at = "2026-01-02T00:00:00Z".to_string();
+        write_rootless_commit_for_test(
+            &storage,
+            "mixed",
+            "initial",
+            &[descriptor_delete, semantic_edit.clone()],
+        )
+        .await;
+
+        let diff = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("rootless diff read should open"),
+            )
+            .diff_commits(
+                "initial",
+                "mixed",
+                &TrackedStateDiffRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec![semantic_edit.schema_key],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rootless mixed cascade/explicit diff should succeed");
+
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(
+            diff.entries[0].kind,
+            crate::tracked_state::TrackedStateDiffKind::Modified
+        );
+        let after = diff.entries[0]
+            .after
+            .as_ref()
+            .expect("explicit semantic row should be the endpoint");
+        assert!(!after.deleted);
+        assert_eq!(
+            after.change_id,
+            ChangeId::for_test_label("semantic-explicit")
+        );
+    }
+
+    #[tokio::test]
+    async fn rootless_descriptor_cascade_drives_point_scan_diff_and_merge_reads() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000521";
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
+        descriptor.row_pk =
+            RowPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
+        descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        descriptor.file_id = Some(FILE_ID.to_string());
+        let mut semantic = row("line-1", "semantic-create", "initial");
+        semantic.file_id = Some(FILE_ID.to_string());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "initial",
+            None,
+            &[descriptor.clone(), semantic.clone()],
+        )
+        .await
+        .expect("initial root should write");
+
+        let mut descriptor_delete = descriptor.clone();
+        descriptor_delete.snapshot_content = None;
+        descriptor_delete.deleted = true;
+        descriptor_delete.change_id = ChangeId::for_test_label("descriptor-delete");
+        descriptor_delete.commit_id = CommitId::for_test_label("delete");
+        descriptor_delete.updated_at = "2026-01-02T00:00:00Z".to_string();
+        write_rootless_commit_for_test(
+            &storage,
+            "delete",
+            "initial",
+            std::slice::from_ref(&descriptor_delete),
+        )
+        .await;
+
+        let semantic_key = TrackedStateKey {
+            schema_key: semantic.schema_key.clone(),
+            file_id: semantic.file_id.clone(),
+            row_pk: semantic.row_pk.clone(),
+        };
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("rootless read should open"),
+        );
+        let point = reader
+            .load_batch_at_commit("delete", std::slice::from_ref(&semantic_key))
+            .await
+            .expect("rootless cascade point read should succeed")
+            .into_rows()
+            .pop()
+            .flatten()
+            .expect("cascaded semantic row should remain addressable");
+        assert!(point.deleted);
+        assert_eq!(point.change_id, descriptor_delete.change_id);
+        assert_eq!(point.created_at, "2026-01-01T00:00:00.000Z");
+
+        let scan = reader
+            .scan_batch_at_commit(
+                "delete",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec![semantic.schema_key.clone()],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rootless cascade scan should succeed")
+            .into_rows();
+        assert_eq!(scan.len(), 1);
+        assert!(scan[0].deleted);
+        assert_eq!(scan[0].change_id, descriptor_delete.change_id);
+
+        let cached_point_rows_before_diff = reader.commit_delta_value_cache.len();
+        let diff = reader
+            .diff_commits(
+                "initial",
+                "delete",
+                &TrackedStateDiffRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec![semantic.schema_key.clone()],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rootless cascade diff should succeed");
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(
+            diff.entries[0].kind,
+            crate::tracked_state::TrackedStateDiffKind::Removed
+        );
+        assert_eq!(
+            reader.commit_delta_value_cache.len(),
+            cached_point_rows_before_diff,
+            "rootless diff scans must not promote an owned key/value row per mutation"
+        );
+        drop(reader);
+
+        semantic.change_id = ChangeId::for_test_label("semantic-edit");
+        semantic.commit_id = CommitId::for_test_label("source");
+        semantic.updated_at = "2026-01-02T00:00:00Z".to_string();
+        semantic.snapshot_content = Some(r#"{"value":"source"}"#.into());
+        write_rootless_commit_for_test(
+            &storage,
+            "source",
+            "initial",
+            std::slice::from_ref(&semantic),
+        )
+        .await;
+
+        let plan = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("merge read should open"),
+            )
+            .plan_merge(
+                "initial",
+                "delete",
+                "source",
+                &TrackedStateDiffRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec![semantic.schema_key],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rootless delete-vs-edit merge should plan");
+        assert!(plan.picks.is_empty());
+        assert_eq!(merge_conflict_ids(&plan), vec!["line-1"]);
+        assert!(
+            plan.conflicts[0]
+                .target
+                .after
+                .as_ref()
+                .expect("target cascade should have an after row")
+                .deleted
+        );
+    }
 
     #[tokio::test]
     async fn file_descriptor_delete_cascade_survives_root_rebuild_and_recreate() {

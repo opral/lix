@@ -93,12 +93,7 @@ where
                 move |(query_source, schema)| async move {
                     let mut json_reader = query_source.json_reader;
                     let canonical_changes =
-                        scan_changelog_changes(
-                            query_source.store,
-                            pushed_limit,
-                            route,
-                            payload_projection.snapshot_content || payload_projection.metadata,
-                        )
+                        scan_changelog_changes(query_source.store, pushed_limit, route)
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                     let mut changes = Vec::with_capacity(canonical_changes.len());
@@ -153,7 +148,6 @@ async fn scan_changelog_changes<S>(
     store: S,
     limit: Option<usize>,
     route: ChangeScanRoute,
-    hydrate_payloads: bool,
 ) -> Result<Vec<LixChangeRow>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -167,11 +161,8 @@ where
         }
         ChangeScanRoute::All => {}
     }
-    let packed_changes = crate::tracked_state::scan_change_records_from_commit_deltas_projected(
-        &store,
-        hydrate_payloads,
-    )
-    .await?;
+    let packed_changes =
+        crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
     let mut reader = ChangelogContext::new().reader(store.clone());
     let mut changes = packed_changes
         .into_iter()

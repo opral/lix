@@ -16,7 +16,6 @@ pub(crate) mod current_state_envelope;
 mod diff;
 mod diff_id;
 mod merge;
-mod native_history_body;
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
 mod row_materialization;
@@ -56,7 +55,10 @@ pub(crate) use merge::{
 pub(crate) use mutation_directory::{
     MUTATION_DIRECTORY_NODE_SPACE, collect_mutation_directory_node_ids,
 };
-pub(crate) use replacement_part::{EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS};
+pub(crate) use replacement_part::{
+    EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
+    ReplacementPartRowRef, encode_replacement_part_with_compressor,
+};
 pub(crate) use row_materialization::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
@@ -80,24 +82,24 @@ pub(crate) use storage::{
     StagedCommitStateManifest, commit_delta_contains_schema, commit_delta_member_scopes,
     direct_change_locator,
     load_change_record_by_id, load_commit_delta_change_records,
-    load_commit_delta_members_for_schemas, load_commit_delta_members_with_payloads,
-    load_commit_delta_members_with_payloads_for_schemas,
+    load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
     load_commit_mutation_directory_roots, load_commit_state_manifest, load_commit_state_manifests,
     load_local_selected_change_owner_commit_ids, load_owned_commit_delta_entries,
     load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_topology,
     load_retained_commit_snapshots_for_schemas, scan_change_records_from_commit_deltas,
-    scan_change_records_from_commit_deltas_projected,
     scan_commit_delta_inventory, scan_commit_delta_values, scan_commit_state_manifest_commit_ids,
     selected_change_selection_fingerprint, stage_addressable_commit_deltas,
     stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
-    certify_authored_current_state_body,
+    stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_ordered_addressable_commit_deltas,
     stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
+    stage_preencoded_ordered_addressable_replacement_parts,
+    stage_prefixed_ordered_addressable_replacement_parts,
 };
 pub(crate) use storage::{
     RetainedPhysicalState, collect_current_state_part_json_refs,
@@ -112,6 +114,8 @@ pub(crate) use storage::{
 // deleting a manifest is a footgun that would outlive the fixture it was added
 // for. This attribute belongs to the `use` on the next line and nothing else;
 // do not insert between them.
+#[cfg(test)]
+pub(crate) use storage::stage_delete_commit_state_manifest_for_gc;
 // The storage-space constants are what the space registry
 // (`crate::storage_spaces`) and its layout invariants are built from. The
 // registry is compiled in every configuration, so these are too.
