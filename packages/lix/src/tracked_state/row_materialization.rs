@@ -751,7 +751,7 @@ mod tests {
     #[tokio::test]
     async fn a_uuid_primary_key_never_reaches_the_columnar_commit_delta_route() {
         use crate::engine::Engine;
-        use crate::storage_adapter::Memory;
+        use crate::storage_adapter::{Memory, StorageReadOptions};
         use serde_json::json;
 
         // The dense columnar lane is only taken by a *certified parameter
@@ -771,9 +771,9 @@ mod tests {
         // rows cannot reach 32,768, so the thresholds stay decisive without
         // being flaky.
 
-        async fn run(schema_key: &str, uuid_pk: bool) -> (u64, u64, usize) {
+        async fn run(schema_key: &str, uuid_pk: bool) -> (u64, u64, usize, bool) {
             let storage = Memory::new();
-            Engine::initialize(storage.clone())
+            let receipt = Engine::initialize(storage.clone())
                 .await
                 .expect("engine should initialize");
             let engine = Engine::new(storage.clone())
@@ -822,6 +822,26 @@ mod tests {
                 .await
                 .expect("the certified parameter batch should insert");
 
+            let inserted_head = engine
+                .load_branch_head_commit_id(&receipt.main_branch_id)
+                .await
+                .expect("inserted branch head should load")
+                .expect("inserted branch must have a head");
+            let read = engine
+                .storage()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("mutation authority read should open");
+            let manifest = crate::tracked_state::load_commit_state_manifest(
+                &read,
+                CommitId::parse_lix(&inserted_head, "columnar identity inserted head")
+                    .expect("inserted head should be canonical"),
+            )
+            .await
+            .expect("mutation authority should load")
+            .expect("inserted commit must publish mutation authority");
+            let publishes_columnar_parts = manifest.mutations.columnar_parts.is_some();
+
             // Rotate onto a branch so the read is served from a root current
             // base and must fetch payloads from the owning commit delta.
             let branch = session
@@ -852,21 +872,28 @@ mod tests {
                 census.commit_delta_columnar_rows,
                 census.commit_delta_rows_loaded,
                 rows.len(),
+                publishes_columnar_parts,
             )
         }
 
-        let (string_columnar, string_packed, string_rows) = run("colstr", false).await;
+        let (string_columnar, string_packed, string_rows, string_publishes_columnar) =
+            run("colstr", false).await;
         println!(
             "columnar_identity | string_pk columnar={string_columnar} packed={string_packed} rows={string_rows}"
         );
         assert_eq!(string_rows, 1, "the string-pk arm must answer one row");
+        assert!(
+            string_publishes_columnar,
+            "arm A must publish columnar mutation authority"
+        );
         assert!(
             string_columnar >= ROWS as u64,
             "arm A must actually reach the columnar route, otherwise arm B proves nothing \
              (columnar={string_columnar} packed={string_packed})"
         );
 
-        let (uuid_columnar, uuid_packed, uuid_rows) = run("coluuid", true).await;
+        let (uuid_columnar, uuid_packed, uuid_rows, uuid_publishes_columnar) =
+            run("coluuid", true).await;
         println!(
             "columnar_identity | uuid_pk columnar={uuid_columnar} packed={uuid_packed} rows={uuid_rows}"
         );
@@ -880,8 +907,8 @@ mod tests {
              (columnar={uuid_columnar} packed={uuid_packed})"
         );
         assert!(
-            uuid_columnar < ROWS as u64,
-            "a uuid primary key must never be served by the columnar route, whose identity \
+            !uuid_publishes_columnar,
+            "a uuid primary key must never publish columnar mutation authority, whose identity \
              match cannot round-trip it (columnar={uuid_columnar} packed={uuid_packed})"
         );
     }
