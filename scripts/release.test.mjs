@@ -138,18 +138,13 @@ test("updateCargoToml bumps every lockstep Rust package and exact dependency pin
 	mkdirSync(join(root, "packages", "lix"), { recursive: true });
 	mkdirSync(join(root, "packages", "storage-rocksdb"), { recursive: true });
 	mkdirSync(join(root, "packages", "storage-slatedb"), { recursive: true });
-	mkdirSync(join(root, "packages", "lix-plugin-bindings-column-merger"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
 		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/storage-rocksdb", version = "=0.6.2" }\nlix_storage_slatedb = { path = "packages/storage-slatedb", version = "=0.6.2" }\nlix = { path = "packages/lix", version = "=0.6.2" }\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "lix", "Cargo.toml"),
-		`[package]\nname = "lix"\nversion.workspace = true\n\n[dependencies]\nlix-plugin-bindings-column-merger = { path = "../lix-plugin-bindings-column-merger", version = "=0.6.2" }\n`,
-	);
-	writeFileSync(
-		join(root, "packages", "lix-plugin-bindings-column-merger", "Cargo.toml"),
-		`[package]\nname = "lix-plugin-bindings-column-merger"\nversion.workspace = true\n`,
+		`[package]\nname = "lix"\nversion.workspace = true\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "js-sdk", "Cargo.toml"),
@@ -174,10 +169,6 @@ test("updateCargoToml bumps every lockstep Rust package and exact dependency pin
 	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.7\.0"/);
 	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /version\.workspace = true/);
 	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.7\.0"/);
-	assert.match(
-		readFileSync(join(root, "packages", "lix", "Cargo.toml"), "utf8"),
-		/lix-plugin-bindings-column-merger = \{ path = "\.\.\/lix-plugin-bindings-column-merger", version = "=0\.7\.0"/,
-	);
 	assert.doesNotThrow(() => validateCargoLockstepVersions(root, "0.7.0"));
 });
 

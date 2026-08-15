@@ -1,13 +1,29 @@
 //! Row-first authoring layer for Lix's Component API v1.
 
-#![allow(clippy::missing_errors_doc)]
+#![allow(
+    clippy::missing_errors_doc,
+    trivial_numeric_casts,
+    unused_qualifications
+)]
 
 #[doc(hidden)]
-pub use lix_plugin_bindings_column_merger as column_merger_bindings;
+pub mod column_merger_bindings {
+    include!(concat!(env!("OUT_DIR"), "/column_merger_bindings.rs"));
+
+    pub use super::combined_bindings::lix;
+}
+
 #[doc(hidden)]
-pub use lix_plugin_bindings_combined as combined_bindings;
+pub mod combined_bindings {
+    include!(concat!(env!("OUT_DIR"), "/combined_bindings.rs"));
+}
+
 #[doc(hidden)]
-pub use lix_plugin_bindings_file_projection as file_projection_bindings;
+pub mod file_projection_bindings {
+    include!(concat!(env!("OUT_DIR"), "/file_projection_bindings.rs"));
+
+    pub use super::combined_bindings::lix;
+}
 
 use self::combined_bindings::exports::lix::plugin::column_merger::Guest as CombinedColumnMergerGuest;
 use self::combined_bindings::exports::lix::plugin::file_projection::Guest as CombinedFileProjectionGuest;
@@ -319,11 +335,6 @@ mod combined_hosts {
     impl_projection_hosts!(combined_bindings);
 }
 
-mod file_projection_hosts {
-    use super::*;
-    impl_projection_hosts!(file_projection_bindings);
-}
-
 macro_rules! impl_column_hosts {
     ($bindings:ident) => {
         fn map_host_error(error: $bindings::lix::plugin::host::HostError) -> CommonHostError {
@@ -418,11 +429,6 @@ macro_rules! impl_column_hosts {
 mod combined_column_hosts {
     use super::*;
     impl_column_hosts!(combined_bindings);
-}
-
-mod column_merger_hosts {
-    use super::*;
-    impl_column_hosts!(column_merger_bindings);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

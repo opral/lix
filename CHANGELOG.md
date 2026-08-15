@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.1 - 2026-08-15
+
+### Patch
+
+- Integrated the generated plugin bindings directly into the `lix` crate.
+
+  Rust consumers no longer need the separate column-merger, combined, or file-projection binding crates.
+
 ## 0.12.0 - 2026-08-15
 
 ### Minor

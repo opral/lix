@@ -2561,12 +2561,5 @@ mod tests {
         assert!(wit.contains("world column-merger-plugin"));
         assert!(wit.contains("world file-projection-plugin"));
         assert!(!wit.contains("resolve-conflicts"));
-        for packaged_copy in [
-            include_str!("../../../../lix-plugin-bindings-column-merger/wit/lix-plugin.wit"),
-            include_str!("../../../../lix-plugin-bindings-combined/wit/lix-plugin.wit"),
-            include_str!("../../../../lix-plugin-bindings-file-projection/wit/lix-plugin.wit"),
-        ] {
-            assert_eq!(packaged_copy, wit, "published binding WIT must stay exact");
-        }
     }
 }

@@ -280,7 +280,13 @@ jobs:
     name: Publish crates.io packages
     runs-on: blacksmith-32vcpu-ubuntu-2404
     environment: production
-    needs: release-version
+    # All reversible build and test work must succeed before the first
+    # immutable registry upload. Registry publication is then serialized:
+    # crates.io -> npm -> GitHub release.
+    needs:
+      - release-version
+      - build-js-sdk-native-packages
+      - test-js-sdk
     if: needs.release-version.outputs.has_release == 'true'
 
     steps:
@@ -308,6 +314,16 @@ jobs:
         with:
           shared-key: publish-rust-crates
 
+      - name: Preflight all lockstep Rust crates
+        run: |
+          set -euo pipefail
+          cargo package --locked --no-verify \
+            -p lix-schema \
+            -p lix \
+            -p lix-storage-rocksdb \
+            -p lix-storage-slatedb \
+            -p lix-storage-filesystem
+
       - name: Publish lockstep Rust crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -315,9 +331,6 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/publish-crate.mjs lix-schema "$EXPECTED_VERSION"
-          node scripts/publish-crate.mjs lix-plugin-bindings-column-merger "$EXPECTED_VERSION"
-          node scripts/publish-crate.mjs lix-plugin-bindings-combined "$EXPECTED_VERSION"
-          node scripts/publish-crate.mjs lix-plugin-bindings-file-projection "$EXPECTED_VERSION"
           node scripts/publish-crate.mjs lix "$EXPECTED_VERSION"
           node scripts/publish-crate.mjs lix-storage-rocksdb "$EXPECTED_VERSION"
           node scripts/publish-crate.mjs lix-storage-slatedb "$EXPECTED_VERSION"
@@ -331,6 +344,7 @@ jobs:
       - release-version
       - build-js-sdk-native-packages
       - test-js-sdk
+      - publish-rust-crates
     permissions:
       contents: read
       id-token: write
