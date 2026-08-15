@@ -31,7 +31,9 @@ use crate::tracked_state::codec::{
     encode_value_ref,
 };
 use crate::tracked_state::types::{
-    ColumnarPageSource, CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
+    AuthoredHistoryBodyCoordinate, AuthoredHistoryBodyEntry, AuthoredHistoryBodyInventory,
+    ColumnarPageSource,
+    CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
     CurrentStatePartDescriptor, CurrentStatePartSource, CurrentStateScopedRangeRoot,
     StoredCommitDeltaReplacementGeneration, StoredReplacementPart, StoredReplacementPartsAuthority,
     TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
@@ -50,7 +52,7 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
     "tracked_state.commit_delta_segment.v6";
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
 pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE: &str =
-    "tracked_state.commit_state_manifest.v7";
+    "tracked_state.commit_state_manifest.v8";
 pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE: &str =
     "tracked_state.commit_mutation_catalog.v1";
 const MIN_CURRENT_STATE_SCOPED_RANGE_POINT_READS: u16 = 4;
@@ -128,7 +130,7 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD17";
 // commit independently from semantic graph ancestry.
 // Version 10 splits the authority header from a separately keyed mutation
 // catalog and authenticates a content-addressed hierarchical part directory.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS10";
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS11";
 const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI1";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
@@ -164,7 +166,7 @@ impl CommitDeltaSegmentEncodeError {
     }
 }
 
-#[derive(Clone, Copy, musli::Encode)]
+#[derive(Clone, musli::Encode)]
 #[musli(packed)]
 struct CommitDeltaPayloadRef<'a> {
     body_digest: [u8; 32],
@@ -173,9 +175,11 @@ struct CommitDeltaPayloadRef<'a> {
     #[musli(with = storage_codec::option)]
     base_coordinate: Option<TrackedStateBaseCoordinate>,
     authored: bool,
+    #[musli(with = storage_codec::option)]
+    tombstone_metadata: Option<NativeHistoryMetadata>,
 }
 
-#[derive(Clone, Copy, musli::Encode)]
+#[derive(Clone, musli::Encode)]
 #[musli(packed)]
 struct CommitDeltaAuthoredPayloadRef<'a> {
     body_digest: [u8; 32],
@@ -183,6 +187,93 @@ struct CommitDeltaAuthoredPayloadRef<'a> {
     origin_key: Option<&'a str>,
     #[musli(with = storage_codec::option)]
     base_coordinate: Option<TrackedStateBaseCoordinate>,
+    #[musli(with = storage_codec::option)]
+    tombstone_metadata: Option<&'a NativeHistoryMetadata>,
+}
+
+const NATIVE_HISTORY_METADATA_INLINE: u8 = 1;
+const NATIVE_HISTORY_METADATA_REF: u8 = 2;
+
+/// The only payload retained for an authored tombstone. This is a typed
+/// metadata scalar, never a serialized row or snapshot fallback.
+#[derive(Clone, Debug, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct NativeHistoryMetadata {
+    kind: u8,
+    #[musli(bytes)]
+    payload: Vec<u8>,
+}
+
+fn native_history_metadata(
+    slot: crate::json_store::JsonSlotRef<'_>,
+) -> Option<NativeHistoryMetadata> {
+    match slot {
+        crate::json_store::JsonSlotRef::None => None,
+        crate::json_store::JsonSlotRef::Inline(json) => Some(NativeHistoryMetadata {
+            kind: NATIVE_HISTORY_METADATA_INLINE,
+            payload: json.as_bytes().to_vec(),
+        }),
+        crate::json_store::JsonSlotRef::Ref(reference) => Some(NativeHistoryMetadata {
+            kind: NATIVE_HISTORY_METADATA_REF,
+            payload: reference.as_hash_bytes().to_vec(),
+        }),
+    }
+}
+
+fn decode_native_history_metadata(
+    metadata: Option<NativeHistoryMetadata>,
+) -> Result<crate::json_store::JsonSlot, LixError> {
+    let Some(metadata) = metadata else {
+        return Ok(crate::json_store::JsonSlot::None);
+    };
+    match metadata.kind {
+        NATIVE_HISTORY_METADATA_INLINE => {
+            let json = String::from_utf8(metadata.payload).map_err(|_| {
+                replacement_payload_error("native history metadata is not UTF-8")
+            })?;
+            if json.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
+                return Err(replacement_payload_error(
+                    "native history metadata has a noncanonical inline layout",
+                ));
+            }
+            Ok(crate::json_store::JsonSlot::Inline(json.into_boxed_str()))
+        }
+        NATIVE_HISTORY_METADATA_REF => {
+            let hash: [u8; 32] = metadata.payload.try_into().map_err(|_| {
+                replacement_payload_error("native history metadata ref has the wrong length")
+            })?;
+            Ok(crate::json_store::JsonSlot::Ref(
+                crate::json_store::JsonRef::from_hash_bytes(hash),
+            ))
+        }
+        _ => Err(replacement_payload_error(
+            "native history metadata has an unsupported layout",
+        )),
+    }
+}
+
+fn validate_native_history_member_metadata(
+    value: &TrackedStateIndexValue,
+    body_digest: [u8; 32],
+    metadata: &crate::json_store::JsonSlot,
+) -> Result<(), LixError> {
+    if value.deleted {
+        if body_digest
+            != history_body_digest(
+                crate::json_store::JsonSlotRef::None,
+                metadata.as_ref_slot(),
+            )
+        {
+            return Err(replacement_payload_error(
+                "native history tombstone metadata disagrees with its body digest",
+            ));
+        }
+    } else if metadata.is_some() {
+        return Err(replacement_payload_error(
+            "live native history member contains tombstone metadata",
+        ));
+    }
+    Ok(())
 }
 
 const COMMIT_DELTA_PAYLOAD_AUTHORED: u8 = 0;
@@ -197,6 +288,8 @@ struct CommitDeltaAuthoredPayload {
     origin_key: Option<String>,
     #[musli(with = storage_codec::option)]
     base_coordinate: Option<TrackedStateBaseCoordinate>,
+    #[musli(with = storage_codec::option)]
+    tombstone_metadata: Option<NativeHistoryMetadata>,
 }
 
 #[derive(Debug)]
@@ -411,6 +504,7 @@ pub(crate) struct LoadedCommitDeltaEntry {
     pub(crate) change_record: crate::changelog::ChangeRecord,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     body_digest: [u8; 32],
+    authored: bool,
     selected_ref: bool,
 }
 
@@ -628,6 +722,8 @@ struct StoredCommitStateManifest {
     touched_scope_filter: crate::tracked_state::types::CommitStateTouchedScopeFilter,
     #[musli(with = storage_codec::option)]
     current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    #[musli(with = storage_codec::option)]
+    authored_history_bodies: Option<Box<AuthoredHistoryBodyInventory>>,
     #[musli(with = storage_codec::option)]
     snapshot_root: Option<Box<TrackedStateCommitRoot>>,
 }
@@ -1303,64 +1399,402 @@ pub(crate) async fn load_complete_current_state_values_from_scoped_root(
     ))
 }
 
-async fn load_complete_current_state_rows_from_scoped_root(
-    store: &(impl StorageAdapterRead + ?Sized),
-    root: &CurrentStateScopedRangeRoot,
-    encoded_keys: &[Bytes],
-) -> Result<Vec<Option<crate::tracked_state::current_state_data_part::CurrentStateDataRow>>, LixError>
-{
-    if encoded_keys.is_empty() {
-        return Ok(Vec::new());
+fn authored_history_body_binding_digest(
+    encoded_key: &[u8],
+    value: &TrackedStateIndexValue,
+    body_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut digest = blake3::Hasher::new_derive_key("lix authored history body member v1");
+    digest.update(&(encoded_key.len() as u64).to_be_bytes());
+    digest.update(encoded_key);
+    let encoded_value = encode_value_ref(TrackedStateIndexValueRef {
+        change_id: value.change_id,
+        commit_id: value.commit_id,
+        deleted: value.deleted,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+    });
+    digest.update(&(encoded_value.len() as u64).to_be_bytes());
+    digest.update(&encoded_value);
+    digest.update(&body_digest);
+    *digest.finalize().as_bytes()
+}
+
+fn authored_history_body_closure_digest(
+    commit_id: CommitId,
+    inventory: &AuthoredHistoryBodyInventory,
+) -> Result<[u8; 32], LixError> {
+    let mut digest = blake3::Hasher::new_derive_key("lix authored history body inventory v1");
+    digest.update(commit_id.as_uuid().as_bytes());
+    digest.update(&inventory.source_root_id);
+    digest.update(&inventory.source_transition_digest);
+    digest.update(&(inventory.descriptors.len() as u64).to_be_bytes());
+    for descriptor in &inventory.descriptors {
+        let encoded = storage_codec::encode("authored history body descriptor", descriptor)?;
+        digest.update(&(encoded.len() as u64).to_be_bytes());
+        digest.update(&encoded);
     }
-    let scopes = encoded_keys
+    digest.update(&(inventory.entries.len() as u64).to_be_bytes());
+    for entry in &inventory.entries {
+        digest.update(entry.change_id.as_uuid().as_bytes());
+        digest.update(&entry.binding_digest);
+        match entry.coordinate {
+            Some(coordinate) => {
+                digest.update(&[1]);
+                digest.update(&coordinate.descriptor_index.to_be_bytes());
+                digest.update(&coordinate.row_index.to_be_bytes());
+            }
+            None => {
+                digest.update(&[0]);
+            }
+        }
+    }
+    Ok(*digest.finalize().as_bytes())
+}
+
+fn validate_authored_history_body_inventory_shape(
+    commit_id: CommitId,
+    inventory: &AuthoredHistoryBodyInventory,
+) -> Result<(), LixError> {
+    if inventory
+        .descriptors
         .iter()
-        .map(|encoded_key| {
-            let key = crate::tracked_state::codec::decode_key_borrowed(encoded_key)?;
-            super::current_state_envelope::current_state_scope_prefix_from_parts(
-                key.schema_key.as_ref(),
-                key.file_id.as_deref(),
-            )
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let requests = scopes
-        .iter()
-        .zip(encoded_keys)
-        .map(|(scope, key)| (scope, key.as_ref()))
-        .collect::<Vec<_>>();
-    let routes =
-        super::scoped_range::route_scoped_range_covered_points(store, &root.tree, &requests)
-            .await?;
-    if routes.iter().any(|route| !route.scope_covered) {
+        .enumerate()
+        .any(|(index, descriptor)| inventory.descriptors[..index].contains(descriptor))
+    {
         return Err(replacement_payload_error(
-            "history body back-edge escaped its authenticated current-state scope",
+            "history body inventory contains a duplicate descriptor",
         ));
     }
-    let descriptors = routes
-        .into_iter()
-        .map(|route| {
-            route
-                .covered_part
-                .as_ref()
-                .map(super::current_state_envelope::current_state_descriptor_from_scoped_range_part)
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let mut writes = StorageWriteSet::new();
-    let mut output = Vec::with_capacity(encoded_keys.len());
-    for (encoded_key, descriptor) in encoded_keys.iter().zip(descriptors) {
-        let Some(descriptor) = descriptor else {
-            output.push(None);
+    let mut change_ids = BTreeSet::new();
+    let mut coordinates = BTreeSet::new();
+    let mut next_descriptor = 0u32;
+    let mut active_descriptor = None;
+    for entry in &inventory.entries {
+        if !change_ids.insert(entry.change_id) {
+            return Err(replacement_payload_error(
+                "history body inventory contains a duplicate change",
+            ));
+        }
+        let Some(coordinate) = entry.coordinate else {
             continue;
         };
-        let rows =
-            load_scoped_current_state_descriptor_rows(store, &mut writes, &descriptor).await?;
-        let row = rows
-            .binary_search_by(|row| row.encoded_key.as_slice().cmp(encoded_key.as_ref()))
-            .ok()
-            .map(|index| rows[index].clone());
-        output.push(row);
+        let descriptor = inventory
+            .descriptors
+            .get(usize::try_from(coordinate.descriptor_index).expect("u32 fits usize"))
+            .ok_or_else(|| replacement_payload_error("history body descriptor is out of bounds"))?;
+        if coordinate.row_index >= descriptor.row_count {
+            return Err(replacement_payload_error(
+                "history body row coordinate is out of bounds",
+            ));
+        }
+        if !coordinates.insert((coordinate.descriptor_index, coordinate.row_index)) {
+            return Err(replacement_payload_error(
+                "history body inventory contains a duplicate row coordinate",
+            ));
+        }
+        match active_descriptor {
+            Some(index) if index == coordinate.descriptor_index => {}
+            _ if coordinate.descriptor_index == next_descriptor => {
+                active_descriptor = Some(coordinate.descriptor_index);
+                next_descriptor = next_descriptor.checked_add(1).ok_or_else(|| {
+                    replacement_payload_error("history body descriptor order overflows")
+                })?;
+            }
+            _ => {
+                return Err(replacement_payload_error(
+                    "history body inventory has noncanonical descriptor order",
+                ));
+            }
+        }
     }
-    Ok(output)
+    if usize::try_from(next_descriptor).expect("u32 fits usize") != inventory.descriptors.len() {
+        return Err(replacement_payload_error(
+            "history body inventory contains an unreferenced descriptor",
+        ));
+    }
+    if authored_history_body_closure_digest(commit_id, inventory)? != inventory.closure_digest {
+        return Err(replacement_payload_error(
+            "history body inventory disagrees with its ordered entry closure",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authored_history_body_inventory(
+    state: &AuthenticatedReplayCommitStateManifest,
+    members: &[CommitDeltaMember],
+    inventory: &AuthoredHistoryBodyInventory,
+) -> Result<(), LixError> {
+    validate_authored_history_body_inventory_shape(state.commit_id, inventory)?;
+    let root = state.current_state_scoped_ranges.as_ref().ok_or_else(|| {
+        replacement_payload_error("history body inventory has no selected source root binding")
+    })?;
+    if inventory.source_root_id != root.tree.root_id
+        || inventory.source_transition_digest != root.transition_digest
+    {
+        return Err(replacement_payload_error(
+            "history body inventory disagrees with its selected source root",
+        ));
+    }
+    for descriptor in &inventory.descriptors {
+        let part = crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
+            &CommitDeltaReplacementScope {
+                schema_key: decode_key(&descriptor.first_key)?.schema_key,
+                file_id: decode_key(&descriptor.first_key)?.file_id,
+            },
+            descriptor,
+        )?;
+        if crate::tracked_state::current_state_envelope::current_state_descriptor_from_scoped_range_part(&part)?
+            != *descriptor
+        {
+            return Err(replacement_payload_error(
+                "history body inventory contains a noncanonical descriptor",
+            ));
+        }
+    }
+    let inventory_entries = inventory
+        .entries
+        .iter()
+        .map(|entry| (entry.change_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    for member in members.iter().filter(|member| member.authored) {
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &member.key.schema_key,
+            file_id: member.key.file_id.as_deref(),
+            row_pk: &member.key.row_pk,
+        });
+        let entry = inventory_entries.get(&member.value.change_id).ok_or_else(|| {
+            replacement_payload_error("history body inventory omitted a requested member")
+        })?;
+        if entry.change_id != member.value.change_id
+            || entry.binding_digest
+                != authored_history_body_binding_digest(
+                    &encoded_key,
+                    &member.value,
+                    member.body_digest,
+                )
+        {
+            return Err(replacement_payload_error(
+                "history body entry disagrees with its authored member",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_loaded_history_body_inventory(
+    state: &AuthenticatedReplayCommitStateManifest,
+    entries: &[LoadedCommitDeltaEntry],
+    inventory: &AuthoredHistoryBodyInventory,
+) -> Result<(), LixError> {
+    validate_authored_history_body_inventory_shape(state.commit_id, inventory)?;
+    let root = state.current_state_scoped_ranges.as_ref().ok_or_else(|| {
+        replacement_payload_error("history body inventory has no selected source root binding")
+    })?;
+    if inventory.source_root_id != root.tree.root_id
+        || inventory.source_transition_digest != root.transition_digest
+    {
+        return Err(replacement_payload_error(
+            "history body inventory disagrees with its selected source root",
+        ));
+    }
+    let inventory_entries = inventory
+        .entries
+        .iter()
+        .map(|entry| (entry.change_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    for entry in entries.iter().filter(|entry| entry.authored) {
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &entry.change_record.schema_key,
+            file_id: entry.change_record.file_id.as_deref(),
+            row_pk: &entry.change_record.row_pk,
+        });
+        let locator = inventory_entries
+            .get(&entry.value.change_id)
+            .ok_or_else(|| replacement_payload_error("history body inventory omitted a requested member"))?;
+        if locator.binding_digest
+            != authored_history_body_binding_digest(&encoded_key, &entry.value, entry.body_digest)
+        {
+            return Err(replacement_payload_error(
+                "history body inventory disagrees with a requested member",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn certify_authored_history_body_inventory(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    account_id: &str,
+    mutations: &CommitStateMutationInventory,
+    root: Option<&CurrentStateScopedRangeRoot>,
+) -> Result<Option<AuthoredHistoryBodyInventory>, LixError> {
+    let staged_segments = staged_commit_delta_segment_bytes(writes, commit_id, mutations)?;
+    let members = staged_commit_delta_members(
+        store,
+        writes,
+        commit_id,
+        account_id,
+        mutations,
+        staged_segments,
+    )
+    .await?;
+    let authored = members.iter().filter(|member| member.authored).collect::<Vec<_>>();
+    if authored.is_empty() {
+        return Ok(None);
+    }
+    let root = root.ok_or_else(|| {
+        replacement_payload_error("authored history body inventory has no canonical source root")
+    })?;
+    let reachable = crate::tracked_state::scoped_range::validate_scoped_range_tree_with_staged(
+        store,
+        writes,
+        &root.tree,
+    )
+    .await?;
+    let mut candidates = reachable
+        .parts
+        .iter()
+        .map(crate::tracked_state::current_state_envelope::current_state_descriptor_from_scoped_range_part)
+        .collect::<Result<Vec<_>, LixError>>()?;
+    candidates.sort_unstable_by(|left, right| left.first_key.cmp(&right.first_key));
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].last_key >= pair[1].first_key)
+    {
+        return Err(replacement_payload_error(
+            "authenticated current-state descriptors overlap or are unordered",
+        ));
+    }
+    let mut descriptors = Vec::<CurrentStatePartDescriptor>::new();
+    let mut descriptor_indices = BTreeMap::<usize, usize>::new();
+    let mut entries = Vec::with_capacity(authored.len());
+    let mut loaded = BTreeMap::<usize, Vec<crate::tracked_state::current_state_data_part::CurrentStateDataRow>>::new();
+    for member in authored {
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &member.key.schema_key,
+            file_id: member.key.file_id.as_deref(),
+            row_pk: &member.key.row_pk,
+        });
+        let binding_digest = authored_history_body_binding_digest(
+            &encoded_key,
+            &member.value,
+            member.body_digest,
+        );
+        if member.value.deleted {
+            if member.body_digest
+                != history_body_digest(
+                    crate::json_store::JsonSlotRef::None,
+                    member.change.metadata.as_ref_slot(),
+                )
+            {
+                return Err(replacement_payload_error(
+                    "authored history tombstone carries a native body digest",
+                ));
+            }
+            entries.push(AuthoredHistoryBodyEntry {
+                change_id: member.value.change_id,
+                binding_digest,
+                coordinate: None,
+            });
+            continue;
+        }
+        let candidate_index = candidates.partition_point(|descriptor| {
+            descriptor.last_key.as_slice() < encoded_key.as_slice()
+        });
+        let Some(descriptor) = candidates.get(candidate_index) else {
+            return Err(replacement_payload_error(
+                "authored history body does not resolve to one canonical source descriptor",
+            ));
+        };
+        if descriptor.first_key.as_slice() > encoded_key.as_slice()
+            || candidates.get(candidate_index + 1).is_some_and(|next| {
+                next.first_key.as_slice() <= encoded_key.as_slice()
+                    && encoded_key.as_slice() <= next.last_key.as_slice()
+            })
+        {
+            return Err(replacement_payload_error(
+                "authored history body does not resolve to one canonical source descriptor",
+            ));
+        }
+        if !loaded.contains_key(&candidate_index) {
+            loaded.insert(
+                candidate_index,
+                load_scoped_current_state_descriptor_rows(
+                    store,
+                    writes,
+                    &candidates[candidate_index],
+                )
+                .await?,
+            );
+        }
+        let rows = &loaded[&candidate_index];
+        let row_index = rows
+            .binary_search_by(|row| row.encoded_key.as_slice().cmp(encoded_key.as_slice()))
+            .map_err(|_| replacement_payload_error("authored history body is absent from its canonical source"))?;
+        if !authored_history_body_matches_current_row(
+            &rows[row_index],
+            &member.value,
+            member.body_digest,
+        ) {
+            return Err(replacement_payload_error(
+                "authored history body disagrees with its canonical source row",
+            ));
+        }
+        let descriptor_index = match descriptor_indices.get(&candidate_index).copied() {
+            Some(index) => index,
+            None => {
+                let index = descriptors.len();
+                descriptors.push(descriptor.clone());
+                descriptor_indices.insert(candidate_index, index);
+                index
+            }
+        };
+        entries.push(AuthoredHistoryBodyEntry {
+            change_id: member.value.change_id,
+            binding_digest,
+            coordinate: Some(AuthoredHistoryBodyCoordinate {
+                descriptor_index: u32::try_from(descriptor_index).map_err(|_| {
+                    replacement_payload_error("history body descriptor count overflows")
+                })?,
+                row_index: u16::try_from(row_index).map_err(|_| {
+                    replacement_payload_error("history body row coordinate overflows")
+                })?,
+            }),
+        });
+    }
+    let mut inventory = AuthoredHistoryBodyInventory {
+        source_root_id: root.tree.root_id,
+        source_transition_digest: root.transition_digest,
+        closure_digest: [0; 32],
+        descriptors,
+        entries,
+    };
+    inventory.closure_digest = authored_history_body_closure_digest(commit_id, &inventory)?;
+    Ok(Some(inventory))
+}
+
+#[cfg(test)]
+pub(crate) async fn certify_authored_history_body_inventory_for_test(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    account_id: &str,
+    mutations: &CommitStateMutationInventory,
+    root: &CurrentStateScopedRangeRoot,
+) -> Result<Option<AuthoredHistoryBodyInventory>, LixError> {
+    certify_authored_history_body_inventory(
+        store,
+        writes,
+        commit_id,
+        account_id,
+        mutations,
+        Some(root),
+    )
+    .await
 }
 
 async fn hydrate_authored_history_members(
@@ -1386,22 +1820,38 @@ async fn hydrate_authored_history_members(
     if authored.is_empty() {
         return Ok(());
     }
-    let root = state.current_state_scoped_ranges.as_ref().ok_or_else(|| {
-        replacement_payload_error("authored history member has no selected current-state root")
+    let inventory = state.authored_history_bodies.as_ref().ok_or_else(|| {
+        replacement_payload_error(&format!(
+            "authored history member for commit '{}' has no canonical body inventory",
+            state.commit_id
+        ))
     })?;
-    let keys = authored
+    validate_authored_history_body_inventory(state, members, inventory)?;
+    let mut writes = StorageWriteSet::new();
+    let mut loaded = BTreeMap::<u32, Vec<crate::tracked_state::current_state_data_part::CurrentStateDataRow>>::new();
+    let inventory_entries = inventory
+        .entries
         .iter()
-        .map(|(_, key)| key.clone())
-        .collect::<Vec<_>>();
-    let rows = load_complete_current_state_rows_from_scoped_root(store, root, &keys).await?;
-    for ((member_index, _), row) in authored.into_iter().zip(rows) {
+        .map(|entry| (entry.change_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    for (member_index, _) in authored {
         let member = &mut members[member_index];
+        // `validate_authored_history_body_inventory` proves that authored
+        // members and inventory entries are the same canonical ordered
+        // closure. Consume that proof directly instead of rescanning the
+        // complete inventory once per member.
+        let coordinate = inventory_entries
+            .get(&member.value.change_id)
+            .ok_or_else(|| {
+                replacement_payload_error("history body inventory omitted a requested member")
+            })?
+            .coordinate;
         if member.value.deleted {
-            if row.is_some()
+            if coordinate.is_some()
                 || member.body_digest
                     != history_body_digest(
                         crate::json_store::JsonSlotRef::None,
-                        crate::json_store::JsonSlotRef::None,
+                        member.change.metadata.as_ref_slot(),
                     )
             {
                 return Err(replacement_payload_error(
@@ -1410,12 +1860,23 @@ async fn hydrate_authored_history_members(
             }
             continue;
         }
-        let row = row.ok_or_else(|| {
-            replacement_payload_error(&format!(
-                "authored history body for schema '{}' in commit '{}' is absent from current-state root",
-                member.key.schema_key, state.commit_id
-            ))
+        let coordinate = coordinate.ok_or_else(|| {
+            replacement_payload_error("live authored history member has no body coordinate")
         })?;
+        let descriptor = inventory
+            .descriptors
+            .get(usize::try_from(coordinate.descriptor_index).expect("u32 fits usize"))
+            .ok_or_else(|| replacement_payload_error("history body descriptor is out of bounds"))?;
+        if !loaded.contains_key(&coordinate.descriptor_index) {
+            loaded.insert(
+                coordinate.descriptor_index,
+                load_scoped_current_state_descriptor_rows(store, &mut writes, descriptor).await?,
+            );
+        }
+        let row = loaded[&coordinate.descriptor_index]
+            .get(usize::from(coordinate.row_index))
+            .ok_or_else(|| replacement_payload_error("history body row coordinate is out of bounds"))?
+            .clone();
         if !authored_history_body_matches_current_row(
             &row,
             &member.value,
@@ -1442,37 +1903,36 @@ async fn hydrate_loaded_history_entries(
     let authored_indices = entries
         .iter()
         .enumerate()
-        .filter_map(|(index, entry)| (!entry.selected_ref).then_some(index))
+        .filter_map(|(index, entry)| entry.authored.then_some(index))
         .collect::<Vec<_>>();
     if authored_indices.is_empty() {
         return Ok(());
     }
-    let root = state.current_state_scoped_ranges.as_ref().ok_or_else(|| {
-        replacement_payload_error(&format!(
-            "authored history entry in commit '{}' has no selected current-state root",
-            state.commit_id
-        ))
+    let inventory = state.authored_history_bodies.as_ref().ok_or_else(|| {
+        replacement_payload_error("authored history entry has no canonical body inventory")
     })?;
-    let keys = authored_indices
+    validate_loaded_history_body_inventory(state, entries, inventory)?;
+    let inventory_entries = inventory
+        .entries
         .iter()
-        .map(|&index| {
-            let entry = &entries[index];
-            Bytes::from(encode_key_ref(TrackedStateKeyRef {
-                schema_key: &entry.change_record.schema_key,
-                file_id: entry.change_record.file_id.as_deref(),
-                row_pk: &entry.change_record.row_pk,
-            }))
-        })
-        .collect::<Vec<_>>();
-    let rows = load_complete_current_state_rows_from_scoped_root(store, root, &keys).await?;
-    for (index, row) in authored_indices.into_iter().zip(rows) {
+        .map(|entry| (entry.change_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut writes = StorageWriteSet::new();
+    let mut loaded = BTreeMap::<u32, Vec<crate::tracked_state::current_state_data_part::CurrentStateDataRow>>::new();
+    for index in authored_indices {
         let entry = &mut entries[index];
+        let coordinate = inventory_entries
+            .get(&entry.value.change_id)
+            .ok_or_else(|| {
+                replacement_payload_error("history body inventory omitted a requested member")
+            })?
+            .coordinate;
         if entry.value.deleted {
-            if row.is_some()
+            if coordinate.is_some()
                 || entry.body_digest
                     != history_body_digest(
                         crate::json_store::JsonSlotRef::None,
-                        crate::json_store::JsonSlotRef::None,
+                        entry.change_record.metadata.as_ref_slot(),
                     )
             {
                 return Err(replacement_payload_error(
@@ -1481,12 +1941,23 @@ async fn hydrate_loaded_history_entries(
             }
             continue;
         }
-        let row = row.ok_or_else(|| {
-            replacement_payload_error(&format!(
-                "authored history body for schema '{}' in commit '{}' is absent from current-state root",
-                entry.change_record.schema_key, state.commit_id
-            ))
+        let coordinate = coordinate.ok_or_else(|| {
+            replacement_payload_error("live authored history entry has no body coordinate")
         })?;
+        let descriptor = inventory
+            .descriptors
+            .get(usize::try_from(coordinate.descriptor_index).expect("u32 fits usize"))
+            .ok_or_else(|| replacement_payload_error("history body descriptor is out of bounds"))?;
+        if !loaded.contains_key(&coordinate.descriptor_index) {
+            loaded.insert(
+                coordinate.descriptor_index,
+                load_scoped_current_state_descriptor_rows(store, &mut writes, descriptor).await?,
+            );
+        }
+        let row = loaded[&coordinate.descriptor_index]
+            .get(usize::from(coordinate.row_index))
+            .ok_or_else(|| replacement_payload_error("history body row coordinate is out of bounds"))?
+            .clone();
         if !authored_history_body_matches_current_row(&row, &entry.value, entry.body_digest) {
             return Err(replacement_payload_error(
                 "authored history body disagrees with its identity or semantic digest",
@@ -3326,7 +3797,14 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
     };
     use crate::tracked_state::scoped_range::{ScopedRangeCoverageMarker, stage_scoped_range_tree};
 
-    let deltas = deltas.into_iter().collect::<Vec<_>>();
+    // Selected-source members carry authenticated identity/provenance only;
+    // their body remains owned by the selected commit. Current-state body
+    // certification therefore consumes exactly the authored subset and must
+    // never reinterpret selected references as newly-authored rows.
+    let deltas = deltas
+        .into_iter()
+        .filter(|delta| delta.authored)
+        .collect::<Vec<_>>();
     let delta_keys = deltas
         .iter()
         .map(|delta| {
@@ -3342,9 +3820,25 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
             "authored current-state certification requires exact canonical member order without duplicates",
         ));
     }
+    // A certified complete replacement generation owns the entire current
+    // body set through its authenticated packed-generation descriptor. The
+    // ordinary row journal is intentionally empty for that path; requiring a
+    // second row-shaped body would duplicate authority. The final publication
+    // still certifies every authored history member against the resulting
+    // current-state root before the manifest can be staged.
+    if deltas.is_empty() && inventory.replacement_generation.is_some() {
+        return Ok(None);
+    }
     let staged_segments = staged_commit_delta_segment_bytes(writes, commit_id, inventory)?;
     let staged_members =
-        staged_commit_delta_members(store, commit_id, account_id, inventory, staged_segments)
+        staged_commit_delta_members(
+            store,
+            writes,
+            commit_id,
+            account_id,
+            inventory,
+            staged_segments,
+        )
             .await?;
     let mut deltas = deltas.into_iter();
     let mut authored_deltas = Vec::new();
@@ -3372,6 +3866,7 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
         let member_matches_current_identity = member.value.change_id == delta.delta.change_id
             && member.value.commit_id == delta.delta.commit_id
             && member.value.deleted == delta.delta.deleted
+            && member.value.created_at == delta.delta.created_at
             && member.value.updated_at == delta.delta.updated_at;
         // The sealed staged member is the base-coordinate authority. A caller
         // may omit that coordinate, but may never substitute another one.
@@ -3798,7 +4293,10 @@ pub(super) async fn load_scoped_current_state_descriptor_rows(
                 get_one(store, CURRENT_STATE_DATA_PART_SPACE, physical_key)
                     .await?
                     .ok_or_else(|| {
-                        replacement_payload_error("native current-state part is missing")
+                        replacement_payload_error(&format!(
+                            "native current-state part {:?} is missing",
+                            descriptor.content_digest
+                        ))
                     })?
             };
             let decoded = decode_current_state_data_part(&descriptor.content_digest, &bytes)?;
@@ -3995,6 +4493,7 @@ pub(crate) fn staged_commit_delta_segment_bytes(
 
 pub(crate) async fn staged_commit_delta_members(
     store: &(impl StorageAdapterRead + ?Sized),
+    writes: &StorageWriteSet,
     commit_id: CommitId,
     account_id: &str,
     inventory: &CommitStateMutationInventory,
@@ -4011,6 +4510,16 @@ pub(crate) async fn staged_commit_delta_members(
             .or_default() += 1;
     }
     let manifest = commit_delta_manifest_from_inventory(inventory);
+    if let Some(parts) = inventory.columnar_parts.as_ref() {
+        return load_columnar_mutation_members_with_staged(
+            store,
+            Some(writes),
+            commit_id,
+            parts,
+            account_id,
+        )
+        .await;
+    }
     let mut members = Vec::with_capacity(inventory.member_count as usize);
     if let Some(inline) = manifest.inline_segment() {
         collect_strict_commit_delta_members(inline, None, commit_id, 0, account_id, &mut members)?;
@@ -4696,6 +5205,11 @@ pub(crate) fn stage_commit_state_manifest(
             "current-state scoped ranges require canonical publication certification",
         ));
     }
+    if manifest.authored_history_bodies.is_some() {
+        return Err(replacement_payload_error(
+            "authored body inventories require canonical publication certification",
+        ));
+    }
     if manifest.touched_scope_filter.complete {
         return Err(replacement_payload_error(
             "complete touched-scope filters require canonical publication certification",
@@ -4740,6 +5254,11 @@ pub(crate) fn stage_certified_commit_state_manifest(
     if manifest.current_state_scoped_ranges != publication.root() {
         return Err(replacement_payload_error(
             "commit manifest disagrees with its canonical scoped-range publication proof",
+        ));
+    }
+    if manifest.authored_history_bodies != publication.authored_history_bodies() {
+        return Err(replacement_payload_error(
+            "commit manifest disagrees with its certified authored body inventory",
         ));
     }
     if (manifest.mutations.member_count != 0
@@ -5753,6 +6272,9 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
             origin_key: delta.origin_key,
             base_coordinate: delta.base_coordinate,
             authored: delta.authored,
+            tombstone_metadata: (delta.authored && delta.delta.deleted)
+                .then(|| native_history_metadata(delta.metadata))
+                .flatten(),
         });
     }
     entries.with_entry_refs(|entries| {
@@ -5816,6 +6338,9 @@ fn stage_commit_deltas_inner(
             origin_key: delta.origin_key,
             base_coordinate: delta.base_coordinate,
             authored: delta.authored,
+            tombstone_metadata: (delta.authored && delta.delta.deleted)
+                .then(|| native_history_metadata(delta.metadata))
+                .flatten(),
         });
     }
     let mutations = entries
@@ -7314,11 +7839,12 @@ where
         ));
     }
     let key = decode_key(entry.key)?;
-    let (body_digest, origin_key, base_coordinate) = match payloads.decode(ordinal)? {
+    let (body_digest, origin_key, base_coordinate, metadata) = match payloads.decode(ordinal)? {
         CommitDeltaPayload::Authored(payload) => (
             payload.body_digest,
             payload.origin_key,
             payload.base_coordinate,
+            decode_native_history_metadata(payload.tombstone_metadata)?,
         ),
         CommitDeltaPayload::SelectedRef(_) | CommitDeltaPayload::SelectedTombstone(_) => {
             return Err(LixError::new(
@@ -7330,6 +7856,7 @@ where
         }
     };
     let updated_at = value.updated_at;
+    validate_native_history_member_metadata(&value, body_digest, &metadata)?;
     Ok(LoadedCommitDeltaEntry {
         value,
         change_record: crate::changelog::ChangeRecord {
@@ -7340,12 +7867,13 @@ where
             row_pk: key.row_pk,
             file_id: key.file_id,
             snapshot: crate::json_store::JsonSlot::None,
-            metadata: crate::json_store::JsonSlot::None,
+            metadata,
             created_at: updated_at,
             origin_key,
         },
         base_coordinate,
         body_digest,
+        authored: true,
         selected_ref: false,
     })
 }
@@ -8207,6 +8735,7 @@ async fn load_columnar_owned_entries(
                         .expect("columnar mutation row fits u32"),
                 }),
                 body_digest,
+                authored: true,
                 selected_ref: false,
             });
         }
@@ -9047,23 +9576,57 @@ async fn load_columnar_mutation_members(
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
     account_id: &str,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
+    load_columnar_mutation_members_with_staged(store, None, commit_id, parts, account_id).await
+}
+
+async fn load_columnar_mutation_members_with_staged(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: Option<&StorageWriteSet>,
+    commit_id: CommitId,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
+) -> Result<Vec<CommitDeltaMember>, LixError> {
     let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
-    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
-        .await?
-        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+    let staged_manifest = writes
+        .map(|writes| crate::columnar_row_group::load_staged_row_group_manifest(writes, id))
+        .transpose()?
+        .flatten();
+    let manifest = match staged_manifest {
+        Some(manifest) => manifest,
+        None => crate::columnar_row_group::load_row_group_manifest(store, id)
+            .await?
+            .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?,
+    };
     validate_columnar_mutation_manifest(&manifest, parts)?;
     let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
     let mut members = Vec::with_capacity(parts.row_count as usize);
     for group_index in 0..manifest.groups.len() {
-        let batch = crate::columnar_row_group::load_row_group_batch(
-            store,
-            id,
-            &manifest,
-            group_index,
-            &projection,
-        )
-        .await?;
-        for row_index in 0..batch.num_rows() {
+        let page_count = (manifest.groups[group_index].row_count as usize)
+            .div_ceil(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS);
+        for page_index in 0..page_count {
+            let batch = if let Some(writes) = writes
+                && crate::columnar_row_group::load_staged_row_group_manifest(writes, id)?.is_some()
+            {
+                crate::columnar_row_group::load_staged_row_group_page(
+                    writes,
+                    id,
+                    &manifest,
+                    group_index,
+                    page_index,
+                    &projection,
+                )?
+            } else {
+                crate::columnar_row_group::load_row_group_page(
+                    store,
+                    id,
+                    &manifest,
+                    group_index,
+                    page_index,
+                    &projection,
+                )
+                .await?
+            };
+            for row_index in 0..batch.num_rows() {
             let global_ordinal = members.len();
             let packed = u32::try_from(global_ordinal)
                 .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
@@ -9099,11 +9662,17 @@ async fn load_columnar_mutation_members(
                     base_commit_id: commit_id,
                     group_index: u32::try_from(group_index)
                         .expect("columnar mutation group fits u32"),
-                    row_index: u32::try_from(row_index).expect("columnar mutation row fits u32"),
+                    row_index: u32::try_from(
+                        page_index
+                            .saturating_mul(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
+                            .saturating_add(row_index),
+                    )
+                    .expect("columnar mutation row fits u32"),
                 }),
                 body_digest,
                 selected_tombstone: false,
             });
+            }
         }
     }
     if members.len() != parts.row_count as usize {
@@ -10526,6 +11095,19 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
     visit_change_records_from_commit_deltas_projected(store, true, visit).await
 }
 
+fn projected_change_identity_eq(
+    left: &crate::changelog::ChangeRecord,
+    right: &crate::changelog::ChangeRecord,
+) -> bool {
+    left.format_version == right.format_version
+        && left.change_id == right.change_id
+        && left.account_id == right.account_id
+        && left.schema_key == right.schema_key
+        && left.row_pk == right.row_pk
+        && left.file_id == right.file_id
+        && left.created_at == right.created_at
+}
+
 async fn visit_change_records_from_commit_deltas_projected(
     store: &(impl StorageAdapterRead + ?Sized),
     hydrate_authored_payloads: bool,
@@ -10640,7 +11222,11 @@ async fn visit_change_records_from_commit_deltas_projected(
                             continue;
                         }
                         let canonical = load_change_record_at_locator(store, locator).await?;
-                        if canonical != member.change {
+                        if if hydrate_authored_payloads {
+                            canonical != member.change
+                        } else {
+                            !projected_change_identity_eq(&canonical, &member.change)
+                        } {
                             return Err(LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
                                 format!(
@@ -11377,14 +11963,14 @@ pub(crate) async fn collect_local_commit_delta_json_refs(
 /// would turn a read failure into a delete.
 pub(crate) async fn collect_current_state_part_json_refs(
     store: &(impl StorageAdapterRead + ?Sized),
-    refs_digests: &BTreeSet<[u8; 32]>,
+    part_refs_digests: &BTreeMap<[u8; 32], [u8; 32]>,
     refs: &mut BTreeSet<[u8; 32]>,
 ) -> Result<(), LixError> {
-    if refs_digests.is_empty() {
+    if part_refs_digests.is_empty() {
         return Ok(());
     }
-    let keys = refs_digests
-        .iter()
+    let keys = part_refs_digests
+        .keys()
         .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
         .collect::<Vec<_>>();
     let loaded = PointReadPlan::new(
@@ -11393,15 +11979,17 @@ pub(crate) async fn collect_current_state_part_json_refs(
     )
     .materialize(store, StorageGetOptions::default())
     .await?;
-    for (digest, value) in refs_digests.iter().zip(loaded.value) {
+    for ((part_digest, refs_digest), value) in part_refs_digests.iter().zip(loaded.value) {
         let Some(bytes) = value.and_then(full_value_bytes) else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "current-state data part references a missing payload-ref summary",
+                format!(
+                    "current-state data part {part_digest:?} references a missing payload-ref summary"
+                ),
             ));
         };
         refs.extend(crate::tracked_state::decode_current_state_data_part_refs(
-            digest, &bytes,
+            refs_digest, &bytes,
         )?);
     }
     Ok(())
@@ -11424,7 +12012,7 @@ pub(crate) async fn stage_retire_commit_physical_state(
     writes: &mut StorageWriteSet,
     commit_id: CommitId,
     retained: RetainedPhysicalState<'_>,
-    released_part_refs_digests: &mut BTreeSet<[u8; 32]>,
+    released_part_refs_digests: &mut BTreeMap<[u8; 32], [u8; 32]>,
 ) -> Result<(), LixError> {
     let manifest = load_commit_state_manifest(store, commit_id)
         .await?
@@ -11468,6 +12056,9 @@ pub(crate) async fn stage_retire_commit_physical_state(
                 payload_refs_digest,
             } = descriptor.source
                 && !retained.native_parts.contains(&descriptor.content_digest)
+                && released_part_refs_digests
+                    .insert(descriptor.content_digest, payload_refs_digest)
+                    .is_none()
             {
                 writes.delete(
                     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
@@ -11475,9 +12066,8 @@ pub(crate) async fn stage_retire_commit_physical_state(
                 );
                 writes.delete(
                     crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-                    key(payload_refs_digest.to_vec()),
+                    key(descriptor.content_digest.to_vec()),
                 );
-                released_part_refs_digests.insert(payload_refs_digest);
             }
         }
     }
@@ -11680,22 +12270,40 @@ fn collect_strict_commit_delta_members(
         }
         let payload = payloads.decode(entry_index)?;
         let key = decode_key(entry.key)?;
-        let (body_digest, origin_key, base_coordinate, authored, selected_tombstone) = match payload
-        {
-            CommitDeltaPayload::Authored(payload) => (
-                payload.body_digest,
-                payload.origin_key,
-                payload.base_coordinate,
-                true,
-                false,
-            ),
+        let (body_digest, origin_key, base_coordinate, authored, selected_tombstone, metadata) =
+            match payload {
+                CommitDeltaPayload::Authored(payload) => (
+                    payload.body_digest,
+                    payload.origin_key,
+                    payload.base_coordinate,
+                    true,
+                    false,
+                    decode_native_history_metadata(payload.tombstone_metadata)?,
+                ),
             CommitDeltaPayload::SelectedRef(base_coordinate) => {
-                ([0; 32], None, base_coordinate, false, false)
+                (
+                    [0; 32],
+                    None,
+                    base_coordinate,
+                    false,
+                    false,
+                    crate::json_store::JsonSlot::None,
+                )
             }
             CommitDeltaPayload::SelectedTombstone(base_coordinate) => {
-                ([0; 32], None, base_coordinate, false, true)
+                (
+                    [0; 32],
+                    None,
+                    base_coordinate,
+                    false,
+                    true,
+                    crate::json_store::JsonSlot::None,
+                )
             }
         };
+        if authored {
+            validate_native_history_member_metadata(&value, body_digest, &metadata)?;
+        }
         let change = crate::changelog::ChangeRecord {
             account_id: account_id.to_string(),
             format_version: 2,
@@ -11704,7 +12312,7 @@ fn collect_strict_commit_delta_members(
             row_pk: key.row_pk.clone(),
             file_id: key.file_id.clone(),
             snapshot: crate::json_store::JsonSlot::None,
-            metadata: crate::json_store::JsonSlot::None,
+            metadata,
             created_at: value.updated_at,
             origin_key,
         };
@@ -11876,7 +12484,7 @@ fn commit_delta_replay_metadata(manifest: &CommitDeltaManifest) -> CommitDeltaRe
     }
 }
 
-fn commit_delta_replay_metadata_from_inventory(
+pub(crate) fn commit_delta_replay_metadata_from_inventory(
     inventory: &CommitStateMutationInventory,
 ) -> CommitDeltaReplayMetadata {
     let lifecycle_summary = inventory.lifecycle_summary.clone();
@@ -12289,6 +12897,7 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
             origin_key: None,
             base_coordinate: None,
             authored: true,
+                tombstone_metadata: None,
         };
         entries.len()
     ];
@@ -12341,6 +12950,7 @@ fn encode_commit_delta_segment_layout(
                 body_digest: payload.body_digest,
                 origin_key: payload.origin_key,
                 base_coordinate: payload.base_coordinate,
+                tombstone_metadata: payload.tombstone_metadata.as_ref(),
             };
             storage_codec::append(
                 "tracked_state indexed authored commit_delta payload",
@@ -12779,6 +13389,7 @@ fn decode_replacement_part_as_commit_delta(
                 body_digest: history_body_digest(snapshot, metadata),
                 origin_key: None,
                 base_coordinate: None,
+                tombstone_metadata: None,
             },
         )?;
     }
@@ -13006,18 +13617,37 @@ where
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_row_loaded(account_id.len());
     let key = decode_key(entry.key)?;
-    let (body_digest, origin_key, base_coordinate, selected_ref) = match payload {
+    let (body_digest, origin_key, base_coordinate, authored, selected_ref, metadata) = match payload {
         CommitDeltaPayload::Authored(payload) => (
             payload.body_digest,
             payload.origin_key,
             payload.base_coordinate,
+            true,
             false,
+            decode_native_history_metadata(payload.tombstone_metadata)?,
         ),
-        CommitDeltaPayload::SelectedRef(base_coordinate) => ([0; 32], None, base_coordinate, true),
+        CommitDeltaPayload::SelectedRef(base_coordinate) => (
+            [0; 32],
+            None,
+            base_coordinate,
+            false,
+            true,
+            crate::json_store::JsonSlot::None,
+        ),
         CommitDeltaPayload::SelectedTombstone(base_coordinate) => {
-            ([0; 32], None, base_coordinate, false)
+            (
+                [0; 32],
+                None,
+                base_coordinate,
+                false,
+                false,
+                crate::json_store::JsonSlot::None,
+            )
         }
     };
+    if authored {
+        validate_native_history_member_metadata(&value, body_digest, &metadata)?;
+    }
     let change_record = crate::changelog::ChangeRecord {
         account_id: account_id.to_string(),
         format_version: 2,
@@ -13026,7 +13656,7 @@ where
         row_pk: key.row_pk,
         file_id: key.file_id,
         snapshot: crate::json_store::JsonSlot::None,
-        metadata: crate::json_store::JsonSlot::None,
+        metadata,
         created_at: value.updated_at,
         origin_key,
     };
@@ -13035,6 +13665,7 @@ where
         change_record,
         base_coordinate,
         body_digest,
+        authored,
         selected_ref,
     })
 }
@@ -13489,6 +14120,7 @@ fn encode_commit_state_manifest(
         mutation_directory_root: stored_inventory.directory_root.clone(),
         touched_scope_filter: manifest.touched_scope_filter.clone(),
         current_state_scoped_ranges: manifest.current_state_scoped_ranges.clone(),
+        authored_history_bodies: manifest.authored_history_bodies.clone(),
         snapshot_root: manifest.snapshot_root.clone(),
     };
     let header_payload = storage_codec::encode("tracked_state commit_state_manifest", &header)?;
@@ -13743,6 +14375,7 @@ fn assemble_commit_state_manifest(
         mutations,
         touched_scope_filter: stored.touched_scope_filter,
         current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        authored_history_bodies: stored.authored_history_bodies,
         snapshot_root: stored.snapshot_root,
     };
     if u32::try_from(manifest.mutations.part_count()).ok() != Some(stored.mutation_part_count) {
@@ -13829,6 +14462,7 @@ fn assemble_shallow_commit_state_manifest(
         mutations,
         touched_scope_filter: stored.touched_scope_filter,
         current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        authored_history_bodies: stored.authored_history_bodies,
         snapshot_root: stored.snapshot_root,
     })
 }
@@ -13960,6 +14594,20 @@ fn validate_commit_state_manifest_header(
             "tracked_state commit_state_manifest scoped-range transition disagrees with its header authority",
         ));
     }
+    if let Some(inventory) = stored.authored_history_bodies.as_ref() {
+        let root = stored.current_state_scoped_ranges.as_ref().ok_or_else(|| {
+            replacement_payload_error("history body inventory has no current-state root binding")
+        })?;
+        if inventory.source_root_id != root.tree.root_id
+            || inventory.source_transition_digest != root.transition_digest
+            || inventory.closure_digest == [0; 32]
+        {
+            return Err(replacement_payload_error(
+                "history body inventory has an invalid root or coordinate binding",
+            ));
+        }
+        validate_authored_history_body_inventory_shape(stored.commit_id, inventory)?;
+    }
     Ok(())
 }
 
@@ -14018,6 +14666,20 @@ fn validate_commit_state_manifest_inner(
     }
 
     validate_commit_state_mutation_inventory(manifest.commit_id, &manifest.mutations)?;
+    if let Some(inventory) = manifest.authored_history_bodies.as_ref() {
+        let root = manifest.current_state_scoped_ranges.as_ref().ok_or_else(|| {
+            replacement_payload_error("history body inventory has no current-state root binding")
+        })?;
+        if inventory.source_root_id != root.tree.root_id
+            || inventory.source_transition_digest != root.transition_digest
+            || inventory.closure_digest == [0; 32]
+        {
+            return Err(replacement_payload_error(
+                "history body inventory has an invalid root or coordinate binding",
+            ));
+        }
+        validate_authored_history_body_inventory_shape(manifest.commit_id, inventory)?;
+    }
     super::scoped_current_state::validate_touched_scope_filter(&manifest.touched_scope_filter)?;
     validate_current_state_scoped_ranges(manifest, validate_scoped_range_attestation)
 }

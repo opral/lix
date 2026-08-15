@@ -22,6 +22,8 @@ mod row_materialization;
 mod scoped_current_state;
 pub(crate) mod scoped_range;
 mod storage;
+#[cfg(test)]
+pub(crate) use storage::certify_authored_history_body_inventory_for_test;
 mod tree;
 mod types;
 

@@ -292,6 +292,44 @@ pub(crate) struct CurrentStatePartDescriptor {
     pub(crate) fragmented: bool,
 }
 
+/// Stable coordinate of one authored history body inside a canonical native
+/// current-state source descriptor.
+///
+/// The descriptor and source bytes remain the sole body authority. History
+/// stores only this authenticated coordinate so GC may reclaim obsolete
+/// scoped-range tree nodes without retaining every historical serving root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct AuthoredHistoryBodyCoordinate {
+    pub(crate) descriptor_index: u32,
+    pub(crate) row_index: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct AuthoredHistoryBodyEntry {
+    pub(crate) change_id: ChangeId,
+    pub(crate) binding_digest: [u8; 32],
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) coordinate: Option<AuthoredHistoryBodyCoordinate>,
+}
+
+/// Manifest-bound locator inventory for authored LXCD17 native bodies.
+///
+/// Entries are in exact authored-member order. Tombstones carry no coordinate;
+/// live members reference one canonical descriptor and row. The closure digest
+/// binds this inventory to the commit, mutation authority, selected serving
+/// root and complete ordered authored-member identity.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct AuthoredHistoryBodyInventory {
+    pub(crate) source_root_id: [u8; 32],
+    pub(crate) source_transition_digest: [u8; 32],
+    pub(crate) closure_digest: [u8; 32],
+    pub(crate) descriptors: Vec<CurrentStatePartDescriptor>,
+    pub(crate) entries: Vec<AuthoredHistoryBodyEntry>,
+}
+
 /// Physical source of one current-state part, with the addressing fields that
 /// source actually uses.
 ///
@@ -360,18 +398,14 @@ pub(crate) struct CurrentStateScopedRangeRoot {
 
 /// Cumulative negative-membership certificate for collection scopes.
 ///
-/// A complete filter may have false positives, but never false negatives: a
-/// missing schema-family bit therefore proves that no effective graph-parent
-/// or selected-source lineage authored any scope for that schema. Coarsening
-/// file-scoped collections to their schema avoids cardinality-driven
-/// saturation while remaining conservative. Incomplete filters fail closed
-/// and carry no bits.
+/// A complete certificate carries the exact canonical set of collection
+/// scopes authored by the effective graph-parent or selected-source lineage.
+/// Incomplete certificates fail closed and carry no scopes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateTouchedScopeFilter {
     pub(crate) complete: bool,
-    #[musli(bytes)]
-    pub(crate) bits: Vec<u8>,
+    pub(crate) scopes: Vec<CommitDeltaReplacementScope>,
 }
 
 /// Point-addressable immutable mutation inventory owned by one commit.
@@ -470,6 +504,10 @@ pub(crate) struct CommitStateManifest {
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    /// Exact canonical body-object coordinates for this commit's authored
+    /// history members. This is locator authority, never a second body copy.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) authored_history_bodies: Option<Box<AuthoredHistoryBodyInventory>>,
     /// Canonical snapshot metadata when this commit was published as a root
     /// fence. The tree chunks are rebuildable by content hash; this immutable
     /// pointer is the authority that permits readers to serve them.

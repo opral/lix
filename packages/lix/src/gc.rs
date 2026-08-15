@@ -868,7 +868,7 @@ struct AuthenticatedServingDependencyClosure {
     /// The scoped-range descriptor is the only place the `content_digest ->
     /// payload_refs_digest` pairing exists, so the walk has to carry it out.
     /// Rediscovering it later would mean re-reading the scoped-range trees.
-    native_part_refs_digests: BTreeSet<[u8; 32]>,
+    native_part_refs_digests: BTreeMap<[u8; 32], [u8; 32]>,
     /// Graph-reachable commits with no physical manifest, i.e. commits whose
     /// history delta a pre-fix sweep already reclaimed. Counted so the
     /// condition is observable; never a retention input.
@@ -1002,48 +1002,7 @@ where
 
     let mut scoped_nodes = BTreeSet::new();
     let mut native_parts = BTreeSet::new();
-    let mut native_part_refs_digests = BTreeSet::new();
-    let scoped_roots = manifests
-        .values()
-        .filter_map(|manifest| {
-            manifest
-                .current_state_scoped_ranges
-                .as_ref()
-                .map(|root| root.tree.clone())
-        })
-        .collect::<Vec<_>>();
-    if !scoped_roots.is_empty() {
-        let reachable =
-            crate::tracked_state::validate_scoped_range_trees(store, &scoped_roots).await?;
-        scoped_nodes.extend(reachable.node_ids);
-        for part in reachable.parts {
-            let descriptor =
-                crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-            match descriptor.source {
-                crate::tracked_state::CurrentStatePartSource::Replacement(source) => {
-                    physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
-                        source.owner_commit_id,
-                    )));
-                }
-                crate::tracked_state::CurrentStatePartSource::ColumnarPage(source) => {
-                    physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
-                        source.owner_commit_id,
-                    )));
-                }
-                crate::tracked_state::CurrentStatePartSource::NativeDataPart {
-                    payload_refs_digest,
-                } => {
-                    native_parts.insert(descriptor.content_digest);
-                    native_part_refs_digests.insert(payload_refs_digest);
-                }
-            }
-        }
-    }
-    let native_commit_dependencies =
-        crate::tracked_state::load_native_current_state_part_owners(store, &native_parts).await?;
-    physical_dependencies.extend(native_commit_dependencies.iter().copied());
-    semantic_dependencies.extend(native_commit_dependencies);
-
+    let mut native_part_refs_digests = BTreeMap::new();
     let missing_dependency_ids = physical_dependencies
         .iter()
         .filter(|commit_id| !manifests.contains_key(commit_id))
@@ -1076,57 +1035,140 @@ where
     .await?;
     semantic_dependencies.extend(cas_logical_dependencies.iter().copied());
 
-    let selected_owner_sources = physical_authorities
-        .union(&physical_dependencies)
-        .copied()
-        .collect::<Vec<_>>();
-    let selected_owner_source_manifests =
-        crate::tracked_state::load_commit_state_manifests(store, &selected_owner_sources).await?;
-    for (commit_id, manifest) in selected_owner_sources
-        .iter()
-        .copied()
-        .zip(selected_owner_source_manifests)
-    {
-        let manifest = manifest.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "active GC dependency '{commit_id}' has no authenticated physical manifest"
-                ),
-            )
-        })?;
-        let may_contain_finite_selected_members =
-            manifest.mutations.may_contain_finite_selected_members();
-        manifests.insert(commit_id, manifest);
-        if may_contain_finite_selected_members {
+    // Physical serving authority is recursive: a checkpoint can select a
+    // member owned by another commit, whose body inventory can in turn name a
+    // scoped/native source owned elsewhere. Resolve that authenticated graph
+    // to a fixed point before planning any deletion. A one-pass ordering can
+    // retain the owner manifest but still sweep the body object it certifies.
+    let mut selected_owner_scanned = BTreeSet::new();
+    loop {
+        let before = (
+            manifests.len(),
+            physical_authorities.len(),
+            physical_dependencies.len(),
+            scoped_nodes.len(),
+            native_parts.len(),
+        );
+
+        let required_ids = physical_authorities
+            .union(&physical_dependencies)
+            .copied()
+            .filter(|commit_id| !manifests.contains_key(commit_id))
+            .collect::<Vec<_>>();
+        let required_manifests =
+            crate::tracked_state::load_commit_state_manifests(store, &required_ids).await?;
+        for (commit_id, manifest) in required_ids.into_iter().zip(required_manifests) {
+            let manifest = manifest.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "active GC dependency '{commit_id}' has no authenticated physical manifest"
+                    ),
+                )
+            })?;
+            manifests.insert(commit_id, manifest);
+        }
+
+        let selected_owner_sources = manifests
+            .iter()
+            .filter_map(|(commit_id, manifest)| {
+                (manifest.mutations.may_contain_finite_selected_members()
+                    && !selected_owner_scanned.contains(commit_id))
+                .then_some(*commit_id)
+            })
+            .collect::<Vec<_>>();
+        for commit_id in selected_owner_sources {
+            selected_owner_scanned.insert(commit_id);
             physical_authorities.extend(
                 crate::tracked_state::load_local_selected_change_owner_commit_ids(store, commit_id)
                     .await?,
             );
         }
+
+        let scoped_roots = manifests
+            .values()
+            .filter_map(|manifest| {
+                manifest
+                    .current_state_scoped_ranges
+                    .as_ref()
+                    .map(|root| root.tree.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut descriptors = manifests
+            .values()
+            .filter_map(|manifest| manifest.authored_history_bodies.as_ref())
+            .flat_map(|inventory| inventory.descriptors.iter().cloned())
+            .collect::<Vec<_>>();
+        if !scoped_roots.is_empty() {
+            let reachable =
+                crate::tracked_state::validate_scoped_range_trees(store, &scoped_roots).await?;
+            scoped_nodes.extend(reachable.node_ids);
+            descriptors.extend(
+                reachable
+                    .parts
+                    .iter()
+                    .map(crate::tracked_state::current_state_descriptor_from_scoped_range_part)
+                    .collect::<Result<Vec<_>, LixError>>()?,
+            );
+        }
+        for descriptor in descriptors {
+            match descriptor.source {
+                crate::tracked_state::CurrentStatePartSource::Replacement(source) => {
+                    physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
+                        source.owner_commit_id,
+                    )));
+                }
+                crate::tracked_state::CurrentStatePartSource::ColumnarPage(source) => {
+                    physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
+                        source.owner_commit_id,
+                    )));
+                }
+                crate::tracked_state::CurrentStatePartSource::NativeDataPart {
+                    payload_refs_digest,
+                } => {
+                    native_parts.insert(descriptor.content_digest);
+                    if let Some(previous) = native_part_refs_digests
+                        .insert(descriptor.content_digest, payload_refs_digest)
+                        && previous != payload_refs_digest
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "native current-state descriptors disagree about payload refs",
+                        ));
+                    }
+                }
+            }
+        }
+        physical_dependencies.extend(
+            crate::tracked_state::load_native_current_state_part_owners(store, &native_parts)
+                .await?,
+        );
+
+        let after = (
+            manifests.len(),
+            physical_authorities.len(),
+            physical_dependencies.len(),
+            scoped_nodes.len(),
+            native_parts.len(),
+        );
+        if before == after
+            && physical_authorities
+                .union(&physical_dependencies)
+                .all(|commit_id| manifests.contains_key(commit_id))
+        {
+            break;
+        }
     }
+    // Native body objects carry immutable row provenance and may outlive the
+    // semantic commit projection that authored them. Retain their physical
+    // manifest owner, but do not turn a body-object back-edge into semantic
+    // commit reachability; checkpoint compaction is allowed to retire that
+    // projection while current state and history keep the canonical bytes.
 
     let retained_physical_ids = physical_authorities
         .union(&physical_dependencies)
         .copied()
         .collect::<Vec<_>>();
-    let retained_physical_manifests =
-        crate::tracked_state::load_commit_state_manifests(store, &retained_physical_ids).await?;
-    for (commit_id, manifest) in retained_physical_ids
-        .iter()
-        .copied()
-        .zip(retained_physical_manifests)
-    {
-        let manifest = manifest.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "active GC dependency '{commit_id}' has no authenticated physical manifest"
-                ),
-            )
-        })?;
-        manifests.insert(commit_id, manifest);
-    }
 
     let mut mutation_nodes = BTreeSet::new();
     let mutation_roots =
@@ -1283,8 +1325,8 @@ async fn plan_json_payload_reclamation<S>(
     controls: &[(String, BranchHeadControl)],
     retired_commits: &BTreeSet<CommitId>,
     surviving_commits: &BTreeSet<CommitId>,
-    released_part_refs_digests: &BTreeSet<[u8; 32]>,
-    retained_part_refs_digests: &BTreeSet<[u8; 32]>,
+    released_part_refs_digests: &BTreeMap<[u8; 32], [u8; 32]>,
+    retained_part_refs_digests: &BTreeMap<[u8; 32], [u8; 32]>,
 ) -> Result<JsonPayloadReclamation, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
@@ -1524,7 +1566,7 @@ where
     // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
-    let mut released_part_refs_digests = BTreeSet::new();
+    let mut released_part_refs_digests = BTreeMap::new();
     for commit_id in candidates {
         if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
             && reclaimed_semantic_commits.insert(commit_id)

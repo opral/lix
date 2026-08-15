@@ -67,6 +67,7 @@ fn stage_bench_commit_deltas(
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            authored_history_bodies: None,
             snapshot_root: None,
         },
     )?;
@@ -564,6 +565,7 @@ where
             mutations,
             touched_scope_filter: publication.touched_scope_filter().clone(),
             current_state_scoped_ranges: publication.root(),
+            authored_history_bodies: publication.authored_history_bodies(),
             snapshot_root: None,
         };
         super::storage::stage_certified_commit_state_manifest(&mut writes, &merged, &publication)
@@ -781,6 +783,7 @@ fn bench_current_state_manifest(
         mutations,
         touched_scope_filter,
         current_state_scoped_ranges,
+        authored_history_bodies: None,
         snapshot_root: None,
     }
 }

@@ -2963,7 +2963,7 @@ pub struct CommitDeltaSegmentSimilarity {
 /// Cap on distinct same-length values compared pairwise per length bucket.
 const SEGMENT_SIMILARITY_BUCKET_CAP: usize = 128;
 /// How much per-segment identity a redesigned payload is allowed to hoist out.
-/// The LXCD16 direct leaf carries a 16-byte commit id, a 4-byte packed base and
+/// The direct leaf carries a 16-byte commit id, a 4-byte packed base and
 /// a small timestamp-tail dictionary; 128 bytes is a generous allowance for all
 /// of it, so this over-counts rather than under-counts the achievable win.
 const SEGMENT_IDENTITY_WINDOW_BYTES: usize = 128;

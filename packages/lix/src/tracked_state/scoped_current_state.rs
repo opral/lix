@@ -15,16 +15,13 @@ use crate::tracked_state::scoped_range::{
     stage_replace_scoped_range, stage_scoped_range_tree, validate_scoped_range_tree_with_staged,
 };
 use crate::tracked_state::types::{
-    ColumnarPageSource, CommitDeltaReplacementScope, CommitStateManifest,
-    CommitStateMutationInventory, CommitStateTouchedScopeFilter, CurrentStatePartDescriptor,
-    CurrentStatePartSource, CurrentStateScopedRangeRoot, ReplacementPartSource,
+    AuthoredHistoryBodyInventory, ColumnarPageSource, CommitDeltaReplacementScope,
+    CommitStateManifest, CommitStateMutationInventory, CommitStateTouchedScopeFilter,
+    CurrentStatePartDescriptor, CurrentStatePartSource, CurrentStateScopedRangeRoot,
+    ReplacementPartSource,
 };
 
 const TRANSITION_CONTEXT: &str = "lix current-state scoped-range transition v2";
-const TOUCHED_SCOPE_FILTER_BYTES: usize = 128;
-const TOUCHED_SCOPE_FILTER_HASHES: usize = 4;
-const TOUCHED_SCOPE_FILTER_CONTEXT: &str = "lix cumulative touched collection scope v1";
-
 #[derive(Clone, Copy)]
 pub(super) struct CommitStateTopologyRef<'a> {
     pub(super) commit_id: CommitId,
@@ -397,7 +394,7 @@ fn parent_scope_is_proven_empty(
 fn empty_complete_touched_scope_filter() -> CommitStateTouchedScopeFilter {
     CommitStateTouchedScopeFilter {
         complete: true,
-        bits: vec![0; TOUCHED_SCOPE_FILTER_BYTES],
+        scopes: Vec::new(),
     }
 }
 
@@ -426,17 +423,19 @@ fn advance_touched_scope_filter_from_topology(
         match parents.split_first() {
             None => empty_complete_touched_scope_filter(),
             Some((first, rest)) => {
-                let mut filter = first.touched_scope_filter.clone();
+                let mut scopes = first
+                    .touched_scope_filter
+                    .scopes
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
                 for parent in rest {
-                    for (target, inherited) in filter
-                        .bits
-                        .iter_mut()
-                        .zip(&parent.touched_scope_filter.bits)
-                    {
-                        *target |= *inherited;
-                    }
+                    scopes.extend(parent.touched_scope_filter.scopes.iter().cloned());
                 }
-                filter
+                CommitStateTouchedScopeFilter {
+                    complete: true,
+                    scopes: scopes.into_iter().collect(),
+                }
             }
         }
     };
@@ -470,11 +469,11 @@ fn extend_touched_scope_filter(
     if !filter.complete {
         return Ok(filter);
     }
+    let mut scopes = filter.scopes.into_iter().collect::<std::collections::BTreeSet<_>>();
     for scope in touched {
-        for bit in touched_scope_filter_bits(scope.schema_key.as_bytes()) {
-            filter.bits[bit / 8] |= 1 << (bit % 8);
-        }
+        scopes.insert(scope.clone());
     }
+    filter.scopes = scopes.into_iter().collect();
     Ok(filter)
 }
 
@@ -486,40 +485,23 @@ fn touched_scope_filter_proves_absent(
     if !filter.complete {
         return Ok(false);
     }
-    Ok(touched_scope_filter_bits(scope.schema_key.as_bytes())
-        .into_iter()
-        .any(|bit| filter.bits[bit / 8] & (1 << (bit % 8)) == 0))
-}
-
-fn touched_scope_filter_bits(scope: &[u8]) -> [usize; TOUCHED_SCOPE_FILTER_HASHES] {
-    let digest = blake3::Hasher::new_derive_key(TOUCHED_SCOPE_FILTER_CONTEXT)
-        .update(&(scope.len() as u64).to_be_bytes())
-        .update(scope)
-        .finalize();
-    let bytes = digest.as_bytes();
-    std::array::from_fn(|index| {
-        let offset = index * 8;
-        let hash = u64::from_be_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .expect("BLAKE3 supplies four u64 filter hashes"),
-        );
-        hash as usize % (TOUCHED_SCOPE_FILTER_BYTES * 8)
-    })
+    Ok(filter
+        .scopes
+        .binary_search(scope)
+        .is_err())
 }
 
 pub(crate) fn validate_touched_scope_filter(
     filter: &CommitStateTouchedScopeFilter,
 ) -> Result<(), LixError> {
-    if filter.complete {
-        if filter.bits.len() != TOUCHED_SCOPE_FILTER_BYTES {
-            return Err(scoped_state_error(
-                "complete touched-scope filter has the wrong length",
-            ));
-        }
-    } else if !filter.bits.is_empty() {
+    if !filter.complete && !filter.scopes.is_empty() {
         return Err(scoped_state_error(
-            "incomplete touched-scope filter carries unauthoritative bits",
+            "incomplete touched-scope filter carries unauthoritative scopes",
+        ));
+    }
+    if filter.scopes.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(scoped_state_error(
+            "touched-scope filter scopes are not canonical and unique",
         ));
     }
     Ok(())
@@ -533,6 +515,7 @@ pub(crate) struct CertifiedCommitStatePhysicalPublication {
     selected_source_commit_id: Option<CommitId>,
     root: Option<CurrentStateScopedRangeRoot>,
     touched_scope_filter: CommitStateTouchedScopeFilter,
+    authored_history_bodies: Option<AuthoredHistoryBodyInventory>,
 }
 
 impl CertifiedCommitStatePhysicalPublication {
@@ -554,6 +537,35 @@ impl CertifiedCommitStatePhysicalPublication {
 
     pub(crate) fn touched_scope_filter(&self) -> &CommitStateTouchedScopeFilter {
         &self.touched_scope_filter
+    }
+
+    pub(crate) fn authored_history_bodies(&self) -> Option<Box<AuthoredHistoryBodyInventory>> {
+        self.authored_history_bodies.clone().map(Box::new)
+    }
+
+    pub(crate) async fn certify_authored_history_bodies(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        account_id: &str,
+        inventory: &CommitStateMutationInventory,
+    ) -> Result<(), LixError> {
+        if self.write_set_id != writes.identity() {
+            return Err(scoped_state_error(
+                "history-body locator certification belongs to another write set",
+            ));
+        }
+        self.authored_history_bodies =
+            super::storage::certify_authored_history_body_inventory(
+                store,
+                writes,
+                self.commit_id,
+                account_id,
+                inventory,
+                self.root.as_ref(),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -596,6 +608,7 @@ pub(super) fn certify_topology_touched_scope_filter_from_manifests(
             selected_source,
             filter_touched.as_deref(),
         )?,
+        authored_history_bodies: None,
     })
 }
 
@@ -848,6 +861,8 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     };
     let inherited_scope_filter =
         advance_touched_scope_filter_from_topology(graph_parents, selected_source, Some(&[]))?;
+    let touched_scope_filter =
+        extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
     if inventory.columnar_parts.is_some() {
         // Bootstrap half of the accelerator: this is the only arm that can
         // mint a scoped root with no parent root in hand.
@@ -862,18 +877,21 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             inventory,
         )
         .await?;
-        let touched_scope_filter =
-            extend_touched_scope_filter(inherited_scope_filter, filter_touched.as_deref())?;
-        return Ok(CertifiedCommitStatePhysicalPublication {
-            write_set_id: writes.identity(),
-            commit_id,
-            selected_source_commit_id,
-            root,
-            touched_scope_filter,
-        });
+        if root.is_some() {
+            return Ok(CertifiedCommitStatePhysicalPublication {
+                write_set_id: writes.identity(),
+                commit_id,
+                selected_source_commit_id,
+                root,
+                touched_scope_filter,
+                authored_history_bodies: None,
+            });
+        }
+        // A disjoint columnar publication can decline when the authenticated
+        // parent already covers the touched scope. That is not permission to
+        // drop the selected current-state root: continue through the canonical
+        // certified sparse rewrite below, or fail there before publication.
     }
-    let touched_scope_filter =
-        extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
 
     let (initial_root, certified_members, mut certified_rows) = match certified_body {
         Some(certified) => certified.into_publication_parts(writes, commit_id, inventory)?,
@@ -950,6 +968,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root: Some(initial_root),
             touched_scope_filter,
+            authored_history_bodies: None,
         });
     }
 
@@ -972,6 +991,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root,
             touched_scope_filter,
+            authored_history_bodies: None,
         });
     }
 
@@ -990,6 +1010,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                     parent_root.tree.clone(),
                 )?),
                 touched_scope_filter,
+                authored_history_bodies: None,
             });
         }
         if inventory.member_count != 0 || inventory.selected_source_commit_id.is_some() {
@@ -1003,6 +1024,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root: None,
             touched_scope_filter,
+            authored_history_bodies: None,
         });
     };
     let Some(parent_root) = parent_root else {
@@ -1017,6 +1039,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             selected_source_commit_id,
             root: None,
             touched_scope_filter,
+            authored_history_bodies: None,
         });
     };
     // Sustain half: the fall-through, not the `else` above. Reaching here means
@@ -1036,6 +1059,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 parent_root.tree.clone(),
             )?),
             touched_scope_filter,
+            authored_history_bodies: None,
         });
     }
     touched.sort();
@@ -1046,6 +1070,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         )?;
         crate::tracked_state::storage::staged_commit_delta_members(
             store,
+            writes,
             commit_id,
             account_id,
             inventory,
@@ -1101,16 +1126,11 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             .await?
             .is_none()
         {
-            validate_touched_scope_filter(&inherited_scope_filter)?;
-            if !inherited_scope_filter.complete {
-                return Ok(CertifiedCommitStatePhysicalPublication {
-                    write_set_id: writes.identity(),
-                    commit_id,
-                    selected_source_commit_id,
-                    root: None,
-                    touched_scope_filter,
-                });
-            }
+            // The authenticated complete scoped-range tree is stronger than
+            // the cumulative touched-scope summary. An exact marker miss
+            // proves this scope is absent and permits inserting its empty
+            // coverage marker; the summary must never turn that proof into a
+            // false-positive rejection.
             tree = stage_replace_scoped_range(
                 store,
                 writes,
@@ -1148,6 +1168,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 selected_source_commit_id,
                 root: None,
                 touched_scope_filter,
+                authored_history_bodies: None,
             });
         };
         tree = rewritten;
@@ -1173,6 +1194,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             tree,
         )?),
         touched_scope_filter,
+        authored_history_bodies: None,
     })
 }
 
@@ -1271,7 +1293,7 @@ mod tests {
     };
 
     use super::{
-        TOUCHED_SCOPE_FILTER_BYTES, advance_touched_scope_filter, attest_scoped_range_root,
+        advance_touched_scope_filter, attest_scoped_range_root,
         certify_topology_touched_scope_filter_from_manifests, parent_scope_is_proven_empty,
         stage_current_state_scoped_ranges, touched_scope_filter_proves_absent,
         validate_scoped_range_attestation, validate_touched_scope_filter,
@@ -1300,6 +1322,7 @@ mod tests {
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
+            authored_history_bodies: None,
             snapshot_root: None,
         }
     }
@@ -1720,7 +1743,7 @@ mod tests {
         )
         .expect("unproven sparse mutation should stage")
         .expect("unproven sparse mutation should be addressable");
-        let fallback = stage_current_state_scoped_ranges(
+        let error = match stage_current_state_scoped_ranges(
             &read,
             &mut fallback_writes,
             &[&unproven_parent],
@@ -1731,10 +1754,15 @@ mod tests {
             fallback_stage.mutation_inventory(),
         )
         .await
-        .expect("unproven missing scope should fall back without failing the commit");
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an unproven non-empty publication must be rejected"),
+        };
         assert!(
-            fallback.root().is_none(),
-            "a missing marker without cumulative absence authority must use canonical replay"
+            error
+                .message
+                .contains("omitted its same-publication body certification"),
+            "unexpected error: {error}"
         );
 
         let mut certified_writes = storage.new_write_set();
@@ -2284,7 +2312,7 @@ mod tests {
             crate::storage_codec::encode("scope-filter size candidate", &parent)
                 .unwrap()
                 .len();
-        assert_eq!(complete_manifest_bytes - incomplete_manifest_bytes, 129);
+        assert!(complete_manifest_bytes > incomplete_manifest_bytes);
         let child_filter = advance_touched_scope_filter(
             &[&parent],
             None,
@@ -2297,7 +2325,7 @@ mod tests {
 
         let incomplete = advance_touched_scope_filter(&[&parent], None, None).unwrap();
         assert!(!incomplete.complete);
-        assert!(incomplete.bits.is_empty());
+        assert!(incomplete.scopes.is_empty());
         assert!(!touched_scope_filter_proves_absent(&incomplete, &absent).unwrap());
     }
 
@@ -2454,14 +2482,14 @@ mod tests {
         assert!(
             validate_touched_scope_filter(&CommitStateTouchedScopeFilter {
                 complete: false,
-                bits: vec![1],
+                scopes: vec![scope("foreign")],
             })
             .is_err()
         );
         assert!(
             validate_touched_scope_filter(&CommitStateTouchedScopeFilter {
                 complete: true,
-                bits: vec![0; TOUCHED_SCOPE_FILTER_BYTES - 1],
+                scopes: vec![scope("z"), scope("a")],
             })
             .is_err()
         );

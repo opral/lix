@@ -447,7 +447,7 @@ where
             commit_deltas.iter().copied(),
         )
         .await?;
-        let physical_publication = crate::tracked_state::
+        let mut physical_publication = crate::tracked_state::
             stage_current_state_scoped_ranges_from_published_topology_parent(
                 &read,
                 &mut writes,
@@ -456,6 +456,14 @@ where
                 &plan.commit.account_id,
                 &initial_mutations,
                 initial_body,
+            )
+            .await?;
+        physical_publication
+            .certify_authored_history_bodies(
+                &read,
+                &mut writes,
+                &plan.commit.account_id,
+                &initial_mutations,
             )
             .await?;
         let _initial_state =
@@ -468,6 +476,7 @@ where
                     mutations: initial_mutations,
                     touched_scope_filter: physical_publication.touched_scope_filter().clone(),
                     current_state_scoped_ranges: physical_publication.root(),
+                    authored_history_bodies: physical_publication.authored_history_bodies(),
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
                 &physical_publication,

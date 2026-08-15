@@ -32,8 +32,6 @@ use crate::json_store::{
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-#[cfg(test)]
-use crate::tracked_state::stage_commit_state_manifest;
 use crate::tracked_state::{
     CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
@@ -6204,17 +6202,23 @@ where
                     row_pk: delta.delta.row_pk,
                 })
             });
+            // Root minting is confined to an actual graph genesis. Every
+            // descendant and selected-source publication must inherit its
+            // authenticated serving root; a missing parent root is never
+            // repaired by silently constructing a partial replacement.
+            let stage_initial_root = record.parent_commit_ids.is_empty()
+                && mutations.selected_source_commit_id().is_none();
             let certified_body = crate::tracked_state::certify_authored_current_state_body(
                 read,
                 writes,
                 record.commit_id,
                 &record.account_id,
                 &mutations,
-                false,
+                stage_initial_root,
                 deltas,
             )
             .await?;
-            let catalog_publication = if record.parent_commit_ids.len() <= 1
+            let mut catalog_publication = if record.parent_commit_ids.len() <= 1
                 && mutations.selected_source_commit_id.is_none()
             {
                 Some(if let Some(parent) = staged_parent {
@@ -6322,9 +6326,22 @@ where
                     .await?,
                 )
             };
+            if let Some(publication) = catalog_publication.as_mut() {
+                publication
+                    .certify_authored_history_bodies(
+                        read,
+                        writes,
+                        &record.account_id,
+                        &mutations,
+                    )
+                    .await?;
+            }
             let current_state_scoped_ranges = catalog_publication
                 .as_ref()
                 .and_then(|publication| publication.root());
+            let authored_history_bodies = catalog_publication
+                .as_ref()
+                .and_then(|publication| publication.authored_history_bodies());
             let touched_scope_filter = catalog_publication.as_ref().map_or_else(
                 crate::tracked_state::incomplete_touched_scope_filter,
                 |publication| publication.touched_scope_filter().clone(),
@@ -6343,6 +6360,7 @@ where
                 mutations,
                 touched_scope_filter,
                 current_state_scoped_ranges,
+                authored_history_bodies,
                 snapshot_root: snapshot_root.map(Box::new),
             };
             let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
@@ -7682,27 +7700,89 @@ mod tests {
         )
         .await
         .expect("mixed certified delta should stage");
-        stage_commit_state_manifest(
+        let inventory = staged_index
+            .inventories
+            .get(&commit_id)
+            .expect("mixed certified inventory should stage");
+        let mut deltas = vec![tracked_commit_delta_from_state_row(state_rows.row(0))
+            .expect("ordinary rooted delta should materialize")];
+        deltas.push(
+            tracked_commit_delta_from_certified_root_row(
+                &certified_rows[&commit_id][0],
+                &certified_json_refs[&commit_id][0],
+            )
+            .expect("certified rooted delta should materialize"),
+        );
+        deltas.sort_by_key(|delta| {
+            encode_key_ref(TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                row_pk: delta.delta.row_pk,
+            })
+        });
+        let tracked_state = TrackedStateContext::new();
+        let mut root_writer = tracked_state.writer(&read, &mut writes);
+        root_writer
+            .stage_commit_root(
+                &commit_id.to_string(),
+                None,
+                deltas.iter().map(|delta| delta.delta),
+            )
+            .await
+            .expect("mixed certified snapshot root should stage");
+        let snapshot_root = root_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == commit_id)
+            .cloned()
+            .expect("mixed certified snapshot root should exist");
+        drop(root_writer);
+        let certified_body = crate::tracked_state::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            inventory,
+            true,
+            deltas.iter().copied(),
+        )
+        .await
+        .expect("mixed certified current-state body should certify");
+        let mut publication =
+            crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
+                &read,
+                &mut writes,
+                None,
+                commit_id,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                inventory,
+                certified_body,
+            )
+            .await
+            .expect("mixed certified current-state root should stage");
+        publication
+            .certify_authored_history_bodies(
+                &read,
+                &mut writes,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                inventory,
+            )
+            .await
+            .expect("mixed certified history bodies should certify");
+        crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             &mut writes,
             &CommitStateManifest {
                 commit_id,
-                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                replay_debt: CommitStateReplayDebt {
-                    depth: 1,
-                    rows: 2,
-                    bytes: 2,
-                },
-                mutations: staged_index
-                    .inventories
-                    .get(&commit_id)
-                    .cloned()
-                    .expect("mixed certified inventory should stage"),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                replay_debt: CommitStateReplayDebt::default(),
+                mutations: inventory.clone(),
+                touched_scope_filter: publication.touched_scope_filter().clone(),
+                current_state_scoped_ranges: publication.root(),
+                authored_history_bodies: publication.authored_history_bodies(),
+                snapshot_root: Some(Box::new(snapshot_root)),
             },
+            &publication,
         )
-        .expect("mixed certified authority should stage");
+        .expect("mixed certified rooted authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -7716,10 +7796,7 @@ mod tests {
             .expect("mixed certified records should load");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].0.schema_key, "certified_schema");
-        assert_eq!(
-            records[0].1.change_id, certified_change_id,
-            "certified packet identity must be present in the commit delta"
-        );
+        assert_eq!(records[0].1.change_id, certified_change_id);
         assert_eq!(records[1].0.schema_key, "ordinary_schema");
         let packed_members =
             crate::tracked_state::load_commit_delta_members_with_payloads(&read, commit_id)
@@ -10127,7 +10204,15 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
-        crate::test_support::seed_global_branch_head(storage.clone()).await;
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            GLOBAL_BRANCH_ID,
+            crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
+            &[materialized_seed_row(
+                crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
+            )],
+        )
+        .await;
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -10421,10 +10506,13 @@ mod tests {
         let branch_ctx = BranchContext::new();
         crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
             .await;
-        crate::test_support::seed_branch_head(
+        crate::test_support::seed_branch_head_with_rows(
             storage.clone(),
             "01920000-0000-7000-8000-0000000000a1",
             "01920000-0000-7000-8000-0000000000a1-before",
+            &[materialized_seed_row(
+                "01920000-0000-7000-8000-0000000000a1-before",
+            )],
         )
         .await;
 
@@ -10898,6 +10986,21 @@ mod tests {
 
     fn tracked_global_row(change_id: &str) -> TestPreparedStateRow {
         tracked_branch_row(GLOBAL_BRANCH_ID, change_id)
+    }
+
+    fn materialized_seed_row(commit_id: &str) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
+            row_pk: RowPk::single("seed"),
+            schema_key: "test_schema".to_owned(),
+            file_id: None,
+            snapshot_content: Some(r#"{"value":0}"#.into()),
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            change_id: ChangeId::for_test_label(&format!("{commit_id}-seed")),
+            commit_id: CommitId::for_test_label(commit_id),
+        }
     }
 
     fn tracked_branch_row(branch_id: &str, change_id: &str) -> TestPreparedStateRow {
