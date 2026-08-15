@@ -211,39 +211,6 @@ impl WasmLix {
         Ok(self.inner.active_account_id().to_string())
     }
 
-    #[wasm_bindgen(js_name = clientStateGet)]
-    pub async fn client_state_get(&self, key: String) -> Result<JsValue, JsValue> {
-        match self
-            .inner
-            .client_state()
-            .get(&key)
-            .await
-            .map_err(lix_error_to_js)?
-        {
-            Some(value) => to_js(&value),
-            None => Ok(JsValue::UNDEFINED),
-        }
-    }
-
-    #[wasm_bindgen(js_name = clientStateSet)]
-    pub async fn client_state_set(&self, key: String, value: JsValue) -> Result<(), JsValue> {
-        let value = from_js::<serde_json::Value>(value)?;
-        self.inner
-            .client_state()
-            .set(&key, value)
-            .await
-            .map_err(lix_error_to_js)
-    }
-
-    #[wasm_bindgen(js_name = clientStateDelete)]
-    pub async fn client_state_delete(&self, key: String) -> Result<(), JsValue> {
-        self.inner
-            .client_state()
-            .delete(&key)
-            .await
-            .map_err(lix_error_to_js)
-    }
-
     #[wasm_bindgen(js_name = createBranch)]
     pub async fn create_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: CreateBranchOptionsDto = from_js(options)?;

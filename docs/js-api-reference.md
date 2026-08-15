@@ -26,7 +26,7 @@ Options:
 | Option      | Type                                  | Description                                                                         |
 | ----------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
 | `storage`   | `LixStorage \| IndexedDbStorage`      | Local storage. `FilesystemStorage` and any adapter implementing `LixStorage` qualify. Omit it for memory. |
-| `server`    | `RemoteLixServerOptions`              | Connect to a remote Lix server. When present, `storage` contains only client state. |
+| `server`    | `RemoteLixServerOptions`              | Connect to a remote Lix server. Remote mode does not accept local storage. |
 | `telemetry` | `LixTelemetryOptions`                 | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only.    |
 
 Connect to a remote server:
@@ -41,7 +41,7 @@ const lix = await openLix({
 });
 ```
 
-Remote file content, SQL rows, and branches live on the server. An optional `IndexedDbStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
+Remote file content, SQL rows, and branches live on the server. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
 Use `IndexedDbStorage` to persist a complete local browser Lix across reloads:
 
@@ -420,15 +420,6 @@ await lix.close();
 ```
 
 Closes the Lix handle and its storage resources.
-
-### clientState
-
-`lix.clientState` stores private client-local JSON state with asynchronous `get`, `set`, and `delete` methods plus `subscribe`; pass `IndexedDbStorage` in remote mode to persist it locally.
-
-```ts
-const preference = await lix.clientState.get("preference");
-await lix.clientState.set("preference", { sidebar: "history" });
-```
 
 ## Transaction
 

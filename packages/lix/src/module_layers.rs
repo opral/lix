@@ -97,7 +97,6 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
         "executor-neutral engine worker plumbing, no repository semantics",
     ),
     ("catalog", "not yet analysed"),
-    ("client_state", "entry-point plumbing, no layer semantics"),
     ("domain", "pure predicates, no owned invariant"),
     ("engine", "entry point; reaches everywhere by design"),
     (

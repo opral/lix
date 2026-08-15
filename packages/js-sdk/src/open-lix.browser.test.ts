@@ -146,80 +146,6 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 	}
 });
 
-test("remote client state survives reopen without selecting protocol identity", async () => {
-	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
-	const storage = new IndexedDbStorage({
-		name: `lix-client-state-test:${crypto.randomUUID()}`,
-	});
-	const sessions = new Map<string, string>();
-	const initialBranchRequests: Array<string | null> = [];
-	const initialAccountRequests: Array<string | null> = [];
-	const requestBodies: string[] = [];
-	let nextSession = 0;
-	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-		const request = new Request(input, init);
-		const url = new URL(request.url);
-		const suppliedSession = request.headers.get("lix-session-id");
-		if (url.pathname.endsWith("/lix/v1/")) {
-			const requestedBranch = url.searchParams.get("activeBranchId");
-			if (!suppliedSession) {
-				initialBranchRequests.push(requestedBranch);
-				initialAccountRequests.push(url.searchParams.get("activeAccountId"));
-			}
-			const sessionId = suppliedSession ?? `session-${++nextSession}`;
-			if (!sessions.has(sessionId)) {
-				sessions.set(sessionId, requestedBranch ?? "main");
-			}
-			return Response.json({
-				protocolVersion: 2,
-				activeBranchId: sessions.get(sessionId),
-				activeAccountId: "00000000-0000-7000-8000-000000000002",
-				sessionId,
-			});
-		}
-		if (url.pathname.endsWith("/branch/switch")) {
-			const body = await request.text();
-			requestBodies.push(body);
-			const branchId = (JSON.parse(body) as { branchId: string }).branchId;
-			if (!suppliedSession) throw new Error("missing test session");
-			sessions.set(suppliedSession, branchId);
-			return Response.json({ branchId });
-		}
-		if (url.pathname.endsWith("/lix/v1/session")) {
-			if (suppliedSession) sessions.delete(suppliedSession);
-			return new Response(null, { status: 204 });
-		}
-		throw new Error(`Unexpected request: ${url.pathname}`);
-	};
-	const options = {
-		server: {
-			mode: "remote" as const,
-			url: "https://lixray.test/@acme/client-state",
-			fetch: remoteFetch,
-		},
-		storage,
-	};
-
-	const first = await openLix(options);
-	await first.clientState.set("atelier", { focusedPanel: "right" });
-	await first.switchBranch({ branchId: "draft" });
-	await first.close();
-
-	const second = await openLix(options);
-	try {
-		expect(await second.activeBranchId()).toBe("main");
-		await expect(second.clientState.get("atelier")).resolves.toEqual({
-			focusedPanel: "right",
-		});
-		expect(requestBodies).toEqual([JSON.stringify({ branchId: "draft" })]);
-		expect(requestBodies.join("\n")).not.toContain("focusedPanel");
-	} finally {
-		await second.close();
-	}
-	expect(initialBranchRequests).toEqual([null, null]);
-	expect(initialAccountRequests).toEqual([null, null]);
-});
-
 test("IndexedDbStorage persists a complete local Lix", async () => {
 	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
 	const storage = new IndexedDbStorage({
@@ -276,49 +202,6 @@ test("IndexedDbStorage releases ownership after corrupt data rejects open", asyn
 	await recovered.close();
 });
 
-test("remote IndexedDbStorage isolates client state by server URL", async () => {
-	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
-	const name = `lix-remote-isolation-test:${crypto.randomUUID()}`;
-	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-		const request = new Request(input, init);
-		const url = new URL(request.url);
-		if (url.pathname.endsWith("/lix/v1/")) {
-			return Response.json({
-				protocolVersion: 2,
-				activeBranchId: "main",
-				activeAccountId: "00000000-0000-7000-8000-000000000002",
-				sessionId: crypto.randomUUID(),
-			});
-		}
-		if (url.pathname.endsWith("/lix/v1/session")) {
-			return new Response(null, { status: 204 });
-		}
-		throw new Error(`Unexpected request: ${url.pathname}`);
-	};
-	const openRemote = (url: string) =>
-		openLix({
-			server: { mode: "remote", url, fetch: remoteFetch },
-			storage: new IndexedDbStorage({ name }),
-		});
-
-	const repositoryA = await openRemote("https://lixray.test/@acme/a");
-	await repositoryA.clientState.set("selected-panel", "history");
-	await repositoryA.close();
-
-	const repositoryB = await openRemote("https://lixray.test/@acme/b");
-	await expect(
-		repositoryB.clientState.get("selected-panel"),
-	).resolves.toBeUndefined();
-	await repositoryB.clientState.set("selected-panel", "files");
-	await repositoryB.close();
-
-	const reopenedA = await openRemote("https://lixray.test/@acme/a/");
-	await expect(reopenedA.clientState.get("selected-panel")).resolves.toBe(
-		"history",
-	);
-	await reopenedA.close();
-});
-
 test("IndexedDbStorage close can retry after an active transaction", async () => {
 	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
 	const storage = new IndexedDbStorage({
@@ -331,13 +214,18 @@ test("IndexedDbStorage close can retry after an active transaction", async () =>
 		code: "LIX_INVALID_TRANSACTION_STATE",
 	});
 	await tx.rollback();
-	await lix.clientState.set("after-failed-close", true);
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["after-failed-close", true],
+	);
 	await lix.close();
 
 	const reopened = await openLix({ storage });
-	await expect(reopened.clientState.get("after-failed-close")).resolves.toBe(
-		true,
+	const result = await reopened.execute(
+		"SELECT value FROM lix_key_value WHERE key = $1",
+		["after-failed-close"],
 	);
+	expect(result.rows[0]?.get("value")).toBe(true);
 	await reopened.close();
 });
 

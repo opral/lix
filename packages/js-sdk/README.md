@@ -55,33 +55,9 @@ open a local engine. Dynamic headers are resolved for every request and
 observation reconnect. An injected `fetch` can route requests through a service
 binding or another authorized server-side transport.
 
-Browser clients can opt into private, durable client state with IndexedDB:
-
-```ts
-import { IndexedDbStorage, openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  server: {
-    mode: "remote",
-    url: "https://example.com/repositories/acme",
-  },
-  storage: new IndexedDbStorage({ name: "repository-client" }),
-});
-
-const previousUiState = await lix.clientState.get("atelier-ui");
-await lix.clientState.set("atelier-ui", { sidebar: "history" });
-```
-
-`lix.clientState` reads and writes through the local Lix transaction path. Its
-JSON values and the client's active branch are stored in the local IndexedDB
-database; repository SQL continues to execute only on the server. Reopening the
-same remote URL with the same storage name restores both. Each
-remote server session is branch-pinned, so switching one client does not switch
-another client.
-
-Client-state mutations commit through the same transactional storage boundary
-as a complete local Lix. A failed IndexedDB transaction rejects the mutation
-without publishing it to the live client-state facade.
+Remote server sessions are branch-pinned, so switching one client does not
+switch another client. Browser-local application state belongs to the
+application rather than the remote Lix handle.
 
 Filesystem sync uses native Node.js dependencies:
 
