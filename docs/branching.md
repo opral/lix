@@ -109,6 +109,7 @@ await lix.execute("UPDATE lix_branch SET hidden = true WHERE id = $1", [
 await lix.execute("DELETE FROM lix_branch WHERE id = $1", [draft.id]);
 ```
 
-Lix does not allow deleting the global branch or the active branch.
+Lix creates a built-in branch named `global` when it opens a repository. You
+cannot delete that branch, and you cannot delete the active branch.
 
 `hidden` only marks a branch for UIs. It does not change what SQL queries can see.

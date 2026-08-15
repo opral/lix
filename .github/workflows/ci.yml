@@ -30,6 +30,9 @@ jobs:
       - name: Validate change fragments
         run: node scripts/validate-changes.mjs
 
+      - name: Validate server protocol docs
+        run: node scripts/validate-server-protocol-docs.mjs
+
   cargo-config:
     name: Cargo config (${{ matrix.name }})
     if: github.event_name == 'push' || github.event.pull_request.draft == false
@@ -186,6 +189,17 @@ jobs:
           cargo test --profile test --workspace --all-features --no-fail-fast
           cargo test --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
           cargo test --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
+
+      # Examples are compiled by `--all-targets` but never executed, so the SQL
+      # strings inside them are never checked. `checkpoints.rs` selected two
+      # columns that do not exist on `lix_checkpoint` and clippy stayed green,
+      # while the docs mirrored the same broken query. Running the example is
+      # what makes its SQL a tested claim rather than a compiled string.
+      # `--all-features` matches the compilation above so the artifacts are
+      # reused.
+      - name: Run Rust examples
+        if: matrix.task == 'test'
+        run: cargo run --profile test -p lix --all-features --example checkpoints
 
       # The e2e test compilation above already builds the real workspace plugin
       # artifacts. This one external fixture covers the distinct risk: whether

@@ -93,7 +93,7 @@ INSERT INTO lix_revert (diff_id)
 SELECT diff_id FROM (VALUES ($1)) AS selected(diff_id);
 ```
 
-Direct `INSERT ... VALUES` is intentionally rejected. Every command must be
+Lix rejects direct `INSERT ... VALUES`. Every command must be
 `INSERT ... SELECT`; the query may read a Lix relation, a `VALUES` relation, a
 CTE, or another valid query.
 

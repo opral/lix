@@ -35,10 +35,13 @@ async fn main() -> Result<(), LixError> {
     let checkpoint = lix.create_checkpoint().await?;
     println!("created checkpoint {}", checkpoint.commit_id);
 
+    // `lix_checkpoint` holds the checkpoint rows and carries no ordering column.
+    // `lix_checkpoint_history()` exposes `lixcol_depth`, so ascending depth is
+    // newest-first.
     let checkpoints = lix
         .execute(
-            "SELECT commit_id, created_at, lixcol_depth
-             FROM lix_checkpoint
+            "SELECT commit_id, lixcol_depth
+             FROM lix_checkpoint_history()
              ORDER BY lixcol_depth",
             &[],
         )
@@ -46,9 +49,8 @@ async fn main() -> Result<(), LixError> {
 
     for row in checkpoints.rows() {
         let commit_id = row.get::<String>("commit_id")?;
-        let created_at = row.get::<String>("created_at")?;
         let depth = row.get::<i64>("lixcol_depth")?;
-        println!("depth {depth}: {commit_id} ({created_at})");
+        println!("depth {depth}: {commit_id}");
     }
     assert_eq!(
         checkpoints.rows()[0].get::<String>("commit_id")?,

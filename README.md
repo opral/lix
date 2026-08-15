@@ -17,7 +17,7 @@ AI products want a repository: files for agents, a SQL database for your app, an
 
 - 📄 **Files, in any format.** Store text and binary files. Plugins make supported formats queryable as versioned rows.
 - 🗄️ **SQL database.** File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.
-- 🔀 **Version control.** Semantic changes: the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.
+- 🔀 **Version control.** Diffs name the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
 - 🧩 **Pluggable storage.** Local filesystem, IndexedDB in the browser, or S3 behind a Lix server.
 - 🔒 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
@@ -62,9 +62,17 @@ const lix = await openLix({
 });
 ```
 
+## Try a demo
+
+LixRay is Lix, hosted. One repo your team and your agents share. Create one for free:
+
+<a href="https://lixray.com"><img src="./website/public/assets/lixray-banner.svg" alt="LixRay: one repo your team and your agents share. Any file type, every change tracked." width="760" /></a>
+
+See the [Hosting guide](./docs/hosting.md) for LixRay and for running your own host.
+
 ## Prime use cases
 
-### Give customers a repository
+### Give each customer a repository
 
 Your product gives every customer their own repository: their files, their data, and the automations LLMs now write for them. Lix is simpler than git here: it embeds in your product, and your customers review and undo changes without branch, merge, or pull request vocabulary.
 
@@ -110,7 +118,7 @@ const changes = await lix.execute(`
 
 Update Lix files and rows in one ACID transaction. Lix records the history automatically.
 
-[Read more about semantic changes →](https://lix.dev/docs/semantic-changes)
+[Read more about diffs →](https://lix.dev/docs/diffs)
 
 ## How Lix works
 

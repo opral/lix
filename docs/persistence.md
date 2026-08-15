@@ -62,8 +62,8 @@ storage.stop_sync().await?;
 ```
 
 `FilesystemStorage` owns synchronization after `start_sync()` returns. Calling
-`stop_sync()` is optional for normal applications and recommended for tests or
-before reopening the same RocksDB path immediately. Dropping the final storage
+`stop_sync()` is optional for normal applications and recommended for tests, or
+before reopening the same directory immediately. Dropping the final storage
 or repository instance performs a best-effort shutdown.
 
 Pass `syncAllFiles: false` to begin with no regular repository files and import
@@ -85,8 +85,7 @@ const lix = await openLix({
 The name identifies one Lix database within the current browser origin. Only
 one Lix handle may open that database name at a time, including from other tabs.
 IndexedDB commits use the same transactional storage boundary as native Lix
-storage; Lix does not export or replace a complete repository snapshot after
-each mutation.
+storage.
 
 Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
 
@@ -107,7 +106,7 @@ const lix = await openLix({
 
 The client needs no local storage option. Files, SQL rows, and branches live on the server.
 
-For S3, the server runs Lix with the Rust SlateDB storage backed by an S3-compatible object store and exposes the repository through the [Lix Server Protocol](./server-protocol.md). Clients do not pass S3 to `openLix()`.
+For S3, the server runs Lix with the Rust `SlateDB` storage on an S3-compatible object store. The server exposes the repository through the [Lix Server Protocol](./server-protocol.md). See [Hosting](./hosting.md). Clients do not pass S3 to `openLix()`.
 
 ```text
 JS client ── HTTP ──▶ Lix server ──▶ SlateDB ──▶ S3

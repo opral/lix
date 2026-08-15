@@ -18,8 +18,8 @@ const alice = await openLix({ server: { mode: "remote", url } });
 const bob = await openLix({ server: { mode: "remote", url } });
 ```
 
-Production clients should also provide authentication headers. See
-[Lix Server Protocol](./server-protocol.md#authentication).
+Production clients should also provide authentication headers. The server owns
+persistence and authentication. See [Hosting](./hosting.md).
 
 ## Observe a query
 
@@ -82,11 +82,6 @@ Branches and observations solve different problems:
 ## Presence
 
 Lix synchronizes repository data. Cursor positions, selections, typing status,
-and user avatars are temporary presence data and are not provided by Lix. Send
+and user avatars are temporary presence data. Lix does not provide them. Send
 them through your application's real-time presence service.
 
-## Hosting
-
-The server owns persistence and authentication. For production hosting, see
-[Persistence and Storage](./persistence.md) and the
-[Lix Server Protocol](./server-protocol.md).

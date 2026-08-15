@@ -4,15 +4,15 @@ description: Lix is not a Git replacement. Keep code in Git; use Lix to version,
 
 # How Lix compares to Git
 
-Lix is not a Git replacement. Git versions source code as line-diffed text. Lix is an SDK you embed in an app to version files and data, with row-level diffs and SQL over content and history.
+Lix is not a Git replacement. Git versions source code as line-diffed text. Lix is an SDK you embed in an app. It versions files and data with row-level diffs. It exposes content and history as SQL.
 
 Keep your code in Git. Use Lix for the documents and app data your product needs to diff, merge, and roll back.
 
 ## When to use which
 
 - **Use Git** for source code repositories and developer workflows.
-- **Use Lix** when non-developers and agents change files and data: documents, spreadsheets, and app records. Lix is designed for their workflows: real-time collaboration, automatic change tracking, review, and restore — no commits, no CLI.
-- **Use both.** Code lives in a Git repository. Your product's files and data live in a Lix repository. They do not conflict.
+- **Use Lix** when non-developers and agents change files and data: documents, spreadsheets, and app records. Lix is built for their workflows: real-time collaboration, automatic change tracking, review, and restore. Lix commits automatically, so nobody runs a commit command or opens a terminal.
+- **Use both.** Code lives in a Git repository. Your product's files and data live in a Lix repository. The two stay independent.
 
 ## What Lix adds over Git
 
@@ -24,7 +24,7 @@ Keep your code in Git. Use Lix for the documents and app data your product needs
 | Runs embedded in your app                 | CLI-first; libraries exist   | SDK-first                               |
 | Pluggable storage (memory, disk, S3)      | Assumes a POSIX filesystem   | Yes                                     |
 
-An agent updates one field in an orders CSV. Git shows a changed text line or a binary blob. Lix shows the row that changed:
+An agent updates one field in an orders CSV. Git shows a changed text line. Lix shows the row that changed:
 
 ```diff
 order_id 1002 status:
@@ -33,7 +33,7 @@ order_id 1002 status:
 + shipped
 ```
 
-And the history is queryable:
+You query that history with SQL:
 
 ```sql
 SELECT created_at, schema_key, row_pk, snapshot_content
@@ -50,6 +50,6 @@ LIMIT 20;
 
 ## Deeper reading
 
-- [Semantic Changes](./semantic-changes.md): how plugins split files into rows.
-- [Change History](./history.md): query what changed with SQL.
+- [Diffs](./diffs.md): how plugins split files into rows.
+- [History](./history.md): query what changed with SQL.
 - [Persistence and Storage](./persistence.md): storage adapters from memory to S3.

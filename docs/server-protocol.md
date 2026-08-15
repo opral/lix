@@ -1,126 +1,60 @@
 # Lix Server Protocol
 
-The Lix Server Protocol is the canonical HTTP contract for hosting a Lix
-repository. Its methods, `/lix/v1` paths, wire formats, session behavior, and
-reference implementation live in the `lix` crate. HTTP frameworks and
-deployment policy do not.
+The Lix Server Protocol is the HTTP contract for talking to a remote Lix
+repository. It is version `2` and lives under `/lix/v1`.
 
-Enable the implementation explicitly:
+It defines the methods, wire formats, session behavior, and error envelopes.
+It does not define HTTP frameworks, authentication schemes, URLs above
+`/lix/v1`, or deployment policy.
 
-```toml
-[dependencies]
-lix = { version = "0.11", features = ["server-protocol"] }
-```
+## Why it exists
 
-The feature is off by default. Embedded users do not compile the HTTP protocol
-surface or its optional dependencies.
+The protocol is the interop layer between clients and hosts.
 
-## Host one repository
+A server that implements `/lix/v1` is a Lix server, and every Lix client works
+against it unchanged. Point a client at a different server and nothing in the
+client changes but the URL. The OpenAPI document plus the normative behavior
+below is the entire contract. There is no separate vendor API.
 
-Open a Lix repository and retain one `LixServerProtocol` for the entire time the
-repository is hosted:
+The `lix` crate contains the reference implementation, so a server provides HTTP
+and authentication and forwards requests to it. See [Hosting](./hosting.md).
 
-```rust,no_run
-use std::sync::Arc;
-use lix::server_protocol::{
-    LixServerProtocol, ServerProtocolContext, ServerProtocolPrincipal,
-};
+## Surface
 
-# async fn example(request: lix::server_protocol::ServerProtocolRequest)
-#     -> Result<lix::server_protocol::ServerProtocolResponse, lix::LixError> {
-let repository = Arc::new(lix::open_lix().await?);
-let protocol = LixServerProtocol::new(repository);
+| Group       | Paths                                                                                         |
+| :---------- | :-------------------------------------------------------------------------------------------- |
+| Handshake   | `/lix/v1`, `/lix/v1/session`                                                                  |
+| SQL         | `/lix/v1/execute`, `/lix/v1/execute-batch`                                                    |
+| Transaction | `/lix/v1/transaction/{begin,execute,commit,rollback}`                                         |
+| Files       | `/lix/v1/file`, `/lix/v1/file/upsert`, `/lix/v1/file/upsert-batch`                            |
+| Versioning  | `/lix/v1/branch/{create,switch}`, `/lix/v1/checkpoint/create`, `/lix/v1/undo`, `/lix/v1/redo` |
+| Observation | `/lix/v1/observe`, `/lix/v1/observe/multiplex`                                                |
 
-// Authentication happens in the host, before protocol dispatch.
-let context = ServerProtocolContext {
-    principal: ServerProtocolPrincipal::Authenticated {
-        account_id: "01920000-0000-7000-8000-000000000001".to_owned(),
-        idempotency_scope: "identity-provider:user-123".to_owned(),
-    },
-    durable_terminal_storage_notifier: None,
-};
+Clients do not construct these paths. `openLix()` appends `/lix/v1/` to the
+repository URL, opens a session, carries the server-issued `Lix-Session-Id` on
+later requests, and reconnects observation streams.
 
-let response = protocol.handle(request, context).await;
-# Ok(response)
-# }
-```
+## Identity and sessions
 
-`ServerProtocolRequest` and `ServerProtocolResponse` use the ecosystem `http`
-types and `ServerProtocolBody`. An Axum, Hyper, Actix, or custom host only needs
-to convert its body into `ServerProtocolBody`, invoke `handle`, and forward the
-returned status, headers, extensions, and body.
+The protocol does not read bearer tokens, cookies, API keys, or certificates. It
+receives an already-trusted principal in process and never derives identity from
+request headers.
 
-The host owns the outer URL. For example, it may mount a repository at
-`/repositories/{repository_id}` and strip that prefix before dispatch. Everything
-beginning at `/lix/v1` is owned by the protocol and must not be renamed.
+On session creation it ensures the Lix account exists, pins the session to it,
+and scopes mutation idempotency to that principal. A session reused through a
+different principal returns `403`. Clients cannot select `activeAccountId`
+during the handshake.
 
-## Authentication
-
-The protocol does not validate bearer tokens, cookies, API keys, or mTLS
-certificates. The host validates credentials and then constructs trusted
-in-process context:
-
-- Use `ServerProtocolPrincipal::Authenticated` for a verified identity.
-- Use `ServerProtocolPrincipal::Anonymous` only when the host deliberately
-  permits anonymous access.
-- Never derive `account_id` or `idempotency_scope` from unverified request
-  headers or query parameters.
-
-On session creation the implementation ensures that an authenticated Lix
-account exists, pins the session to it, and scopes mutation idempotency to the
-trusted principal. Reusing a session through another principal returns `403`.
-The client cannot select `activeAccountId` during the handshake.
-
-Invalid credentials should be rejected by the host with `401` before calling
-the protocol. Valid credentials that do not own an existing protocol session
-receive the protocol's canonical `403` error envelope.
-
-## Connect a JavaScript client
-
-```ts
-import { openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  server: {
-    mode: "remote",
-    url: "https://example.com/repositories/acme",
-    headers: async () => ({
-      Authorization: `Bearer ${await getAccessToken()}`,
-    }),
-  },
-});
-```
-
-The SDK appends `/lix/v1/`, opens a server-issued session, sends the
-`Lix-Session-Id` capability on later requests, and reconnects observation
-streams. The handshake response reports the account chosen by the host.
-
-## Host responsibilities
-
-Before dispatch, the host must:
-
-- authenticate and select a trusted principal;
-- resolve the outer repository identifier and retain its runtime;
-- strip the outer route prefix;
-- decompress request content and enforce a compressed-body safety limit;
-- convert the decoded body to `ServerProtocolBody`.
-
-After dispatch, the host may apply response compression, CORS, deadlines,
-rate limits, and telemetry. It must preserve protocol status codes, headers,
-body bytes, and streaming behavior. SSE responses must retain the repository
-runtime until their body closes.
-
-`DurableTerminalStorageNotifier`, `is_terminal_storage_response`, and
-`terminal_storage_stream_signal` let a production host replace a terminal
-storage runtime without parsing wire error bodies or SSE frames.
-
-Call `LixServerProtocol::close()` during repository shutdown. Dropping a live
-server invalidates its in-memory session capabilities.
+SQL and file mutations accept an optional `Idempotency-Key` header. Replaying a
+key after a lost response applies the mutation once.
 
 ## Contract
 
-The machine-readable HTTP surface is
+The machine-readable surface is
 [`packages/lix/server-protocol.openapi.yaml`](../packages/lix/server-protocol.openapi.yaml).
-Behavior that OpenAPI cannot fully express—session pinning, transaction
-ownership, idempotency replay, observation ordering, and terminal storage
-semantics—is normative in the reference implementation and its tests.
+
+Behavior that OpenAPI cannot express — session pinning, transaction ownership,
+idempotency replay, observation ordering, and terminal storage semantics — is
+normative in the reference implementation and its tests.
+
+To run a server, see [Hosting](./hosting.md).
