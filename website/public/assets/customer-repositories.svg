@@ -14,25 +14,31 @@
       <rect x="-84" y="-52" width="168" height="104" rx="10" fill="rgba(7,182,213,0.05)" stroke="#07B6D5" stroke-width="1.5"/>
       <text x="0" y="-30" text-anchor="middle" font-size="10.5" font-weight="700" letter-spacing="0.8" fill="#0891AC">CUSTOMER A REPO</text>
       <rect x="-66" y="-16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
-      <text x="0" y="1" text-anchor="middle" font-size="10.5" fill="#3D4046">automations/</text>
+      <path transform="translate(-58, -8.3)" d="M0 1.9 C0 1.2 0.5 0.7 1.2 0.7 H4.2 L5.4 2 H10.8 C11.5 2 12 2.5 12 3.2 V8.8 C12 9.5 11.5 10 10.8 10 H1.2 C0.5 10 0 9.5 0 8.8 Z" fill="#54AEFF"/>
+      <text x="-40" y="1" font-size="10.5" fill="#3D4046">automations/</text>
       <rect x="-66" y="16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
-      <text x="0" y="33" text-anchor="middle" font-size="10.5" fill="#3D4046">handbook.md</text>
+      <g transform="translate(-57.5, 22.8)"><path d="M0 0 H6 L9.5 3.5 V12.5 H0 Z" fill="#2B579A"/><path d="M6 0 V3.5 H9.5 Z" fill="#FFFFFF" opacity="0.4"/></g>
+      <text x="-40" y="33" font-size="10.5" fill="#3D4046">handbook.docx</text>
     </g>
     <g transform="translate(320, 158)">
       <rect x="-84" y="-52" width="168" height="104" rx="10" fill="rgba(7,182,213,0.05)" stroke="#07B6D5" stroke-width="1.5"/>
       <text x="0" y="-30" text-anchor="middle" font-size="10.5" font-weight="700" letter-spacing="0.8" fill="#0891AC">CUSTOMER B REPO</text>
       <rect x="-66" y="-16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
-      <text x="0" y="1" text-anchor="middle" font-size="10.5" fill="#3D4046">automations/</text>
+      <path transform="translate(-58, -8.3)" d="M0 1.9 C0 1.2 0.5 0.7 1.2 0.7 H4.2 L5.4 2 H10.8 C11.5 2 12 2.5 12 3.2 V8.8 C12 9.5 11.5 10 10.8 10 H1.2 C0.5 10 0 9.5 0 8.8 Z" fill="#54AEFF"/>
+      <text x="-40" y="1" font-size="10.5" fill="#3D4046">skills/</text>
       <rect x="-66" y="16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
-      <text x="0" y="33" text-anchor="middle" font-size="10.5" fill="#3D4046">pricing.xlsx</text>
+      <g transform="translate(-57.5, 22.8)"><path d="M0 0 H6 L9.5 3.5 V12.5 H0 Z" fill="#217346"/><path d="M6 0 V3.5 H9.5 Z" fill="#FFFFFF" opacity="0.4"/></g>
+      <text x="-40" y="33" font-size="10.5" fill="#3D4046">pricing.xlsx</text>
     </g>
     <g transform="translate(522, 158)">
       <rect x="-84" y="-52" width="168" height="104" rx="10" fill="rgba(7,182,213,0.05)" stroke="#07B6D5" stroke-width="1.5"/>
       <text x="0" y="-30" text-anchor="middle" font-size="10.5" font-weight="700" letter-spacing="0.8" fill="#0891AC">CUSTOMER C REPO</text>
       <rect x="-66" y="-16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
-      <text x="0" y="1" text-anchor="middle" font-size="10.5" fill="#3D4046">knowledge/</text>
+      <path transform="translate(-58, -8.3)" d="M0 1.9 C0 1.2 0.5 0.7 1.2 0.7 H4.2 L5.4 2 H10.8 C11.5 2 12 2.5 12 3.2 V8.8 C12 9.5 11.5 10 10.8 10 H1.2 C0.5 10 0 9.5 0 8.8 Z" fill="#54AEFF"/>
+      <text x="-40" y="1" font-size="10.5" fill="#3D4046">knowledge/</text>
       <rect x="-66" y="16" width="132" height="26" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/>
-      <text x="0" y="33" text-anchor="middle" font-size="10.5" fill="#3D4046">contracts/</text>
+      <g transform="translate(-57.5, 22.8)"><path d="M0 0 H6 L9.5 3.5 V12.5 H0 Z" fill="#D93025"/><path d="M6 0 V3.5 H9.5 Z" fill="#FFFFFF" opacity="0.4"/></g>
+      <text x="-40" y="33" font-size="10.5" fill="#3D4046">terms.pdf</text>
     </g>
   </g>
 </svg>

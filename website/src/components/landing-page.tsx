@@ -672,9 +672,9 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
 
         {/* README */}
         {readmeHtml && (
-          <section className="pt-14">
-            <div className="overflow-hidden rounded-xl border border-line bg-white">
-              <div className="flex flex-wrap items-center justify-between gap-5 border-b border-line-soft bg-[#FDFCFA] px-7 py-2.5">
+          <section className="-mx-8 pt-14 sm:mx-0">
+            <div className="overflow-hidden border-y border-line bg-white sm:rounded-xl sm:border-x">
+              <div className="flex flex-wrap items-center justify-between gap-5 border-b border-line-soft bg-[#FDFCFA] px-4 py-2.5 sm:px-7">
                 <span className="font-mono text-xs text-ink-faint">
                   README.md · opral/lix
                 </span>
@@ -695,7 +695,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                   view on GitHub →
                 </a>
               </div>
-              <div className="px-6 pb-10 pt-8 sm:px-10">
+              <div className="px-4 pb-10 pt-8 sm:px-10">
                 <article
                   className="markdown-wc-body"
                   dangerouslySetInnerHTML={{ __html: readmeHtml }}
