@@ -14286,6 +14286,7 @@ mod tests {
     };
     use crate::tracked_state::types::CurrentStatePartSource;
     use crate::tracked_state::types::{
+        AuthoredHistoryBodyCoordinate, AuthoredHistoryBodyEntry, AuthoredHistoryBodyInventory,
         CommitStateManifest, CommitStateMutationInventory,
         CommitStateMutationPart as FixtureMutationPart, CommitStateReplayDebt,
         CurrentStatePartDescriptor, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
@@ -14603,24 +14604,8 @@ mod tests {
         current_state_scoped_ranges: Option<
             crate::tracked_state::types::CurrentStateScopedRangeRoot,
         >,
+        authored_history_bodies: Option<AuthoredHistoryBodyInventory>,
     ) -> CommitStateManifest {
-        let current_state_scoped_ranges = current_state_scoped_ranges.or_else(|| {
-            (mutations.member_count != 0 || mutations.selected_source_commit_id().is_some())
-                .then(|| {
-                    let tree = crate::tracked_state::scoped_range::ScopedRangeRoot {
-                        root_id: *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
-                        root_digest: *blake3::hash(b"fixture current-state root").as_bytes(),
-                        marker_count: 1,
-                        part_count: 1,
-                        row_count: u64::from(mutations.member_count),
-                        tree_height: 1,
-                    };
-                    crate::tracked_state::scoped_current_state::attest_scoped_range_root(
-                        commit_id, None, &mutations, tree,
-                    )
-                    .expect("fixture current-state root should attest")
-                })
-        });
         CommitStateManifest {
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
@@ -14632,6 +14617,7 @@ mod tests {
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: current_state_scoped_ranges.map(Box::new),
+            authored_history_bodies: authored_history_bodies.map(Box::new),
             snapshot_root: None,
         }
     }
@@ -14641,7 +14627,7 @@ mod tests {
         commit_id: CommitId,
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
-        stage_fixture_manifest_with_current_state(writes, commit_id, mutations, None)
+        stage_fixture_manifest_with_current_state(writes, commit_id, mutations, None, None)
     }
 
     fn stage_fixture_manifest_with_current_state(
@@ -14651,6 +14637,7 @@ mod tests {
         current_state_scoped_ranges: Option<
             crate::tracked_state::types::CurrentStateScopedRangeRoot,
         >,
+        authored_history_bodies: Option<AuthoredHistoryBodyInventory>,
     ) -> Result<(), LixError> {
         let record = CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
@@ -14674,8 +14661,14 @@ mod tests {
                 commit_id,
                 mutations.clone(),
                 current_state_scoped_ranges,
+                authored_history_bodies,
             ),
         )
+    }
+
+    struct FixtureCurrentStatePublication {
+        root: crate::tracked_state::types::CurrentStateScopedRangeRoot,
+        row_coordinates: BTreeMap<Vec<u8>, (CurrentStatePartDescriptor, u16)>,
     }
 
     fn stage_fixture_current_state_root(
@@ -14683,7 +14676,7 @@ mod tests {
         commit_id: CommitId,
         mutations: &CommitStateMutationInventory,
         deltas: &[TrackedStateCommitDeltaRef<'_>],
-    ) -> Result<Option<crate::tracked_state::types::CurrentStateScopedRangeRoot>, LixError> {
+    ) -> Result<Option<FixtureCurrentStatePublication>, LixError> {
         use crate::tracked_state::current_state_data_part::CurrentStateDataRow;
         use crate::tracked_state::current_state_envelope::{
             current_state_scope_prefix, scoped_range_part_from_current_state_descriptor,
@@ -14697,13 +14690,13 @@ mod tests {
             crate::tracked_state::types::CommitDeltaReplacementScope,
             Vec<CurrentStateDataRow>,
         >::new();
-        for delta in deltas.iter().filter(|delta| delta.authored) {
+        for delta in deltas {
             let scope = crate::tracked_state::types::CommitDeltaReplacementScope {
                 schema_key: delta.delta.schema_key.to_owned(),
                 file_id: delta.delta.file_id.map(str::to_owned),
             };
             let rows = scopes.entry(scope).or_default();
-            if !delta.delta.deleted {
+            if delta.authored && !delta.delta.deleted {
                 rows.push(CurrentStateDataRow {
                     encoded_key: encode_key_ref(TrackedStateKeyRef {
                         schema_key: delta.delta.schema_key,
@@ -14726,10 +14719,29 @@ mod tests {
             return Ok(None);
         }
         let mut staged_scopes = Vec::with_capacity(scopes.len());
+        let mut row_coordinates = BTreeMap::new();
         for (scope, mut rows) in scopes {
             rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
             let mut descriptors = Vec::new();
             super::stage_scoped_native_current_state_rows(writes, &rows, false, &mut descriptors)?;
+            for descriptor in &descriptors {
+                for (row_index, row) in rows
+                    .iter()
+                    .filter(|row| {
+                        descriptor.first_key <= row.encoded_key
+                            && row.encoded_key <= descriptor.last_key
+                    })
+                    .enumerate()
+                {
+                    row_coordinates.insert(
+                        row.encoded_key.clone(),
+                        (
+                            descriptor.clone(),
+                            u16::try_from(row_index).expect("native fixture part row fits u16"),
+                        ),
+                    );
+                }
+            }
             let parts = descriptors
                 .iter()
                 .map(|descriptor| {
@@ -14746,7 +14758,180 @@ mod tests {
             ));
         }
         let tree = stage_scoped_range_tree(writes, staged_scopes)?;
-        attest_scoped_range_root(commit_id, None, mutations, tree).map(Some)
+        let root = attest_scoped_range_root(commit_id, None, mutations, tree)?;
+        Ok(Some(FixtureCurrentStatePublication {
+            root,
+            row_coordinates,
+        }))
+    }
+
+    fn fixture_authored_history_body_inventory(
+        commit_id: CommitId,
+        root: &crate::tracked_state::types::CurrentStateScopedRangeRoot,
+        row_coordinates: &BTreeMap<Vec<u8>, (CurrentStatePartDescriptor, u16)>,
+        deltas: &[TrackedStateCommitDeltaRef<'_>],
+    ) -> Result<Option<AuthoredHistoryBodyInventory>, LixError> {
+        let mut authored = deltas
+            .iter()
+            .copied()
+            .filter(|delta| delta.authored)
+            .map(|delta| {
+                let encoded_key = encode_key_ref(TrackedStateKeyRef {
+                    schema_key: delta.delta.schema_key,
+                    file_id: delta.delta.file_id,
+                    row_pk: delta.delta.row_pk,
+                });
+                (encoded_key, delta)
+            })
+            .collect::<Vec<_>>();
+        authored.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if authored.is_empty() {
+            return Ok(None);
+        }
+
+        let mut descriptors = Vec::<CurrentStatePartDescriptor>::new();
+        let mut descriptor_indices = BTreeMap::<Vec<u8>, u32>::new();
+        let mut entries = Vec::with_capacity(authored.len());
+        for (encoded_key, delta) in authored {
+            let value = TrackedStateIndexValue {
+                change_id: delta.delta.change_id,
+                commit_id: delta.delta.commit_id,
+                deleted: delta.delta.deleted,
+                created_at: delta.delta.created_at,
+                updated_at: delta.delta.updated_at,
+            };
+            let body_digest = history_body_digest(delta.snapshot, delta.metadata);
+            let coordinate = if delta.delta.deleted {
+                None
+            } else {
+                let (descriptor, row_index) =
+                    row_coordinates.get(&encoded_key).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "live fixture history member has no native current-state coordinate",
+                        )
+                    })?;
+                let descriptor_index = match descriptor_indices.get(&descriptor.first_key) {
+                    Some(index) => *index,
+                    None => {
+                        let index = u32::try_from(descriptors.len()).map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "fixture history descriptor count overflows",
+                            )
+                        })?;
+                        descriptors.push(descriptor.clone());
+                        descriptor_indices.insert(descriptor.first_key.clone(), index);
+                        index
+                    }
+                };
+                Some(AuthoredHistoryBodyCoordinate {
+                    descriptor_index,
+                    row_index: *row_index,
+                })
+            };
+            entries.push(AuthoredHistoryBodyEntry {
+                change_id: value.change_id,
+                binding_digest: super::authored_history_body_binding_digest(
+                    &encoded_key,
+                    &value,
+                    body_digest,
+                ),
+                coordinate,
+            });
+        }
+        let mut inventory = AuthoredHistoryBodyInventory {
+            source_root_id: root.tree.root_id,
+            source_transition_digest: root.transition_digest,
+            closure_digest: [0; 32],
+            descriptors,
+            entries,
+        };
+        inventory.closure_digest =
+            super::authored_history_body_closure_digest(commit_id, &inventory)?;
+        Ok(Some(inventory))
+    }
+
+    fn fixture_single_row_body_inventory(
+        commit_id: CommitId,
+        root: &crate::tracked_state::types::CurrentStateScopedRangeRoot,
+        members: Vec<(Vec<u8>, TrackedStateIndexValue, [u8; 32])>,
+    ) -> AuthoredHistoryBodyInventory {
+        let descriptors = members
+            .iter()
+            .map(|(encoded_key, _, _)| CurrentStatePartDescriptor {
+                first_key: encoded_key.clone(),
+                last_key: encoded_key.clone(),
+                content_digest: *blake3::hash(encoded_key).as_bytes(),
+                source: CurrentStatePartSource::NativeDataPart {
+                    payload_refs_digest: *blake3::hash(
+                        &[b"fixture payload refs".as_slice(), encoded_key].concat(),
+                    )
+                    .as_bytes(),
+                },
+                source_row_offset: 0,
+                row_count: 1,
+                fragmented: false,
+            })
+            .collect::<Vec<_>>();
+        let entries = members
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (encoded_key, value, body_digest))| AuthoredHistoryBodyEntry {
+                    change_id: value.change_id,
+                    binding_digest: super::authored_history_body_binding_digest(
+                        encoded_key,
+                        value,
+                        *body_digest,
+                    ),
+                    coordinate: Some(AuthoredHistoryBodyCoordinate {
+                        descriptor_index: u32::try_from(index)
+                            .expect("fixture descriptor index fits u32"),
+                        row_index: 0,
+                    }),
+                },
+            )
+            .collect();
+        let mut inventory = AuthoredHistoryBodyInventory {
+            source_root_id: root.tree.root_id,
+            source_transition_digest: root.transition_digest,
+            closure_digest: [0; 32],
+            descriptors,
+            entries,
+        };
+        inventory.closure_digest =
+            super::authored_history_body_closure_digest(commit_id, &inventory)
+                .expect("fixture history inventory should hash");
+        inventory
+    }
+
+    fn stage_fixture_native_manifest(
+        writes: &mut StorageWriteSet,
+        commit_id: CommitId,
+        mutations: &CommitStateMutationInventory,
+        deltas: &[TrackedStateCommitDeltaRef<'_>],
+    ) -> Result<(), LixError> {
+        let publication = stage_fixture_current_state_root(writes, commit_id, mutations, deltas)?
+            .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "member-bearing fixture has no authenticated current-state root",
+            )
+        })?;
+        let inventory = fixture_authored_history_body_inventory(
+            commit_id,
+            &publication.root,
+            &publication.row_coordinates,
+            deltas,
+        )?;
+        stage_fixture_manifest_with_current_state(
+            writes,
+            commit_id,
+            mutations,
+            Some(publication.root),
+            inventory,
+        )
     }
 
     fn stage_commit_deltas(
@@ -14758,18 +14943,7 @@ mod tests {
             .first()
             .map(|delta| delta.delta.commit_id)
             .unwrap_or_default();
-        let root = stage_fixture_current_state_root(
-            writes,
-            commit_id,
-            staged.mutation_inventory(),
-            deltas,
-        )?;
-        stage_fixture_manifest_with_current_state(
-            writes,
-            commit_id,
-            staged.mutation_inventory(),
-            root,
-        )?;
+        stage_fixture_native_manifest(writes, commit_id, staged.mutation_inventory(), deltas)?;
         Ok(staged.locators)
     }
 
@@ -14795,9 +14969,7 @@ mod tests {
                 delta
             })
             .collect::<Vec<_>>();
-        let root =
-            stage_fixture_current_state_root(writes, commit_id, &mutations, &fixture_deltas)?;
-        stage_fixture_manifest_with_current_state(writes, commit_id, &mutations, root)?;
+        stage_fixture_native_manifest(writes, commit_id, &mutations, &fixture_deltas)?;
         Ok(staged)
     }
 
@@ -14818,7 +14990,8 @@ mod tests {
             .map(|delta| delta.delta.commit_id)
             .unwrap_or_default();
         let mutations = fixture_addressable_inventory(&staged);
-        let local_root = stage_fixture_current_state_root(writes, commit_id, &mutations, deltas)?;
+        let local_publication =
+            stage_fixture_current_state_root(writes, commit_id, &mutations, deltas)?;
         let source_key = super::commit_state_manifest_key(selected_source_commit_id);
         let source_header = writes
             .staged_value(
@@ -14840,13 +15013,15 @@ mod tests {
                     "selected-source fixture has no staged current-state root",
                 )
             })?;
-        let root = match local_root {
-            Some(root) => crate::tracked_state::scoped_current_state::attest_scoped_range_root(
-                commit_id,
-                Some((selected_source_commit_id, &source)),
-                &mutations,
-                root.tree,
-            )?,
+        let root = match local_publication.as_ref() {
+            Some(publication) => {
+                crate::tracked_state::scoped_current_state::attest_scoped_range_root(
+                    commit_id,
+                    Some((selected_source_commit_id, &source)),
+                    &mutations,
+                    publication.root.tree.clone(),
+                )?
+            }
             None => crate::tracked_state::scoped_current_state::attest_scoped_range_root(
                 commit_id,
                 Some((selected_source_commit_id, &source)),
@@ -14854,7 +15029,24 @@ mod tests {
                 source.tree.clone(),
             )?,
         };
-        stage_fixture_manifest_with_current_state(writes, commit_id, &mutations, Some(root))?;
+        let empty_coordinates = BTreeMap::new();
+        let inventory = fixture_authored_history_body_inventory(
+            commit_id,
+            &root,
+            local_publication
+                .as_ref()
+                .map_or(&empty_coordinates, |publication| {
+                    &publication.row_coordinates
+                }),
+            deltas,
+        )?;
+        stage_fixture_manifest_with_current_state(
+            writes,
+            commit_id,
+            &mutations,
+            Some(root),
+            inventory,
+        )?;
         Ok(staged)
     }
 
@@ -14907,17 +15099,11 @@ mod tests {
                     delta
                 })
                 .collect::<Vec<_>>();
-            let root = stage_fixture_current_state_root(
+            stage_fixture_native_manifest(
                 writes,
                 staged.commit_id,
                 staged.mutation_inventory(),
                 &fixture_deltas,
-            )?;
-            stage_fixture_manifest_with_current_state(
-                writes,
-                staged.commit_id,
-                staged.mutation_inventory(),
-                root,
             )?;
         }
         Ok(staged)
@@ -15920,7 +16106,33 @@ mod tests {
         // Compact replacement authority stores bounds in the authenticated
         // digest directory, not the generic bounded-part vector.
         inventory.parts.clear();
-        stage_fixture_manifest(&mut writes, commit_id, &inventory)
+        let fixtures = ["compact-000", "compact-001"].map(|row_pk| CommitDeltaFixture {
+            schema_key: "compact-direct".to_owned(),
+            file_id: None,
+            row_pk: RowPk::single(row_pk),
+            change_id: ChangeId::default(),
+            deleted: false,
+            created_at,
+            updated_at: created_at,
+        });
+        let deltas = fixtures
+            .iter()
+            .enumerate()
+            .map(|(index, fixture)| {
+                let mut delta = commit_delta_ref(
+                    commit_id,
+                    fixture,
+                    crate::json_store::JsonSlotRef::Inline("{\"v\":1}"),
+                    crate::json_store::JsonSlotRef::None,
+                    None,
+                );
+                delta.delta.change_id = staged
+                    .change_id_at(index)
+                    .expect("replacement fixture row should be addressed");
+                delta
+            })
+            .collect::<Vec<_>>();
+        stage_fixture_native_manifest(&mut writes, commit_id, &inventory, &deltas)
             .expect("compact replacement authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -16116,9 +16328,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn public_membership_dedupes_ids_but_payload_authority_rejects_conflicts() {
-        let storage = StorageAdapter::new(Memory::new());
+    #[test]
+    fn authored_body_inventory_rejects_duplicate_change_ids_before_publication() {
         let commit_id = CommitId::for_test_label("duplicate-change-id");
         let mut fixtures = packed_commit_delta_fixtures()
             .into_iter()
@@ -16126,31 +16337,10 @@ mod tests {
             .collect::<Vec<_>>();
         fixtures[1].change_id = fixtures[0].change_id;
         let deltas = commit_delta_refs(commit_id, &fixtures);
-        let mut writes = storage.new_write_set();
-        stage_commit_deltas(&mut writes, &deltas).expect("distinct identities should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("corrupt duplicate-id fixture should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        assert_eq!(
-            load_commit_delta_change_ids(&read, commit_id)
-                .await
-                .expect("public commit membership should load"),
-            vec![fixtures[0].change_id]
-        );
-        let error = scan_commit_delta_inventory(&read)
-            .await
-            .expect_err("global authority must reject duplicate change ids");
-        assert!(error.to_string().contains("contains duplicate change id"));
-        let error = scan_change_records_from_commit_deltas(&read)
-            .await
-            .expect_err("streaming authority must reject duplicate change ids");
-        assert!(error.to_string().contains("contains duplicate change id"));
+        let mut writes = StorageWriteSet::new();
+        let error = stage_commit_deltas(&mut writes, &deltas)
+            .expect_err("duplicate authored change ids must not publish an inventory");
+        assert!(error.to_string().contains("duplicate change"));
     }
 
     #[tokio::test]
@@ -16231,6 +16421,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             }],
         );
         let mut writes = orphan_storage.new_write_set();
@@ -17286,8 +17477,8 @@ mod tests {
         let commit_id = CommitId::for_test_label("index-only-skips-sidecar");
         let fixture = packed_commit_delta_fixtures()
             .into_iter()
-            .next()
-            .expect("fixture should exist");
+            .find(|fixture| !fixture.deleted)
+            .expect("live fixture should exist");
         let entry = EncodedLeafEntry {
             key: encode_key_ref(TrackedStateKeyRef {
                 schema_key: &fixture.schema_key,
@@ -17315,6 +17506,7 @@ mod tests {
                 origin_key: Some(&snapshot),
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             }],
         );
         segment.pop();
@@ -17336,10 +17528,18 @@ mod tests {
             inline_segment: segment,
             segments: Vec::new(),
         };
-        stage_fixture_manifest(
+        let delta = commit_delta_ref(
+            commit_id,
+            &fixture,
+            crate::json_store::JsonSlotRef::Inline(&snapshot),
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        stage_fixture_native_manifest(
             &mut writes,
             commit_id,
             &super::commit_state_inventory_from_delta_manifest(&delta_manifest),
+            &[delta],
         )
         .expect("commit-state authority should stage");
         storage
@@ -17419,6 +17619,7 @@ mod tests {
                 origin_key: Some("first"),
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             },
             CommitDeltaPayloadRef {
                 body_digest: history_body_digest(
@@ -17428,6 +17629,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             },
             CommitDeltaPayloadRef {
                 body_digest: history_body_digest(
@@ -17437,6 +17639,7 @@ mod tests {
                 origin_key: Some("last"),
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             },
         ];
         let mut encoded = encode_commit_delta_segment_with_raw_sidecar(&entries, &payloads);
@@ -17557,6 +17760,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: Some(coordinates[0]),
                 authored: true,
+                tombstone_metadata: None,
             },
             CommitDeltaPayloadRef {
                 body_digest: history_body_digest(
@@ -17566,6 +17770,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: Some(coordinates[1]),
                 authored: false,
+                tombstone_metadata: None,
             },
             CommitDeltaPayloadRef {
                 body_digest: history_body_digest(
@@ -17575,6 +17780,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: Some(coordinates[2]),
                 authored: true,
+                tombstone_metadata: None,
             },
         ];
         let encoded = encode_commit_delta_segment_with_raw_sidecar(&entries, &payloads);
@@ -17646,12 +17852,14 @@ mod tests {
                 origin_key: Some(&first_origin),
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             },
             CommitDeltaPayloadRef {
                 body_digest: second_digest,
                 origin_key: Some(&second_origin),
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             },
         ];
         let encoded = encode_commit_delta_segment_with_payloads(&entries, &payloads);
@@ -17701,54 +17909,6 @@ mod tests {
     }
 
     #[test]
-    fn tiny_payload_sidecar_keeps_raw_fallback() {
-        let fixture = packed_commit_delta_fixtures()
-            .into_iter()
-            .next()
-            .expect("fixture should exist");
-        let entry = EncodedLeafEntry {
-            key: encode_key_ref(TrackedStateKeyRef {
-                schema_key: &fixture.schema_key,
-                file_id: fixture.file_id.as_deref(),
-                row_pk: &fixture.row_pk,
-            })
-            .into(),
-            value: encode_value_ref(TrackedStateIndexValueRef {
-                change_id: fixture.change_id,
-                commit_id: CommitId::for_test_label("raw-payload-sidecar"),
-                deleted: fixture.deleted,
-                created_at: fixture.created_at,
-                updated_at: fixture.updated_at,
-            })
-            .into(),
-        };
-        let encoded = encode_commit_delta_segment_with_payloads(
-            &[entry],
-            &[CommitDeltaPayloadRef {
-                body_digest: history_body_digest(
-                    crate::json_store::JsonSlotRef::None,
-                    crate::json_store::JsonSlotRef::None,
-                ),
-                origin_key: None,
-                base_coordinate: None,
-                authored: true,
-            }],
-        );
-        let leaf_len = usize::try_from(u32::from_be_bytes(
-            encoded[COMMIT_DELTA_FORMAT_MAGIC.len()..COMMIT_DELTA_FORMAT_MAGIC.len() + 4]
-                .try_into()
-                .expect("fixed leaf length"),
-        ))
-        .expect("u32 fits usize");
-        assert_eq!(
-            encoded[COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + leaf_len],
-            super::COMMIT_DELTA_SIDECAR_RAW,
-            "compression must not expand tiny sidecars"
-        );
-        decode_commit_delta_with_payloads(&encoded, None).expect("raw fallback should decode");
-    }
-
-    #[test]
     fn packed_commit_members_reject_empty_authoritative_payload_ranges() {
         let commit_id = CommitId::for_test_label("missing-authoritative-payload");
         let fixtures = packed_commit_delta_fixtures()
@@ -17783,6 +17943,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             },
             CommitDeltaPayloadRef {
                 body_digest: history_body_digest(
@@ -17792,6 +17953,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             },
         ];
         let mut encoded = encode_commit_delta_segment_with_raw_sidecar(&entries, &payloads);
@@ -17939,6 +18101,7 @@ mod tests {
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
+                tombstone_metadata: None,
             }],
         );
 
@@ -18518,13 +18681,53 @@ mod tests {
             replacement_generation: None,
             replacement_parts: None,
             columnar_parts: None,
-            inline_segment: encode_commit_delta_segment(&entries),
+            inline_segment: encode_commit_delta_segment_with_payloads(
+                &entries,
+                &[
+                    CommitDeltaPayloadRef {
+                        body_digest: history_body_digest(
+                            crate::json_store::JsonSlotRef::None,
+                            crate::json_store::JsonSlotRef::None,
+                        ),
+                        origin_key: None,
+                        base_coordinate: None,
+                        authored: true,
+                        tombstone_metadata: None,
+                    },
+                    CommitDeltaPayloadRef {
+                        body_digest: history_body_digest(
+                            crate::json_store::JsonSlotRef::Inline("null"),
+                            crate::json_store::JsonSlotRef::None,
+                        ),
+                        origin_key: None,
+                        base_coordinate: None,
+                        authored: true,
+                        tombstone_metadata: None,
+                    },
+                ],
+            ),
             segments: Vec::new(),
         };
-        stage_fixture_manifest(
+        let alpha_delta = commit_delta_ref(
+            commit_id,
+            alpha,
+            crate::json_store::JsonSlotRef::None,
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        let mut beta_delta = commit_delta_ref(
+            commit_id,
+            beta,
+            crate::json_store::JsonSlotRef::None,
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        beta_delta.delta.commit_id = wrong_commit_id;
+        stage_fixture_native_manifest(
             &mut writes,
             commit_id,
             &super::commit_state_inventory_from_delta_manifest(&delta_manifest),
+            &[alpha_delta, beta_delta],
         )
         .expect("commit-state authority should stage");
         storage
@@ -18755,40 +18958,72 @@ mod tests {
         let schema_key = "manifest-schema";
         let row_pk = RowPk::single("manifest-row");
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(1234);
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key,
+            file_id: None,
+            row_pk: &row_pk,
+        });
+        let value = TrackedStateIndexValue {
+            change_id: super::change_id_from_packed_address(commit_id, 1),
+            commit_id,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
         let entry = EncodedLeafEntry {
-            key: encode_key_ref(TrackedStateKeyRef {
-                schema_key,
-                file_id: None,
-                row_pk: &row_pk,
-            })
-            .into(),
+            key: encoded_key.clone().into(),
             value: encode_value_ref(TrackedStateIndexValueRef {
-                change_id: super::change_id_from_packed_address(commit_id, 1),
-                commit_id,
-                deleted: false,
-                created_at: timestamp,
-                updated_at: timestamp,
+                change_id: value.change_id,
+                commit_id: value.commit_id,
+                deleted: value.deleted,
+                created_at: value.created_at,
+                updated_at: value.updated_at,
             })
             .into(),
         };
         let mutations = CommitStateMutationInventory {
-                selected_source_commit_id: None,
-                member_count: 1,
-                selection_fingerprint: [3; 32],
-                direct_part_row_counts: vec![1],
-                replacement_part_digests: Vec::new(),
-                single_partition: Some(super::CommitDeltaReplacementScope {
-                    schema_key: schema_key.to_owned(),
-                    file_id: None,
-                }),
-                lifecycle_summary: None,
-                replacement_generation: None,
-                replacement_parts: None,
-                columnar_parts: None,
-                inline_part: encode_commit_delta_segment(&[entry]),
-                parts: Vec::new(),
-            };
-        let mut manifest = fixture_commit_state_manifest(commit_id, mutations, None);
+            selected_source_commit_id: None,
+            member_count: 1,
+            selection_fingerprint: [3; 32],
+            direct_part_row_counts: vec![1],
+            replacement_part_digests: Vec::new(),
+            single_partition: Some(super::CommitDeltaReplacementScope {
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+            }),
+            lifecycle_summary: None,
+            replacement_generation: None,
+            replacement_parts: None,
+            columnar_parts: None,
+            inline_part: encode_commit_delta_segment(&[entry]),
+            parts: Vec::new(),
+        };
+        let tree = crate::tracked_state::scoped_range::ScopedRangeRoot {
+            root_id: *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
+            root_digest: *blake3::hash(b"manifest fixture current-state root").as_bytes(),
+            marker_count: 1,
+            part_count: 1,
+            row_count: 1,
+            tree_height: 1,
+        };
+        let root = crate::tracked_state::scoped_current_state::attest_scoped_range_root(
+            commit_id, None, &mutations, tree,
+        )
+        .expect("manifest fixture current-state root should attest");
+        let bodies = fixture_single_row_body_inventory(
+            commit_id,
+            &root,
+            vec![(
+                encoded_key,
+                value,
+                history_body_digest(
+                    crate::json_store::JsonSlotRef::None,
+                    crate::json_store::JsonSlotRef::None,
+                ),
+            )],
+        );
+        let mut manifest =
+            fixture_commit_state_manifest(commit_id, mutations, Some(root), Some(bodies));
         manifest.replay_debt = CommitStateReplayDebt {
             depth: 2,
             rows: 1,
@@ -18823,23 +19058,60 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mutations = CommitStateMutationInventory {
-                selected_source_commit_id: None,
-                member_count: part_count as u32,
-                selection_fingerprint: [4; 32],
-                direct_part_row_counts: vec![1; part_count],
-                replacement_part_digests: Vec::new(),
-                single_partition: Some(super::CommitDeltaReplacementScope {
-                    schema_key,
-                    file_id: None,
-                }),
-                lifecycle_summary: None,
-                replacement_generation: None,
-                replacement_parts: None,
-                columnar_parts: None,
-                inline_part: Vec::new(),
-                parts,
-            };
-        fixture_commit_state_manifest(commit_id, mutations, None)
+            selected_source_commit_id: None,
+            member_count: part_count as u32,
+            selection_fingerprint: [4; 32],
+            direct_part_row_counts: vec![1; part_count],
+            replacement_part_digests: Vec::new(),
+            single_partition: Some(super::CommitDeltaReplacementScope {
+                schema_key,
+                file_id: None,
+            }),
+            lifecycle_summary: None,
+            replacement_generation: None,
+            replacement_parts: None,
+            columnar_parts: None,
+            inline_part: Vec::new(),
+            parts,
+        };
+        let tree = crate::tracked_state::scoped_range::ScopedRangeRoot {
+            root_id: *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
+            root_digest: *blake3::hash(label.as_bytes()).as_bytes(),
+            marker_count: 1,
+            part_count: u32::try_from(part_count).expect("fixture part count fits u32"),
+            row_count: part_count as u64,
+            tree_height: 1,
+        };
+        let root = crate::tracked_state::scoped_current_state::attest_scoped_range_root(
+            commit_id, None, &mutations, tree,
+        )
+        .expect("external fixture current-state root should attest");
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        let members = mutations
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(index, part)| {
+                (
+                    part.first_key.clone(),
+                    TrackedStateIndexValue {
+                        change_id: ChangeId::for_test_label(&format!(
+                            "{label}-external-member-{index}"
+                        )),
+                        commit_id,
+                        deleted: false,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    },
+                    history_body_digest(
+                        crate::json_store::JsonSlotRef::None,
+                        crate::json_store::JsonSlotRef::None,
+                    ),
+                )
+            })
+            .collect();
+        let bodies = fixture_single_row_body_inventory(commit_id, &root, members);
+        fixture_commit_state_manifest(commit_id, mutations, Some(root), Some(bodies))
     }
 
     /// The point-replay authority cache must never return a manifest the
@@ -19041,7 +19313,11 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let error = stage_commit_state_manifest(&mut writes, &manifest)
             .expect_err("member-bearing LXCD17 manifests require the opaque publication proof");
-        assert!(error.message.contains("certified current-state publication"));
+        assert!(
+            error
+                .message
+                .contains("certified current-state publication")
+        );
     }
 
     #[tokio::test]
@@ -19239,7 +19515,11 @@ mod tests {
             .into_publication_parts(&writes, commit_id, staged.mutation_inventory())
             .err()
             .expect("post-seal segment mutation must invalidate the certificate");
-        assert!(error.message.contains("post-seal duplicate segment mutation"));
+        assert!(
+            error
+                .message
+                .contains("post-seal duplicate segment mutation")
+        );
     }
 
     #[test]
@@ -19270,6 +19550,15 @@ mod tests {
                 serving_base_root_id,
                 transition_digest,
             }));
+        let inventory = manifest
+            .authored_history_bodies
+            .as_mut()
+            .expect("member-bearing fixture has a body inventory");
+        inventory.source_root_id = [7; 32];
+        inventory.source_transition_digest = transition_digest;
+        inventory.closure_digest =
+            super::authored_history_body_closure_digest(manifest.commit_id, inventory)
+                .expect("rebound fixture inventory should hash");
 
         let encoded = encode_commit_state_manifest(&manifest).expect("manifest should encode");
         assert_eq!(
@@ -19303,6 +19592,16 @@ mod tests {
             .as_mut()
             .unwrap()
             .transition_digest[0] ^= 1;
+        let forged_transition = manifest
+            .current_state_scoped_ranges
+            .as_ref()
+            .unwrap()
+            .transition_digest;
+        let inventory = manifest.authored_history_bodies.as_mut().unwrap();
+        inventory.source_transition_digest = forged_transition;
+        inventory.closure_digest =
+            super::authored_history_body_closure_digest(manifest.commit_id, inventory)
+                .expect("forged fixture inventory should hash");
         let error = encode_commit_state_manifest(&manifest)
             .expect_err("forged scoped-range transition must fail closed");
         assert!(error.message.contains("transition"));
@@ -19602,31 +19901,6 @@ mod tests {
                 .expect("manifest should load"),
             Some(manifest)
         );
-    }
-
-    #[tokio::test]
-    async fn rootless_manifest_rejects_snapshot_authority() {
-        let mut original = commit_state_manifest_fixture();
-        original.replay_debt = CommitStateReplayDebt {
-            depth: 1,
-            rows: 1,
-            bytes: 64,
-        };
-        let rebuilt = TrackedStateCommitRoot {
-            commit_id: original.commit_id,
-            root_id: TrackedStateRootId::new([9; 32]),
-            parent_roots: vec![crate::tracked_state::types::TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("rebuild-parent"),
-                root_id: TrackedStateRootId::new([8; 32]),
-            }],
-            changed_key_count: 1,
-            row_count_estimate: 1,
-            tree_height: 1,
-        };
-        original.snapshot_root = Some(Box::new(rebuilt));
-        let error = encode_commit_state_manifest(&original)
-            .expect_err("rootless immutable authority must not accept a snapshot root");
-        assert!(error.message.contains("rootless"));
     }
 
     #[test]
