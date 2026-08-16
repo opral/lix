@@ -334,7 +334,9 @@ fn extract_sql_scope_schema_keys(sql: &str) -> Vec<String> {
             if table == "select" {
                 return vec![FULL_SYNC_SCOPE.to_owned()];
             }
-            if is_sync_control_schema(table) {
+            if is_sync_history_schema(table) {
+                scopes.insert(FULL_SYNC_SCOPE.to_owned());
+            } else if is_sync_control_schema(table) {
                 scopes.insert(CONTROL_SYNC_SCOPE.to_owned());
             } else if !table.starts_with("lix_") {
                 scopes.insert(table.clone());
@@ -355,13 +357,19 @@ fn is_sync_control_schema(schema_key: &str) -> bool {
     matches!(
         schema_key,
         "lix_branch"
-            | "lix_change"
-            | "lix_commit"
-            | "lix_commit_edge"
-            | "lix_diff"
-            | "lix_working_diff"
             | "lix_branch_descriptor"
             | "lix_branch_ref"
+    )
+}
+
+/// History and diff surfaces depend on commit/change topology rather than a
+/// single semantic row scope. Until commit packs are independently hydrated,
+/// these queries conservatively request the complete canonical event stream
+/// instead of risking a locally incomplete diff.
+fn is_sync_history_schema(schema_key: &str) -> bool {
+    matches!(
+        schema_key,
+        "lix_change" | "lix_commit" | "lix_commit_edge" | "lix_diff" | "lix_working_diff"
     )
 }
 
@@ -3794,7 +3802,7 @@ mod tests {
         );
         assert_eq!(
             extract_sql_scope_schema_keys("SELECT * FROM lix_diff"),
-            vec![CONTROL_SYNC_SCOPE.to_owned()]
+            vec![FULL_SYNC_SCOPE.to_owned()]
         );
         assert_eq!(
             extract_sql_scope_schema_keys("SELECT content FROM lix_file WHERE path = '/shared.md'"),
