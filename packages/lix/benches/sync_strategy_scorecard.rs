@@ -212,6 +212,10 @@ struct Counters {
     client_fsyncs: usize,
     #[serde(skip)]
     action_latencies_ns: Vec<u128>,
+    #[serde(skip)]
+    fast_forward_latencies_ns: Vec<u128>,
+    #[serde(skip)]
+    divergent_apply_latencies_ns: Vec<u128>,
     elapsed_ns: u128,
 }
 
@@ -228,6 +232,8 @@ struct ScorecardResult {
     no_lost_disjoint_writes: bool,
     server_operations_per_second: u64,
     catch_up_bytes_per_accepted_operation: usize,
+    fast_forward_p95_ns: u128,
+    divergent_apply_p95_ns: u128,
     p50_action_ns: u128,
     p95_action_ns: u128,
     counters: Counters,
@@ -463,6 +469,8 @@ impl Simulation {
                 .download_bytes
                 .checked_div(self.counters.accepted_operations.max(1))
                 .unwrap_or_default(),
+            fast_forward_p95_ns: percentile(&self.counters.fast_forward_latencies_ns, 95),
+            divergent_apply_p95_ns: percentile(&self.counters.divergent_apply_latencies_ns, 95),
             p50_action_ns: percentile(&self.counters.action_latencies_ns, 50),
             p95_action_ns: percentile(&self.counters.action_latencies_ns, 95),
             counters: self.counters,
@@ -679,7 +687,16 @@ impl Simulation {
             } else if has_pending {
                 self.counters.divergent_applies += 1;
             }
+            let apply_started = Instant::now();
             self.apply_record(client, &record);
+            let apply_elapsed = apply_started.elapsed().as_nanos();
+            if fast_forward {
+                self.counters.fast_forward_latencies_ns.push(apply_elapsed);
+            } else if has_pending {
+                self.counters
+                    .divergent_apply_latencies_ns
+                    .push(apply_elapsed);
+            }
         }
     }
 

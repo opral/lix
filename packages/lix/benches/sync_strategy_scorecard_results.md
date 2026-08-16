@@ -53,7 +53,10 @@ delivery in the simulator to use the fast-forward path. Commit-pack admission
 adds roughly 4% upload bytes without improving convergence or storage counts.
 The quick Criterion run measured these central-time ranges: tx + event
 189–866 µs, tx + commit 190–850 µs, and commit both ways 196–876 µs. The
-simulator's runtime is not a production decision: transaction-event pull wins
+The JSON output also records fast-forward/divergent-apply p95 and logical
+server operations/second, so the next adapter-backed run can apply the same
+gates to real storage costs. The simulator's runtime is not a production
+decision: transaction-event pull wins
 on the disjoint and branch-isolation cases, while transaction-commit pull wins
 on the other four. The next gate is an adapter-backed run using the real Lix
 server and FilesystemStorage/RocksDB counters before declaring a final format
