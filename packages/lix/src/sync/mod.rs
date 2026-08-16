@@ -34,13 +34,17 @@ use crate::binary_cas::BlobDataReader;
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphContext;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonSlot, JsonStoreContext};
+use crate::plugin::runtime::{is_reservation_key, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY};
 use crate::session::ExecuteIdempotency;
 use crate::storage_adapter::{
     Storage, StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StoragePrecondition, StorageProjectedValue, StorageReadOptions, StorageSpace,
     StorageSpaceId, StorageWriteOptions, StorageWriteSet, ValueSemantics, exact_get_many,
 };
-use crate::tracked_state::{TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter};
+use crate::tracked_state::{
+    TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateKey,
+    load_commit_delta_change_records,
+};
 use crate::transaction::PreparedWriteSet;
 use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 use crate::{CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, LixError, Value};
@@ -115,6 +119,12 @@ pub(crate) struct SyncModeState {
     scopes: Arc<RwLock<BTreeSet<String>>>,
     hydrated_scopes: Arc<RwLock<BTreeSet<String>>>,
     scope_notify: Arc<tokio::sync::Notify>,
+    /// Serializes canonical event application across foreground hydration,
+    /// the background worker, and topology backfills sharing one repository.
+    /// The graph identity check and its row/marker commit must be one local
+    /// critical section or two clients can both replay the same event and one
+    /// will advance the branch with a generated projection commit.
+    apply_gate: Arc<tokio::sync::Mutex<()>>,
     internal_scope_depth: Arc<AtomicU64>,
     /// Monotonically changes whenever the active branch changes. Hydration is
     /// asynchronous, so an old-branch worker must not publish readiness after
@@ -129,6 +139,7 @@ impl Default for SyncModeState {
             scopes: Arc::new(RwLock::new(BTreeSet::new())),
             hydrated_scopes: Arc::new(RwLock::new(BTreeSet::new())),
             scope_notify: Arc::new(tokio::sync::Notify::new()),
+            apply_gate: Arc::new(tokio::sync::Mutex::new(())),
             internal_scope_depth: Arc::new(AtomicU64::new(0)),
             scope_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -140,6 +151,10 @@ impl SyncModeState {
         self.role.read().map(|role| role.clone()).map_err(|_| {
             LixError::new(LixError::CODE_INTERNAL_ERROR, "sync mode state is poisoned")
         })
+    }
+
+    pub(crate) async fn lock_apply_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.apply_gate).lock_owned().await
     }
 
     pub(crate) fn set_role(&self, role: SyncRole) -> Result<(), LixError> {
@@ -338,6 +353,13 @@ fn extract_sql_scope_schema_keys(sql: &str) -> Vec<String> {
                 scopes.insert(FULL_SYNC_SCOPE.to_owned());
             } else if is_sync_control_schema(table) {
                 scopes.insert(CONTROL_SYNC_SCOPE.to_owned());
+            } else if table == "lix_registered_schema" && token == "from" {
+                // The catalog is always bootstrapped before an application
+                // relation is hydrated, but a direct catalog read still
+                // needs its own readiness demand. A local INSERT/UPDATE into
+                // this engine table must not turn a write into a network
+                // barrier.
+                scopes.insert(table.clone());
             } else if !table.starts_with("lix_") {
                 scopes.insert(table.clone());
             }
@@ -359,6 +381,13 @@ fn is_sync_control_schema(schema_key: &str) -> bool {
         "lix_branch"
             | "lix_branch_descriptor"
             | "lix_branch_ref"
+    )
+}
+
+fn is_file_projection_sync_schema(schema_key: &str) -> bool {
+    matches!(
+        schema_key,
+        "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
     )
 }
 
@@ -469,6 +498,14 @@ pub struct SyncRowMutation {
     pub row_pk: serde_json::Value,
     pub snapshot: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
+    /// Control-plane rows are global facts (`lix_branch_descriptor` and
+    /// `lix_branch_ref`) rather than branch-local semantic rows. They travel
+    /// in the same atomic transaction pack, but the server validates these
+    /// flags against the allow-listed control schemas before applying them.
+    #[serde(default)]
+    pub global: bool,
+    #[serde(default)]
+    pub untracked: bool,
 }
 
 /// Inline bytes belonging to a file mutation in a transaction pack.
@@ -526,6 +563,11 @@ pub struct SyncTransactionPack {
     pub branch_id: String,
     pub base_server_commit_id: String,
     pub local_commit_id: String,
+    /// Optional commit-graph parents supplied by a local merge/checkpoint.
+    /// Ordinary writes leave this empty and the server derives the first
+    /// parent from its authoritative admission head.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_commit_ids: Vec<String>,
     #[serde(default)]
     pub rows: Vec<SyncRowMutation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -554,6 +596,16 @@ pub(crate) fn validate_sync_transaction_pack(
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 format!("sync {field} must contain 1 to 255 bytes"),
+            ));
+        }
+    }
+    let mut parent_ids = BTreeSet::new();
+    for parent in &pack.parent_commit_ids {
+        let parent = CommitId::parse_lix(parent, "sync parent_commit_id")?;
+        if pack.local_commit_id == parent.to_string() || !parent_ids.insert(parent) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync pack contains an invalid parent topology",
             ));
         }
     }
@@ -604,6 +656,19 @@ pub(crate) fn validate_sync_transaction_pack(
                 "sync row fileId must contain at most 255 bytes",
             ));
         }
+        let control = is_sync_control_schema(&row.schema_key);
+        if row.global != control || row.untracked != (row.schema_key == "lix_branch_ref") {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync row control flags do not match its schema",
+            ));
+        }
+        if control && row.file_id.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync branch control rows cannot carry a fileId",
+            ));
+        }
     }
     for file in &pack.files {
         if file.file_id.is_empty() || file.file_id.len() > MAX_SYNC_SCOPE_KEY_BYTES {
@@ -650,6 +715,17 @@ fn validate_sync_canonical_event_identity(event: &SyncCanonicalEvent) -> Result<
             "sync canonical event has an invalid cursor or commit identity",
         ));
     }
+    let canonical = CommitId::parse_lix(&event.canonical_commit_id, "sync canonical commit_id")?;
+    let mut seen = BTreeSet::new();
+    for parent in &event.parent_commit_ids {
+        let parent = CommitId::parse_lix(parent, "sync canonical parent_commit_id")?;
+        if parent == canonical || !seen.insert(parent) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync canonical event contains an invalid parent topology",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -659,6 +735,10 @@ fn validate_sync_canonical_event_identity(event: &SyncCanonicalEvent) -> Result<
 pub struct SyncCanonicalEvent {
     pub cursor: u64,
     pub canonical_commit_id: String,
+    /// Ordered canonical parents. Older servers omitted this field; clients
+    /// retain the safe generated-parent fallback when it is absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_commit_ids: Vec<String>,
     /// Digest of the unfiltered canonical pack. Scoped responses retain it so
     /// applied markers compare the same event regardless of projection order.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -740,6 +820,15 @@ pub trait SyncTransport: Send + Sync {
     fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    /// Whether [`list_branches`](Self::list_branches) is an authoritative
+    /// catalog for this transport. The default is deliberately false: an
+    /// empty result from an embedded or test transport must not be interpreted
+    /// as proof that every local branch was deleted. Only an explicit catalog
+    /// implementation may drive destructive branch pruning.
+    fn has_authoritative_branch_catalog(&self) -> bool {
+        false
+    }
 }
 
 /// Browser/WASM variant of [`SyncTransport`] whose fetch futures and handles
@@ -764,15 +853,23 @@ pub trait SyncTransport {
     fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    fn has_authoritative_branch_catalog(&self) -> bool {
+        false
+    }
 }
 
 /// Applies the remote global branch catalog to a local repository. This is a
 /// control-plane reconciliation path, separate from semantic row events. A
 /// branch whose source commit is not materialized locally yet is left for a
-/// later pass rather than being created at an incorrect head.
+/// later pass rather than being created at an incorrect head. The post-flush
+/// pass may prune local branches absent from an explicitly authoritative
+/// catalog; the pre-flush pass deliberately does not, so an offline local
+/// branch can first enter the admission queue.
 pub(crate) async fn reconcile_sync_branches<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
+    prune_missing: bool,
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -780,6 +877,10 @@ where
 {
     let remote_branches = transport.list_branches().await?;
     let active_branch_id = lix.active_branch_id().await?;
+    let remote_ids = remote_branches
+        .iter()
+        .map(|branch| branch.id.clone())
+        .collect::<BTreeSet<_>>();
     for remote in remote_branches {
         if remote.id == active_branch_id || remote.id == GLOBAL_BRANCH_ID {
             continue;
@@ -800,10 +901,77 @@ where
                 .await
             {
                 // A lazy replica may not have materialized the branch's
-                // source commit yet. Leave this branch for a later catalog
-                // pass after its commit scope is requested.
+                // source commit yet. Install the control-plane descriptor and
+                // ref directly; topology/state hydration is handled by the
+                // branch-local demand path.
                 Err(error) if error.code == LixError::CODE_COMMIT_NOT_FOUND => {
-                    continue;
+                    hydrate_sync_commit_from_active_branch(
+                        lix,
+                        transport,
+                        &remote.commit_id,
+                    )
+                    .await?;
+                    if lix
+                        .create_branch(CreateBranchOptions {
+                            id: Some(remote.id.clone()),
+                            name: remote.name.clone(),
+                            from_commit_id: Some(remote.commit_id.clone()),
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    // If the source commit is not on the selected branch's
+                    // history, create a local placeholder from the current
+                    // head and replay the remote branch's canonical events
+                    // into that branch. This preserves the public branch
+                    // lifecycle while allowing lazy topology to arrive in
+                    // branch-local pages.
+                    if lix
+                        .create_branch(CreateBranchOptions {
+                            id: Some(remote.id.clone()),
+                            name: remote.name.clone(),
+                            from_commit_id: None,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        hydrate_sync_branch_events(lix, transport, &remote.id).await?;
+                        let _ = lix
+                            .execute(
+                                "INSERT INTO lix_branch (id, name, hidden, commit_id) VALUES ($1, $2, $3, $4) \
+                                 ON CONFLICT (id) DO UPDATE SET name = excluded.name, hidden = excluded.hidden, \
+                                 commit_id = excluded.commit_id",
+                                &[
+                                    Value::Text(remote.id.clone()),
+                                    Value::Text(remote.name.clone()),
+                                    Value::Boolean(remote.hidden),
+                                    Value::Text(remote.commit_id.clone()),
+                                ],
+                            )
+                            .await;
+                        continue;
+                    }
+                    let result = lix
+                        .execute(
+                            "INSERT INTO lix_branch (id, name, hidden, commit_id) VALUES ($1, $2, $3, $4)",
+                            &[
+                                Value::Text(remote.id.clone()),
+                                Value::Text(remote.name.clone()),
+                                Value::Boolean(remote.hidden),
+                                Value::Text(remote.commit_id.clone()),
+                            ],
+                        )
+                        .await;
+                    if let Err(insert_error) = result {
+                        if insert_error.code == LixError::CODE_COMMIT_NOT_FOUND
+                            || insert_error.code == LixError::CODE_FOREIGN_KEY
+                        {
+                            continue;
+                        }
+                        return Err(insert_error);
+                    }
                 }
                 Err(error) => return Err(error),
                 Ok(_) => {}
@@ -826,7 +994,15 @@ where
             || current_name.as_deref() != Some(remote.name.as_str())
             || current_hidden != Some(remote.hidden)
         {
-            lix.execute(
+            if current_commit.as_deref() != Some(remote.commit_id.as_str()) {
+                // Pull the branch's own event stream before updating its ref.
+                // This materializes source commits that are not ancestors of
+                // the currently selected branch (for example a feature head
+                // that will later become a merge parent).
+                hydrate_sync_branch_events(lix, transport, &remote.id).await?;
+                hydrate_sync_commit_from_active_branch(lix, transport, &remote.commit_id).await?;
+            }
+            let update = lix.execute(
                 "INSERT INTO lix_branch (id, name, hidden, commit_id) VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (id) DO UPDATE SET name = excluded.name, hidden = excluded.hidden, \
                  commit_id = excluded.commit_id",
@@ -837,10 +1013,183 @@ where
                     Value::Text(remote.commit_id),
                 ],
             )
+            .await;
+            if let Err(error) = update
+                && error.code != LixError::CODE_COMMIT_NOT_FOUND
+                && error.code != LixError::CODE_FOREIGN_KEY
+            {
+                return Err(error);
+            }
+        }
+    }
+    if prune_missing && transport.has_authoritative_branch_catalog() {
+        let default_branch_id = lix
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text(crate::init::DEFAULT_BRANCH_KEY.to_owned())],
+            )
+            .await?
+            .rows()
+            .first()
+            .and_then(|row| row.get::<serde_json::Value>("value").ok())
+            .and_then(|value| value.as_str().map(str::to_owned));
+        let local = lix
+            .execute(
+                "SELECT id FROM lix_branch WHERE id != $1",
+                &[Value::Text(GLOBAL_BRANCH_ID.to_owned())],
+            )
+            .await?;
+        for row in local.rows() {
+            let Some(branch_id) = row.get::<String>("id").ok() else {
+                continue;
+            };
+            if branch_id == active_branch_id
+                || default_branch_id.as_deref() == Some(branch_id.as_str())
+                || remote_ids.contains(branch_id.as_str())
+            {
+                continue;
+            }
+            // The worker session suppresses its own outbox, so this catalog
+            // cleanup cannot echo a remote deletion back to the server.
+            lix.execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id)],
+            )
             .await?;
         }
     }
     Ok(())
+}
+
+/// Backfills canonical semantic events for the currently selected branch
+/// until `commit_id` exists locally. Branch catalog entries can point at a
+/// commit that was skipped by a head-only lazy pull; replaying the filtered
+/// history here establishes the same commit identity and state topology
+/// before the ordinary branch lifecycle creates its ref.
+async fn hydrate_sync_commit_from_active_branch<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    commit_id: &str,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let target = CommitId::parse_lix(commit_id, "sync branch source commit_id")?;
+    let active_branch_id = lix.active_branch_id().await?;
+    let mut cursor = 0;
+    loop {
+        let response = transport
+            .pull(
+                &active_branch_id,
+                cursor,
+                DEFAULT_SYNC_PULL_LIMIT,
+                &[],
+            )
+            .await?;
+        require_sync_identity(
+            "topology pull branch",
+            &active_branch_id,
+            &response.branch_id,
+        )?;
+        let response_empty = response.events.is_empty();
+        for event in response.events {
+            cursor = event.cursor;
+            let canonical_commit_id = CommitId::parse_lix(
+                &event.canonical_commit_id,
+                "sync topology canonical commit_id",
+            )?;
+            let adapter = lix.storage_adapter();
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let mut graph = CommitGraphContext::new().reader(read);
+            if graph.load_node(&canonical_commit_id).await?.is_some() {
+                continue;
+            }
+            // A branch-control-only event may refer to the commit that is
+            // already the branch source. Its global ref cannot be replayed
+            // before that commit exists, so leave control rows to catalog
+            // reconciliation and only materialize semantic payloads here.
+            let mut semantic_event = event.clone();
+            semantic_event
+                .pack
+                .rows
+                .retain(|row| !is_sync_control_schema(&row.schema_key));
+            if !semantic_event.pack.rows.is_empty() || !semantic_event.pack.files.is_empty() {
+                lix.apply_sync_canonical_event(
+                    &semantic_event,
+                    transport.remote_id(),
+                    &[],
+                )
+                .await?;
+            }
+            let adapter = lix.storage_adapter();
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let mut graph = CommitGraphContext::new().reader(read);
+            if graph.load_node(&target).await?.is_some() {
+                return Ok(());
+            }
+        }
+        if cursor >= response.head_cursor || response_empty {
+            return Ok(());
+        }
+    }
+}
+
+/// Hydrates semantic canonical events for a branch that already has a local
+/// placeholder ref. Control rows are omitted because branch descriptors/refs
+/// are reconciled by the catalog and may point at a source commit that is
+/// still outside this replica's materialized topology.
+async fn hydrate_sync_branch_events<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    branch_id: &str,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let target = lix
+        .open_internal_session_suppressed(branch_id.to_owned(), lix.active_account_id().to_owned())
+        .await?;
+    let mut cursor = 0;
+    loop {
+        let response = transport
+            .pull(branch_id, cursor, DEFAULT_SYNC_PULL_LIMIT, &[])
+            .await?;
+        require_sync_identity("branch topology pull", branch_id, &response.branch_id)?;
+        let response_empty = response.events.is_empty();
+        for event in response.events {
+            cursor = event.cursor;
+            let canonical_commit_id = CommitId::parse_lix(
+                &event.canonical_commit_id,
+                "sync topology canonical commit_id",
+            )?;
+            let adapter = lix.storage_adapter();
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let mut graph = CommitGraphContext::new().reader(read);
+            if graph.load_node(&canonical_commit_id).await?.is_some() {
+                continue;
+            }
+            let mut semantic_event = event;
+            semantic_event
+                .pack
+                .rows
+                .retain(|row| !is_sync_control_schema(&row.schema_key));
+            if !semantic_event.pack.rows.is_empty() || !semantic_event.pack.files.is_empty() {
+                target
+                    .apply_sync_canonical_event(
+                        &semantic_event,
+                        transport.remote_id(),
+                        &[],
+                    )
+                    .await?;
+            }
+        }
+        if cursor >= response.head_cursor || response_empty {
+            break;
+        }
+    }
+    target.close().await
 }
 
 /// Durable result of draining a client's pending queue.
@@ -1202,6 +1551,8 @@ where
                 row_pk: entry.identity.row_pk().as_json_array_value()?,
                 snapshot,
                 metadata,
+                global: false,
+                untracked: false,
             });
         }
 
@@ -1210,6 +1561,7 @@ where
             branch_id,
             base_server_commit_id: base_server_commit_id.into(),
             local_commit_id: to_local_commit_id.to_owned(),
+            parent_commit_ids: Vec::new(),
             rows,
             files: Vec::new(),
         })
@@ -1227,7 +1579,7 @@ where
         pack: &SyncTransactionPack,
     ) -> Result<(), LixError> {
         validate_sync_transaction_pack(pack)?;
-        self.apply_sync_transaction_pack_inner(pack, None, None, None)
+        self.apply_sync_transaction_pack_inner(pack, None, None, None, None)
             .await
     }
 
@@ -1242,6 +1594,7 @@ where
         remote_id: &str,
         scopes: &[String],
     ) -> Result<(), LixError> {
+        let _apply_guard = self.sync_mode_state().lock_apply_gate().await;
         validate_sync_canonical_event_identity(event)?;
         validate_sync_transaction_pack(&event.pack)?;
         let pack_fingerprint = if event.pack_fingerprint.is_empty() {
@@ -1257,7 +1610,6 @@ where
         } else {
             scopes.to_vec()
         };
-        let file_view_requested = marker_scopes.iter().any(|scope| scope == "lix_file");
         let mut coverage_scopes = marker_scopes.clone();
         // `lix_file` is the aggregate receipt for the file view, including
         // every plugin schema rendered into it. Keeping one marker instead of
@@ -1317,46 +1669,36 @@ where
             &event.canonical_commit_id,
             "sync canonical commit_id",
         )?;
-        let canonical_already_local = {
+        let (canonical_already_local, canonical_parent_commit_ids) = {
             let graph_read = adapter.begin_read(StorageReadOptions::default()).await?;
             let mut graph = CommitGraphContext::new().reader(graph_read);
-            graph.load_node(&canonical_commit_id).await?.is_some()
+            let canonical_already_local = graph.load_node(&canonical_commit_id).await?.is_some();
+            let mut parent_ids = None;
+            if !event.parent_commit_ids.is_empty() {
+                let mut available = true;
+                for parent in &event.parent_commit_ids {
+                    let parent = CommitId::parse_lix(parent, "sync canonical parent_commit_id")?;
+                    if graph.load_node(&parent).await?.is_none() {
+                        available = false;
+                        break;
+                    }
+                }
+                if available {
+                    parent_ids = Some(event.parent_commit_ids.clone());
+                }
+            }
+            (canonical_already_local, parent_ids)
         };
         let replay_commit_id = (!canonical_already_local).then_some(event.canonical_commit_id.as_str());
 
         let mut pack = event.pack.clone();
-        if marker_scopes[0] != FULL_SYNC_SCOPE {
-            let wanted = marker_scopes.iter().cloned().collect::<HashSet<_>>();
-            pack.rows.retain(|row| {
-                let in_scope = wanted.contains(&row.schema_key)
-                    || (file_view_requested
-                        && row.file_id.is_some()
-                        && !row.schema_key.starts_with("lix_"));
-                let semantic_marker_covers_row = previous
-                    .get(&row.schema_key)
-                    .and_then(|marker| marker.as_ref())
-                    .is_some_and(|(_, marker)| {
-                        marker_covers_event(marker, event, &pack_fingerprint)
-                    });
-                let file_marker_covers_row = file_view_requested
-                    && row.file_id.is_some()
-                    && previous
-                        .get("lix_file")
-                        .and_then(|marker| marker.as_ref())
-                        .is_some_and(|(_, marker)| {
-                            marker_covers_event(marker, event, &pack_fingerprint)
-                        });
-                in_scope && !semantic_marker_covers_row && !file_marker_covers_row
-            });
-            if !file_view_requested {
-                pack.files.clear();
-            } else if previous
-                .get("lix_file")
-                .and_then(|marker| marker.as_ref())
-                .is_some_and(|(_, marker)| marker_covers_event(marker, event, &pack_fingerprint))
-            {
-                pack.files.clear();
-            }
+        if canonical_already_local {
+            // The first materialization fetched the complete canonical event.
+            // Later scope receipts only need a marker commit; replaying the
+            // same rows would create a local projection child and move the
+            // branch head away from the server's canonical commit.
+            pack.rows.clear();
+            pack.files.clear();
         }
         let markers = missing
             .into_iter()
@@ -1386,6 +1728,10 @@ where
             None,
             Some(&markers),
             replay_commit_id,
+            (!canonical_already_local)
+                .then_some(canonical_parent_commit_ids)
+                .flatten()
+                .as_deref(),
         )
             .await
     }
@@ -1429,7 +1775,13 @@ where
         authoritative_branch_id: &str,
     ) -> Result<(), LixError> {
         require_branch(authoritative_branch_id, &pack.branch_id)?;
-        self.apply_sync_transaction_pack_inner(pack, Some(authoritative_branch_id), None, None)
+        self.apply_sync_transaction_pack_inner(
+            pack,
+            Some(authoritative_branch_id),
+            None,
+            None,
+            None,
+        )
             .await
     }
 
@@ -1440,20 +1792,36 @@ where
     ) -> Result<SyncAdmission, LixError> {
         validate_sync_transaction_pack(pack)?;
         require_branch(&self.active_branch_id().await?, &pack.branch_id)?;
-        self.require_sync_base_on_active_branch(&pack.base_server_commit_id)
+        let canonical_base_commit_id = self
+            .require_sync_base_on_active_branch(&pack.base_server_commit_id)
             .await?;
+        let canonical_pack = canonicalize_sync_control_rows(pack, &canonical_base_commit_id)?;
+        if !canonical_pack.parent_commit_ids.is_empty() {
+            let adapter = self.storage_adapter();
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let mut graph = CommitGraphContext::new().reader(read);
+            for parent in &canonical_pack.parent_commit_ids {
+                let parent = CommitId::parse_lix(parent, "sync admission parent_commit_id")?;
+                if graph.load_node(&parent).await?.is_none() {
+                    return Err(LixError::new(
+                        LixError::CODE_COMMIT_NOT_FOUND,
+                        format!("sync admission parent commit '{parent}' is not materialized"),
+                    ));
+                }
+            }
+        }
         let admission_plan = self.sync_admission_plan(&pack.branch_id).await?;
         let mut transaction = self.begin_transaction().await?;
         require_branch(transaction.active_branch_id()?, &pack.branch_id)?;
         let transaction_branch_id = transaction.active_branch_id()?.to_owned();
-        let rows = sync_write_batch(pack, &transaction_branch_id)?;
-        if !rows.is_empty() || !pack.files.is_empty() {
+        let rows = sync_write_batch(&canonical_pack, &transaction_branch_id)?;
+        if !rows.is_empty() || !canonical_pack.files.is_empty() {
             transaction
-                .stage_sync_pack(rows, pack.files.clone())
+                .stage_sync_pack(rows, canonical_pack.files.clone())
                 .await?;
         }
         let admission = transaction
-            .stage_sync_admission_receipt(idempotency, pack, admission_plan)
+            .stage_sync_admission_receipt(idempotency, &canonical_pack, admission_plan)
             .await?;
         transaction.commit().await?;
         Ok(admission)
@@ -1675,6 +2043,7 @@ where
         authoritative_branch_id: Option<&str>,
         applied_markers: Option<&[(SyncAppliedEventMarker, Option<Vec<u8>>)]>,
         canonical_commit_id: Option<&str>,
+        canonical_parent_commit_ids: Option<&[String]>,
     ) -> Result<(), LixError> {
         // The canonical event was validated before projection. A projection
         // can legitimately become empty when an overlapping lazy scope has
@@ -1708,7 +2077,12 @@ where
             }
         }
         transaction
-            .stage_sync_pack_with_commit_id(rows, pack.files.clone(), canonical_commit_id)
+            .stage_sync_pack_with_commit_and_parents(
+                rows,
+                pack.files.clone(),
+                canonical_commit_id,
+                canonical_parent_commit_ids,
+            )
             .await?;
         if let Some(markers) = applied_markers {
             transaction.stage_sync_applied_event_markers(markers)?;
@@ -1747,25 +2121,80 @@ fn filter_sync_event(
     event
 }
 
-/// Applies the same lazy scope projection to a transaction pack without
-/// changing its operation/branch/cursor identity. Keeping this helper shared
-/// by server responses and pending-overlay comparisons is important: a
-/// multi-schema local transaction is expected to compare equal to its
-/// projected canonical event, not to the full unfiltered pack.
+/// Applies the lazy scope projection to a transaction pack without changing
+/// its operation/branch/cursor identity.
+///
+/// A canonical commit is an atomic graph node. Once a requested scope touches
+/// a commit, the complete pack must be retained so that later scope hydration
+/// cannot create a second, divergent local projection of the same commit. The
+/// projection therefore skips unrelated commits, but never slices a matching
+/// commit row-by-row.
 fn filter_sync_pack(pack: &mut SyncTransactionPack, schema_scope: &SyncFilterScope<'_>) {
     // A file read is a demand for its plugin-owned semantic rows as well as
     // raw bytes. Those rows carry stable file IDs; keeping them here lets each
     // replica run its own plugin renderer instead of treating file bytes as
     // canonical state.
-    pack.rows.retain(|row| {
+    let touches_scope = pack.rows.iter().any(|row| {
         schema_scope.keys.contains(row.schema_key.as_str())
             || (schema_scope.wants_file_views
                 && row.file_id.is_some()
-                && !row.schema_key.starts_with("lix_"))
-    });
-    if !schema_scope.wants_file_views {
+                && (!row.schema_key.starts_with("lix_")
+                    || is_file_projection_sync_schema(&row.schema_key)))
+    }) || (schema_scope.wants_file_views && !pack.files.is_empty());
+    if !touches_scope {
+        pack.rows.clear();
         pack.files.clear();
     }
+}
+
+fn sync_packs_match_admission_projection(
+    expected: &SyncTransactionPack,
+    actual: &SyncTransactionPack,
+) -> bool {
+    if expected.operation_id != actual.operation_id
+        || expected.branch_id != actual.branch_id
+        || expected.base_server_commit_id != actual.base_server_commit_id
+        || expected.local_commit_id != actual.local_commit_id
+        || expected.files != actual.files
+        || expected.rows.len() != actual.rows.len()
+    {
+        return false;
+    }
+    expected
+        .rows
+        .iter()
+        .zip(&actual.rows)
+        .all(|(expected, actual)| {
+            if expected.schema_key != actual.schema_key
+                || expected.file_id != actual.file_id
+                || expected.row_pk != actual.row_pk
+                || expected.metadata != actual.metadata
+                || expected.global != actual.global
+                || expected.untracked != actual.untracked
+            {
+                return false;
+            }
+            if expected.schema_key != "lix_branch_ref" {
+                return expected.snapshot == actual.snapshot;
+            }
+            let Some(expected_snapshot) = expected.snapshot.as_ref() else {
+                return actual.snapshot.is_none();
+            };
+            let Some(actual_snapshot) = actual.snapshot.as_ref() else {
+                return false;
+            };
+            let (Some(expected_object), Some(actual_object)) =
+                (expected_snapshot.as_object(), actual_snapshot.as_object())
+            else {
+                return false;
+            };
+            let mut expected_object = expected_object.clone();
+            let Some(actual_commit_id) = actual_object.get("commit_id") else {
+                return false;
+            };
+            expected_object.insert("commit_id".to_owned(), actual_commit_id.clone());
+            expected_object == *actual_object
+        })
 }
 
 impl<StorageImpl, Transport> SyncClient<StorageImpl, Transport>
@@ -1885,6 +2314,11 @@ where
                         ),
                     ));
                 }
+                // A lazy head-only pull may advance the authoritative cursor
+                // without returning the event payload. The optimistic local
+                // transaction is already visible, so acknowledge the exact
+                // pending operation once its cursor is known to be published.
+                self.remove_pending_operation(&admission.operation_id);
             }
         }
         self.pull_to_head().await?;
@@ -1962,7 +2396,13 @@ where
             })
             .cloned()
             .collect::<Vec<_>>();
-        let schema_scope = (!full_hydrated).then(|| SyncFilterScope::new(&schema_keys));
+        // Canonical live events are fetched unfiltered. A commit must be
+        // materialized once as one local graph node; applying a schema
+        // projection first and a second projection later would require a
+        // child commit and would make the branch head differ from the server.
+        // Query-derived filtering remains in `hydrate_scope`, which is the
+        // cold-history path where lazy retention matters.
+        let schema_scope = None;
         if schema_keys.is_empty() && !full_hydrated {
             return self.pull_head_only().await;
         }
@@ -1973,7 +2413,7 @@ where
                     &self.state.branch_id,
                     self.state.cursor,
                     DEFAULT_SYNC_PULL_LIMIT,
-                    &schema_keys,
+                    &[],
                 )
                 .await?;
             require_sync_identity("pull branch", &self.state.branch_id, &response.branch_id)?;
@@ -2280,7 +2720,7 @@ where
             if let Some(schema_scope) = schema_scope {
                 filter_sync_pack(&mut expected, schema_scope);
             }
-            if expected != *event_pack {
+            if !sync_packs_match_admission_projection(&expected, event_pack) {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     format!(
@@ -3069,6 +3509,7 @@ pub(crate) fn stage_sync_event_publication(
     pack: &SyncTransactionPack,
     canonical_commit_id: &str,
     plan: &SyncAdmissionPlan,
+    parent_commit_ids: &[String],
 ) -> Result<SyncCanonicalEvent, LixError> {
     validate_sync_transaction_pack(pack)?;
     validate_sync_branch_id(&pack.branch_id)?;
@@ -3087,6 +3528,7 @@ pub(crate) fn stage_sync_event_publication(
     let event = SyncCanonicalEvent {
         cursor: plan.cursor,
         canonical_commit_id: canonical_commit_id.to_owned(),
+        parent_commit_ids: parent_commit_ids.to_vec(),
         pack_fingerprint,
         pack: pack.clone(),
     };
@@ -3155,19 +3597,52 @@ where
         .copied()
         .flatten()
         .map_or_else(|| commit_id.clone(), |parent| parent.to_string());
-    let rows = prepared_sync_rows(prepared, branch_id)?;
+    let mut rows = prepared_sync_rows(prepared, branch_id)?;
+    append_selected_sync_rows(read, prepared, branch_id, &mut rows).await?;
+    rows.retain(|row| !is_engine_managed_sync_row(row));
     let files = prepared_sync_files(blob_reader, prepared, branch_id).await?;
+    if sync_pack_has_semantic_rows(&rows) {
+        // Plugin-backed rows are canonical. Their filesystem projections are
+        // regenerated by the normal transaction pipeline on the receiving
+        // replica; carrying the generated descriptor/blob rows as well would
+        // stage each projection twice.
+        rows.retain(|row| !is_file_projection_sync_schema(&row.schema_key));
+    } else if !files.is_empty() {
+        // A native file mutation is the source of truth for live projection
+        // rows. Preserve only tombstones (rename/delete cleanup); live rows
+        // are generated from the file payload using its canonical file ID.
+        rows.retain(|row| {
+            !is_file_projection_sync_schema(&row.schema_key) || row.snapshot.is_none()
+        });
+    }
+    if files.iter().any(is_plugin_archive_sync_file) {
+        rows.retain(|row| row.schema_key != "lix_registered_schema");
+    }
     if rows.is_empty() && files.is_empty() {
         return Ok(false);
     }
-    let pack = SyncTransactionPack {
+    let mut pack = SyncTransactionPack {
         operation_id: format!("server:{commit_id}"),
         branch_id: branch_id.to_owned(),
         base_server_commit_id,
         local_commit_id: commit_id.clone(),
+        parent_commit_ids: Vec::new(),
         rows,
         files,
     };
+    let mut parent_commit_ids = prepared
+        .first_commit_parent_override_by_branch
+        .get(branch_id)
+        .copied()
+        .or_else(|| parent_heads.get(branch_id).copied().flatten())
+        .into_iter()
+        .map(|parent| parent.to_string())
+        .collect::<Vec<_>>();
+    if let Some(extra) = prepared.extra_commit_parents_by_branch.get(branch_id) {
+        parent_commit_ids.extend(extra.iter().map(ToString::to_string));
+    }
+    parent_commit_ids.retain(|parent| parent != &commit_id);
+    pack.parent_commit_ids = parent_commit_ids.clone();
     let stored = load_sync_head(read, branch_id).await?;
     let cursor = stored
         .as_ref()
@@ -3178,7 +3653,14 @@ where
         cursor,
         previous_head_value: stored.map(|(value, _)| value),
     };
-    stage_sync_event_publication(writes, preconditions, &pack, &commit_id, &plan)?;
+    stage_sync_event_publication(
+        writes,
+        preconditions,
+        &pack,
+        &commit_id,
+        &plan,
+        &parent_commit_ids,
+    )?;
     Ok(true)
 }
 
@@ -3196,15 +3678,41 @@ pub(crate) async fn stage_local_transaction_outbox<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let Some(change_refs) = prepared.commit_change_refs_by_branch.get(branch_id) else {
-        return Ok(false);
-    };
-    let rows = prepared_sync_rows(prepared, branch_id)?;
+    let mut rows = prepared_sync_rows(prepared, branch_id)?;
+    append_selected_sync_rows(read, prepared, branch_id, &mut rows).await?;
+    rows.retain(|row| !is_engine_managed_sync_row(row));
     let files = prepared_sync_files(blob_reader, prepared, branch_id).await?;
+    if sync_pack_has_semantic_rows(&rows) {
+        rows.retain(|row| !is_file_projection_sync_schema(&row.schema_key));
+    } else if !files.is_empty() {
+        rows.retain(|row| {
+            !is_file_projection_sync_schema(&row.schema_key) || row.snapshot.is_none()
+        });
+    }
+    if files.iter().any(is_plugin_archive_sync_file) {
+        rows.retain(|row| row.schema_key != "lix_registered_schema");
+    }
     if rows.is_empty() && files.is_empty() {
         return Ok(false);
     }
-    let commit_id = change_refs.commit_id.to_string();
+    // Branch-control rows are committed on the global control branch by the
+    // ordinary transaction planner, while the replica admission stream is
+    // pinned to the caller's active branch. Use the transaction's first
+    // finalized commit as the local identity regardless of which branch owns
+    // that commit; the server assigns the authoritative branch commit during
+    // admission. Semantic branch-local writes still take their own branch's
+    // commit identity.
+    let commit_id = prepared
+        .commit_change_refs_by_branch
+        .get(branch_id)
+        .or_else(|| prepared.commit_change_refs_by_branch.values().next())
+        .map(|refs| refs.commit_id.to_string())
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync control rows have no finalized transaction commit",
+            )
+        })?;
     let Some(manifest) = load_sync_client_manifest(read, remote_id, branch_id).await? else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -3217,6 +3725,10 @@ where
             "sync replica has not observed a server head",
         )
     })?;
+    let mut parent_commit_ids = vec![base_server_commit_id.clone()];
+    if let Some(extra) = prepared.extra_commit_parents_by_branch.get(branch_id) {
+        parent_commit_ids.extend(extra.iter().map(ToString::to_string));
+    }
     let operation_id = format!("client:{commit_id}");
     if manifest
         .pending_operations
@@ -3233,6 +3745,7 @@ where
         branch_id: branch_id.to_owned(),
         base_server_commit_id,
         local_commit_id: commit_id,
+        parent_commit_ids,
         rows,
         files,
     };
@@ -3318,10 +3831,17 @@ fn prepared_sync_rows(
         .state_rows
         .iter()
         .filter(|row| {
-            !row.untracked
-                && !row.global
-                && row.branch_id.as_str() == branch_id
-                && ordinary_sync_schema(row.schema_key.as_str())
+            let is_control = is_sync_control_schema(row.schema_key.as_str());
+            if is_control {
+                row.global
+                    && row.branch_id.as_str() == GLOBAL_BRANCH_ID
+                    && row.untracked == (row.schema_key == "lix_branch_ref")
+            } else {
+                !row.untracked
+                    && !row.global
+                    && row.branch_id.as_str() == branch_id
+                    && ordinary_sync_schema(row.schema_key.as_str())
+            }
         })
         .map(|row| {
             Ok(SyncRowMutation {
@@ -3330,9 +3850,149 @@ fn prepared_sync_rows(
                 row_pk: row.row_pk.as_json_array_value()?,
                 snapshot: row.snapshot.map(|value| value.value().clone()),
                 metadata: row.metadata.map(|value| value.value().clone()),
+                global: row.global,
+                untracked: row.untracked,
             })
         })
         .collect()
+}
+
+/// Merge commits retain source changes as immutable selected references rather
+/// than restaging every selected row in `state_rows`.  The selected reference
+/// is enough for the local commit materializer, but a sync event must carry a
+/// self-contained semantic row payload so a replica can apply the same merge
+/// without already having the source branch's changelog.  Resolve those
+/// references in one batch per source commit and append only rows that were
+/// not already materialized by plugin-specific merge resolution.
+async fn append_selected_sync_rows<R>(
+    read: &R,
+    prepared: &PreparedWriteSet,
+    branch_id: &str,
+    rows: &mut Vec<SyncRowMutation>,
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let Some(change_refs) = prepared.commit_change_refs_by_branch.get(branch_id) else {
+        return Ok(());
+    };
+    let selected = change_refs
+        .selected_changes()
+        .filter(|change| ordinary_sync_schema(change.schema_key()))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let mut source_requests = BTreeMap::<CommitId, Vec<(usize, TrackedStateKey)>>::new();
+    for (index, change) in selected.iter().enumerate() {
+        if change.deleted {
+            continue;
+        }
+        source_requests
+            .entry(change.source_commit_id)
+            .or_default()
+            .push((
+                index,
+                TrackedStateKey {
+                    schema_key: change.schema_key().to_owned(),
+                    file_id: change.file_id().map(str::to_owned),
+                    row_pk: change.row_pk().clone(),
+                },
+            ));
+    }
+    let mut payloads = vec![None; selected.len()];
+    for (source_commit_id, requests) in source_requests {
+        let keys = requests
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        let records = load_commit_delta_change_records(read, source_commit_id, &keys).await?;
+        let mut materialize = Vec::with_capacity(records.len());
+        let mut positions = Vec::with_capacity(records.len());
+        for ((index, _), record) in requests.into_iter().zip(records) {
+            let Some(record) = record else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "sync merge selected change at source commit '{source_commit_id}' has no payload"
+                    ),
+                ));
+            };
+            positions.push(index);
+            materialize.push(record);
+        }
+        let hydrated = crate::changelog::materialize_known_change_payloads_in_order(
+            read,
+            materialize.into_iter(),
+            crate::changelog::ChangeRecordProjection::full(),
+        )
+        .await?;
+        for (index, (change_id, payload)) in positions.into_iter().zip(hydrated) {
+            if change_id != selected[index].change_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync merge selected payload identity does not match its change reference",
+                ));
+            }
+            payloads[index] = Some(payload);
+        }
+    }
+
+    for (index, change) in selected.into_iter().enumerate() {
+        let snapshot = if change.deleted {
+            None
+        } else {
+            let payload = payloads[index].as_ref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync merge selected live row is missing its payload",
+                )
+            })?;
+            let snapshot = payload.snapshot_content.as_deref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync merge selected live row has no snapshot payload",
+                )
+            })?;
+            Some(serde_json::from_str(snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("decode sync merge selected row snapshot: {error}"),
+                )
+            })?)
+        };
+        let metadata = payloads[index]
+            .as_ref()
+            .and_then(|payload| payload.metadata.as_deref())
+            .map(|metadata| {
+                serde_json::from_str(metadata).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("decode sync merge selected row metadata: {error}"),
+                    )
+                })
+            })
+            .transpose()?;
+        let row_pk = change.row_pk().as_json_array_value()?;
+        let duplicate = rows.iter().any(|existing| {
+            existing.schema_key == change.schema_key()
+                && existing.file_id.as_deref() == change.file_id()
+                && existing.row_pk == row_pk
+        });
+        if !duplicate {
+            rows.push(SyncRowMutation {
+                schema_key: change.schema_key().to_owned(),
+                file_id: change.file_id().map(str::to_owned),
+                row_pk,
+                snapshot,
+                metadata,
+                global: false,
+                untracked: false,
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn prepared_sync_files(
@@ -3401,7 +4061,52 @@ async fn prepared_sync_files(
 
 fn ordinary_sync_schema(schema_key: &str) -> bool {
     !schema_key.starts_with("lix_")
-        || matches!(schema_key, "lix_registered_schema" | "lix_key_value")
+        || matches!(
+            schema_key,
+            "lix_registered_schema"
+                | "lix_key_value"
+                | "lix_file_descriptor"
+                | "lix_directory_descriptor"
+                | "lix_binary_blob_ref"
+        )
+}
+
+/// Plugin installation and file-ownership rows are engine-managed state. They
+/// can appear in the same canonical commit as user rows, but replaying them as
+/// ordinary sync writes would trip the transaction reservation guard (and a
+/// replica may legitimately have a different local plugin catalog). Keep the
+/// canonical commit/topology while omitting only these non-replayable rows.
+fn is_engine_managed_sync_row(row: &SyncRowMutation) -> bool {
+    if row.schema_key != "lix_key_value" {
+        return false;
+    }
+    let row_key = row
+        .row_pk
+        .as_array()
+        .and_then(|parts| parts.first())
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            row.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("key"))
+                .and_then(serde_json::Value::as_str)
+        });
+    row_key.is_some_and(|key| {
+        matches!(key, PLUGIN_REGISTRY_KEY | PLUGIN_OWNER_KEY) || is_reservation_key(key)
+    })
+}
+
+fn is_plugin_archive_sync_file(file: &SyncFileMutation) -> bool {
+    file.path
+        .as_deref()
+        .is_some_and(|path| path.starts_with("/.lix/plugins/"))
+}
+
+fn sync_pack_has_semantic_rows(rows: &[SyncRowMutation]) -> bool {
+    rows.iter().any(|row| {
+        !is_sync_control_schema(&row.schema_key)
+            && !is_file_projection_sync_schema(&row.schema_key)
+    })
 }
 
 async fn load_sync_head<R>(
@@ -3467,8 +4172,22 @@ fn sync_write_batch(
     pack: &SyncTransactionPack,
     branch_id: &str,
 ) -> Result<RawWriteBatch, LixError> {
+    let has_semantic_rows = sync_pack_has_semantic_rows(&pack.rows);
     let mut rows = RawWriteBatch::with_capacity(pack.rows.len());
-    for mutation in &pack.rows {
+    for mutation in pack
+        .rows
+        .iter()
+        .filter(|mutation| {
+            !is_engine_managed_sync_row(mutation)
+                && !(has_semantic_rows && is_file_projection_sync_schema(&mutation.schema_key))
+                && !(!has_semantic_rows
+                    && !pack.files.is_empty()
+                    && is_file_projection_sync_schema(&mutation.schema_key)
+                    && mutation.snapshot.is_some())
+                && !(pack.files.iter().any(is_plugin_archive_sync_file)
+                    && mutation.schema_key == "lix_registered_schema")
+        })
+    {
         let row_pk =
             crate::row_pk::RowPk::from_json_array_value(&mutation.row_pk).map_err(|error| {
                 LixError::new(
@@ -3493,14 +4212,60 @@ fn sync_write_batch(
             origin: None,
             created_at: None,
             updated_at: None,
-            global: false,
+            global: mutation.global,
             change_id: None,
             commit_id: None,
-            untracked: false,
-            branch_id: branch_id.to_owned().into(),
+            untracked: mutation.untracked,
+            branch_id: if mutation.global {
+                GLOBAL_BRANCH_ID.to_owned().into()
+            } else {
+                branch_id.to_owned().into()
+            },
         });
     }
     Ok(rows)
+}
+
+/// Rewrites branch-ref control rows to the authoritative source head during
+/// admission. A local replica may have a different commit identifier for the
+/// same optimistic branch head; publishing that identifier would violate the
+/// server's foreign-key contract. The descriptor remains byte-for-byte as
+/// proposed, while the server-owned ref points at the canonical base.
+pub(crate) fn canonicalize_sync_control_rows(
+    pack: &SyncTransactionPack,
+    canonical_base_commit_id: &str,
+) -> Result<SyncTransactionPack, LixError> {
+    validate_sync_transaction_pack(pack)?;
+    CommitId::parse_lix(canonical_base_commit_id, "sync canonical branch base commit_id")?;
+    let mut canonical = pack.clone();
+    if !canonical.parent_commit_ids.is_empty() {
+        canonical.parent_commit_ids[0] = canonical_base_commit_id.to_owned();
+        let mut seen = BTreeSet::new();
+        canonical.parent_commit_ids.retain(|parent| {
+            CommitId::parse_lix(parent, "sync canonical parent_commit_id").is_ok()
+                && seen.insert(parent.clone())
+        });
+    }
+    for row in &mut canonical.rows {
+        if row.schema_key != "lix_branch_ref" {
+            continue;
+        }
+        let Some(snapshot) = row.snapshot.as_mut() else {
+            continue;
+        };
+        let object = snapshot.as_object_mut().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync branch ref snapshot must be a JSON object",
+            )
+        })?;
+        object.insert(
+            "commit_id".to_owned(),
+            serde_json::Value::String(canonical_base_commit_id.to_owned()),
+        );
+    }
+    validate_sync_transaction_pack(&canonical)?;
+    Ok(canonical)
 }
 
 async fn materialize_diff_payload<S>(
@@ -3618,12 +4383,14 @@ mod tests {
         let event = SyncCanonicalEvent {
             cursor: 1,
             canonical_commit_id: "canonical-1".to_owned(),
+            parent_commit_ids: Vec::new(),
             pack_fingerprint: String::new(),
             pack: SyncTransactionPack {
                 operation_id: "operation-1".to_owned(),
                 branch_id,
                 base_server_commit_id: "base".to_owned(),
                 local_commit_id: "local".to_owned(),
+                parent_commit_ids: Vec::new(),
                 rows: vec![SyncRowMutation {
                     schema_key: "lix_key_value".to_owned(),
                     file_id: None,
@@ -3633,6 +4400,8 @@ mod tests {
                         "value": "once"
                     })),
                     metadata: None,
+                    global: false,
+                    untracked: false,
                 }],
                 files: Vec::new(),
             },
@@ -3713,18 +4482,22 @@ mod tests {
         let mut event = SyncCanonicalEvent {
             cursor: 1,
             canonical_commit_id: "canonical-marker-order".to_owned(),
+            parent_commit_ids: Vec::new(),
             pack_fingerprint: String::new(),
             pack: SyncTransactionPack {
                 operation_id: "operation-marker-order".to_owned(),
                 branch_id,
                 base_server_commit_id: "base".to_owned(),
                 local_commit_id: "local".to_owned(),
+                parent_commit_ids: Vec::new(),
                 rows: vec![SyncRowMutation {
                     schema_key: "sync_marker_row".to_owned(),
                     file_id: Some(file_id.to_owned()),
                     row_pk: serde_json::json!(["row-1"]),
                     snapshot: Some(serde_json::json!({"id": "row-1", "value": "one"})),
                     metadata: None,
+                    global: false,
+                    untracked: false,
                 }],
                 files: vec![SyncFileMutation {
                     file_id: file_id.to_owned(),
@@ -3797,6 +4570,10 @@ mod tests {
             vec!["lix_file".to_owned()]
         );
         assert_eq!(
+            extract_sql_scope_schema_keys("SELECT value FROM lix_registered_schema"),
+            vec!["lix_registered_schema".to_owned()]
+        );
+        assert_eq!(
             extract_sql_scope_schema_keys("SELECT id, commit_id FROM lix_branch"),
             vec![CONTROL_SYNC_SCOPE.to_owned()]
         );
@@ -3836,12 +4613,15 @@ mod tests {
             row_pk: serde_json::json!(["id"]),
             snapshot: Some(serde_json::json!({"value": "x"})),
             metadata: None,
+            global: false,
+            untracked: false,
         };
         let pack = SyncTransactionPack {
             operation_id: "op".to_owned(),
             branch_id: "branch".to_owned(),
             base_server_commit_id: "base".to_owned(),
             local_commit_id: "local".to_owned(),
+            parent_commit_ids: Vec::new(),
             rows: vec![row; MAX_SYNC_PACK_ROWS + 1],
             files: Vec::new(),
         };
@@ -3850,26 +4630,37 @@ mod tests {
     }
 
     #[test]
-    fn scoped_projection_matches_only_the_requested_part_of_a_multi_schema_pack() {
+    fn scoped_projection_retains_a_matching_commit_as_an_atomic_pack() {
         let row = |schema_key: &str| SyncRowMutation {
             schema_key: schema_key.to_owned(),
             file_id: None,
             row_pk: serde_json::json!([schema_key]),
             snapshot: Some(serde_json::json!({"value": schema_key})),
             metadata: None,
+            global: false,
+            untracked: false,
         };
         let mut pack = SyncTransactionPack {
             operation_id: "op".to_owned(),
             branch_id: "branch".to_owned(),
             base_server_commit_id: "base".to_owned(),
             local_commit_id: "local".to_owned(),
+            parent_commit_ids: Vec::new(),
             rows: vec![row("first"), row("second")],
             files: Vec::new(),
         };
         let scope_keys = vec!["first".to_owned()];
         let scope = SyncFilterScope::new(&scope_keys);
         filter_sync_pack(&mut pack, &scope);
-        assert_eq!(pack.rows.len(), 1);
+        assert_eq!(pack.rows.len(), 2);
         assert_eq!(pack.rows[0].schema_key, "first");
+        assert_eq!(pack.rows[1].schema_key, "second");
+
+        let mut unrelated = pack.clone();
+        let unrelated_keys = ["missing".to_owned()];
+        let unrelated_scope = SyncFilterScope::new(&unrelated_keys);
+        filter_sync_pack(&mut unrelated, &unrelated_scope);
+        assert!(unrelated.rows.is_empty());
+        assert!(unrelated.files.is_empty());
     }
 }

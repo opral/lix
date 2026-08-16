@@ -55,6 +55,22 @@ state so history, diff, working diff, undo/redo, and merge behavior remain
 equivalent across replicas. Plugin rows are canonical synchronization data;
 files are projections loaded only when requested.
 
+The current prototype has one deliberate topology constraint: live polling
+pulls canonical events unfiltered so a commit is materialized as one graph
+node with all parents. Cold scope hydration is filtered at event granularity
+(unrelated commits transfer only their cursor identity; a matching commit is
+kept atomically). A future commit-skeleton/row-pack split is required before
+live polling can be filtered without risking a missing parent or a divergent
+local graph.
+
+Internal branch-catalog reconciliation runs in a sync-suppressed worker
+session, so catalog maintenance cannot echo a remote branch back into the
+outbox. After a successful flush it removes local non-default, non-active
+branches absent from an explicitly authoritative catalog; the pre-flush pass
+leaves offline local branches intact long enough to be admitted. Embedded or
+custom transports that cannot enumerate branches never trigger destructive
+pruning.
+
 ## Acceptance criteria
 
 - Cached `execute()` performs zero network requests and stays within 10% of
@@ -74,6 +90,48 @@ files are projections loaded only when requested.
   lag, bytes transferred, retained storage, and scope hit rate.
 - Correctness, durability, security, and performance receive independent
   sub-agent review before the implementation is considered production-ready.
+
+## Prototype measurements
+
+The checked-in `sync_lazy_profile` benchmark measures the protocol's JSON
+framing and scope projection, not database throughput. On the seeded mixed
+trace, scoped payload bytes were reduced by 86.2% (16×64 events/rows), 88.5%
+(128×64), and 89.2% (512×128). The strategy scorecard likewise reports
+convergence, duplicate-admission safety, offline replay, branch isolation, and
+wire/storage counters for transaction-admission/event-pull versus commit-pack
+variants. Those numbers are deterministic simulator evidence; production
+gates still require real FilesystemStorage/RocksDB runs measuring cached-read
+latency, cold hydration p50/p95, replication lag, and retained bytes.
+
+## Remaining production work
+
+The 90% path is implemented and covered by Rust unit tests, 20 protocol tests,
+and a 12-test two-replica/filesystem/plugin matrix. The following are explicit
+follow-ups rather than hidden semantics:
+
+- replace unfiltered live pulls with a topology skeleton plus independently
+  hydrated row/blob packs;
+- make pending-overlay replay idempotent without repeatedly generating local
+  projection commits;
+- provide a certified bootstrap for a fresh replica whose server already has
+  history (the current safe behavior rejects an uncertified divergent start);
+- make ambiguous durable-receipt recovery work with RocksDB-backed
+  FilesystemStorage after a server restart;
+- paginate branch catalogs and broaden SQL/API scope inference for every
+  history/system surface, including explicit transaction and prepared-DML
+  reads;
+- defer `observe()` binding until its first hydrated evaluation, and make merge
+  and merge-preview wait for branch-control topology before resolving a remote
+  source branch;
+- canonicalize same-path native-file identity when two replicas write the
+  path concurrently, so later rename/delete events cannot leave an orphaned
+  file identity;
+- make branch deletion safe when the deleted ref is currently selected and
+  key hydration readiness by branch/session rather than one process-wide mark;
+- cover plugin archive installation on a fresh replica (not only replicas that
+  already have the plugin installed);
+- run real backend benchmarks and independent security/performance review
+  before calling the protocol production-ready.
 
 ## Non-goals
 

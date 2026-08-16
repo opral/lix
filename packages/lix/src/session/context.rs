@@ -170,6 +170,9 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
     pub(super) sync_mode: SyncModeState,
+    /// Internal sync sessions apply canonical rows and must not enqueue those
+    /// maintenance writes as new client proposals.
+    pub(super) sync_outbox_suppressed: bool,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
@@ -344,6 +347,7 @@ where
             observe_coordinator,
             observe_invalidation,
             sync_mode,
+            sync_outbox_suppressed: false,
             plugin_host,
             telemetry,
             transaction_manager,
@@ -360,6 +364,10 @@ where
 
     pub fn is_closed(&self) -> bool {
         self.transaction_manager.is_closed()
+    }
+
+    pub(crate) fn set_sync_outbox_suppressed(&mut self, suppressed: bool) {
+        self.sync_outbox_suppressed = suppressed;
     }
 
     /// Returns the immutable account that authors every change from this session.
@@ -570,6 +578,9 @@ where
         self.ensure_open()?;
         let mut transaction = opened.transaction;
         transaction.set_sync_role(self.sync_mode.role()?);
+        if self.sync_outbox_suppressed {
+            transaction.suppress_ordinary_sync_event();
+        }
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
         if planner_validation_is_serialized {
             transaction.trust_serialized_filesystem_planner();

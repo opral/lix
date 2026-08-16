@@ -179,29 +179,48 @@ where
                     // transaction and intermittently return
                     // LIX_INVALID_TRANSACTION_STATE.
                     let worker_session = worker_lix
-                        .open_internal_session(
+                        .open_internal_session_suppressed(
                             active_branch_id,
                             worker_lix.active_account_id().to_owned(),
                         )
                         .await?;
                     let topology_transport = current.clone();
+                    // Materialize branch-local source commits before pulling
+                    // the selected branch's merge events. Otherwise a merge
+                    // event can be admitted while its second parent is still
+                    // outside the local graph and the replica would have to
+                    // fall back to a one-parent projection permanently.
+                    {
+                        let _scope_guard =
+                            worker_lix.sync_mode_state().begin_internal_scope();
+                        let _ = reconcile_sync_branches(
+                            &worker_session,
+                            &topology_transport,
+                            false,
+                        )
+                        .await;
+                    }
                     let mut client = worker_session.sync_lifecycle(current).await?;
                     let result = client.flush().await;
-                    worker_session.close().await?;
                     if result.is_ok() {
                         // Topology is independent of the row cursor. Run it
                         // after the normal flush so a slow/unsupported branch
                         // catalog can never delay first-row hydration.
                         let _scope_guard = worker_lix.sync_mode_state().begin_internal_scope();
-                        if reconcile_sync_branches(&worker_lix, &topology_transport)
-                            .await
-                            .is_ok()
+                        if reconcile_sync_branches(
+                            &worker_session,
+                            &topology_transport,
+                            true,
+                        )
+                        .await
+                        .is_ok()
                         {
                             worker_lix
                                 .sync_mode_state()
                                 .mark_scope_hydrated(super::CONTROL_SYNC_SCOPE);
                         }
                     }
+                    worker_session.close().await?;
                     result
                 });
                 let delay = match result {
@@ -219,6 +238,7 @@ where
                         idle_delay
                     }
                     Err(error) => {
+                        tracing::warn!(error = ?error, "sync runtime iteration failed");
                         // The server may have restarted or evicted this
                         // session. Re-handshake on the next iteration; durable
                         // local state keeps the cursor and pending queue

@@ -1,10 +1,10 @@
 //! Profile the payload that lazy schema scoping can avoid transferring.
 //!
 //! The current eager path serializes every canonical event in a pull page. The
-//! lazy path keeps the same cursor/event framing but removes row payloads for
-//! schemas outside the client's demand scope. This benchmark measures the
-//! representative wire-size and JSON work for mixed repositories; it is a
-//! baseline for the follow-up optimization rather than a synthetic backend
+//! lazy path keeps the same cursor/event framing, skips commits that do not
+//! touch the demanded schema, and retains a matching commit as one atomic pack.
+//! This benchmark measures the representative wire-size and JSON work for a
+//! mixed repository; it is a protocol baseline rather than a synthetic backend
 //! throughput claim.
 
 use std::hint::black_box;
@@ -18,14 +18,17 @@ fn events(event_count: usize, rows_per_event: usize) -> Vec<SyncCanonicalEvent> 
         .map(|event| SyncCanonicalEvent {
             cursor: event as u64 + 1,
             canonical_commit_id: format!("commit-{event}"),
+            parent_commit_ids: Vec::new(),
+            pack_fingerprint: String::new(),
             pack: SyncTransactionPack {
                 operation_id: format!("server:{event}"),
                 branch_id: "main".to_owned(),
                 base_server_commit_id: "server-head".to_owned(),
                 local_commit_id: format!("commit-{event}"),
+                parent_commit_ids: Vec::new(),
                 rows: (0..rows_per_event)
                     .map(|row| {
-                        let schema = if row % 10 == 0 {
+                        let schema = if event % 10 == 0 && row == 0 {
                             "needed_schema"
                         } else {
                             "unrelated_schema"
@@ -39,6 +42,8 @@ fn events(event_count: usize, rows_per_event: usize) -> Vec<SyncCanonicalEvent> 
                                 "payload": "lazy-sync-profile-row"
                             })),
                             metadata: None,
+                            global: false,
+                            untracked: false,
                         }
                     })
                     .collect(),
@@ -53,10 +58,15 @@ fn filtered(events: &[SyncCanonicalEvent]) -> Vec<SyncCanonicalEvent> {
         .iter()
         .cloned()
         .map(|mut event| {
-            event
+            let touches_scope = event
                 .pack
                 .rows
-                .retain(|row| row.schema_key == "needed_schema");
+                .iter()
+                .any(|row| row.schema_key == "needed_schema");
+            if !touches_scope {
+                event.pack.rows.clear();
+                event.pack.files.clear();
+            }
             event
         })
         .collect()

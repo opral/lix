@@ -489,6 +489,8 @@ impl Simulation {
             row_pk: json!([write.row_key]),
             snapshot: Some(json!({"id": write.row_key, "value": write.value})),
             metadata: None,
+            global: false,
+            untracked: false,
         };
         let files = if self.scenario.shape == Shape::FileProjection {
             vec![SyncFileMutation {
@@ -513,6 +515,7 @@ impl Simulation {
             branch_id: write.branch_id,
             base_server_commit_id: replica.confirmed_commit.clone(),
             local_commit_id,
+            parent_commit_ids: Vec::new(),
             rows: vec![row],
             files,
         });
@@ -637,6 +640,7 @@ impl Simulation {
         let event = SyncCanonicalEvent {
             cursor: self.server.cursor,
             canonical_commit_id: self.server.head_commit.clone(),
+            parent_commit_ids: vec![parent_commit_id.clone()],
             pack_fingerprint: String::new(),
             pack: canonical_pack.clone(),
         };

@@ -92,6 +92,9 @@ where
             };
         self.ensure_open()?;
         opened.transaction.set_sync_role(self.sync_mode.role()?);
+        if self.sync_outbox_suppressed {
+            opened.transaction.suppress_ordinary_sync_event();
+        }
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
@@ -150,6 +153,14 @@ where
 
     pub(crate) fn relabel_sync_commit(&mut self, canonical_commit_id: &str) -> Result<(), LixError> {
         self.transaction_mut()?.relabel_sync_commit(canonical_commit_id)
+    }
+
+    pub(crate) fn stage_sync_commit_parents(
+        &mut self,
+        parent_commit_ids: &[String],
+    ) -> Result<(), LixError> {
+        self.transaction_mut()?
+            .stage_sync_commit_parents(parent_commit_ids)
     }
 
     pub(crate) async fn stage_sync_admission_receipt(

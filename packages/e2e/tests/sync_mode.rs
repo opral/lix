@@ -202,6 +202,361 @@ async fn server_created_branch_becomes_visible_on_sync_replicas() {
     }
     assert_eq!(server_branch.id, branch_id);
 
+    server_lix
+        .execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch_id.to_owned())],
+        )
+        .await
+        .expect("delete server branch");
+    wait_for_branch_absent(&alice, branch_id).await;
+    wait_for_branch_absent(&bob, branch_id).await;
+
+    alice.close().await.expect("close alice");
+    bob.close().await.expect("close bob");
+    server_lix.close().await.expect("close server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_branch_creation_replicates_through_sync_admission() {
+    let server_lix = Arc::new(open_lix().await.expect("open server repository"));
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) = serve_protocol(protocol).await;
+    server_lix
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+            &[Value::Text(ROW_SCHEMA.to_owned())],
+        )
+        .await
+        .expect("register synchronized schema");
+
+    let alice_dir = TempDir::new().expect("alice tempdir");
+    let bob_dir = TempDir::new().expect("bob tempdir");
+    let alice = open_lix()
+        .with_storage(
+            FilesystemStorage::new(alice_dir.path())
+                .open()
+                .expect("open alice storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open alice replica");
+    let bob = open_lix()
+        .with_storage(
+            FilesystemStorage::new(bob_dir.path())
+                .open()
+                .expect("open bob storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open bob replica");
+
+    let branch_id = "0198a000-0000-7000-8000-0000000000d1";
+    let created = alice
+        .create_branch(lix::CreateBranchOptions {
+            id: Some(branch_id.to_owned()),
+            name: "alice-feature".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create branch on alice");
+    assert_eq!(created.id, branch_id);
+
+    wait_for_branch(server_lix.as_ref(), branch_id).await;
+    wait_for_branch(&bob, branch_id).await;
+    let server_row = server_lix
+        .execute(
+            "SELECT name, commit_id FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch_id.to_owned())],
+        )
+        .await
+        .expect("read server branch")
+        .rows()
+        .first()
+        .cloned()
+        .expect("server branch row");
+    for replica in [&alice, &bob] {
+        let row = replica
+            .execute(
+                "SELECT name, commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id.to_owned())],
+            )
+            .await
+            .expect("read replicated branch")
+            .rows()
+            .first()
+            .cloned()
+            .expect("replicated branch row");
+        assert_eq!(
+            row.get::<String>("name").unwrap(),
+            server_row.get::<String>("name").unwrap()
+        );
+        assert_eq!(
+            row.get::<String>("commit_id").unwrap(),
+            server_row.get::<String>("commit_id").unwrap()
+        );
+    }
+
+    // Deleting a branch is an ordinary global-control write from the
+    // application's point of view. It should travel through the same local
+    // outbox and disappear from every replica's normal branch catalog.
+    alice
+        .execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch_id.to_owned())],
+        )
+        .await
+        .expect("delete branch on alice");
+    wait_for_branch_absent(server_lix.as_ref(), branch_id).await;
+    wait_for_branch_absent(&bob, branch_id).await;
+
+    alice.close().await.expect("close alice");
+    bob.close().await.expect("close bob");
+    server_lix.close().await.expect("close server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_diff_and_working_diff_hydrate_canonical_sync_topology() {
+    let server_lix = Arc::new(open_lix().await.expect("open server repository"));
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) = serve_protocol(protocol).await;
+    server_lix
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+            &[Value::Text(ROW_SCHEMA.to_owned())],
+        )
+        .await
+        .expect("register synchronized schema");
+    server_lix
+        .execute(
+            "INSERT INTO sync_mode_row (row_id, value) VALUES ('history', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed history row");
+    let seed_head = active_head(server_lix.as_ref()).await;
+
+    let alice_dir = TempDir::new().expect("alice tempdir");
+    let bob_dir = TempDir::new().expect("bob tempdir");
+    let alice = open_lix()
+        .with_storage(
+            FilesystemStorage::new(alice_dir.path())
+                .open()
+                .expect("open alice storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open alice replica");
+    let bob = open_lix()
+        .with_storage(
+            FilesystemStorage::new(bob_dir.path())
+                .open()
+                .expect("open bob storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open bob replica");
+
+    server_lix
+        .execute(
+            "UPDATE sync_mode_row SET value = 'after' WHERE row_id = 'history'",
+            &[],
+        )
+        .await
+        .expect("write remote history change");
+    wait_for_named_value(&bob, "history", "after").await;
+    let updated_head = active_head(server_lix.as_ref()).await;
+
+    let diff = bob
+        .execute(
+            "SELECT diff_type FROM lix_diff($1, $2) WHERE schema_key = 'sync_mode_row'",
+            &[Value::Text(seed_head.clone()), Value::Text(updated_head.clone())],
+        )
+        .await
+        .expect("sync diff should hydrate canonical history");
+    assert_eq!(diff.rows().len(), 1, "one row should differ across heads");
+
+    alice
+        .execute(
+            "UPDATE sync_mode_row SET value = 'local' WHERE row_id = 'history'",
+            &[],
+        )
+        .await
+        .expect("write local optimistic change");
+    let working_diff = alice
+        .execute(
+            "SELECT COUNT(*) AS entries FROM lix_working_diff WHERE schema_key = 'sync_mode_row'",
+            &[],
+        )
+        .await
+        .expect("working diff should stay local");
+    assert_eq!(
+        working_diff.rows()[0].get::<i64>("entries").unwrap(),
+        1,
+        "local pending edit must appear in working diff"
+    );
+
+    alice.close().await.expect("close alice");
+    bob.close().await.expect("close bob");
+    server_lix.close().await.expect("close server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_commit_topology_and_branch_head_replicate_without_conflict_api() {
+    let template_dir = TempDir::new().expect("template tempdir");
+    let main_branch_id = {
+        let seed = open_lix()
+            .with_storage(
+                FilesystemStorage::new(template_dir.path())
+                    .open()
+                    .expect("open template storage"),
+            )
+            .await
+            .expect("open template repository");
+        seed.execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+            &[Value::Text(ROW_SCHEMA.to_owned())],
+        )
+        .await
+        .expect("register synchronized schema");
+        seed.execute(
+            "INSERT INTO sync_mode_row (row_id, value) VALUES ('merge-base', 'base')",
+            &[],
+        )
+        .await
+        .expect("seed merge base");
+        let main_branch_id = seed.active_branch_id().await.expect("main branch id");
+        seed.create_branch(lix::CreateBranchOptions {
+            id: Some("0198a000-0000-7000-8000-0000000000e1".to_owned()),
+            name: "merge-feature".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create merge feature branch");
+        seed.close().await.expect("close template repository");
+        main_branch_id
+    };
+
+    let server_dir = TempDir::new().expect("server tempdir");
+    let alice_dir = TempDir::new().expect("alice tempdir");
+    let bob_dir = TempDir::new().expect("bob tempdir");
+    copy_directory(template_dir.path(), server_dir.path());
+    copy_directory(template_dir.path(), alice_dir.path());
+    copy_directory(template_dir.path(), bob_dir.path());
+
+    let server_lix = Arc::new(
+        open_lix()
+            .with_storage(
+                FilesystemStorage::new(server_dir.path())
+                    .open()
+                    .expect("open server storage"),
+            )
+            .await
+            .expect("open server repository"),
+    );
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) = serve_protocol(protocol).await;
+    let alice = open_lix()
+        .with_storage(
+            FilesystemStorage::new(alice_dir.path())
+                .open()
+                .expect("open alice storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open alice replica");
+    let bob = open_lix()
+        .with_storage(
+            FilesystemStorage::new(bob_dir.path())
+                .open()
+                .expect("open bob storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open bob replica");
+
+    server_lix
+        .execute(
+            "INSERT INTO sync_mode_row (row_id, value) VALUES ('merge-main', 'main')",
+            &[],
+        )
+        .await
+        .expect("create divergent main change");
+
+    let feature_branch_id = "0198a000-0000-7000-8000-0000000000e1";
+    server_lix
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: feature_branch_id.to_owned(),
+        })
+        .await
+        .expect("switch server to feature branch");
+    server_lix
+        .execute(
+            "INSERT INTO sync_mode_row (row_id, value) VALUES ('merge-feature', 'feature')",
+            &[],
+        )
+        .await
+        .expect("write feature branch change");
+    let feature_head = active_head(server_lix.as_ref()).await;
+    server_lix
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: main_branch_id.clone(),
+        })
+        .await
+        .expect("switch server to main branch");
+    let main_head_before_merge = active_head(server_lix.as_ref()).await;
+    let merge = server_lix
+        .merge_branch(lix::MergeBranchOptions {
+            source_branch_id: feature_branch_id.to_owned(),
+        })
+        .await
+        .expect("merge feature branch into main");
+    let server_main_head = active_head(server_lix.as_ref()).await;
+    assert_eq!(merge.target_head_after_commit_id, server_main_head);
+
+    wait_for_named_value(&alice, "merge-feature", "feature").await;
+    wait_for_named_value(&bob, "merge-feature", "feature").await;
+    for replica in [&alice, &bob] {
+        let head = active_head(replica).await;
+        assert_eq!(head, server_main_head, "merge head must be canonical on replicas");
+        let branch_row = replica
+            .execute(
+                "SELECT commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(main_branch_id.clone())],
+            )
+            .await
+            .expect("read replicated main branch")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        assert_eq!(branch_row, server_main_head);
+        let parents = replica
+            .execute(
+                "SELECT parent_id, parent_order FROM lix_commit_edge \
+                 WHERE child_id = $1 ORDER BY parent_order",
+                &[Value::Text(server_main_head.clone())],
+            )
+            .await
+            .expect("read replicated merge parents")
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("parent_id").unwrap(),
+                    row.get::<i64>("parent_order").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parents,
+            vec![(main_head_before_merge.clone(), 0), (feature_head.clone(), 1)],
+            "replicas must retain the canonical two-parent merge topology"
+        );
+    }
+
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
     server_lix.close().await.expect("close server");
@@ -260,6 +615,78 @@ async fn binary_file_bytes_follow_sync_mode_between_filesystem_replicas() {
 
     wait_for_binary_file(&bob, payload).await;
     wait_for_binary_file(server_lix.as_ref(), payload).await;
+
+    alice.close().await.expect("close alice");
+    bob.close().await.expect("close bob");
+    server_lix.close().await.expect("close server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_renames_and_deletes_follow_sync_mode() {
+    let server_lix = Arc::new(open_lix().await.expect("open server repository"));
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) = serve_protocol(protocol).await;
+    server_lix
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+            &[Value::Text(ROW_SCHEMA.to_owned())],
+        )
+        .await
+        .expect("register synchronized schema");
+    server_lix
+        .execute(
+            "INSERT INTO sync_mode_row (row_id, value) VALUES ('seed', 'seed')",
+            &[],
+        )
+        .await
+        .expect("seed canonical sync event");
+    let alice_dir = TempDir::new().expect("alice tempdir");
+    let bob_dir = TempDir::new().expect("bob tempdir");
+    let alice = open_lix()
+        .with_storage(
+            FilesystemStorage::new(alice_dir.path())
+                .open()
+                .expect("open alice filesystem storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open alice sync replica");
+    let bob = open_lix()
+        .with_storage(
+            FilesystemStorage::new(bob_dir.path())
+                .open()
+                .expect("open bob filesystem storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open bob sync replica");
+
+    let payload = b"rename-delete";
+    alice
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/before.bin', $1)",
+            &[Value::Blob(payload.to_vec().into())],
+        )
+        .await
+        .expect("write file before rename");
+    wait_for_file_at(&bob, "/before.bin", payload).await;
+
+    alice
+        .execute(
+            "UPDATE lix_file SET path = '/after.bin' WHERE path = '/before.bin'",
+            &[],
+        )
+    .await
+    .expect("rename file");
+    wait_for_file_at(&bob, "/after.bin", payload).await;
+    wait_for_file_absent(&bob, "/before.bin").await;
+
+    alice
+        .execute("DELETE FROM lix_file WHERE path = '/after.bin'", &[])
+        .await
+        .expect("delete renamed file");
+    wait_for_file_absent(&bob, "/after.bin").await;
 
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
@@ -658,6 +1085,18 @@ where
     .unwrap_or_else(|_| panic!("timed out waiting for synchronized value '{expected}'"));
 }
 
+async fn active_head<S>(lix: &Lix<S>) -> String
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("read active branch head")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("active branch head commit id")
+}
+
 async fn wait_for_named_value<S>(lix: &Lix<S>, row_id: &str, expected: &str)
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -710,6 +1149,29 @@ where
     .unwrap_or_else(|_| panic!("timed out waiting for branch '{branch_id}'"));
 }
 
+async fn wait_for_branch_absent<S>(lix: &Lix<S>, branch_id: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let result = lix
+                .execute(
+                    "SELECT id FROM lix_branch WHERE id = $1",
+                    &[Value::Text(branch_id.to_owned())],
+                )
+                .await
+                .expect("read synchronized branch deletion");
+            if result.rows().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for branch '{branch_id}' deletion"));
+}
+
 async fn wait_for_file<S>(lix: &Lix<S>, expected: &[u8])
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -738,12 +1200,20 @@ async fn wait_for_binary_file<S>(lix: &Lix<S>, expected: &[u8])
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    wait_for_file_at(lix, "/binary.bin", expected).await;
+}
+
+async fn wait_for_file_at<S>(lix: &Lix<S>, path: &str, expected: &[u8])
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let path = path.to_owned();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let result = lix
                 .execute(
-                    "SELECT content FROM lix_file WHERE path = '/binary.bin'",
-                    &[],
+                    "SELECT content FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.clone())],
                 )
                 .await
                 .expect("read synchronized binary file");
@@ -759,6 +1229,30 @@ where
     })
     .await
     .expect("timed out waiting for synchronized binary file");
+}
+
+async fn wait_for_file_absent<S>(lix: &Lix<S>, path: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let path = path.to_owned();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let result = lix
+                .execute(
+                    "SELECT id FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.clone())],
+                )
+                .await
+                .expect("read synchronized file absence");
+            if result.rows().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for synchronized file deletion");
 }
 
 async fn install_markdown_plugin<S>(lix: &Lix<S>)

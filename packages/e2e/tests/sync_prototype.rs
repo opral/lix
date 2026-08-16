@@ -1368,6 +1368,7 @@ fn sync_client_does_not_acknowledge_an_operation_id_with_another_payload() {
             events: vec![SyncCanonicalEvent {
                 cursor: 1,
                 canonical_commit_id: local_head.clone(),
+                parent_commit_ids: Vec::new(),
                 pack_fingerprint: String::new(),
                 pack: other_pack,
             }],

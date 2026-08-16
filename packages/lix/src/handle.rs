@@ -359,6 +359,19 @@ where
         self.engine.sync_mode()
     }
 
+    /// API-level operations that inspect commit/branch state use the same
+    /// lazy readiness barrier as SQL. Local writes still run immediately; the
+    /// barrier is only entered when an operation cannot be answered from the
+    /// currently materialized repository.
+    async fn ensure_sync_api_scope(&self, sql_shape: &str) -> Result<(), LixError> {
+        let sync_mode = self.engine.sync_mode();
+        if matches!(sync_mode.role()?, crate::sync::SyncRole::Replica { .. }) {
+            sync_mode.register_sql_scope(sql_shape);
+            sync_mode.wait_for_scope_hydration().await?;
+        }
+        Ok(())
+    }
+
     /// Starts configuring another independent session for this repository.
     ///
     /// Await the returned builder directly, or call
@@ -408,6 +421,29 @@ where
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
     ) -> Result<Self, LixError> {
+        self.open_internal_session_with_sync_suppression(
+            active_branch_id,
+            active_account_id,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_internal_session_suppressed(
+        &self,
+        active_branch_id: impl Into<String>,
+        active_account_id: impl Into<String>,
+    ) -> Result<Self, LixError> {
+        self.open_internal_session_with_sync_suppression(active_branch_id, active_account_id, true)
+            .await
+    }
+
+    async fn open_internal_session_with_sync_suppression(
+        &self,
+        active_branch_id: impl Into<String>,
+        active_account_id: impl Into<String>,
+        suppress_sync_outbox: bool,
+    ) -> Result<Self, LixError> {
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
@@ -431,6 +467,8 @@ where
             .engine
             .open_session_at_with_account(active_branch_id, active_account_id)
             .await?;
+        let mut session = session;
+        session.set_sync_outbox_suppressed(suppress_sync_outbox);
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
@@ -700,20 +738,37 @@ where
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
-        self.session.create_branch(options).await
+        let retry_options = options.clone();
+        match self.session.create_branch(options).await {
+            Ok(receipt) => Ok(receipt),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    LixError::CODE_COMMIT_NOT_FOUND | LixError::CODE_BRANCH_NOT_FOUND
+                ) =>
+            {
+                self.ensure_sync_api_scope("SELECT * FROM lix_commit")
+                    .await?;
+                self.session.create_branch(retry_options).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
+        self.ensure_sync_api_scope("SELECT * FROM lix_commit").await?;
         self.session.create_checkpoint().await
     }
 
     /// Reverses the latest undoable tracked commit on this handle's active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
+        self.ensure_sync_api_scope("SELECT * FROM lix_commit").await?;
         self.session.undo().await
     }
 
     /// Replays the latest tracked commit abandoned by undo on this handle's active branch.
     pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
+        self.ensure_sync_api_scope("SELECT * FROM lix_commit").await?;
         self.session.redo().await
     }
 
@@ -730,7 +785,20 @@ where
                     Some(gate) => Some(gate.lock().await),
                     None => None,
                 };
-                let receipt = self.session.switch_branch(options).await?;
+                let retry_options = options.clone();
+                let receipt = match self.session.switch_branch(options).await {
+                    Ok(receipt) => receipt,
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            LixError::CODE_BRANCH_NOT_FOUND | LixError::CODE_COMMIT_NOT_FOUND
+                        ) => {
+                        self.ensure_sync_api_scope("SELECT * FROM lix_branch")
+                            .await?;
+                        self.session.switch_branch(retry_options).await?
+                    }
+                    Err(error) => return Err(error),
+                };
                 // Keep the selected branch durable even when the process goes
                 // offline immediately after switching. The sync worker also
                 // persists this mapping after a successful re-handshake, but
@@ -762,6 +830,7 @@ where
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
+        self.ensure_sync_api_scope("SELECT * FROM lix_commit").await?;
         self.session.merge_branch(options).await
     }
 
@@ -778,6 +847,7 @@ where
         &self,
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
+        self.ensure_sync_api_scope("SELECT * FROM lix_commit").await?;
         self.session.merge_branch_preview(options).await
     }
 
@@ -919,6 +989,17 @@ where
         files: Vec<crate::sync::SyncFileMutation>,
         canonical_commit_id: Option<&str>,
     ) -> Result<(), LixError> {
+        self.stage_sync_pack_with_commit_and_parents(rows, files, canonical_commit_id, None)
+            .await
+    }
+
+    pub(crate) async fn stage_sync_pack_with_commit_and_parents(
+        &mut self,
+        rows: crate::transaction_types::RawWriteBatch,
+        files: Vec<crate::sync::SyncFileMutation>,
+        canonical_commit_id: Option<&str>,
+        parent_commit_ids: Option<&[String]>,
+    ) -> Result<(), LixError> {
         self.inner.suppress_ordinary_sync_event()?;
         for file in files {
             let path = file.path.ok_or_else(|| {
@@ -927,15 +1008,26 @@ where
                     "sync file mutation is missing its logical path",
                 )
             })?;
+            // File IDs are part of the canonical row identity. Keeping them
+            // stable across replicas is what lets a later descriptor-only
+            // rename find the existing blob reference instead of creating a
+            // second empty projection row.
             self.execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[Value::Text(path), Value::Blob(file.content.into())],
+                &[
+                    Value::Text(file.file_id),
+                    Value::Text(path),
+                    Value::Blob(file.content.into()),
+                ],
             )
             .await?;
         }
         if !rows.is_empty() {
             self.stage_sync_rows(rows).await?;
+        }
+        if let Some(parent_commit_ids) = parent_commit_ids {
+            self.inner.stage_sync_commit_parents(parent_commit_ids)?;
         }
         if let Some(canonical_commit_id) = canonical_commit_id {
             self.inner.relabel_sync_commit(canonical_commit_id)?;

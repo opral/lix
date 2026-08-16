@@ -6815,6 +6815,24 @@ where
             .replace_commit_id(&self.active_branch_id, generated, canonical)
     }
 
+    pub(crate) fn stage_sync_commit_parents(
+        &self,
+        parent_commit_ids: &[String],
+    ) -> Result<(), LixError> {
+        let Some(first) = parent_commit_ids.first() else {
+            return Ok(());
+        };
+        let first = CommitId::parse_lix(first, "sync canonical first parent commit_id")?;
+        self.staged_writes
+            .set_first_commit_parent(self.active_branch_id.clone(), first)?;
+        for parent in parent_commit_ids.iter().skip(1) {
+            let parent = CommitId::parse_lix(parent, "sync canonical parent commit_id")?;
+            self.staged_writes
+                .add_commit_parent(self.active_branch_id.clone(), parent)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn stage_sync_admission_receipt(
         &mut self,
         idempotency: &ExecuteIdempotency,
@@ -6852,12 +6870,25 @@ where
         }
         let mut writes = self.storage.new_write_set();
         let mut preconditions = Vec::new();
+        let parent_commit_ids = if pack.parent_commit_ids.is_empty() {
+            (pack.base_server_commit_id != canonical_commit_id)
+                .then(|| pack.base_server_commit_id.clone())
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            pack.parent_commit_ids.clone()
+        };
+        let parent_commit_ids = parent_commit_ids
+            .into_iter()
+            .filter(|parent| parent != &canonical_commit_id)
+            .collect::<Vec<_>>();
         crate::sync::stage_sync_event_publication(
             &mut writes,
             &mut preconditions,
             pack,
             &canonical_commit_id,
             &plan,
+            &parent_commit_ids,
         )?;
         self.atomic_metadata_writes = Some(writes);
         self.atomic_metadata_preconditions = preconditions;

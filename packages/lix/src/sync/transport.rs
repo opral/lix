@@ -123,7 +123,7 @@ impl SyncTransport for HttpSyncTransport {
 
     fn pull<'a>(
         &'a self,
-        _branch_id: &'a str,
+        branch_id: &'a str,
         after_cursor: u64,
         limit: usize,
         schema_keys: &'a [String],
@@ -136,6 +136,7 @@ impl SyncTransport for HttpSyncTransport {
                 .query(&[
                     ("after", after_cursor.to_string()),
                     ("limit", limit.to_string()),
+                    ("branch", branch_id.to_owned()),
                 ]);
             // Omit `schemas` for an unscoped pull. Sending an empty value is a
             // meaningful filtered request on the server and would otherwise
@@ -162,6 +163,10 @@ impl SyncTransport for HttpSyncTransport {
                 .map_err(|error| transport_error("list sync branches", error))?;
             decode_response(response, "list sync branches").await
         })
+    }
+
+    fn has_authoritative_branch_catalog(&self) -> bool {
+        true
     }
 }
 

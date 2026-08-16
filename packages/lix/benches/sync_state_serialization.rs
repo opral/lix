@@ -31,6 +31,7 @@ fn fixture(queue_len: usize) -> (SyncManifestProbe, Vec<SyncTransactionPack>) {
             branch_id: "main".to_owned(),
             base_server_commit_id: "server-head".to_owned(),
             local_commit_id: format!("local:{operation}"),
+            parent_commit_ids: Vec::new(),
             rows: vec![SyncRowMutation {
                 schema_key: "benchmark_row".to_owned(),
                 file_id: Some("file-1".to_owned()),
@@ -40,6 +41,8 @@ fn fixture(queue_len: usize) -> (SyncManifestProbe, Vec<SyncTransactionPack>) {
                     "payload": "sync serialization fixture"
                 })),
                 metadata: None,
+                global: false,
+                untracked: false,
             }],
             files: Vec::new(),
         })

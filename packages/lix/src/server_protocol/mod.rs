@@ -2399,7 +2399,16 @@ where
 {
     let response = lease
         .run_cancellable_read(move |lix| async move {
-            let branch_id = lix.active_branch_id().await?;
+            let session_branch_id = lix.active_branch_id().await?;
+            let branch_id = request.branch.clone().unwrap_or(session_branch_id.clone());
+            let target = if branch_id == session_branch_id {
+                None
+            } else {
+                Some(
+                    lix.open_internal_session(branch_id.clone(), lix.active_account_id().to_owned())
+                        .await?,
+                )
+            };
             if request
                 .schemas
                 .as_deref()
@@ -2414,13 +2423,28 @@ where
             if let Some(schema_keys) = schema_keys.as_deref() {
                 validate_sync_scope(schema_keys)?;
             }
-            lix.pull_sync_events(
-                &branch_id,
-                request.after,
-                request.limit,
-                schema_keys.as_deref(),
-            )
-            .await
+            let result = match target.as_ref() {
+                Some(target) => target
+                    .pull_sync_events(
+                        &branch_id,
+                        request.after,
+                        request.limit,
+                        schema_keys.as_deref(),
+                    )
+                    .await,
+                None => lix
+                    .pull_sync_events(
+                        &branch_id,
+                        request.after,
+                        request.limit,
+                        schema_keys.as_deref(),
+                    )
+                    .await,
+            };
+            if let Some(target) = target {
+                target.close().await?;
+            }
+            result
         })
         .await?;
     let encoded = serde_json::to_vec(&response).map_err(|error| {
@@ -3939,6 +3963,11 @@ struct SyncPullRequest {
     /// hydration.
     #[serde(default)]
     schemas: Option<String>,
+    /// Internal topology pulls may read another branch without mutating the
+    /// authenticated session's branch selector. Ordinary clients send their
+    /// pinned branch as well, so the server can validate the request identity.
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 fn parse_sync_scope(value: &str) -> Vec<String> {
