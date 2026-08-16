@@ -61,3 +61,11 @@ on the disjoint and branch-isolation cases, while transaction-commit pull wins
 on the other four. The next gate is an adapter-backed run using the real Lix
 server and FilesystemStorage/RocksDB counters before declaring a final format
 choice.
+
+Within the protocol-level gate, transaction admission plus commit-pack pull is
+the selected architecture: it has the same pull bytes and correctness as
+commit-pack-only, but 3.9% fewer upload bytes. Its aggregate fast-forward p95
+was 23,545 ns versus 22,622 ns for commit-pack-only (4.1% slower, inside the
+predeclared 10% gate). The transaction-pack admission boundary therefore stays
+because it is cheaper without sacrificing server ordering, idempotency, or
+row-level LWW semantics.
