@@ -1266,8 +1266,6 @@ where
         require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
-        self.sync_mode.register_sql_scope(sql);
-        self.sync_mode.wait_for_scope_hydration().await?;
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             if require_idempotency_for_writes && idempotency.is_none() {
@@ -1319,6 +1317,13 @@ where
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
+
+        // Sync readiness is a read barrier. Local writes must stay available
+        // offline even when they introduce a schema that has not yet been
+        // materialized on this replica; their outbox record is durable and
+        // the background worker can admit it after reconnecting.
+        self.sync_mode.register_sql_scope(sql);
+        self.sync_mode.wait_for_scope_hydration().await?;
 
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
         let exact_schema_point_read = exact_filesystem_read
@@ -1787,24 +1792,25 @@ where
             )?;
         }
 
-        // Keep batch SQL on the same lazy-sync read path as single
-        // statements. Register every shape before classification so a
-        // read-only batch cannot open a snapshot before its demanded scopes
-        // have been hydrated. This is intentionally one barrier for the
-        // whole batch: the batch executes against one coherent local read
-        // snapshot, and cached scopes remain entirely network-free.
-        for statement in statements {
-            self.sync_mode.register_sql_scope(&statement.sql);
-        }
-        self.sync_mode.wait_for_scope_hydration().await?;
-
         match classify_execute_batch(statements, &self.sql_planning_cache)? {
             ExecuteBatchExecution::ReadOnly(parsed) => {
+                // Keep a pure read batch on the same lazy-sync path as a
+                // single statement. One barrier covers the whole batch so
+                // every statement executes against one coherent local
+                // snapshot.
+                for statement in statements {
+                    self.sync_mode.register_sql_scope(&statement.sql);
+                }
+                self.sync_mode.wait_for_scope_hydration().await?;
                 self.execute_read_only_batch(statements, parsed).await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
                 let contains_write = parsed.contains_write()?;
                 if !contains_write {
+                    for statement in statements {
+                        self.sync_mode.register_sql_scope(&statement.sql);
+                    }
+                    self.sync_mode.wait_for_scope_hydration().await?;
                     return self
                         .execute_transaction_batch(
                             statements,
