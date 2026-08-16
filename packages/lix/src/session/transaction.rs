@@ -25,9 +25,11 @@ use crate::transaction_types::TransactionWriteRow;
 use super::context::{SessionWriteAccess, closed_error};
 use super::{ExecuteIdempotency, SessionContext};
 use crate::transaction::CommitCoordinator;
+use crate::sync::SyncModeState;
 
 #[expect(missing_debug_implementations)]
 pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
+    pub(super) session: SessionContext<StorageImpl>,
     pub(super) transaction: Option<Transaction<StorageImpl>>,
     pub(super) runtime_functions: FunctionContext,
     transaction_manager: SessionTransactionManager,
@@ -37,6 +39,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     write_access: Option<SessionWriteAccess>,
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
+    pub(super) sync_mode: SyncModeState,
     pub(super) has_started_statement: bool,
     /// Reusable storage only for SQL literals containing doubled quote
     /// escapes. Ordinary warm literals continue to borrow the SQL text.
@@ -101,6 +104,7 @@ where
         self.transaction_manager()
             .mark_explicit_transaction_open()?;
         Ok(SessionTransaction {
+            session: self.clone(),
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
             transaction_manager: self.transaction_manager(),
@@ -110,6 +114,7 @@ where
             write_access: Some(write_access),
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
+            sync_mode: self.sync_mode.clone(),
             has_started_statement: false,
             prepared_literal_escape_scratch: SmallVec::new(),
             prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape::default(),
@@ -121,6 +126,49 @@ impl<StorageImpl> SessionTransaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(super) async fn reopen_after_sync_hydration(&mut self) -> Result<(), LixError> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
+        transaction.rollback().await?;
+        self._deterministic_runtime_guard.take();
+
+        let (mut opened, deterministic_runtime_guard) =
+            open_transaction_with_runtime_boundary(
+                &self.session.branch,
+                self.session.active_account_id.to_string(),
+                self.session.storage.clone(),
+                Arc::clone(&self.session.hot_state),
+                Arc::clone(&self.session.tracked_state),
+                Arc::clone(&self.session.binary_cas),
+                self.session.plugin_host.clone(),
+                Arc::clone(&self.session.branch_ctx),
+                Arc::clone(&self.session.catalog_context),
+                Arc::clone(&self.session.sql_planning_cache),
+                self.session.file_views.clone(),
+                async |runtime_functions| {
+                    if runtime_functions.deterministic_mode_enabled() {
+                        Ok(Some(self.session.lock_deterministic_runtime().await))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .await?;
+        opened.transaction.set_sync_role(self.session.sync_mode.role()?);
+        if self.session.sync_outbox_suppressed {
+            opened.transaction.suppress_ordinary_sync_event();
+        }
+        opened
+            .transaction
+            .attach_commit_boundary(self.session.transaction_commit_boundary());
+        self.transaction = Some(opened.transaction);
+        self.runtime_functions = opened.runtime_functions;
+        self._deterministic_runtime_guard = deterministic_runtime_guard;
+        Ok(())
+    }
+
     pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<StorageImpl>, LixError> {
         self.ensure_session_open()?;
         self.transaction

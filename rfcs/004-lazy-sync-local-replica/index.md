@@ -118,16 +118,11 @@ follow-ups rather than hidden semantics:
 - make ambiguous durable-receipt recovery work with RocksDB-backed
   FilesystemStorage after a server restart;
 - paginate branch catalogs and broaden SQL/API scope inference for every
-  history/system surface, including explicit transaction and prepared-DML
-  reads;
-- defer `observe()` binding until its first hydrated evaluation, and make merge
-  and merge-preview wait for branch-control topology before resolving a remote
-  source branch;
-- canonicalize same-path native-file identity when two replicas write the
-  path concurrently, so later rename/delete events cannot leave an orphaned
-  file identity;
-- make branch deletion safe when the deleted ref is currently selected and
-  key hydration readiness by branch/session rather than one process-wide mark;
+  history/system surface, including prepared-DML and more complex query
+  shapes;
+- audit `observe()` binding for every plugin/query shape and extend the
+  branch-control barrier to any API that resolves a remote source branch;
+- make branch deletion safe when the deleted ref is currently selected;
 - cover plugin archive installation on a fresh replica (not only replicas that
   already have the plugin installed);
 - run real backend benchmarks and independent security/performance review

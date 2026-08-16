@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::storage_adapter::Storage;
-use crate::{CreateBranchOptions, Lix, LixError, SwitchBranchOptions, Value};
+use crate::{CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, LixError, SwitchBranchOptions, Value};
 
 use super::transport::HttpSyncTransport;
 use super::reconcile_sync_branches;
@@ -143,7 +143,7 @@ where
             };
             while !worker_shutdown.load(Ordering::Acquire) {
                 let result = worker_runtime.block_on(async {
-                    let active_branch_id = worker_lix.active_branch_id().await?;
+                    let active_branch_id = worker_lix.active_branch_id_for_sync_worker()?;
                     // A branch switch is session-local. Drop the old HTTP
                     // session before flushing so the next handshake is pinned
                     // to the newly selected branch.
@@ -178,35 +178,49 @@ where
                     // session would make `observe()` race the sync apply
                     // transaction and intermittently return
                     // LIX_INVALID_TRANSACTION_STATE.
+                    let active_branch_for_worker = active_branch_id.clone();
                     let worker_session = worker_lix
                         .open_internal_session_suppressed(
                             active_branch_id,
                             worker_lix.active_account_id().to_owned(),
                         )
                         .await?;
+                    let local_branch_ids = worker_session
+                        .execute(
+                            "SELECT id FROM lix_branch WHERE id != $1",
+                            &[Value::Text(GLOBAL_BRANCH_ID.to_owned())],
+                        )
+                        .await?
+                        .rows()
+                        .iter()
+                        .filter_map(|row| row.get::<String>("id").ok())
+                        .collect::<Vec<_>>();
+                    let mut pending_inactive_branches = Vec::new();
+                    for branch_id in local_branch_ids {
+                        if branch_id == active_branch_for_worker {
+                            continue;
+                        }
+                        if worker_lix
+                            .sync_branch_has_pending(&remote_id, &branch_id)
+                            .await?
+                        {
+                            pending_inactive_branches.push(branch_id);
+                        }
+                    }
                     let topology_transport = current.clone();
                     // Materialize branch-local source commits before pulling
                     // the selected branch's merge events. Otherwise a merge
                     // event can be admitted while its second parent is still
                     // outside the local graph and the replica would have to
                     // fall back to a one-parent projection permanently.
-                    {
-                        let _scope_guard =
-                            worker_lix.sync_mode_state().begin_internal_scope();
-                        let _ = reconcile_sync_branches(
-                            &worker_session,
-                            &topology_transport,
-                            false,
-                        )
+                    let _ = reconcile_sync_branches(&worker_session, &topology_transport, false)
                         .await;
-                    }
                     let mut client = worker_session.sync_lifecycle(current).await?;
                     let result = client.flush().await;
                     if result.is_ok() {
                         // Topology is independent of the row cursor. Run it
                         // after the normal flush so a slow/unsupported branch
                         // catalog can never delay first-row hydration.
-                        let _scope_guard = worker_lix.sync_mode_state().begin_internal_scope();
                         if reconcile_sync_branches(
                             &worker_session,
                             &topology_transport,
@@ -217,8 +231,58 @@ where
                         {
                             worker_lix
                                 .sync_mode_state()
-                                .mark_scope_hydrated(super::CONTROL_SYNC_SCOPE);
+                                .mark_scope_hydrated_for_branch(
+                                    &active_branch_for_worker,
+                                    super::CONTROL_SYNC_SCOPE,
+                                    worker_lix.sync_mode_state().scope_generation(),
+                                );
                         }
+
+                        // Pending queues are durable per branch. A local
+                        // write can be queued on branch A and then the user
+                        // can switch to branch B before reconnecting; only
+                        // flushing B would strand A indefinitely. Drain each
+                        // inactive branch that has an actual pending queue,
+                        // while preserving the active branch's process-local
+                        // readiness marks (the durable state remains keyed by
+                        // branch).
+                        let readiness = worker_lix
+                            .sync_mode_state()
+                            .hydrated_scopes_snapshot_for_branch(&active_branch_for_worker);
+                        for branch_id in pending_inactive_branches {
+                            let branch_result = async {
+                                let branch_transport =
+                                    HttpSyncTransport::connect(&remote_id, Some(&branch_id))
+                                        .await?;
+                                if branch_transport.branch_id() != branch_id {
+                                    return Err(LixError::new(
+                                        LixError::CODE_INVALID_PARAM,
+                                        "sync server returned another branch for an inactive queue",
+                                    ));
+                                }
+                                let branch_session = worker_lix
+                                    .open_internal_session_suppressed(
+                                        branch_id,
+                                        worker_lix.active_account_id().to_owned(),
+                                    )
+                                    .await?;
+                                let mut branch_client =
+                                    branch_session.sync_lifecycle(branch_transport).await?;
+                                let result = branch_client.flush().await;
+                                branch_session.close().await?;
+                                result
+                            }
+                            .await;
+                            if let Err(error) = branch_result {
+                                tracing::warn!(error = ?error, "inactive sync branch queue was not flushed");
+                            }
+                        }
+                        worker_lix
+                            .sync_mode_state()
+                            .restore_hydrated_scopes_for_branch(
+                                &active_branch_for_worker,
+                                readiness,
+                            );
                     }
                     worker_session.close().await?;
                     result

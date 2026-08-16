@@ -1270,8 +1270,8 @@ where
         // server's schema catalog before SQL can be planned, so the existing
         // readiness barrier intentionally covers the complete single-
         // statement path. Once the scope is cached this is local-only.
-        self.sync_mode.register_sql_scope(sql);
-        self.sync_mode.wait_for_scope_hydration().await?;
+        let requested_scopes = self.register_sync_sql_scope(sql);
+        self.wait_for_sync_scope_hydration(&requested_scopes).await?;
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             if require_idempotency_for_writes && idempotency.is_none() {
@@ -1797,19 +1797,21 @@ where
                 // single statement. One barrier covers the whole batch so
                 // every statement executes against one coherent local
                 // snapshot.
-                for statement in statements {
-                    self.sync_mode.register_sql_scope(&statement.sql);
-                }
-                self.sync_mode.wait_for_scope_hydration().await?;
+                let requested_scopes = statements
+                    .iter()
+                    .flat_map(|statement| self.register_sync_sql_scope(&statement.sql))
+                    .collect::<Vec<_>>();
+                self.wait_for_sync_scope_hydration(&requested_scopes).await?;
                 self.execute_read_only_batch(statements, parsed).await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
                 let contains_write = parsed.contains_write()?;
                 if !contains_write {
-                    for statement in statements {
-                        self.sync_mode.register_sql_scope(&statement.sql);
-                    }
-                    self.sync_mode.wait_for_scope_hydration().await?;
+                    let requested_scopes = statements
+                        .iter()
+                        .flat_map(|statement| self.register_sync_sql_scope(&statement.sql))
+                        .collect::<Vec<_>>();
+                    self.wait_for_sync_scope_hydration(&requested_scopes).await?;
                     return self
                         .execute_transaction_batch(
                             statements,
@@ -2141,10 +2143,11 @@ where
         statements: &[(&str, &[Value])],
     ) -> Result<CoherentReadBatch, LixError> {
         self.ensure_open()?;
-        for (sql, _) in statements {
-            self.sync_mode.register_sql_scope(sql);
-        }
-        self.sync_mode.wait_for_scope_hydration().await?;
+        let requested_scopes = statements
+            .iter()
+            .flat_map(|(sql, _)| self.register_sync_sql_scope(sql))
+            .collect::<Vec<_>>();
+        self.wait_for_sync_scope_hydration(&requested_scopes).await?;
         let parsed = statements
             .iter()
             .map(|(sql, _)| {
@@ -3135,6 +3138,33 @@ where
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
+        self.ensure_session_open()?;
+        // Explicit transactions retain their opening snapshot, but a lazy
+        // replica still must hydrate a demanded read before planning it. Do
+        // the route check before entering the normal statement fast paths so
+        // writes remain immediate and never wait on the network.
+        let requested_scopes = self.session.register_sync_sql_scope(sql);
+        let route_statement = self.sql_planning_cache.parse_statement(sql)?;
+        if sql2::bind_statement_route(&route_statement)? == sql2::BoundStatementRoute::Read {
+            let refresh_transaction = matches!(
+                self.sync_mode.role(),
+                Ok(crate::sync::SyncRole::Replica { .. })
+            ) && !self.sync_mode.scopes_are_hydrated_for_branch(
+                &requested_scopes,
+                &self
+                    .session
+                    .branch
+                    .get()
+                    .expect("session branch selector should be readable"),
+            )
+                && !self.has_started_statement;
+            self.session
+                .wait_for_sync_scope_hydration(&requested_scopes)
+                .await?;
+            if refresh_transaction {
+                self.reopen_after_sync_hydration().await?;
+            }
+        }
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
         let may_reuse_literal_shape = self.has_started_statement;

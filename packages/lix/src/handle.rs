@@ -359,6 +359,11 @@ where
         self.engine.sync_mode()
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn active_branch_id_for_sync_worker(&self) -> Result<String, LixError> {
+        self.session.active_branch_id_for_sync_worker()
+    }
+
     /// API-level operations that inspect commit/branch state use the same
     /// lazy readiness barrier as SQL. Local writes still run immediately; the
     /// barrier is only entered when an operation cannot be answered from the
@@ -366,8 +371,11 @@ where
     async fn ensure_sync_api_scope(&self, sql_shape: &str) -> Result<(), LixError> {
         let sync_mode = self.engine.sync_mode();
         if matches!(sync_mode.role()?, crate::sync::SyncRole::Replica { .. }) {
-            sync_mode.register_sql_scope(sql_shape);
-            sync_mode.wait_for_scope_hydration().await?;
+            let branch_id = self.active_branch_id().await?;
+            let requested_scopes = sync_mode.register_sql_scope_for_branch(sql_shape, &branch_id);
+            sync_mode
+                .wait_for_scope_hydration_for_branch(&requested_scopes, &branch_id)
+                .await?;
         }
         Ok(())
     }
@@ -469,6 +477,7 @@ where
             .await?;
         let mut session = session;
         session.set_sync_outbox_suppressed(suppress_sync_outbox);
+        session.set_sync_scope_suppressed(suppress_sync_outbox);
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
@@ -830,6 +839,7 @@ where
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
+        self.ensure_sync_api_scope("SELECT * FROM lix_branch").await?;
         self.ensure_sync_api_scope("SELECT * FROM lix_commit").await?;
         self.session.merge_branch(options).await
     }
@@ -847,6 +857,7 @@ where
         &self,
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
+        self.ensure_sync_api_scope("SELECT * FROM lix_branch").await?;
         self.ensure_sync_api_scope("SELECT * FROM lix_commit").await?;
         self.session.merge_branch_preview(options).await
     }
@@ -1012,9 +1023,18 @@ where
             // stable across replicas is what lets a later descriptor-only
             // rename find the existing blob reference instead of creating a
             // second empty projection row.
+            // The canonical file identity wins even when another replica
+            // created a different ID for the same path while offline. Remove
+            // the path occupant first, then upsert by ID so later descriptor
+            // or delete events cannot target an orphaned local identity.
+            self.execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[Value::Text(path.clone())],
+            )
+            .await?;
             self.execute(
                 "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3) \
-                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                 ON CONFLICT (id) DO UPDATE SET path = excluded.path, content = excluded.content",
                 &[
                     Value::Text(file.file_id),
                     Value::Text(path),

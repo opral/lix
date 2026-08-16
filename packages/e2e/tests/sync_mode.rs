@@ -62,6 +62,26 @@ async fn open_execute_observe_syncs_two_filesystem_replicas_and_server_writes() 
         .await
         .expect("open bob sync replica");
 
+    // Explicit transactions must use the same lazy hydration barrier as
+    // ordinary execute(). The relation is absent from Bob's fresh local
+    // catalog until this read demand is fulfilled.
+    let mut bob_transaction = bob
+        .begin_transaction()
+        .await
+        .expect("begin bob lazy-read transaction");
+    let initial_rows = bob_transaction
+        .execute(
+            "SELECT value FROM sync_mode_row WHERE row_id = 'shared'",
+            &[],
+        )
+        .await
+        .expect("hydrate and execute inside explicit transaction");
+    assert!(initial_rows.rows().is_empty());
+    bob_transaction
+        .rollback()
+        .await
+        .expect("rollback read-only transaction");
+
     let mut bob_observation = bob
         .observe(
             "SELECT value FROM sync_mode_row WHERE row_id = 'shared'",
@@ -739,6 +759,13 @@ async fn initialized_filesystem_replica_reopens_and_accepts_writes_offline() {
         .await
         .expect("reopen initialized replica offline");
     wait_for_named_value(&offline, "offline", "online").await;
+    // Cached scopes remain local-only while an uncached relation fails closed
+    // instead of returning a partial snapshot after the server disappears.
+    let uncached_error = offline
+        .execute("SELECT * FROM sync_mode_uncached", &[])
+        .await
+        .expect_err("offline uncached scope must not fabricate a result");
+    assert_eq!(uncached_error.code, LixError::CODE_INVALID_PARAM);
     offline
         .execute(
             "UPDATE sync_mode_row SET value = 'queued-offline' WHERE row_id = 'offline'",

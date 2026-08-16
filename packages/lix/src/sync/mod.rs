@@ -116,8 +116,8 @@ pub(crate) enum SyncRole {
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
     role: Arc<RwLock<SyncRole>>,
-    scopes: Arc<RwLock<BTreeSet<String>>>,
-    hydrated_scopes: Arc<RwLock<BTreeSet<String>>>,
+    scopes_by_branch: Arc<RwLock<BTreeMap<String, BTreeSet<String>>>>,
+    hydrated_scopes_by_branch: Arc<RwLock<BTreeMap<String, BTreeSet<String>>>>,
     scope_notify: Arc<tokio::sync::Notify>,
     /// Serializes canonical event application across foreground hydration,
     /// the background worker, and topology backfills sharing one repository.
@@ -125,7 +125,6 @@ pub(crate) struct SyncModeState {
     /// critical section or two clients can both replay the same event and one
     /// will advance the branch with a generated projection commit.
     apply_gate: Arc<tokio::sync::Mutex<()>>,
-    internal_scope_depth: Arc<AtomicU64>,
     /// Monotonically changes whenever the active branch changes. Hydration is
     /// asynchronous, so an old-branch worker must not publish readiness after
     /// a switch has reset the process-local marks.
@@ -136,11 +135,10 @@ impl Default for SyncModeState {
     fn default() -> Self {
         Self {
             role: Arc::new(RwLock::new(SyncRole::Disabled)),
-            scopes: Arc::new(RwLock::new(BTreeSet::new())),
-            hydrated_scopes: Arc::new(RwLock::new(BTreeSet::new())),
+            scopes_by_branch: Arc::new(RwLock::new(BTreeMap::new())),
+            hydrated_scopes_by_branch: Arc::new(RwLock::new(BTreeMap::new())),
             scope_notify: Arc::new(tokio::sync::Notify::new()),
             apply_gate: Arc::new(tokio::sync::Mutex::new(())),
-            internal_scope_depth: Arc::new(AtomicU64::new(0)),
             scope_generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -164,16 +162,17 @@ impl SyncModeState {
         Ok(())
     }
 
-    /// Registers the schemas touched by an application query. Lazy sync uses
-    /// this process-local set as its demand signal; the durable cursor remains
-    /// independent so a replica can advance past unrelated repository data.
-    pub(crate) fn register_sql_scope(&self, sql: &str) {
-        if self.internal_scope_depth.load(Ordering::Acquire) != 0 {
-            return;
-        }
+    /// Registers the schemas touched by an application query on one branch.
+    /// The durable cursor remains independent so a replica can advance past
+    /// unrelated repository data without materializing it.
+    pub(crate) fn register_sql_scope_for_branch(
+        &self,
+        sql: &str,
+        branch_id: &str,
+    ) -> Vec<String> {
         let schemas = extract_sql_scope_schema_keys(sql);
         if schemas.is_empty() {
-            return;
+            return Vec::new();
         }
         let schemas = if schemas.len() > MAX_SYNC_SCOPE_KEYS
             || schemas
@@ -184,12 +183,12 @@ impl SyncModeState {
         } else {
             schemas
         };
-        let full_hydrated = self
-            .hydrated_scopes
-            .read()
-            .is_ok_and(|hydrated| hydrated.contains(FULL_SYNC_SCOPE));
-        if let Ok(mut scopes) = self.scopes.write() {
-            if schemas.iter().any(|schema| schema == FULL_SYNC_SCOPE)
+        let mut effective_scopes = schemas.clone();
+        if let Ok(mut branches) = self.scopes_by_branch.write() {
+            let scopes = branches.entry(branch_id.to_owned()).or_default();
+            if scopes.contains(FULL_SYNC_SCOPE) {
+                effective_scopes = vec![FULL_SYNC_SCOPE.to_owned()];
+            } else if schemas.iter().any(|schema| schema == FULL_SYNC_SCOPE)
                 || scopes.len().saturating_add(schemas.len()) > MAX_SYNC_SCOPE_KEYS
             {
                 // An unbounded demand set would make every subsequent
@@ -197,79 +196,122 @@ impl SyncModeState {
                 // marker is the correctness-preserving fallback.
                 scopes.clear();
                 scopes.insert(FULL_SYNC_SCOPE.to_owned());
+                effective_scopes = vec![FULL_SYNC_SCOPE.to_owned()];
             } else {
                 scopes.extend(schemas.iter().cloned());
             }
         }
-        // Once a full history has been materialized, any later demand is
-        // already satisfied. Marking the newly discovered relation prevents a
-        // subsequent observer from waiting forever for a redundant hydrate.
-        if full_hydrated && let Ok(mut hydrated) = self.hydrated_scopes.write() {
-            hydrated.extend(schemas);
-            self.scope_notify.notify_waiters();
-        }
+        effective_scopes
     }
 
-    pub(crate) fn scopes(&self) -> Vec<String> {
-        self.scopes
+    pub(crate) fn scopes_for_branch(&self, branch_id: &str) -> Vec<String> {
+        self.scopes_by_branch
             .read()
-            .map(|scopes| scopes.iter().cloned().collect())
+            .ok()
+            .and_then(|branches| branches.get(branch_id).cloned())
+            .map(|scopes| scopes.into_iter().collect())
             .unwrap_or_default()
     }
 
-    pub(crate) fn mark_scope_hydrated(&self, schema_key: &str) {
-        self.mark_scope_hydrated_if_generation(schema_key, self.scope_generation());
+
+    pub(crate) fn scopes_are_hydrated_for_branch(
+        &self,
+        requested_scopes: &[String],
+        branch_id: &str,
+    ) -> bool {
+        requested_scopes.is_empty()
+            || self
+                .hydrated_scopes_by_branch
+                .read()
+                .ok()
+                .and_then(|branches| branches.get(branch_id).cloned())
+                .is_some_and(|hydrated| {
+                    requested_scopes
+                        .iter()
+                        .all(|scope| hydrated.contains(scope))
+                })
+    }
+
+    pub(crate) fn hydrated_scopes_snapshot_for_branch(
+        &self,
+        branch_id: &str,
+    ) -> BTreeSet<String> {
+        self.hydrated_scopes_by_branch
+            .read()
+            .ok()
+            .and_then(|branches| branches.get(branch_id).cloned())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn restore_hydrated_scopes_for_branch(
+        &self,
+        branch_id: &str,
+        scopes: BTreeSet<String>,
+    ) {
+        if let Ok(mut branches) = self.hydrated_scopes_by_branch.write() {
+            branches.insert(branch_id.to_owned(), scopes);
+            self.scope_notify.notify_waiters();
+        }
     }
 
     pub(crate) fn scope_generation(&self) -> u64 {
         self.scope_generation.load(Ordering::Acquire)
     }
 
-    pub(crate) fn mark_scope_hydrated_if_generation(&self, schema_key: &str, generation: u64) {
+    pub(crate) fn mark_scope_hydrated_for_branch(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+        generation: u64,
+    ) {
         if self.scope_generation() != generation {
             return;
         }
-        if let Ok(mut hydrated) = self.hydrated_scopes.write() {
+        if let Ok(mut branches) = self.hydrated_scopes_by_branch.write() {
             if self.scope_generation() != generation {
                 return;
             }
-            hydrated.insert(schema_key.to_owned());
+            branches
+                .entry(branch_id.to_owned())
+                .or_default()
+                .insert(schema_key.to_owned());
             self.scope_notify.notify_waiters();
         }
     }
 
-    /// Drops the process-local hydration marks after a replica switches
-    /// branches. Hydration is branch-specific durable state, but this demand
-    /// registry is shared by all sessions in an engine. Keeping marks from the
-    /// previous branch would let the next query skip its first hydration and
-    /// observe rows from the wrong branch until the polling worker caught up.
+    /// Advances the generation used to reject readiness marks from an
+    /// in-flight worker that belongs to a previous branch selection. Existing
+    /// durable marks for other branches remain valid and are intentionally
+    /// retained for lazy re-entry.
     pub(crate) fn reset_scope_hydration(&self) {
         self.scope_generation.fetch_add(1, Ordering::AcqRel);
-        if let Ok(mut hydrated) = self.hydrated_scopes.write() {
-            hydrated.clear();
-            self.scope_notify.notify_waiters();
-        }
+        self.scope_notify.notify_waiters();
     }
 
-    pub(crate) async fn wait_for_scope_hydration(&self) -> Result<(), LixError> {
+    pub(crate) async fn wait_for_scope_hydration_for_branch(
+        &self,
+        requested_scopes: &[String],
+        branch_id: &str,
+    ) -> Result<(), LixError> {
         #[cfg(not(target_family = "wasm"))]
         {
-            if self.internal_scope_depth.load(Ordering::Acquire) != 0 {
-                return Ok(());
-            }
-            if !matches!(self.role(), Ok(SyncRole::Replica { .. })) {
+            if !matches!(self.role(), Ok(SyncRole::Replica { .. }))
+                || requested_scopes.is_empty()
+            {
                 return Ok(());
             }
             let deadline = std::time::Duration::from_secs(5);
             let wait = async {
                 loop {
                     let ready = self
-                        .scopes
+                        .hydrated_scopes_by_branch
                         .read()
                         .ok()
-                        .zip(self.hydrated_scopes.read().ok())
-                        .is_some_and(|(scopes, hydrated)| {
-                            scopes.iter().all(|scope| hydrated.contains(scope))
+                        .and_then(|branches| branches.get(branch_id).cloned())
+                        .is_some_and(|hydrated| {
+                            requested_scopes
+                                .iter()
+                                .all(|scope| hydrated.contains(scope))
                         });
                     if ready {
                         return;
@@ -290,24 +332,6 @@ impl SyncModeState {
         Ok(())
     }
 
-    /// Suppresses scope registration/readiness waits for internal sync
-    /// catalog maintenance. Public SQL never obtains this guard.
-    pub(crate) fn begin_internal_scope(&self) -> InternalScopeGuard {
-        self.internal_scope_depth.fetch_add(1, Ordering::AcqRel);
-        InternalScopeGuard {
-            depth: Arc::clone(&self.internal_scope_depth),
-        }
-    }
-}
-
-pub(crate) struct InternalScopeGuard {
-    depth: Arc<AtomicU64>,
-}
-
-impl Drop for InternalScopeGuard {
-    fn drop(&mut self) {
-        self.depth.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 /// Conservative SQL scope extraction for the lazy-sync MVP. The SQL planner
@@ -1396,6 +1420,20 @@ where
             .is_some())
     }
 
+    pub(crate) async fn sync_branch_has_pending(
+        &self,
+        remote_id: &str,
+        branch_id: &str,
+    ) -> Result<bool, LixError> {
+        validate_sync_remote_id(remote_id)?;
+        validate_sync_branch_id(branch_id)?;
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        Ok(load_sync_client_state(&read, remote_id, branch_id)
+            .await?
+            .is_some_and(|(_, state, _)| !state.pending.is_empty()))
+    }
+
     pub(crate) async fn restore_sync_scope_readiness(
         &self,
         remote_id: &str,
@@ -1407,7 +1445,7 @@ where
         if let Some((_, state, _)) = load_sync_client_state(&read, remote_id, &branch_id).await? {
             let sync_mode = self.sync_mode_state();
             for scope in state.hydrated_scopes {
-                sync_mode.mark_scope_hydrated(&scope);
+                sync_mode.mark_scope_hydrated_for_branch(&branch_id, &scope, sync_mode.scope_generation());
             }
         }
         Ok(())
@@ -1486,7 +1524,11 @@ where
             scope_state: self.sync_mode_state(),
         };
         for scope in &client.state.hydrated_scopes {
-            client.scope_state.mark_scope_hydrated(scope);
+            client.scope_state.mark_scope_hydrated_for_branch(
+                &client.state.branch_id,
+                scope,
+                client.scope_state.scope_generation(),
+            );
         }
         // A manual client may be opened on a storage snapshot whose local
         // application commit is not the active view anymore (for example
@@ -2562,7 +2604,7 @@ where
         let scope_generation = self.scope_state.scope_generation();
         let requested = self
             .scope_state
-            .scopes()
+            .scopes_for_branch(&self.state.branch_id)
             .into_iter()
             // The branch/commit catalog is reconciled by the runtime's
             // control-plane pass. It is not a semantic row scope and must
@@ -2580,7 +2622,11 @@ where
                 .hydrated_scopes
                 .insert(FULL_SYNC_SCOPE.to_owned());
             self.scope_state
-                .mark_scope_hydrated_if_generation(FULL_SYNC_SCOPE, scope_generation);
+                .mark_scope_hydrated_for_branch(
+                    &self.state.branch_id,
+                    FULL_SYNC_SCOPE,
+                    scope_generation,
+                );
             self.persist_state().await?;
             self.replay_pending_overlay().await?;
         }
@@ -2593,7 +2639,11 @@ where
                 if !self.state.hydrated_scopes.contains(&schema_key) {
                     self.state.hydrated_scopes.insert(schema_key.clone());
                     self.scope_state
-                        .mark_scope_hydrated_if_generation(&schema_key, scope_generation);
+                        .mark_scope_hydrated_for_branch(
+                            &self.state.branch_id,
+                            &schema_key,
+                            scope_generation,
+                        );
                     changed = true;
                 }
             }
@@ -2608,7 +2658,11 @@ where
                 .hydrated_scopes
                 .insert("lix_registered_schema".to_owned());
             self.scope_state
-                .mark_scope_hydrated_if_generation("lix_registered_schema", scope_generation);
+                .mark_scope_hydrated_for_branch(
+                    &self.state.branch_id,
+                    "lix_registered_schema",
+                    scope_generation,
+                );
             self.persist_state().await?;
             self.replay_pending_overlay().await?;
         }
@@ -2622,7 +2676,11 @@ where
             self.hydrate_scope(&schema_key).await?;
             self.state.hydrated_scopes.insert(schema_key.clone());
             self.scope_state
-                .mark_scope_hydrated_if_generation(&schema_key, scope_generation);
+                .mark_scope_hydrated_for_branch(
+                    &self.state.branch_id,
+                    &schema_key,
+                    scope_generation,
+                );
             self.persist_state().await?;
             self.replay_pending_overlay().await?;
         }
@@ -4371,10 +4429,55 @@ fn require_sync_identity(label: &str, expected: &str, actual: &str) -> Result<()
 mod tests {
     use super::{
         CONTROL_SYNC_SCOPE, FULL_SYNC_SCOPE, MAX_SYNC_PACK_ROWS, SyncCanonicalEvent,
-        SyncFileMutation, SyncFilterScope, SyncRowMutation, SyncTransactionPack,
+        SyncFileMutation, SyncFilterScope, SyncModeState, SyncRole, SyncRowMutation,
+        SyncTransactionPack,
         extract_sql_scope_schema_keys, filter_sync_pack, sync_pack_fingerprint,
         validate_sync_transaction_pack,
     };
+
+    #[tokio::test]
+    async fn scope_readiness_waits_only_for_the_current_query_demand() {
+        let state = SyncModeState::default();
+        state
+            .set_role(SyncRole::Replica {
+                remote_id: "https://sync.example/repository".to_owned(),
+            })
+            .expect("set replica role");
+        let first = state.register_sql_scope_for_branch("SELECT * FROM first_scope", "main");
+        let second = state.register_sql_scope_for_branch("SELECT * FROM second_scope", "main");
+        let generation = state.scope_generation();
+        state.mark_scope_hydrated_for_branch("main", "first_scope", generation);
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.wait_for_scope_hydration_for_branch(&first, "main"),
+        )
+        .await
+        .expect("the first query must not wait on unrelated demand")
+        .expect("the first scope is hydrated");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                state.wait_for_scope_hydration_for_branch(&second, "main"),
+            )
+            .await
+            .is_err(),
+            "an uncached scope must remain pending"
+        );
+    }
+
+    #[test]
+    fn scope_demands_are_isolated_per_branch() {
+        let state = SyncModeState::default();
+        let main = state.register_sql_scope_for_branch("SELECT * FROM main_rows", "main");
+        let feature = state.register_sql_scope_for_branch("SELECT * FROM feature_rows", "feature");
+
+        assert_eq!(main, vec!["main_rows"]);
+        assert_eq!(feature, vec!["feature_rows"]);
+        assert_eq!(state.scopes_for_branch("main"), vec!["main_rows"]);
+        assert_eq!(state.scopes_for_branch("feature"), vec!["feature_rows"]);
+    }
 
     #[tokio::test]
     async fn canonical_event_marker_makes_replay_after_manifest_loss_a_noop() {

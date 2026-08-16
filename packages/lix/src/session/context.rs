@@ -173,6 +173,11 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     /// Internal sync sessions apply canonical rows and must not enqueue those
     /// maintenance writes as new client proposals.
     pub(super) sync_outbox_suppressed: bool,
+    /// Internal sync sessions also issue catalog reads while the worker is
+    /// hydrating. Scope registration/readiness is session-local suppression;
+    /// using the process-wide sync state for this would race application
+    /// queries in another session.
+    pub(super) sync_scope_suppressed: bool,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
@@ -348,6 +353,7 @@ where
             observe_invalidation,
             sync_mode,
             sync_outbox_suppressed: false,
+            sync_scope_suppressed: false,
             plugin_host,
             telemetry,
             transaction_manager,
@@ -368,6 +374,40 @@ where
 
     pub(crate) fn set_sync_outbox_suppressed(&mut self, suppressed: bool) {
         self.sync_outbox_suppressed = suppressed;
+    }
+
+    pub(crate) fn set_sync_scope_suppressed(&mut self, suppressed: bool) {
+        self.sync_scope_suppressed = suppressed;
+    }
+
+    pub(super) fn register_sync_sql_scope(&self, sql: &str) -> Vec<String> {
+        if self.sync_scope_suppressed {
+            Vec::new()
+        } else {
+            let branch_id = self
+                .branch
+                .get()
+                .expect("session branch selector should be readable");
+            self.sync_mode
+                .register_sql_scope_for_branch(sql, &branch_id)
+        }
+    }
+
+    pub(super) async fn wait_for_sync_scope_hydration(
+        &self,
+        requested_scopes: &[String],
+    ) -> Result<(), LixError> {
+        if self.sync_scope_suppressed {
+            Ok(())
+        } else {
+            let branch_id = self
+                .branch
+                .get()
+                .expect("session branch selector should be readable");
+            self.sync_mode
+                .wait_for_scope_hydration_for_branch(requested_scopes, &branch_id)
+                .await
+        }
     }
 
     /// Returns the immutable account that authors every change from this session.
@@ -491,6 +531,16 @@ where
             Ok(branch_id) => Ok(branch_id),
             Err(error) => Err(error),
         }
+    }
+
+    /// Reads the session's branch selector without waiting for the session
+    /// operation lease. The sync worker uses this while the application may
+    /// hold an explicit transaction; that transaction cannot change the
+    /// selector, and blocking the worker here would prevent lazy hydration
+    /// from making progress for the transaction's first read.
+    pub(crate) fn active_branch_id_for_sync_worker(&self) -> Result<String, LixError> {
+        self.ensure_open()?;
+        self.branch.get()
     }
 
     pub(crate) fn active_branch_id_owned(
