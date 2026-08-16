@@ -10,7 +10,9 @@ protocol strategies:
 The simulator is deliberately transport- and storage-adapter-neutral. It
 asserts convergence, branch isolation, and idempotent retry behavior for every
 trace, reports deterministic wire/storage/replay counters as JSON lines, and
-uses Criterion for runtime measurements.
+uses Criterion for runtime measurements. The crash scenario models a process
+death after server admission and before the acknowledgement is persisted; the
+real durable-receipt behavior remains covered by the storage/e2e tests.
 
 Run it with:
 

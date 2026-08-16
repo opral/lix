@@ -78,10 +78,11 @@ struct Scenario {
     shape: Shape,
     offline_client: Option<usize>,
     retry_first_admission: bool,
+    crash_after_first_admission: bool,
     wrong_branch_write: bool,
 }
 
-fn scenarios() -> [Scenario; 6] {
+fn scenarios() -> [Scenario; 7] {
     [
         Scenario {
             name: "disjoint_rows",
@@ -92,6 +93,7 @@ fn scenarios() -> [Scenario; 6] {
             shape: Shape::DirectRow,
             offline_client: None,
             retry_first_admission: false,
+            crash_after_first_admission: false,
             wrong_branch_write: false,
         },
         Scenario {
@@ -103,6 +105,7 @@ fn scenarios() -> [Scenario; 6] {
             shape: Shape::DirectRow,
             offline_client: None,
             retry_first_admission: false,
+            crash_after_first_admission: false,
             wrong_branch_write: false,
         },
         Scenario {
@@ -114,6 +117,7 @@ fn scenarios() -> [Scenario; 6] {
             shape: Shape::DirectRow,
             offline_client: Some(1),
             retry_first_admission: true,
+            crash_after_first_admission: false,
             wrong_branch_write: false,
         },
         Scenario {
@@ -125,6 +129,7 @@ fn scenarios() -> [Scenario; 6] {
             shape: Shape::PluginRow,
             offline_client: None,
             retry_first_admission: false,
+            crash_after_first_admission: false,
             wrong_branch_write: false,
         },
         Scenario {
@@ -136,6 +141,7 @@ fn scenarios() -> [Scenario; 6] {
             shape: Shape::FileProjection,
             offline_client: None,
             retry_first_admission: false,
+            crash_after_first_admission: false,
             wrong_branch_write: false,
         },
         Scenario {
@@ -147,7 +153,20 @@ fn scenarios() -> [Scenario; 6] {
             shape: Shape::DirectRow,
             offline_client: None,
             retry_first_admission: false,
+            crash_after_first_admission: false,
             wrong_branch_write: true,
+        },
+        Scenario {
+            name: "crash_after_ack_loss",
+            seed: 0x51_1a_84,
+            clients: 2,
+            operations: 48,
+            shared_keys: 6,
+            shape: Shape::DirectRow,
+            offline_client: None,
+            retry_first_admission: false,
+            crash_after_first_admission: true,
+            wrong_branch_write: false,
         },
     ]
 }
@@ -174,6 +193,7 @@ struct Counters {
     accepted_operations: usize,
     rejected_operations: usize,
     duplicate_admissions: usize,
+    crash_recoveries: usize,
     stale_base_admissions: usize,
     overlapping_rows: usize,
     fast_forwards: usize,
@@ -204,6 +224,7 @@ struct ScorecardResult {
     branch_isolated: bool,
     duplicate_safe: bool,
     retry_idempotent: bool,
+    crash_safe: bool,
     no_lost_disjoint_writes: bool,
     server_operations_per_second: u64,
     catch_up_bytes_per_accepted_operation: usize,
@@ -270,6 +291,7 @@ struct Simulation {
     replicas: Vec<Replica>,
     counters: Counters,
     first_admission: bool,
+    crash_recovery_done: bool,
 }
 
 fn build_actions(scenario: &Scenario) -> Vec<Action> {
@@ -348,6 +370,7 @@ impl Simulation {
             replicas,
             counters: Counters::default(),
             first_admission: true,
+            crash_recovery_done: false,
         }
     }
 
@@ -383,6 +406,10 @@ impl Simulation {
         let retry_idempotent = !self.scenario.retry_first_admission
             || (self.counters.duplicate_admissions == 1
                 && self.server.events.len() == self.counters.accepted_operations);
+        let crash_safe = !self.scenario.crash_after_first_admission
+            || (self.counters.crash_recoveries == 1
+                && self.counters.duplicate_admissions == 1
+                && self.server.events.len() == self.counters.accepted_operations);
         let no_lost_disjoint_writes = self.scenario.shared_keys != 0
             || self.server.state.len() >= self.scenario.operations + 1;
         assert!(converged, "{} did not converge", self.strategy);
@@ -402,6 +429,11 @@ impl Simulation {
             self.strategy
         );
         assert!(
+            crash_safe,
+            "{} did not recover a lost acknowledgement",
+            self.strategy
+        );
+        assert!(
             no_lost_disjoint_writes,
             "{} lost a disjoint write",
             self.strategy
@@ -415,6 +447,7 @@ impl Simulation {
             branch_isolated,
             duplicate_safe,
             retry_idempotent,
+            crash_safe,
             no_lost_disjoint_writes,
             server_operations_per_second: if self.counters.elapsed_ns == 0 {
                 0
@@ -488,6 +521,15 @@ impl Simulation {
             let admission = self.admit(&pack);
             match admission {
                 Ok(receipt) => {
+                    if self.scenario.crash_after_first_admission && !self.crash_recovery_done {
+                        // Model a process death after the server committed but
+                        // before the client persisted the acknowledgement.
+                        // The next loop iteration is the restarted client
+                        // retrying the same durable pending operation.
+                        self.crash_recovery_done = true;
+                        self.counters.crash_recoveries += 1;
+                        continue;
+                    }
                     if self.scenario.retry_first_admission && self.first_admission {
                         self.first_admission = false;
                         let retry = self.admit(&pack).expect("retry should return receipt");

@@ -7,15 +7,15 @@ cargo bench -p lix --bench sync_strategy_scorecard -- --noplot \
   --warm-up-time 0.05 --measurement-time 0.1 --sample-size 10
 ```
 
-All 18 strategy/scenario runs converged, preserved branch isolation, reported
+All 21 strategy/scenario runs converged, preserved branch isolation, reported
 no lost disjoint writes, and returned idempotent retry receipts. Across the
 six scenarios, the aggregate wire counters were:
 
 | Strategy | Upload bytes | Download bytes | Minimum fast-forwards |
 | --- | ---: | ---: | ---: |
-| tx + event | 105,979 | 280,301 | 16 |
-| tx + commit | 105,979 | 262,967 | 62 |
-| commit both ways | 110,008 | 262,967 | 62 |
+| tx + event | 120,303 | 318,317 | 16 |
+| tx + commit | 120,303 | 298,603 | 62 |
+| commit both ways | 124,969 | 298,603 | 62 |
 
 The per-scenario deterministic counters were:
 
@@ -39,6 +39,13 @@ The per-scenario deterministic counters were:
 | branch isolation | tx + event | 9,347 | 24,501 | 16 | 27 |
 | branch isolation | tx + commit | 9,347 | 22,971 | 62 | 27 |
 | branch isolation | commit both ways | 9,763 | 22,971 | 62 | 27 |
+| crash after ack loss | tx + event | 14,324 | 38,016 | 24 | 42 |
+| crash after ack loss | tx + commit | 14,324 | 35,636 | 96 | 42 |
+| crash after ack loss | commit both ways | 14,961 | 35,636 | 96 | 42 |
+
+For the crash-after-ack-loss scenario, every strategy recorded exactly one
+server-side duplicate admission and one recovery, with one canonical event
+rather than two. The offline scenario similarly recorded one idempotent retry.
 
 The sample supports canonical commit-pack replication: it removes roughly
 6% of pull bytes and exposes a parent commit, allowing every canonical
