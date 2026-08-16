@@ -186,9 +186,7 @@ impl SyncModeState {
         let mut effective_scopes = schemas.clone();
         if let Ok(mut branches) = self.scopes_by_branch.write() {
             let scopes = branches.entry(branch_id.to_owned()).or_default();
-            if scopes.contains(FULL_SYNC_SCOPE) {
-                effective_scopes = vec![FULL_SYNC_SCOPE.to_owned()];
-            } else if schemas.iter().any(|schema| schema == FULL_SYNC_SCOPE)
+            if schemas.iter().any(|schema| schema == FULL_SYNC_SCOPE)
                 || scopes.len().saturating_add(schemas.len()) > MAX_SYNC_SCOPE_KEYS
             {
                 // An unbounded demand set would make every subsequent
@@ -226,9 +224,10 @@ impl SyncModeState {
                 .ok()
                 .and_then(|branches| branches.get(branch_id).cloned())
                 .is_some_and(|hydrated| {
-                    requested_scopes
-                        .iter()
-                        .all(|scope| hydrated.contains(scope))
+                    hydrated.contains(FULL_SYNC_SCOPE)
+                        || requested_scopes
+                            .iter()
+                            .all(|scope| hydrated.contains(scope))
                 })
     }
 
@@ -309,9 +308,10 @@ impl SyncModeState {
                         .ok()
                         .and_then(|branches| branches.get(branch_id).cloned())
                         .is_some_and(|hydrated| {
-                            requested_scopes
-                                .iter()
-                                .all(|scope| hydrated.contains(scope))
+                            hydrated.contains(FULL_SYNC_SCOPE)
+                                || requested_scopes
+                                    .iter()
+                                    .all(|scope| hydrated.contains(scope))
                         });
                     if ready {
                         return;
