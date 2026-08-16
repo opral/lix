@@ -17,6 +17,7 @@ use crate::plugin::runtime::{
 };
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
+use crate::sync::SyncModeState;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StoragePrefix,
@@ -44,6 +45,7 @@ pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
+    sync_mode: SyncModeState,
     plugin_host: PluginRuntimeHost,
     telemetry: Option<Arc<dyn TelemetrySink>>,
 }
@@ -190,6 +192,7 @@ where
             commit_coordinator,
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
             observe_invalidation,
+            sync_mode: SyncModeState::default(),
             plugin_host,
             telemetry: options.telemetry,
         })
@@ -197,6 +200,14 @@ where
 
     pub(crate) fn storage(&self) -> StorageAdapter<StorageImpl> {
         self.storage.clone()
+    }
+
+    pub(crate) fn sync_mode(&self) -> SyncModeState {
+        self.sync_mode.clone()
+    }
+
+    pub(crate) fn collaboration_write_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.collaboration_write_gate)
     }
 
     /// Loads the current commit head for a branch.
@@ -252,6 +263,7 @@ where
             Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
+            self.sync_mode.clone(),
             self.plugin_host.clone(),
             self.telemetry.clone(),
         )
@@ -283,6 +295,7 @@ where
             Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
+            self.sync_mode.clone(),
             self.plugin_host.clone(),
             self.telemetry.clone(),
         )

@@ -51,4 +51,5 @@ pub(crate) use context::transactions_can_share_cohort;
 pub(crate) use plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE;
 pub(crate) use plugin_checkpoint::stage_delete_branch_plugin_checkpoints;
 pub(crate) use staged_commit_changes::StagedCommitChangeBatchBuilder;
+pub(crate) use staging::PreparedWriteSet;
 pub(crate) use staging::duplicate_insert_identity_message;

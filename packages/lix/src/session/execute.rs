@@ -1266,6 +1266,8 @@ where
         require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
+        self.sync_mode.register_sql_scope(sql);
+        self.sync_mode.wait_for_scope_hydration().await?;
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             if require_idempotency_for_writes && idempotency.is_none() {
@@ -1325,13 +1327,13 @@ where
             .flatten();
         let exact_schema_batch_read = (exact_filesystem_read.is_none()
             && exact_schema_point_read.is_none())
-            .then(|| exact_schema_batch_read_route(&statement, params))
-            .flatten();
+        .then(|| exact_schema_batch_read_route(&statement, params))
+        .flatten();
         let late_file_content_read = (exact_filesystem_read.is_none()
             && exact_schema_point_read.is_none()
             && exact_schema_batch_read.is_none())
-            .then(|| late_materialized_lix_file_content_read(&statement))
-            .flatten();
+        .then(|| late_materialized_lix_file_content_read(&statement))
+        .flatten();
         let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
             || matches!(
                 &exact_filesystem_read,
@@ -1532,6 +1534,16 @@ where
         };
         Self::require_matching_idempotency_receipt(&durable, idempotency)?;
         Ok(IdempotencyReceiptResolution::Replay(durable))
+    }
+
+    pub(crate) async fn replay_execute_idempotency_result(
+        &self,
+        idempotency: &ExecuteIdempotency,
+    ) -> Result<Option<ExecuteResult>, LixError> {
+        match self.resolve_idempotency_receipt(idempotency).await? {
+            IdempotencyReceiptResolution::Absent => Ok(None),
+            IdempotencyReceiptResolution::Replay(receipt) => receipt.into_single_result().map(Some),
+        }
     }
 
     async fn load_idempotency_receipt(
@@ -2467,15 +2479,13 @@ where
                 file_views: None,
             };
             let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
-            if let Some((spec, row_pk)) =
-                resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
+            if let Some((spec, row_pk)) = resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
             {
-                let reader: Arc<dyn sql2::RowSnapshotReader> = Arc::new(
-                    sql2::CurrentRowSnapshotReader::new(
+                let reader: Arc<dyn sql2::RowSnapshotReader> =
+                    Arc::new(sql2::CurrentRowSnapshotReader::new(
                         Arc::clone(&self.hot_state),
                         read_store.clone(),
-                    ),
-                );
+                    ));
                 let query = sql2::execute_exact_schema_point_read(
                     &spec,
                     &active_branch_id,
@@ -4007,11 +4017,7 @@ fn exact_schema_point_read_route(
         return None;
     }
     let mut equalities = BTreeMap::new();
-    collect_exact_schema_equalities(
-        simple.select.selection.as_ref()?,
-        params,
-        &mut equalities,
-    )?;
+    collect_exact_schema_equalities(simple.select.selection.as_ref()?, params, &mut equalities)?;
     Some(ExactSchemaPointRead {
         table_name: simple.table_name,
         projected_columns,
@@ -4066,10 +4072,7 @@ fn exact_schema_batch_read_route(
         }
         Some(_) => return None,
     };
-    let identities = collect_exact_schema_identity_rows(
-        simple.select.selection.as_ref()?,
-        params,
-    )?;
+    let identities = collect_exact_schema_identity_rows(simple.select.selection.as_ref()?, params)?;
     (identities.len() > 1).then_some(ExactSchemaBatchRead {
         table_name: simple.table_name,
         projected_columns,
@@ -4165,11 +4168,19 @@ fn collect_exact_schema_equalities(
 ) -> Option<()> {
     match expression {
         Expr::Nested(expression) => collect_exact_schema_equalities(expression, params, equalities),
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             collect_exact_schema_equalities(left, params, equalities)?;
             collect_exact_schema_equalities(right, params, equalities)
         }
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
             let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
                 (Some(column), None) => (column, exact_schema_literal(right, params)?),
                 (None, Some(column)) => (column, exact_schema_literal(left, params)?),
@@ -4265,10 +4276,9 @@ fn resolve_exact_schema_point_read(
     let Some(parts) = parts else {
         return Ok(None);
     };
-    let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
-        parts,
-        &spec.primary_key_component_types,
-    ) else {
+    let Ok(row_pk) =
+        crate::row_pk::RowPk::from_external_parts(parts, &spec.primary_key_component_types)
+    else {
         return Ok(None);
     };
     Ok(Some((spec, row_pk)))
@@ -4330,12 +4340,9 @@ fn resolve_exact_schema_batch_read(
     let mut identities = Vec::with_capacity(exact.identities.len());
     for identity in &exact.identities {
         if identity.len() != primary_key_columns.len() + 1
-            || identity
-                .keys()
-                .any(|column| {
-                    column != "lixcol_file_id"
-                        && !primary_key_columns.contains(&column.as_str())
-                })
+            || identity.keys().any(|column| {
+                column != "lixcol_file_id" && !primary_key_columns.contains(&column.as_str())
+            })
         {
             return Ok(None);
         }
@@ -4366,10 +4373,9 @@ fn resolve_exact_schema_batch_read(
         let Some(parts) = parts else {
             return Ok(None);
         };
-        let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
-            parts,
-            &spec.primary_key_component_types,
-        ) else {
+        let Ok(row_pk) =
+            crate::row_pk::RowPk::from_external_parts(parts, &spec.primary_key_component_types)
+        else {
             return Ok(None);
         };
         if seen.insert((row_pk.clone(), file_id.clone())) {
@@ -5492,7 +5498,10 @@ mod tests {
         .expect("complete composite identities should route");
         assert_eq!(route.identities.len(), 3, "request slots stay aligned");
         assert_eq!(route.order_by_columns, ["tenant", "revision"]);
-        assert_eq!(route.identities[0]["tenant"], Value::Text("docs".to_owned()));
+        assert_eq!(
+            route.identities[0]["tenant"],
+            Value::Text("docs".to_owned())
+        );
         assert_eq!(route.identities[0]["revision"], Value::Integer(7));
         assert_eq!(route.identities[0]["lixcol_file_id"], Value::Null);
         assert_eq!(route.identities[1]["revision"], Value::Integer(9));
@@ -5555,8 +5564,15 @@ mod tests {
             .await
             .expect("relational control should execute");
         assert_eq!(exact, relational);
-        assert_eq!(exact.rows().len(), 2, "duplicates and misses emit no extra rows");
-        assert_eq!(exact.rows()[0].value("note").expect("note column"), &Value::Null);
+        assert_eq!(
+            exact.rows().len(),
+            2,
+            "duplicates and misses emit no extra rows"
+        );
+        assert_eq!(
+            exact.rows()[0].value("note").expect("note column"),
+            &Value::Null
+        );
         assert_eq!(
             exact.rows()[1].value("payload").expect("payload column"),
             &Value::Jsonb(serde_json::json!({"rank": 2}).into())
@@ -5574,7 +5590,10 @@ mod tests {
                 .await
                 .expect("profiled native batch route should execute");
             assert_eq!(profiled.rows().len(), 2);
-            assert_eq!(profile.scan_rows, 2, "only returned public rows are scanned");
+            assert_eq!(
+                profile.scan_rows, 2,
+                "only returned public rows are scanned"
+            );
             assert_eq!(
                 profile.provider_rows_examined, 3,
                 "present, missing, and duplicate slots examine three unique exact identities"
@@ -5827,9 +5846,7 @@ mod tests {
             ExecutionDisposition::CancellableRead
         );
         assert_eq!(
-            session
-                .execution_disposition("SELECT uuidv7()")
-                .unwrap(),
+            session.execution_disposition("SELECT uuidv7()").unwrap(),
             ExecutionDisposition::Durable
         );
         assert_eq!(
@@ -7615,7 +7632,8 @@ mod tests {
             .await
             .expect("compatible schema amendment should stage");
 
-        let sql = "UPDATE amended_parameter_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let sql =
+            "UPDATE amended_parameter_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let statements = [
             ExecuteBatchStatement {
                 label: None,
@@ -7925,8 +7943,7 @@ mod tests {
             .unwrap();
 
         sql2::take_certified_row_insert_parameter_batch_executions();
-        let sql =
-            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
+        let sql = "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -8612,7 +8629,8 @@ mod tests {
             .await
             .unwrap();
 
-        let sql = "UPDATE certified_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let sql =
+            "UPDATE certified_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let missing_results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -8801,7 +8819,8 @@ mod tests {
         crate::transaction::take_complete_replacement_packed_current_base_publications();
         crate::transaction::take_rootless_replacement_generation_publications();
         sql2::take_certified_generation_identity_replacements();
-        let update_sql = "UPDATE packed_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let update_sql =
+            "UPDATE packed_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -9458,7 +9477,8 @@ mod tests {
             .await
             .unwrap();
 
-        let update_sql = "UPDATE staged_generation_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let update_sql =
+            "UPDATE staged_generation_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -11650,7 +11670,6 @@ mod tests {
     }
 }
 
-
 /// Compile-time proofs for the `AssumeSendFuture` safety obligation.
 ///
 /// `AssumeSendFuture` asserts `Send` unconditionally, so its soundness rests on
@@ -11748,7 +11767,6 @@ mod assume_send_future_proofs {
         assert_send::<crate::storage::GetManyResult>();
     }
 }
-
 
 /// Borrowing-adapter half of the `AssumeSendFuture` proofs.
 ///

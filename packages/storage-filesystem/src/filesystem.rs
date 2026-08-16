@@ -16,6 +16,11 @@ use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
     StorageWrite, WriteOptions,
 };
+#[cfg(test)]
+use lix::storage::{
+    CoreProjection, GetManyRequest, GetOptions, PutEntry, ReadDurability, SpaceId, StorageRead,
+    StoredValue,
+};
 use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value, open_lix};
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -2441,6 +2446,62 @@ mod tests {
         )
         .await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn filesystem_storage_durable_reads_recover_an_acknowledgement_receipt() {
+        let tempdir = tempfile::tempdir().expect("create filesystem storage directory");
+        let storage = FilesystemStorage::new(tempdir.path())
+            .open()
+            .expect("open filesystem storage");
+        let receipt_space = StorageSpace::mutable(SpaceId(0x0007_000a), "sync.client_state.v1");
+        let key = Key(b"operation-1".to_vec().into());
+        let mut write = storage
+            .begin_write(WriteOptions {
+                await_durable: true,
+                ..WriteOptions::default()
+            })
+            .await
+            .expect("begin durable receipt write");
+        write
+            .put_many(
+                receipt_space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key.clone(),
+                        value: StoredValue {
+                            bytes: b"receipt".to_vec().into(),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("write receipt");
+        write.commit().await.expect("commit receipt");
+
+        let read = storage
+            .begin_read(ReadOptions {
+                durability: ReadDurability::Durable,
+                ..ReadOptions::default()
+            })
+            .await
+            .expect("begin durable receipt read");
+        let values = read
+            .get_many(&[GetManyRequest {
+                space: receipt_space,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            }])
+            .await
+            .expect("read receipt");
+        assert_eq!(
+            values.values,
+            vec![Some(lix::storage::ProjectedValue::FullValue(
+                b"receipt".to_vec().into()
+            ))]
+        );
     }
 
     async fn open_test_filesystem_state(

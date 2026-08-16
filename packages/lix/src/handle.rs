@@ -20,10 +20,35 @@ use std::{
 };
 
 use crate::engine::{Engine, EngineOptions};
-use crate::session::{CoherentReadBatch, ExecuteOptions};
 use crate::session::SessionContext;
+use crate::session::{CoherentReadBatch, ExecuteOptions};
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
+
+/// Server behavior for an opened local Lix repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerMode {
+    /// Execute against local storage and continuously synchronize the active
+    /// branch with the server.
+    Sync,
+}
+
+/// Configures the server associated with a local Lix repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerOptions {
+    pub mode: ServerMode,
+    pub url: String,
+}
+
+impl ServerOptions {
+    pub fn sync(url: impl Into<String>) -> Self {
+        Self {
+            mode: ServerMode::Sync,
+            url: url.into(),
+        }
+    }
+}
 
 /// Configures the primary session for a Lix repository.
 ///
@@ -34,6 +59,7 @@ pub struct OpenLixBuilder<StorageImpl = Memory> {
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    server: Option<ServerOptions>,
 }
 
 impl Default for OpenLixBuilder<Memory> {
@@ -42,6 +68,7 @@ impl Default for OpenLixBuilder<Memory> {
             storage: Memory::new(),
             wasm_runtime: None,
             telemetry: None,
+            server: None,
         }
     }
 }
@@ -56,6 +83,7 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
             storage,
             wasm_runtime: self.wasm_runtime,
             telemetry: self.telemetry,
+            server: self.server,
         }
     }
 
@@ -68,6 +96,12 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
     /// Sends engine spans to `telemetry` for this Lix instance.
     pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Runs this repository as a local replica of `server`.
+    pub fn with_server(mut self, server: ServerOptions) -> Self {
+        self.server = Some(server);
         self
     }
 }
@@ -103,7 +137,7 @@ where
         // compiler cannot prove all deeply nested SQL futures are Send.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                open_lix_inner(self.storage, self.wasm_runtime, self.telemetry).await
+                open_lix_inner(self.storage, self.wasm_runtime, self.telemetry, self.server).await
             })
         })
     }
@@ -270,29 +304,61 @@ where
     engine: Arc<Engine<StorageImpl>>,
     session: Arc<SessionContext<StorageImpl>>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
+    #[cfg(not(target_family = "wasm"))]
+    sync_runtime: Option<Arc<crate::sync::SyncRuntime>>,
 }
 
 async fn open_lix_inner<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    server: Option<ServerOptions>,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let engine = open_or_initialize_engine(storage, wasm_runtime, telemetry, None).await?;
     let session = engine.open_session().await?;
-    Ok(Lix {
+    let mut lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
-    })
+        #[cfg(not(target_family = "wasm"))]
+        sync_runtime: None,
+    };
+    if let Some(server) = server {
+        match server.mode {
+            ServerMode::Sync => {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    lix.sync_runtime =
+                        Some(crate::sync::activate_sync_mode(&lix, &server.url).await?);
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "Rust sync mode is not available on wasm yet",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(lix)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
+        self.engine.storage()
+    }
+
+    pub(crate) fn sync_mode_state(&self) -> crate::sync::SyncModeState {
+        self.engine.sync_mode()
+    }
+
     /// Starts configuring another independent session for this repository.
     ///
     /// Await the returned builder directly, or call
@@ -369,6 +435,8 @@ where
             engine: self.engine.clone(),
             session: Arc::new(session),
             primary_switch_gate: None,
+            #[cfg(not(target_family = "wasm"))]
+            sync_runtime: None,
         })
     }
 
@@ -662,7 +730,30 @@ where
                     Some(gate) => Some(gate.lock().await),
                     None => None,
                 };
-                self.session.switch_branch(options).await
+                let receipt = self.session.switch_branch(options).await?;
+                // Keep the selected branch durable even when the process goes
+                // offline immediately after switching. The sync worker also
+                // persists this mapping after a successful re-handshake, but
+                // doing it at the session boundary closes the short
+                // switch-then-close window.
+                #[cfg(not(target_family = "wasm"))]
+                // Only the primary handle owns the process sync worker and
+                // its durable branch binding. Secondary sessions have their
+                // own branch selector; letting one of them rewrite this
+                // mapping would make the worker reconnect to the wrong
+                // branch. Clones of the primary retain this gate.
+                if self.primary_switch_gate.is_some()
+                    && let crate::sync::SyncRole::Replica { remote_id } =
+                        self.engine.sync_mode().role()?
+                {
+                    self.persist_sync_replica_config(&remote_id, &receipt.branch_id)
+                        .await?;
+                    // Scope hydration is branch-specific. Clear the
+                    // process-local readiness marks so the sync worker must
+                    // hydrate the selected branch before reads resume.
+                    self.engine.sync_mode().reset_scope_hydration();
+                }
+                Ok(receipt)
             })
         }
     }
@@ -674,6 +765,15 @@ where
         self.session.merge_branch(options).await
     }
 
+    pub(crate) async fn replay_execute_idempotency_result(
+        &self,
+        idempotency: &ExecuteIdempotency,
+    ) -> Result<Option<ExecuteResult>, LixError> {
+        self.session
+            .replay_execute_idempotency_result(idempotency)
+            .await
+    }
+
     pub async fn merge_branch_preview(
         &self,
         options: MergeBranchPreviewOptions,
@@ -682,7 +782,19 @@ where
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(runtime) = &self.sync_runtime {
+            runtime.stop_and_join().await?;
+        }
         self.session.close().await
+    }
+
+    pub(crate) fn set_sync_role(&self, role: crate::sync::SyncRole) -> Result<(), LixError> {
+        self.engine.sync_mode().set_role(role)
+    }
+
+    pub(crate) async fn lock_collaboration_writes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.engine.collaboration_write_gate().lock_owned().await
     }
 
     /// Returns engine-local transition counters for profiling and
@@ -784,6 +896,61 @@ where
         row: TransactionWriteRow,
     ) -> Result<(), LixError> {
         self.inner.stage_test_row(row).await
+    }
+
+    pub(crate) async fn stage_sync_rows(
+        &mut self,
+        rows: crate::transaction_types::RawWriteBatch,
+    ) -> Result<(), LixError> {
+        self.inner.stage_sync_rows(rows).await
+    }
+
+    pub(crate) async fn stage_sync_pack(
+        &mut self,
+        rows: crate::transaction_types::RawWriteBatch,
+        files: Vec<crate::sync::SyncFileMutation>,
+    ) -> Result<(), LixError> {
+        self.inner.suppress_ordinary_sync_event()?;
+        for file in files {
+            let path = file.path.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync file mutation is missing its logical path",
+                )
+            })?;
+            self.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[Value::Text(path), Value::Blob(file.content.into())],
+            )
+            .await?;
+        }
+        if !rows.is_empty() {
+            self.stage_sync_rows(rows).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn stage_sync_admission_receipt(
+        &mut self,
+        idempotency: &ExecuteIdempotency,
+        pack: &crate::sync::SyncTransactionPack,
+        plan: crate::sync::SyncAdmissionPlan,
+    ) -> Result<crate::sync::SyncAdmission, LixError> {
+        self.inner
+            .stage_sync_admission_receipt(idempotency, pack, plan)
+            .await
+    }
+
+    pub(crate) fn stage_sync_applied_event_markers(
+        &mut self,
+        markers: &[(crate::sync::SyncAppliedEventMarker, Option<Vec<u8>>)],
+    ) -> Result<(), LixError> {
+        self.inner.stage_sync_applied_event_markers(markers)
+    }
+
+    pub(crate) fn active_branch_id(&self) -> Result<&str, LixError> {
+        self.inner.active_branch_id()
     }
 
     pub async fn commit(self) -> Result<(), LixError> {
@@ -1080,7 +1247,6 @@ mod tests {
     }
 }
 
-
 /// See `session::execute::assume_send_future_proofs`.
 #[cfg(test)]
 mod assume_send_future_proofs {
@@ -1095,7 +1261,7 @@ mod assume_send_future_proofs {
         wasm_runtime: Option<Arc<dyn WasmRuntime>>,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) {
-        is_send(&open_lix_inner(storage, wasm_runtime, telemetry));
+        is_send(&open_lix_inner(storage, wasm_runtime, telemetry, None));
     }
 
     // handle.rs -- Lix::switch_branch (body mirrored verbatim)

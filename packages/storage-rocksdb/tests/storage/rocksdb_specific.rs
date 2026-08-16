@@ -98,6 +98,51 @@ fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
 }
 
 #[test]
+fn durable_reads_fence_the_wal_and_return_receipts() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("durable-read.rocksdb");
+    let storage = RocksDB::open(&path).expect("open storage");
+    let space = StorageSpace::mutable(SpaceId(7), "test.receipt");
+    let key = Key(Bytes::from_static(b"operation-1"));
+    let mut write = block_on(storage.begin_write(WriteOptions {
+        await_durable: true,
+        ..WriteOptions::default()
+    }))
+    .expect("begin durable write");
+    block_on(write.put_many(
+        space,
+        PutBatch {
+            entries: vec![PutEntry {
+                key: key.clone(),
+                value: StoredValue {
+                    bytes: Bytes::from_static(b"receipt"),
+                },
+            }],
+        },
+    ))
+    .expect("write receipt");
+    block_on(write.commit()).expect("commit durable receipt");
+
+    let read = block_on(storage.begin_read(ReadOptions {
+        durability: lix::storage::ReadDurability::Durable,
+        ..ReadOptions::default()
+    }))
+    .expect("durable read should be supported by RocksDB");
+    let result = block_on(read.get_many(&[GetManyRequest {
+        space,
+        keys: std::slice::from_ref(&key),
+        opts: GetOptions::default(),
+    }]))
+    .expect("read durable receipt");
+    assert_eq!(
+        result.values,
+        vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+            b"receipt"
+        )))]
+    );
+}
+
+#[test]
 fn multi_key_delete_uses_exact_contiguous_key_ranges() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");

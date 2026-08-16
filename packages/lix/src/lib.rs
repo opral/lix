@@ -103,6 +103,8 @@ mod schema;
 #[cfg(feature = "server-protocol")]
 pub mod server_protocol;
 mod session;
+#[doc(hidden)]
+pub mod sync;
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
 mod sql_profile;
@@ -140,7 +142,7 @@ pub mod wasm;
 pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{
     ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction, OpenAnotherSessionBuilder,
-    OpenLixBuilder, TransactionExecuteBuilder, open_lix,
+    OpenLixBuilder, ServerMode, ServerOptions, TransactionExecuteBuilder, open_lix,
 };
 
 pub use schema::{

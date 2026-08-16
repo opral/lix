@@ -79,6 +79,45 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ExecuteResponse" }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/sync/admit:
+    post:
+      operationId: syncAdmit
+      description: Durably admits one row-first transaction pack into the session branch.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/RequiredIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/SyncTransactionPack" } }
+      responses:
+        "200":
+          description: The pack was admitted, or its durable receipt was replayed.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/SyncAdmitResponse" } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/sync/pull:
+    get:
+      operationId: syncPull
+      description: Pulls canonical row-first transaction packs after a durable branch cursor.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - name: after
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 512, default: 128 }
+        - name: schemas
+          in: query
+          description: Comma-separated semantic schema keys to hydrate; omit with limit=0 for a head-only pull.
+          schema: { type: string, maxLength: 16384 }
+      responses:
+        "200":
+          description: The next ordered page and the current authoritative head.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/SyncPullResponse" } }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/transaction/begin:
     post:
       operationId: beginTransaction
@@ -287,6 +326,11 @@ components:
       in: header
       required: false
       schema: { type: string, minLength: 1, maxLength: 255 }
+    RequiredIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 255 }
     FilePath:
       name: path
       in: query
@@ -323,11 +367,13 @@ components:
         sessionId: { type: string }
         capabilities:
           type: object
-          required: [binaryFileUpsert, binaryFileUpsertBatch, binaryFileRead]
+          required: [binaryFileUpsert, binaryFileUpsertBatch, binaryFileRead, syncAdmission, syncPull]
           properties:
             binaryFileUpsert: { type: boolean }
             binaryFileUpsertBatch: { type: boolean }
             binaryFileRead: { type: boolean }
+            syncAdmission: { type: boolean }
+            syncPull: { type: boolean }
     ExecuteOptions:
       type: object
       properties: { originKey: { type: string } }
@@ -354,6 +400,78 @@ components:
         rows: { type: array, items: { type: array, items: {} } }
         rowsAffected: { type: integer, minimum: 0 }
         notices: { type: array, items: { type: object } }
+    SyncRowMutation:
+      type: object
+      required: [schemaKey, rowPk]
+      properties:
+        schemaKey: { type: string, minLength: 1, maxLength: 255 }
+        fileId: { type: [string, "null"], maxLength: 255 }
+        rowPk: {}
+        snapshot: {}
+        metadata: {}
+    SyncFileMutation:
+      type: object
+      required: [fileId, path, global, untracked, content]
+      properties:
+        fileId: { type: string, minLength: 1, maxLength: 255 }
+        path: { type: string, minLength: 1, maxLength: 4096 }
+        filename: { type: [string, "null"], maxLength: 4096 }
+        global: { type: boolean }
+        untracked: { type: boolean }
+        content:
+          type: string
+          contentEncoding: base64
+    SyncTransactionPack:
+      type: object
+      required: [operationId, branchId, baseServerCommitId, localCommitId]
+      description: At least one row or file mutation is required by the server.
+      anyOf:
+        - required: [rows]
+          properties:
+            rows: { type: array, minItems: 1 }
+        - required: [files]
+          properties:
+            files: { type: array, minItems: 1 }
+      properties:
+        operationId: { type: string, minLength: 1, maxLength: 255 }
+        branchId: { type: string, minLength: 1, maxLength: 255 }
+        baseServerCommitId: { type: string, minLength: 1, maxLength: 255 }
+        localCommitId: { type: string, minLength: 1, maxLength: 255 }
+        rows:
+          type: array
+          maxItems: 8192
+          items: { $ref: "#/components/schemas/SyncRowMutation" }
+        files:
+          type: array
+          maxItems: 1024
+          items: { $ref: "#/components/schemas/SyncFileMutation" }
+    SyncAdmitResponse:
+      type: object
+      required: [operationId, branchId, canonicalCommitId, cursor]
+      properties:
+        operationId: { type: string }
+        branchId: { type: string }
+        canonicalCommitId: { type: string }
+        cursor: { type: integer, minimum: 1 }
+    SyncCanonicalEvent:
+      type: object
+      required: [cursor, canonicalCommitId, pack]
+      properties:
+        cursor: { type: integer, minimum: 1 }
+        canonicalCommitId: { type: string }
+        packFingerprint: { type: string, minLength: 64, maxLength: 64 }
+        pack: { $ref: "#/components/schemas/SyncTransactionPack" }
+    SyncPullResponse:
+      type: object
+      required: [branchId, events, nextCursor, headCursor, headCommitId]
+      properties:
+        branchId: { type: string }
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/SyncCanonicalEvent" }
+        nextCursor: { type: integer, minimum: 0 }
+        headCursor: { type: integer, minimum: 0 }
+        headCommitId: { type: string }
     ErrorEnvelope:
       type: object
       required: [error]

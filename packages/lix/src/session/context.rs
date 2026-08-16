@@ -31,6 +31,7 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
     SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
 };
+use crate::sync::SyncModeState;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
@@ -168,6 +169,7 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) file_views: SessionFileViews,
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
+    pub(super) sync_mode: SyncModeState,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
@@ -191,6 +193,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        sync_mode: SyncModeState,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
@@ -215,6 +218,7 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            sync_mode,
             plugin_host,
             telemetry,
         ))
@@ -235,6 +239,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        sync_mode: SyncModeState,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
@@ -253,6 +258,7 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            sync_mode,
             plugin_host,
             telemetry,
         ))
@@ -273,6 +279,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        sync_mode: SyncModeState,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Self {
@@ -291,6 +298,7 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            sync_mode,
             plugin_host,
             telemetry,
             SessionTransactionManager::new(),
@@ -313,6 +321,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        sync_mode: SyncModeState,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
         transaction_manager: SessionTransactionManager,
@@ -334,6 +343,7 @@ where
             file_views,
             observe_coordinator,
             observe_invalidation,
+            sync_mode,
             plugin_host,
             telemetry,
             transaction_manager,
@@ -559,6 +569,7 @@ where
         .await?;
         self.ensure_open()?;
         let mut transaction = opened.transaction;
+        transaction.set_sync_role(self.sync_mode.role()?);
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
         if planner_validation_is_serialized {
             transaction.trust_serialized_filesystem_planner();

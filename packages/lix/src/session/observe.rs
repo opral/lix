@@ -77,6 +77,7 @@ where
             return Ok(None);
         }
         if self.last_rows.is_none() {
+            self.session.sync_mode.wait_for_scope_hydration().await?;
             let Some((mutation_sequence, evaluation)) =
                 Box::pin(self.evaluate_stable_snapshot()).await?
             else {
@@ -260,6 +261,7 @@ where
                 "observe requires a non-empty SQL string",
             ));
         }
+        self.sync_mode.register_sql_scope(sql);
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             return Err(LixError::new(
@@ -297,7 +299,6 @@ where
     }
 }
 
-
 /// See `session::execute::assume_send_future_proofs`.
 #[cfg(test)]
 mod assume_send_future_proofs {
@@ -319,4 +320,3 @@ mod assume_send_future_proofs {
         assert_send::<ObserveEvents<S>>();
     }
 }
-

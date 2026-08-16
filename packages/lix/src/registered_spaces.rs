@@ -50,8 +50,7 @@ pub const HOT_FILE_SPACE: StorageSpace = crate::hot_state::FILE_SPACE;
 pub const HOT_DIFF_SPACE: StorageSpace = crate::hot_state::DIFF_SPACE;
 pub const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace =
     crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
-pub const CERTIFIED_ROW_BATCH_SPACE: StorageSpace =
-    crate::hot_state::CERTIFIED_ROW_BATCH_SPACE;
+pub const CERTIFIED_ROW_BATCH_SPACE: StorageSpace = crate::hot_state::CERTIFIED_ROW_BATCH_SPACE;
 pub const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = crate::branch::BRANCH_HEAD_CONTROL_SPACE;
 pub const CERTIFIED_ROW_BATCH_MANIFEST_SPACE: StorageSpace =
     crate::hot_state::CERTIFIED_ROW_BATCH_MANIFEST_SPACE;
@@ -109,6 +108,12 @@ pub const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace =
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE;
 pub const UPLOAD_STATE_SPACE: StorageSpace = crate::session::UPLOAD_STATE_SPACE;
 pub const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = crate::session::UPLOAD_MANIFEST_LEAF_SPACE;
+pub const SYNC_EVENT_SPACE: StorageSpace = crate::sync::SYNC_EVENT_SPACE;
+pub const SYNC_HEAD_SPACE: StorageSpace = crate::sync::SYNC_HEAD_SPACE;
+pub const SYNC_CLIENT_STATE_SPACE: StorageSpace = crate::sync::SYNC_CLIENT_STATE_SPACE;
+pub const SYNC_REPLICA_CONFIG_SPACE: StorageSpace = crate::sync::SYNC_REPLICA_CONFIG_SPACE;
+pub const SYNC_CLIENT_PENDING_SPACE: StorageSpace = crate::sync::SYNC_CLIENT_PENDING_SPACE;
+pub const SYNC_CLIENT_APPLIED_SPACE: StorageSpace = crate::sync::SYNC_CLIENT_APPLIED_SPACE;
 pub const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = crate::gc::CHECKPOINT_RECOVERY_REF_SPACE;
 pub const CHECKPOINT_GC_STATE_SPACE: StorageSpace = crate::gc::CHECKPOINT_GC_STATE_SPACE;
 
@@ -160,6 +165,12 @@ mod tests {
         EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
         UPLOAD_STATE_SPACE,
         UPLOAD_MANIFEST_LEAF_SPACE,
+        SYNC_EVENT_SPACE,
+        SYNC_HEAD_SPACE,
+        SYNC_CLIENT_STATE_SPACE,
+        SYNC_REPLICA_CONFIG_SPACE,
+        SYNC_CLIENT_PENDING_SPACE,
+        SYNC_CLIENT_APPLIED_SPACE,
         CHECKPOINT_RECOVERY_REF_SPACE,
         CHECKPOINT_GC_STATE_SPACE,
     ];

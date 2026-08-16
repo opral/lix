@@ -366,7 +366,9 @@ fn common_registry_column_merger(
         (Some(opening), Some(current)) if opening == current => Ok(Some(current.clone())),
         _ => Err(LixError::new(
             LixError::CODE_MERGE_CONFLICT,
-            format!("column merger generation for schema '{schema_key}' changed during the transaction"),
+            format!(
+                "column merger generation for schema '{schema_key}' changed during the transaction"
+            ),
         )
         .with_hint("commit the plugin generation change before retrying the row edit")),
     }
@@ -698,6 +700,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// uses this lane for its completed manifest and upload receipt.
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
+    suppress_ordinary_sync_event: bool,
+    sync_role: crate::sync::SyncRole,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -1583,6 +1587,8 @@ where
                     idempotency_receipt: None,
                     atomic_metadata_writes: None,
                     atomic_metadata_preconditions: Vec::new(),
+                    suppress_ordinary_sync_event: false,
+                    sync_role: crate::sync::SyncRole::Disabled,
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
@@ -1753,6 +1759,48 @@ where
         };
         let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
         let previous_filesystem_revision = loaded_filesystem_revision.flatten();
+        let mut automatic_sync_writes = transaction.storage.new_write_set();
+        let mut automatic_sync_preconditions = Vec::new();
+        let sync_blob_reader = TransactionBlobDataReader {
+            base: Arc::new(transaction.binary_cas.reader(read.clone())),
+            staged_writes: Arc::clone(&transaction.staged_writes),
+        };
+        if transaction.atomic_metadata_writes.is_none() && !transaction.suppress_ordinary_sync_event
+        {
+            match &transaction.sync_role {
+                crate::sync::SyncRole::Disabled => {}
+                crate::sync::SyncRole::Authority => {
+                    if crate::sync::stage_ordinary_transaction_event(
+                        &read,
+                        &sync_blob_reader,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        &prepared_writes,
+                        &commit_parent_heads,
+                        &transaction.active_branch_id,
+                    )
+                    .await?
+                    {
+                        transaction.await_durable_commit = true;
+                    }
+                }
+                crate::sync::SyncRole::Replica { remote_id } => {
+                    if crate::sync::stage_local_transaction_outbox(
+                        &read,
+                        &sync_blob_reader,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        &prepared_writes,
+                        &transaction.active_branch_id,
+                        remote_id,
+                    )
+                    .await?
+                    {
+                        transaction.await_durable_commit = true;
+                    }
+                }
+            }
+        }
         let (mut writes, materialization_preconditions, filesystem_delta_rows) =
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
@@ -1793,6 +1841,7 @@ where
         if tracked_state_changed {
             StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
         }
+        writes.extend(automatic_sync_writes);
         if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
             writes.extend(metadata_writes);
         }
@@ -1801,6 +1850,9 @@ where
         write_options
             .preconditions
             .extend(materialization_preconditions);
+        write_options
+            .preconditions
+            .append(&mut automatic_sync_preconditions);
         write_options
             .preconditions
             .append(&mut transaction.atomic_metadata_preconditions);
@@ -1817,6 +1869,7 @@ where
             // A protocol acknowledgement may replay only from a durable
             // receipt, so ask the storage to cross its durability boundary
             // before it reports this commit as successful.
+            write_options.await_durable = true;
             write_options.idempotency_key = Some(key.0.clone());
             write_options
                 .preconditions
@@ -1950,6 +2003,10 @@ where
 
     pub(crate) fn attach_commit_boundary(&mut self, boundary: TransactionCommitBoundary) {
         self.commit_boundary = Some(boundary);
+    }
+
+    pub(crate) fn set_sync_role(&mut self, role: crate::sync::SyncRole) {
+        self.sync_role = role;
     }
 
     pub(crate) fn trust_serialized_filesystem_planner(&mut self) {
@@ -6637,7 +6694,6 @@ where
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
-    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_rows(
         &mut self,
         rows: RawWriteBatch,
@@ -6733,6 +6789,95 @@ where
             ));
         }
         self.idempotency_receipt = Some(encode_receipt(idempotency, receipt)?);
+        Ok(())
+    }
+
+    pub(crate) fn suppress_ordinary_sync_event(&mut self) {
+        self.suppress_ordinary_sync_event = true;
+    }
+
+    pub(crate) async fn stage_sync_admission_receipt(
+        &mut self,
+        idempotency: &ExecuteIdempotency,
+        pack: &crate::sync::SyncTransactionPack,
+        plan: crate::sync::SyncAdmissionPlan,
+    ) -> Result<crate::sync::SyncAdmission, LixError> {
+        self.flush_prepared_mutations().await?;
+        let canonical_commit_id = self
+            .staged_writes
+            .commit_id_for_branch(&self.active_branch_id)?
+            .or(self.opening_active_branch_head)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    "sync admission target branch has no commit",
+                )
+            })?
+            .to_string();
+        let result = crate::ExecuteResult::from_rows(
+            vec!["canonical_commit_id".to_owned(), "cursor".to_owned()],
+            vec![vec![
+                Value::Text(canonical_commit_id.clone()),
+                Value::Integer(i64::try_from(plan.cursor).map_err(|_| {
+                    LixError::new(LixError::CODE_INTERNAL_ERROR, "sync cursor exceeds i64")
+                })?),
+            ]],
+        );
+        let receipt = ExecuteIdempotencyReceipt::single(idempotency, &result)?;
+        self.stage_execute_idempotency_receipt(idempotency, &receipt)?;
+        if self.atomic_metadata_writes.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync admission cannot share another atomic metadata publication",
+            ));
+        }
+        let mut writes = self.storage.new_write_set();
+        let mut preconditions = Vec::new();
+        crate::sync::stage_sync_event_publication(
+            &mut writes,
+            &mut preconditions,
+            pack,
+            &canonical_commit_id,
+            &plan,
+        )?;
+        self.atomic_metadata_writes = Some(writes);
+        self.atomic_metadata_preconditions = preconditions;
+        Ok(crate::sync::SyncAdmission {
+            operation_id: pack.operation_id.clone(),
+            branch_id: pack.branch_id.clone(),
+            canonical_commit_id,
+            cursor: plan.cursor,
+        })
+    }
+
+    /// Publishes the replica-side applied-event receipts in the same storage
+    /// commit as the canonical rows/files they protect. This is the crash
+    /// fence for cursor replay: a cursor manifest may lag, but a committed
+    /// marker proves the plugin transaction already ran.
+    pub(crate) fn stage_sync_applied_event_markers(
+        &mut self,
+        markers: &[(crate::sync::SyncAppliedEventMarker, Option<Vec<u8>>)],
+    ) -> Result<(), LixError> {
+        if markers.is_empty() {
+            return Ok(());
+        }
+        if self.atomic_metadata_writes.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync applied markers cannot share another atomic metadata publication",
+            ));
+        }
+        let mut writes = self.storage.new_write_set();
+        let mut preconditions = Vec::new();
+        crate::sync::stage_sync_applied_event_markers(&mut writes, &mut preconditions, markers)?;
+        self.atomic_metadata_writes = Some(writes);
+        self.atomic_metadata_preconditions = preconditions;
+        // The cursor manifest is persisted only after this transaction
+        // returns. The marker must therefore cross the backend's durability
+        // boundary before acknowledgement; otherwise a power loss could keep
+        // the durable cursor while losing the marker+row commit, making the
+        // replica skip canonical data on restart.
+        self.await_durable_commit = true;
         Ok(())
     }
 

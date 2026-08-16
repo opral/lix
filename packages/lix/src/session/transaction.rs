@@ -18,11 +18,12 @@ use crate::transaction::{
     CommitBoundaryState, Transaction, TransactionCommitBoundary,
     open_transaction_with_runtime_boundary,
 };
+use crate::transaction_types::RawWriteBatch;
 #[cfg(test)]
-use crate::transaction_types::{RawWriteBatch, TransactionWriteRow};
+use crate::transaction_types::TransactionWriteRow;
 
-use super::SessionContext;
 use super::context::{SessionWriteAccess, closed_error};
+use super::{ExecuteIdempotency, SessionContext};
 use crate::transaction::CommitCoordinator;
 
 #[expect(missing_debug_implementations)]
@@ -90,6 +91,7 @@ where
                 }
             };
         self.ensure_open()?;
+        opened.transaction.set_sync_role(self.sync_mode.role()?);
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
@@ -132,6 +134,36 @@ where
             .stage_engine_test_rows(RawWriteBatch::from_test_rows(vec![row]))
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn stage_sync_rows(&mut self, rows: RawWriteBatch) -> Result<(), LixError> {
+        let transaction = self.transaction_mut()?;
+        transaction.suppress_ordinary_sync_event();
+        transaction.stage_rows(rows).await?;
+        Ok(())
+    }
+
+    pub(crate) fn suppress_ordinary_sync_event(&mut self) -> Result<(), LixError> {
+        self.transaction_mut()?.suppress_ordinary_sync_event();
+        Ok(())
+    }
+
+    pub(crate) async fn stage_sync_admission_receipt(
+        &mut self,
+        idempotency: &ExecuteIdempotency,
+        pack: &crate::sync::SyncTransactionPack,
+        plan: crate::sync::SyncAdmissionPlan,
+    ) -> Result<crate::sync::SyncAdmission, LixError> {
+        self.transaction_mut()?
+            .stage_sync_admission_receipt(idempotency, pack, plan)
+            .await
+    }
+
+    pub(crate) fn stage_sync_applied_event_markers(
+        &mut self,
+        markers: &[(crate::sync::SyncAppliedEventMarker, Option<Vec<u8>>)],
+    ) -> Result<(), LixError> {
+        self.transaction_mut()?.stage_sync_applied_event_markers(markers)
     }
 
     pub fn active_branch_id(&self) -> Result<&str, LixError> {
