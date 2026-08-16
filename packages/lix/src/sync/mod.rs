@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binary_cas::BlobDataReader;
 use crate::changelog::CommitId;
+use crate::commit_graph::CommitGraphContext;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonSlot, JsonStoreContext};
 use crate::session::ExecuteIdempotency;
 use crate::storage_adapter::{
@@ -1297,6 +1298,24 @@ where
             return Ok(());
         }
 
+        // A lazy scope may be hydrated after another scope has already
+        // materialized this canonical commit. Replaying that event with the
+        // canonical label would attach an ancestor-sized ID to a new child
+        // and create a local parent cycle. Preserve canonical identity only
+        // for the first local materialization; later projections get an
+        // ordinary local commit while their durable marker still records the
+        // server identity.
+        let canonical_commit_id = CommitId::parse_lix(
+            &event.canonical_commit_id,
+            "sync canonical commit_id",
+        )?;
+        let canonical_already_local = {
+            let graph_read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let mut graph = CommitGraphContext::new().reader(graph_read);
+            graph.load_node(&canonical_commit_id).await?.is_some()
+        };
+        let replay_commit_id = (!canonical_already_local).then_some(event.canonical_commit_id.as_str());
+
         let mut pack = event.pack.clone();
         if marker_scopes[0] != FULL_SYNC_SCOPE {
             let wanted = marker_scopes.iter().cloned().collect::<HashSet<_>>();
@@ -1358,7 +1377,7 @@ where
             &pack,
             None,
             Some(&markers),
-            Some(&event.canonical_commit_id),
+            replay_commit_id,
         )
             .await
     }
@@ -1629,7 +1648,7 @@ where
         let base = CommitId::parse_lix(base_commit_id, "sync base commit_id")?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let mut graph = crate::commit_graph::CommitGraphContext::new().reader(read);
+        let mut graph = CommitGraphContext::new().reader(read);
         let merge_base = graph.merge_base(&current, &base).await?;
         if merge_base != base {
             return Err(LixError::new(
