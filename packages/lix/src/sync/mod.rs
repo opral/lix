@@ -1071,7 +1071,7 @@ where
         pack: &SyncTransactionPack,
     ) -> Result<(), LixError> {
         validate_sync_transaction_pack(pack)?;
-        self.apply_sync_transaction_pack_inner(pack, None, None)
+        self.apply_sync_transaction_pack_inner(pack, None, None, None)
             .await
     }
 
@@ -1207,7 +1207,12 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        self.apply_sync_transaction_pack_inner(&pack, None, Some(&markers))
+        self.apply_sync_transaction_pack_inner(
+            &pack,
+            None,
+            Some(&markers),
+            Some(&event.canonical_commit_id),
+        )
             .await
     }
 
@@ -1250,7 +1255,7 @@ where
         authoritative_branch_id: &str,
     ) -> Result<(), LixError> {
         require_branch(authoritative_branch_id, &pack.branch_id)?;
-        self.apply_sync_transaction_pack_inner(pack, Some(authoritative_branch_id), None)
+        self.apply_sync_transaction_pack_inner(pack, Some(authoritative_branch_id), None, None)
             .await
     }
 
@@ -1495,6 +1500,7 @@ where
         pack: &SyncTransactionPack,
         authoritative_branch_id: Option<&str>,
         applied_markers: Option<&[(SyncAppliedEventMarker, Option<Vec<u8>>)]>,
+        canonical_commit_id: Option<&str>,
     ) -> Result<(), LixError> {
         // The canonical event was validated before projection. A projection
         // can legitimately become empty when an overlapping lazy scope has
@@ -1528,7 +1534,7 @@ where
             }
         }
         transaction
-            .stage_sync_pack(rows, pack.files.clone())
+            .stage_sync_pack_with_commit_id(rows, pack.files.clone(), canonical_commit_id)
             .await?;
         if let Some(markers) = applied_markers {
             transaction.stage_sync_applied_event_markers(markers)?;
@@ -3456,6 +3462,11 @@ mod tests {
             .rows()[0]
             .get::<String>("commit_id")
             .expect("first commit id");
+        assert_eq!(
+            first_commit,
+            crate::changelog::CommitId::for_test_label("canonical-1").to_string(),
+            "canonical event replay must retain the server commit identity"
+        );
 
         // Model a crash after the row/plugin commit but before the cursor
         // manifest commit: the canonical event is delivered again while the

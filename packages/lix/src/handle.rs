@@ -910,6 +910,15 @@ where
         rows: crate::transaction_types::RawWriteBatch,
         files: Vec<crate::sync::SyncFileMutation>,
     ) -> Result<(), LixError> {
+        self.stage_sync_pack_with_commit_id(rows, files, None).await
+    }
+
+    pub(crate) async fn stage_sync_pack_with_commit_id(
+        &mut self,
+        rows: crate::transaction_types::RawWriteBatch,
+        files: Vec<crate::sync::SyncFileMutation>,
+        canonical_commit_id: Option<&str>,
+    ) -> Result<(), LixError> {
         self.inner.suppress_ordinary_sync_event()?;
         for file in files {
             let path = file.path.ok_or_else(|| {
@@ -927,6 +936,9 @@ where
         }
         if !rows.is_empty() {
             self.stage_sync_rows(rows).await?;
+        }
+        if let Some(canonical_commit_id) = canonical_commit_id {
+            self.inner.relabel_sync_commit(canonical_commit_id)?;
         }
         Ok(())
     }

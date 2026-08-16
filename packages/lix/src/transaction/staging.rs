@@ -1678,6 +1678,59 @@ impl TransactionWriteBuffer {
         }
     }
 
+    /// Rebinds the one commit produced by a sync replay to the canonical
+    /// server identity. Sync rows are staged through the normal planner first
+    /// so schema/plugin validation remains unchanged; only the final commit
+    /// label is replaced here.
+    pub(crate) fn replace_commit_id(
+        &self,
+        branch_id: &str,
+        from: CommitId,
+        to: CommitId,
+    ) -> Result<(), LixError> {
+        if from == to {
+            return Ok(());
+        }
+        {
+            let mut rows = self.rows.lock().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire transaction staged rows lock",
+                )
+            })?;
+            match &mut *rows {
+                StagedPreparedRows::AppendOnly { rows, .. }
+                | StagedPreparedRows::Indexed { rows, .. } => rows.replace_commit_id(from, to),
+            }
+        }
+        let mut refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit refs lock",
+            )
+        })?;
+        let Some(change_refs) = refs.get_mut(branch_id) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync replay has no staged commit refs to relabel",
+            ));
+        };
+        if change_refs.commit_id != from {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync replay staged commit identity changed before relabel",
+            ));
+        }
+        if change_refs.ordered_mutation_journal().is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync replay cannot relabel an immutable mutation journal",
+            ));
+        }
+        change_refs.commit_id = to;
+        Ok(())
+    }
+
     pub(crate) fn certify_complete_collection_replacement(
         &self,
         expected_schema_key: &str,

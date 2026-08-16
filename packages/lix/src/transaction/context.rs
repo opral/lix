@@ -6796,6 +6796,25 @@ where
         self.suppress_ordinary_sync_event = true;
     }
 
+    /// Keeps the canonical server commit identity when replaying a sync
+    /// event. The event has already passed the normal row/plugin planner, so
+    /// this only relabels the commit refs and prepared rows before commit
+    /// materialization.
+    pub(crate) fn relabel_sync_commit(&self, canonical_commit_id: &str) -> Result<(), LixError> {
+        let canonical = CommitId::parse_lix(canonical_commit_id, "sync canonical commit_id")?;
+        let generated = self
+            .staged_writes
+            .commit_id_for_branch(&self.active_branch_id)?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync replay has no staged commit to relabel",
+                )
+            })?;
+        self.staged_writes
+            .replace_commit_id(&self.active_branch_id, generated, canonical)
+    }
+
     pub(crate) async fn stage_sync_admission_receipt(
         &mut self,
         idempotency: &ExecuteIdempotency,

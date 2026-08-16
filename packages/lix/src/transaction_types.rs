@@ -3143,6 +3143,28 @@ impl PreparedStateBatch {
         self.len() == 0
     }
 
+    /// Rebinds the commit identity assigned by the local staging path to a
+    /// canonical identity supplied by the sync protocol. This is deliberately
+    /// private to transaction materialization: ordinary SQL writes continue
+    /// to allocate their own commit IDs, while a replicated event can retain
+    /// the server identity that other replicas observe.
+    pub(crate) fn replace_commit_id(&mut self, from: CommitId, to: CommitId) {
+        if from == to {
+            return;
+        }
+        if let Some(dense) = self.dense_certified_parameter.as_mut() {
+            if dense.commit_id == Some(from) {
+                dense.commit_id = Some(to);
+            }
+            return;
+        }
+        for slot in &mut self.slots {
+            if slot.commit_id == Some(from) {
+                slot.commit_id = Some(to);
+            }
+        }
+    }
+
     pub(crate) fn certified_tracked_keys_strictly_ordered(&self) -> bool {
         self.certified_tracked_keys_strictly_ordered
     }

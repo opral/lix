@@ -148,6 +148,10 @@ where
         Ok(())
     }
 
+    pub(crate) fn relabel_sync_commit(&mut self, canonical_commit_id: &str) -> Result<(), LixError> {
+        self.transaction_mut()?.relabel_sync_commit(canonical_commit_id)
+    }
+
     pub(crate) async fn stage_sync_admission_receipt(
         &mut self,
         idempotency: &ExecuteIdempotency,

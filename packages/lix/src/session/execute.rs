@@ -1266,6 +1266,12 @@ where
         require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
+        // Register the demand before planning. A fresh replica may need the
+        // server's schema catalog before SQL can be planned, so the existing
+        // readiness barrier intentionally covers the complete single-
+        // statement path. Once the scope is cached this is local-only.
+        self.sync_mode.register_sql_scope(sql);
+        self.sync_mode.wait_for_scope_hydration().await?;
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             if require_idempotency_for_writes && idempotency.is_none() {
@@ -1317,13 +1323,6 @@ where
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
-
-        // Sync readiness is a read barrier. Local writes must stay available
-        // offline even when they introduce a schema that has not yet been
-        // materialized on this replica; their outbox record is durable and
-        // the background worker can admit it after reconnecting.
-        self.sync_mode.register_sql_scope(sql);
-        self.sync_mode.wait_for_scope_hydration().await?;
 
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
         let exact_schema_point_read = exact_filesystem_read
