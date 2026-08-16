@@ -111,6 +111,104 @@ async fn open_execute_observe_syncs_two_filesystem_replicas_and_server_writes() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_created_branch_becomes_visible_on_sync_replicas() {
+    let server_lix = Arc::new(open_lix().await.expect("open server repository"));
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) = serve_protocol(protocol).await;
+    server_lix
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+            &[Value::Text(ROW_SCHEMA.to_owned())],
+        )
+        .await
+        .expect("register synchronized schema");
+
+    let alice_dir = TempDir::new().expect("alice tempdir");
+    let bob_dir = TempDir::new().expect("bob tempdir");
+    let alice = open_lix()
+        .with_storage(
+            FilesystemStorage::new(alice_dir.path())
+                .open()
+                .expect("open alice storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open alice replica");
+    let bob = open_lix()
+        .with_storage(
+            FilesystemStorage::new(bob_dir.path())
+                .open()
+                .expect("open bob storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open bob replica");
+
+    // Establish a canonical commit that is present in both local commit
+    // graphs. The branch catalog can then use that identity as its source.
+    alice
+        .execute(
+            "INSERT INTO sync_mode_row (row_id, value) VALUES ('branch-seed', 'seed')",
+            &[],
+        )
+        .await
+        .expect("seed canonical row");
+    wait_for_named_value(&bob, "branch-seed", "seed").await;
+    wait_for_named_value(server_lix.as_ref(), "branch-seed", "seed").await;
+
+    let branch_id = "0198a000-0000-7000-8000-0000000000c1";
+    let server_branch = server_lix
+        .create_branch(lix::CreateBranchOptions {
+            id: Some(branch_id.to_owned()),
+            name: "server-feature".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create branch on server");
+
+    wait_for_branch(&alice, branch_id).await;
+    wait_for_branch(&bob, branch_id).await;
+    let server_branch_row = server_lix
+        .execute(
+            "SELECT name, commit_id FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch_id.to_owned())],
+        )
+        .await
+        .expect("read server branch")
+        .rows()
+        .first()
+        .cloned()
+        .expect("server branch row");
+    for replica in [&alice, &bob] {
+        let row = replica
+            .execute(
+                "SELECT name, commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id.to_owned())],
+            )
+            .await
+            .expect("read replicated branch")
+            .rows()
+            .first()
+            .cloned()
+            .expect("replicated branch row");
+        assert_eq!(
+            row.get::<String>("name").unwrap(),
+            server_branch_row.get::<String>("name").unwrap()
+        );
+        assert_eq!(
+            row.get::<String>("commit_id").unwrap(),
+            server_branch_row.get::<String>("commit_id").unwrap()
+        );
+    }
+    assert_eq!(server_branch.id, branch_id);
+
+    alice.close().await.expect("close alice");
+    bob.close().await.expect("close bob");
+    server_lix.close().await.expect("close server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_file_bytes_follow_sync_mode_between_filesystem_replicas() {
     let server_lix = Arc::new(open_lix().await.expect("open server repository"));
     let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
@@ -587,6 +685,29 @@ where
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for row '{row_id}' value '{expected}'"));
+}
+
+async fn wait_for_branch<S>(lix: &Lix<S>, branch_id: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let result = lix
+                .execute(
+                    "SELECT id FROM lix_branch WHERE id = $1",
+                    &[Value::Text(branch_id.to_owned())],
+                )
+                .await
+                .expect("read synchronized branch catalog");
+            if !result.rows().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for branch '{branch_id}'"));
 }
 
 async fn wait_for_file<S>(lix: &Lix<S>, expected: &[u8])

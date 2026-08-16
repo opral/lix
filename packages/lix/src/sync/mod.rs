@@ -42,7 +42,7 @@ use crate::storage_adapter::{
 use crate::tracked_state::{TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter};
 use crate::transaction::PreparedWriteSet;
 use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
-use crate::{Lix, LixError};
+use crate::{CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, LixError, Value};
 
 pub(crate) const SYNC_EVENT_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0007_0008),
@@ -92,6 +92,10 @@ pub(crate) const SYNC_CLIENT_APPLIED_SPACE: StorageSpace = StorageSpace::declare
 /// finite set of relations safely (for example a CTE or nested subquery).
 /// Such queries take the correctness-first full-history path.
 const FULL_SYNC_SCOPE: &str = "\0__lix_sync_all__";
+/// Readiness marker for the global branch/commit control plane. It is
+/// intentionally separate from semantic row scopes because topology is
+/// reconciled by a compact catalog pull, not by user row packs.
+pub(crate) const CONTROL_SYNC_SCOPE: &str = "\0__lix_sync_control__";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SyncRole {
@@ -110,6 +114,7 @@ pub(crate) struct SyncModeState {
     scopes: Arc<RwLock<BTreeSet<String>>>,
     hydrated_scopes: Arc<RwLock<BTreeSet<String>>>,
     scope_notify: Arc<tokio::sync::Notify>,
+    internal_scope_depth: Arc<AtomicU64>,
     /// Monotonically changes whenever the active branch changes. Hydration is
     /// asynchronous, so an old-branch worker must not publish readiness after
     /// a switch has reset the process-local marks.
@@ -123,6 +128,7 @@ impl Default for SyncModeState {
             scopes: Arc::new(RwLock::new(BTreeSet::new())),
             hydrated_scopes: Arc::new(RwLock::new(BTreeSet::new())),
             scope_notify: Arc::new(tokio::sync::Notify::new()),
+            internal_scope_depth: Arc::new(AtomicU64::new(0)),
             scope_generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -146,6 +152,9 @@ impl SyncModeState {
     /// this process-local set as its demand signal; the durable cursor remains
     /// independent so a replica can advance past unrelated repository data.
     pub(crate) fn register_sql_scope(&self, sql: &str) {
+        if self.internal_scope_depth.load(Ordering::Acquire) != 0 {
+            return;
+        }
         let schemas = extract_sql_scope_schema_keys(sql);
         if schemas.is_empty() {
             return;
@@ -229,6 +238,9 @@ impl SyncModeState {
     pub(crate) async fn wait_for_scope_hydration(&self) -> Result<(), LixError> {
         #[cfg(not(target_family = "wasm"))]
         {
+            if self.internal_scope_depth.load(Ordering::Acquire) != 0 {
+                return Ok(());
+            }
             if !matches!(self.role(), Ok(SyncRole::Replica { .. })) {
                 return Ok(());
             }
@@ -260,6 +272,25 @@ impl SyncModeState {
             })?;
         }
         Ok(())
+    }
+
+    /// Suppresses scope registration/readiness waits for internal sync
+    /// catalog maintenance. Public SQL never obtains this guard.
+    pub(crate) fn begin_internal_scope(&self) -> InternalScopeGuard {
+        self.internal_scope_depth.fetch_add(1, Ordering::AcqRel);
+        InternalScopeGuard {
+            depth: Arc::clone(&self.internal_scope_depth),
+        }
+    }
+}
+
+pub(crate) struct InternalScopeGuard {
+    depth: Arc<AtomicU64>,
+}
+
+impl Drop for InternalScopeGuard {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -302,7 +333,9 @@ fn extract_sql_scope_schema_keys(sql: &str) -> Vec<String> {
             if table == "select" {
                 return vec![FULL_SYNC_SCOPE.to_owned()];
             }
-            if !table.starts_with("lix_") {
+            if is_sync_control_schema(table) {
+                scopes.insert(CONTROL_SYNC_SCOPE.to_owned());
+            } else if !table.starts_with("lix_") {
                 scopes.insert(table.clone());
             }
         }
@@ -315,6 +348,20 @@ fn extract_sql_scope_schema_keys(sql: &str) -> Vec<String> {
     } else {
         scopes.into_iter().collect()
     }
+}
+
+fn is_sync_control_schema(schema_key: &str) -> bool {
+    matches!(
+        schema_key,
+        "lix_branch"
+            | "lix_change"
+            | "lix_commit"
+            | "lix_commit_edge"
+            | "lix_diff"
+            | "lix_working_diff"
+            | "lix_branch_descriptor"
+            | "lix_branch_ref"
+    )
 }
 
 /// Returns true for identifier quoting/qualification that the token lexer
@@ -635,6 +682,18 @@ pub struct SyncAdmission {
     pub cursor: u64,
 }
 
+/// Branch catalog entry used by the background replica worker. Branch
+/// topology is control-plane state, so it is intentionally separate from
+/// row transaction packs and never appears as a public sync API.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncBranch {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) hidden: bool,
+    pub(crate) commit_id: String,
+}
+
 /// A boxed request future returned by [`SyncTransport`].
 #[cfg(not(target_family = "wasm"))]
 pub type SyncTransportFuture<'a, T> =
@@ -665,6 +724,13 @@ pub trait SyncTransport: Send + Sync {
         // materialize row/file payloads for these schema keys.
         schema_keys: &'a [String],
     ) -> SyncTransportFuture<'a, SyncPullResponse>;
+
+    /// Returns the current global branch catalog. Transports that do not
+    /// expose control-plane enumeration can leave this empty; row sync remains
+    /// fully functional and the runtime retries topology after reconnect.
+    fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// Browser/WASM variant of [`SyncTransport`] whose fetch futures and handles
@@ -685,6 +751,87 @@ pub trait SyncTransport {
         // materialize row/file payloads for these schema keys.
         schema_keys: &'a [String],
     ) -> SyncTransportFuture<'a, SyncPullResponse>;
+
+    fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Applies the remote global branch catalog to a local repository. This is a
+/// control-plane reconciliation path, separate from semantic row events. A
+/// branch whose source commit is not materialized locally yet is left for a
+/// later pass rather than being created at an incorrect head.
+pub(crate) async fn reconcile_sync_branches<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let remote_branches = transport.list_branches().await?;
+    let active_branch_id = lix.active_branch_id().await?;
+    for remote in remote_branches {
+        if remote.id == active_branch_id || remote.id == GLOBAL_BRANCH_ID {
+            continue;
+        }
+        let existing = lix
+            .execute(
+                "SELECT id, name, hidden, commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(remote.id.clone())],
+            )
+            .await?;
+        if existing.rows().is_empty() {
+            match lix
+                .create_branch(CreateBranchOptions {
+                    id: Some(remote.id.clone()),
+                    name: remote.name.clone(),
+                    from_commit_id: Some(remote.commit_id.clone()),
+                })
+                .await
+            {
+                // A lazy replica may not have materialized the branch's
+                // source commit yet. Leave this branch for a later catalog
+                // pass after its commit scope is requested.
+                Err(error) if error.code == LixError::CODE_COMMIT_NOT_FOUND => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
+        }
+
+        let current_commit = existing
+            .rows()
+            .first()
+            .and_then(|row| row.get::<String>("commit_id").ok());
+        let current_name = existing
+            .rows()
+            .first()
+            .and_then(|row| row.get::<String>("name").ok());
+        let current_hidden = existing
+            .rows()
+            .first()
+            .and_then(|row| row.get::<bool>("hidden").ok());
+        if current_commit.as_deref() != Some(remote.commit_id.as_str())
+            || current_name.as_deref() != Some(remote.name.as_str())
+            || current_hidden != Some(remote.hidden)
+        {
+            lix.execute(
+                "INSERT INTO lix_branch (id, name, hidden, commit_id) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name, hidden = excluded.hidden, \
+                 commit_id = excluded.commit_id",
+                &[
+                    Value::Text(remote.id),
+                    Value::Text(remote.name),
+                    Value::Boolean(remote.hidden),
+                    Value::Text(remote.commit_id),
+                ],
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Durable result of draining a client's pending queue.
@@ -1783,7 +1930,9 @@ where
             .state
             .hydrated_scopes
             .iter()
-            .filter(|schema| schema.as_str() != FULL_SYNC_SCOPE)
+            .filter(|schema| {
+                schema.as_str() != FULL_SYNC_SCOPE && schema.as_str() != CONTROL_SYNC_SCOPE
+            })
             .cloned()
             .collect::<Vec<_>>();
         let schema_scope = (!full_hydrated).then(|| SyncFilterScope::new(&schema_keys));
@@ -1944,7 +2093,15 @@ where
 
     async fn hydrate_requested_scopes(&mut self) -> Result<(), LixError> {
         let scope_generation = self.scope_state.scope_generation();
-        let requested = self.scope_state.scopes();
+        let requested = self
+            .scope_state
+            .scopes()
+            .into_iter()
+            // The branch/commit catalog is reconciled by the runtime's
+            // control-plane pass. It is not a semantic row scope and must
+            // never force replay of the registered-schema bootstrap stream.
+            .filter(|scope| scope != CONTROL_SYNC_SCOPE)
+            .collect::<Vec<_>>();
         if requested.is_empty() {
             return Ok(());
         }
@@ -1989,7 +2146,7 @@ where
             self.replay_pending_overlay().await?;
         }
         for schema_key in requested {
-            if schema_key == FULL_SYNC_SCOPE {
+            if schema_key == FULL_SYNC_SCOPE || schema_key == CONTROL_SYNC_SCOPE {
                 continue;
             }
             if self.state.hydrated_scopes.contains(&schema_key) {
@@ -3421,9 +3578,10 @@ fn require_sync_identity(label: &str, expected: &str, actual: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        FULL_SYNC_SCOPE, MAX_SYNC_PACK_ROWS, SyncCanonicalEvent, SyncFileMutation, SyncFilterScope,
-        SyncRowMutation, SyncTransactionPack, extract_sql_scope_schema_keys, filter_sync_pack,
-        sync_pack_fingerprint, validate_sync_transaction_pack,
+        CONTROL_SYNC_SCOPE, FULL_SYNC_SCOPE, MAX_SYNC_PACK_ROWS, SyncCanonicalEvent,
+        SyncFileMutation, SyncFilterScope, SyncRowMutation, SyncTransactionPack,
+        extract_sql_scope_schema_keys, filter_sync_pack, sync_pack_fingerprint,
+        validate_sync_transaction_pack,
     };
 
     #[tokio::test]
@@ -3598,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_scope_extraction_is_conservative_and_ignores_lix_catalog_tables() {
+    fn sql_scope_extraction_registers_the_control_plane_without_hydrating_rows() {
         assert_eq!(
             extract_sql_scope_schema_keys(
                 "SELECT value FROM needed_rows n JOIN other_rows o ON n.id = o.id"
@@ -3610,6 +3768,14 @@ mod tests {
                 "INSERT INTO lix_registered_schema (value) VALUES ($1); SELECT content FROM lix_file"
             ),
             vec!["lix_file".to_owned()]
+        );
+        assert_eq!(
+            extract_sql_scope_schema_keys("SELECT id, commit_id FROM lix_branch"),
+            vec![CONTROL_SYNC_SCOPE.to_owned()]
+        );
+        assert_eq!(
+            extract_sql_scope_schema_keys("SELECT * FROM lix_diff"),
+            vec![CONTROL_SYNC_SCOPE.to_owned()]
         );
         assert_eq!(
             extract_sql_scope_schema_keys("SELECT content FROM lix_file WHERE path = '/shared.md'"),

@@ -1,8 +1,9 @@
 use serde::Deserialize;
 
 use super::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, SyncAdmission, SyncPullResponse, SyncTransactionPack,
-    SyncTransport, SyncTransportFuture, validate_sync_branch_id, validate_sync_remote_id,
+    MAX_SYNC_PULL_RESPONSE_BYTES, SyncAdmission, SyncBranch, SyncPullResponse,
+    SyncTransactionPack, SyncTransport, SyncTransportFuture, validate_sync_branch_id,
+    validate_sync_remote_id,
 };
 use crate::LixError;
 
@@ -147,6 +148,19 @@ impl SyncTransport for HttpSyncTransport {
                 .await
                 .map_err(|error| transport_error("pull sync transactions", error))?;
             decode_response(response, "pull sync transactions").await
+        })
+    }
+
+    fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(format!("{}/sync/branches", self.protocol_url))
+                .header(SESSION_HEADER, &self.session_id)
+                .send()
+                .await
+                .map_err(|error| transport_error("list sync branches", error))?;
+            decode_response(response, "list sync branches").await
         })
     }
 }

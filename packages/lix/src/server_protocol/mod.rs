@@ -7,7 +7,7 @@ use crate::session::ExecuteOptions;
 use crate::session::media_upload::FILE_UPLOAD_PART_BYTES;
 use crate::sync::{
     MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_SCOPE_KEY_BYTES, MAX_SYNC_SCOPE_KEYS, SyncAdmission,
-    SyncPullResponse, SyncTransactionPack, validate_sync_transaction_pack,
+    SyncBranch, SyncPullResponse, SyncTransactionPack, validate_sync_transaction_pack,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -285,6 +285,7 @@ pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("POST", "/lix/v1/execute-batch"),
     ("POST", "/lix/v1/sync/admit"),
     ("GET", "/lix/v1/sync/pull"),
+    ("GET", "/lix/v1/sync/branches"),
     ("POST", "/lix/v1/transaction/begin"),
     ("POST", "/lix/v1/transaction/execute"),
     ("POST", "/lix/v1/transaction/commit"),
@@ -1614,6 +1615,9 @@ where
                 };
                 result_response(sync_pull(lease, query).await)
             }
+            (&Method::GET, "/lix/v1/sync/branches") => {
+                result_response(sync_branches(lease).await)
+            }
             (&Method::POST, "/lix/v1/transaction/begin") => {
                 result_response(begin_transaction(lease).await)
             }
@@ -2429,6 +2433,38 @@ where
         return Err(ApiError::payload_too_large(MAX_SYNC_PULL_RESPONSE_BYTES));
     }
     Ok(Json(response))
+}
+
+/// Returns the global branch catalog for a lazy local replica. This control
+/// plane is deliberately read-only and carries no row payloads; branch data
+/// is materialized locally through the existing branch API.
+async fn sync_branches<S>(lease: SessionLease<S>) -> Result<Json<Vec<SyncBranch>>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let branches = lease
+        .run_cancellable_read(|lix| async move {
+            let result = lix
+                .execute(
+                    "SELECT id, name, hidden, commit_id FROM lix_branch ORDER BY id",
+                    &[],
+                )
+                .await?;
+            result
+                .rows()
+                .iter()
+                .map(|row| {
+                    Ok(SyncBranch {
+                        id: row.get::<String>("id")?,
+                        name: row.get::<String>("name")?,
+                        hidden: row.get::<bool>("hidden")?,
+                        commit_id: row.get::<String>("commit_id")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, LixError>>()
+        })
+        .await?;
+    Ok(Json(branches))
 }
 
 fn validate_sync_scope(schema_keys: &[String]) -> Result<(), LixError> {
