@@ -1787,6 +1787,17 @@ where
             )?;
         }
 
+        // Keep batch SQL on the same lazy-sync read path as single
+        // statements. Register every shape before classification so a
+        // read-only batch cannot open a snapshot before its demanded scopes
+        // have been hydrated. This is intentionally one barrier for the
+        // whole batch: the batch executes against one coherent local read
+        // snapshot, and cached scopes remain entirely network-free.
+        for statement in statements {
+            self.sync_mode.register_sql_scope(&statement.sql);
+        }
+        self.sync_mode.wait_for_scope_hydration().await?;
+
         match classify_execute_batch(statements, &self.sql_planning_cache)? {
             ExecuteBatchExecution::ReadOnly(parsed) => {
                 self.execute_read_only_batch(statements, parsed).await
@@ -2125,6 +2136,10 @@ where
         statements: &[(&str, &[Value])],
     ) -> Result<CoherentReadBatch, LixError> {
         self.ensure_open()?;
+        for (sql, _) in statements {
+            self.sync_mode.register_sql_scope(sql);
+        }
+        self.sync_mode.wait_for_scope_hydration().await?;
         let parsed = statements
             .iter()
             .map(|(sql, _)| {
