@@ -391,3 +391,5 @@ jobs:
         run: |
           npm run test:browser:built
           npm run test:browser:production
+          npm run benchmark
+          npm run benchmark:multi-tab

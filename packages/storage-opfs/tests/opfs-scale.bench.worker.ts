@@ -2,11 +2,15 @@
 
 import type {
 	LixStorageProvider,
+	LixStorageProviderRegistration,
 	LixStorageSpace,
 } from "@lix-js/sdk";
-import { OpfsStorage } from "@lix-js/storage-opfs";
 
-type BenchmarkRequest = { name: string; rows: number };
+type BenchmarkRequest = {
+	name: string;
+	rows: number;
+	registration: LixStorageProviderRegistration;
+};
 
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 const BENCH_SPACE: LixStorageSpace = {
@@ -28,15 +32,12 @@ scope.onmessage = (event: MessageEvent<BenchmarkRequest>) => {
 };
 
 async function run(request: BenchmarkRequest) {
-	const registration = new OpfsStorage({ name: request.name }).lixStorage;
-	const { OpfsBackend } = (await import(
-		/* @vite-ignore */ registration.moduleUrl
+	const { createLixStorageProvider } = (await import(
+		/* @vite-ignore */ request.registration.moduleUrl
 	)) as {
-		OpfsBackend: {
-			open(name: string): Promise<LixStorageProvider>;
-		};
+		createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
 	};
-	const backend = await OpfsBackend.open(request.name);
+	const backend = await createLixStorageProvider(request.registration.options);
 	const seedStarted = performance.now();
 	const batchSize = 10_000;
 	for (let offset = 0; offset < request.rows; offset += batchSize) {
@@ -97,7 +98,7 @@ async function run(request: BenchmarkRequest) {
 	let remainingRows = 0;
 	for (let sample = 0; sample < 8; sample += 1) {
 		const reopenStarted = performance.now();
-		const reopened = await OpfsBackend.open(request.name);
+		const reopened = await createLixStorageProvider(request.registration.options);
 		const reopenedRead = await reopened.beginRead({
 			consistency: "snapshot",
 			durability: "visible",

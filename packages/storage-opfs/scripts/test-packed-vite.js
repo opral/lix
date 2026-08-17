@@ -17,8 +17,10 @@ const viteBin = join(packageDir, "node_modules", "vite", "bin", "vite.js");
 const base = "/lix-storage-opfs-smoke/";
 const tempRoot = await mkdtemp(join(tmpdir(), "lix-storage-opfs-vite-smoke-"));
 const fixtureDir = join(tempRoot, "app");
+const benchmarkEnabled = process.env.LIX_OPFS_BENCHMARK === "1";
 let server;
 let browser;
+let context;
 
 try {
 	await cp(fixtureSource, fixtureDir, { recursive: true });
@@ -44,30 +46,79 @@ try {
 
 	server = await serve(join(fixtureDir, "dist"));
 	browser = await chromium.launch({ headless: true });
-	const page = await browser.newPage();
-	const browserErrors = [];
-	page.on("console", (message) => {
-		if (message.type() === "error") browserErrors.push(message.text());
-	});
-	page.on("pageerror", (error) => browserErrors.push(error.stack ?? error.message));
-	page.setDefaultTimeout(120_000);
-	try {
-		await page.goto(`http://127.0.0.1:${server.port}${base}`, {
-			waitUntil: "load",
+	context = await browser.newContext();
+	const pages = await Promise.all([context.newPage(), context.newPage()]);
+	const browserErrors = pages.map(() => []);
+	for (const [index, page] of pages.entries()) {
+		page.on("console", (message) => {
+			if (message.type() === "error") browserErrors[index].push(message.text());
 		});
-		await page.waitForFunction(
-			() => "__storageOpfsProductionSmoke" in globalThis,
+		page.on("pageerror", (error) => browserErrors[index].push(error.stack ?? error.message));
+		page.setDefaultTimeout(120_000);
+	}
+	try {
+		const results = [];
+		for (const page of pages) {
+			progress("loading smoke page");
+			await page.goto(`http://127.0.0.1:${server.port}${base}`, { waitUntil: "load" });
+			await page.waitForFunction(() => "__storageOpfsProductionSmoke" in globalThis);
+			results.push(
+				await page.evaluate(() => globalThis.__storageOpfsProductionSmoke),
+			);
+		}
+		for (const result of results) assert.deepEqual(result, { message: "persistent-production" });
+		assert.deepEqual(browserErrors, [[], []]);
+		progress("checking cross-tab observation");
+		await pages[0].evaluate(() => globalThis.__storageOpfsStartObservation());
+		await pages[1].evaluate(() =>
+			globalThis.__storageOpfsCommitObservedValue("cross-tab-production"),
 		);
-		const result = await page.evaluate(
-			() => globalThis.__storageOpfsProductionSmoke,
+		assert.equal(
+			await pages[0].evaluate(() => globalThis.__storageOpfsFinishObservation()),
+			"cross-tab-production",
 		);
-		assert.deepEqual(result, { message: "persistent-production" });
-		assert.deepEqual(browserErrors, []);
+		if (benchmarkEnabled) {
+			await pages[1].evaluate(() =>
+				globalThis.__storageOpfsPrepareBenchmarkWriter(),
+			);
+			const samples = await pages[0].evaluate(() =>
+				globalThis.__storageOpfsBenchmarkCrossTab(30),
+			);
+			console.log(
+				JSON.stringify({
+					benchmark: "lix-opfs-cross-tab-observer-delivery",
+					...summarize(samples),
+				}),
+			);
+		}
+		progress("checking observation across owner failover");
+		await pages[1].evaluate(() => globalThis.__storageOpfsStartObservation());
+		await pages[0].close();
+		const failover = await pages[1].evaluate(() => {
+			return globalThis.__storageOpfsRecoverObservation("owner-failover-production");
+		});
+		assert.equal(failover.value, "owner-failover-production");
+		progress("owner failover observation passed");
+		const failoverSamples = [failover.elapsedMs];
+		if (benchmarkEnabled) {
+			for (let index = 1; index < 10; index += 1) {
+				failoverSamples.push(
+					await measureOwnerFailover(context, server.port, `owner-failover-${index}`),
+				);
+			}
+			console.log(
+				JSON.stringify({
+					benchmark: "lix-opfs-owner-failover-observer-recovery",
+					...summarize(failoverSamples),
+				}),
+			);
+		}
 	} finally {
-		await page.close();
+		await Promise.all(pages.map((page) => page.close()));
 	}
 	console.log("Packed OPFS storage Vite production smoke passed.");
 } finally {
+	await context?.close();
 	await browser?.close();
 	await server?.close();
 	if (process.env.LIX_KEEP_VITE_SMOKE === "1") {
@@ -75,6 +126,52 @@ try {
 	} else {
 		await rm(tempRoot, { recursive: true, force: true });
 	}
+}
+
+async function measureOwnerFailover(browserContext, port, storageName) {
+	const owner = await browserContext.newPage();
+	const follower = await browserContext.newPage();
+	const errors = [];
+	for (const page of [owner, follower]) {
+		page.on("console", (message) => {
+			if (message.type() === "error") errors.push(message.text());
+		});
+		page.on("pageerror", (error) => errors.push(error.stack ?? error.message));
+		page.setDefaultTimeout(120_000);
+	}
+	const url = `http://127.0.0.1:${port}${base}?storage=${encodeURIComponent(storageName)}`;
+	try {
+		for (const page of [owner, follower]) {
+			await page.goto(url, { waitUntil: "load" });
+			await page.waitForFunction(() => "__storageOpfsProductionSmoke" in globalThis);
+			assert.deepEqual(await page.evaluate(() => globalThis.__storageOpfsProductionSmoke), {
+				message: "persistent-production",
+			});
+		}
+		await follower.evaluate(() => globalThis.__storageOpfsStartObservation());
+		await owner.close();
+		const recovered = await follower.evaluate(() =>
+			globalThis.__storageOpfsRecoverObservation("owner-failover-benchmark"),
+		);
+		assert.equal(recovered.value, "owner-failover-benchmark");
+		assert.deepEqual(errors, []);
+		return recovered.elapsedMs;
+	} finally {
+		await Promise.all([owner.close(), follower.close()]);
+	}
+}
+
+function summarize(samples) {
+	const sorted = [...samples].sort((left, right) => left - right);
+	return {
+		samples,
+		p50Ms: sorted[Math.max(0, Math.ceil(sorted.length * 0.5) - 1)],
+		p95Ms: sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)],
+	};
+}
+
+function progress(message) {
+	if (process.env.LIX_OPFS_VERBOSE === "1") console.log(message);
 }
 
 async function pack(directory, destination, label) {

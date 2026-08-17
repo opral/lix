@@ -6,6 +6,7 @@ import type {
 import type {
 	LixStorageBound,
 	LixStorageCommitResult,
+	LixStorageChangeWatch,
 	LixStorageError,
 	LixStorageErrorCode,
 	LixStorageGetManyRequest,
@@ -24,6 +25,7 @@ import type {
 	LixStorageWriteStats,
 } from "@lix-js/sdk";
 import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm";
+import { StorageChangeNotifier } from "./change-watch.js";
 
 type SqliteValue =
 	| string
@@ -67,7 +69,7 @@ type StagedDeleteRange = {
 	range: LixStorageKeyRange;
 };
 
-type SqliteChanges = {
+export type SqliteChanges = {
 	deletes: StagedDelete[];
 	puts: StagedEntry[];
 	deleteRanges: StagedDeleteRange[];
@@ -99,6 +101,7 @@ export class OpfsBackend implements LixStorageProvider {
 	readonly #database: OpfsSAHPoolDatabase;
 	readonly #pool: SAHPoolUtil;
 	readonly #releaseLock: () => void;
+	readonly #changes = new StorageChangeNotifier();
 	#generation = 0;
 	#closed = false;
 
@@ -156,15 +159,28 @@ export class OpfsBackend implements LixStorageProvider {
 		return new OpfsWrite(this, options);
 	}
 
+	async watchForChanges(): Promise<LixStorageChangeWatch> {
+		this.#assertOpen();
+		return this.#changes.watch();
+	}
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#changes.close(
+			storageError("LIX_STORAGE_CLOSED", "SQLite OPFS storage is closed"),
+		);
 		try {
 			this.#database.close();
 			if (!this.#pool.isPaused()) this.#pool.pauseVfs();
 		} finally {
 			this.#releaseLock();
 		}
+	}
+
+	currentGeneration(): number {
+		this.#assertOpen();
+		return this.#generation;
 	}
 
 	readMany(
@@ -306,6 +322,7 @@ export class OpfsBackend implements LixStorageProvider {
 			}
 			this.#database.exec("COMMIT");
 			this.#generation += 1;
+			this.#changes.notify();
 		} catch (error) {
 			try {
 				this.#database.exec("ROLLBACK");
@@ -615,7 +632,12 @@ function acquireOpfsLock(name: string): Promise<() => void> {
 				{ ifAvailable: true, mode: "exclusive" },
 				async (lock) => {
 					if (!lock) {
-						reject(new Error(`OPFS storage '${name}' is already open`));
+						reject(
+							storageError(
+								"LIX_STORAGE_FENCED",
+								`OPFS storage '${name}' is already open`,
+							),
+						);
 						return;
 					}
 					resolve(release);

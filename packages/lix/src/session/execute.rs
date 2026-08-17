@@ -40,6 +40,7 @@ use super::transaction::{SessionTransaction, transaction_state_error};
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXPIRED_READ_RETRIES: usize = 16;
 
 enum LiteralParameterBuilder {
     Utf8(StringBuilder),
@@ -1164,47 +1165,71 @@ where
 
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read_scope = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let (content, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
-            read_scope,
-            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let plugin_cache_snapshot = read_store.snapshot_cache_key();
-                let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
-                    Arc::new(self.hot_state.reader(read_store.clone()));
-                let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                    Arc::new(self.hot_state.reader(read_store.clone()));
-                let branch_ref: Arc<dyn BranchRefReader> =
-                    Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-                let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                    Arc::new(self.binary_cas.reader(read_store));
-                // A raw file download delivers the same bytes as a direct
-                // `lix_file.content` read, so it must acknowledge rendered
-                // plugin state for subsequent collaborative writes.
-                let file_view_collector = sql2::SessionFileViews::default();
-                let result = sql2::execute_exact_lix_file_batch_read(
-                    &active_branch_id,
-                    hot_state,
-                    filesystem_path_index,
-                    branch_ref,
-                    blob_reader,
-                    self.plugin_host.clone(),
-                    Some(file_view_collector.clone()),
-                    plugin_cache_snapshot,
-                    &paths,
-                    requested_range.clone(),
-                )
-                .await?;
-                let content = native_file_read_from_exact_result(result, &paths, requested_range)?;
-                Ok((content, file_view_collector.plugin_file_mutations()))
-            },
-        )
-        .await?;
-        self.file_views.apply_mutations(file_view_mutations);
-        Ok(content)
+        let mut expired_read_retries = 0;
+        loop {
+            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
+                Ok(read_scope) => read_scope,
+                Err(error) => {
+                    let error: LixError = error.into();
+                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let attempt = with_static_session_sql_read::<StorageImpl, _, _, _>(
+                read_scope,
+                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
+                    let paths = paths.clone();
+                    let requested_range = requested_range.clone();
+                    async move {
+                        let active_branch_id =
+                            self.active_branch_id_from_reader(&read_store).await?;
+                        let plugin_cache_snapshot = read_store.snapshot_cache_key();
+                        let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                            Arc::new(self.hot_state.reader(read_store.clone()));
+                        let filesystem_path_index: Arc<
+                            dyn crate::filesystem::FilesystemPathIndexReader,
+                        > = Arc::new(self.hot_state.reader(read_store.clone()));
+                        let branch_ref: Arc<dyn BranchRefReader> =
+                            Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+                        let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
+                            Arc::new(self.binary_cas.reader(read_store));
+                        // A raw file download delivers the same bytes as a direct
+                        // `lix_file.content` read, so it must acknowledge rendered
+                        // plugin state for subsequent collaborative writes.
+                        let file_view_collector = sql2::SessionFileViews::default();
+                        let result = sql2::execute_exact_lix_file_batch_read(
+                            &active_branch_id,
+                            hot_state,
+                            filesystem_path_index,
+                            branch_ref,
+                            blob_reader,
+                            self.plugin_host.clone(),
+                            Some(file_view_collector.clone()),
+                            plugin_cache_snapshot,
+                            &paths,
+                            requested_range.clone(),
+                        )
+                        .await?;
+                        let content =
+                            native_file_read_from_exact_result(result, &paths, requested_range)?;
+                        Ok((content, file_view_collector.plugin_file_mutations()))
+                    }
+                },
+            )
+            .await;
+            match attempt {
+                Ok((content, file_view_mutations)) => {
+                    self.file_views.apply_mutations(file_view_mutations);
+                    return Ok(content);
+                }
+                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(crate) async fn execute_for_observe(
@@ -1325,13 +1350,13 @@ where
             .flatten();
         let exact_schema_batch_read = (exact_filesystem_read.is_none()
             && exact_schema_point_read.is_none())
-            .then(|| exact_schema_batch_read_route(&statement, params))
-            .flatten();
+        .then(|| exact_schema_batch_read_route(&statement, params))
+        .flatten();
         let late_file_content_read = (exact_filesystem_read.is_none()
             && exact_schema_point_read.is_none()
             && exact_schema_batch_read.is_none())
-            .then(|| late_materialized_lix_file_content_read(&statement))
-            .flatten();
+        .then(|| late_materialized_lix_file_content_read(&statement))
+        .flatten();
         let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
             || matches!(
                 &exact_filesystem_read,
@@ -1359,35 +1384,55 @@ where
         } else {
             None
         };
-        let read_scope = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
-            read_scope,
-            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                self.execute_read_statement_with_store(
-                    read_store,
-                    sql,
-                    statement,
-                    params,
-                    acknowledge_file_views,
-                    exact_filesystem_read,
-                    exact_schema_point_read,
-                    exact_schema_batch_read,
-                    late_file_content_read,
-                    has_durable_runtime_function,
-                )
-                .await
-            },
-        );
-        let (mut read_result, file_view_mutations, _provider_rows_examined) =
-            match read_result.await {
-                Ok(result) => result,
+        let mut expired_read_retries = 0;
+        let (mut read_result, file_view_mutations, _provider_rows_examined) = loop {
+            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
+                Ok(read_scope) => read_scope,
                 Err(error) => {
+                    let error: LixError = error.into();
+                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                        continue;
+                    }
                     return Err(normalize_sql_surface_error(error, sql));
                 }
             };
+            let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
+                read_scope,
+                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
+                    let statement = statement.clone();
+                    let exact_filesystem_read = exact_filesystem_read.clone();
+                    let exact_schema_point_read = exact_schema_point_read.clone();
+                    let exact_schema_batch_read = exact_schema_batch_read.clone();
+                    let late_file_content_read = late_file_content_read.clone();
+                    async move {
+                        self.execute_read_statement_with_store(
+                            read_store,
+                            sql,
+                            statement,
+                            params,
+                            acknowledge_file_views,
+                            exact_filesystem_read,
+                            exact_schema_point_read,
+                            exact_schema_batch_read,
+                            late_file_content_read,
+                            has_durable_runtime_function,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await;
+            match read_result {
+                Ok(result) => break result,
+                Err(error) => {
+                    let error = normalize_sql_surface_error(error, sql);
+                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        };
         let runtime_storage_stats = match read_result.runtime_functions.take() {
             Some(runtime_functions) => {
                 self.persist_runtime_functions_if_needed(
@@ -1996,76 +2041,97 @@ where
             is_acknowledgeable_file_content_read(parsed, &statement.params)
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read_scope = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
-            read_scope,
-            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                let file_view_collector =
-                    acknowledge_file_views.then(sql2::SessionFileViews::default);
-                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let ctx = SessionSqlExecutionContext {
-                    active_branch_id: &active_branch_id,
-                    active_account_id: self.active_account_id(),
-                    read_store,
-                    hot_state: Arc::clone(&self.hot_state),
-                    binary_cas: Arc::clone(&self.binary_cas),
-                    branch_ctx: Arc::clone(&self.branch_ctx),
-                    catalog_context: Arc::clone(&self.catalog_context),
-                    sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                    functions: FunctionProviderHandle::system(),
-                    plugin_host: self.plugin_host.clone(),
-                    file_views: file_view_collector.clone(),
-                };
-                let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
-                let mut results = Vec::with_capacity(statements.len());
-                for (statement_index, (statement, parsed)) in
-                    statements.iter().zip(parsed).enumerate()
-                {
-                    let telemetry = SqlStatementTelemetry::start(
-                        self.telemetry.as_ref(),
-                        &statement.sql,
-                        "batch",
-                        Some(statement_index),
-                    );
-                    let operation = async {
-                        sql2::execute_read_statement_in_session_from_parsed(
-                            &read_session,
-                            &statement.sql,
-                            parsed,
-                            &statement.params,
-                        )
-                        .await
-                        .map(ExecuteResult::from_sql_query_result)
-                        .map_err(|error| {
-                            with_batch_statement_index(
-                                normalize_sql_surface_error(error, &statement.sql),
-                                statement_index,
-                            )
-                        })
-                    };
-                    let result = match telemetry.as_ref() {
-                        Some(telemetry) => telemetry.instrument(operation).await,
-                        None => operation.await,
-                    };
-                    if let Some(telemetry) = telemetry {
-                        telemetry.finish(&result);
+        let mut expired_read_retries = 0;
+        loop {
+            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
+                Ok(read_scope) => read_scope,
+                Err(error) => {
+                    let error: LixError = error.into();
+                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                        continue;
                     }
-                    results.push(result?);
+                    return Err(error);
                 }
-                drop(read_session);
-                drop(ctx);
-                let file_view_mutations = file_view_collector
-                    .map(|collector| collector.plugin_file_mutations())
-                    .unwrap_or_default();
-                Ok((results, file_view_mutations))
-            },
-        )
-        .await?;
-        self.file_views.apply_mutations(file_view_mutations);
-        Ok(results)
+            };
+            let attempt = with_static_session_sql_read::<StorageImpl, _, _, _>(
+                read_scope,
+                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
+                    let parsed = parsed.clone();
+                    async move {
+                        let file_view_collector =
+                            acknowledge_file_views.then(sql2::SessionFileViews::default);
+                        let active_branch_id =
+                            self.active_branch_id_from_reader(&read_store).await?;
+                        let ctx = SessionSqlExecutionContext {
+                            active_branch_id: &active_branch_id,
+                            active_account_id: self.active_account_id(),
+                            read_store,
+                            hot_state: Arc::clone(&self.hot_state),
+                            binary_cas: Arc::clone(&self.binary_cas),
+                            branch_ctx: Arc::clone(&self.branch_ctx),
+                            catalog_context: Arc::clone(&self.catalog_context),
+                            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+                            functions: FunctionProviderHandle::system(),
+                            plugin_host: self.plugin_host.clone(),
+                            file_views: file_view_collector.clone(),
+                        };
+                        let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
+                        let mut results = Vec::with_capacity(statements.len());
+                        for (statement_index, (statement, parsed)) in
+                            statements.iter().zip(parsed).enumerate()
+                        {
+                            let telemetry = SqlStatementTelemetry::start(
+                                self.telemetry.as_ref(),
+                                &statement.sql,
+                                "batch",
+                                Some(statement_index),
+                            );
+                            let operation = async {
+                                sql2::execute_read_statement_in_session_from_parsed(
+                                    &read_session,
+                                    &statement.sql,
+                                    parsed,
+                                    &statement.params,
+                                )
+                                .await
+                                .map(ExecuteResult::from_sql_query_result)
+                                .map_err(|error| {
+                                    with_batch_statement_index(
+                                        normalize_sql_surface_error(error, &statement.sql),
+                                        statement_index,
+                                    )
+                                })
+                            };
+                            let result = match telemetry.as_ref() {
+                                Some(telemetry) => telemetry.instrument(operation).await,
+                                None => operation.await,
+                            };
+                            if let Some(telemetry) = telemetry {
+                                telemetry.finish(&result);
+                            }
+                            results.push(result?);
+                        }
+                        drop(read_session);
+                        drop(ctx);
+                        let file_view_mutations = file_view_collector
+                            .map(|collector| collector.plugin_file_mutations())
+                            .unwrap_or_default();
+                        Ok((results, file_view_mutations))
+                    }
+                },
+            )
+            .await;
+            match attempt {
+                Ok((results, file_view_mutations)) => {
+                    self.file_views.apply_mutations(file_view_mutations);
+                    return Ok(results);
+                }
+                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -2138,108 +2204,132 @@ where
             .all(|(parsed, (_, params))| is_acknowledgeable_file_content_read(parsed, params));
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read_scope = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
-            read_scope,
-            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                let file_view_collector =
-                    acknowledge_file_views.then(sql2::SessionFileViews::default);
-                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let active_branch_head = self
-                    .branch_ctx
-                    .ref_reader(read_store.clone())
-                    .load_head(&active_branch_id)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::branch_not_found(
-                            active_branch_id.clone(),
-                            "execute coherent read batch",
-                            "active branch",
-                        )
-                    })?;
-                let active_branch_commit_id = active_branch_head.commit_id.to_string();
-                let storage_mutation_revision =
-                    StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read_store)
-                        .await?
-                        .map(|revision| revision.to_vec());
-                if parsed.is_empty() {
-                    return Ok((
-                        CoherentReadBatch {
-                            active_branch_id,
-                            active_branch_commit_id,
-                            storage_mutation_revision,
-                            results: Vec::new(),
-                        },
-                        Vec::new(),
-                    ));
-                }
-                let ctx = SessionSqlExecutionContext {
-                    active_branch_id: &active_branch_id,
-                    active_account_id: self.active_account_id(),
-                    read_store,
-                    hot_state: Arc::clone(&self.hot_state),
-                    binary_cas: Arc::clone(&self.binary_cas),
-                    branch_ctx: Arc::clone(&self.branch_ctx),
-                    catalog_context: Arc::clone(&self.catalog_context),
-                    sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                    functions: FunctionProviderHandle::system(),
-                    plugin_host: self.plugin_host.clone(),
-                    file_views: file_view_collector.clone(),
-                };
-                let read_session =
-                    sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed).await?;
-                let mut results = Vec::with_capacity(statements.len());
-                for (statement_index, ((sql, params), statement)) in
-                    statements.iter().zip(parsed).enumerate()
-                {
-                    let telemetry = SqlStatementTelemetry::start(
-                        self.telemetry.as_ref(),
-                        sql,
-                        "coherent_read_batch",
-                        Some(statement_index),
-                    );
-                    let operation = async {
-                        sql2::execute_read_statement_in_session_from_parsed(
-                            &read_session,
-                            sql,
-                            statement,
-                            params,
-                        )
-                        .await
-                        .map(ExecuteResult::from_sql_query_result)
-                        .map_err(|error| normalize_sql_surface_error(error, sql))
-                    };
-                    let result = match telemetry.as_ref() {
-                        Some(telemetry) => telemetry.instrument(operation).await,
-                        None => operation.await,
-                    };
-                    if let Some(telemetry) = telemetry {
-                        telemetry.finish(&result);
+        let mut expired_read_retries = 0;
+        loop {
+            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
+                Ok(read_scope) => read_scope,
+                Err(error) => {
+                    let error: LixError = error.into();
+                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                        continue;
                     }
-                    results.push(result?);
+                    return Err(error);
                 }
-                drop(read_session);
-                drop(ctx);
-                let file_view_mutations = file_view_collector
-                    .map(|collector| collector.plugin_file_mutations())
-                    .unwrap_or_default();
-                Ok((
-                    CoherentReadBatch {
-                        active_branch_id,
-                        active_branch_commit_id,
-                        storage_mutation_revision,
-                        results,
-                    },
-                    file_view_mutations,
-                ))
-            },
-        )
-        .await?;
-        self.file_views.apply_mutations(file_view_mutations);
-        Ok(batch)
+            };
+            let attempt = with_static_session_sql_read::<StorageImpl, _, _, _>(
+                read_scope,
+                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
+                    let parsed = parsed.clone();
+                    async move {
+                        let file_view_collector =
+                            acknowledge_file_views.then(sql2::SessionFileViews::default);
+                        let active_branch_id =
+                            self.active_branch_id_from_reader(&read_store).await?;
+                        let active_branch_head = self
+                            .branch_ctx
+                            .ref_reader(read_store.clone())
+                            .load_head(&active_branch_id)
+                            .await?
+                            .ok_or_else(|| {
+                                LixError::branch_not_found(
+                                    active_branch_id.clone(),
+                                    "execute coherent read batch",
+                                    "active branch",
+                                )
+                            })?;
+                        let active_branch_commit_id = active_branch_head.commit_id.to_string();
+                        let storage_mutation_revision =
+                            StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(
+                                &read_store,
+                            )
+                            .await?
+                            .map(|revision| revision.to_vec());
+                        if parsed.is_empty() {
+                            return Ok((
+                                CoherentReadBatch {
+                                    active_branch_id,
+                                    active_branch_commit_id,
+                                    storage_mutation_revision,
+                                    results: Vec::new(),
+                                },
+                                Vec::new(),
+                            ));
+                        }
+                        let ctx = SessionSqlExecutionContext {
+                            active_branch_id: &active_branch_id,
+                            active_account_id: self.active_account_id(),
+                            read_store,
+                            hot_state: Arc::clone(&self.hot_state),
+                            binary_cas: Arc::clone(&self.binary_cas),
+                            branch_ctx: Arc::clone(&self.branch_ctx),
+                            catalog_context: Arc::clone(&self.catalog_context),
+                            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+                            functions: FunctionProviderHandle::system(),
+                            plugin_host: self.plugin_host.clone(),
+                            file_views: file_view_collector.clone(),
+                        };
+                        let read_session =
+                            sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed)
+                                .await?;
+                        let mut results = Vec::with_capacity(statements.len());
+                        for (statement_index, ((sql, params), statement)) in
+                            statements.iter().zip(parsed).enumerate()
+                        {
+                            let telemetry = SqlStatementTelemetry::start(
+                                self.telemetry.as_ref(),
+                                sql,
+                                "coherent_read_batch",
+                                Some(statement_index),
+                            );
+                            let operation = async {
+                                sql2::execute_read_statement_in_session_from_parsed(
+                                    &read_session,
+                                    sql,
+                                    statement,
+                                    params,
+                                )
+                                .await
+                                .map(ExecuteResult::from_sql_query_result)
+                                .map_err(|error| normalize_sql_surface_error(error, sql))
+                            };
+                            let result = match telemetry.as_ref() {
+                                Some(telemetry) => telemetry.instrument(operation).await,
+                                None => operation.await,
+                            };
+                            if let Some(telemetry) = telemetry {
+                                telemetry.finish(&result);
+                            }
+                            results.push(result?);
+                        }
+                        drop(read_session);
+                        drop(ctx);
+                        let file_view_mutations = file_view_collector
+                            .map(|collector| collector.plugin_file_mutations())
+                            .unwrap_or_default();
+                        Ok((
+                            CoherentReadBatch {
+                                active_branch_id,
+                                active_branch_commit_id,
+                                storage_mutation_revision,
+                                results,
+                            },
+                            file_view_mutations,
+                        ))
+                    }
+                },
+            )
+            .await;
+            match attempt {
+                Ok((batch, file_view_mutations)) => {
+                    self.file_views.apply_mutations(file_view_mutations);
+                    return Ok(batch);
+                }
+                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2467,15 +2557,13 @@ where
                 file_views: None,
             };
             let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
-            if let Some((spec, row_pk)) =
-                resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
+            if let Some((spec, row_pk)) = resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
             {
-                let reader: Arc<dyn sql2::RowSnapshotReader> = Arc::new(
-                    sql2::CurrentRowSnapshotReader::new(
+                let reader: Arc<dyn sql2::RowSnapshotReader> =
+                    Arc::new(sql2::CurrentRowSnapshotReader::new(
                         Arc::clone(&self.hot_state),
                         read_store.clone(),
-                    ),
-                );
+                    ));
                 let query = sql2::execute_exact_schema_point_read(
                     &spec,
                     &active_branch_id,
@@ -4007,11 +4095,7 @@ fn exact_schema_point_read_route(
         return None;
     }
     let mut equalities = BTreeMap::new();
-    collect_exact_schema_equalities(
-        simple.select.selection.as_ref()?,
-        params,
-        &mut equalities,
-    )?;
+    collect_exact_schema_equalities(simple.select.selection.as_ref()?, params, &mut equalities)?;
     Some(ExactSchemaPointRead {
         table_name: simple.table_name,
         projected_columns,
@@ -4066,10 +4150,7 @@ fn exact_schema_batch_read_route(
         }
         Some(_) => return None,
     };
-    let identities = collect_exact_schema_identity_rows(
-        simple.select.selection.as_ref()?,
-        params,
-    )?;
+    let identities = collect_exact_schema_identity_rows(simple.select.selection.as_ref()?, params)?;
     (identities.len() > 1).then_some(ExactSchemaBatchRead {
         table_name: simple.table_name,
         projected_columns,
@@ -4165,11 +4246,19 @@ fn collect_exact_schema_equalities(
 ) -> Option<()> {
     match expression {
         Expr::Nested(expression) => collect_exact_schema_equalities(expression, params, equalities),
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             collect_exact_schema_equalities(left, params, equalities)?;
             collect_exact_schema_equalities(right, params, equalities)
         }
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
             let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
                 (Some(column), None) => (column, exact_schema_literal(right, params)?),
                 (None, Some(column)) => (column, exact_schema_literal(left, params)?),
@@ -4265,10 +4354,9 @@ fn resolve_exact_schema_point_read(
     let Some(parts) = parts else {
         return Ok(None);
     };
-    let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
-        parts,
-        &spec.primary_key_component_types,
-    ) else {
+    let Ok(row_pk) =
+        crate::row_pk::RowPk::from_external_parts(parts, &spec.primary_key_component_types)
+    else {
         return Ok(None);
     };
     Ok(Some((spec, row_pk)))
@@ -4330,12 +4418,9 @@ fn resolve_exact_schema_batch_read(
     let mut identities = Vec::with_capacity(exact.identities.len());
     for identity in &exact.identities {
         if identity.len() != primary_key_columns.len() + 1
-            || identity
-                .keys()
-                .any(|column| {
-                    column != "lixcol_file_id"
-                        && !primary_key_columns.contains(&column.as_str())
-                })
+            || identity.keys().any(|column| {
+                column != "lixcol_file_id" && !primary_key_columns.contains(&column.as_str())
+            })
         {
             return Ok(None);
         }
@@ -4366,10 +4451,9 @@ fn resolve_exact_schema_batch_read(
         let Some(parts) = parts else {
             return Ok(None);
         };
-        let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
-            parts,
-            &spec.primary_key_component_types,
-        ) else {
+        let Ok(row_pk) =
+            crate::row_pk::RowPk::from_external_parts(parts, &spec.primary_key_component_types)
+        else {
             return Ok(None);
         };
         if seen.insert((row_pk.clone(), file_id.clone())) {
@@ -5033,6 +5117,14 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
     error
 }
 
+fn consume_expired_read_retry(retries: &mut usize, error: &LixError) -> bool {
+    if error.code != LixError::CODE_STORAGE_READ_EXPIRED || *retries >= MAX_EXPIRED_READ_RETRIES {
+        return false;
+    }
+    *retries += 1;
+    true
+}
+
 fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
     (lower.contains("lix_file") || lower.contains("lix_directory")) && lower.contains("path")
@@ -5492,7 +5584,10 @@ mod tests {
         .expect("complete composite identities should route");
         assert_eq!(route.identities.len(), 3, "request slots stay aligned");
         assert_eq!(route.order_by_columns, ["tenant", "revision"]);
-        assert_eq!(route.identities[0]["tenant"], Value::Text("docs".to_owned()));
+        assert_eq!(
+            route.identities[0]["tenant"],
+            Value::Text("docs".to_owned())
+        );
         assert_eq!(route.identities[0]["revision"], Value::Integer(7));
         assert_eq!(route.identities[0]["lixcol_file_id"], Value::Null);
         assert_eq!(route.identities[1]["revision"], Value::Integer(9));
@@ -5555,8 +5650,15 @@ mod tests {
             .await
             .expect("relational control should execute");
         assert_eq!(exact, relational);
-        assert_eq!(exact.rows().len(), 2, "duplicates and misses emit no extra rows");
-        assert_eq!(exact.rows()[0].value("note").expect("note column"), &Value::Null);
+        assert_eq!(
+            exact.rows().len(),
+            2,
+            "duplicates and misses emit no extra rows"
+        );
+        assert_eq!(
+            exact.rows()[0].value("note").expect("note column"),
+            &Value::Null
+        );
         assert_eq!(
             exact.rows()[1].value("payload").expect("payload column"),
             &Value::Jsonb(serde_json::json!({"rank": 2}).into())
@@ -5574,7 +5676,10 @@ mod tests {
                 .await
                 .expect("profiled native batch route should execute");
             assert_eq!(profiled.rows().len(), 2);
-            assert_eq!(profile.scan_rows, 2, "only returned public rows are scanned");
+            assert_eq!(
+                profile.scan_rows, 2,
+                "only returned public rows are scanned"
+            );
             assert_eq!(
                 profile.provider_rows_examined, 3,
                 "present, missing, and duplicate slots examine three unique exact identities"
@@ -5827,9 +5932,7 @@ mod tests {
             ExecutionDisposition::CancellableRead
         );
         assert_eq!(
-            session
-                .execution_disposition("SELECT uuidv7()")
-                .unwrap(),
+            session.execution_disposition("SELECT uuidv7()").unwrap(),
             ExecutionDisposition::Durable
         );
         assert_eq!(
@@ -7615,7 +7718,8 @@ mod tests {
             .await
             .expect("compatible schema amendment should stage");
 
-        let sql = "UPDATE amended_parameter_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let sql =
+            "UPDATE amended_parameter_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let statements = [
             ExecuteBatchStatement {
                 label: None,
@@ -7925,8 +8029,7 @@ mod tests {
             .unwrap();
 
         sql2::take_certified_row_insert_parameter_batch_executions();
-        let sql =
-            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
+        let sql = "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -8612,7 +8715,8 @@ mod tests {
             .await
             .unwrap();
 
-        let sql = "UPDATE certified_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let sql =
+            "UPDATE certified_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let missing_results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -8801,7 +8905,8 @@ mod tests {
         crate::transaction::take_complete_replacement_packed_current_base_publications();
         crate::transaction::take_rootless_replacement_generation_publications();
         sql2::take_certified_generation_identity_replacements();
-        let update_sql = "UPDATE packed_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let update_sql =
+            "UPDATE packed_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -9458,7 +9563,8 @@ mod tests {
             .await
             .unwrap();
 
-        let update_sql = "UPDATE staged_generation_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let update_sql =
+            "UPDATE staged_generation_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -11650,7 +11756,6 @@ mod tests {
     }
 }
 
-
 /// Compile-time proofs for the `AssumeSendFuture` safety obligation.
 ///
 /// `AssumeSendFuture` asserts `Send` unconditionally, so its soundness rests on
@@ -11748,7 +11853,6 @@ mod assume_send_future_proofs {
         assert_send::<crate::storage::GetManyResult>();
     }
 }
-
 
 /// Borrowing-adapter half of the `AssumeSendFuture` proofs.
 ///

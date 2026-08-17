@@ -1,5 +1,6 @@
 //! Primary storage API.
 
+mod change_watch;
 pub mod conformance;
 mod cursor;
 mod error;
@@ -10,6 +11,7 @@ mod predicate;
 mod traits;
 mod types;
 
+pub use change_watch::{StorageChangeSource, StorageChangeWatch};
 pub use cursor::{ScanCursor, StorageScanSource};
 pub use error::{
     Capability, Precondition, PreconditionFailure, PreconditionItemSupport,

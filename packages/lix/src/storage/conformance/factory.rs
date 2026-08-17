@@ -1,4 +1,4 @@
-use crate::storage::{ReadOptions, Storage, StorageError, WriteOptions};
+use crate::storage::{ReadOptions, Storage, StorageChangeWatch, StorageError, WriteOptions};
 
 pub trait StorageFactory: Sync {
     type Storage: Storage;
@@ -62,6 +62,12 @@ where
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         self.storage.begin_write(opts)
+    }
+
+    fn watch_for_changes(
+        &self,
+    ) -> impl Future<Output = Result<StorageChangeWatch, StorageError>> + Send {
+        self.storage.watch_for_changes()
     }
 }
 

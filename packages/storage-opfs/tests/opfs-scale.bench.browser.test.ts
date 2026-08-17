@@ -1,4 +1,5 @@
 import { expect, test } from "vitest";
+import { OpfsStorage } from "@lix-js/storage-opfs";
 
 type ScaleResult = {
 	rows: number;
@@ -17,9 +18,10 @@ test(
 		for (const rows of [10_000, 1_000_000]) {
 			results.push(await runWorker(rows));
 		}
-		console.info(
+			console.info(
 			JSON.stringify({
-				benchmark: "lix-opfs-sqlite-scale",
+				benchmark: "lix-opfs-shared-owner-scale",
+				path: "Lix worker -> BroadcastChannel -> package owner -> SQLite",
 					targets: {
 						warmReopenP95Ms: 50,
 						firstPageRows: 1_000,
@@ -42,6 +44,8 @@ test(
 
 function runWorker(rows: number): Promise<ScaleResult> {
 	return new Promise((resolve, reject) => {
+		const name = `lix-opfs-scale:${rows}:${crypto.randomUUID()}`;
+		const registration = new OpfsStorage({ name }).lixStorage;
 		const worker = new Worker(
 			new URL("./opfs-scale.bench.worker.ts", import.meta.url),
 			{ type: "module" },
@@ -59,7 +63,8 @@ function runWorker(rows: number): Promise<ScaleResult> {
 			reject(event.error ?? new Error(event.message));
 		};
 		worker.postMessage({
-			name: `lix-opfs-scale:${rows}:${crypto.randomUUID()}`,
+			name,
+			registration,
 			rows,
 		});
 	});

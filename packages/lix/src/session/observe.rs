@@ -161,7 +161,6 @@ where
             .clone();
         match event {
             ObserveInvalidationEvent::Generation(generation) => Ok(generation),
-            #[cfg(not(target_family = "wasm"))]
             ObserveInvalidationEvent::TerminalStorageError(error) => Err(error),
         }
     }
@@ -171,7 +170,6 @@ where
     ) -> Result<Option<(u64, ObserveQueryEvaluation)>, LixError> {
         loop {
             let operation_guard = self.session.begin_waitable_session_operation().await?;
-            #[cfg(not(target_family = "wasm"))]
             self.session
                 .observe_invalidation
                 .ensure_external_watcher(self.session.storage.clone())
@@ -297,7 +295,6 @@ where
     }
 }
 
-
 /// See `session::execute::assume_send_future_proofs`.
 #[cfg(test)]
 mod assume_send_future_proofs {
@@ -319,4 +316,3 @@ mod assume_send_future_proofs {
         assert_send::<ObserveEvents<S>>();
     }
 }
-

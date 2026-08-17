@@ -26,6 +26,7 @@ pub enum StorageError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
+    ChangeWatch,
     EnvelopeProjection,
     KeyOrderedPoints,
     UnorderedPoints,

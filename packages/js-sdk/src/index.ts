@@ -2,6 +2,7 @@ export { Lix, LixTransaction, ObserveEvents, openLix } from "./open-lix.js";
 export type {
 	LixStorage,
 	LixStorageBound,
+	LixStorageChangeWatch,
 	LixStorageCommitResult,
 	LixStorageErrorCode,
 	LixStorageGetManyRequest,

@@ -1,7 +1,10 @@
 /// <reference lib="webworker" />
 
-import type { LixStorageError, LixStorageProvider } from "@lix-js/sdk";
-import { OpfsStorage } from "@lix-js/storage-opfs";
+import type {
+	LixStorageError,
+	LixStorageProvider,
+	LixStorageProviderRegistration,
+} from "@lix-js/sdk";
 
 type ProviderModule = {
 	createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
@@ -9,8 +12,8 @@ type ProviderModule = {
 
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 
-scope.onmessage = (event: MessageEvent<{ name: string }>) => {
-	void run(event.data.name).then(
+scope.onmessage = (event: MessageEvent<{ registration: LixStorageProviderRegistration }>) => {
+	void run(event.data.registration).then(
 		(code) => scope.postMessage({ ok: true, code }),
 		(error) =>
 			scope.postMessage({
@@ -20,13 +23,12 @@ scope.onmessage = (event: MessageEvent<{ name: string }>) => {
 	);
 };
 
-async function run(name: string): Promise<string | undefined> {
-	const storage = new OpfsStorage({ name });
+async function run(registration: LixStorageProviderRegistration): Promise<string | undefined> {
 	const providerModule = (await import(
-		/* @vite-ignore */ storage.lixStorage.moduleUrl
+		/* @vite-ignore */ registration.moduleUrl
 	)) as ProviderModule;
 	const provider = await providerModule.createLixStorageProvider(
-		storage.lixStorage.options,
+		registration.options,
 	);
 	try {
 		try {

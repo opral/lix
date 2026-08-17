@@ -83,6 +83,11 @@ impl LixError {
     /// Storage I/O failed.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 
+    /// A coherent storage read was invalidated by a concurrent commit.
+    /// Auto-commit read surfaces consume this internally by reopening the
+    /// complete read/query against a fresh snapshot.
+    pub const CODE_STORAGE_READ_EXPIRED: &'static str = "LIX_STORAGE_READ_EXPIRED";
+
     /// The selected storage cannot prove the requested persistence boundary.
     pub const CODE_STORAGE_DURABILITY_UNAVAILABLE: &'static str =
         "LIX_STORAGE_DURABILITY_UNAVAILABLE";
@@ -380,6 +385,13 @@ impl From<crate::storage_adapter::StorageError> for LixError {
                 Self::CODE_STORAGE_DURABILITY_UNAVAILABLE,
                 "the storage backend cannot prove the requested durability boundary",
             ),
+            crate::storage_adapter::StorageError::ReadExpired => Self::new(
+                Self::CODE_STORAGE_READ_EXPIRED,
+                "the coherent storage read was invalidated by a concurrent commit",
+            )
+            .with_details(json!({
+                "retryable": true,
+            })),
             error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
         }
     }

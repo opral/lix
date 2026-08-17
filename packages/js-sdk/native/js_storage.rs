@@ -7,8 +7,8 @@ use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadConsistency,
     ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, Storage,
-    StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, ValueIntegrity,
-    ValueSemantics, WriteOptions, WriteStats,
+    StorageChangeSource, StorageChangeWatch, StorageError, StorageRead, StorageScanSource,
+    StorageSpace, StorageWrite, ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, prelude::*};
@@ -27,6 +27,18 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     pub fn close(this: &JsStorageProvider) -> js_sys::Promise;
+
+    #[wasm_bindgen(method, js_name = watchForChanges)]
+    fn watch_for_changes(this: &JsStorageProvider) -> js_sys::Promise;
+
+    #[derive(Clone)]
+    type JsStorageChangeWatchHandle;
+
+    #[wasm_bindgen(method)]
+    fn changed(this: &JsStorageChangeWatchHandle) -> js_sys::Promise;
+
+    #[wasm_bindgen(method)]
+    fn close(this: &JsStorageChangeWatchHandle);
 
     #[derive(Clone)]
     type JsStorageReadHandle;
@@ -82,6 +94,8 @@ struct SendScan(JsStorageScanHandle);
 
 struct SendWrite(JsStorageWriteHandle);
 
+struct SendChangeWatch(JsStorageChangeWatchHandle);
+
 // Browser WASM and every imported provider run on one dedicated worker. The
 // engine traits retain Send/Sync so native adapters can use multithreaded
 // executors; these wrappers never cross a browser worker boundary.
@@ -91,6 +105,7 @@ unsafe impl Send for SendRead {}
 unsafe impl Sync for SendRead {}
 unsafe impl Send for SendScan {}
 unsafe impl Send for SendWrite {}
+unsafe impl Send for SendChangeWatch {}
 
 struct SendJsFuture(JsFuture);
 
@@ -122,6 +137,10 @@ pub struct JsStorageWrite {
 
 struct JsStorageScanSource {
     handle: SendScan,
+}
+
+struct JsStorageChangeSource {
+    handle: SendChangeWatch,
 }
 
 #[derive(Serialize)]
@@ -334,6 +353,33 @@ impl Storage for JsStorage {
         Ok(JsStorageWrite {
             handle: SendWrite(handle),
         })
+    }
+
+    async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
+        let handle = SendJsFuture(JsFuture::from(self.provider.0.watch_for_changes()))
+            .await
+            .map_err(storage_error)?
+            .unchecked_into::<JsStorageChangeWatchHandle>();
+        Ok(StorageChangeWatch::from_source(JsStorageChangeSource {
+            handle: SendChangeWatch(handle),
+        }))
+    }
+}
+
+impl StorageChangeSource for JsStorageChangeSource {
+    fn changed(&mut self) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            SendJsFuture(JsFuture::from(self.handle.0.changed()))
+                .await
+                .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for JsStorageChangeSource {
+    fn drop(&mut self) {
+        self.handle.0.close();
     }
 }
 
@@ -700,6 +746,7 @@ fn capability_from_error(error: &JsValue) -> Option<Capability> {
         .ok()?
         .as_string()?;
     match capability.as_str() {
+        "changeWatch" => Some(Capability::ChangeWatch),
         "envelopeProjection" => Some(Capability::EnvelopeProjection),
         "keyOrderedPoints" => Some(Capability::KeyOrderedPoints),
         "unorderedPoints" => Some(Capability::UnorderedPoints),

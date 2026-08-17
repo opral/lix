@@ -1,7 +1,7 @@
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
-    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError, StorageRead,
-    StorageSpace, StorageWrite, WriteOptions,
+    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageChangeWatch,
+    StorageError, StorageRead, StorageSpace, StorageWrite, WriteOptions,
 };
 
 use crate::js_storage::{JsStorage, JsStorageRead, JsStorageWrite};
@@ -32,8 +32,14 @@ impl BrowserStorage {
 }
 
 impl Storage for BrowserStorage {
-    type Read<'a> = BrowserRead where Self: 'a;
-    type Write<'a> = BrowserWrite where Self: 'a;
+    type Read<'a>
+        = BrowserRead
+    where
+        Self: 'a;
+    type Write<'a>
+        = BrowserWrite
+    where
+        Self: 'a;
 
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         match self {
@@ -46,6 +52,13 @@ impl Storage for BrowserStorage {
         match self {
             Self::Memory(storage) => storage.begin_write(opts).await.map(BrowserWrite::Memory),
             Self::Js(storage) => storage.begin_write(opts).await.map(BrowserWrite::Js),
+        }
+    }
+
+    async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
+        match self {
+            Self::Memory(storage) => storage.watch_for_changes().await,
+            Self::Js(storage) => storage.watch_for_changes().await,
         }
     }
 }

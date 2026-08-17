@@ -1,6 +1,7 @@
 use crate::storage::{
-    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch,
-    ReadOptions, ScanCursor, StorageError, StorageSpace, WriteOptions,
+    BeginScanOptions, Capability, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange,
+    PutBatch, ReadOptions, ScanCursor, StorageChangeWatch, StorageError, StorageSpace,
+    WriteOptions,
 };
 
 /// An ordered byte-key entry storage with coherent read views, batched point
@@ -46,6 +47,19 @@ pub trait Storage: Send + Sync {
         &self,
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send;
+
+    /// Opens a watch for committed changes to the underlying storage.
+    ///
+    /// The watch covers changes regardless of which engine, process, tab, or
+    /// replica applied them. It is an invalidation signal, not a change log:
+    /// notifications may be coalesced or spurious, and callers inspect the
+    /// result by opening a fresh read view. Implementations must establish the
+    /// watch without a registration gap that could permanently miss a change.
+    fn watch_for_changes(
+        &self,
+    ) -> impl Future<Output = Result<StorageChangeWatch, StorageError>> + Send {
+        async { Err(StorageError::Unsupported(Capability::ChangeWatch)) }
+    }
 }
 
 /// One coherent read view.

@@ -1,19 +1,16 @@
-#[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
-#[cfg(not(target_family = "wasm"))]
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
-#[cfg(not(target_family = "wasm"))]
 use crate::LixError;
-#[cfg(not(target_family = "wasm"))]
 use crate::storage_adapter::Storage;
-#[cfg(not(target_family = "wasm"))]
 use crate::storage_adapter::StorageAdapter;
+use crate::storage_adapter::StorageCapability;
+use crate::storage_adapter::StorageError;
 use crate::storage_adapter::StorageWriteSetStats;
 
 #[cfg(not(target_family = "wasm"))]
@@ -22,9 +19,6 @@ const EXTERNAL_MUTATION_REVISION_POLL_INTERVAL: Duration = Duration::from_millis
 #[derive(Clone, Debug)]
 pub(crate) enum ObserveInvalidationEvent {
     Generation(u64),
-    /// Only the native external-mutation watcher can observe a fenced or
-    /// closed store, so this variant cannot be constructed on wasm.
-    #[cfg(not(target_family = "wasm"))]
     TerminalStorageError(LixError),
 }
 
@@ -32,7 +26,6 @@ pub(crate) enum ObserveInvalidationEvent {
 pub(crate) struct ObserveInvalidation {
     generation: AtomicU64,
     sender: watch::Sender<ObserveInvalidationEvent>,
-    #[cfg(not(target_family = "wasm"))]
     external_watcher_started: Mutex<bool>,
 }
 
@@ -42,7 +35,6 @@ impl ObserveInvalidation {
         Self {
             generation: AtomicU64::new(0),
             sender,
-            #[cfg(not(target_family = "wasm"))]
             external_watcher_started: Mutex::new(false),
         }
     }
@@ -50,7 +42,6 @@ impl ObserveInvalidation {
     pub(crate) fn bump(&self) -> u64 {
         let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.sender.send_modify(|event| {
-            #[cfg(not(target_family = "wasm"))]
             if matches!(event, ObserveInvalidationEvent::TerminalStorageError(_)) {
                 return;
             }
@@ -59,7 +50,6 @@ impl ObserveInvalidation {
         next
     }
 
-    #[cfg(not(target_family = "wasm"))]
     fn fail_terminal_storage(&self, error: LixError) {
         self.sender.send_modify(|event| {
             if !matches!(event, ObserveInvalidationEvent::TerminalStorageError(_)) {
@@ -78,7 +68,6 @@ impl ObserveInvalidation {
         self.sender.subscribe()
     }
 
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn ensure_external_watcher<StorageImpl>(
         self: &Arc<Self>,
         storage: StorageAdapter<StorageImpl>,
@@ -98,8 +87,37 @@ impl ObserveInvalidation {
         if *watcher_started {
             return Ok(());
         }
-        let mut last_seen_revision = match storage.load_mutation_revision().await {
-            Ok(revision) => revision,
+
+        match storage.watch_for_changes().await {
+            Ok(mut changes) => {
+                let invalidation = Arc::downgrade(self);
+                crate::background_task::spawn("lix-observe-change-watch", move || async move {
+                    loop {
+                        let Some(invalidation) = invalidation.upgrade() else {
+                            break;
+                        };
+                        match changes.changed().await {
+                            Ok(()) => {
+                                invalidation.bump();
+                            }
+                            Err(error) => {
+                                if matches!(error, StorageError::Fenced | StorageError::Closed(_)) {
+                                    invalidation.fail_terminal_storage(error.into());
+                                } else {
+                                    // Wake observers so the stable-read loop can retry and
+                                    // reopen the adapter watch after a transient failure.
+                                    invalidation.bump();
+                                }
+                                *invalidation.external_watcher_started.lock().await = false;
+                                break;
+                            }
+                        }
+                    }
+                })?;
+                *watcher_started = true;
+                return Ok(());
+            }
+            Err(StorageError::Unsupported(StorageCapability::ChangeWatch)) => {}
             Err(error) => {
                 let error: LixError = error.into();
                 if matches!(
@@ -110,49 +128,75 @@ impl ObserveInvalidation {
                 }
                 return Err(error);
             }
-        };
-        let invalidation = Arc::downgrade(self);
-        crate::background_task::spawn("lix-observe-invalidation", move || async move {
-            loop {
-                // This is a dedicated Lix-owned worker. Sleeping the worker
-                // thread avoids requiring a Tokio timer driver from the host.
-                std::thread::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL);
-                let Some(invalidation) = invalidation.upgrade() else {
-                    break;
-                };
-                if invalidation.sender.receiver_count() == 0 {
-                    // Synchronize shutdown with startup. A new subscriber can race this
-                    // check; rechecking under the startup gate either keeps this watcher
-                    // alive or lets the contender start its replacement.
-                    let mut watcher_started = invalidation.external_watcher_started.lock().await;
-                    if invalidation.sender.receiver_count() == 0 {
-                        *watcher_started = false;
-                        break;
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+            // Browser memory storage cannot be modified outside its engine.
+            // Shared JS providers implement the change-watch capability.
+            *watcher_started = true;
+            return Ok(());
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let mut last_seen_revision = match storage.load_mutation_revision().await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    let error: LixError = error.into();
+                    if matches!(
+                        error.code.as_str(),
+                        LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
+                    ) {
+                        self.fail_terminal_storage(error.clone());
                     }
-                    drop(watcher_started);
+                    return Err(error);
                 }
-                let current_revision = match storage.load_mutation_revision().await {
-                    Ok(revision) => revision,
-                    Err(error) => {
-                        let error: LixError = error.into();
-                        if matches!(
-                            error.code.as_str(),
-                            LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
-                        ) {
-                            invalidation.fail_terminal_storage(error);
+            };
+            let invalidation = Arc::downgrade(self);
+            crate::background_task::spawn("lix-observe-invalidation", move || async move {
+                loop {
+                    // This is a dedicated Lix-owned worker. Sleeping the worker
+                    // thread avoids requiring a Tokio timer driver from the host.
+                    std::thread::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL);
+                    let Some(invalidation) = invalidation.upgrade() else {
+                        break;
+                    };
+                    if invalidation.sender.receiver_count() == 0 {
+                        // Synchronize shutdown with startup. A new subscriber can race this
+                        // check; rechecking under the startup gate either keeps this watcher
+                        // alive or lets the contender start its replacement.
+                        let mut watcher_started =
+                            invalidation.external_watcher_started.lock().await;
+                        if invalidation.sender.receiver_count() == 0 {
+                            *watcher_started = false;
                             break;
                         }
-                        continue;
+                        drop(watcher_started);
                     }
-                };
-                if current_revision != last_seen_revision {
-                    last_seen_revision = current_revision;
-                    invalidation.bump();
+                    let current_revision = match storage.load_mutation_revision().await {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            let error: LixError = error.into();
+                            if matches!(
+                                error.code.as_str(),
+                                LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
+                            ) {
+                                invalidation.fail_terminal_storage(error);
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    if current_revision != last_seen_revision {
+                        last_seen_revision = current_revision;
+                        invalidation.bump();
+                    }
                 }
-            }
-        })?;
-        *watcher_started = true;
-        Ok(())
+            })?;
+            *watcher_started = true;
+            Ok(())
+        }
     }
 }
 
@@ -160,9 +204,12 @@ impl ObserveInvalidation {
 mod tests {
     use super::*;
     use crate::storage::{
-        Memory, MemoryRead, MemoryWrite, ReadOptions, StorageError, WriteOptions,
+        Memory, MemoryRead, MemoryWrite, ReadOptions, StorageChangeSource, StorageChangeWatch,
+        StorageError, WriteOptions,
     };
     use crate::storage_adapter::StorageAdapter;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::Notify;
 
@@ -226,6 +273,13 @@ mod tests {
         inner: Memory,
     }
 
+    #[derive(Clone)]
+    struct FencedChangeWatchStorage {
+        inner: Memory,
+    }
+
+    struct FencedChangeSource;
+
     impl Storage for FencedInitialReadStorage {
         type Read<'a>
             = MemoryRead
@@ -245,6 +299,40 @@ mod tests {
             options: WriteOptions,
         ) -> Result<Self::Write<'_>, StorageError> {
             self.inner.begin_write(options).await
+        }
+    }
+
+    impl Storage for FencedChangeWatchStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+
+        async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
+            Ok(StorageChangeWatch::from_source(FencedChangeSource))
+        }
+    }
+
+    impl StorageChangeSource for FencedChangeSource {
+        fn changed(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+            Box::pin(async { Err(StorageError::Fenced) })
         }
     }
 
@@ -276,6 +364,28 @@ mod tests {
             .await
             .expect_err("terminal watcher failure should remain sticky");
         assert_eq!(retry_error.code, LixError::CODE_STORAGE_FENCED);
+    }
+
+    #[tokio::test]
+    async fn fenced_change_watch_is_terminal_for_observers() {
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let mut observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(StorageAdapter::new(FencedChangeWatchStorage {
+                inner: Memory::new(),
+            }))
+            .await
+            .expect("watch should establish before reporting fencing");
+
+        tokio::time::timeout(Duration::from_secs(1), observer.changed())
+            .await
+            .expect("fenced watch should wake observers")
+            .expect("watch channel should remain open");
+        assert!(matches!(
+            observer.borrow_and_update().clone(),
+            ObserveInvalidationEvent::TerminalStorageError(error)
+                if error.code == LixError::CODE_STORAGE_FENCED
+        ));
     }
 
     #[tokio::test]

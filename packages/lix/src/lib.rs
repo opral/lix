@@ -50,7 +50,6 @@ engine_surface! {
 pub(crate) mod account;
 mod binary_cas;
 pub(crate) mod branch;
-#[cfg(not(target_family = "wasm"))]
 mod background_task;
 pub(crate) mod catalog;
 #[cfg(feature = "storage-benches")]

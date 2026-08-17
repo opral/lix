@@ -70,6 +70,9 @@ test("same-Wasm memory and JS SQLite OPFS execution paths", async () => {
 		}),
 	);
 	expect(results).toHaveLength(2);
+	const opfs = results.find((result) => result.storage === "js-sqlite-opfs");
+	expect(opfs?.read.p95Ms).toBeLessThan(50);
+	expect(opfs?.write.p95Ms).toBeLessThan(50);
 });
 
 function summarize(samples: number[]) {

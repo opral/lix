@@ -165,9 +165,16 @@ export type LixStorageCommitResult = {
 export interface LixStorageProvider {
 	beginRead(options: LixStorageReadOptions): Promise<LixStorageRead>;
 	beginWrite(options: LixStorageWriteOptions): Promise<LixStorageWrite>;
+	watchForChanges(): Promise<LixStorageChangeWatch>;
 
 	/** SDK lifecycle hook corresponding to releasing the Rust storage owner. */
 	close(): Promise<void>;
+}
+
+/** Mirrors `lix::storage::StorageChangeWatch`. */
+export interface LixStorageChangeWatch {
+	changed(): Promise<void>;
+	close(): void;
 }
 
 /** Mirrors `lix::storage::StorageRead`. */
