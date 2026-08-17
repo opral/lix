@@ -2182,8 +2182,14 @@ fn validate_certified_record(
             "a certified batch with foreign keys must contain complete file state",
         ));
     }
-    let value: serde_json::Value = serde_json::from_slice(snapshot)
-        .map_err(|error| invalid_guest(format!("certified snapshot is invalid JSON: {error}")))?;
+    // Parse once with the stricter component-row decoder, then reuse that DOM
+    // for schema/relationship validation and canonical encoding below.
+    let value = parse_number_free_snapshot(snapshot)?;
+    if !value.is_object() {
+        return Err(invalid_guest(
+            "component row snapshots must be JSON objects",
+        ));
+    }
     if let Err(error) = plan.compiled_schema.validate(&value) {
         return Err(invalid_guest(format!(
             "certified snapshot failed schema validation: {error}"
@@ -2212,7 +2218,8 @@ fn validate_certified_record(
             }
         }
     }
-    let canonical = canonicalize_snapshot(snapshot)?;
+    let mut canonical = Vec::with_capacity(snapshot.len());
+    encode_number_free_json(&value, &mut canonical)?;
     Ok((canonical.as_slice() != snapshot).then_some(canonical))
 }
 

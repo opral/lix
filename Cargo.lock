@@ -3081,10 +3081,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "markdown-syntax"
-version = "0.2.0"
-
-[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3698,7 +3694,6 @@ dependencies = [
  "chardetng",
  "encoding_rs",
  "lix",
- "markdown-syntax",
  "serde",
  "serde_json",
  "uuid",

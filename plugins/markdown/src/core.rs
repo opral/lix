@@ -253,10 +253,21 @@ fn render_tree_with_lexical_fallback(root: &NodeTree) -> Result<Vec<u8>, PluginE
 fn detect_changes_for_markdown(
     before: &ProjectionView<'_>,
     before_root: Option<&NodeTree>,
-    mut after: ParsedMarkdown,
+    after: ParsedMarkdown,
     namespace: IdNamespace,
     minimum_ordinal: u32,
 ) -> Result<(Vec<DetectedChange>, NodeTree), PluginError> {
+    let root = reconcile_markdown_tree(before_root, after, namespace, minimum_ordinal)?;
+    let changes = diff_tree(before, &root)?;
+    Ok((changes, root))
+}
+
+fn reconcile_markdown_tree(
+    before_root: Option<&NodeTree>,
+    mut after: ParsedMarkdown,
+    namespace: IdNamespace,
+    minimum_ordinal: u32,
+) -> Result<NodeTree, PluginError> {
     let generated_ids = collect_generated_ids(&after.root);
     let mut replacements = BTreeMap::new();
     if let Some(before_root) = before_root {
@@ -310,8 +321,7 @@ fn detect_changes_for_markdown(
         }
         replace_column_ids(&mut node.payload, &replacements);
     });
-    let changes = diff_tree(before, &after.root)?;
-    Ok((changes, after.root))
+    Ok(after.root)
 }
 
 fn collect_generated_ids(root: &NodeTree) -> BTreeSet<String> {
@@ -1808,7 +1818,7 @@ struct WireNodeSnapshot {
 }
 
 impl WireNodeSnapshot {
-    fn from_logical(node: NodeSnapshot) -> Result<Self, PluginError> {
+    fn from_logical(node: &NodeSnapshot) -> Result<Self, PluginError> {
         let payload_json = serde_json::to_string(&node.payload).map_err(|error| {
             PluginError::Internal(format!("failed to encode Markdown node payload: {error}"))
         })?;
@@ -1817,10 +1827,10 @@ impl WireNodeSnapshot {
         })?;
         Ok(Self {
             format_json,
-            id: node.id,
-            kind: node.kind,
-            order_key: node.order_key,
-            parent_id: node.parent_id,
+            id: node.id.clone(),
+            kind: node.kind.clone(),
+            order_key: node.order_key.clone(),
+            parent_id: node.parent_id.clone(),
             payload_json,
         })
     }
@@ -1855,15 +1865,34 @@ impl WireNodeSnapshot {
 }
 
 fn logical_to_wire(snapshot: &str) -> Result<Vec<u8>, PluginError> {
-    let logical = serde_json::from_str(snapshot).map_err(|error| {
+    let logical: NodeSnapshot = serde_json::from_str(snapshot).map_err(|error| {
         PluginError::Internal(format!(
             "generated Markdown snapshot is not valid JSON: {error}"
         ))
     })?;
+    logical_node_to_wire(&logical)
+}
+
+fn logical_node_to_wire(logical: &NodeSnapshot) -> Result<Vec<u8>, PluginError> {
     let wire = WireNodeSnapshot::from_logical(logical)?;
     serde_json::to_vec(&wire).map_err(|error| {
         PluginError::Internal(format!("failed to encode Markdown wire snapshot: {error}"))
     })
+}
+
+fn fresh_tree_to_row_changes(root: &NodeTree) -> Result<Vec<RowChange>, PluginError> {
+    ProjectionView::from_tree(root)
+        .nodes_by_id
+        .into_iter()
+        .map(|(id, node)| {
+            Ok(RowChange {
+                schema_key: NODE_SCHEMA_KEY.to_owned(),
+                row_pk: vec![id.to_owned()],
+                snapshot: Some(logical_node_to_wire(node)?),
+                effect: ChangeEffect::Content,
+            })
+        })
+        .collect()
 }
 
 fn wire_to_logical(snapshot: &[u8]) -> Result<String, PluginError> {
@@ -2060,12 +2089,8 @@ impl Document {
         let mut parsed = parse_file_with_literal_fast_path(&file, allow_literal_fast_path)?;
         retain_noncanonical_source(&mut parsed, &file.content)?;
         let top_level_ranges = parsed.top_level_ranges.clone();
-        let (detected, root) =
-            detect_changes_for_markdown(&ProjectionView::default(), None, parsed, namespace, 0)?;
-        let changes = detected
-            .into_iter()
-            .map(detected_to_row_change)
-            .collect::<Result<Vec<_>, _>>()?;
+        let root = reconcile_markdown_tree(None, parsed, namespace, 0)?;
+        let changes = fresh_tree_to_row_changes(&root)?;
         Ok((
             Self {
                 bytes: PersistentBytes::from_vec(bytes),

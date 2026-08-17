@@ -1,3 +1,7 @@
+// Originally based on markdown-syntax 0.2.0 by Plimeor and modified by Lix.
+// Upstream: https://github.com/plimeor/markdown-syntax
+// Original license: MIT; see LICENSE-MIT beside this module.
+//
 //! Markdown source to AST. The entry points are the free [`parse`] function
 //! (maximal default dialect) and the [`SyntaxOptions::parse`] /
 //! [`SyntaxOptions::parse_strict`] methods. Parsing is tolerant: problems are
@@ -6893,11 +6897,7 @@ fn task_marker_at_text_end(input: &str) -> Option<bool> {
     let start = leading_trim_bytes(input);
     let rest = &input[start..];
     let checked = task_marker_checked(rest)?;
-    if rest.len() == 3 {
-        Some(checked)
-    } else {
-        None
-    }
+    if rest.len() == 3 { Some(checked) } else { None }
 }
 
 fn task_marker_split_open(input: &str) -> bool {
@@ -7456,11 +7456,7 @@ fn parse_html_attribute_value(input: &str, index: usize) -> Option<usize> {
             }) {
                 cursor += 1;
             }
-            if cursor == index {
-                None
-            } else {
-                Some(cursor)
-            }
+            if cursor == index { None } else { Some(cursor) }
         }
     }
 }
