@@ -10,20 +10,31 @@ const syncTestState = {
 	scopedPullResponsesRemaining: 0,
 };
 
-function respondJson(
-	response: import("node:http").ServerResponse,
-	value: unknown,
-): void {
+type SyncTestRequest = {
+	url?: string;
+	method?: string;
+	[Symbol.asyncIterator](): AsyncIterator<unknown>;
+};
+
+type SyncTestResponse = {
+	statusCode: number;
+	writableEnded: boolean;
+	setHeader(name: string, value: string): void;
+	end(body?: string): void;
+	on(event: "close", listener: () => void): void;
+};
+
+function respondJson(response: SyncTestResponse, value: unknown): void {
 	response.statusCode = 200;
 	response.setHeader("content-type", "application/json");
 	response.end(JSON.stringify(value));
 }
 
 async function readJson(
-	request: import("node:http").IncomingMessage,
+	request: SyncTestRequest,
 ): Promise<Record<string, string>> {
 	let body = "";
-	for await (const chunk of request) body += chunk;
+	for await (const chunk of request) body += String(chunk);
 	return JSON.parse(body) as Record<string, string>;
 }
 
@@ -33,9 +44,11 @@ export default defineConfig({
 			name: "opfs-sync-long-poll-test-server",
 			configureServer(server) {
 				server.middlewares.use(async (request, response, next) => {
-					const url = new URL(request.url ?? "/", "http://localhost");
+					const testRequest = request as unknown as SyncTestRequest;
+					const testResponse = response as unknown as SyncTestResponse;
+					const url = new URL(testRequest.url ?? "/", "http://localhost");
 					if (url.pathname === "/__lix_sync_test/config") {
-						const config = await readJson(request);
+						const config = await readJson(testRequest);
 						Object.assign(syncTestState, {
 							branchId: config.branchId,
 							headCommitId: config.headCommitId,
@@ -44,15 +57,15 @@ export default defineConfig({
 							abortedLongPolls: 0,
 							scopedPullResponsesRemaining: 1,
 						});
-						respondJson(response, { ok: true });
+						respondJson(testResponse, { ok: true });
 						return;
 					}
 					if (url.pathname === "/__lix_sync_test/state") {
-						respondJson(response, syncTestState);
+						respondJson(testResponse, syncTestState);
 						return;
 					}
 					if (url.pathname === "/__lix_sync_test/repository/lix/v1") {
-						respondJson(response, {
+						respondJson(testResponse, {
 							activeBranchId: syncTestState.branchId,
 							sessionId: "browser-long-poll-test",
 						});
@@ -62,7 +75,7 @@ export default defineConfig({
 						url.pathname ===
 						"/__lix_sync_test/repository/lix/v1/sync/branches"
 					) {
-						respondJson(response, []);
+						respondJson(testResponse, []);
 						return;
 					}
 					if (
@@ -84,23 +97,23 @@ export default defineConfig({
 							(requestedColdScope && syncTestState.scopedPullResponsesRemaining > 0)
 						) {
 							if (requestedColdScope) syncTestState.scopedPullResponsesRemaining -= 1;
-							respondJson(response, pull);
+							respondJson(testResponse, pull);
 							return;
 						}
 						syncTestState.longPollStarts += 1;
 						syncTestState.activeLongPolls += 1;
-						response.on("close", () => {
+						testResponse.on("close", () => {
 							syncTestState.activeLongPolls -= 1;
-							if (!response.writableEnded) syncTestState.abortedLongPolls += 1;
+							if (!testResponse.writableEnded) syncTestState.abortedLongPolls += 1;
 						});
 						return;
 					}
 					if (
 						url.pathname === "/__lix_sync_test/repository/lix/v1/session" &&
-						request.method === "DELETE"
+						testRequest.method === "DELETE"
 					) {
-						response.statusCode = 204;
-						response.end();
+						testResponse.statusCode = 204;
+						testResponse.end();
 						return;
 					}
 					next();
