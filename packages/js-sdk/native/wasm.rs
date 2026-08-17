@@ -10,7 +10,7 @@ use lix::{
     CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
     ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
     Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, SqlScriptPlan,
+    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, ServerOptions, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
     parse_sql_script as parse_rs_sql_script,
 };
@@ -103,8 +103,16 @@ pub struct WasmObserveEvents {
 }
 
 #[wasm_bindgen(js_name = openMemory)]
-pub async fn open_memory(telemetry_dispatch: Option<Function>) -> Result<WasmLix, JsValue> {
-    open_browser_storage(BrowserStorage::Memory(Memory::new()), telemetry_dispatch).await
+pub async fn open_memory(
+    telemetry_dispatch: Option<Function>,
+    server: Option<JsValue>,
+) -> Result<WasmLix, JsValue> {
+    open_browser_storage(
+        BrowserStorage::Memory(Memory::new()),
+        telemetry_dispatch,
+        server,
+    )
+    .await
 }
 
 #[wasm_bindgen(js_name = openMemoryFromSnapshot)]
@@ -118,17 +126,18 @@ pub async fn open_memory_from_snapshot(
         }
         None => Memory::new(),
     };
-    open_browser_storage(BrowserStorage::Memory(storage), telemetry_dispatch).await
+    open_browser_storage(BrowserStorage::Memory(storage), telemetry_dispatch, None).await
 }
 
 #[wasm_bindgen(js_name = openJsStorage)]
 pub async fn open_js_storage(
     provider: JsStorageProvider,
     telemetry_dispatch: Option<Function>,
+    server: Option<JsValue>,
 ) -> Result<WasmLix, JsValue> {
     let storage = JsStorage::new(provider);
     let browser_storage = BrowserStorage::Js(storage);
-    match open_browser_storage(browser_storage.clone(), telemetry_dispatch).await {
+    match open_browser_storage(browser_storage.clone(), telemetry_dispatch, server).await {
         Ok(lix) => Ok(lix),
         Err(error) => {
             let _ = browser_storage.close().await;
@@ -140,6 +149,7 @@ pub async fn open_js_storage(
 async fn open_browser_storage(
     storage: BrowserStorage,
     telemetry_dispatch: Option<Function>,
+    server: Option<JsValue>,
 ) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
     let telemetry = telemetry_dispatch.map(|dispatch| {
@@ -152,14 +162,32 @@ async fn open_browser_storage(
         }));
         sink
     });
+    #[derive(Deserialize)]
+    struct BrowserSyncServerOptions {
+        url: String,
+        headers: Vec<(String, String)>,
+    }
+    let server = server
+        .map(serde_wasm_bindgen::from_value::<BrowserSyncServerOptions>)
+        .transpose()?
+        .map(|server| ServerOptions::sync(server.url).with_headers(server.headers));
     let inner = match telemetry {
         Some(telemetry) => {
-            open_lix()
+            let builder = open_lix()
                 .with_storage(storage.clone())
-                .with_telemetry(telemetry)
-                .await
+                .with_telemetry(telemetry);
+            match server {
+                Some(server) => builder.with_server(server).await,
+                None => builder.await,
+            }
         }
-        None => open_lix().with_storage(storage.clone()).await,
+        None => {
+            let builder = open_lix().with_storage(storage.clone());
+            match server {
+                Some(server) => builder.with_server(server).await,
+                None => builder.await,
+            }
+        }
     }
     .map_err(lix_error_to_js)?;
     Ok(WasmLix { inner, storage })

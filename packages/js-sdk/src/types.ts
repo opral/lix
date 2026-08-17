@@ -12,13 +12,14 @@ export type RemoteLixServerOptions = {
 
 /**
  * Opens a local native replica that synchronizes with the server in the
- * background. Sync mode keeps the normal local storage/read path; it does
- * not use the remote SQL client and is therefore only available to the
- * native Node binding today.
+ * background. Sync mode keeps the normal local storage/read path and works
+ * with browser storage such as OPFS as well as native storage.
  */
 export type SyncLixServerOptions = {
 	mode: "sync";
 	url: string | URL;
+	/** Headers copied into each browser sync request, such as Authorization. */
+	headers?: HeadersInit;
 };
 
 export type LixTelemetrySpan = {
@@ -46,9 +47,7 @@ export type OpenLixOptions =
 			telemetry?: never;
 	  }
 	| {
-			storage?:
-				| import("./storage-adapter.js").LixStorage
-				| import("./open-lix.js").IndexedDbStorage;
+			storage?: import("./storage-adapter.js").LixStorage;
 			server: SyncLixServerOptions;
 			telemetry?: LixTelemetryOptions;
 	  };

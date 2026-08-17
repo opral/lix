@@ -18,7 +18,12 @@ export type WorkerRequest = {
 };
 
 export type WorkerOperation =
-	| { kind: "open"; storage: LixStorageConfig; telemetryEnabled: boolean }
+	| {
+			kind: "open";
+			storage: LixStorageConfig;
+			telemetryEnabled: boolean;
+			server?: { url: string; headers: [string, string][] };
+	  }
 	| {
 			kind: "execute";
 			sql: string;

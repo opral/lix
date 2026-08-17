@@ -36,11 +36,14 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			return new Lix(await openRemoteLixBinding(options.server));
 		}
 	}
-	const syncServerUrl =
+	const syncServer =
 		options.server?.mode === "sync"
-			? new URL(options.server.url).toString()
+			? {
+					url: new URL(options.server.url).toString(),
+					headers: resolveHeaders(options.server.headers),
+				}
 			: undefined;
-	if (options.server !== undefined && syncServerUrl === undefined) {
+	if (options.server !== undefined && syncServer === undefined) {
 		throw new TypeError("openLix() server mode must be 'remote' or 'sync'");
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
@@ -50,7 +53,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				{ kind: "memory" },
 				undefined,
 				options.telemetry,
-				syncServerUrl,
+				syncServer,
 			),
 		);
 	}
@@ -58,7 +61,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		return openJsProviderStorage(
 			options.storage,
 			options.telemetry,
-			syncServerUrl,
+			syncServer,
 		);
 	}
 	if (isLixStorage(options.storage)) {
@@ -77,7 +80,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				storage.lixStorage.config,
 				disconnect,
 				options.telemetry,
-				syncServerUrl,
+				syncServer,
 			);
 			storage.lixStorage.connect({
 				importFilesystemPaths: (paths) =>
@@ -103,7 +106,7 @@ async function openJsProviderStorage(
 		};
 	},
 	telemetry: OpenLixOptions["telemetry"],
-	syncServerUrl: string | undefined,
+	syncServer: { url: string; headers: [string, string][] } | undefined,
 ): Promise<Lix> {
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (openStorages.has(storage)) throw storageAlreadyOpen();
@@ -118,7 +121,7 @@ async function openJsProviderStorage(
 			},
 			() => openStorages.delete(storage),
 			telemetry,
-			syncServerUrl,
+			syncServer,
 		);
 		binding = opened;
 		return new Lix(opened);
@@ -127,6 +130,12 @@ async function openJsProviderStorage(
 		await binding?.close().catch(() => undefined);
 		throw error;
 	}
+}
+
+function resolveHeaders(headers: HeadersInit | undefined): [string, string][] {
+	const entries: [string, string][] = [];
+	new Headers(headers).forEach((value, name) => entries.push([name, value]));
+	return entries;
 }
 
 function storageAlreadyOpen(): Error & { code: string } {

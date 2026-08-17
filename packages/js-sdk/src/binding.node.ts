@@ -77,12 +77,12 @@ function loadNativeAddon(): NativeAddon {
 export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
-	serverUrl?: string,
+	server?: { url: string; headers: [string, string][] },
 ): Promise<LixBinding> {
 	try {
-		return await openNativeLixBinding(storage, telemetry, serverUrl);
+		return await openNativeLixBinding(storage, telemetry, server?.url);
 	} catch (nativeError) {
-		if (storage.kind !== "memory" || serverUrl !== undefined) throw nativeError;
+		if (storage.kind !== "memory" || server !== undefined) throw nativeError;
 		try {
 			const { openMemoryWasmBinding } = await import(
 				"./binding.node-wasm.js"

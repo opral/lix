@@ -134,6 +134,11 @@ wit-bindgen = "0.57"
 [target.'cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))'.dependencies]
 uuid = { version = "1", features = ["std"] }
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
 ahash = "0.8"
 async-trait = "0.1"

@@ -20,16 +20,37 @@ mod runtime;
 #[cfg(not(target_family = "wasm"))]
 mod transport;
 
+#[cfg(target_family = "wasm")]
+mod runtime_wasm;
+#[cfg(target_family = "wasm")]
+mod transport_wasm;
+
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use runtime::{SyncRuntime, activate_sync_mode};
+#[cfg(target_family = "wasm")]
+pub(crate) use runtime_wasm::{SyncRuntime, activate_sync_mode};
 
 /// Performs the one fresh-store handshake needed to seed a local repository's
 /// main branch with the server's default branch identity. Reopened stores do
 /// not call this path; they use their durable branch binding and reconnect in
 /// the worker so offline reads remain local.
 #[cfg(not(target_family = "wasm"))]
-pub(crate) async fn probe_sync_branch_id(server_url: &str) -> Result<String, LixError> {
-    let transport = transport::HttpSyncTransport::connect(server_url, None).await?;
+pub(crate) async fn probe_sync_branch_id(server: &crate::ServerOptions) -> Result<String, LixError> {
+    let transport =
+        transport::HttpSyncTransport::connect(&server.url, &server.headers, None).await?;
+    let branch_id = transport.branch_id().to_owned();
+    transport.close().await?;
+    Ok(branch_id)
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn probe_sync_branch_id(server: &crate::ServerOptions) -> Result<String, LixError> {
+    let transport = transport_wasm::HttpSyncTransport::connect(
+        &server.url,
+        &server.headers,
+        None,
+    )
+    .await?;
     let branch_id = transport.branch_id().to_owned();
     transport.close().await?;
     Ok(branch_id)
@@ -642,6 +663,54 @@ impl SyncModeState {
                     "Retry after the replica reconnects, or query only data already hydrated locally.",
                 )
             })?;
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            use futures_util::future::{Either, select};
+
+            if !self.is_replica() || requested_scopes.is_empty() {
+                return Ok(());
+            }
+            let wait = async {
+                loop {
+                    let ready = self
+                        .hydrated_scopes_by_branch
+                        .read()
+                        .ok()
+                        .and_then(|branches| branches.get(branch_id).cloned())
+                        .is_some_and(|hydrated| {
+                            (hydrated.contains(FULL_SYNC_SCOPE)
+                                && requested_scopes.iter().all(|scope| scope != "lix_file"))
+                                || requested_scopes
+                                    .iter()
+                                    .all(|scope| hydrated.contains(scope))
+                    });
+                    if ready {
+                        return Ok::<(), LixError>(());
+                    }
+                    self.scope_notify.notified().await;
+                }
+            };
+            // Browser WASM is single-threaded. The shared session API keeps a
+            // `Send` future signature for native callers, so erase the
+            // non-Send marker carried by JavaScript's Promise future here.
+            let timeout = unsafe {
+                crate::session::AssumeSendFuture::new(runtime_wasm::sleep(Duration::from_secs(5)))
+            };
+            futures_util::pin_mut!(wait, timeout);
+            match select(wait, timeout).await {
+                Either::Left((result, _)) => result?,
+                Either::Right((timer, _)) => {
+                    timer?;
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync scope hydration did not complete before the readiness deadline",
+                    )
+                    .with_hint(
+                        "Retry after the replica reconnects, or query only data already hydrated locally.",
+                    ));
+                }
+            }
         }
         Ok(())
     }

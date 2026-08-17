@@ -84,6 +84,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 						? (span: LixTelemetrySpan) =>
 							endpoint.postMessage({ kind: "telemetry", span })
 						: undefined,
+					operation.server,
 				);
 				return undefined;
 			case "execute":

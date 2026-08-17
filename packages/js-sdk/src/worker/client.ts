@@ -31,6 +31,7 @@ export async function openLixWorker(
 	storage: LixStorageConfig,
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
+	server?: { url: string; headers: [string, string][] },
 ): Promise<LixWorkerClient> {
 	let client = idleWorkers.pop();
 	while (client?.isDisposed) client = idleWorkers.pop();
@@ -41,6 +42,7 @@ export async function openLixWorker(
 			kind: "open",
 			storage,
 			telemetryEnabled: telemetry !== undefined,
+			server,
 		});
 		return client;
 	} catch (error) {
@@ -54,7 +56,7 @@ export async function openLixWorkerBinding(
 	storage: LixStorageConfig,
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
-	serverUrl?: string,
+	server?: { url: string; headers: [string, string][] },
 ): Promise<LixBinding> {
 	if (openDirectLixBinding) {
 		const telemetryDispatch = telemetry
@@ -69,7 +71,7 @@ export async function openLixWorkerBinding(
 		const binding = await openDirectLixBinding(
 			storage,
 			telemetryDispatch,
-			serverUrl,
+			server,
 		);
 		if (binding) {
 			if (!onDisposed) return binding;
@@ -94,12 +96,7 @@ export async function openLixWorkerBinding(
 			});
 		}
 	}
-	if (serverUrl !== undefined) {
-		throw new Error(
-			"openLix() sync mode requires the native Node binding; browser/WASM storage does not support local synchronization yet",
-		);
-	}
-	const client = await openLixWorker(storage, onDisposed, telemetry);
+	const client = await openLixWorker(storage, onDisposed, telemetry, server);
 	return workerBinding(client);
 }
 

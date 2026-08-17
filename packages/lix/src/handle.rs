@@ -39,6 +39,8 @@ pub enum ServerMode {
 pub struct ServerOptions {
     pub mode: ServerMode,
     pub url: String,
+    /// HTTP headers included on browser sync protocol requests.
+    pub headers: Vec<(String, String)>,
 }
 
 impl ServerOptions {
@@ -46,7 +48,14 @@ impl ServerOptions {
         Self {
             mode: ServerMode::Sync,
             url: url.into(),
+            headers: Vec::new(),
         }
+    }
+
+    /// Adds HTTP headers used by the sync transport, such as Authorization.
+    pub fn with_headers(mut self, headers: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.headers = headers.into_iter().collect();
+        self
     }
 }
 
@@ -304,7 +313,6 @@ where
     engine: Arc<Engine<StorageImpl>>,
     session: Arc<SessionContext<StorageImpl>>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
-    #[cfg(not(target_family = "wasm"))]
     sync_runtime: Option<Arc<crate::sync::SyncRuntime>>,
 }
 
@@ -322,7 +330,6 @@ where
     // must reopen from durable local state without putting the network in the
     // read/open hot path.
     let initial_sync_branch_id: Option<String> = {
-        #[cfg(not(target_family = "wasm"))]
         {
             if let Some(server) = server.as_ref() {
                 let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
@@ -333,17 +340,13 @@ where
                     crate::init::repository_protocol_status(&read).await?,
                     crate::init::RepositoryProtocolStatus::Missing
                 ) {
-                    Some(crate::sync::probe_sync_branch_id(&server.url).await?)
+                    Some(crate::sync::probe_sync_branch_id(server).await?)
                 } else {
                     None
                 }
             } else {
                 None
             }
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            None
         }
     };
     let engine = open_or_initialize_engine(
@@ -359,24 +362,12 @@ where
         engine: Arc::new(engine),
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
-        #[cfg(not(target_family = "wasm"))]
         sync_runtime: None,
     };
     if let Some(server) = server {
         match server.mode {
             ServerMode::Sync => {
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    lix.sync_runtime =
-                        Some(crate::sync::activate_sync_mode(&lix, &server.url).await?);
-                }
-                #[cfg(target_family = "wasm")]
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "Rust sync mode is not available on wasm yet",
-                    ));
-                }
+                lix.sync_runtime = Some(crate::sync::activate_sync_mode(&lix, &server).await?);
             }
         }
     }
@@ -395,7 +386,6 @@ where
         self.engine.sync_mode()
     }
 
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn active_branch_id_for_sync_worker(&self) -> Result<String, LixError> {
         self.session.active_branch_id_for_sync_worker()
     }
@@ -585,7 +575,6 @@ where
             engine: self.engine.clone(),
             session: Arc::new(session),
             primary_switch_gate: None,
-            #[cfg(not(target_family = "wasm"))]
             sync_runtime: None,
         })
     }
@@ -1057,7 +1046,6 @@ where
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
-        #[cfg(not(target_family = "wasm"))]
         if let Some(runtime) = &self.sync_runtime {
             runtime.stop_and_join().await?;
         }

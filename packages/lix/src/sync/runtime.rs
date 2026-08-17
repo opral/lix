@@ -88,12 +88,13 @@ impl Drop for SyncRuntime {
 
 pub(crate) async fn activate_sync_mode<StorageImpl>(
     lix: &Lix<StorageImpl>,
-    server_url: &str,
+    server: &crate::ServerOptions,
 ) -> Result<Arc<SyncRuntime>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let remote_id = server_url.trim_end_matches('/').to_owned();
+    let remote_id = server.url.trim_end_matches('/').to_owned();
+    let headers = server.headers.clone();
     // Keep a reopened replica on the branch it last used. New replicas have
     // no durable mapping yet and therefore let the server choose its default
     // branch during the first handshake.
@@ -141,7 +142,7 @@ where
         lix.restore_sync_scope_readiness(&remote_id).await?;
         None
     } else {
-        match HttpSyncTransport::connect(&remote_id, remembered_branch.as_deref()).await {
+        match HttpSyncTransport::connect(&remote_id, &headers, remembered_branch.as_deref()).await {
             Ok(transport) => {
                 // The handshake identifies the branch; the catalog supplies
                 // its authoritative user-facing name/hidden bit. A fresh
@@ -326,7 +327,11 @@ where
                         Some(current) => current,
                         None => {
                             let current =
-                                HttpSyncTransport::connect(&remote_id, Some(&active_branch_id))
+                                HttpSyncTransport::connect(
+                                    &remote_id,
+                                    &headers,
+                                    Some(&active_branch_id),
+                                )
                                     .await?;
                             if active_branch_id != current.branch_id() {
                                 return Err(LixError::new(
@@ -554,7 +559,11 @@ where
                         for branch_id in pending_inactive_branches {
                             let branch_result = async {
                                 let branch_transport =
-                                    HttpSyncTransport::connect(&remote_id, Some(&branch_id))
+                                    HttpSyncTransport::connect(
+                                        &remote_id,
+                                        &headers,
+                                        Some(&branch_id),
+                                    )
                                         .await?;
                                 if branch_transport.branch_id() != branch_id {
                                     return Err(LixError::new(

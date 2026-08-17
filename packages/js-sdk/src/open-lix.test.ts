@@ -47,21 +47,6 @@ test("filesystem storage is owned by its adapter package", async () => {
 	expect("LocalFilesystem" in sdk).toBe(false);
 });
 
-test("sync mode rejects browser IndexedDB storage until a local transport exists", async () => {
-	const { IndexedDbStorage } = await import("./open-lix.js");
-	const storage = new IndexedDbStorage({
-		name: `sync-unsupported-${Math.random().toString(36).slice(2)}`,
-	});
-	await expect(
-		openLix({
-			storage,
-			server: { mode: "sync", url: "https://sync.example.test/repository" },
-		}),
-	).rejects.toThrow(
-		"openLix() sync mode is not available with IndexedDbStorage yet",
-	);
-});
-
 test("sync mode keeps cached native reads local after bootstrap", async () => {
 	const storagePath = mkdtempSync(join(tmpdir(), "lix-js-sync-"));
 	const seed = await openLix({

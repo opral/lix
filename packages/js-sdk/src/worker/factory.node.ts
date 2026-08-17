@@ -51,12 +51,12 @@ export function createWorkerConnection(): WorkerConnection {
 export const openDirectLixBinding = async (
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
-	serverUrl?: string,
+	server?: { url: string; headers: [string, string][] },
 ): Promise<LixBinding | undefined> => {
 	try {
-		return await openNativeLixBinding(storage, telemetry, serverUrl);
+		return await openNativeLixBinding(storage, telemetry, server?.url);
 	} catch (error) {
-		if (serverUrl !== undefined) throw error;
+		if (server !== undefined) throw error;
 		if (storage.kind === "memory") return undefined;
 		throw error;
 	}

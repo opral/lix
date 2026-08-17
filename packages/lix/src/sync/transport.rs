@@ -49,12 +49,30 @@ impl HttpSyncTransport {
     /// could never follow a local branch switch.
     pub(crate) async fn connect(
         repository_url: &str,
+        headers: &[(String, String)],
         active_branch_id: Option<&str>,
     ) -> Result<Self, LixError> {
         let repository_url = repository_url.trim_end_matches('/').to_owned();
         validate_sync_remote_id(&repository_url)?;
         let protocol_url = format!("{repository_url}/lix/v1");
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("invalid sync HTTP header name: {error}"),
+                )
+            })?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("invalid sync HTTP header value: {error}"),
+                )
+            })?;
+            default_headers.append(name, value);
+        }
         let client = reqwest::Client::builder()
+            .default_headers(default_headers)
             // Event pulls are mandatory long-polls. Leave a small margin for
             // response framing and proxy jitter beyond the server heartbeat;
             // a five-second client timeout would turn an idle connection into

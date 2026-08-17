@@ -18,11 +18,12 @@ function initializeWasm(): Promise<unknown> {
 export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	server?: { url: string; headers: [string, string][] },
 ): Promise<LixBinding> {
 	await initializeWasm();
 	switch (storage.kind) {
 		case "memory":
-			return openMemory(telemetry) as Promise<LixBinding>;
+			return openMemory(telemetry, server) as Promise<LixBinding>;
 		case "jsStorage": {
 			const module = (await import(
 				/* @vite-ignore */ storage.moduleUrl
@@ -37,6 +38,7 @@ export async function openLixBinding(
 				const binding = (await openJsStorage(
 					provider,
 					telemetry,
+					server,
 				)) as unknown as LixBinding;
 				return binding;
 			} catch (error) {
