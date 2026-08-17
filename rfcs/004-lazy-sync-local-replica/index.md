@@ -53,7 +53,12 @@ Branch creation, deletion, switching, refs, and listings are replicated as
 repository metadata. Merge commits replicate their parents and resulting row
 state so history, diff, working diff, undo/redo, and merge behavior remain
 equivalent across replicas. Plugin rows are canonical synchronization data;
-files are projections loaded only when requested.
+files are projections loaded only when requested. For a fresh plugin row
+scope, a certified event that combines a source-file mutation with its rows
+currently retains that one plugin-owned source payload so the local runtime
+can establish ownership and regenerate the rows; ordinary row-only events
+remain byte-free. A future ownership/CAS lane can remove this bootstrap
+exception.
 
 The current prototype has one deliberate topology constraint: live polling
 pulls canonical events unfiltered so a commit is materialized as one graph
@@ -106,7 +111,7 @@ latency, cold hydration p50/p95, replication lag, and retained bytes.
 ## Remaining production work
 
 The 90% path is implemented and covered by Rust unit tests, 20 protocol tests,
-and a 12-test two-replica/filesystem/plugin matrix. The following are explicit
+and a 13-test two-replica/filesystem/plugin matrix. The following are explicit
 follow-ups rather than hidden semantics:
 
 - replace unfiltered live pulls with a topology skeleton plus independently
@@ -123,8 +128,6 @@ follow-ups rather than hidden semantics:
 - audit `observe()` binding for every plugin/query shape and extend the
   branch-control barrier to any API that resolves a remote source branch;
 - make branch deletion safe when the deleted ref is currently selected;
-- cover plugin archive installation on a fresh replica (not only replicas that
-  already have the plugin installed);
 - run real backend benchmarks and independent security/performance review
   before calling the protocol production-ready.
 

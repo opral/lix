@@ -959,6 +959,87 @@ async fn fresh_replica_file_observe_hydrates_only_file_view_semantics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_replica_plugin_rows_hydrate_without_a_preinstalled_plugin() {
+    let server_lix = Arc::new(open_lix().await.expect("open server repository"));
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) = serve_protocol(protocol).await;
+    install_markdown_plugin(server_lix.as_ref()).await;
+    write_file(
+        server_lix.as_ref(),
+        "/fresh-plugin.md",
+        b"First paragraph.\n\nSecond paragraph.\n",
+    )
+    .await;
+
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_lix()
+        .with_storage(
+            FilesystemStorage::new(replica_dir.path())
+                .open()
+                .expect("open fresh replica storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open fresh lazy replica");
+
+    let server_rows = server_lix
+        .execute(
+            "SELECT payload_json FROM markdown_node WHERE kind = 'paragraph'",
+            &[],
+        )
+        .await
+        .expect("read server plugin rows");
+    assert_eq!(server_rows.rows().len(), 2);
+
+    // The fresh local filesystem has no plugin archive. A row-first query
+    // hydrates the registered schema and canonical plugin rows; only the
+    // plugin-owned source payload needed to establish ownership is used when
+    // the server event combines certified rows with a file mutation.
+    let rows = replica
+        .execute(
+            "SELECT payload_json FROM markdown_node WHERE kind = 'paragraph' ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("hydrate plugin rows on a fresh replica");
+    let local_schema_count = replica
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_registered_schema WHERE schema_key = 'markdown_node'",
+            &[],
+        )
+        .await
+        .expect("read local registered plugin schema")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("local schema count");
+    let local_archive_count = replica
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_file WHERE path = '/.lix/plugins/plugin_markdown.lixplugin'",
+            &[],
+        )
+        .await
+        .expect("read local plugin archive")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("local archive count");
+    assert_eq!(local_schema_count, 1);
+    assert_eq!(local_archive_count, 1);
+    assert_eq!(rows.rows().len(), 2);
+    assert!(rows.rows()[0]
+        .get::<String>("payload_json")
+        .expect("first plugin payload")
+        .contains("First paragraph."));
+    assert!(rows.rows()[1]
+        .get::<String>("payload_json")
+        .expect("second plugin payload")
+        .contains("Second paragraph."));
+
+    replica.close().await.expect("close replica");
+    server_lix.close().await.expect("close server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn switching_sync_branches_rebinds_each_replica_to_that_branch() {
     // Build one identical repository image first. This gives every replica a
     // certified local copy of both branch heads before sync authority starts.
