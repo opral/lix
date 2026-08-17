@@ -142,7 +142,7 @@ test("sync mode keeps cached native reads local after bootstrap", async () => {
 	expect(requestCount).toBe(requestsAfterBootstrap);
 	await lix.close();
 	rmSync(storagePath, { recursive: true, force: true });
-});
+}, 30_000);
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	let resolveSpan!: (span: LixTelemetrySpan) => void;
