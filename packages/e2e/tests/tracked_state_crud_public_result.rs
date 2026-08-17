@@ -3,6 +3,8 @@
 // assertion.
 #![allow(dead_code)]
 
+use std::future::Future;
+
 const READ_MANY_PK_COUNT: usize = 4;
 
 #[path = "../benches/tracked_state_crud/sql_session.rs"]
@@ -18,6 +20,29 @@ static PUBLIC_RESULT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 
 async fn serialized_public_result_test() -> tokio::sync::MutexGuard<'static, ()> {
     PUBLIC_RESULT_TEST_LOCK.lock().await
+}
+
+// The typed OLAP fixtures build unoptimized DataFusion plans over 2,048 rows.
+// Keep those benchmark-parity checks independent of libtest's small worker
+// stack; this does not change the production execution stack or its behavior.
+fn run_on_sized_stack<Body, Fut>(name: &str, body: Body)
+where
+    Body: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build public-result test runtime")
+                .block_on(body());
+        })
+        .expect("spawn public-result test thread")
+        .join()
+        .expect("public-result test body panicked");
 }
 
 #[test]
@@ -49,9 +74,11 @@ fn typed_olap_queries_are_plain_datafusion_selects() {
     }
 }
 
-#[tokio::test]
-async fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
-    validate_exact_olap_shapes().await;
+#[test]
+fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
+    run_on_sized_stack("olap-exact-results", || async {
+        validate_exact_olap_shapes().await;
+    });
 }
 
 async fn validate_exact_olap_shapes() {
@@ -78,9 +105,11 @@ async fn validate_exact_olap_shapes() {
     }
 }
 
-#[tokio::test]
-async fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
-    validate_above_columnar_publication_threshold().await;
+#[test]
+fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
+    run_on_sized_stack("olap-above-columnar-threshold", || async {
+        validate_above_columnar_publication_threshold().await;
+    });
 }
 
 async fn validate_above_columnar_publication_threshold() {
@@ -107,10 +136,12 @@ async fn validate_above_columnar_publication_threshold() {
     }
 }
 
-#[tokio::test]
-async fn typed_olap_shapes_validate_exact_results_after_sparse_and_moderate_mutations() {
-    let _test_guard = serialized_public_result_test().await;
-    validate_post_update_olap_shapes().await;
+#[test]
+fn typed_olap_shapes_validate_exact_results_after_sparse_and_moderate_mutations() {
+    run_on_sized_stack("post-update-olap-validation", || async {
+        let _test_guard = serialized_public_result_test().await;
+        validate_post_update_olap_shapes().await;
+    });
 }
 
 async fn validate_post_update_olap_shapes() {

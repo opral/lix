@@ -674,13 +674,17 @@ fn extract_sql_scope_schema_keys(sql: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(|token| token.to_ascii_lowercase())
         .collect::<Vec<_>>();
+    let mut scopes = BTreeSet::new();
     if tokens.iter().any(|token| {
         matches!(
             token.as_str(),
             "lix_active_branch_id" | "lix_active_branch_commit_id"
         )
     }) {
-        return vec![CONTROL_SYNC_SCOPE.to_owned()];
+        // Keep extracting relation scopes as well. A query can combine a
+        // control-plane function with an ordinary relation, and both sides
+        // must be ready before executing against the local replica.
+        scopes.insert(CONTROL_SYNC_SCOPE.to_owned());
     }
     // The lexer is intentionally conservative. A false positive scope can
     // cause an unnecessary request, but a false negative can return an empty
@@ -694,7 +698,6 @@ fn extract_sql_scope_schema_keys(sql: &str) -> Vec<String> {
                 "with" | "union" | "intersect" | "except" | "returning"
             )
         });
-    let mut scopes = BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
         if matches!(token.as_str(), "from" | "join" | "into" | "update")
             && let Some(table) = tokens.get(index + 1)
@@ -713,7 +716,9 @@ fn extract_sql_scope_schema_keys(sql: &str) -> Vec<String> {
                 scopes.insert(FULL_SYNC_SCOPE.to_owned());
             } else if is_sync_control_schema(table) {
                 scopes.insert(CONTROL_SYNC_SCOPE.to_owned());
-            } else if !table.starts_with("lix_") {
+            } else if table != "lix_registered_schema"
+                && (ordinary_sync_schema(table) || table == "lix_file")
+            {
                 scopes.insert(table.clone());
             }
         }
@@ -7947,8 +7952,18 @@ mod tests {
             vec![CONTROL_SYNC_SCOPE.to_owned()]
         );
         assert_eq!(
+            extract_sql_scope_schema_keys("SELECT key, value FROM lix_key_value"),
+            vec!["lix_key_value".to_owned()]
+        );
+        assert_eq!(
             extract_sql_scope_schema_keys("SELECT lix_active_branch_commit_id()"),
             vec![CONTROL_SYNC_SCOPE.to_owned()]
+        );
+        assert_eq!(
+            extract_sql_scope_schema_keys(
+                "SELECT lix_active_branch_id(), value FROM project_rows"
+            ),
+            vec![CONTROL_SYNC_SCOPE.to_owned(), "project_rows".to_owned()]
         );
         assert_eq!(
             extract_sql_scope_schema_keys("SELECT * FROM lix_diff"),
