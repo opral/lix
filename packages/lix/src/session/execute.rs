@@ -41,6 +41,7 @@ use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXPIRED_READ_RETRIES: usize = 16;
+const MAX_AUTO_COMMIT_RETRIES: usize = 16;
 
 enum LiteralParameterBuilder {
     Utf8(StringBuilder),
@@ -658,6 +659,7 @@ enum ExecuteBatchExecution {
     Transaction(TransactionBatchStatements),
 }
 
+#[derive(Clone)]
 enum TransactionBatchStatements {
     Shared {
         statement: datafusion::sql::parser::Statement,
@@ -1311,36 +1313,52 @@ where
                     )
                     .await;
             }
-            let write_access = self.begin_session_write_access().await?;
             let sql_for_error = sql.to_string();
-            let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
-            return self
-                .with_write_transaction_reserved_lending(
-                    write_access,
-                    async move |transaction| {
-                        let previous_origin_key =
-                            transaction.replace_origin_key(options.origin_key);
-                        let result = async {
-                            let tx_plan = transaction
-                                .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                            let result = execute_prepared_transaction_write(
-                                transaction,
-                                tx_plan,
-                                &params,
-                                &metadata,
-                            )
-                            .await?;
-                            Ok(ExecuteResult::from_sql_write_result(result))
-                        }
-                        .await;
-                        transaction.replace_origin_key(previous_origin_key);
-                        result
-                    },
-                    |_| Ok(()),
-                )
-                .await
-                .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+            let mut auto_commit_retries = 0;
+            loop {
+                let write_access = self.begin_session_write_access().await?;
+                let sql_for_planning = sql_for_error.clone();
+                let statement = statement.clone();
+                let params = params.clone();
+                let options = options.clone();
+                let metadata = metadata.clone();
+                let result = self
+                    .with_write_transaction_reserved_lending(
+                        write_access,
+                        async move |transaction| {
+                            let previous_origin_key =
+                                transaction.replace_origin_key(options.origin_key);
+                            let result = async {
+                                let tx_plan = transaction.prepare_sql_write_logical_plan(
+                                    &sql_for_planning,
+                                    &statement,
+                                )?;
+                                let result = execute_prepared_transaction_write(
+                                    transaction,
+                                    tx_plan,
+                                    &params,
+                                    &metadata,
+                                )
+                                .await?;
+                                Ok(ExecuteResult::from_sql_write_result(result))
+                            }
+                            .await;
+                            transaction.replace_origin_key(previous_origin_key);
+                            result
+                        },
+                        |_| Ok(()),
+                    )
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+                match result {
+                    Ok(result) => return Ok(result),
+                    Err(error) if consume_auto_commit_retry(&mut auto_commit_retries, &error) => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
 
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
@@ -1828,12 +1846,11 @@ where
                 let contains_write = parsed.contains_write()?;
                 if !contains_write {
                     return self
-                        .execute_transaction_batch(
+                        .execute_transaction_batch_with_auto_commit_retry(
                             statements,
                             parsed,
                             options,
                             statement_metadata,
-                            None,
                         )
                         .await;
                 }
@@ -1845,12 +1862,11 @@ where
                 }
                 let Some(idempotency) = idempotency else {
                     return self
-                        .execute_transaction_batch(
+                        .execute_transaction_batch_with_auto_commit_retry(
                             statements,
                             parsed,
                             options,
                             statement_metadata,
-                            None,
                         )
                         .await;
                 };
@@ -1893,6 +1909,34 @@ where
                     }
                     Err(error) => Err(error),
                 }
+            }
+        }
+    }
+
+    async fn execute_transaction_batch_with_auto_commit_retry(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        parsed: TransactionBatchStatements,
+        options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        let mut auto_commit_retries = 0;
+        loop {
+            let result = self
+                .execute_transaction_batch(
+                    statements,
+                    parsed.clone(),
+                    options.clone(),
+                    statement_metadata.clone(),
+                    None,
+                )
+                .await;
+            match result {
+                Ok(results) => return Ok(results),
+                Err(error) if consume_auto_commit_retry(&mut auto_commit_retries, &error) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -5119,6 +5163,18 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
 
 fn consume_expired_read_retry(retries: &mut usize, error: &LixError) -> bool {
     if error.code != LixError::CODE_STORAGE_READ_EXPIRED || *retries >= MAX_EXPIRED_READ_RETRIES {
+        return false;
+    }
+    *retries += 1;
+    true
+}
+
+fn consume_auto_commit_retry(retries: &mut usize, error: &LixError) -> bool {
+    if !matches!(
+        error.code.as_str(),
+        LixError::CODE_STORAGE_READ_EXPIRED | LixError::CODE_TRANSACTION_CONFLICT
+    ) || *retries >= MAX_AUTO_COMMIT_RETRIES
+    {
         return false;
     }
     *retries += 1;

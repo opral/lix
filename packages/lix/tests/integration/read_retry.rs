@@ -126,6 +126,80 @@ async fn auto_commit_query_restarts_after_its_snapshot_expires() {
 }
 
 #[tokio::test]
+async fn auto_commit_mutation_restarts_after_its_planning_snapshot_expires() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+
+    storage.expire_next_read_call();
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+        &[
+            Value::Text("write-retry".into()),
+            Value::Text("committed".into()),
+        ],
+    )
+    .await
+    .expect("the complete auto-commit mutation should restart");
+
+    let result = lix
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = $1",
+            &[Value::Text("write-retry".into())],
+        )
+        .await
+        .expect("read committed value");
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("committed")
+    );
+    assert_eq!(storage.expired_calls(), 1);
+}
+
+#[tokio::test]
+async fn mutation_batch_restarts_atomically_after_snapshot_expiry() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+
+    storage.expire_next_read_call();
+    let statements = [
+        ExecuteBatchStatement {
+            label: None,
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+            params: vec![Value::Text("batch-left".into()), Value::Integer(1)],
+        },
+        ExecuteBatchStatement {
+            label: None,
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+            params: vec![Value::Text("batch-right".into()), Value::Integer(2)],
+        },
+    ];
+    lix.execute_batch(&statements)
+        .await
+        .expect("the complete mutation batch should restart");
+
+    for (key, expected) in [("batch-left", 1), ("batch-right", 2)] {
+        let result = lix
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text(key.into())],
+            )
+            .await
+            .expect("read committed batch value");
+        assert_eq!(
+            result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!(expected)
+        );
+    }
+    assert_eq!(storage.expired_calls(), 1);
+}
+
+#[tokio::test]
 async fn read_only_batch_restarts_as_one_coherent_unit_after_expiry() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()

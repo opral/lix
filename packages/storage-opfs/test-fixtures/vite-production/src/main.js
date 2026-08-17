@@ -6,6 +6,8 @@ let observation;
 let pendingObservation;
 let benchmarkWriterLix;
 let benchmarkWriterChannel;
+let offlineLix;
+let crashLix;
 
 const storageName =
 	new URL(globalThis.location.href).searchParams.get("storage") ??
@@ -20,6 +22,13 @@ globalThis.__storageOpfsFinishObservation = finishObservation;
 globalThis.__storageOpfsRecoverObservation = recoverObservation;
 globalThis.__storageOpfsPrepareBenchmarkWriter = prepareBenchmarkWriter;
 globalThis.__storageOpfsBenchmarkCrossTab = benchmarkCrossTab;
+globalThis.__storageOpfsReadValue = readValue;
+globalThis.__storageOpfsWriteValue = writeValue;
+globalThis.__storageOpfsReadValues = readValues;
+globalThis.__storageOpfsPrepareOfflineSession = prepareOfflineSession;
+globalThis.__storageOpfsOfflineReadWrite = offlineReadWrite;
+globalThis.__storageOpfsFinishOfflineSession = finishOfflineSession;
+globalThis.__storageOpfsStartCrashWrite = startCrashWrite;
 
 async function run() {
 	const [first, second] = await Promise.all([
@@ -66,6 +75,99 @@ async function failover() {
 	} finally {
 		await lix.close();
 	}
+}
+
+async function readValue(key) {
+	const lix = await openLix({
+		storage: new OpfsStorage({ name: storageName }),
+	});
+	try {
+		const result = await lix.execute(
+			"SELECT value FROM lix_key_value WHERE key = $1",
+			[key],
+		);
+		return result.rows[0]?.get("value");
+	} finally {
+		await lix.close();
+	}
+}
+
+async function writeValue(key, value) {
+	const lix = await openLix({
+		storage: new OpfsStorage({ name: storageName }),
+	});
+	try {
+		await lix.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+			[key, value],
+		);
+	} finally {
+		await lix.close();
+	}
+}
+
+async function readValues(keys) {
+	const lix = await openLix({
+		storage: new OpfsStorage({ name: storageName }),
+	});
+	try {
+		const result = await lix.execute(
+			"SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
+			keys,
+		);
+		return result.rows.map((row) => [row.get("key"), row.get("value")]);
+	} finally {
+		await lix.close();
+	}
+}
+
+async function prepareOfflineSession() {
+	offlineLix = await openLix({
+		storage: new OpfsStorage({ name: storageName }),
+	});
+	const result = await offlineLix.execute(
+		"SELECT value FROM lix_key_value WHERE key = $1",
+		["packed-vite"],
+	);
+	return result.rows[0]?.get("value");
+}
+
+async function offlineReadWrite(value) {
+	if (!offlineLix) throw new Error("offline session was not prepared");
+	await offlineLix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+		["offline-round-trip", value],
+	);
+	const result = await offlineLix.execute(
+		"SELECT value FROM lix_key_value WHERE key = $1",
+		["offline-round-trip"],
+	);
+	return result.rows[0]?.get("value");
+}
+
+async function finishOfflineSession() {
+	await offlineLix?.close();
+	offlineLix = undefined;
+	return readValue("offline-round-trip");
+}
+
+async function startCrashWrite(value) {
+	crashLix = await openLix({
+		storage: new OpfsStorage({ name: storageName }),
+	});
+	await crashLix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+		["crash-recovery", value],
+	);
+	return readValueFrom(crashLix, "crash-recovery");
+}
+
+async function readValueFrom(lix, key) {
+	const result = await lix.execute(
+		"SELECT value FROM lix_key_value WHERE key = $1",
+		[key],
+	);
+	return result.rows[0]?.get("value");
 }
 
 async function startObservation() {

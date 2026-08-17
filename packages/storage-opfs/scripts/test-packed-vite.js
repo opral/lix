@@ -68,6 +68,98 @@ try {
 		}
 		for (const result of results) assert.deepEqual(result, { message: "persistent-production" });
 		assert.deepEqual(browserErrors, [[], []]);
+		progress("checking durable reload recovery");
+		await pages[0].evaluate(() =>
+			globalThis.__storageOpfsWriteValue("reload-recovery", "after-reload"),
+		);
+		await pages[0].reload({ waitUntil: "load" });
+		await pages[0].waitForFunction(() => "__storageOpfsProductionSmoke" in globalThis);
+		assert.deepEqual(
+			await pages[0].evaluate(() => globalThis.__storageOpfsProductionSmoke),
+			{ message: "persistent-production" },
+		);
+		assert.equal(
+			await pages[0].evaluate(() =>
+				globalThis.__storageOpfsReadValue("reload-recovery"),
+			),
+			"after-reload",
+		);
+		progress("checking hydrated offline reads and writes");
+		assert.equal(
+			await pages[1].evaluate(() =>
+				globalThis.__storageOpfsPrepareOfflineSession(),
+			),
+			"persistent-production",
+		);
+		await context.setOffline(true);
+		try {
+			assert.equal(
+				await pages[1].evaluate(() =>
+					globalThis.__storageOpfsOfflineReadWrite("written-offline"),
+				),
+				"written-offline",
+			);
+		} finally {
+			await context.setOffline(false);
+		}
+		assert.equal(
+			await pages[1].evaluate(() =>
+				globalThis.__storageOpfsFinishOfflineSession(),
+			),
+			"written-offline",
+		);
+		progress("checking divergent clients converge");
+		await Promise.all([
+			pages[0].evaluate(() =>
+				globalThis.__storageOpfsWriteValue("divergent-left", "left"),
+			),
+			pages[1].evaluate(() =>
+				globalThis.__storageOpfsWriteValue("divergent-right", "right"),
+			),
+		]);
+		const convergedRows = [
+			["divergent-left", "left"],
+			["divergent-right", "right"],
+		];
+		assert.deepEqual(
+			await pages[0].evaluate(() =>
+				globalThis.__storageOpfsReadValues([
+					"divergent-left",
+					"divergent-right",
+				]),
+			),
+			convergedRows,
+		);
+		assert.deepEqual(
+			await pages[1].evaluate(() =>
+				globalThis.__storageOpfsReadValues([
+					"divergent-left",
+					"divergent-right",
+				]),
+			),
+			convergedRows,
+		);
+		await Promise.all([
+			pages[0].evaluate(() =>
+				globalThis.__storageOpfsWriteValue("divergent-same-key", "left"),
+			),
+			pages[1].evaluate(() =>
+				globalThis.__storageOpfsWriteValue("divergent-same-key", "right"),
+			),
+		]);
+		const sameKeyValues = await Promise.all([
+			pages[0].evaluate(() =>
+				globalThis.__storageOpfsReadValue("divergent-same-key"),
+			),
+			pages[1].evaluate(() =>
+				globalThis.__storageOpfsReadValue("divergent-same-key"),
+			),
+		]);
+		assert.ok(["left", "right"].includes(sameKeyValues[0]));
+		assert.equal(sameKeyValues[1], sameKeyValues[0]);
+		assert.deepEqual(browserErrors, [[], []]);
+		progress("checking abrupt tab termination recovery");
+		await checkCrashRecovery(context, server.port);
 		progress("checking cross-tab observation");
 		await pages[0].evaluate(() => globalThis.__storageOpfsStartObservation());
 		await pages[1].evaluate(() =>
@@ -158,6 +250,54 @@ async function measureOwnerFailover(browserContext, port, storageName) {
 		return recovered.elapsedMs;
 	} finally {
 		await Promise.all([owner.close(), follower.close()]);
+	}
+}
+
+async function checkCrashRecovery(browserContext, port) {
+	const storageName = `crash-recovery-${crypto.randomUUID()}`;
+	const url = `http://127.0.0.1:${port}${base}?storage=${encodeURIComponent(storageName)}`;
+	const writer = await browserContext.newPage();
+	const errors = [];
+	writer.on("console", (message) => {
+		if (message.type() === "error") errors.push(message.text());
+	});
+	writer.on("pageerror", (error) => errors.push(error.stack ?? error.message));
+	writer.setDefaultTimeout(120_000);
+	await writer.goto(url, { waitUntil: "load" });
+	await writer.waitForFunction(() => "__storageOpfsProductionSmoke" in globalThis);
+	assert.deepEqual(await writer.evaluate(() => globalThis.__storageOpfsProductionSmoke), {
+		message: "persistent-production",
+	});
+	assert.equal(
+		await writer.evaluate(() =>
+			globalThis.__storageOpfsStartCrashWrite("survived-crash"),
+		),
+		"survived-crash",
+	);
+	await writer.close();
+
+	const recovery = await browserContext.newPage();
+	recovery.on("console", (message) => {
+		if (message.type() === "error") errors.push(message.text());
+	});
+	recovery.on("pageerror", (error) => errors.push(error.stack ?? error.message));
+	recovery.setDefaultTimeout(120_000);
+	try {
+		await recovery.goto(url, { waitUntil: "load" });
+		await recovery.waitForFunction(() => "__storageOpfsProductionSmoke" in globalThis);
+		assert.deepEqual(
+			await recovery.evaluate(() => globalThis.__storageOpfsProductionSmoke),
+			{ message: "persistent-production" },
+		);
+		assert.equal(
+			await recovery.evaluate(() =>
+				globalThis.__storageOpfsReadValue("crash-recovery"),
+			),
+			"survived-crash",
+		);
+		assert.deepEqual(errors, []);
+	} finally {
+		await recovery.close();
 	}
 }
 
