@@ -140,8 +140,14 @@ export class OpfsBackend implements LixStorageProvider {
 		}
 	}
 
-	async beginRead(_options: LixStorageReadOptions): Promise<LixStorageRead> {
+	async beginRead(options: LixStorageReadOptions): Promise<LixStorageRead> {
 		this.#assertOpen();
+		if (options.durability === "durable") {
+			throw storageError(
+				"LIX_STORAGE_DURABILITY",
+				"SQLite OPFS storage does not support durable reads",
+			);
+		}
 		return new OpfsRead(this, this.#generation);
 	}
 

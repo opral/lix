@@ -46,3 +46,27 @@ test("opens distinct repositories in parallel workers", async () => {
 	const [left, right] = await Promise.all([first, second]);
 	await Promise.all([left.close(), right.close()]);
 });
+
+test("rejects durable reads instead of weakening their semantics", async () => {
+	const worker = new Worker(new URL("./durable-read.worker.ts", import.meta.url), {
+		type: "module",
+	});
+	const result = new Promise<{ code: string | undefined }>((resolve, reject) => {
+		worker.onmessage = (event: MessageEvent<
+			| { ok: true; code: string | undefined }
+			| { ok: false; error: string }
+		>) => {
+			worker.terminate();
+			if (event.data.ok) resolve(event.data);
+			else reject(new Error(event.data.error));
+		};
+		worker.onerror = (event) => {
+			worker.terminate();
+			reject(event.error ?? new Error(event.message));
+		};
+	});
+	worker.postMessage({
+		name: `lix-opfs-durable-read-test:${crypto.randomUUID()}`,
+	});
+	expect((await result).code).toBe("LIX_STORAGE_DURABILITY");
+});

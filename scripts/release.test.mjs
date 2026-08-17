@@ -235,10 +235,11 @@ test("updateCargoToml restores every manifest after a commit failure", () => {
 	assert.equal(readFileSync(join(root, "packages", "app", "Cargo.toml"), "utf8"), appManifest);
 });
 
-test("updatePackageVersion pins native optional dependencies", () => {
+test("updatePackageVersion pins every lockstep npm package", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, "packages", "js-sdk"), { recursive: true });
 	mkdirSync(join(root, "packages", "storage-filesystem"), { recursive: true });
+	mkdirSync(join(root, "packages", "storage-opfs"), { recursive: true });
 	writeFileSync(
 		join(root, "packages", "js-sdk", "package.json"),
 		`${JSON.stringify({ name: "@lix-js/sdk", version: "0.6.0" }, null, "\t")}\n`,
@@ -272,6 +273,14 @@ test("updatePackageVersion pins native optional dependencies", () => {
 		join(root, "packages", "storage-filesystem", "package-lock.json"),
 		`${JSON.stringify({ name: "@lix-js/storage-filesystem", version: "0.1.0", lockfileVersion: 3, packages: { "": { name: "@lix-js/storage-filesystem", version: "0.1.0", peerDependencies: { "@lix-js/sdk": "^0.6.0" } } } }, null, "\t")}\n`,
 	);
+	writeFileSync(
+		join(root, "packages", "storage-opfs", "package.json"),
+		`${JSON.stringify({ name: "@lix-js/storage-opfs", version: "0.1.0", peerDependencies: { "@lix-js/sdk": "^0.6.0" } }, null, "\t")}\n`,
+	);
+	writeFileSync(
+		join(root, "packages", "storage-opfs", "package-lock.json"),
+		`${JSON.stringify({ name: "@lix-js/storage-opfs", version: "0.1.0", lockfileVersion: 3, packages: { "": { name: "@lix-js/storage-opfs", version: "0.1.0", peerDependencies: { "@lix-js/sdk": "^0.6.0" } }, "../js-sdk": { name: "@lix-js/sdk", version: "0.6.0", optionalDependencies: { "@lix-js/sdk-linux-x64": "0.6.0" } } } }, null, "\t")}\n`,
+	);
 
 	updatePackageVersion(root, "0.7.0");
 
@@ -294,4 +303,23 @@ test("updatePackageVersion pins native optional dependencies", () => {
 	assert.equal(storagePackage.peerDependencies["@lix-js/sdk"], "0.7.0");
 	assert.equal(storageLock.version, "0.7.0");
 	assert.equal(storageLock.packages[""].peerDependencies["@lix-js/sdk"], "0.7.0");
+
+	const opfsPackage = JSON.parse(
+		readFileSync(join(root, "packages", "storage-opfs", "package.json"), "utf8"),
+	);
+	const opfsLock = JSON.parse(
+		readFileSync(join(root, "packages", "storage-opfs", "package-lock.json"), "utf8"),
+	);
+	assert.equal(opfsPackage.version, "0.7.0");
+	assert.equal(opfsPackage.peerDependencies["@lix-js/sdk"], "0.7.0");
+	assert.equal(opfsLock.version, "0.7.0");
+	assert.equal(opfsLock.packages[""].version, "0.7.0");
+	assert.equal(opfsLock.packages[""].peerDependencies["@lix-js/sdk"], "0.7.0");
+	assert.equal(opfsLock.packages["../js-sdk"].version, "0.7.0");
+	assert.equal(
+		opfsLock.packages["../js-sdk"].optionalDependencies[
+			"@lix-js/sdk-linux-x64"
+		],
+		"0.7.0",
+	);
 });

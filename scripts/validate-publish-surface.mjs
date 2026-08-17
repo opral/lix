@@ -95,7 +95,7 @@ for (const packagePath of PUBLIC_NPM_PACKAGE_PATHS) {
 		failures.push(`${npmPackage.name} native packages must pin ${workspaceVersion}`);
 	}
 	if (
-		npmPackage.name === "@lix-js/storage-filesystem" &&
+		npmPackage.peerDependencies?.["@lix-js/sdk"] !== undefined &&
 		npmPackage.peerDependencies?.["@lix-js/sdk"] !== workspaceVersion
 	) {
 		failures.push(
@@ -110,6 +110,18 @@ for (const packagePath of PUBLIC_NPM_PACKAGE_PATHS) {
 		packageLock.packages?.[""]?.version !== workspaceVersion
 	) {
 		failures.push(`${npmPackage.name} package lock must match ${workspaceVersion}`);
+	}
+	const linkedSdk = packageLock.packages?.["../js-sdk"];
+	if (
+		linkedSdk &&
+		(linkedSdk.version !== workspaceVersion ||
+			JS_SDK_NATIVE_PACKAGES.some(
+				(name) => linkedSdk.optionalDependencies?.[name] !== workspaceVersion,
+			))
+	) {
+		failures.push(
+			`${npmPackage.name} package lock must pin its linked SDK to ${workspaceVersion}`,
+		);
 	}
 }
 

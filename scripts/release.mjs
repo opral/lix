@@ -20,6 +20,7 @@ export const JS_SDK_NATIVE_PACKAGES = [
 export const PUBLIC_NPM_PACKAGE_PATHS = [
 	"packages/js-sdk",
 	"packages/storage-filesystem",
+	"packages/storage-opfs",
 ];
 
 export function readText(root, path) {
@@ -444,7 +445,7 @@ export function updatePackageVersion(root, version) {
 				JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
 			);
 		}
-		if (packageJson.name === "@lix-js/storage-filesystem") {
+		if (packageJson.peerDependencies?.["@lix-js/sdk"] !== undefined) {
 			packageJson.peerDependencies["@lix-js/sdk"] = version;
 		}
 		writeJson(root, packageJsonPath, packageJson);
@@ -465,6 +466,13 @@ export function updatePackageVersion(root, version) {
 				lockedPackage.resolved = `https://registry.npmjs.org/${packageName}/-/${unscopedName}-${version}.tgz`;
 				delete lockedPackage.integrity;
 			}
+		}
+		const linkedSdk = lock.packages?.["../js-sdk"];
+		if (linkedSdk) {
+			linkedSdk.version = version;
+			linkedSdk.optionalDependencies = Object.fromEntries(
+				JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
+			);
 		}
 		writeJson(root, lockPath, lock);
 	}
