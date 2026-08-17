@@ -1,6 +1,17 @@
 import { openLix } from "@lix-js/sdk";
 import { OpfsStorage } from "@lix-js/storage-opfs";
 import { expect, test } from "vitest";
+import { restoreSynchronousModeBestEffort } from "../js/sqlite-cleanup.js";
+
+test("does not replace a committed result with a synchronous cleanup error", () => {
+	const database = {
+		exec: () => {
+			throw new Error("injected post-commit cleanup failure");
+		},
+	} as Parameters<typeof restoreSynchronousModeBestEffort>[0];
+
+	expect(() => restoreSynchronousModeBestEffort(database, 1)).not.toThrow();
+});
 
 test("persists a complete local Lix", async () => {
 	const storage = new OpfsStorage({

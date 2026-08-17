@@ -26,6 +26,7 @@ import type {
 } from "@lix-js/sdk";
 import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm";
 import { StorageChangeNotifier } from "./change-watch.js";
+import { restoreSynchronousModeBestEffort } from "./sqlite-cleanup.js";
 
 type SqliteValue =
 	| string
@@ -332,8 +333,9 @@ export class OpfsBackend implements LixStorageProvider {
 			throw error;
 		} finally {
 			if (changes.strictDurability) {
-				this.#database.exec(
-					`PRAGMA synchronous = ${previousSynchronous === 2 ? "FULL" : "NORMAL"}`,
+				restoreSynchronousModeBestEffort(
+					this.#database,
+					previousSynchronous,
 				);
 			}
 		}
