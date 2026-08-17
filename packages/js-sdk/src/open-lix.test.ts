@@ -121,6 +121,13 @@ test("sync mode keeps cached native reads local after bootstrap", async () => {
 			url: `http://127.0.0.1:${address.port}/repository`,
 		},
 	});
+	// Materialize the key/value scope while the transport is available. The
+	// assertions below then exercise the cached local-read and local-write path
+	// after disconnect, rather than intentionally querying an uncached scope.
+	const emptyKeyValue = await lix.execute(
+		"SELECT value FROM lix_key_value WHERE key = 'offline-sync-js'",
+	);
+	expect(emptyKeyValue.rows).toHaveLength(0);
 	const requestsAfterBootstrap = requestCount;
 	await new Promise<void>((resolve, reject) =>
 		server.close((error) => (error ? reject(error) : resolve())),
