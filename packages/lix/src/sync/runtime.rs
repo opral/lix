@@ -1,7 +1,8 @@
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+use futures_util::{FutureExt, select_biased};
 
 use crate::storage_adapter::Storage;
 use crate::{CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, LixError, SwitchBranchOptions, Value};
@@ -9,12 +10,11 @@ use crate::{CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, LixError, SwitchBranchOp
 use crate::branch::{branch_descriptor_tombstone_row, branch_ref_tombstone_row};
 use crate::transaction_types::RawWriteBatch;
 
-use super::transport::HttpSyncTransport;
+use super::platform::{HttpSyncTransport, SyncTask, sleep, spawn_sync_task};
 use super::{SyncBranch, SyncTransport, reconcile_sync_branches};
 
-const SYNC_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SYNC_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const SYNC_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-const SYNC_MAX_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const SYNC_LOCAL_CHANGE_CODE: &str = "LIX_SYNC_LOCAL_CHANGE";
 // Branch catalog mutations may be ordinary server writes with no canonical
 // event. Refresh frequently enough that a branch admitted on an inactive
@@ -26,57 +26,18 @@ const SYNC_TOPOLOGY_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
     shutdown: Arc<AtomicBool>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
-    finished: Arc<AtomicBool>,
-    finished_notify: Arc<tokio::sync::Notify>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    task: SyncTask,
 }
-
 impl SyncRuntime {
     pub(crate) fn stop(&self) {
         self.shutdown.store(true, Ordering::Release);
-        // A worker may currently be inside the mandatory HTTP long-poll. The
-        // atomic flag alone cannot interrupt an in-flight future; this permit
-        // lets the worker drop that request immediately and join cleanly.
-        self.shutdown_notify.notify_one();
+        self.shutdown_tx.send_replace(true);
     }
 
     pub(crate) async fn stop_and_join(&self) -> Result<(), LixError> {
         self.stop();
-        {
-            let worker = self.worker.lock().map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "sync worker lock is poisoned",
-                )
-            })?;
-            if let Some(worker) = worker.as_ref() {
-                worker.thread().unpark();
-            }
-        }
-        loop {
-            let notified = self.finished_notify.notified();
-            if self.finished.load(Ordering::Acquire) {
-                break;
-            }
-            notified.await;
-        }
-        let worker = self
-            .worker
-            .lock()
-            .map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "sync worker lock is poisoned",
-                )
-            })?
-            .take();
-        if let Some(worker) = worker {
-            worker.join().map_err(|_| {
-                LixError::new(LixError::CODE_INTERNAL_ERROR, "sync worker panicked")
-            })?;
-        }
-        Ok(())
+        self.task.join().await
     }
 }
 
@@ -255,461 +216,391 @@ where
     lix.restore_sync_file_projections(&remote_id).await?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let worker_shutdown = Arc::clone(&shutdown);
-    let worker_shutdown_notify = Arc::clone(&shutdown_notify);
-    let finished = Arc::new(AtomicBool::new(false));
-    let worker_finished = Arc::clone(&finished);
-    let finished_notify = Arc::new(tokio::sync::Notify::new());
-    let worker_finished_notify = Arc::clone(&finished_notify);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker_lix = lix.clone();
-    // Plugin reconciliation and the nested single-thread Tokio runtime use
-    // more than Rust's 2 MiB default stack under concurrent replicas. Keep a
-    // bounded per-replica stack so parallel sync workers fail gracefully
-    // rather than aborting the process with a stack overflow.
-    let worker = std::thread::Builder::new()
-        .name("lix-sync".to_owned())
-        .stack_size(4 * 1024 * 1024)
-        .spawn(move || {
-            let _done = WorkerDone {
-                finished: worker_finished,
-                notify: worker_finished_notify,
-            };
-            let mut transport = initial_transport;
-            let mut retry_backoff = SYNC_POLL_INTERVAL;
-            let mut idle_delay = SYNC_POLL_INTERVAL;
-            let mut last_cursor = None;
-            // A fresh replica needs its branch catalog before callers can
-            // enumerate branches. Run one bounded control-plane pass on the
-            // worker stack before entering the mandatory event long-poll;
-            // keeping this outside `activate_sync_mode` avoids overflowing
-            // the caller's small Tokio test/application stack on deep commit
-            // graphs. Later iterations still reconcile after each flush.
-            let mut topology_bootstrap_pending = true;
-            // A watch receiver is level-triggered: a scope registration that
-            // happens before this loop reaches `select!` is still observed.
-            // `Notify` is edge-triggered and could lose exactly that wake,
-            // leaving a cold query behind the thirty-second long-poll.
-            let mut change_watcher = worker_lix.sync_mode_state().change_watcher();
-            let worker_runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(_) => return,
-            };
-            while !worker_shutdown.load(Ordering::Acquire) {
-                let result = worker_runtime.block_on(async {
-                    let stopped = worker_shutdown_notify.notified();
-                    if worker_shutdown.load(Ordering::Acquire) {
-                        return Err(LixError::new(
-                            LixError::CODE_CLOSED,
-                            "sync worker is stopping",
-                        ));
-                    }
-                    tokio::select! {
-                        _ = stopped => Err(LixError::new(
-                            LixError::CODE_CLOSED,
-                            "sync worker is stopping",
-                        )),
-                        result = async {
-                    let active_branch_id = worker_lix.active_branch_id_for_sync_worker()?;
-                    // A branch switch is session-local. Drop the old HTTP
-                    // session before flushing so the next handshake is pinned
-                    // to the newly selected branch.
-                    if transport
-                        .as_ref()
-                        .is_some_and(|current| current.branch_id() != active_branch_id)
-                    {
-                        transport = None;
-                    }
-                    let current = match transport.clone() {
-                        Some(current) => current,
-                        None => {
-                            let current =
-                                HttpSyncTransport::connect(
-                                    &remote_id,
-                                    &headers,
-                                    Some(&active_branch_id),
-                                )
-                                    .await?;
-                            if active_branch_id != current.branch_id() {
-                                return Err(LixError::new(
-                                    LixError::CODE_INVALID_PARAM,
-                                    "sync server branch changed while the replica was offline",
-                                ));
-                            }
-                            worker_lix
-                                .persist_sync_replica_config(&remote_id, current.branch_id())
-                                .await?;
-                            transport = Some(current.clone());
-                            topology_bootstrap_pending = true;
-                            current
-                        }
-                    };
-                    // Keep the polling writer on its own logical session. A
-                    // Lix handle rejects reads/observations while that handle
-                    // owns an explicit transaction; sharing the application
-                    // session would make `observe()` race the sync apply
-                    // transaction and intermittently return
-                    // LIX_INVALID_TRANSACTION_STATE.
-                    let active_branch_for_worker = active_branch_id.clone();
-                    let worker_session = worker_lix
-                        .open_internal_session_suppressed(
-                            active_branch_id,
-                            worker_lix.active_account_id().to_owned(),
-                        )
-                        .await?;
-                    let local_branch_ids = worker_session
-                        .execute(
-                            "SELECT id FROM lix_branch WHERE id != $1",
-                            &[Value::Text(GLOBAL_BRANCH_ID.to_owned())],
-                        )
-                        .await?
-                        .rows()
-                        .iter()
-                        .filter_map(|row| row.get::<String>("id").ok())
-                        .collect::<Vec<_>>();
-                    let mut pending_inactive_branches = Vec::new();
-                    for branch_id in local_branch_ids {
-                        if branch_id == active_branch_for_worker {
-                            continue;
-                        }
-                        if worker_lix
-                            .sync_branch_has_pending(&remote_id, &branch_id)
-                            .await?
-                        {
-                            pending_inactive_branches.push(branch_id);
-                        }
-                    }
-                    let topology_transport = current.clone();
-                    let control_scope = [super::CONTROL_SYNC_SCOPE.to_owned()];
-                    let control_scope_demanded = !worker_lix
-                        .sync_mode_state()
-                        .scopes_are_hydrated_for_branch(&control_scope, &active_branch_for_worker);
-                    if topology_bootstrap_pending || control_scope_demanded {
-                        match reconcile_sync_branches(
-                            &worker_session,
-                            &topology_transport,
-                            false,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                let pending = worker_lix
-                                    .sync_branch_has_pending(
-                                        &remote_id,
-                                        &active_branch_for_worker,
-                                    )
-                                    .await?;
-                                topology_bootstrap_pending = pending;
-                                if !pending {
-                                    worker_lix
-                                        .sync_mode_state()
-                                        .mark_scope_hydrated_for_branch(
-                                            &active_branch_for_worker,
-                                            super::CONTROL_SYNC_SCOPE,
-                                            worker_lix.sync_mode_state().scope_generation(),
-                                        );
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = ?error,
-                                    "initial sync topology reconciliation failed"
-                                );
-                            }
-                        }
-                    }
-                    // Do the row/admission flush before the optional control
-                    // catalog pass. A fresh replica can receive a local file
-                    // write immediately after open; waiting for a potentially
-                    // large branch-topology walk here would strand that
-                    // durable outbox behind startup work. Pull-time parent
-                    // hydration still preserves merge topology, and the
-                    // post-flush catalog pass catches up branch metadata.
-                    let mut client = worker_session.sync_lifecycle(current).await?;
-                    // A new SQL scope or local write can arrive while the
-                    // lifecycle client is inside the server's mandatory
-                    // long-poll. Cancel that wait immediately so the next
-                    // iteration can hydrate/admit the newly demanded state;
-                    // otherwise a cold query or write would sit behind the
-                    // heartbeat for up to thirty seconds.
-                    // Consume a notification that was already pending before
-                    // this flush. The flush itself reads the durable local
-                    // state, so only changes that arrive while it is waiting
-                    // should cancel the in-flight long poll.
-                    let _ = change_watcher.borrow_and_update();
-                    let local_changed_during_flush = change_watcher.changed();
-                    tokio::pin!(local_changed_during_flush);
-                    let mut topology_tick = tokio::time::interval(SYNC_TOPOLOGY_INTERVAL);
-                    // `interval` fires immediately on its first tick. Consume
-                    // that tick so the startup reconciliation above remains
-                    // the only synchronous catalog pass for this iteration.
-                    topology_tick.tick().await;
-                    let mut client_flush = Box::pin(client.flush());
-                    let result = loop {
-                        tokio::select! {
-                            _ = &mut local_changed_during_flush => {
-                                break Err(LixError::new(
-                                    SYNC_LOCAL_CHANGE_CODE,
-                                    "local sync state changed while waiting for remote events",
-                                ));
-                            }
-                            result = &mut client_flush => break result,
-                            _ = topology_tick.tick() => {
-                                // The selected branch's event stream does
-                                // not wake when another client changes branch
-                                // descriptors/refs on GLOBAL. Reconcile on a
-                                // suppressed session while the semantic
-                                // long-poll remains pending.
-                                let topology_session = worker_lix
-                                    .open_internal_session_suppressed(
-                                        active_branch_for_worker.clone(),
-                                        worker_lix.active_account_id().to_owned(),
-                                    )
-                                    .await;
-                                match topology_session {
-                                    Ok(topology_session) => {
-                                        let topology_result = reconcile_sync_branches(
-                                            &topology_session,
-                                            &topology_transport,
-                                            true,
-                                        )
-                                        .await;
-                                        topology_session.close().await?;
-                                        if let Err(error) = topology_result {
-                                            tracing::warn!(
-                                                error = ?error,
-                                                "background sync topology reconciliation failed"
-                                            );
-                                        } else if !worker_lix
-                                            .sync_branch_has_pending(
-                                                &remote_id,
-                                                &active_branch_for_worker,
-                                            )
-                                            .await?
-                                        {
-                                            worker_lix
-                                                .sync_mode_state()
-                                                .mark_scope_hydrated_for_branch(
-                                                    &active_branch_for_worker,
-                                                    super::CONTROL_SYNC_SCOPE,
-                                                    worker_lix
-                                                        .sync_mode_state()
-                                                        .scope_generation(),
-                                                );
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            error = ?error,
-                                            "open background sync topology session failed"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    if result.is_ok() {
-                        // Canonical file bytes are applied on the worker
-                        // session so application reads never share its
-                        // transaction state. Refresh the primary session's
-                        // durable projection overlay before observers/query
-                        // providers inspect the newly acknowledged files.
-                        worker_lix
-                            .restore_sync_file_projections(&remote_id)
-                            .await?;
-                        // Topology is independent of the row cursor. Run it
-                        // after the normal flush so a slow/unsupported branch
-                        // catalog can never delay first-row hydration.
-                        if let Err(error) = reconcile_sync_branches(
-                            &worker_session,
-                            &topology_transport,
-                            true,
-                        )
-                        .await
-                        {
-                            tracing::warn!(error = ?error, "sync post-topology reconciliation failed");
-                        } else if !worker_lix
-                            .sync_branch_has_pending(&remote_id, &active_branch_for_worker)
-                            .await?
-                        {
-                            worker_lix
-                                .sync_mode_state()
-                                .mark_scope_hydrated_for_branch(
-                                    &active_branch_for_worker,
-                                    super::CONTROL_SYNC_SCOPE,
-                                    worker_lix.sync_mode_state().scope_generation(),
-                                );
-                        }
+    let worker_shutdown = Arc::clone(&shutdown);
+    let task = spawn_sync_task(async move {
+        run_sync_worker(
+            worker_lix,
+            remote_id,
+            headers,
+            initial_transport,
+            worker_shutdown,
+            shutdown_rx,
+        )
+        .await;
+    })?;
 
-                        // Pending queues are durable per branch. A local
-                        // write can be queued on branch A and then the user
-                        // can switch to branch B before reconnecting; only
-                        // flushing B would strand A indefinitely. Drain each
-                        // inactive branch that has an actual pending queue,
-                        // while preserving the active branch's process-local
-                        // readiness marks (the durable state remains keyed by
-                        // branch).
-                        let readiness = worker_lix
-                            .sync_mode_state()
-                            .hydrated_scopes_snapshot_for_branch(&active_branch_for_worker);
-                        let had_pending_inactive_branches = !pending_inactive_branches.is_empty();
-                        for branch_id in pending_inactive_branches {
-                            let branch_result = async {
-                                let branch_transport =
-                                    HttpSyncTransport::connect(
-                                        &remote_id,
-                                        &headers,
-                                        Some(&branch_id),
-                                    )
-                                        .await?;
-                                if branch_transport.branch_id() != branch_id {
-                                    return Err(LixError::new(
-                                        LixError::CODE_INVALID_PARAM,
-                                        "sync server returned another branch for an inactive queue",
-                                    ));
-                                }
-                                let branch_session = worker_lix
-                                    .open_internal_session_suppressed(
-                                        branch_id,
-                                        worker_lix.active_account_id().to_owned(),
-                                    )
-                                    .await?;
-                                let mut branch_client =
-                                    branch_session.sync_lifecycle(branch_transport).await?;
-                                let result = branch_client.flush().await;
-                                branch_session.close().await?;
-                                result
-                            }
-                            .await;
-                            if let Err(error) = branch_result {
-                                tracing::warn!(error = ?error, "inactive sync branch queue was not flushed");
-                            }
-                        }
-                        // An inactive branch admission creates/advances its
-                        // canonical global ref after the active branch's
-                        // topology pass above. Reconcile once more so the
-                        // local branch catalog does not expose the optimistic
-                        // commit ID in the small window before the next
-                        // active-branch long-poll wakes.
-                        if had_pending_inactive_branches {
-                            if let Err(error) = reconcile_sync_branches(
-                                &worker_session,
-                                &topology_transport,
-                                true,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    error = ?error,
-                                    "sync post-inactive-branch topology reconciliation failed"
-                                );
-                            }
-                        }
-                        worker_lix
-                            .sync_mode_state()
-                            .restore_hydrated_scopes_for_branch(
-                                &active_branch_for_worker,
-                                readiness,
-                            );
-                    }
-                    worker_session.close().await?;
-                    result
-                        } => result,
-                    }
-                });
-                let delay = match result {
-                    Ok(receipt) => {
-                        retry_backoff = SYNC_POLL_INTERVAL;
-                        if last_cursor == Some(receipt.cursor) {
-                            idle_delay = idle_delay
-                                .checked_mul(2)
-                                .unwrap_or(SYNC_MAX_IDLE_INTERVAL)
-                                .min(SYNC_MAX_IDLE_INTERVAL);
-                        } else {
-                            last_cursor = Some(receipt.cursor);
-                            idle_delay = SYNC_POLL_INTERVAL;
-                        }
-                        idle_delay
-                    }
-                    Err(error) => {
-                        let local_wake = error.code == SYNC_LOCAL_CHANGE_CODE;
-                        if local_wake {
-                            // A local API retry may have invalidated the
-                            // control scope because a remote branch was just
-                            // created. Re-run the bounded catalog pass before
-                            // entering another event long-poll; branch
-                            // discovery is not itself a canonical row event.
-                            topology_bootstrap_pending = true;
-                        }
-                        if !local_wake {
-                            tracing::warn!(error = ?error, "sync runtime iteration failed");
-                        }
-                        // The server may have restarted or evicted this
-                        // session. Re-handshake on the next iteration; durable
-                        // local state keeps the cursor and pending queue
-                        // authoritative. Backoff also prevents a permanent
-                        // validation/bootstrap error from becoming a 10 Hz
-                        // reconnect storm.
-                        if !local_wake {
-                            transport = None;
-                        }
-                        idle_delay = SYNC_POLL_INTERVAL;
-                        let delay = if local_wake {
-                            Duration::ZERO
-                        } else if error.code == LixError::CODE_INVALID_PARAM {
-                            retry_backoff.max(Duration::from_secs(5))
-                        } else {
-                            retry_backoff
-                        };
-                        // A local commit only interrupted the in-flight
-                        // wait so the worker can flush immediately. It is
-                        // not evidence of a transport failure; advancing
-                        // network retry backoff here would make a burst of
-                        // local edits increasingly delay replication after
-                        // an otherwise healthy connection.
-                        if !local_wake {
-                            retry_backoff = retry_backoff
-                                .checked_mul(2)
-                                .unwrap_or(SYNC_MAX_RETRY_BACKOFF)
-                                .min(SYNC_MAX_RETRY_BACKOFF);
-                        }
-                        delay
-                    }
-                };
-                if worker_shutdown.load(Ordering::Acquire) {
-                    break;
-                }
-                std::thread::park_timeout(delay);
-            }
-        })
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("start sync worker: {error}"),
-            )
-        })?;
     Ok(Arc::new(SyncRuntime {
         shutdown,
-        shutdown_notify,
-        finished,
-        finished_notify,
-        worker: Mutex::new(Some(worker)),
+        shutdown_tx,
+        task,
     }))
 }
 
-struct WorkerDone {
-    finished: Arc<AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
+/// Shared synchronization policy. Platform-specific runtimes only decide how
+/// this future is spawned and how its timer/fetch futures are implemented.
+async fn run_sync_worker<StorageImpl>(
+    lix: Lix<StorageImpl>,
+    remote_id: String,
+    headers: Vec<(String, String)>,
+    initial_transport: Option<HttpSyncTransport>,
+    shutdown: Arc<AtomicBool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let mut transport = initial_transport;
+    let mut retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
+    let mut topology_bootstrap_pending = true;
+    let mut change_watcher = lix.sync_mode_state().change_watcher();
+
+    while !shutdown.load(Ordering::Acquire) {
+        let result = sync_iteration(
+            &lix,
+            &remote_id,
+            &headers,
+            &mut transport,
+            &mut topology_bootstrap_pending,
+            &mut change_watcher,
+            &mut shutdown_rx,
+        )
+        .await;
+
+        let delay = match result {
+            Ok(()) => {
+                retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
+                Duration::ZERO
+            }
+            Err(error) => {
+                let local_wake = error.code == SYNC_LOCAL_CHANGE_CODE;
+                if !local_wake && error.code != LixError::CODE_CLOSED {
+                    tracing::warn!(error = ?error, "sync runtime iteration failed");
+                    transport = None;
+                }
+                if shutdown.load(Ordering::Acquire) || error.code == LixError::CODE_CLOSED {
+                    break;
+                }
+                let delay = if local_wake {
+                    Duration::ZERO
+                } else if error.code == LixError::CODE_INVALID_PARAM {
+                    retry_backoff.max(Duration::from_secs(5))
+                } else {
+                    retry_backoff
+                };
+                if !local_wake {
+                    retry_backoff = retry_backoff
+                        .checked_mul(2)
+                        .unwrap_or(SYNC_MAX_RETRY_BACKOFF)
+                        .min(SYNC_MAX_RETRY_BACKOFF);
+                }
+                delay
+            }
+        };
+
+        if delay > Duration::ZERO
+            && wait_for_delay_or_shutdown(delay, &mut shutdown_rx)
+                .await
+                .is_err()
+        {
+            break;
+        }
+    }
 }
 
-impl Drop for WorkerDone {
-    fn drop(&mut self) {
-        self.finished.store(true, Ordering::Release);
-        self.notify.notify_waiters();
+async fn sync_iteration<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    headers: &[(String, String)],
+    transport: &mut Option<HttpSyncTransport>,
+    topology_bootstrap_pending: &mut bool,
+    change_watcher: &mut tokio::sync::watch::Receiver<u64>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    if *shutdown_rx.borrow() {
+        return Err(stopped_error());
     }
+    let active_branch_id = lix.active_branch_id_for_sync_worker()?;
+    if transport
+        .as_ref()
+        .is_some_and(|current| current.branch_id() != active_branch_id)
+    {
+        *transport = None;
+    }
+    let current = match transport.clone() {
+        Some(current) => current,
+        None => {
+            let current =
+                HttpSyncTransport::connect(remote_id, headers, Some(&active_branch_id)).await?;
+            if current.branch_id() != active_branch_id {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync server branch changed while the replica was offline",
+                ));
+            }
+            lix.persist_sync_replica_config(remote_id, current.branch_id())
+                .await?;
+            *transport = Some(current.clone());
+            *topology_bootstrap_pending = true;
+            current
+        }
+    };
+
+    let active_branch_for_worker = active_branch_id.clone();
+    let worker_session = lix
+        .open_internal_session_suppressed(active_branch_id, lix.active_account_id().to_owned())
+        .await?;
+    let result = async {
+        let local_branch_ids = worker_session
+            .execute(
+                "SELECT id FROM lix_branch WHERE id != $1",
+                &[Value::Text(GLOBAL_BRANCH_ID.to_owned())],
+            )
+            .await?
+            .rows()
+            .iter()
+            .filter_map(|row| row.get::<String>("id").ok())
+            .collect::<Vec<_>>();
+        let mut pending_inactive_branches = Vec::new();
+        for branch_id in local_branch_ids {
+            if branch_id != active_branch_for_worker
+                && lix.sync_branch_has_pending(remote_id, &branch_id).await?
+            {
+                pending_inactive_branches.push(branch_id);
+            }
+        }
+
+        let topology_transport = current.clone();
+        let control_scope = [super::CONTROL_SYNC_SCOPE.to_owned()];
+        let control_scope_demanded = !lix
+            .sync_mode_state()
+            .scopes_are_hydrated_for_branch(&control_scope, &active_branch_for_worker);
+        if *topology_bootstrap_pending || control_scope_demanded {
+            match reconcile_sync_branches(&worker_session, &topology_transport, false).await {
+                Ok(()) => {
+                    let pending = lix
+                        .sync_branch_has_pending(remote_id, &active_branch_for_worker)
+                        .await?;
+                    *topology_bootstrap_pending = pending;
+                    if !pending {
+                        mark_control_scope_hydrated(lix, &active_branch_for_worker);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = ?error,
+                        "initial sync topology reconciliation failed"
+                    );
+                }
+            }
+        }
+
+        let mut client = worker_session.sync_lifecycle(current).await?;
+        let flush_result = flush_interruptibly(
+            lix,
+            remote_id,
+            &active_branch_for_worker,
+            &topology_transport,
+            &mut client,
+            change_watcher,
+            shutdown_rx,
+        )
+        .await;
+        if flush_result.is_ok() {
+            lix.restore_sync_file_projections(remote_id).await?;
+            if let Err(error) =
+                reconcile_sync_branches(&worker_session, &topology_transport, true).await
+            {
+                tracing::warn!(error = ?error, "sync post-topology reconciliation failed");
+            } else if !lix
+                .sync_branch_has_pending(remote_id, &active_branch_for_worker)
+                .await?
+            {
+                mark_control_scope_hydrated(lix, &active_branch_for_worker);
+            }
+
+            let readiness = lix
+                .sync_mode_state()
+                .hydrated_scopes_snapshot_for_branch(&active_branch_for_worker);
+            let had_pending_inactive_branches = !pending_inactive_branches.is_empty();
+            for branch_id in pending_inactive_branches {
+                if let Err(error) =
+                    flush_inactive_branch(lix, remote_id, headers, branch_id).await
+                {
+                    tracing::warn!(
+                        error = ?error,
+                        "inactive sync branch queue was not flushed"
+                    );
+                }
+            }
+            if had_pending_inactive_branches
+                && let Err(error) =
+                    reconcile_sync_branches(&worker_session, &topology_transport, true).await
+            {
+                tracing::warn!(
+                    error = ?error,
+                    "sync post-inactive-branch topology reconciliation failed"
+                );
+            }
+            lix.sync_mode_state()
+                .restore_hydrated_scopes_for_branch(&active_branch_for_worker, readiness);
+        }
+        flush_result.map(|_| ())
+    }
+    .await;
+    let close = worker_session.close().await;
+    match (result, close) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn flush_interruptibly<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    active_branch_id: &str,
+    topology_transport: &Transport,
+    client: &mut super::SyncClient<StorageImpl, Transport>,
+    change_watcher: &mut tokio::sync::watch::Receiver<u64>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<super::SyncFlushReceipt, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport + Clone,
+{
+    let _ = change_watcher.borrow_and_update();
+    let local_changed = change_watcher.changed().fuse();
+    let shutdown_changed = shutdown_rx.changed().fuse();
+    let flush = client.flush().fuse();
+    futures_util::pin_mut!(local_changed, shutdown_changed, flush);
+
+    loop {
+        let topology_timer = sleep(SYNC_TOPOLOGY_INTERVAL).fuse();
+        futures_util::pin_mut!(topology_timer);
+        select_biased! {
+            changed = shutdown_changed => {
+                let _ = changed;
+                return Err(stopped_error());
+            }
+            changed = local_changed => {
+                let _ = changed;
+                return Err(LixError::new(
+                    SYNC_LOCAL_CHANGE_CODE,
+                    "local sync state changed while waiting for remote events",
+                ));
+            }
+            result = flush => return result,
+            timer = topology_timer => {
+                timer?;
+                reconcile_topology_during_pull(
+                    lix,
+                    remote_id,
+                    active_branch_id,
+                    topology_transport,
+                ).await?;
+            }
+        }
+    }
+}
+
+async fn reconcile_topology_during_pull<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    active_branch_id: &str,
+    transport: &Transport,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport + Clone,
+{
+    let session = lix
+        .open_internal_session_suppressed(
+            active_branch_id.to_owned(),
+            lix.active_account_id().to_owned(),
+        )
+        .await?;
+    let result = reconcile_sync_branches(&session, transport, true).await;
+    let close = session.close().await;
+    match (result, close) {
+        (Err(error), _) => {
+            tracing::warn!(error = ?error, "background sync topology reconciliation failed");
+            Ok(())
+        }
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => {
+            if !lix
+                .sync_branch_has_pending(remote_id, active_branch_id)
+                .await?
+            {
+                mark_control_scope_hydrated(lix, active_branch_id);
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn flush_inactive_branch<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    headers: &[(String, String)],
+    branch_id: String,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let transport = HttpSyncTransport::connect(remote_id, headers, Some(&branch_id)).await?;
+    if transport.branch_id() != branch_id {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync server returned another branch for an inactive queue",
+        ));
+    }
+    let session = lix
+        .open_internal_session_suppressed(branch_id, lix.active_account_id().to_owned())
+        .await?;
+    let mut client = session.sync_lifecycle(transport).await?;
+    let result = client.flush().await;
+    let close = session.close().await;
+    match (result, close) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(_), Ok(())) => Ok(()),
+    }
+}
+
+fn mark_control_scope_hydrated<StorageImpl>(lix: &Lix<StorageImpl>, branch_id: &str)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.sync_mode_state().mark_scope_hydrated_for_branch(
+        branch_id,
+        super::CONTROL_SYNC_SCOPE,
+        lix.sync_mode_state().scope_generation(),
+    );
+}
+
+async fn wait_for_delay_or_shutdown(
+    duration: Duration,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), LixError> {
+    if *shutdown_rx.borrow() {
+        return Err(stopped_error());
+    }
+    let timer = sleep(duration).fuse();
+    let changed = shutdown_rx.changed().fuse();
+    futures_util::pin_mut!(timer, changed);
+    select_biased! {
+        _ = changed => Err(stopped_error()),
+        result = timer => result,
+    }
+}
+
+fn stopped_error() -> LixError {
+    LixError::new(LixError::CODE_CLOSED, "sync worker is stopping")
 }
 
 async fn select_server_branch<StorageImpl>(

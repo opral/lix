@@ -37,6 +37,7 @@ test(
 				...result,
 			}),
 		);
+		expect(result.p95Ms).toBeLessThan(50);
 	},
 	120_000,
 );
@@ -73,6 +74,7 @@ test(
 					...result,
 				}),
 			);
+			expect(result.p95Ms).toBeLessThan(50);
 		} finally {
 			observation.close();
 			await lix.close();

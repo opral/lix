@@ -216,6 +216,91 @@ async fn open_execute_observe_syncs_two_filesystem_replicas_and_server_writes() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_long_poll_delivery_stays_below_300ms_with_100ms_rtt() {
+    let server_lix = Arc::new(open_lix().await.expect("open server repository"));
+    server_lix
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+            &[Value::Text(ROW_SCHEMA.to_owned())],
+        )
+        .await
+        .expect("register synchronized schema");
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) =
+        serve_protocol_with_response_delay(protocol, Duration::from_millis(100)).await;
+    let alice_dir = TempDir::new().expect("delayed alice tempdir");
+    let bob_dir = TempDir::new().expect("delayed bob tempdir");
+    let alice_storage = FilesystemStorage::new(alice_dir.path())
+        .open()
+        .expect("open delayed alice filesystem storage");
+    let bob_storage = FilesystemStorage::new(bob_dir.path())
+        .open()
+        .expect("open delayed bob filesystem storage");
+    let alice = open_lix()
+        .with_storage(alice_storage)
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open delayed alice replica");
+    let bob = open_lix()
+        .with_storage(bob_storage)
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open delayed bob replica");
+    let mut observation = bob
+        .observe(
+            "SELECT value FROM sync_mode_row WHERE row_id = 'rtt-budget'",
+            &[],
+        )
+        .expect("observe delayed replica");
+    observation
+        .next()
+        .await
+        .expect("initial delayed observation")
+        .expect("delayed observation remains open");
+    alice
+        .execute(
+            "SELECT value FROM sync_mode_row WHERE row_id = 'rtt-budget'",
+            &[],
+        )
+        .await
+        .expect("hydrate delayed alice scope");
+    // Let bootstrap and lazy schema hydration finish so the measured path is
+    // one steady-state outbox admission plus the already-held long poll.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let started = std::time::Instant::now();
+    alice
+        .execute(
+            "INSERT INTO sync_mode_row (row_id, value) VALUES ('rtt-budget', 'remote')",
+            &[],
+        )
+        .await
+        .expect("write delayed alice value");
+    let event = tokio::time::timeout(Duration::from_millis(300), observation.next())
+        .await
+        .expect("remote update must arrive inside the 100 ms RTT budget")
+        .expect("remote delivery observation")
+        .expect("remote delivery observation remains open");
+    assert_eq!(
+        event.rows.rows()[0].get::<String>("value").unwrap(),
+        "remote"
+    );
+    let delivery = started.elapsed();
+    println!("sync_remote_delivery_100ms_rtt_us={}", delivery.as_micros());
+    assert!(
+        delivery < Duration::from_millis(300),
+        "100 ms RTT remote delivery exceeded 300 ms: {:?}",
+        delivery
+    );
+
+    observation.close();
+    alice.close().await.expect("close delayed alice replica");
+    bob.close().await.expect("close delayed bob replica");
+    server_lix.close().await.expect("close delayed server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_transaction_writes_replicate_through_the_same_local_api() {
     let server_lix = Arc::new(open_lix().await.expect("open server repository"));
     let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
@@ -722,8 +807,8 @@ async fn sync_cached_reads_stay_local_and_report_replication_cost() {
 
     // This is the direct hot-path contract: once the relation is materialized,
     // an execute() must not synchronously cause another HTTP request. The
-    // background worker is deliberately left running; a request that races
-    // the 100 ms poll is reported rather than hidden from the metric.
+    // background worker is deliberately left running; it remains blocked in
+    // one server long poll while this cached read stays entirely local.
     let requests_before_cached_read = metrics.snapshot();
     replica
         .execute(
@@ -2876,10 +2961,35 @@ where
     serve_protocol_with_listener(protocol, listener, metrics).await
 }
 
+async fn serve_protocol_with_response_delay<S>(
+    protocol: LixServerProtocol<S>,
+    response_delay: Duration,
+) -> (String, tokio::task::JoinHandle<()>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind delayed protocol listener");
+    serve_protocol_with_listener_and_delay(protocol, listener, None, response_delay).await
+}
+
 async fn serve_protocol_with_listener<S>(
     protocol: LixServerProtocol<S>,
     listener: TcpListener,
     metrics: Option<Arc<ProtocolMetrics>>,
+) -> (String, tokio::task::JoinHandle<()>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    serve_protocol_with_listener_and_delay(protocol, listener, metrics, Duration::ZERO).await
+}
+
+async fn serve_protocol_with_listener_and_delay<S>(
+    protocol: LixServerProtocol<S>,
+    listener: TcpListener,
+    metrics: Option<Arc<ProtocolMetrics>>,
+    response_delay: Duration,
 ) -> (String, tokio::task::JoinHandle<()>)
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -2892,7 +3002,12 @@ where
             let metrics = metrics.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
-                    serve_request_with_metrics(protocol.clone(), request, metrics.clone())
+                    serve_request_with_metrics(
+                        protocol.clone(),
+                        request,
+                        metrics.clone(),
+                        response_delay,
+                    )
                 });
                 let _ = http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -2907,6 +3022,7 @@ async fn serve_request_with_metrics<S>(
     protocol: LixServerProtocol<S>,
     request: Request<Incoming>,
     metrics: Option<Arc<ProtocolMetrics>>,
+    response_delay: Duration,
 ) -> Result<Response<Full<Bytes>>, Infallible>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -2930,6 +3046,9 @@ where
             ServerProtocolContext::anonymous(),
         )
         .await;
+    if response_delay > Duration::ZERO {
+        tokio::time::sleep(response_delay).await;
+    }
     let (parts, body) = response.into_parts();
     let body = body
         .collect()

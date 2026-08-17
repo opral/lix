@@ -185,6 +185,23 @@ async fn fetch(
     body: Option<&str>,
 ) -> Result<FetchResponse, LixError> {
     let init = Object::new();
+    let global = js_sys::global();
+    let controller_constructor = Reflect::get(&global, &"AbortController".into())
+        .map_err(js_transport_error)?
+        .dyn_into::<Function>()
+        .map_err(js_transport_error)?;
+    let controller = Reflect::construct(&controller_constructor, &Array::new())
+        .map_err(js_transport_error)?;
+    let signal = Reflect::get(&controller, &"signal".into()).map_err(js_transport_error)?;
+    Reflect::set(&init, &"signal".into(), &signal).map_err(js_transport_error)?;
+    // Dropping the Rust future is how the shared runtime interrupts a held
+    // long poll for a local write or shutdown. A JavaScript Promise keeps the
+    // underlying request alive after its JsFuture is dropped, so tie that
+    // cancellation boundary to AbortController explicitly.
+    let mut abort_on_drop = AbortOnDrop {
+        controller: controller.into(),
+        armed: true,
+    };
     Reflect::set(&init, &"method".into(), &method.into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"credentials".into(), &"include".into())
         .map_err(js_transport_error)?;
@@ -200,7 +217,6 @@ async fn fetch(
         Reflect::set(&init, &"body".into(), &body.into()).map_err(js_transport_error)?;
     }
 
-    let global = js_sys::global();
     let fetch = Reflect::get(&global, &"fetch".into())
         .map_err(js_transport_error)?
         .dyn_into::<Function>()
@@ -238,11 +254,30 @@ async fn fetch(
             format!("sync response exceeds {MAX_SYNC_PULL_RESPONSE_BYTES} bytes"),
         ));
     }
+    abort_on_drop.armed = false;
     Ok(FetchResponse {
         status,
         status_text,
         body,
     })
+}
+
+struct AbortOnDrop {
+    controller: Object,
+    armed: bool,
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(abort) = Reflect::get(&self.controller, &"abort".into())
+            && let Ok(abort) = abort.dyn_into::<Function>()
+        {
+            let _ = abort.call0(&self.controller);
+        }
+    }
 }
 
 fn ensure_success(response: FetchResponse, operation: &str) -> Result<(), LixError> {

@@ -15,37 +15,26 @@
 //! payloads remain a later blob-transfer optimization; the 90% path uses the
 //! inline bytes already present in the transaction.
 
+mod platform;
 #[cfg(not(target_family = "wasm"))]
+mod platform_native;
+#[cfg(target_family = "wasm")]
+mod platform_wasm;
 mod runtime;
 #[cfg(not(target_family = "wasm"))]
 mod transport;
 
 #[cfg(target_family = "wasm")]
-mod runtime_wasm;
-#[cfg(target_family = "wasm")]
 mod transport_wasm;
 
-#[cfg(not(target_family = "wasm"))]
 pub(crate) use runtime::{SyncRuntime, activate_sync_mode};
-#[cfg(target_family = "wasm")]
-pub(crate) use runtime_wasm::{SyncRuntime, activate_sync_mode};
 
 /// Performs the one fresh-store handshake needed to seed a local repository's
 /// main branch with the server's default branch identity. Reopened stores do
 /// not call this path; they use their durable branch binding and reconnect in
 /// the worker so offline reads remain local.
-#[cfg(not(target_family = "wasm"))]
 pub(crate) async fn probe_sync_branch_id(server: &crate::ServerOptions) -> Result<String, LixError> {
-    let transport =
-        transport::HttpSyncTransport::connect(&server.url, &server.headers, None).await?;
-    let branch_id = transport.branch_id().to_owned();
-    transport.close().await?;
-    Ok(branch_id)
-}
-
-#[cfg(target_family = "wasm")]
-pub(crate) async fn probe_sync_branch_id(server: &crate::ServerOptions) -> Result<String, LixError> {
-    let transport = transport_wasm::HttpSyncTransport::connect(
+    let transport = platform::HttpSyncTransport::connect(
         &server.url,
         &server.headers,
         None,
@@ -695,7 +684,7 @@ impl SyncModeState {
             // `Send` future signature for native callers, so erase the
             // non-Send marker carried by JavaScript's Promise future here.
             let timeout = unsafe {
-                crate::session::AssumeSendFuture::new(runtime_wasm::sleep(Duration::from_secs(5)))
+                crate::session::AssumeSendFuture::new(platform::sleep(Duration::from_secs(5)))
             };
             futures_util::pin_mut!(wait, timeout);
             match select(wait, timeout).await {
