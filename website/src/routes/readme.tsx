@@ -14,7 +14,8 @@ export const Route = createFileRoute("/readme")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix README | Repository backend for AI products";
+    const title =
+      "Lix README | Files, a SQL database, and version control in one repository";
     const description =
       "Read how Lix gives AI products a repository: files for agents, a SQL database for your app, and version control over both.";
     const canonicalUrl = buildCanonicalUrl("/readme");
