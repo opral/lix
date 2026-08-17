@@ -24,7 +24,6 @@ base64 = "0.22"
 chardetng = "1"
 encoding_rs = "0.8"
 lix = { workspace = true, default-features = true }
-markdown-syntax = "=0.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["std"] }

@@ -1,4 +1,4 @@
-//! The owned Markdown AST that [`parse()`](crate::parse()) produces and
+//! The owned Markdown AST that [`parse()`](crate::parse::parse) produces and
 //! `Document::to_markdown`/`to_html` consume. Every node carries a [`NodeMeta`]
 //! with an optional source [`Span`]. [`Block`] and [`Inline`] are the two node
 //! enums; everything else is a concrete node struct or a small enum describing

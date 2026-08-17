@@ -160,6 +160,83 @@ async fn markdown_syntax_rich_initial_import_control() {
     );
 }
 
+/// Control for the repository/storage path without a semantic Markdown plugin.
+///
+/// This keeps the corpus and public SQL write path identical to the semantic
+/// benchmark while isolating parsing, row generation, and component execution.
+#[tokio::test]
+#[ignore = "manual raw Lix initial-import control"]
+async fn markdown_raw_lix_initial_import_control() {
+    let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
+    let samples = env_usize("LIX_MARKDOWN_RAW_BENCH_SAMPLES", 3);
+    assert!(samples > 0);
+    let source = markdown_corpus(target_bytes).bytes;
+    let mut timings = Vec::with_capacity(samples);
+
+    for _sample in 0..samples {
+        let root = tempfile::tempdir().expect("create raw Lix benchmark directory");
+        let lix = open_rocksdb_lix(root.path()).await;
+        let started = Instant::now();
+        write_file(&lix, "/benchmark.md", source.clone()).await;
+        timings.push(started.elapsed());
+        assert_same_bytes(
+            "raw Lix write must retain exact Markdown bytes",
+            &read_file(&lix, "/benchmark.md").await,
+            &source,
+        );
+        lix.close().await.expect("close raw Lix benchmark");
+    }
+
+    print_duration_metric("raw_initial_import", "lix-raw", &timings);
+    eprintln!(
+        "markdown_raw_lix_control corpus_bytes={} samples={}",
+        source.len(),
+        samples,
+    );
+}
+
+/// Isolated semantic-import target for CPU profiling. Unlike the comparison
+/// benchmark, this test performs no edits, merges, or Git subprocess work.
+#[tokio::test]
+#[ignore = "manual semantic Markdown initial-import profile target"]
+async fn markdown_semantic_initial_import_control() {
+    init_perf_tracing();
+
+    let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
+    let samples = env_usize("LIX_MARKDOWN_SEMANTIC_BENCH_SAMPLES", 3);
+    assert!(samples > 0);
+    let corpus = markdown_corpus(target_bytes);
+    let archive = build_markdown_plugin_archive();
+    let mut timings = Vec::with_capacity(samples);
+
+    for _sample in 0..samples {
+        let root = tempfile::tempdir().expect("create semantic Lix benchmark directory");
+        let lix = open_rocksdb_lix(root.path()).await;
+        install_plugin(&lix, "plugin_markdown", &archive).await;
+        let started = Instant::now();
+        write_file(&lix, "/benchmark.md", corpus.bytes.clone()).await;
+        timings.push(started.elapsed());
+        let file_id = file_id_at_path(&lix, "/benchmark.md").await;
+        assert_eq!(
+            markdown_nodes_by_kind(&lix, &file_id, "paragraph")
+                .await
+                .len(),
+            corpus.texts.len()
+        );
+        lix.close()
+            .await
+            .expect("close semantic Markdown benchmark Lix");
+    }
+
+    print_duration_metric("semantic_initial_import", "lix-semantic", &timings);
+    eprintln!(
+        "markdown_semantic_control corpus_bytes={} paragraphs={} samples={}",
+        corpus.bytes.len(),
+        corpus.texts.len(),
+        samples,
+    );
+}
+
 #[tokio::test]
 #[ignore = "manual Git versus Lix Markdown benchmark"]
 async fn markdown_git_semantic_rows_benchmark() {
@@ -802,8 +879,13 @@ fn syntax_rich_markdown_corpus(target_bytes: usize) -> Vec<u8> {
         // typical prose document and avoids treating an all-table stress case
         // as the 90%-path control.
         if index % RICH_BLOCK_INTERVAL == RICH_BLOCK_INTERVAL - 1 {
+            let link = if std::env::var_os("LIX_MARKDOWN_SYNTAX_RICH_NO_LINKS").is_some() {
+                "a link".to_owned()
+            } else {
+                format!("[a link](https://example.com/{index})")
+            };
             let block = format!(
-                "## Section {index}\n\nParagraph {index} has *emphasis*, **strong**, ~~delete~~, [a link](https://example.com/{index}), and `code`.\n\n- alpha {index}\n- beta {index}\n\n| key | value |\n| --- | :--- |\n| left {index} | right {index} |\n\n```rust\nlet value_{index} = {index};\n```\n\n> quoted paragraph {index}\n\n"
+                "## Section {index}\n\nParagraph {index} has *emphasis*, **strong**, ~~delete~~, {link}, and `code`.\n\n- alpha {index}\n- beta {index}\n\n| key | value |\n| --- | :--- |\n| left {index} | right {index} |\n\n```rust\nlet value_{index} = {index};\n```\n\n> quoted paragraph {index}\n\n"
             );
             if bytes.len() + block.len() <= target_bytes {
                 bytes.extend_from_slice(block.as_bytes());

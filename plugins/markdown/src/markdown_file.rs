@@ -1,4 +1,6 @@
 use crate::core::{File, PARSED_ROOT_ID, PluginError};
+use crate::markdown_syntax::ast as md;
+use crate::markdown_syntax::{LineEnding, SerializeOptions, Span, SyntaxOptions};
 use crate::model::{
     AutolinkFormat, CharacterReferenceFormat, DeleteFormat, DelimiterFormat,
     FootnoteReferenceFormat, InlineCodeFormat, InlineContent, InlineNode, LineBreakFormat,
@@ -7,8 +9,6 @@ use crate::model::{
 };
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::Encoding;
-use markdown_syntax::ast as md;
-use markdown_syntax::{LineEnding, SerializeOptions, Span, SyntaxOptions};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -95,11 +95,11 @@ fn fully_escape_orphan_table_delimiters(rendered: Vec<u8>) -> Vec<u8> {
             .unwrap_or(line)
             .strip_suffix(b"\r")
             .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
-        let trimmed = content
+        let leading_whitespace = content
             .iter()
-            .copied()
-            .skip_while(|byte| byte.is_ascii_whitespace())
-            .collect::<Vec<_>>();
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(content.len());
+        let trimmed = &content[leading_whitespace..];
         let candidate = trimmed.starts_with(b"|")
             && trimmed.ends_with(b"|")
             && trimmed.contains(&b'\\')
@@ -131,7 +131,7 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
     if let Some(diagnostic) = output
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.severity == markdown_syntax::DiagnosticSeverity::Error)
+        .find(|diagnostic| diagnostic.severity == crate::markdown_syntax::DiagnosticSeverity::Error)
     {
         return Err(PluginError::InvalidInput(format!(
             "file.content must be valid GitHub Flavored Markdown: {}",
@@ -1006,6 +1006,97 @@ mod tests {
             );
             assert_parse_serialize_fixpoint("generated corpus case", &source);
         }
+    }
+
+    /// Native parser profile target. This deliberately excludes Wasm, Lix,
+    /// row emission, and storage so `perf` can resolve the parser call tree.
+    #[test]
+    #[ignore = "manual Markdown parser profile target"]
+    fn markdown_parser_profile_target() {
+        let target_bytes = std::env::var("LIX_MARKDOWN_PARSER_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2 * 1024 * 1024);
+        let repeats = std::env::var("LIX_MARKDOWN_PARSER_REPEATS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3);
+        let mode =
+            std::env::var("LIX_MARKDOWN_PARSER_MODE").unwrap_or_else(|_| "plugin_full".to_owned());
+        let rich = std::env::var_os("LIX_MARKDOWN_PARSER_PLAIN").is_none();
+        let source = parser_profile_source(target_bytes, rich);
+
+        let started = std::time::Instant::now();
+        for _ in 0..repeats {
+            match mode.as_str() {
+                "syntax" => {
+                    let output = SyntaxOptions::gfm().parse(&source);
+                    assert!(output.diagnostics.is_empty());
+                    std::hint::black_box(output);
+                }
+                "plugin_once" => {
+                    let output =
+                        parse_markdown_source_once(&source).expect("profile corpus should parse");
+                    std::hint::black_box(output);
+                }
+                "plugin_full" => {
+                    let output = parse_markdown_source(&source)
+                        .expect("profile corpus should parse and serialize");
+                    std::hint::black_box(output);
+                }
+                other => panic!("unknown LIX_MARKDOWN_PARSER_MODE: {other}"),
+            }
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "markdown_parser_profile mode={} rich={} bytes={} repeats={} total_ms={:.3} mean_ms={:.3}",
+            mode,
+            rich,
+            source.len(),
+            repeats,
+            elapsed.as_secs_f64() * 1_000.0,
+            elapsed.as_secs_f64() * 1_000.0 / repeats as f64,
+        );
+    }
+
+    fn parser_profile_source(target_bytes: usize, rich: bool) -> String {
+        const BODY_BYTES: usize = 496;
+        const RICH_BLOCK_INTERVAL: usize = 64;
+        const WORDS: &[&str] = &[
+            "amber", "branch", "canvas", "delta", "ember", "forest", "gentle", "harbor", "island",
+            "jungle", "kernel", "lantern", "meadow", "native", "orbit", "paper", "quiet", "river",
+            "silver", "timber", "update", "violet", "window", "yellow",
+        ];
+
+        let mut source = String::with_capacity(target_bytes + 512);
+        for index in 0usize.. {
+            let mut body = String::with_capacity(BODY_BYTES);
+            let mut cursor = index.wrapping_mul(17);
+            while body.len() < BODY_BYTES {
+                if !body.is_empty() {
+                    body.push(' ');
+                }
+                body.push_str(WORDS[cursor % WORDS.len()]);
+                cursor = cursor.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            }
+            body.truncate(BODY_BYTES);
+            let prose = format!("P{index:06} {body}\n\n");
+            if source.len() + prose.len() > target_bytes {
+                break;
+            }
+            source.push_str(&prose);
+
+            if rich && index % RICH_BLOCK_INTERVAL == RICH_BLOCK_INTERVAL - 1 {
+                let block = format!(
+                    "## Section {index}\n\nParagraph {index} has *emphasis*, **strong**, ~~delete~~, [a link](https://example.com/{index}), and `code`.\n\n- alpha {index}\n- beta {index}\n\n| key | value |\n| --- | :--- |\n| left {index} | right {index} |\n\n```rust\nlet value_{index} = {index};\n```\n\n> quoted paragraph {index}\n\n"
+                );
+                if source.len() + block.len() <= target_bytes {
+                    source.push_str(&block);
+                }
+            }
+        }
+        source.push('\n');
+        source
     }
 }
 

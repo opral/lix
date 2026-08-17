@@ -1,3 +1,7 @@
+// Originally based on markdown-syntax 0.2.0 by Plimeor and modified by Lix.
+// Upstream: https://github.com/plimeor/markdown-syntax
+// Original license: MIT; see LICENSE-MIT beside this module.
+//
 //! AST to canonical Markdown. The verbs live on [`Document`]
 //! ([`to_markdown`](Document::to_markdown) /
 //! [`to_markdown_with`](Document::to_markdown_with)); [`SerializeOptions`] tunes
@@ -1214,6 +1218,10 @@ fn escape_text_with_context(
     preserve_trailing: bool,
     context: InlineSerializeContext,
 ) -> String {
+    // This function encodes source line endings as entities below, so its
+    // output never contains a literal newline. `output.len()` is therefore
+    // the current line length and avoids rescanning the growing string with
+    // `rsplit_once` for every input character.
     let avoid_star_edges = context.avoid_star_edges;
     let mut output = String::new();
     let mut line_digit_prefix = 0usize;
@@ -1251,7 +1259,7 @@ fn escape_text_with_context(
             continue;
         }
         at_leading_edge = false;
-        if line_digit_prefix == output_line_len(&output) && char.is_ascii_digit() {
+        if line_digit_prefix == output.len() && char.is_ascii_digit() {
             output.push(char);
             line_digit_prefix += 1;
             continue;
@@ -1293,7 +1301,7 @@ fn escape_text_with_context(
             line_digit_prefix = usize::MAX;
             continue;
         }
-        if output_line_len(&output) == 0
+        if output.is_empty()
             && matches!(char, '-' | '+')
             && chars
                 .peek()
@@ -1305,7 +1313,7 @@ fn escape_text_with_context(
             line_digit_prefix = usize::MAX;
             continue;
         }
-        if output_line_len(&output) == 0
+        if output.is_empty()
             && ((char == '-' && chars.peek().is_some_and(|(_, next)| *next == '-')) || char == '=')
         {
             output.push('\\');
@@ -1317,7 +1325,7 @@ fn escape_text_with_context(
         match char {
             '*' if avoid_star_edges => output.push_str("&#x2A;"),
             '|' if context.table_cell => output.push_str("&#x7C;"),
-            '|' if output_line_len(&output) == 0 => {
+            '|' if output.is_empty() => {
                 output.push('\\');
                 output.push(char);
             }
@@ -1337,7 +1345,7 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '>' if output_line_len(&output) == 0 => {
+            '>' if output.is_empty() => {
                 output.push('\\');
                 output.push(char);
             }

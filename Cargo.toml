@@ -9,9 +9,6 @@ members = [
   "packages/storage-rocksdb",
   "packages/storage-slatedb",
   "plugins/*",
-  # This patched dependency has private parser-equivalence tests that must run
-  # with the workspace suite while the upstream optimization is evaluated.
-  "vendor/markdown-syntax",
 ]
 exclude = [
   # These application/test packages use Cargo artifact dependencies to build
@@ -80,10 +77,3 @@ large_enum_variant = "allow"
 cargo_common_metadata = "allow"
 redundant_feature_names = "allow"
 multiple_crate_versions = "allow"
-
-# Keep the published 0.2.0 surface local while the Markdown parser prepass
-# optimization is evaluated. The vendored crate intentionally contains only
-# its published library sources and licensing/readme material; remove this
-# override once the equivalent upstream release is adopted.
-[patch.crates-io]
-markdown-syntax = { path = "vendor/markdown-syntax" }

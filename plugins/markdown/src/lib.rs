@@ -1,11 +1,28 @@
 //! Markdown support for the row-first Component API v1.
 #![allow(dead_code)]
 
+extern crate alloc;
+
 mod core;
 mod markdown_file;
+#[allow(
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_strip,
+    clippy::question_mark,
+    clippy::sliced_string_as_bytes,
+    clippy::while_let_loop
+)]
+mod markdown_syntax;
 mod model;
 mod order_key;
 mod schemas;
+
+// The integrated upstream modules retain their original crate-root paths.
+pub(crate) use markdown_syntax::{
+    ast, diagnostic, entities, options, parse, span, unicode_punctuation, validate,
+};
 
 use core::{
     ArenaMarkdownBlock, ChangeEffect, Document, FileEdit, IdNamespace, NODE_SCHEMA_KEY,
