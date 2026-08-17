@@ -1288,12 +1288,118 @@ fn sync_client_flushes_two_filesystem_replicas_and_restores_a_durable_queue() {
         assert_eq!(read_state(&server).await, expected);
         assert_eq!(read_state(&alice).await, expected);
         assert_eq!(read_state(&bob).await, expected);
-        assert_eq!(alice_sync.cursor(), 2);
-        assert_eq!(bob_sync.cursor(), 2);
+        // Cursor values count canonical protocol events, not application
+        // commits: control/catalog and projection events may be published
+        // separately from the two admitted row transactions. Convergence is
+        // the contract; keep the lower bound only to ensure the bootstrap and
+        // both admissions were observed.
+        assert_eq!(alice_sync.cursor(), bob_sync.cursor());
+        assert!(alice_sync.cursor() >= 3);
 
         protocol.close().await.unwrap();
         bob.close().await.unwrap();
         alice.close().await.unwrap();
+        seed.close().await.unwrap();
+    });
+}
+
+#[test]
+fn manual_sync_enqueue_hydrates_existing_remote_rows_before_proposal_creation() {
+    run_sync_test("sync-client-manual-enqueue-hydration", || async {
+        let seed_storage = Memory::new();
+        let seed = open_lix()
+            .with_storage(seed_storage.clone())
+            .await
+            .unwrap();
+        register_schema(&seed).await;
+        apply_mutations(
+            &seed,
+            &[RowMutation {
+                row_id: "remote".to_owned(),
+                base: None,
+                proposed: Some("authoritative".to_owned()),
+            }],
+        )
+        .await;
+
+        let server = Arc::new(open_snapshot(&seed_storage.export_snapshot().unwrap()).await);
+        let protocol = LixServerProtocol::new(Arc::clone(&server));
+        let branch_id = server.active_branch_id().await.unwrap();
+
+        // This is a genuinely fresh local store: it shares only the branch
+        // identity and schema, not the server's existing row history.
+        let local = open_lix().with_storage(Memory::new()).await.unwrap();
+        let branch = local
+            .create_branch(CreateBranchOptions {
+                id: Some(branch_id.clone()),
+                name: "manual sync target".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        local
+            .switch_branch(SwitchBranchOptions {
+                branch_id: branch.id,
+            })
+            .await
+            .unwrap();
+        register_schema(&local).await;
+
+        let session_id = open_protocol_session(&protocol).await;
+        let mut sync = local
+            .sync(ProtocolSyncTransport {
+                protocol: protocol.clone(),
+                session_id,
+            })
+            .await
+            .unwrap();
+
+        // An initial manual flush with no registered scope performs only the
+        // head handshake. The remote row must still be absent locally here.
+        sync.flush().await.unwrap();
+        assert!(read_state(&local).await.is_empty());
+
+        let before = active_commit_id(&local).await;
+        apply_mutations(
+            &local,
+            &[RowMutation {
+                row_id: "local".to_owned(),
+                base: None,
+                proposed: Some("offline".to_owned()),
+            }],
+        )
+        .await;
+        let after = active_commit_id(&local).await;
+
+        assert!(
+            sync.enqueue_transaction(
+                "manual-hydration-proposal",
+                &before,
+                &after,
+                &["prototype_sync_row"],
+            )
+            .await
+            .unwrap()
+        );
+
+        // enqueue_transaction must hydrate the explicit semantic demand
+        // before capturing/admitting the local proposal. This assertion is
+        // intentionally before flush: a later flush would hide a regression
+        // by performing the deferred scope pull itself.
+        assert_eq!(
+            read_state(&local).await,
+            BTreeMap::from([
+                ("local".to_owned(), "offline".to_owned()),
+                ("remote".to_owned(), "authoritative".to_owned()),
+            ])
+        );
+
+        sync.flush().await.unwrap();
+        assert_eq!(read_state(&local).await["remote"], "authoritative");
+
+        local.close().await.unwrap();
+        server.close().await.unwrap();
+        protocol.close().await.unwrap();
         seed.close().await.unwrap();
     });
 }
@@ -1382,6 +1488,35 @@ fn sync_client_does_not_acknowledge_an_operation_id_with_another_payload() {
         assert_eq!(sync.pending_operations(), 1);
         assert_eq!(read_state(&lix).await["shared"], "mine");
         lix.close().await.unwrap();
+    });
+}
+
+#[test]
+fn sync_client_rejects_an_untrusted_pull_head_identity() {
+    run_sync_test("sync-pull-head-identity", || async {
+        let lix = open_lix().await.expect("open sync replica");
+        let branch_id = lix.active_branch_id().await.expect("active branch");
+        let response = SyncPullResponse {
+            branch_id,
+            events: Vec::new(),
+            next_cursor: 0,
+            head_cursor: 0,
+            // A head-only page has no canonical event whose identity can be
+            // validated. The client must reject this before persisting it as
+            // the next offline admission base.
+            head_commit_id: String::new(),
+        };
+        let mut sync = lix
+            .sync(CollisionSyncTransport { response })
+            .await
+            .expect("open sync client");
+        let error = sync
+            .flush()
+            .await
+            .expect_err("malformed pull head must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert_eq!(sync.cursor(), 0, "invalid head must not advance the cursor");
+        lix.close().await.expect("close sync replica");
     });
 }
 

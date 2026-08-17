@@ -10028,6 +10028,24 @@ pub(crate) async fn scan_change_records_from_commit_deltas(
     Ok(records)
 }
 
+/// Variant used by the sync replica's public change surface. Fresh local
+/// stores retain their temporary bootstrap commit deltas for graph/jump
+/// invariants, but those commits are an implementation detail and must not
+/// leak through `lix_change`.
+pub(crate) async fn scan_change_records_from_commit_deltas_excluding_commits(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hidden_commits: &BTreeSet<CommitId>,
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    let mut records = Vec::new();
+    visit_change_records_from_commit_deltas_filtered(store, Some(hidden_commits), |record| {
+        records.push(record);
+        Ok(())
+    })
+    .await?;
+    records.sort_unstable_by_key(|record| record.change_id);
+    Ok(records)
+}
+
 /// Visits canonical packed changes while retaining memory proportional to one
 /// storage page plus one logical commit, never total repository history.
 ///
@@ -10036,6 +10054,14 @@ pub(crate) async fn scan_change_records_from_commit_deltas(
 /// skipped; authored rows require no secondary read.
 pub(crate) async fn visit_change_records_from_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
+    visit: impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
+) -> Result<usize, LixError> {
+    visit_change_records_from_commit_deltas_filtered(store, None, visit).await
+}
+
+async fn visit_change_records_from_commit_deltas_filtered(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hidden_commits: Option<&BTreeSet<CommitId>>,
     mut visit: impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
 ) -> Result<usize, LixError> {
     let range = StorageKeyRange {
@@ -10072,6 +10098,9 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                         LixError::CODE_INTERNAL_ERROR,
                         "tracked_state commit_delta manifest key is not a 16-byte commit id",
                     ));
+                }
+                if hidden_commits.is_some_and(|commits| commits.contains(&commit_id)) {
+                    continue;
                 }
                 let StorageProjectedValue::FullValue(_) = &entry.value else {
                     unreachable!("full commit-delta scan returned a key-only row");

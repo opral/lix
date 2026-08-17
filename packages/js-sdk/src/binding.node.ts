@@ -11,11 +11,13 @@ type NativeAddon = {
 	Lix: {
 		openMemory(
 			telemetry?: (spanJson: string) => void,
+			serverUrl?: string,
 		): Promise<LixBinding>;
 		openFilesystemStorage(
 			path: string,
 			syncAllFiles: boolean,
 			telemetry?: (spanJson: string) => void,
+			serverUrl?: string,
 		): Promise<LixBinding>;
 	};
 };
@@ -75,11 +77,12 @@ function loadNativeAddon(): NativeAddon {
 export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	serverUrl?: string,
 ): Promise<LixBinding> {
 	try {
-		return await openNativeLixBinding(storage, telemetry);
+		return await openNativeLixBinding(storage, telemetry, serverUrl);
 	} catch (nativeError) {
-		if (storage.kind !== "memory") throw nativeError;
+		if (storage.kind !== "memory" || serverUrl !== undefined) throw nativeError;
 		try {
 			const { openMemoryWasmBinding } = await import(
 				"./binding.node-wasm.js"
@@ -97,6 +100,7 @@ export async function openLixBinding(
 export async function openNativeLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	serverUrl?: string,
 ): Promise<LixBinding> {
 	switch (storage.kind) {
 		case "memory": {
@@ -104,8 +108,10 @@ export async function openNativeLixBinding(
 			const nativeTelemetry = telemetry
 				? (spanJson: string) => telemetry(JSON.parse(spanJson))
 				: undefined;
-			if (nativeTelemetry) return nativeAddon.Lix.openMemory(nativeTelemetry);
-			return nativeAddon.Lix.openMemory();
+			if (nativeTelemetry) {
+				return nativeAddon.Lix.openMemory(nativeTelemetry, serverUrl);
+			}
+			return nativeAddon.Lix.openMemory(undefined, serverUrl);
 		}
 		case "indexedDb":
 			throw new Error("IndexedDbStorage is only available in browsers");
@@ -119,11 +125,14 @@ export async function openNativeLixBinding(
 					storage.path,
 					storage.syncAllFiles,
 					nativeTelemetry,
+					serverUrl,
 				);
 			}
 			return nativeAddon.Lix.openFilesystemStorage(
 				storage.path,
 				storage.syncAllFiles,
+				undefined,
+				serverUrl,
 			);
 		}
 	}

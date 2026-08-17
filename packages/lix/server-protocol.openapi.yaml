@@ -99,7 +99,7 @@ paths:
   /lix/v1/sync/pull:
     get:
       operationId: syncPull
-      description: Pulls canonical row-first transaction packs after a durable branch cursor.
+      description: Pulls canonical row-first transaction packs after a durable branch cursor. Event-bearing pulls are mandatory long-polls: they block until the branch head advances or the server heartbeat expires. A limit=0 request is metadata-only and returns the current head without an event page.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - name: after
@@ -110,13 +110,28 @@ paths:
           schema: { type: integer, minimum: 0, maximum: 512, default: 128 }
         - name: schemas
           in: query
-          description: Comma-separated semantic schema keys to hydrate; omit with limit=0 for a head-only pull.
+          description: Comma-separated semantic schema keys to hydrate. Omit for an unscoped topology pull; use limit=0 only for a metadata-only head probe.
           schema: { type: string, maxLength: 16384 }
       responses:
         "200":
           description: The next ordered page and the current authoritative head.
           content:
             application/json: { schema: { $ref: "#/components/schemas/SyncPullResponse" } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/sync/branches:
+    get:
+      operationId: syncBranches
+      description: Lists the authoritative branch catalog for the repository.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+      responses:
+        "200":
+          description: Branch IDs, names, heads, and visibility flags.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SyncBranch" }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/transaction/begin:
     post:
@@ -472,6 +487,14 @@ components:
         nextCursor: { type: integer, minimum: 0 }
         headCursor: { type: integer, minimum: 0 }
         headCommitId: { type: string }
+    SyncBranch:
+      type: object
+      required: [id, name, commitId, hidden]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        commitId: { type: string }
+        hidden: { type: boolean }
     ErrorEnvelope:
       type: object
       required: [error]

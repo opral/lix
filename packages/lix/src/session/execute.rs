@@ -1162,6 +1162,15 @@ where
         // `lix_file` predicates or legacy path shapes.
         crate::common::LixPath::try_from_file_path(&path)?;
 
+        // Keep the structured file API on the same lazy-sync contract as
+        // `SELECT ... FROM lix_file`: hydrate the file projection before the
+        // local path index is consulted, while subsequent reads remain fully
+        // local.
+        let requested_scopes =
+            self.register_sync_sql_scope("SELECT content FROM lix_file WHERE path = $1");
+        self.wait_for_sync_scope_hydration(&requested_scopes)
+            .await?;
+
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read_scope = self
@@ -1184,7 +1193,11 @@ where
                 // A raw file download delivers the same bytes as a direct
                 // `lix_file.content` read, so it must acknowledge rendered
                 // plugin state for subsequent collaborative writes.
-                let file_view_collector = sql2::SessionFileViews::default();
+                // Reuse the session view cache so late raw-file projections
+                // fetched by sync are visible to the structured file API as
+                // well as SQL. The cache is shared by clone, and plugin
+                // acknowledgements remain idempotent when applied below.
+                let file_view_collector = self.file_views.fork_for_read();
                 let result = sql2::execute_exact_lix_file_batch_read(
                     &active_branch_id,
                     hot_state,
@@ -1266,14 +1279,23 @@ where
         require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
-        // Register the demand before planning. A fresh replica may need the
-        // server's schema catalog before SQL can be planned, so the existing
-        // readiness barrier intentionally covers the complete single-
-        // statement path. Once the scope is cached this is local-only.
-        let requested_scopes = self.register_sync_sql_scope(sql);
-        self.wait_for_sync_scope_hydration(&requested_scopes).await?;
         let statement = self.sql_planning_cache.parse_statement(sql)?;
-        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+        let route = sql2::bind_statement_route(&statement)?;
+        let requested_scopes = self.register_sync_sql_scope(sql);
+        // Reads wait for their demanded scope so a successful result never
+        // comes from an incomplete local projection. Writes use the same
+        // policy through the session helper: catalog-only planning for an
+        // uncached insert, relation hydration for targeted updates/deletes,
+        // and no barrier for engine-owned local writes.
+        let wait_scopes = if route == sql2::BoundStatementRoute::Read {
+            requested_scopes.clone()
+        } else {
+            self.sync_write_wait_scopes(sql, route, &requested_scopes)
+        };
+        if !wait_scopes.is_empty() {
+            self.wait_for_sync_scope_hydration(&wait_scopes).await?;
+        }
+        if route == sql2::BoundStatementRoute::Write {
             if require_idempotency_for_writes && idempotency.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_IDEMPOTENCY_KEY_REQUIRED,
@@ -1633,6 +1655,13 @@ where
             ));
         }
 
+        let requested_scopes = self.register_sync_sql_scope(&sql);
+        let wait_scopes =
+            self.sync_write_wait_scopes(&sql, sql2::BoundStatementRoute::Write, &requested_scopes);
+        if !wait_scopes.is_empty() {
+            self.wait_for_sync_scope_hydration(&wait_scopes).await?;
+        }
+
         let sql_for_error = Arc::clone(&sql);
         let result = self
             .with_write_transaction_lending(async move |transaction| {
@@ -1801,7 +1830,8 @@ where
                     .iter()
                     .flat_map(|statement| self.register_sync_sql_scope(&statement.sql))
                     .collect::<Vec<_>>();
-                self.wait_for_sync_scope_hydration(&requested_scopes).await?;
+                self.wait_for_sync_scope_hydration(&requested_scopes)
+                    .await?;
                 self.execute_read_only_batch(statements, parsed).await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
@@ -1811,7 +1841,8 @@ where
                         .iter()
                         .flat_map(|statement| self.register_sync_sql_scope(&statement.sql))
                         .collect::<Vec<_>>();
-                    self.wait_for_sync_scope_hydration(&requested_scopes).await?;
+                    self.wait_for_sync_scope_hydration(&requested_scopes)
+                        .await?;
                     return self
                         .execute_transaction_batch(
                             statements,
@@ -1821,6 +1852,25 @@ where
                             None,
                         )
                         .await;
+                }
+                // A write batch opens one transaction after this barrier. Do
+                // the same per-statement scope classification as single
+                // execute: a custom INSERT needs only the catalog, while a
+                // custom UPDATE/DELETE needs its target rows. This prevents
+                // a fresh partial replica from silently executing a no-op.
+                let mut wait_scopes = Vec::new();
+                for statement in statements {
+                    let requested_scopes = self.register_sync_sql_scope(&statement.sql);
+                    let parsed = self.sql_planning_cache.parse_statement(&statement.sql)?;
+                    let route = sql2::bind_statement_route(&parsed)?;
+                    wait_scopes.extend(self.sync_write_wait_scopes(
+                        &statement.sql,
+                        route,
+                        &requested_scopes,
+                    ));
+                }
+                if !wait_scopes.is_empty() {
+                    self.wait_for_sync_scope_hydration(&wait_scopes).await?;
                 }
                 if require_idempotency_for_writes && idempotency.is_none() {
                     return Err(LixError::new(
@@ -2024,6 +2074,7 @@ where
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, statement)| {
             is_acknowledgeable_file_content_read(parsed, &statement.params)
+                || late_materialized_lix_file_content_read(parsed).is_some()
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read_scope = self
@@ -2033,8 +2084,7 @@ where
         let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                let file_view_collector =
-                    acknowledge_file_views.then(sql2::SessionFileViews::default);
+                let file_view_collector = acknowledge_file_views.then(|| self.file_views.fork_for_read());
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
@@ -2147,7 +2197,8 @@ where
             .iter()
             .flat_map(|(sql, _)| self.register_sync_sql_scope(sql))
             .collect::<Vec<_>>();
-        self.wait_for_sync_scope_hydration(&requested_scopes).await?;
+        self.wait_for_sync_scope_hydration(&requested_scopes)
+            .await?;
         let parsed = statements
             .iter()
             .map(|(sql, _)| {
@@ -2170,7 +2221,10 @@ where
         let acknowledge_file_views = parsed
             .iter()
             .zip(statements)
-            .all(|(parsed, (_, params))| is_acknowledgeable_file_content_read(parsed, params));
+            .all(|(parsed, (_, params))| {
+                is_acknowledgeable_file_content_read(parsed, params)
+                    || late_materialized_lix_file_content_read(parsed).is_some()
+            });
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read_scope = self
@@ -2180,8 +2234,7 @@ where
         let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                let file_view_collector =
-                    acknowledge_file_views.then(sql2::SessionFileViews::default);
+                let file_view_collector = acknowledge_file_views.then(|| self.file_views.fork_for_read());
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let active_branch_head = self
                     .branch_ctx
@@ -2379,7 +2432,7 @@ where
         ),
         LixError,
     > {
-        let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
+        let file_view_collector = acknowledge_file_views.then(|| self.file_views.fork_for_read());
         let active_branch_id = self
             .active_branch_id_from_reader(&read_store)
             .instrument(tracing::debug_span!(
@@ -3145,21 +3198,27 @@ where
         // writes remain immediate and never wait on the network.
         let requested_scopes = self.session.register_sync_sql_scope(sql);
         let route_statement = self.sql_planning_cache.parse_statement(sql)?;
-        if sql2::bind_statement_route(&route_statement)? == sql2::BoundStatementRoute::Read {
+        let route = sql2::bind_statement_route(&route_statement)?;
+        let wait_scopes = if route == sql2::BoundStatementRoute::Read {
+            requested_scopes.clone()
+        } else {
+            self.session
+                .sync_write_wait_scopes(sql, route, &requested_scopes)
+        };
+        if !wait_scopes.is_empty() {
             let refresh_transaction = matches!(
                 self.sync_mode.role(),
                 Ok(crate::sync::SyncRole::Replica { .. })
             ) && !self.sync_mode.scopes_are_hydrated_for_branch(
-                &requested_scopes,
+                &wait_scopes,
                 &self
                     .session
                     .branch
                     .get()
                     .expect("session branch selector should be readable"),
-            )
-                && !self.has_started_statement;
+            ) && !self.has_started_statement;
             self.session
-                .wait_for_sync_scope_hydration(&requested_scopes)
+                .wait_for_sync_scope_hydration(&wait_scopes)
                 .await?;
             if refresh_transaction {
                 self.reopen_after_sync_hydration().await?;

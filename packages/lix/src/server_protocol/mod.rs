@@ -6,8 +6,9 @@ use crate::session::ExecuteOptions;
 #[cfg(test)]
 use crate::session::media_upload::FILE_UPLOAD_PART_BYTES;
 use crate::sync::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_SCOPE_KEY_BYTES, MAX_SYNC_SCOPE_KEYS, SyncAdmission,
-    SyncBranch, SyncPullResponse, SyncTransactionPack, validate_sync_transaction_pack,
+    MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_SCOPE_KEY_BYTES, MAX_SYNC_SCOPE_KEYS,
+    SYNC_LONG_POLL_TIMEOUT, SyncAdmission, SyncBranch, SyncPullResponse, SyncTransactionPack,
+    validate_sync_transaction_pack,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -1615,9 +1616,7 @@ where
                 };
                 result_response(sync_pull(lease, query).await)
             }
-            (&Method::GET, "/lix/v1/sync/branches") => {
-                result_response(sync_branches(lease).await)
-            }
+            (&Method::GET, "/lix/v1/sync/branches") => result_response(sync_branches(lease).await),
             (&Method::POST, "/lix/v1/transaction/begin") => {
                 result_response(begin_transaction(lease).await)
             }
@@ -2397,56 +2396,35 @@ async fn sync_pull<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let response = lease
-        .run_cancellable_read(move |lix| async move {
-            let session_branch_id = lix.active_branch_id().await?;
-            let branch_id = request.branch.clone().unwrap_or(session_branch_id.clone());
-            let target = if branch_id == session_branch_id {
-                None
-            } else {
-                Some(
-                    lix.open_internal_session(branch_id.clone(), lix.active_account_id().to_owned())
-                        .await?,
-                )
-            };
-            if request
-                .schemas
-                .as_deref()
-                .is_some_and(|schemas| schemas.len() > MAX_SYNC_SCOPE_KEYS * (MAX_SYNC_SCOPE_KEY_BYTES + 1))
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync pull schema scope is too large",
-                ));
-            }
-            let schema_keys = request.schemas.as_deref().map(parse_sync_scope);
-            if let Some(schema_keys) = schema_keys.as_deref() {
-                validate_sync_scope(schema_keys)?;
-            }
-            let result = match target.as_ref() {
-                Some(target) => target
-                    .pull_sync_events(
-                        &branch_id,
-                        request.after,
-                        request.limit,
-                        schema_keys.as_deref(),
-                    )
-                    .await,
-                None => lix
-                    .pull_sync_events(
-                        &branch_id,
-                        request.after,
-                        request.limit,
-                        schema_keys.as_deref(),
-                    )
-                    .await,
-            };
-            if let Some(target) = target {
-                target.close().await?;
-            }
-            result
-        })
-        .await?;
+    // The change stream belongs to the repository engine rather than one
+    // pinned session. Every server session therefore wakes when any canonical
+    // write commits, including direct Lix writes made by an embedded host.
+    let mut change_watcher = lease.record.lix.sync_mode_state().change_watcher();
+    let long_poll = request.limit != 0;
+    let response = loop {
+        // Subscribe before reading the head. The level-triggered watch closes
+        // the classic long-poll race where a commit lands between the read
+        // and registration of the waiter.
+        let response = pull_sync_once(&lease, request.clone()).await?;
+        let at_head = response.events.is_empty() && response.head_cursor <= request.after;
+        if !long_poll || !at_head {
+            break response;
+        }
+        // `watch` is level-triggered, so a commit that lands during the
+        // storage read is observed by `changed()` even if it happened before
+        // the wait future was registered. The receiver was subscribed before
+        // the read, which closes the classic long-poll race without polling
+        // `has_changed()` (that method does not consume the notification).
+        tokio::select! {
+            result = change_watcher.changed() => {
+                if result.is_ok() {
+                    continue;
+                }
+                break response;
+            },
+            _ = tokio::time::sleep(SYNC_LONG_POLL_TIMEOUT) => break response,
+        }
+    };
     let encoded = serde_json::to_vec(&response).map_err(|error| {
         ApiError::from(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -2459,6 +2437,69 @@ where
     Ok(Json(response))
 }
 
+async fn pull_sync_once<S>(
+    lease: &SessionLease<S>,
+    request: SyncPullRequest,
+) -> Result<SyncPullResponse, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    lease
+        .run_cancellable_read(move |lix| async move {
+            let session_branch_id = lix.active_branch_id().await?;
+            let branch_id = request.branch.clone().unwrap_or(session_branch_id.clone());
+            let target = if branch_id == session_branch_id {
+                None
+            } else {
+                Some(
+                    lix.open_internal_session(
+                        branch_id.clone(),
+                        lix.active_account_id().to_owned(),
+                    )
+                    .await?,
+                )
+            };
+            if request.schemas.as_deref().is_some_and(|schemas| {
+                schemas.len() > MAX_SYNC_SCOPE_KEYS * (MAX_SYNC_SCOPE_KEY_BYTES + 1)
+            }) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync pull schema scope is too large",
+                ));
+            }
+            let schema_keys = request.schemas.as_deref().map(parse_sync_scope);
+            if let Some(schema_keys) = schema_keys.as_deref() {
+                validate_sync_scope(schema_keys)?;
+            }
+            let result = match target.as_ref() {
+                Some(target) => {
+                    target
+                        .pull_sync_events(
+                            &branch_id,
+                            request.after,
+                            request.limit,
+                            schema_keys.as_deref(),
+                        )
+                        .await
+                }
+                None => {
+                    lix.pull_sync_events(
+                        &branch_id,
+                        request.after,
+                        request.limit,
+                        schema_keys.as_deref(),
+                    )
+                    .await
+                }
+            };
+            if let Some(target) = target {
+                target.close().await?;
+            }
+            result
+        })
+        .await
+}
+
 /// Returns the global branch catalog for a lazy local replica. This control
 /// plane is deliberately read-only and carries no row payloads; branch data
 /// is materialized locally through the existing branch API.
@@ -2468,24 +2509,45 @@ where
 {
     let branches = lease
         .run_cancellable_read(|lix| async move {
-            let result = lix
-                .execute(
-                    "SELECT id, name, hidden, commit_id FROM lix_branch ORDER BY id",
-                    &[],
+            // The authenticated lease is pinned to the caller's application
+            // branch. Its branch-head/SQL caches can legitimately lag a
+            // concurrent control write made through another server session
+            // (for example a new branch created by the authority itself).
+            // Read the catalog through a fresh suppressed global session so
+            // every sync client sees the authoritative global control lane.
+            let global = lix
+                .open_internal_session_suppressed(
+                    lix::GLOBAL_BRANCH_ID.to_owned(),
+                    lix.active_account_id().to_owned(),
                 )
                 .await?;
-            result
-                .rows()
-                .iter()
-                .map(|row| {
-                    Ok(SyncBranch {
-                        id: row.get::<String>("id")?,
-                        name: row.get::<String>("name")?,
-                        hidden: row.get::<bool>("hidden")?,
-                        commit_id: row.get::<String>("commit_id")?,
+            let branches_result = async {
+                let result = global
+                    .execute(
+                        "SELECT id, name, hidden, commit_id FROM lix_branch ORDER BY id",
+                        &[],
+                    )
+                    .await?;
+                result
+                    .rows()
+                    .iter()
+                    .map(|row| {
+                        Ok(SyncBranch {
+                            id: row.get::<String>("id")?,
+                            name: row.get::<String>("name")?,
+                            hidden: row.get::<bool>("hidden")?,
+                            commit_id: row.get::<String>("commit_id")?,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, LixError>>()
+                    .collect::<Result<Vec<_>, LixError>>()
+            }
+            .await;
+            let close_result = global.close().await;
+            match (branches_result, close_result) {
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+                (Ok(branches), Ok(())) => Ok(branches),
+            }
         })
         .await?;
     Ok(Json(branches))
@@ -3951,7 +4013,7 @@ struct BeginTransactionResponse {
     transaction_id: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncPullRequest {
     #[serde(default)]
@@ -3959,8 +4021,9 @@ struct SyncPullRequest {
     #[serde(default = "default_sync_pull_limit")]
     limit: usize,
     /// Comma-separated semantic schema keys requested by a lazy replica.
-    /// Empty means head-only metadata when `limit` is zero, not full-repository
-    /// hydration.
+    /// Event-bearing requests are always long-polled. An empty scope is an
+    /// unscoped/topology pull; only `limit=0` is the internal metadata-only
+    /// head probe and never returns an event page.
     #[serde(default)]
     schemas: Option<String>,
     /// Internal topology pulls may read another branch without mutating the
@@ -4769,6 +4832,7 @@ mod tests {
                 ("POST", "/lix/v1/execute-batch") => "executeBatch",
                 ("POST", "/lix/v1/sync/admit") => "syncAdmit",
                 ("GET", "/lix/v1/sync/pull") => "syncPull",
+                ("GET", "/lix/v1/sync/branches") => "syncBranches",
                 ("POST", "/lix/v1/transaction/begin") => "beginTransaction",
                 ("POST", "/lix/v1/transaction/execute") => "transactionExecute",
                 ("POST", "/lix/v1/transaction/commit") => "commitTransaction",
@@ -7022,6 +7086,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_pull_is_a_mandatory_long_poll_and_wakes_after_canonical_admission() {
+        let app = app().await;
+        app.lix
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[Value::Text(SYNC_TEST_SCHEMA.to_owned())],
+            )
+            .await
+            .expect("register sync schema");
+        let (session_id, handshake) = new_session(&app.router).await;
+        let branch_id = handshake["activeBranchId"]
+            .as_str()
+            .expect("branch id")
+            .to_owned();
+        let base = active_commit_id(&app.lix).await;
+
+        let first = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/admit",
+            Some(&session_id),
+            &[(IDEMPOTENCY_KEY_HEADER, "long-poll-first")],
+            Some(sync_pack_json(
+                "long-poll-first",
+                &branch_id,
+                &base,
+                "long-poll",
+                "first",
+            )),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        let first_commit = first["canonicalCommitId"]
+            .as_str()
+            .expect("first canonical commit")
+            .to_owned();
+        let first_cursor = first["cursor"].as_u64().expect("first cursor");
+
+        // Unknown query controls are rejected. Long-polling is the server
+        // contract, not an opt-in `waitMs` request mode.
+        let unsupported = request_with_headers(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/pull?after={first_cursor}&limit=1&waitMs=1"),
+            Some(&session_id),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+
+        let pending_router = app.router.clone();
+        let pending_session_id = session_id.clone();
+        let mut pending = tokio::spawn(async move {
+            request_with_headers(
+                &pending_router,
+                "GET",
+                &format!("/lix/v1/sync/pull?after={first_cursor}&limit=1"),
+                Some(&pending_session_id),
+                &[],
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "an event pull at the current head should stay open"
+        );
+
+        let second = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/admit",
+            Some(&session_id),
+            &[(IDEMPOTENCY_KEY_HEADER, "long-poll-second")],
+            Some(sync_pack_json(
+                "long-poll-second",
+                &branch_id,
+                &first_commit,
+                "long-poll",
+                "second",
+            )),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = response_json(second).await;
+        let second_cursor = second["cursor"].as_u64().expect("second cursor");
+
+        let response = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("canonical admission should wake the long poll")
+            .expect("long-poll task should finish");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["events"].as_array().unwrap().len(), 1);
+        assert_eq!(response["events"][0]["cursor"], second_cursor);
+        assert_eq!(
+            response["events"][0]["pack"]["operationId"],
+            "long-poll-second"
+        );
+
+        // Ordinary authoritative Lix writes use the same canonical event
+        // lane. They must wake a waiter too; admission is not a special push
+        // path that would leave embedded/server-side writes invisible.
+        let pending_router = app.router.clone();
+        let pending_session_id = session_id.clone();
+        let mut pending = tokio::spawn(async move {
+            request_with_headers(
+                &pending_router,
+                "GET",
+                &format!("/lix/v1/sync/pull?after={second_cursor}&limit=1"),
+                Some(&pending_session_id),
+                &[],
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "the second event pull should also wait at the current head"
+        );
+
+        // A repository-wide invalidation must not turn every branch's
+        // long-poll into an empty response. The waiter is pinned to the
+        // authenticated branch; unrelated branch activity should be ignored
+        // until that branch advances, otherwise N clients multiply every
+        // other branch's commit into an avoidable reconnect storm.
+        let foreign_branch_id = "0198a000-0000-7000-8000-0000000000f1";
+        app.lix
+            .create_branch(CreateBranchOptions {
+                id: Some(foreign_branch_id.to_owned()),
+                name: "long-poll-foreign".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create unrelated branch");
+        let foreign = app
+            .lix
+            .open_another_session()
+            .with_branch(foreign_branch_id)
+            .await
+            .expect("open unrelated branch session");
+        foreign
+            .execute(
+                "UPDATE server_sync_test_row SET value = 'foreign' WHERE row_id = 'long-poll'",
+                &[],
+            )
+            .await
+            .expect("write unrelated branch event");
+        foreign.close().await.expect("close unrelated branch session");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "unrelated branch activity must not complete the main-branch long poll"
+        );
+
+        app.lix
+            .execute(
+                "UPDATE server_sync_test_row SET value = 'direct' WHERE row_id = 'long-poll'",
+                &[],
+            )
+            .await
+            .expect("direct authoritative write");
+        let response = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("direct canonical write should wake the long poll")
+            .expect("long-poll task should finish");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["events"].as_array().unwrap().len(), 1);
+        assert!(
+            response["events"][0]["pack"]["operationId"]
+                .as_str()
+                .is_some_and(|operation| operation.starts_with("server:"))
+        );
+    }
+
+    #[tokio::test]
     async fn sync_admission_replays_receipt_and_orders_overlapping_row_packs() {
         let lix = Arc::new(
             open_lix()
@@ -7117,10 +7365,14 @@ mod tests {
             .expect("second canonical commit")
             .to_owned();
         assert_ne!(second_commit, first_commit);
+        // A pre-sync repository now publishes its reachable commit DAG as
+        // oldest-first bootstrap events before admitting the first live pack.
+        // Locate the live operation by identity instead of assuming that the
+        // bootstrap occupies exactly one cursor slot.
         let first_page = request_with_headers(
             &router,
             "GET",
-            "/lix/v1/sync/pull?after=1&limit=1",
+            "/lix/v1/sync/pull?after=1&limit=32",
             Some(&session_id),
             &[],
             None,
@@ -7128,16 +7380,32 @@ mod tests {
         .await;
         assert_eq!(first_page.status(), StatusCode::OK);
         let first_page = response_json(first_page).await;
-        assert_eq!(first_page["events"].as_array().unwrap().len(), 1);
-        assert_eq!(first_page["events"][0]["cursor"], 2);
-        assert_eq!(first_page["events"][0]["pack"], first_pack);
-        assert_eq!(first_page["nextCursor"], 2);
-        assert_eq!(first_page["headCursor"], 3);
+        let events = first_page["events"].as_array().unwrap();
+        let first_event = events
+            .iter()
+            .find(|event| event["pack"] == first_pack)
+            .expect("first admitted pack appears after bootstrap history");
+        let first_cursor = first_event["cursor"]
+            .as_u64()
+            .expect("first admitted cursor");
+        let second_event = events
+            .iter()
+            .find(|event| event["canonicalCommitId"] == second_commit)
+            .expect("second admitted pack appears after the first");
+        let second_cursor = second_event["cursor"]
+            .as_u64()
+            .expect("second admitted cursor");
+        assert!(first_cursor < second_cursor);
+        assert_eq!(second_event["pack"]["operationId"], "sync-second");
+        let head_cursor = first_page["headCursor"]
+            .as_u64()
+            .expect("bootstrap/live head cursor");
+        assert!(head_cursor >= second_cursor);
 
         let second_page = request_with_headers(
             &router,
             "GET",
-            "/lix/v1/sync/pull?after=2&limit=1",
+            &format!("/lix/v1/sync/pull?after={first_cursor}&limit=1"),
             Some(&session_id),
             &[],
             None,
@@ -7146,14 +7414,14 @@ mod tests {
         assert_eq!(second_page.status(), StatusCode::OK);
         let second_page = response_json(second_page).await;
         assert_eq!(second_page["events"].as_array().unwrap().len(), 1);
-        assert_eq!(second_page["events"][0]["cursor"], 3);
+        assert_eq!(second_page["events"][0]["cursor"], second_cursor);
         assert_eq!(second_page["events"][0]["canonicalCommitId"], second_commit);
-        assert_eq!(second_page["nextCursor"], 3);
-        assert_eq!(second_page["headCursor"], 3);
+        assert_eq!(second_page["nextCursor"], second_cursor);
+        assert_eq!(second_page["headCursor"], head_cursor);
         let head_only = request_with_headers(
             &router,
             "GET",
-            "/lix/v1/sync/pull?after=3&limit=0",
+            &format!("/lix/v1/sync/pull?after={head_cursor}&limit=0"),
             Some(&session_id),
             &[],
             None,
@@ -7162,8 +7430,8 @@ mod tests {
         assert_eq!(head_only.status(), StatusCode::OK);
         let head_only = response_json(head_only).await;
         assert!(head_only["events"].as_array().unwrap().is_empty());
-        assert_eq!(head_only["nextCursor"], 3);
-        assert_eq!(head_only["headCursor"], 3);
+        assert_eq!(head_only["nextCursor"], head_cursor);
+        assert_eq!(head_only["headCursor"], head_cursor);
 
         let filtered_page = request_with_headers(
             &router,

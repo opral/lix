@@ -15,6 +15,7 @@ import type {
 export const openDirectLixBinding: undefined | ((
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	serverUrl?: string,
 ) => Promise<LixBinding>) = undefined;
 
 export function createWorkerConnection(): WorkerConnection {

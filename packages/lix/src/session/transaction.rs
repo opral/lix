@@ -24,8 +24,8 @@ use crate::transaction_types::TransactionWriteRow;
 
 use super::context::{SessionWriteAccess, closed_error};
 use super::{ExecuteIdempotency, SessionContext};
+use crate::sync::{SyncModeState, SyncRole};
 use crate::transaction::CommitCoordinator;
-use crate::sync::SyncModeState;
 
 #[expect(missing_debug_implementations)]
 pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
@@ -134,29 +134,30 @@ where
         transaction.rollback().await?;
         self._deterministic_runtime_guard.take();
 
-        let (mut opened, deterministic_runtime_guard) =
-            open_transaction_with_runtime_boundary(
-                &self.session.branch,
-                self.session.active_account_id.to_string(),
-                self.session.storage.clone(),
-                Arc::clone(&self.session.hot_state),
-                Arc::clone(&self.session.tracked_state),
-                Arc::clone(&self.session.binary_cas),
-                self.session.plugin_host.clone(),
-                Arc::clone(&self.session.branch_ctx),
-                Arc::clone(&self.session.catalog_context),
-                Arc::clone(&self.session.sql_planning_cache),
-                self.session.file_views.clone(),
-                async |runtime_functions| {
-                    if runtime_functions.deterministic_mode_enabled() {
-                        Ok(Some(self.session.lock_deterministic_runtime().await))
-                    } else {
-                        Ok(None)
-                    }
-                },
-            )
-            .await?;
-        opened.transaction.set_sync_role(self.session.sync_mode.role()?);
+        let (mut opened, deterministic_runtime_guard) = open_transaction_with_runtime_boundary(
+            &self.session.branch,
+            self.session.active_account_id.to_string(),
+            self.session.storage.clone(),
+            Arc::clone(&self.session.hot_state),
+            Arc::clone(&self.session.tracked_state),
+            Arc::clone(&self.session.binary_cas),
+            self.session.plugin_host.clone(),
+            Arc::clone(&self.session.branch_ctx),
+            Arc::clone(&self.session.catalog_context),
+            Arc::clone(&self.session.sql_planning_cache),
+            self.session.file_views.clone(),
+            async |runtime_functions| {
+                if runtime_functions.deterministic_mode_enabled() {
+                    Ok(Some(self.session.lock_deterministic_runtime().await))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .await?;
+        opened
+            .transaction
+            .set_sync_role(self.session.sync_mode.role()?);
         if self.session.sync_outbox_suppressed {
             opened.transaction.suppress_ordinary_sync_event();
         }
@@ -190,7 +191,51 @@ where
     pub(crate) async fn stage_sync_rows(&mut self, rows: RawWriteBatch) -> Result<(), LixError> {
         let transaction = self.transaction_mut()?;
         transaction.suppress_ordinary_sync_event();
-        transaction.stage_rows(rows).await?;
+        transaction.stage_sync_rows(rows).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn stage_sync_file_projection(
+        &mut self,
+        remote_id: &str,
+        files: Vec<crate::sync::SyncFileMutation>,
+    ) -> Result<(), LixError> {
+        let transaction = self.transaction_mut()?;
+        transaction.suppress_ordinary_sync_event();
+        transaction
+            .stage_sync_file_projection(remote_id, files)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_sync_file_projection(&mut self, file_id: &str) -> Result<(), LixError> {
+        self.transaction_mut()?.clear_sync_file_projection(file_id)
+    }
+
+    pub(crate) fn sync_remote_id(&self) -> Result<Option<String>, LixError> {
+        Ok(match self.sync_mode.role()? {
+            SyncRole::Replica { remote_id } => Some(remote_id),
+            _ => None,
+        })
+    }
+
+    pub(crate) async fn stage_sync_canonical_renderer_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<(), LixError> {
+        let transaction = self.transaction_mut()?;
+        transaction.suppress_ordinary_sync_event();
+        transaction.stage_sync_canonical_renderer_rows(rows).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn stage_sync_canonical_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<(), LixError> {
+        let transaction = self.transaction_mut()?;
+        transaction.suppress_ordinary_sync_event();
+        transaction.stage_sync_canonical_rows(rows).await?;
         Ok(())
     }
 
@@ -199,8 +244,12 @@ where
         Ok(())
     }
 
-    pub(crate) fn relabel_sync_commit(&mut self, canonical_commit_id: &str) -> Result<(), LixError> {
-        self.transaction_mut()?.relabel_sync_commit(canonical_commit_id)
+    pub(crate) fn relabel_sync_commit(
+        &mut self,
+        canonical_commit_id: &str,
+    ) -> Result<(), LixError> {
+        self.transaction_mut()?
+            .relabel_sync_commit(canonical_commit_id)
     }
 
     pub(crate) fn stage_sync_commit_parents(
@@ -209,6 +258,16 @@ where
     ) -> Result<(), LixError> {
         self.transaction_mut()?
             .stage_sync_commit_parents(parent_commit_ids)
+    }
+
+    pub(crate) fn stage_sync_topology_commit(
+        &mut self,
+        canonical_commit_id: &str,
+        parent_commit_ids: &[String],
+    ) -> Result<(), LixError> {
+        let transaction = self.transaction_mut()?;
+        transaction.suppress_ordinary_sync_event();
+        transaction.stage_sync_topology_commit(canonical_commit_id, parent_commit_ids)
     }
 
     pub(crate) async fn stage_sync_admission_receipt(
@@ -226,7 +285,8 @@ where
         &mut self,
         markers: &[(crate::sync::SyncAppliedEventMarker, Option<Vec<u8>>)],
     ) -> Result<(), LixError> {
-        self.transaction_mut()?.stage_sync_applied_event_markers(markers)
+        self.transaction_mut()?
+            .stage_sync_applied_event_markers(markers)
     }
 
     pub fn active_branch_id(&self) -> Result<&str, LixError> {
@@ -265,6 +325,14 @@ where
         drop(self.write_access.take());
         self.observe_invalidation
             .bump_if_storage_changed(&outcome.storage_stats);
+        // Explicit transactions publish the same canonical event lane as
+        // automatic writes. Wake server long-polls only after the durable
+        // commit so readers never race a still-staged event. Suppressed
+        // internal replica transactions are excluded for the same reason as
+        // automatic sync-apply sessions.
+        if !self.session.sync_outbox_suppressed {
+            self.sync_mode.notify_sync_change();
+        }
         Ok(())
     }
 

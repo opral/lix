@@ -1,9 +1,9 @@
 use serde::Deserialize;
 
 use super::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, SyncAdmission, SyncBranch, SyncPullResponse,
-    SyncTransactionPack, SyncTransport, SyncTransportFuture, validate_sync_branch_id,
-    validate_sync_remote_id,
+    MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SyncAdmission, SyncBranch,
+    SyncPullResponse, SyncTransactionPack, SyncTransport, SyncTransportFuture,
+    validate_sync_branch_id, validate_sync_remote_id,
 };
 use crate::LixError;
 
@@ -55,7 +55,11 @@ impl HttpSyncTransport {
         validate_sync_remote_id(&repository_url)?;
         let protocol_url = format!("{repository_url}/lix/v1");
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            // Event pulls are mandatory long-polls. Leave a small margin for
+            // response framing and proxy jitter beyond the server heartbeat;
+            // a five-second client timeout would turn an idle connection into
+            // a reconnect storm.
+            .timeout(SYNC_LONG_POLL_TIMEOUT + std::time::Duration::from_secs(5))
             .build()
             .map_err(|error| transport_error("configure sync transport", error))?;
         let handshake_url = if let Some(active_branch_id) = active_branch_id {
@@ -95,6 +99,16 @@ impl HttpSyncTransport {
 
     pub(crate) fn branch_id(&self) -> &str {
         &self.branch_id
+    }
+
+    pub(crate) async fn close(self) -> Result<(), LixError> {
+        self.client
+            .delete(format!("{}/session", self.protocol_url))
+            .header(SESSION_HEADER, self.session_id)
+            .send()
+            .await
+            .map_err(|error| transport_error("close sync session", error))?;
+        Ok(())
     }
 }
 

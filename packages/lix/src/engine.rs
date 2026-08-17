@@ -116,9 +116,21 @@ where
     /// construction. Call this before `Engine::new(...)` for a brand-new
     /// storage.
     pub(crate) async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
+        Self::initialize_with_main_branch_id(storage, None).await
+    }
+
+    pub(crate) async fn initialize_with_main_branch_id(
+        storage: StorageImpl,
+        requested_main_branch_id: Option<&str>,
+    ) -> Result<InitReceipt, LixError> {
         let storage = StorageAdapter::new(storage);
 
-        crate::init::initialize(storage, &TrackedStateContext::new()).await
+        crate::init::initialize_with_main_branch_id(
+            storage,
+            &TrackedStateContext::new(),
+            requested_main_branch_id,
+        )
+        .await
     }
 
     /// Creates a clean DataFusion-first engine over an initialized storage.

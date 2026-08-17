@@ -72,6 +72,8 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::SYNC_REPLICA_CONFIG_SPACE,
     crate::sync::SYNC_CLIENT_PENDING_SPACE,
     crate::sync::SYNC_CLIENT_APPLIED_SPACE,
+    crate::sync::SYNC_CLIENT_FILE_PROJECTION_SPACE,
+    crate::sync::SYNC_HIDDEN_COMMIT_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The

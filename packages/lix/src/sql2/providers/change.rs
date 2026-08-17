@@ -161,8 +161,12 @@ where
         }
         ChangeScanRoute::All => {}
     }
-    let packed_changes =
-        crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
+    let hidden_commits = crate::sync::load_sync_hidden_commit_ids(&store).await?;
+    let packed_changes = crate::tracked_state::scan_change_records_from_commit_deltas_excluding_commits(
+        &store,
+        &hidden_commits,
+    )
+    .await?;
     let mut reader = ChangelogContext::new().reader(store.clone());
     let mut changes = packed_changes
         .into_iter()
@@ -184,6 +188,9 @@ where
     }
     let mut graph_reader = crate::commit_graph::CommitGraphContext::new().reader(store);
     for commit in graph_reader.all_nodes().await? {
+        if hidden_commits.contains(&commit.commit_id) {
+            continue;
+        }
         changes.push(LixChangeRow::DerivedCommit(
             crate::commit_graph::canonical_commit_change(&commit),
         ));
@@ -276,6 +283,12 @@ where
     let Some(commit_id) = change_id.as_commit_change() else {
         return Ok(None);
     };
+    if crate::sync::load_sync_hidden_commit_ids(&store)
+        .await?
+        .contains(&commit_id)
+    {
+        return Ok(None);
+    }
     let Some(commit) = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
         .load_node(&commit_id)
