@@ -17,7 +17,7 @@ export const Route = createFileRoute("/readme")({
     const title =
       "Lix README | Files, a SQL database, and version control in one repository";
     const description =
-      "Read how Lix gives AI products a repository: files for agents, a SQL database for your app, and version control over both.";
+      "The Lix README: files, a SQL database, and version control in one repository that you embed in your product.";
     const canonicalUrl = buildCanonicalUrl("/readme");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
