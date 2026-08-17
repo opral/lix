@@ -1,0 +1,20 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/subscript.rs
+role: upstream-input
+count: 3
+profiles: extras,gfm
+
+--- case 1 profile extras bytes 6
+H~2~O
+
+--- end
+--- case 2 profile gfm bytes 10
+~~H~2~O~~
+
+--- end
+--- case 3 profile extras bytes 10
+~~H~2~O~~
+
+--- end

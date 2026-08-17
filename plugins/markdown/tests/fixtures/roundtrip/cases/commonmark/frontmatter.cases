@@ -1,0 +1,106 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/frontmatter.rs
+role: upstream-input
+count: 21
+profiles: commonmark,frontmatter
+
+--- case 1 profile commonmark bytes 22
+---
+title: Jupyter
+---
+--- end
+--- case 2 profile frontmatter bytes 22
+---
+title: Jupyter
+---
+--- end
+--- case 3 profile frontmatter bytes 25
++++
+title = "Jupyter"
++++
+--- end
+--- case 4 profile frontmatter bytes 7
+---
+---
+--- end
+--- case 5 profile frontmatter bytes 6
+--
+---
+--- end
+--- case 6 profile frontmatter bytes 8
+----
+---
+--- end
+--- case 7 profile frontmatter bytes 6
+---
+--
+--- end
+--- case 8 profile frontmatter bytes 7
+---
+--
+
+--- end
+--- case 9 profile frontmatter bytes 8
+---
+----
+--- end
+--- case 10 profile frontmatter bytes 18
+---
+---
+## Neptune
+--- end
+--- case 11 profile frontmatter bytes 9
+--- 	
+---
+--- end
+--- case 12 profile frontmatter bytes 9
+---
+---	 
+--- end
+--- case 13 profile frontmatter bytes 11
+---
+---
+a
+b
+--- end
+--- case 14 profile frontmatter bytes 9
+--- a
+---
+--- end
+--- case 15 profile frontmatter bytes 9
+---
+--- b
+--- end
+--- case 16 profile frontmatter bytes 18
+## Neptune
+---
+---
+--- end
+--- case 17 profile frontmatter bytes 24
+> ---
+> ---
+> ## Neptune
+--- end
+--- case 18 profile frontmatter bytes 3
+---
+--- end
+--- case 19 profile frontmatter bytes 18
+---
+title: Neptune
+--- end
+--- case 20 profile frontmatter bytes 17
+---
+a
+
+b
+ 	
+c
+---
+--- end
+--- case 21 profile frontmatter bytes 12
+---
+a: b
+---
+--- end

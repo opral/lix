@@ -1,0 +1,39 @@
+Document
+  Paragraph
+    Underline
+      Text "underlined text"
+  Paragraph
+    Emphasis
+      Underline
+        Text "this"
+  Paragraph
+    Text "H"
+    Subscript
+      Text "2"
+    Text "O and e = mc"
+    Superscript
+      Text "2"
+    Text "."
+  Paragraph
+    Text "The "
+    Spoiler
+      Text "dog dies"
+    Text "."
+  Paragraph
+    Text "|"
+    Spoiler
+      Text "pipe wrapped"
+    Text "|"
+  Table
+    Alignments none,none
+    Row
+      Cell
+        Text "Text"
+      Cell
+        Text "Result"
+    Row
+      Cell
+        Code value="||literal||" raw="||literal||" fence=1
+      Cell
+        Spoiler
+          Text "visible"

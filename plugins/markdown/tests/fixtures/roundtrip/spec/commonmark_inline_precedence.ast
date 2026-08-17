@@ -1,0 +1,17 @@
+Document
+  Paragraph
+    Text "*"
+    Link destination=/uri title=none
+      Text "foo*"
+  Paragraph
+    Link destination=baz* title=none
+      Text "foo *bar"
+  Paragraph
+    Text "[foo "
+    HtmlInline "<bar attr=\"](baz)\">"
+  Paragraph
+    Text "[foo"
+    Code value="](/uri)" raw="](/uri)" fence=1
+  Paragraph
+    Text "[foo"
+    Autolink "http://example.com/?search=](uri)" kind=angle

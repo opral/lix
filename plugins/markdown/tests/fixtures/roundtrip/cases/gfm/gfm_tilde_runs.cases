@@ -1,0 +1,17 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/strikethrough.rs
+role: upstream-input
+count: 3
+profiles: gfm
+
+--- case 1 profile gfm bytes 17
+~one~ and ~~two~~
+--- end
+--- case 2 profile gfm bytes 9
+~~~not~~~
+--- end
+--- case 3 profile gfm bytes 33
+This ~text~~~~~ is ~~~~~curious~.
+--- end

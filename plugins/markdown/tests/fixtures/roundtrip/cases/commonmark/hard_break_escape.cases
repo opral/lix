@@ -1,0 +1,38 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/hard_break_escape.rs
+role: upstream-input
+count: 8
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 8
+foo\
+baz
+--- end
+--- case 2 profile commonmark bytes 13
+foo\
+     bar
+--- end
+--- case 3 profile commonmark bytes 10
+*foo\
+bar*
+--- end
+--- case 4 profile commonmark bytes 14
+``code\
+text``
+--- end
+--- case 5 profile commonmark bytes 4
+foo\
+--- end
+--- case 6 profile commonmark bytes 8
+### foo\
+--- end
+--- case 7 profile commonmark bytes 4
+a\
+b
+--- end
+--- case 8 profile commonmark bytes 5
+a\
+b.
+--- end

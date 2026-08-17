@@ -1,0 +1,192 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: frontmatter
+count: 20
+
+--- case 1 options - label-bytes 41 input-bytes 22 expected-bytes 30
+should not support frontmatter by default
+--- input
+---
+title: Jupyter
+---
+--- expected
+<hr />
+<h2>title: Jupyter</h2>
+--- end
+--- case 2 options frontmatter label-bytes 33 input-bytes 22 expected-bytes 0
+should support frontmatter (yaml)
+--- input
+---
+title: Jupyter
+---
+--- expected
+
+--- end
+--- case 3 options frontmatter label-bytes 33 input-bytes 25 expected-bytes 0
+should support frontmatter (toml)
+--- input
++++
+title = "Jupyter"
++++
+--- expected
+
+--- end
+--- case 4 options frontmatter label-bytes 32 input-bytes 7 expected-bytes 0
+should support empty frontmatter
+--- input
+---
+---
+--- expected
+
+--- end
+--- case 5 options frontmatter label-bytes 48 input-bytes 6 expected-bytes 11
+should not support 2 markers in an opening fence
+--- input
+--
+---
+--- expected
+<h2>--</h2>
+--- end
+--- case 6 options frontmatter label-bytes 48 input-bytes 8 expected-bytes 13
+should not support 4 markers in an opening fence
+--- input
+----
+---
+--- expected
+<hr />
+<hr />
+--- end
+--- case 7 options frontmatter label-bytes 47 input-bytes 6 expected-bytes 16
+should not support 2 markers in a closing fence
+--- input
+---
+--
+--- expected
+<hr />
+<p>--</p>
+--- end
+--- case 8 options frontmatter label-bytes 56 input-bytes 7 expected-bytes 17
+should not panic if newline after 2 marker closing fence
+--- input
+---
+--
+
+--- expected
+<hr />
+<p>--</p>
+
+--- end
+--- case 9 options frontmatter label-bytes 47 input-bytes 8 expected-bytes 13
+should not support 4 markers in a closing fence
+--- input
+---
+----
+--- expected
+<hr />
+<hr />
+--- end
+--- case 10 options frontmatter label-bytes 40 input-bytes 18 expected-bytes 16
+should support content after frontmatter
+--- input
+---
+---
+## Neptune
+--- expected
+<h2>Neptune</h2>
+--- end
+--- case 11 options frontmatter label-bytes 50 input-bytes 9 expected-bytes 0
+should support spaces and tabs after opening fence
+--- input
+--- 	
+---
+--- expected
+
+--- end
+--- case 12 options frontmatter label-bytes 50 input-bytes 9 expected-bytes 0
+should support spaces and tabs after closing fence
+--- input
+---
+---	 
+--- expected
+
+--- end
+--- case 13 options frontmatter label-bytes 45 input-bytes 11 expected-bytes 10
+should support line endings after frontmatter
+--- input
+---
+---
+a
+b
+--- expected
+<p>a
+b</p>
+--- end
+--- case 14 options frontmatter label-bytes 46 input-bytes 9 expected-bytes 14
+should not support content after opening fence
+--- input
+--- a
+---
+--- expected
+<h2>--- a</h2>
+--- end
+--- case 15 options frontmatter label-bytes 46 input-bytes 9 expected-bytes 19
+should not support content after closing fence
+--- input
+---
+--- b
+--- expected
+<hr />
+<p>--- b</p>
+--- end
+--- case 16 options frontmatter label-bytes 44 input-bytes 18 expected-bytes 30
+should not support frontmatter after content
+--- input
+## Neptune
+---
+---
+--- expected
+<h2>Neptune</h2>
+<hr />
+<hr />
+--- end
+--- case 17 options frontmatter label-bytes 45 input-bytes 24 expected-bytes 57
+should not support frontmatter in a container
+--- input
+> ---
+> ---
+> ## Neptune
+--- expected
+<blockquote>
+<hr />
+<hr />
+<h2>Neptune</h2>
+</blockquote>
+--- end
+--- case 18 options frontmatter label-bytes 40 input-bytes 3 expected-bytes 6
+should not support just an opening fence
+--- input
+---
+--- expected
+<hr />
+--- end
+--- case 19 options frontmatter label-bytes 42 input-bytes 18 expected-bytes 28
+should not support a missing closing fence
+--- input
+---
+title: Neptune
+--- expected
+<hr />
+<p>title: Neptune</p>
+--- end
+--- case 20 options frontmatter label-bytes 41 input-bytes 17 expected-bytes 0
+should support blank lines in frontmatter
+--- input
+---
+a
+
+b
+ 	
+c
+---
+--- expected
+
+--- end

@@ -1,0 +1,30 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: tasklist
+count: 2
+
+--- case 1 options extension.tasklist label-bytes 27 input-bytes 10 expected-bytes 28
+tasklist_relaxed_regression
+--- input
+* [!] Red
+
+--- expected
+<ul>
+<li>[!] Red</li>
+</ul>
+
+--- end
+--- case 2 options render.r#unsafe,extension.tasklist label-bytes 11 input-bytes 83 expected-bytes 252
+tasklist_32
+--- input
+- [ ] List item 1
+- [ ] This list item is **bold**
+- [x] There is some `code` here
+
+--- expected
+<ul>
+<li><input type="checkbox" disabled="" /> List item 1</li>
+<li><input type="checkbox" disabled="" /> This list item is <strong>bold</strong></li>
+<li><input type="checkbox" checked="" disabled="" /> There is some <code>code</code> here</li>
+</ul>
+
+--- end

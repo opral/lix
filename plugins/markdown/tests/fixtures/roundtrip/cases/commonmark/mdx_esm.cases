@@ -1,0 +1,224 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/mdx_esm.rs
+role: upstream-input
+count: 53
+profiles: mdx
+
+--- case 1 profile mdx bytes 20
+import a from 'b'
+
+c
+--- end
+--- case 2 profile mdx bytes 19
+export default a
+
+b
+--- end
+--- case 3 profile mdx bytes 10
+impossible
+--- end
+--- case 4 profile mdx bytes 9
+exporting
+--- end
+--- case 5 profile mdx bytes 7
+import.
+--- end
+--- case 6 profile mdx bytes 11
+import('a')
+--- end
+--- case 7 profile mdx bytes 38
+- import a from 'b'
+> export default c
+--- end
+--- case 8 profile mdx bytes 34
+import a from 'b'
+export default c
+--- end
+--- case 9 profile mdx bytes 35
+import a from 'b'
+
+export default c
+--- end
+--- case 10 profile mdx bytes 41
+a
+
+import a from 'b'
+
+b
+
+export default c
+--- end
+--- case 11 profile mdx bytes 39
+a
+import a from 'b'
+
+b
+export default c
+--- end
+--- case 12 profile mdx bytes 8
+import a
+--- end
+--- case 13 profile mdx bytes 10
+import 1/1
+--- end
+--- case 14 profile mdx bytes 26
+export {
+  a
+} from 'b'
+
+c
+--- end
+--- case 15 profile mdx bytes 28
+export {
+
+  a
+
+} from 'b'
+
+c
+--- end
+--- case 16 profile mdx bytes 23
+import a from 'b'
+*md*?
+--- end
+--- case 17 profile mdx bytes 32
+export var a = 1
+// b
+/* c */
+
+d
+--- end
+--- case 18 profile mdx bytes 25
+export var a = 1
+var b
+
+c
+--- end
+--- case 19 profile mdx bytes 15
+import ('a')
+
+b
+--- end
+--- case 20 profile mdx bytes 31
+import a from 'b'
+export {a}
+
+c
+--- end
+--- case 21 profile mdx bytes 33
+import a from 'b';
+export {a};
+
+c
+--- end
+--- case 22 profile mdx bytes 42
+import a from 'b'
+export {a as default}
+
+c
+--- end
+--- case 23 profile mdx bytes 26
+export var a = () => <b />
+--- end
+--- case 24 profile mdx bytes 11
+export {a}
+
+--- end
+--- case 25 profile mdx bytes 32
+import a from 'b'
+
+export {a}
+
+c
+--- end
+--- case 26 profile mdx bytes 34
+import a from 'b'
+
+export {a}
+
+# c
+--- end
+--- case 27 profile mdx bytes 28
+import a from 'b'
+export {a}
+--- end
+--- case 28 profile mdx bytes 17
+import a from "b"
+--- end
+--- case 29 profile mdx bytes 22
+import * as a from "b"
+--- end
+--- case 30 profile mdx bytes 19
+import {a} from "b"
+--- end
+--- case 31 profile mdx bytes 24
+import {a as b} from "c"
+--- end
+--- case 32 profile mdx bytes 27
+import a, {b as c} from "d"
+--- end
+--- case 33 profile mdx bytes 25
+import a, * as b from "c"
+--- end
+--- case 34 profile mdx bytes 10
+import "a"
+--- end
+--- case 35 profile mdx bytes 17
+export var a = ""
+--- end
+--- case 36 profile mdx bytes 19
+export const a = ""
+--- end
+--- case 37 profile mdx bytes 17
+export let a = ""
+--- end
+--- case 38 profile mdx bytes 15
+export var a, b
+--- end
+--- case 39 profile mdx bytes 27
+export var a = "a", b = "b"
+--- end
+--- case 40 profile mdx bytes 22
+export function a() {}
+--- end
+--- case 41 profile mdx bytes 17
+export class a {}
+--- end
+--- case 42 profile mdx bytes 19
+export var {a} = {}
+--- end
+--- case 43 profile mdx bytes 22
+export var {a: b} = {}
+--- end
+--- case 44 profile mdx bytes 19
+export var [a] = []
+--- end
+--- case 45 profile mdx bytes 20
+export default a = 1
+--- end
+--- case 46 profile mdx bytes 30
+export default function a() {}
+--- end
+--- case 47 profile mdx bytes 25
+export default class a {}
+--- end
+--- case 48 profile mdx bytes 17
+export * from "a"
+--- end
+--- case 49 profile mdx bytes 22
+export * as a from "b"
+--- end
+--- case 50 profile mdx bytes 19
+export {a} from "b"
+--- end
+--- case 51 profile mdx bytes 24
+export {a as b} from "c"
+--- end
+--- case 52 profile mdx bytes 25
+export {default} from "b"
+--- end
+--- case 53 profile mdx bytes 33
+export {default as a, b} from "c"
+--- end

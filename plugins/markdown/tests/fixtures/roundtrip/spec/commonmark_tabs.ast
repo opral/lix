@@ -1,0 +1,14 @@
+Document
+  CodeBlock kind=indented info=none
+    Value "foo\nbar\n# x\n> x\n- x\n---\n```\n<div>\n	x"
+  Heading depth=1 kind=atx
+    Text "Foo"
+  CodeBlock kind=indented info=none
+    Value "> x"
+  ThematicBreak
+  CodeBlock kind=fenced info="x	y"
+    Value ""
+  Paragraph
+    Text "Text "
+    HtmlInline "<x	y	z	=	\"	x	\">"
+    Text "."

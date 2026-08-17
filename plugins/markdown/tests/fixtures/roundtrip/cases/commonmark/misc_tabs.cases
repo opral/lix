@@ -1,0 +1,151 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/misc_tabs.rs
+role: upstream-input
+count: 44
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 5
+    x
+--- end
+--- case 2 profile commonmark bytes 2
+	x
+--- end
+--- case 3 profile commonmark bytes 3
+ 	x
+--- end
+--- case 4 profile commonmark bytes 4
+  	x
+--- end
+--- case 5 profile commonmark bytes 5
+   	x
+--- end
+--- case 6 profile commonmark bytes 6
+    	x
+--- end
+--- case 7 profile commonmark bytes 7
+   	# x
+--- end
+--- case 8 profile commonmark bytes 7
+   	> x
+--- end
+--- case 9 profile commonmark bytes 7
+   	- x
+--- end
+--- case 10 profile commonmark bytes 7
+   	---
+--- end
+--- case 11 profile commonmark bytes 7
+   	```
+--- end
+--- case 12 profile commonmark bytes 9
+   	<div>
+--- end
+--- case 13 profile commonmark bytes 6
+#	x	#	
+--- end
+--- case 14 profile commonmark bytes 9
+#		x		#		
+--- end
+--- case 15 profile commonmark bytes 13
+```	x	y	
+```	
+--- end
+--- case 16 profile commonmark bytes 17
+```		x		y		
+```		
+--- end
+--- case 17 profile commonmark bytes 9
+```x
+	```
+--- end
+--- case 18 profile commonmark bytes 15
+<x	y	z	=	"	x	">
+--- end
+--- case 19 profile commonmark bytes 6
+*	*	*	
+--- end
+--- case 20 profile commonmark bytes 9
+*		*		*		
+--- end
+--- case 21 profile commonmark bytes 8
+<http:	>
+--- end
+--- case 22 profile commonmark bytes 9
+<http:x	>
+--- end
+--- case 23 profile commonmark bytes 16
+<example	@x.com>
+--- end
+--- case 24 profile commonmark bytes 17
+<example@x	y.com>
+--- end
+--- case 25 profile commonmark bytes 3
+\	x
+--- end
+--- case 26 profile commonmark bytes 4
+&#9;
+--- end
+--- case 27 profile commonmark bytes 4
+`	x`
+--- end
+--- case 28 profile commonmark bytes 4
+`x	`
+--- end
+--- case 29 profile commonmark bytes 5
+`	x	`
+--- end
+--- case 30 profile commonmark bytes 5
+`	x `
+--- end
+--- case 31 profile commonmark bytes 5
+` x	`
+--- end
+--- case 32 profile commonmark bytes 4
+x	
+y
+--- end
+--- case 33 profile commonmark bytes 4
+x
+	y
+--- end
+--- case 34 profile commonmark bytes 8
+x[	y](z)
+--- end
+--- case 35 profile commonmark bytes 8
+x[y	](z)
+--- end
+--- case 36 profile commonmark bytes 8
+[x	y](z)
+--- end
+--- case 37 profile commonmark bytes 7
+[x](	y)
+--- end
+--- case 38 profile commonmark bytes 7
+[x](y	)
+--- end
+--- case 39 profile commonmark bytes 10
+[x](y	"z")
+--- end
+--- case 40 profile commonmark bytes 6
+```
+	x
+--- end
+--- case 41 profile commonmark bytes 7
+ ```
+	x
+--- end
+--- case 42 profile commonmark bytes 8
+  ```
+	x
+--- end
+--- case 43 profile commonmark bytes 9
+   ```
+	x
+--- end
+--- case 44 profile commonmark bytes 7
+-	a
+
+	b
+--- end

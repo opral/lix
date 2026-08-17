@@ -1,0 +1,25 @@
+Document
+  DescriptionList tight=false
+    Item
+      Term
+        Emphasis
+          Text "apple"
+      Details
+        Paragraph
+          Text "red fruit"
+        Paragraph
+          Text "contains seeds,"
+          SoftBreak
+          Text "crisp, pleasant to taste"
+    Item
+      Term
+        Emphasis
+          Text "orange"
+      Details
+        Paragraph
+          Text "orange fruit"
+        CodeBlock kind=indented info=none
+          Value "{ orange code block }"
+        BlockQuote
+          Paragraph
+            Text "orange block quote"

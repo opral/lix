@@ -1,0 +1,38 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/alerts.rs
+role: upstream-input
+count: 6
+profiles: extras
+
+--- case 1 profile extras bytes 26
+> [!note]
+> Pay attention
+
+--- end
+--- case 2 profile extras bytes 29
+>>> [!note]
+Pay attention
+>>>
+--- end
+--- case 3 profile extras bytes 42
+- item one
+
+  > [!note]
+  > Pay attention
+
+--- end
+--- case 4 profile extras bytes 30
+>>> [!note]
+Pay attention
+>>>
+
+--- end
+--- case 5 profile extras bytes 10
+> [!note]
+
+--- end
+--- case 6 profile extras bytes 9
+> [!note]
+--- end

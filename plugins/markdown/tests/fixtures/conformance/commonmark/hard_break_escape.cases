@@ -1,0 +1,53 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: hard_break_escape
+count: 6
+
+--- case 1 options - label-bytes 47 input-bytes 8 expected-bytes 20
+should support a backslash to form a hard break
+--- input
+foo\
+baz
+--- expected
+<p>foo<br />
+baz</p>
+--- end
+--- case 2 options - label-bytes 56 input-bytes 13 expected-bytes 20
+should support leading spaces after an escape hard break
+--- input
+foo\
+     bar
+--- expected
+<p>foo<br />
+bar</p>
+--- end
+--- case 3 options - label-bytes 45 input-bytes 10 expected-bytes 29
+should support escape hard breaks in emphasis
+--- input
+*foo\
+bar*
+--- expected
+<p><em>foo<br />
+bar</em></p>
+--- end
+--- case 4 options - label-bytes 45 input-bytes 14 expected-bytes 30
+should not support escape hard breaks in code
+--- input
+``code\
+text``
+--- expected
+<p><code>code\ text</code></p>
+--- end
+--- case 5 options - label-bytes 63 input-bytes 4 expected-bytes 11
+should not support escape hard breaks at the end of a paragraph
+--- input
+foo\
+--- expected
+<p>foo\</p>
+--- end
+--- case 6 options - label-bytes 61 input-bytes 8 expected-bytes 13
+should not support escape hard breaks at the end of a heading
+--- input
+### foo\
+--- expected
+<h3>foo\</h3>
+--- end

@@ -1,0 +1,12 @@
+Document
+  Heading depth=1 kind=atx
+    Text "Title"
+  Paragraph
+    Text "Hello "
+    Emphasis
+      Text "world"
+    Text " and "
+    Strong
+      Text "friends"
+    Text "."
+

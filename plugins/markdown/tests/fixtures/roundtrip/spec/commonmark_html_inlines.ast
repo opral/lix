@@ -1,0 +1,15 @@
+Document
+  Paragraph
+    Text "Text "
+    HtmlInline "<!-- ok -->"
+    Text " "
+    HtmlInline "<?pi?>"
+    Text " "
+    HtmlInline "<!X>"
+    Text " "
+    HtmlInline "<![CDATA[x<y]]>"
+    Text " "
+    HtmlInline "<span data-x='1' data:y=ok empty>"
+    Text "ok"
+    HtmlInline "</span>"
+    Text " and <span a=`bad>no."

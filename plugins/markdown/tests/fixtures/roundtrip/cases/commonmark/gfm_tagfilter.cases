@@ -1,0 +1,68 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/gfm_tagfilter.rs
+role: upstream-input
+count: 5
+profiles: gfm
+
+--- case 1 profile gfm bytes 8
+<iframe>
+--- end
+--- case 2 profile gfm bytes 14
+a <i>
+<script>
+--- end
+--- case 3 profile gfm bytes 9
+<iframe
+>
+--- end
+--- case 4 profile gfm bytes 6
+<div
+>
+--- end
+--- case 5 profile gfm bytes 897
+
+<title>
+
+<div title="<title>"></div>
+
+<span title="<title>"></span>
+
+<div><title></title></div>
+
+<span><title></title></span>
+
+<b><textarea></textarea></b>
+
+<script/src="#">
+
+<SCRIPT SRC=http://xss.rocks/xss.js></SCRIPT>
+
+<IMG SRC="javascript:alert('XSS');">
+
+<IMG SRC=javascript:alert('XSS')>
+
+<IMG SRC=`javascript:alert("RSnake says, 'XSS'")`>
+
+<IMG """><SCRIPT>alert("XSS")</SCRIPT>"\>
+
+<SCRIPT/XSS SRC="http://xss.rocks/xss.js"></SCRIPT>
+
+<BODY onload!#$%&()*~+-_.,:;?@[/|\]^`=alert("XSS")>
+
+<<SCRIPT>alert("XSS");//\<</SCRIPT>
+
+<SCRIPT SRC=http://xss.rocks/xss.js?< B >
+
+<SCRIPT SRC=//xss.rocks/.j>
+
+</TITLE><SCRIPT>alert("XSS");</SCRIPT>
+
+<STYLE>li {list-style-image: url("javascript:alert('XSS')");}</STYLE><UL><LI>XSS</br>
+
+javascript:/*--></title></style></textarea></script></xmp><svg/onload='+/"/+/onmouseover=1/+/[*/[]/+alert(1)//'>
+
+<STYLE>@import'http://xss.rocks/xss.css';</STYLE>
+
+--- end

@@ -1,0 +1,13 @@
+Document
+  Paragraph
+    Code value="foo ` bar" raw=" foo ` bar " fence=2
+    SoftBreak
+    Code value="foo bar" raw="\nfoo\nbar\n" fence=2
+    SoftBreak
+    Code value=" both " raw="  both  " fence=1
+    SoftBreak
+    Code value="`code`" raw=" `code` " fence=2
+  Paragraph
+    Code value="``" raw=" `` " fence=3
+  Paragraph
+    Code value="a``b" raw="a``b" fence=3

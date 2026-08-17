@@ -1,0 +1,275 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: image
+count: 34
+
+--- case 1 options - label-bytes 20 input-bytes 20 expected-bytes 44
+should support links
+--- input
+[link](/uri "title")
+--- expected
+<p><a href="/uri" title="title">link</a></p>
+--- end
+--- case 2 options - label-bytes 32 input-bytes 20 expected-bytes 49
+should support image w/ resource
+--- input
+![foo](/url "title")
+--- expected
+<p><img src="/url" alt="foo" title="title" /></p>
+--- end
+--- case 3 options - label-bytes 42 input-bytes 53 expected-bytes 71
+should support image as shortcut reference
+--- input
+[foo *bar*]: train.jpg "train & tracks"
+
+![foo *bar*]
+--- expected
+<p><img src="train.jpg" alt="foo bar" title="train &amp; tracks" /></p>
+--- end
+--- case 4 options - label-bytes 37 input-bytes 26 expected-bytes 40
+should “support” images in images
+--- input
+![foo ![bar](/url)](/url2)
+--- expected
+<p><img src="/url2" alt="foo bar" /></p>
+--- end
+--- case 5 options - label-bytes 36 input-bytes 25 expected-bytes 40
+should “support” links in images
+--- input
+![foo [bar](/url)](/url2)
+--- expected
+<p><img src="/url2" alt="foo bar" /></p>
+--- end
+--- case 6 options - label-bytes 38 input-bytes 55 expected-bytes 71
+should support “content” in images
+--- input
+[foo *bar*]: train.jpg "train & tracks"
+
+![foo *bar*][]
+--- expected
+<p><img src="train.jpg" alt="foo bar" title="train &amp; tracks" /></p>
+--- end
+--- case 7 options - label-bytes 38 input-bytes 58 expected-bytes 71
+should support “content” in images
+--- input
+[FOOBAR]: train.jpg "train & tracks"
+
+![foo *bar*][foobar]
+--- expected
+<p><img src="train.jpg" alt="foo bar" title="train &amp; tracks" /></p>
+--- end
+--- case 8 options - label-bytes 31 input-bytes 17 expected-bytes 40
+should support images w/o title
+--- input
+![foo](train.jpg)
+--- expected
+<p><img src="train.jpg" alt="foo" /></p>
+--- end
+--- case 9 options - label-bytes 43 input-bytes 45 expected-bytes 70
+should support images w/ lots of whitespace
+--- input
+My ![foo bar](/path/to/train.jpg  "title"   )
+--- expected
+<p>My <img src="/path/to/train.jpg" alt="foo bar" title="title" /></p>
+--- end
+--- case 10 options - label-bytes 46 input-bytes 13 expected-bytes 34
+should support images w/ enclosed destinations
+--- input
+![foo](<url>)
+--- expected
+<p><img src="url" alt="foo" /></p>
+--- end
+--- case 11 options - label-bytes 37 input-bytes 9 expected-bytes 32
+should support images w/ empty labels
+--- input
+![](/url)
+--- expected
+<p><img src="/url" alt="" /></p>
+--- end
+--- case 12 options - label-bytes 34 input-bytes 24 expected-bytes 35
+should support full references (1)
+--- input
+[bar]: /url
+
+![foo][bar]
+--- expected
+<p><img src="/url" alt="foo" /></p>
+--- end
+--- case 13 options - label-bytes 34 input-bytes 24 expected-bytes 35
+should support full references (2)
+--- input
+[BAR]: /url
+
+![foo][bar]
+--- expected
+<p><img src="/url" alt="foo" /></p>
+--- end
+--- case 14 options - label-bytes 39 input-bytes 29 expected-bytes 49
+should support collapsed references (1)
+--- input
+[foo]: /url "title"
+
+![foo][]
+--- expected
+<p><img src="/url" alt="foo" title="title" /></p>
+--- end
+--- case 15 options - label-bytes 39 input-bytes 41 expected-bytes 53
+should support collapsed references (2)
+--- input
+[*foo* bar]: /url "title"
+
+![*foo* bar][]
+--- expected
+<p><img src="/url" alt="foo bar" title="title" /></p>
+--- end
+--- case 16 options - label-bytes 38 input-bytes 29 expected-bytes 49
+should support case-insensitive labels
+--- input
+[foo]: /url "title"
+
+![Foo][]
+--- expected
+<p><img src="/url" alt="Foo" title="title" /></p>
+--- end
+--- case 17 options - label-bytes 54 input-bytes 31 expected-bytes 52
+should not support whitespace between sets of brackets
+--- input
+[foo]: /url "title"
+
+![foo] 
+[]
+--- expected
+<p><img src="/url" alt="foo" title="title" />
+[]</p>
+--- end
+--- case 18 options - label-bytes 38 input-bytes 27 expected-bytes 49
+should support shortcut references (1)
+--- input
+[foo]: /url "title"
+
+![foo]
+--- expected
+<p><img src="/url" alt="foo" title="title" /></p>
+--- end
+--- case 19 options - label-bytes 38 input-bytes 39 expected-bytes 53
+should support shortcut references (2)
+--- input
+[*foo* bar]: /url "title"
+
+![*foo* bar]
+--- expected
+<p><img src="/url" alt="foo bar" title="title" /></p>
+--- end
+--- case 20 options - label-bytes 52 input-bytes 31 expected-bytes 54
+should not support link labels w/ unescaped brackets
+--- input
+[[foo]]: /url "title"
+
+![[foo]]
+--- expected
+<p>[[foo]]: /url &quot;title&quot;</p>
+<p>![[foo]]</p>
+--- end
+--- case 21 options - label-bytes 46 input-bytes 27 expected-bytes 49
+should support case-insensitive label matching
+--- input
+[foo]: /url "title"
+
+![Foo]
+--- expected
+<p><img src="/url" alt="Foo" title="title" /></p>
+--- end
+--- case 22 options - label-bytes 59 input-bytes 28 expected-bytes 13
+should “support” an escaped bracket instead of an image
+--- input
+[foo]: /url "title"
+
+!\[foo]
+--- expected
+<p>![foo]</p>
+--- end
+--- case 23 options - label-bytes 73 input-bytes 28 expected-bytes 44
+should support an escaped bang instead of an image, but still have a link
+--- input
+[foo]: /url "title"
+
+\![foo]
+--- expected
+<p>!<a href="/url" title="title">foo</a></p>
+--- end
+--- case 24 options - label-bytes 37 input-bytes 8 expected-bytes 31
+should support images w/o destination
+--- input
+![foo]()
+--- expected
+<p><img src="" alt="foo" /></p>
+--- end
+--- case 25 options - label-bytes 51 input-bytes 10 expected-bytes 31
+should support images w/ explicit empty destination
+--- input
+![foo](<>)
+--- expected
+<p><img src="" alt="foo" /></p>
+--- end
+--- case 26 options - label-bytes 29 input-bytes 16 expected-bytes 39
+should support images w/o alt
+--- input
+![](example.png)
+--- expected
+<p><img src="example.png" alt="" /></p>
+--- end
+--- case 27 options - label-bytes 40 input-bytes 22 expected-bytes 42
+should support images w/ empty title (1)
+--- input
+![alpha](bravo.png "")
+--- expected
+<p><img src="bravo.png" alt="alpha" /></p>
+--- end
+--- case 28 options - label-bytes 40 input-bytes 22 expected-bytes 42
+should support images w/ empty title (2)
+--- input
+![alpha](bravo.png '')
+--- expected
+<p><img src="bravo.png" alt="alpha" /></p>
+--- end
+--- case 29 options - label-bytes 40 input-bytes 22 expected-bytes 42
+should support images w/ empty title (3)
+--- input
+![alpha](bravo.png ())
+--- expected
+<p><img src="bravo.png" alt="alpha" /></p>
+--- end
+--- case 30 options - label-bytes 45 input-bytes 56 expected-bytes 89
+should support character references in images
+--- input
+![&amp;&copy;&](example.com/&amp;&copy;& "&amp;&copy;&")
+--- expected
+<p><img src="example.com/&amp;%C2%A9&amp;" alt="&amp;©&amp;" title="&amp;©&amp;" /></p>
+--- end
+--- case 31 options - label-bytes 28 input-bytes 10 expected-bytes 28
+should ignore an empty title
+--- input
+![](<> "")
+--- expected
+<p><img src="" alt="" /></p>
+--- end
+--- case 32 options - label-bytes 43 input-bytes 24 expected-bytes 28
+should ignore non-http protocols by default
+--- input
+![](javascript:alert(1))
+--- expected
+<p><img src="" alt="" /></p>
+--- end
+--- case 33 options allow_dangerous_protocol label-bytes 59 input-bytes 24 expected-bytes 47
+should allow non-http protocols w/ `allowDangerousProtocol`
+--- input
+![](javascript:alert(1))
+--- expected
+<p><img src="javascript:alert(1)" alt="" /></p>
+--- end
+--- case 34 options allow_dangerous_protocol,allow_any_img_src label-bytes 67 input-bytes 24 expected-bytes 47
+should allow non-http protocols with the `allow_any_img_src` option
+--- input
+![](javascript:alert(1))
+--- expected
+<p><img src="javascript:alert(1)" alt="" /></p>
+--- end

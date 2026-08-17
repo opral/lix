@@ -1,0 +1,33 @@
+Document
+  Paragraph
+    Link destination=/uri title=none
+      Text "link "
+      Emphasis
+        Text "foo "
+        Strong
+          Text "bar"
+        Text " "
+        Code value="#" raw="#" fence=1
+  Paragraph
+    Link destination=/uri title=none
+      Image destination=moon.jpg title=none
+        Text "moon"
+  Paragraph
+    Text "[foo "
+    Link destination=/inner title=none
+      Text "bar"
+    Text "](/outer)"
+  Paragraph
+    Text "[foo "
+    Emphasis
+      Text "[bar "
+      Link destination=/inner title=none
+        Text "baz"
+      Text "](/middle)"
+    Text "](/outer)"
+  Paragraph
+    Image destination=uri3 title=none
+      Text "["
+      Link destination=uri1 title=none
+        Text "foo"
+      Text "](uri2)"

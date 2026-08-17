@@ -1,0 +1,5 @@
+Document
+  MdxEsm "import a from 'b'\nexport {\n  a\n} from 'b'"
+  MdxEsm "export var c = 1\n// comment\n/* block */"
+  Heading depth=1 kind=atx
+    Text "After"

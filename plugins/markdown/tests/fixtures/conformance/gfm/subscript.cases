@@ -1,0 +1,31 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: subscript
+count: 3
+
+--- case 1 options extension.subscript label-bytes 9 input-bytes 6 expected-bytes 22
+subscript
+--- input
+H~2~O
+
+--- expected
+<p>H<sub>2</sub>O</p>
+
+--- end
+--- case 2 options extension.subscript,extension.strikethrough label-bytes 27 input-bytes 10 expected-bytes 33
+strikethrough_and_subscript
+--- input
+~~H~2~O~~
+
+--- expected
+<p><del>H<sub>2</sub>O</del></p>
+
+--- end
+--- case 3 options extension.subscript label-bytes 36 input-bytes 10 expected-bytes 26
+no_strikethrough_when_only_subscript
+--- input
+~~H~2~O~~
+
+--- expected
+<p>~~H<sub>2</sub>O~~</p>
+
+--- end

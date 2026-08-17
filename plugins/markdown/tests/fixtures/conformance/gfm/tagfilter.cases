@@ -1,0 +1,16 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: tagfilter
+count: 1
+
+--- case 1 options render.r#unsafe,extension.tagfilter label-bytes 9 input-bytes 19 expected-bytes 31
+tagfilter
+--- input
+hi <xmp> ok
+
+<xmp>
+
+--- expected
+<p>hi &lt;xmp> ok</p>
+&lt;xmp>
+
+--- end

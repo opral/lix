@@ -1,0 +1,17 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: alerts
+count: 1
+
+--- case 1 options extension.alerts label-bytes 6 input-bytes 26 expected-bytes 118
+alerts
+--- input
+> [!note]
+> Pay attention
+
+--- expected
+<div class="markdown-alert markdown-alert-note">
+<p class="markdown-alert-title">Note</p>
+<p>Pay attention</p>
+</div>
+
+--- end

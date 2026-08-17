@@ -1,0 +1,40 @@
+Document
+  Paragraph
+    Text "!\"#$%&'()*+,-./:;<=>?@[]^_`{|}~"
+  Paragraph
+    Text "\\→\\A\\a\\ \\3\\φ\\«"
+  Paragraph
+    Text "*not emphasized*"
+    SoftBreak
+    Text "<br/> not a tag"
+    SoftBreak
+    Text "[not a link](/foo)"
+    SoftBreak
+    Text "`not code`"
+    SoftBreak
+    Text "1. not a list"
+    SoftBreak
+    Text "* not a list"
+    SoftBreak
+    Text "# not a heading"
+    SoftBreak
+    Text "[foo]: /url \"not a reference\""
+    SoftBreak
+    Text "&ouml; not a character entity"
+  Paragraph
+    Text "foo"
+    LineBreak kind=backslash
+    Text "bar"
+  Paragraph
+    Code value="\\[\\`" raw=" \\[\\` " fence=2
+  CodeBlock kind=indented info=none
+    Value "\\[\\]"
+  Paragraph
+    Link destination=/bar* title="ti*tle"
+      Text "foo"
+  Definition label=bar destination=/bar* title="ti*tle"
+  Paragraph
+    LinkReference identifier=bar
+      Text "bar"
+  CodeBlock kind=fenced info="foo+bar"
+    Value "body"

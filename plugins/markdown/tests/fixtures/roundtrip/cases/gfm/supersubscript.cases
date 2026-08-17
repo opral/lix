@@ -1,0 +1,24 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/supersubscript.rs
+role: upstream-input
+count: 4
+profiles: extras
+
+--- case 1 profile extras bytes 11
+e = mc^2^.
+
+--- end
+--- case 2 profile extras bytes 12
+i^-2^ = -1.
+
+--- end
+--- case 3 profile extras bytes 28
+f~i~ = f~i - 2~ + f~i - 1~.
+
+--- end
+--- case 4 profile extras bytes 30
+f~i~ = f~-2 + i~ + f~-1 + i~.
+
+--- end

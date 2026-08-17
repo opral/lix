@@ -1,0 +1,526 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: autolink
+count: 63
+
+--- case 1 options extension.autolink label-bytes 12 input-bytes 17 expected-bytes 62
+autolink_www
+--- input
+www.autolink.com
+
+--- expected
+<p><a href="http://www.autolink.com">www.autolink.com</a></p>
+
+--- end
+--- case 2 options extension.autolink label-bytes 14 input-bytes 15 expected-bytes 58
+autolink_email
+--- input
+john@smith.com
+
+--- expected
+<p><a href="mailto:john@smith.com">john@smith.com</a></p>
+
+--- end
+--- case 3 options extension.autolink label-bytes 15 input-bytes 51 expected-bytes 99
+autolink_scheme
+--- input
+https://google.com/search
+rdar://localhost.com/blah
+--- expected
+<p><a href="https://google.com/search">https://google.com/search</a>
+rdar://localhost.com/blah</p>
+
+--- end
+--- case 4 options extension.autolink label-bytes 25 input-bytes 53 expected-bytes 143
+autolink_scheme_multiline
+--- input
+https://google.com/search
+https://www.google.com/maps
+--- expected
+<p><a href="https://google.com/search">https://google.com/search</a>
+<a href="https://www.google.com/maps">https://www.google.com/maps</a></p>
+
+--- end
+--- case 5 options extension.autolink label-bytes 20 input-bytes 18 expected-bytes 31
+autolink_no_link_bad
+--- input
+@a.b.c@. x
+
+n@. x
+
+--- expected
+<p>@a.b.c@. x</p>
+<p>n@. x</p>
+
+--- end
+--- case 6 options extension.autolink label-bytes 32 input-bytes 41 expected-bytes 105
+autolink_parentheses_balanced[0]
+--- input
+http://www.pokemon.com/Pikachu_(Electric)
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_(Electric)">http://www.pokemon.com/Pikachu_(Electric)</a></p>
+
+--- end
+--- case 7 options extension.autolink label-bytes 32 input-bytes 42 expected-bytes 107
+autolink_parentheses_balanced[1]
+--- input
+http://www.pokemon.com/Pikachu_((Electric)
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_((Electric)">http://www.pokemon.com/Pikachu_((Electric)</a></p>
+
+--- end
+--- case 8 options extension.autolink label-bytes 32 input-bytes 42 expected-bytes 106
+autolink_parentheses_balanced[2]
+--- input
+http://www.pokemon.com/Pikachu_(Electric))
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_(Electric)">http://www.pokemon.com/Pikachu_(Electric)</a>)</p>
+
+--- end
+--- case 9 options extension.autolink label-bytes 32 input-bytes 43 expected-bytes 109
+autolink_parentheses_balanced[3]
+--- input
+http://www.pokemon.com/Pikachu_((Electric))
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_((Electric))">http://www.pokemon.com/Pikachu_((Electric))</a></p>
+
+--- end
+--- case 10 options extension.autolink,parse.relaxed_autolinks label-bytes 32 input-bytes 41 expected-bytes 105
+autolink_parentheses_balanced[0]
+--- input
+http://www.pokemon.com/Pikachu_(Electric)
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_(Electric)">http://www.pokemon.com/Pikachu_(Electric)</a></p>
+
+--- end
+--- case 11 options extension.autolink,parse.relaxed_autolinks label-bytes 32 input-bytes 42 expected-bytes 107
+autolink_parentheses_balanced[1]
+--- input
+http://www.pokemon.com/Pikachu_((Electric)
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_((Electric)">http://www.pokemon.com/Pikachu_((Electric)</a></p>
+
+--- end
+--- case 12 options extension.autolink,parse.relaxed_autolinks label-bytes 32 input-bytes 42 expected-bytes 106
+autolink_parentheses_balanced[2]
+--- input
+http://www.pokemon.com/Pikachu_(Electric))
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_(Electric)">http://www.pokemon.com/Pikachu_(Electric)</a>)</p>
+
+--- end
+--- case 13 options extension.autolink,parse.relaxed_autolinks label-bytes 32 input-bytes 43 expected-bytes 109
+autolink_parentheses_balanced[3]
+--- input
+http://www.pokemon.com/Pikachu_((Electric))
+--- expected
+<p><a href="http://www.pokemon.com/Pikachu_((Electric))">http://www.pokemon.com/Pikachu_((Electric))</a></p>
+
+--- end
+--- case 14 options extension.autolink label-bytes 28 input-bytes 29 expected-bytes 82
+autolink_brackets_unbalanced
+--- input
+http://example.com/[abc]]...
+
+--- expected
+<p><a href="http://example.com/%5Babc%5D%5D">http://example.com/[abc]]</a>...</p>
+
+--- end
+--- case 15 options extension.autolink label-bytes 36 input-bytes 17 expected-bytes 25
+autolink_ignore_links_in_brackets[0]
+--- input
+[https://foo.com]
+--- expected
+<p>[https://foo.com]</p>
+
+--- end
+--- case 16 options extension.autolink label-bytes 36 input-bytes 19 expected-bytes 27
+autolink_ignore_links_in_brackets[1]
+--- input
+[[https://foo.com]]
+--- expected
+<p>[[https://foo.com]]</p>
+
+--- end
+--- case 17 options extension.autolink label-bytes 36 input-bytes 23 expected-bytes 31
+autolink_ignore_links_in_brackets[2]
+--- input
+[[Foo|https://foo.com]]
+--- expected
+<p>[[Foo|https://foo.com]]</p>
+
+--- end
+--- case 18 options extension.autolink label-bytes 36 input-bytes 19 expected-bytes 55
+autolink_ignore_links_in_brackets[3]
+--- input
+[<https://foo.com>]
+--- expected
+<p>[<a href="https://foo.com">https://foo.com</a>]</p>
+
+--- end
+--- case 19 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 17 expected-bytes 55
+autolink_relaxed_links_in_brackets[0]
+--- input
+[https://foo.com]
+--- expected
+<p>[<a href="https://foo.com">https://foo.com</a>]</p>
+
+--- end
+--- case 20 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 19 expected-bytes 57
+autolink_relaxed_links_in_brackets[1]
+--- input
+[[https://foo.com]]
+--- expected
+<p>[[<a href="https://foo.com">https://foo.com</a>]]</p>
+
+--- end
+--- case 21 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 23 expected-bytes 61
+autolink_relaxed_links_in_brackets[2]
+--- input
+[[Foo|https://foo.com]]
+--- expected
+<p>[[Foo|<a href="https://foo.com">https://foo.com</a>]]</p>
+
+--- end
+--- case 22 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 19 expected-bytes 55
+autolink_relaxed_links_in_brackets[3]
+--- input
+[<https://foo.com>]
+--- expected
+<p>[<a href="https://foo.com">https://foo.com</a>]</p>
+
+--- end
+--- case 23 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 22 expected-bytes 41
+autolink_relaxed_links_in_brackets[4]
+--- input
+[http://foo.com/](url)
+--- expected
+<p><a href="url">http://foo.com/</a></p>
+
+--- end
+--- case 24 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 21 expected-bytes 29
+autolink_relaxed_links_in_brackets[5]
+--- input
+[http://foo.com/](url
+--- expected
+<p>[http://foo.com/](url</p>
+
+--- end
+--- case 25 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 19 expected-bytes 38
+autolink_relaxed_links_in_brackets[6]
+--- input
+[www.foo.com/](url)
+--- expected
+<p><a href="url">www.foo.com/</a></p>
+
+--- end
+--- case 26 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 17 expected-bytes 55
+autolink_relaxed_links_in_brackets[7]
+--- input
+{https://foo.com}
+--- expected
+<p>{<a href="https://foo.com">https://foo.com</a>}</p>
+
+--- end
+--- case 27 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 31 expected-bytes 50
+autolink_relaxed_links_in_brackets[8]
+--- input
+[this http://and.com that](url)
+--- expected
+<p><a href="url">this http://and.com that</a></p>
+
+--- end
+--- case 28 options extension.autolink,parse.relaxed_autolinks label-bytes 37 input-bytes 33 expected-bytes 50
+autolink_relaxed_links_in_brackets[9]
+--- input
+[this <http://and.com> that](url)
+--- expected
+<p><a href="url">this http://and.com that</a></p>
+
+--- end
+--- case 29 options extension.autolink,parse.relaxed_autolinks label-bytes 38 input-bytes 31 expected-bytes 68
+autolink_relaxed_links_in_brackets[10]
+--- input
+{this http://and.com that}(url)
+--- expected
+<p>{this <a href="http://and.com">http://and.com</a> that}(url)</p>
+
+--- end
+--- case 30 options extension.autolink,parse.relaxed_autolinks label-bytes 38 input-bytes 78 expected-bytes 90
+autolink_relaxed_links_in_brackets[11]
+--- input
+[http://foo.com](url)
+[http://bar.com]
+
+[http://bar.com]: http://bar.com/extra
+--- expected
+<p><a href="url">http://foo.com</a>
+<a href="http://bar.com/extra">http://bar.com</a></p>
+
+--- end
+--- case 31 options extension.autolink,parse.relaxed_autolinks label-bytes 40 input-bytes 29 expected-bytes 79
+autolink_relaxed_links_brackets_balanced
+--- input
+http://example.com/[abc]]...
+
+--- expected
+<p><a href="http://example.com/%5Babc%5D">http://example.com/[abc]</a>]...</p>
+
+--- end
+--- case 32 options extension.autolink,parse.relaxed_autolinks label-bytes 44 input-bytes 29 expected-bytes 79
+autolink_relaxed_links_curly_braces_balanced
+--- input
+http://example.com/{abc}}...
+
+--- expected
+<p><a href="http://example.com/%7Babc%7D">http://example.com/{abc}</a>}...</p>
+
+--- end
+--- case 33 options extension.autolink,parse.relaxed_autolinks label-bytes 49 input-bytes 29 expected-bytes 75
+autolink_relaxed_links_curly_parentheses_balanced
+--- input
+http://example.com/(abc))...
+
+--- expected
+<p><a href="http://example.com/(abc)">http://example.com/(abc)</a>)...</p>
+
+--- end
+--- case 34 options extension.autolink,parse.relaxed_autolinks label-bytes 33 input-bytes 15 expected-bytes 53
+autolink_relaxed_links_schemes[0]
+--- input
+https://foo.com
+--- expected
+<p><a href="https://foo.com">https://foo.com</a></p>
+
+--- end
+--- case 35 options extension.autolink,parse.relaxed_autolinks label-bytes 33 input-bytes 29 expected-bytes 81
+autolink_relaxed_links_schemes[1]
+--- input
+smb:///Volumes/shared/foo.pdf
+--- expected
+<p><a href="smb:///Volumes/shared/foo.pdf">smb:///Volumes/shared/foo.pdf</a></p>
+
+--- end
+--- case 36 options extension.autolink,parse.relaxed_autolinks label-bytes 33 input-bytes 26 expected-bytes 75
+autolink_relaxed_links_schemes[2]
+--- input
+irc://irc.freenode.net/git
+--- expected
+<p><a href="irc://irc.freenode.net/git">irc://irc.freenode.net/git</a></p>
+
+--- end
+--- case 37 options extension.autolink,parse.relaxed_autolinks label-bytes 33 input-bytes 25 expected-bytes 73
+autolink_relaxed_links_schemes[3]
+--- input
+rdar://localhost.com/blah
+--- expected
+<p><a href="rdar://localhost.com/blah">rdar://localhost.com/blah</a></p>
+
+--- end
+--- case 38 options extension.autolink label-bytes 23 input-bytes 47 expected-bytes 89
+autolink_cmark_edge_382
+--- input
+See &lt;&lt;&lt;http://example.com/&gt;&gt;&gt;
+--- expected
+<p>See &lt;&lt;&lt;<a href="http://example.com/">http://example.com/</a>&gt;&gt;&gt;</p>
+
+--- end
+--- case 39 options extension.autolink label-bytes 23 input-bytes 40 expected-bytes 103
+autolink_cmark_edge_388
+--- input
+http://example.com/src/_mocks_/vscode.js
+--- expected
+<p><a href="http://example.com/src/_mocks_/vscode.js">http://example.com/src/_mocks_/vscode.js</a></p>
+
+--- end
+--- case 40 options extension.autolink,extension.strikethrough label-bytes 23 input-bytes 234 expected-bytes 468
+autolink_cmark_edge_423
+--- input
+Here's an autolink: https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022 and another one https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022.
+--- expected
+<p>Here's an autolink: <a href="https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022">https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022</a> and another one <a href="https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022">https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022</a>.</p>
+
+--- end
+--- case 41 options extension.autolink,extension.superscript label-bytes 22 input-bytes 61 expected-bytes 153
+autolink_cmark_edge_58
+--- input
+https://www.wolframalpha.com/input/?i=x^2+(y-(x^2)^(1/3))^2=1
+--- expected
+<p><a href="https://www.wolframalpha.com/input/?i=x%5E2+(y-(x%5E2)%5E(1/3))%5E2=1">https://www.wolframalpha.com/input/?i=x^2+(y-(x^2)^(1/3))^2=1</a></p>
+
+--- end
+--- case 42 options extension.autolink label-bytes 27 input-bytes 51 expected-bytes 75
+autolink_failing_spec_image
+--- input
+![http://inline.com/image](http://inline.com/image)
+--- expected
+<p><img src="http://inline.com/image" alt="http://inline.com/image" /></p>
+
+--- end
+--- case 43 options extension.autolink label-bytes 33 input-bytes 53 expected-bytes 61
+autolink_failing_spec_underscores
+--- input
+Underscores not allowed in host name www.xxx.yyy._zzz
+--- expected
+<p>Underscores not allowed in host name www.xxx.yyy._zzz</p>
+
+--- end
+--- case 44 options extension.autolink,parse.relaxed_autolinks label-bytes 27 input-bytes 4 expected-bytes 31
+autolink_fuzz_leading_colon
+--- input
+://-
+--- expected
+<p><a href="://-">://-</a></p>
+
+--- end
+--- case 45 options extension.autolink,parse.relaxed_autolinks label-bytes 16 input-bytes 6 expected-bytes 35
+autolink_fuzz_we
+--- input
+we://w
+--- expected
+<p><a href="we://w">we://w</a></p>
+
+--- end
+--- case 46 options extension.autolink label-bytes 35 input-bytes 63 expected-bytes 82
+autolink_not_generated_inside_links
+--- input
+[Contact user@example.com for help](http://support.example.com)
+--- expected
+<p><a href="http://support.example.com">Contact user@example.com for help</a></p>
+
+--- end
+--- case 47 options extension.autolink label-bytes 35 input-bytes 51 expected-bytes 70
+autolink_not_generated_inside_links
+--- input
+[Visit https://www.example.com](http://example.com)
+--- expected
+<p><a href="http://example.com">Visit https://www.example.com</a></p>
+
+--- end
+--- case 48 options extension.autolink label-bytes 35 input-bytes 47 expected-bytes 66
+autolink_not_generated_inside_links
+--- input
+[Check out www.example.com](http://example.com)
+--- expected
+<p><a href="http://example.com">Check out www.example.com</a></p>
+
+--- end
+--- case 49 options extension.autolink label-bytes 36 input-bytes 38 expected-bytes 62
+autolink_not_generated_inside_images
+--- input
+![Contact user@example.com](image.png)
+--- expected
+<p><img src="image.png" alt="Contact user@example.com" /></p>
+
+--- end
+--- case 50 options extension.autolink label-bytes 36 input-bytes 43 expected-bytes 67
+autolink_not_generated_inside_images
+--- input
+![Visit https://www.example.com](image.png)
+--- expected
+<p><img src="image.png" alt="Visit https://www.example.com" /></p>
+
+--- end
+--- case 51 options extension.autolink label-bytes 36 input-bytes 35 expected-bytes 59
+autolink_not_generated_inside_images
+--- input
+![Check www.example.com](image.png)
+--- expected
+<p><img src="image.png" alt="Check www.example.com" /></p>
+
+--- end
+--- case 52 options extension.autolink,extension.wikilinks_title_after_pipe label-bytes 39 input-bytes 47 expected-bytes 86
+autolink_not_generated_inside_wikilinks
+--- input
+[[http://example.com|Contact user@example.com]]
+--- expected
+<p><a href="http://example.com" data-wikilink="true">Contact user@example.com</a></p>
+
+--- end
+--- case 53 options extension.autolink,extension.wikilinks_title_after_pipe label-bytes 39 input-bytes 52 expected-bytes 91
+autolink_not_generated_inside_wikilinks
+--- input
+[[http://example.com|Visit https://www.example.com]]
+--- expected
+<p><a href="http://example.com" data-wikilink="true">Visit https://www.example.com</a></p>
+
+--- end
+--- case 54 options extension.autolink,extension.wikilinks_title_before_pipe label-bytes 39 input-bytes 44 expected-bytes 83
+autolink_not_generated_inside_wikilinks
+--- input
+[[Check www.example.com|http://example.com]]
+--- expected
+<p><a href="http://example.com" data-wikilink="true">Check www.example.com</a></p>
+
+--- end
+--- case 55 options extension.autolink,parse.relaxed_autolinks label-bytes 16 input-bytes 48 expected-bytes 112
+ipv6_host_scoped
+--- input
+scoped https://[fe80::1ff:fe23:4567:890a%25eth2]
+--- expected
+<p>scoped <a href="https://[fe80::1ff:fe23:4567:890a%25eth2]">https://[fe80::1ff:fe23:4567:890a%25eth2]</a></p>
+
+--- end
+--- case 56 options extension.autolink label-bytes 12 input-bytes 47 expected-bytes 55
+ipv6_relaxed
+--- input
+hi: nex://[fe80::1ff:fe23:4567:890a%25eth2]/z/x
+--- expected
+<p>hi: nex://[fe80::1ff:fe23:4567:890a%25eth2]/z/x</p>
+
+--- end
+--- case 57 options extension.autolink,parse.relaxed_autolinks label-bytes 12 input-bytes 47 expected-bytes 113
+ipv6_relaxed
+--- input
+hi: nex://[fe80::1ff:fe23:4567:890a%25eth2]/z/x
+--- expected
+<p>hi: <a href="nex://[fe80::1ff:fe23:4567:890a%25eth2]/z/x">nex://[fe80::1ff:fe23:4567:890a%25eth2]/z/x</a></p>
+
+--- end
+--- case 58 options extension.autolink label-bytes 17 input-bytes 12 expected-bytes 20
+autolink_bare_www
+--- input
+foo www. foo
+--- expected
+<p>foo www. foo</p>
+
+--- end
+--- case 59 options extension.autolink,parse.relaxed_autolinks label-bytes 17 input-bytes 12 expected-bytes 45
+autolink_bare_www
+--- input
+foo www. foo
+--- expected
+<p>foo <a href="http://www">www</a>. foo</p>
+
+--- end
+--- case 60 options extension.autolink label-bytes 20 input-bytes 15 expected-bytes 23
+autolink_bare_scheme
+--- input
+foo http:// foo
+--- expected
+<p>foo http:// foo</p>
+
+--- end
+--- case 61 options extension.autolink,parse.relaxed_autolinks label-bytes 20 input-bytes 15 expected-bytes 45
+autolink_bare_scheme
+--- input
+foo http:// foo
+--- expected
+<p>foo <a href="http://">http://</a> foo</p>
+
+--- end
+--- case 62 options extension.autolink label-bytes 31 input-bytes 24 expected-bytes 71
+autolink_with_unicode_isolation
+--- input
+https://www.example.com/
+--- expected
+<p><a href="https://www.example.com/">https://www.example.com/</a></p>
+
+--- end
+--- case 63 options extension.autolink label-bytes 31 input-bytes 30 expected-bytes 77
+autolink_with_unicode_isolation
+--- input
+⁨https://www.example.com/⁩
+--- expected
+<p>⁨<a href="https://www.example.com/">https://www.example.com/</a>⁩</p>
+
+--- end

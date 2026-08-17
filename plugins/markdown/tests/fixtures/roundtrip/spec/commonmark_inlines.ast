@@ -1,0 +1,33 @@
+Document
+  Paragraph
+    Text "Escaped * text with "
+    Code value="code" raw="code" fence=1
+    Text " and "
+    Strong
+      Text "strong "
+      Emphasis
+        Text "em"
+      Text " text"
+    Text "."
+    SoftBreak
+    Emphasis
+      Text "under"
+    Text " and "
+    Strong
+      Text "strong under"
+    Text " but foo_bar stays."
+    SoftBreak
+    Text "Autolink "
+    Autolink "https://example.com" kind=angle
+    Text " and email "
+    Autolink "a@example.com" kind=angle
+    Text "."
+    SoftBreak
+    Text "Backslash hard break"
+    LineBreak kind=backslash
+    Text "next."
+    SoftBreak
+    Image destination=image.png title=none
+      Text "alt "
+      Emphasis
+        Text "text"

@@ -1,0 +1,13 @@
+Document
+  Paragraph
+    Text "Text "
+    MdxJsx "<ns:Box.part value={1} {...props}>ok</ns:Box.part>"
+    Text " and "
+    MdxJsx "<>frag</>"
+    Text " plus "
+    MdxJsx "<$Icon name=\"x\" />"
+    Text "."
+    SoftBreak
+    Text "Escaped "
+    MdxJsx "<Box value={'} > '} other={\"}\"}>ok</Box>"
+    Text "."

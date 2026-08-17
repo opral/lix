@@ -1,0 +1,19 @@
+Document
+  Paragraph
+    Text "b"
+    SoftBreak
+    Text "||"
+  Paragraph
+    Text "d"
+    SoftBreak
+    Text "|:|"
+  Paragraph
+    Text "e"
+    SoftBreak
+    Text "| |"
+  Paragraph
+    Text "|"
+    SoftBreak
+    Text "|-|"
+    SoftBreak
+    Text "|d|"

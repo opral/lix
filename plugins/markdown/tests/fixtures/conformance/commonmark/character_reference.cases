@@ -1,0 +1,232 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: character_reference
+count: 29
+
+--- case 1 options - label-bytes 41 input-bytes 109 expected-bytes 45
+should support named character references
+--- input
+&nbsp; &amp; &copy; &AElig; &Dcaron;
+&frac34; &HilbertSpace; &DifferentialD;
+&ClockwiseContourIntegral; &ngE;
+--- expected
+<p>  &amp; © Æ Ď
+¾ ℋ ⅆ
+∲ ≧̸</p>
+--- end
+--- case 2 options - label-bytes 43 input-bytes 25 expected-bytes 18
+should support decimal character references
+--- input
+&#35; &#1234; &#992; &#0;
+--- expected
+<p># Ӓ Ϡ �</p>
+--- end
+--- case 3 options - label-bytes 47 input-bytes 22 expected-bytes 21
+should support hexadecimal character references
+--- input
+&#X22; &#XD06; &#xcab;
+--- expected
+<p>&quot; ആ ಫ</p>
+--- end
+--- case 4 options - label-bytes 67 input-bytes 67 expected-bytes 106
+should not support other things that look like character references
+--- input
+&nbsp &x; &#; &#x;
+&#987654321;
+&#abcdef0;
+&ThisIsNotDefined; &hi?;
+--- expected
+<p>&amp;nbsp &amp;x; &amp;#; &amp;#x;
+&amp;#987654321;
+&amp;#abcdef0;
+&amp;ThisIsNotDefined; &amp;hi?;</p>
+--- end
+--- case 5 options - label-bytes 53 input-bytes 5 expected-bytes 16
+should not support character references w/o semicolon
+--- input
+&copy
+--- expected
+<p>&amp;copy</p>
+--- end
+--- case 6 options - label-bytes 53 input-bytes 14 expected-bytes 25
+should not support unknown named character references
+--- input
+&MadeUpEntity;
+--- expected
+<p>&amp;MadeUpEntity;</p>
+--- end
+--- case 7 options allow_dangerous_html,allow_dangerous_protocol label-bytes 50 input-bytes 28 expected-bytes 28
+should not care about character references in html
+--- input
+<a href="&ouml;&ouml;.html">
+--- expected
+<a href="&ouml;&ouml;.html">
+--- end
+--- case 8 options - label-bytes 63 input-bytes 37 expected-bytes 53
+should support character references in resource URLs and titles
+--- input
+[foo](/f&ouml;&ouml; "f&ouml;&ouml;")
+--- expected
+<p><a href="/f%C3%B6%C3%B6" title="föö">foo</a></p>
+--- end
+--- case 9 options - label-bytes 65 input-bytes 44 expected-bytes 53
+should support character references in definition URLs and titles
+--- input
+[foo]: /f&ouml;&ouml; "f&ouml;&ouml;"
+
+[foo]
+--- expected
+<p><a href="/f%C3%B6%C3%B6" title="föö">foo</a></p>
+--- end
+--- case 10 options - label-bytes 52 input-bytes 25 expected-bytes 51
+should support character references in code language
+--- input
+``` f&ouml;&ouml;
+foo
+```
+--- expected
+<pre><code class="language-föö">foo
+</code></pre>
+--- end
+--- case 11 options - label-bytes 52 input-bytes 15 expected-bytes 41
+should not support character references in text code
+--- input
+`f&ouml;&ouml;`
+--- expected
+<p><code>f&amp;ouml;&amp;ouml;</code></p>
+--- end
+--- case 12 options - label-bytes 56 input-bytes 18 expected-bytes 47
+should not support character references in indented code
+--- input
+    f&ouml;f&ouml;
+--- expected
+<pre><code>f&amp;ouml;f&amp;ouml;
+</code></pre>
+--- end
+--- case 13 options - label-bytes 64 input-bytes 19 expected-bytes 25
+should not support character references as construct markers (1)
+--- input
+&#42;foo&#42;
+*foo*
+--- expected
+<p>*foo*
+<em>foo</em></p>
+--- end
+--- case 14 options - label-bytes 64 input-bytes 16 expected-bytes 36
+should not support character references as construct markers (2)
+--- input
+&#42; foo
+
+* foo
+--- expected
+<p>* foo</p>
+<ul>
+<li>foo</li>
+</ul>
+--- end
+--- case 15 options - label-bytes 64 input-bytes 24 expected-bytes 31
+should not support character references as construct markers (3)
+--- input
+[a](url &quot;tit&quot;)
+--- expected
+<p>[a](url &quot;tit&quot;)</p>
+--- end
+--- case 16 options - label-bytes 57 input-bytes 16 expected-bytes 15
+should not support character references as whitespace (1)
+--- input
+foo&#10;&#10;bar
+--- expected
+<p>foo
+
+bar</p>
+--- end
+--- case 17 options - label-bytes 57 input-bytes 7 expected-bytes 11
+should not support character references as whitespace (2)
+--- input
+&#9;foo
+--- expected
+<p>	foo</p>
+--- end
+--- case 18 options - label-bytes 61 input-bytes 33 expected-bytes 10
+should support the longest possible named character reference
+--- input
+&CounterClockwiseContourIntegral;
+--- expected
+<p>∳</p>
+--- end
+--- case 19 options - label-bytes 71 input-bytes 10 expected-bytes 10
+should “support” a longest possible hexadecimal character reference
+--- input
+&#xff9999;
+--- expected
+<p>�</p>
+--- end
+--- case 20 options - label-bytes 67 input-bytes 10 expected-bytes 10
+should “support” a longest possible decimal character reference
+--- input
+&#9999999;
+--- expected
+<p>�</p>
+--- end
+--- case 21 options - label-bytes 65 input-bytes 34 expected-bytes 45
+should not support the longest possible named character reference
+--- input
+&CounterClockwiseContourIntegrali;
+--- expected
+<p>&amp;CounterClockwiseContourIntegrali;</p>
+--- end
+--- case 22 options - label-bytes 69 input-bytes 11 expected-bytes 22
+should not support a longest possible hexadecimal character reference
+--- input
+&#xff99999;
+--- expected
+<p>&amp;#xff99999;</p>
+--- end
+--- case 23 options - label-bytes 65 input-bytes 11 expected-bytes 22
+should not support a longest possible decimal character reference
+--- input
+&#99999999;
+--- expected
+<p>&amp;#99999999;</p>
+--- end
+--- case 24 options - label-bytes 49 input-bytes 3 expected-bytes 14
+should not support the other characters after `&`
+--- input
+&-;
+--- expected
+<p>&amp;-;</p>
+--- end
+--- case 25 options - label-bytes 49 input-bytes 4 expected-bytes 15
+should not support the other characters after `#`
+--- input
+&#-;
+--- expected
+<p>&amp;#-;</p>
+--- end
+--- case 26 options - label-bytes 50 input-bytes 5 expected-bytes 16
+should not support the other characters after `#x`
+--- input
+&#x-;
+--- expected
+<p>&amp;#x-;</p>
+--- end
+--- case 27 options - label-bytes 53 input-bytes 5 expected-bytes 16
+should not support the other characters inside a name
+--- input
+&lt-;
+--- expected
+<p>&amp;lt-;</p>
+--- end
+--- case 28 options - label-bytes 56 input-bytes 5 expected-bytes 16
+should not support the other characters inside a demical
+--- input
+&#9-;
+--- expected
+<p>&amp;#9-;</p>
+--- end
+--- case 29 options - label-bytes 60 input-bytes 6 expected-bytes 17
+should not support the other characters inside a hexademical
+--- input
+&#x9-;
+--- expected
+<p>&amp;#x9-;</p>
+--- end

@@ -1,0 +1,20 @@
+Document
+  Definition label=Foo destination=https://example.com title="Title"
+  Paragraph
+    Text "Use "
+    LinkReference identifier=foo
+      Text "Foo"
+    Text ", "
+    LinkReference identifier=foo
+      Text "Foo"
+    Text ", and "
+    LinkReference identifier=foo
+      Text "Foo"
+    Text "."
+  HtmlBlock "<div class=\"note\">\nraw\n</div>"
+  Paragraph
+    Text "Text "
+    HtmlInline "<span data-x=\"1\">"
+    Text "ok"
+    HtmlInline "</span>"
+    HtmlInline "<!-- comment -->"

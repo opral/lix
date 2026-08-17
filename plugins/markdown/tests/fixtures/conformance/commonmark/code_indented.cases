@@ -1,0 +1,312 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: code_indented
+count: 26
+
+--- case 1 options - label-bytes 28 input-bytes 38 expected-bytes 55
+should support indented code
+--- input
+    a simple
+      indented code block
+--- expected
+<pre><code>a simple
+  indented code block
+</code></pre>
+--- end
+--- case 2 options - label-bytes 54 input-bytes 16 expected-bytes 43
+should prefer list item content over indented code (1)
+--- input
+  - foo
+
+    bar
+--- expected
+<ul>
+<li>
+<p>foo</p>
+<p>bar</p>
+</li>
+</ul>
+--- end
+--- case 3 options - label-bytes 54 input-bytes 18 expected-bytes 56
+should prefer list item content over indented code (2)
+--- input
+1.  foo
+
+    - bar
+--- expected
+<ol>
+<li>
+<p>foo</p>
+<ul>
+<li>bar</li>
+</ul>
+</li>
+</ol>
+--- end
+--- case 4 options - label-bytes 47 input-bytes 28 expected-bytes 47
+should support blank lines in indented code (1)
+--- input
+    <a/>
+    *hi*
+
+    - one
+--- expected
+<pre><code>&lt;a/&gt;
+*hi*
+
+- one
+</code></pre>
+--- end
+--- case 5 options - label-bytes 47 input-bytes 40 expected-bytes 49
+should support blank lines in indented code (2)
+--- input
+    chunk1
+
+    chunk2
+  
+ 
+ 
+    chunk3
+--- expected
+<pre><code>chunk1
+
+chunk2
+
+
+
+chunk3
+</code></pre>
+--- end
+--- case 6 options - label-bytes 47 input-bytes 30 expected-bytes 43
+should support blank lines in indented code (3)
+--- input
+    chunk1
+      
+      chunk2
+--- expected
+<pre><code>chunk1
+  
+  chunk2
+</code></pre>
+--- end
+--- case 7 options - label-bytes 42 input-bytes 11 expected-bytes 14
+should not support interrupting paragraphs
+--- input
+Foo
+    bar
+--- expected
+<p>Foo
+bar</p>
+--- end
+--- case 8 options - label-bytes 54 input-bytes 11 expected-bytes 39
+should support paragraphs directly after indented code
+--- input
+    foo
+bar
+--- expected
+<pre><code>foo
+</code></pre>
+<p>bar</p>
+--- end
+--- case 9 options - label-bytes 27 input-bytes 45 expected-bytes 98
+should mix w/ other content
+--- input
+# Heading
+    foo
+Heading
+------
+    foo
+----
+--- expected
+<h1>Heading</h1>
+<pre><code>foo
+</code></pre>
+<h2>Heading</h2>
+<pre><code>foo
+</code></pre>
+<hr />
+--- end
+--- case 10 options - label-bytes 49 input-bytes 19 expected-bytes 36
+should support extra whitespace on the first line
+--- input
+        foo
+    bar
+--- expected
+<pre><code>    foo
+bar
+</code></pre>
+--- end
+--- case 11 options - label-bytes 38 input-bytes 18 expected-bytes 28
+should not support initial blank lines
+--- input
+
+    
+    foo
+    
+--- expected
+<pre><code>foo
+</code></pre>
+--- end
+--- case 12 options - label-bytes 34 input-bytes 9 expected-bytes 30
+should support trailing whitespace
+--- input
+    foo  
+--- expected
+<pre><code>foo  
+</code></pre>
+--- end
+--- case 13 options - label-bytes 31 input-bytes 9 expected-bytes 62
+should not support lazyness (1)
+--- input
+>     a
+b
+--- expected
+<blockquote>
+<pre><code>a
+</code></pre>
+</blockquote>
+<p>b</p>
+--- end
+--- case 14 options - label-bytes 31 input-bytes 9 expected-bytes 37
+should not support lazyness (2)
+--- input
+> a
+    b
+--- expected
+<blockquote>
+<p>a
+b</p>
+</blockquote>
+--- end
+--- case 15 options - label-bytes 31 input-bytes 10 expected-bytes 37
+should not support lazyness (3)
+--- input
+> a
+     b
+--- expected
+<blockquote>
+<p>a
+b</p>
+</blockquote>
+--- end
+--- case 16 options - label-bytes 31 input-bytes 11 expected-bytes 37
+should not support lazyness (4)
+--- input
+> a
+      b
+--- expected
+<blockquote>
+<p>a
+b</p>
+</blockquote>
+--- end
+--- case 17 options - label-bytes 31 input-bytes 14 expected-bytes 81
+should not support lazyness (6)
+--- input
+>     a
+     b
+--- expected
+<blockquote>
+<pre><code>a
+</code></pre>
+</blockquote>
+<pre><code> b
+</code></pre>
+--- end
+--- case 18 options - label-bytes 31 input-bytes 15 expected-bytes 82
+should not support lazyness (7)
+--- input
+>     a
+      b
+--- expected
+<blockquote>
+<pre><code>a
+</code></pre>
+</blockquote>
+<pre><code>  b
+</code></pre>
+--- end
+--- case 19 options code_indented_off label-bytes 45 input-bytes 5 expected-bytes 8
+should support turning off code (indented, 1)
+--- input
+    a
+--- expected
+<p>a</p>
+--- end
+--- case 20 options code_indented_off label-bytes 45 input-bytes 9 expected-bytes 37
+should support turning off code (indented, 2)
+--- input
+> a
+    b
+--- expected
+<blockquote>
+<p>a
+b</p>
+</blockquote>
+--- end
+--- case 21 options code_indented_off label-bytes 45 input-bytes 9 expected-bytes 23
+should support turning off code (indented, 3)
+--- input
+- a
+    b
+--- expected
+<ul>
+<li>a
+b</li>
+</ul>
+--- end
+--- case 22 options code_indented_off label-bytes 45 input-bytes 11 expected-bytes 44
+should support turning off code (indented, 4)
+--- input
+- a
+    - b
+--- expected
+<ul>
+<li>a
+<ul>
+<li>b</li>
+</ul>
+</li>
+</ul>
+--- end
+--- case 23 options code_indented_off label-bytes 45 input-bytes 13 expected-bytes 26
+should support turning off code (indented, 6)
+--- input
+```
+a
+    ```
+--- expected
+<pre><code>a
+</code></pre>
+--- end
+--- case 24 options allow_dangerous_html,code_indented_off label-bytes 45 input-bytes 11 expected-bytes 14
+should support turning off code (indented, 7)
+--- input
+a <?
+    ?>
+--- expected
+<p>a <?
+?></p>
+--- end
+--- case 25 options code_indented_off label-bytes 45 input-bytes 9 expected-bytes 30
+should support turning off code (indented, 8)
+--- input
+- Foo
+---
+--- expected
+<ul>
+<li>Foo</li>
+</ul>
+<hr />
+--- end
+--- case 26 options code_indented_off label-bytes 45 input-bytes 14 expected-bytes 34
+should support turning off code (indented, 9)
+--- input
+- Foo
+     ---
+--- expected
+<ul>
+<li>
+<h2>Foo</h2>
+</li>
+</ul>
+--- end

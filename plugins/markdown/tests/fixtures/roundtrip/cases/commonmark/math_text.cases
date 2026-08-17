@@ -1,0 +1,94 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/math_text.rs
+role: upstream-input
+count: 26
+profiles: commonmark,math
+
+--- case 1 profile commonmark bytes 3
+$a$
+--- end
+--- case 2 profile math bytes 13
+$foo$ $$bar$$
+--- end
+--- case 3 profile math bytes 15
+$$ foo $ bar $$
+--- end
+--- case 4 profile math bytes 6
+$ $$ $
+--- end
+--- case 5 profile math bytes 8
+$  $$  $
+--- end
+--- case 6 profile math bytes 4
+$ a$
+--- end
+--- case 7 profile math bytes 7
+$ b $
+--- end
+--- case 8 profile math bytes 8
+$ $
+$  $
+--- end
+--- case 9 profile math bytes 17
+$
+foo
+bar  
+baz
+$
+--- end
+--- case 10 profile math bytes 8
+$
+foo 
+$
+--- end
+--- case 11 profile math bytes 16
+$foo   bar 
+baz$
+--- end
+--- case 12 profile math bytes 10
+$foo\$bar$
+--- end
+--- case 13 profile math bytes 11
+$$foo$bar$$
+--- end
+--- case 14 profile math bytes 14
+$ foo $$ bar $
+--- end
+--- case 15 profile math bytes 7
+*foo$*$
+--- end
+--- case 16 profile math bytes 20
+[not a $link](/foo$)
+--- end
+--- case 17 profile math bytes 14
+$<a href="$">$
+--- end
+--- case 18 profile math bytes 13
+<a href="$">$
+--- end
+--- case 19 profile math bytes 23
+$<http://foo.bar.$baz>$
+--- end
+--- case 20 profile math bytes 22
+<http://foo.bar.$baz>$
+--- end
+--- case 21 profile math bytes 8
+$$$foo$$
+--- end
+--- case 22 profile math bytes 4
+$foo
+--- end
+--- case 23 profile math bytes 11
+$foo$$bar$$
+--- end
+--- case 24 profile math bytes 10
+$foo		bar$
+--- end
+--- case 25 profile math bytes 5
+\$$x$
+--- end
+--- case 26 profile math bytes 12
+a $alpha$ b.
+--- end

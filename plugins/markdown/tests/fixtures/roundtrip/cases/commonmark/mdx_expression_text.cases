@@ -1,0 +1,117 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/mdx_expression_text.rs
+role: upstream-input
+count: 31
+profiles: mdx
+
+--- case 1 profile mdx bytes 6
+a {} b
+--- end
+--- case 2 profile mdx bytes 10
+a { 	
+} b
+--- end
+--- case 3 profile mdx bytes 10
+a {/**/} b
+--- end
+--- case 4 profile mdx bytes 14
+a {  /*
+*/	} b
+--- end
+--- case 5 profile mdx bytes 16
+a {/*b*//*c*/} d
+--- end
+--- case 6 profile mdx bytes 12
+a {b/*c*/} d
+--- end
+--- case 7 profile mdx bytes 12
+a {/*b*/c} d
+--- end
+--- case 8 profile mdx bytes 8
+a {//} b
+--- end
+--- case 9 profile mdx bytes 12
+a { // b } c
+--- end
+--- case 10 profile mdx bytes 9
+a {//
+} b
+--- end
+--- case 11 profile mdx bytes 12
+a {// b
+c} d
+--- end
+--- case 12 profile mdx bytes 12
+a {b// c
+} d
+--- end
+--- case 13 profile mdx bytes 17
+a {/*b*/ // c
+} d
+--- end
+--- case 14 profile mdx bytes 9
+a {b.c} d
+--- end
+--- case 15 profile mdx bytes 11
+a {1 + 1} b
+--- end
+--- case 16 profile mdx bytes 20
+a {function () {}} b
+--- end
+--- case 17 profile mdx bytes 17
+a {var b = "c"} d
+--- end
+--- case 18 profile mdx bytes 12
+> a {
+> b} c
+--- end
+--- case 19 profile mdx bytes 13
+> a {
+> b<} c
+--- end
+--- case 20 profile mdx bytes 16
+> a {
+> b
+> c} d
+--- end
+--- case 21 profile mdx bytes 7
+a {b} c
+--- end
+--- case 22 profile mdx bytes 6
+a {b c
+--- end
+--- case 23 profile mdx bytes 12
+a {b { c } d
+--- end
+--- case 24 profile mdx bytes 7
+a {
+} b
+--- end
+--- case 25 profile mdx bytes 5
+a } b
+--- end
+--- case 26 profile mdx bytes 7
+{ a } b
+--- end
+--- case 27 profile mdx bytes 12
+a {alpha} b.
+--- end
+--- case 28 profile mdx bytes 8
+a {??} b
+--- end
+--- case 29 profile mdx bytes 15
+a { /* { */ } b
+--- end
+--- case 30 profile mdx bytes 15
+a { /* } */ } b
+--- end
+--- case 31 profile mdx bytes 63
+> alpha {`
+> bravo
+>  charlie
+>   delta
+>    echo
+> `} foxtrot.
+--- end

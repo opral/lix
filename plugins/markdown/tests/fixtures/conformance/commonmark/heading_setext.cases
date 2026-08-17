@@ -1,0 +1,456 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: heading_setext
+count: 45
+
+--- case 1 options - label-bytes 52 input-bytes 19 expected-bytes 25
+should support a heading w/ an equals to (rank of 1)
+--- input
+Foo *bar*
+=========
+--- expected
+<h1>Foo <em>bar</em></h1>
+--- end
+--- case 2 options - label-bytes 46 input-bytes 19 expected-bytes 25
+should support a heading w/ a dash (rank of 2)
+--- input
+Foo *bar*
+---------
+--- expected
+<h2>Foo <em>bar</em></h2>
+--- end
+--- case 3 options - label-bytes 46 input-bytes 18 expected-bytes 29
+should support line endings in setext headings
+--- input
+Foo *bar
+baz*
+====
+--- expected
+<h1>Foo <em>bar
+baz</em></h1>
+--- end
+--- case 4 options - label-bytes 62 input-bytes 21 expected-bytes 29
+should not include initial and final whitespace around content
+--- input
+  Foo *bar
+baz*	
+====
+--- expected
+<h1>Foo <em>bar
+baz</em></h1>
+--- end
+--- case 5 options - label-bytes 30 input-bytes 29 expected-bytes 12
+should support long underlines
+--- input
+Foo
+-------------------------
+--- expected
+<h2>Foo</h2>
+--- end
+--- case 6 options - label-bytes 31 input-bytes 5 expected-bytes 12
+should support short underlines
+--- input
+Foo
+=
+--- expected
+<h1>Foo</h1>
+--- end
+--- case 7 options - label-bytes 42 input-bytes 10 expected-bytes 12
+should support indented content w/ 1 space
+--- input
+ Foo
+  ===
+--- expected
+<h1>Foo</h1>
+--- end
+--- case 8 options - label-bytes 43 input-bytes 9 expected-bytes 12
+should support indented content w/ 2 spaces
+--- input
+  Foo
+---
+--- expected
+<h2>Foo</h2>
+--- end
+--- case 9 options - label-bytes 43 input-bytes 10 expected-bytes 12
+should support indented content w/ 3 spaces
+--- input
+   Foo
+---
+--- expected
+<h2>Foo</h2>
+--- end
+--- case 10 options - label-bytes 48 input-bytes 15 expected-bytes 32
+should not support too much indented content (1)
+--- input
+    Foo
+    ---
+--- expected
+<pre><code>Foo
+---
+</code></pre>
+--- end
+--- case 11 options - label-bytes 48 input-bytes 11 expected-bytes 35
+should not support too much indented content (2)
+--- input
+    Foo
+---
+--- expected
+<pre><code>Foo
+</code></pre>
+<hr />
+--- end
+--- case 12 options - label-bytes 64 input-bytes 17 expected-bytes 12
+should support initial and final whitespace around the underline
+--- input
+Foo
+   ----      
+--- expected
+<h2>Foo</h2>
+--- end
+--- case 13 options - label-bytes 42 input-bytes 8 expected-bytes 12
+should support whitespace before underline
+--- input
+Foo
+   =
+--- expected
+<h1>Foo</h1>
+--- end
+--- case 14 options - label-bytes 59 input-bytes 9 expected-bytes 12
+should not support too much whitespace before underline (1)
+--- input
+Foo
+    =
+--- expected
+<p>Foo
+=</p>
+--- end
+--- case 15 options - label-bytes 59 input-bytes 6 expected-bytes 12
+should not support too much whitespace before underline (2)
+--- input
+Foo
+	=
+--- expected
+<p>Foo
+=</p>
+--- end
+--- case 16 options - label-bytes 50 input-bytes 7 expected-bytes 14
+should not support whitespace in the underline (1)
+--- input
+Foo
+= =
+--- expected
+<p>Foo
+= =</p>
+--- end
+--- case 17 options - label-bytes 50 input-bytes 9 expected-bytes 17
+should not support whitespace in the underline (2)
+--- input
+Foo
+--- -
+--- expected
+<p>Foo</p>
+<hr />
+--- end
+--- case 18 options - label-bytes 52 input-bytes 11 expected-bytes 12
+should not support a hard break w/ spaces at the end
+--- input
+Foo  
+-----
+--- expected
+<h2>Foo</h2>
+--- end
+--- case 19 options - label-bytes 55 input-bytes 10 expected-bytes 13
+should not support a hard break w/ backslash at the end
+--- input
+Foo\
+-----
+--- expected
+<h2>Foo\</h2>
+--- end
+--- case 20 options - label-bytes 41 input-bytes 11 expected-bytes 22
+should precede over inline constructs (1)
+--- input
+`Foo
+----
+`
+--- expected
+<h2>`Foo</h2>
+<p>`</p>
+--- end
+--- case 21 options - label-bytes 41 input-bytes 32 expected-bytes 60
+should precede over inline constructs (2)
+--- input
+<a title="a lot
+---
+of dashes"/>
+--- expected
+<h2>&lt;a title=&quot;a lot</h2>
+<p>of dashes&quot;/&gt;</p>
+--- end
+--- case 22 options - label-bytes 41 input-bytes 9 expected-bytes 44
+should not allow underline to be lazy (1)
+--- input
+> Foo
+---
+--- expected
+<blockquote>
+<p>Foo</p>
+</blockquote>
+<hr />
+--- end
+--- case 23 options - label-bytes 41 input-bytes 13 expected-bytes 45
+should not allow underline to be lazy (2)
+--- input
+> foo
+bar
+===
+--- expected
+<blockquote>
+<p>foo
+bar
+===</p>
+</blockquote>
+--- end
+--- case 24 options - label-bytes 41 input-bytes 9 expected-bytes 30
+should not allow underline to be lazy (3)
+--- input
+- Foo
+---
+--- expected
+<ul>
+<li>Foo</li>
+</ul>
+<hr />
+--- end
+--- case 25 options - label-bytes 46 input-bytes 11 expected-bytes 16
+should support line endings in setext headings
+--- input
+Foo
+Bar
+---
+--- expected
+<h2>Foo
+Bar</h2>
+--- end
+--- case 26 options - label-bytes 39 input-bytes 23 expected-bytes 43
+should support adjacent setext headings
+--- input
+---
+Foo
+---
+Bar
+---
+Baz
+--- expected
+<hr />
+<h2>Foo</h2>
+<h2>Bar</h2>
+<p>Baz</p>
+--- end
+--- case 27 options - label-bytes 40 input-bytes 5 expected-bytes 11
+should not support empty setext headings
+--- input
+
+====
+--- expected
+<p>====</p>
+--- end
+--- case 28 options - label-bytes 55 input-bytes 7 expected-bytes 13
+should prefer other constructs over setext headings (1)
+--- input
+---
+---
+--- expected
+<hr />
+<hr />
+--- end
+--- case 29 options - label-bytes 55 input-bytes 11 expected-bytes 30
+should prefer other constructs over setext headings (2)
+--- input
+- foo
+-----
+--- expected
+<ul>
+<li>foo</li>
+</ul>
+<hr />
+--- end
+--- case 30 options - label-bytes 55 input-bytes 11 expected-bytes 35
+should prefer other constructs over setext headings (3)
+--- input
+    foo
+---
+--- expected
+<pre><code>foo
+</code></pre>
+<hr />
+--- end
+--- case 31 options - label-bytes 55 input-bytes 11 expected-bytes 44
+should prefer other constructs over setext headings (4)
+--- input
+> foo
+-----
+--- expected
+<blockquote>
+<p>foo</p>
+</blockquote>
+<hr />
+--- end
+--- case 32 options - label-bytes 44 input-bytes 13 expected-bytes 17
+should support starting w/ character escapes
+--- input
+\> foo
+------
+--- expected
+<h2>&gt; foo</h2>
+--- end
+--- case 33 options - label-bytes 35 input-bytes 15 expected-bytes 27
+paragraph and heading interplay (1)
+--- input
+Foo
+bar
+---
+baz
+--- expected
+<h2>Foo
+bar</h2>
+<p>baz</p>
+--- end
+--- case 34 options - label-bytes 35 input-bytes 16 expected-bytes 34
+paragraph and heading interplay (2)
+--- input
+Foo
+
+bar
+---
+baz
+--- expected
+<p>Foo</p>
+<h2>bar</h2>
+<p>baz</p>
+--- end
+--- case 35 options - label-bytes 35 input-bytes 17 expected-bytes 32
+paragraph and heading interplay (3)
+--- input
+Foo
+bar
+
+---
+
+baz
+--- expected
+<p>Foo
+bar</p>
+<hr />
+<p>baz</p>
+--- end
+--- case 36 options - label-bytes 35 input-bytes 17 expected-bytes 32
+paragraph and heading interplay (4)
+--- input
+Foo
+bar
+* * *
+baz
+--- expected
+<p>Foo
+bar</p>
+<hr />
+<p>baz</p>
+--- end
+--- case 37 options - label-bytes 35 input-bytes 16 expected-bytes 22
+paragraph and heading interplay (5)
+--- input
+Foo
+bar
+\---
+baz
+--- expected
+<p>Foo
+bar
+---
+baz</p>
+--- end
+--- case 38 options - label-bytes 48 input-bytes 15 expected-bytes 22
+should support a hard break w/ spaces in between
+--- input
+Foo  
+bar
+-----
+--- expected
+<h2>Foo<br />
+bar</h2>
+--- end
+--- case 39 options - label-bytes 51 input-bytes 14 expected-bytes 22
+should support a hard break w/ backslash in between
+--- input
+Foo\
+bar
+-----
+--- expected
+<h2>Foo<br />
+bar</h2>
+--- end
+--- case 40 options - label-bytes 56 input-bytes 5 expected-bytes 19
+should prefer a setext heading over an interrupting list
+--- input
+a
+-
+b
+--- expected
+<h2>a</h2>
+<p>b</p>
+--- end
+--- case 41 options - label-bytes 86 input-bytes 10 expected-bytes 10
+should support a two setext heading underlines after a definition, as a setext heading
+--- input
+[a]: b
+=
+=
+--- expected
+<h1>=</h1>
+--- end
+--- case 42 options - label-bytes 31 input-bytes 7 expected-bytes 39
+should not support lazyness (1)
+--- input
+> ===
+a
+--- expected
+<blockquote>
+<p>===
+a</p>
+</blockquote>
+--- end
+--- case 43 options - label-bytes 31 input-bytes 7 expected-bytes 39
+should not support lazyness (2)
+--- input
+> a
+===
+--- expected
+<blockquote>
+<p>a
+===</p>
+</blockquote>
+--- end
+--- case 44 options - label-bytes 31 input-bytes 7 expected-bytes 32
+should not support piercing (1)
+--- input
+a
+- ===
+--- expected
+<p>a</p>
+<ul>
+<li>===</li>
+</ul>
+--- end
+--- case 45 options - label-bytes 31 input-bytes 7 expected-bytes 37
+should not support piercing (2)
+--- input
+a
+* ---
+--- expected
+<p>a</p>
+<ul>
+<li>
+<hr />
+</li>
+</ul>
+--- end

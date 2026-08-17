@@ -1,0 +1,284 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: autolink
+count: 40
+
+--- case 1 options - label-bytes 37 input-bytes 20 expected-bytes 58
+should support protocol autolinks (1)
+--- input
+<http://foo.bar.baz>
+--- expected
+<p><a href="http://foo.bar.baz">http://foo.bar.baz</a></p>
+--- end
+--- case 2 options - label-bytes 37 input-bytes 47 expected-bytes 128
+should support protocol autolinks (2)
+--- input
+<http://foo.bar.baz/test?q=hello&id=22&boolean>
+--- expected
+<p><a href="http://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean">http://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean</a></p>
+--- end
+--- case 3 options - label-bytes 53 input-bytes 24 expected-bytes 66
+should support protocol autolinks w/ non-HTTP schemes
+--- input
+<irc://foo.bar:2233/baz>
+--- expected
+<p><a href="irc://foo.bar:2233/baz">irc://foo.bar:2233/baz</a></p>
+--- end
+--- case 4 options - label-bytes 46 input-bytes 20 expected-bytes 58
+should support protocol autolinks in uppercase
+--- input
+<MAILTO:FOO@BAR.BAZ>
+--- expected
+<p><a href="MAILTO:FOO@BAR.BAZ">MAILTO:FOO@BAR.BAZ</a></p>
+--- end
+--- case 5 options - label-bytes 64 input-bytes 9 expected-bytes 29
+should support protocol autolinks w/ incorrect URIs (1, default)
+--- input
+<a+b+c:d>
+--- expected
+<p><a href="">a+b+c:d</a></p>
+--- end
+--- case 6 options allow_dangerous_html,allow_dangerous_protocol label-bytes 63 input-bytes 9 expected-bytes 36
+should support protocol autolinks w/ incorrect URIs (1, danger)
+--- input
+<a+b+c:d>
+--- expected
+<p><a href="a+b+c:d">a+b+c:d</a></p>
+--- end
+--- case 7 options - label-bytes 64 input-bytes 26 expected-bytes 46
+should support protocol autolinks w/ incorrect URIs (2, default)
+--- input
+<made-up-scheme://foo,bar>
+--- expected
+<p><a href="">made-up-scheme://foo,bar</a></p>
+--- end
+--- case 8 options allow_dangerous_html,allow_dangerous_protocol label-bytes 63 input-bytes 26 expected-bytes 70
+should support protocol autolinks w/ incorrect URIs (2, danger)
+--- input
+<made-up-scheme://foo,bar>
+--- expected
+<p><a href="made-up-scheme://foo,bar">made-up-scheme://foo,bar</a></p>
+--- end
+--- case 9 options - label-bytes 55 input-bytes 12 expected-bytes 42
+should support protocol autolinks w/ incorrect URIs (3)
+--- input
+<http://../>
+--- expected
+<p><a href="http://../">http://../</a></p>
+--- end
+--- case 10 options allow_dangerous_html,allow_dangerous_protocol label-bytes 55 input-bytes 20 expected-bytes 58
+should support protocol autolinks w/ incorrect URIs (4)
+--- input
+<localhost:5001/foo>
+--- expected
+<p><a href="localhost:5001/foo">localhost:5001/foo</a></p>
+--- end
+--- case 11 options - label-bytes 47 input-bytes 24 expected-bytes 37
+should not support protocol autolinks w/ spaces
+--- input
+<http://foo.bar/baz bim>
+--- expected
+<p>&lt;http://foo.bar/baz bim&gt;</p>
+--- end
+--- case 12 options - label-bytes 58 input-bytes 24 expected-bytes 72
+should not support character escapes in protocol autolinks
+--- input
+<http://example.com/\[\>
+--- expected
+<p><a href="http://example.com/%5C%5B%5C">http://example.com/\[\</a></p>
+--- end
+--- case 13 options - label-bytes 34 input-bytes 21 expected-bytes 67
+should support email autolinks (1)
+--- input
+<foo@bar.example.com>
+--- expected
+<p><a href="mailto:foo@bar.example.com">foo@bar.example.com</a></p>
+--- end
+--- case 14 options - label-bytes 34 input-bytes 30 expected-bytes 85
+should support email autolinks (2)
+--- input
+<foo+special@Bar.baz-bar0.com>
+--- expected
+<p><a href="mailto:foo+special@Bar.baz-bar0.com">foo+special@Bar.baz-bar0.com</a></p>
+--- end
+--- case 15 options - label-bytes 34 input-bytes 7 expected-bytes 39
+should support email autolinks (3)
+--- input
+<a@b.c>
+--- expected
+<p><a href="mailto:a@b.c">a@b.c</a></p>
+--- end
+--- case 16 options - label-bytes 55 input-bytes 23 expected-bytes 35
+should not support character escapes in email autolinks
+--- input
+<foo\+@bar.example.com>
+--- expected
+<p>&lt;foo+@bar.example.com&gt;</p>
+--- end
+--- case 17 options - label-bytes 34 input-bytes 2 expected-bytes 15
+should not support empty autolinks
+--- input
+<>
+--- expected
+<p>&lt;&gt;</p>
+--- end
+--- case 18 options - label-bytes 37 input-bytes 18 expected-bytes 31
+should not support autolinks w/ space
+--- input
+< http://foo.bar >
+--- expected
+<p>&lt; http://foo.bar &gt;</p>
+--- end
+--- case 19 options - label-bytes 63 input-bytes 7 expected-bytes 20
+should not support autolinks w/ a single character for a scheme
+--- input
+<m:abc>
+--- expected
+<p>&lt;m:abc&gt;</p>
+--- end
+--- case 20 options - label-bytes 51 input-bytes 13 expected-bytes 26
+should not support autolinks w/o a colon or at sign
+--- input
+<foo.bar.baz>
+--- expected
+<p>&lt;foo.bar.baz&gt;</p>
+--- end
+--- case 21 options - label-bytes 56 input-bytes 18 expected-bytes 25
+should not support protocol autolinks w/o angle brackets
+--- input
+http://example.com
+--- expected
+<p>http://example.com</p>
+--- end
+--- case 22 options - label-bytes 53 input-bytes 19 expected-bytes 26
+should not support email autolinks w/o angle brackets
+--- input
+foo@bar.example.com
+--- expected
+<p>foo@bar.example.com</p>
+--- end
+--- case 23 options - label-bytes 37 input-bytes 15 expected-bytes 55
+should support autolinks w/ atext (1)
+--- input
+<*@example.com>
+--- expected
+<p><a href="mailto:*@example.com">*@example.com</a></p>
+--- end
+--- case 24 options - label-bytes 37 input-bytes 16 expected-bytes 57
+should support autolinks w/ atext (2)
+--- input
+<a*@example.com>
+--- expected
+<p><a href="mailto:a*@example.com">a*@example.com</a></p>
+--- end
+--- case 25 options - label-bytes 37 input-bytes 17 expected-bytes 59
+should support autolinks w/ atext (3)
+--- input
+<aa*@example.com>
+--- expected
+<p><a href="mailto:aa*@example.com">aa*@example.com</a></p>
+--- end
+--- case 26 options - label-bytes 58 input-bytes 19 expected-bytes 32
+should support non-atext in email autolinks local part (1)
+--- input
+<aaa©@example.com>
+--- expected
+<p>&lt;aaa©@example.com&gt;</p>
+--- end
+--- case 27 options - label-bytes 58 input-bytes 19 expected-bytes 32
+should support non-atext in email autolinks local part (2)
+--- input
+<a*a©@example.com>
+--- expected
+<p>&lt;a*a©@example.com&gt;</p>
+--- end
+--- case 28 options - label-bytes 60 input-bytes 18 expected-bytes 31
+should not support a dot after an at sign in email autolinks
+--- input
+<asd@.example.com>
+--- expected
+<p>&lt;asd@.example.com&gt;</p>
+--- end
+--- case 29 options - label-bytes 61 input-bytes 19 expected-bytes 32
+should not support a dot after another dot in email autolinks
+--- input
+<asd@e..xample.com>
+--- expected
+<p>&lt;asd@e..xample.com&gt;</p>
+--- end
+--- case 30 options - label-bytes 54 input-bytes 69 expected-bytes 163
+should support 63 character in email autolinks domains
+--- input
+<asd@012345678901234567890123456789012345678901234567890123456789012>
+--- expected
+<p><a href="mailto:asd@012345678901234567890123456789012345678901234567890123456789012">asd@012345678901234567890123456789012345678901234567890123456789012</a></p>
+--- end
+--- case 31 options - label-bytes 58 input-bytes 70 expected-bytes 83
+should not support 64 character in email autolinks domains
+--- input
+<asd@0123456789012345678901234567890123456789012345678901234567890123>
+--- expected
+<p>&lt;asd@0123456789012345678901234567890123456789012345678901234567890123&gt;</p>
+--- end
+--- case 32 options - label-bytes 67 input-bytes 71 expected-bytes 167
+should support a TLD after a 63 character domain in email autolinks
+--- input
+<asd@012345678901234567890123456789012345678901234567890123456789012.a>
+--- expected
+<p><a href="mailto:asd@012345678901234567890123456789012345678901234567890123456789012.a">asd@012345678901234567890123456789012345678901234567890123456789012.a</a></p>
+--- end
+--- case 33 options - label-bytes 71 input-bytes 72 expected-bytes 85
+should not support a TLD after a 64 character domain in email autolinks
+--- input
+<asd@0123456789012345678901234567890123456789012345678901234567890123.a>
+--- expected
+<p>&lt;asd@0123456789012345678901234567890123456789012345678901234567890123.a&gt;</p>
+--- end
+--- case 34 options - label-bytes 52 input-bytes 71 expected-bytes 167
+should support a 63 character TLD in email autolinks
+--- input
+<asd@a.012345678901234567890123456789012345678901234567890123456789012>
+--- expected
+<p><a href="mailto:asd@a.012345678901234567890123456789012345678901234567890123456789012">asd@a.012345678901234567890123456789012345678901234567890123456789012</a></p>
+--- end
+--- case 35 options - label-bytes 56 input-bytes 72 expected-bytes 85
+should not support a 64 character TLD in email autolinks
+--- input
+<asd@a.0123456789012345678901234567890123456789012345678901234567890123>
+--- expected
+<p>&lt;asd@a.0123456789012345678901234567890123456789012345678901234567890123&gt;</p>
+--- end
+--- case 36 options - label-bytes 54 input-bytes 18 expected-bytes 31
+should not support a dash after `@` in email autolinks
+--- input
+<asd@-example.com>
+--- expected
+<p>&lt;asd@-example.com&gt;</p>
+--- end
+--- case 37 options - label-bytes 70 input-bytes 18 expected-bytes 61
+should support a dash after other domain characters in email autolinks
+--- input
+<asd@e-xample.com>
+--- expected
+<p><a href="mailto:asd@e-xample.com">asd@e-xample.com</a></p>
+--- end
+--- case 38 options - label-bytes 59 input-bytes 19 expected-bytes 63
+should support a dash after another dash in email autolinks
+--- input
+<asd@e--xample.com>
+--- expected
+<p><a href="mailto:asd@e--xample.com">asd@e--xample.com</a></p>
+--- end
+--- case 39 options - label-bytes 57 input-bytes 18 expected-bytes 31
+should not support a dash before a dot in email autolinks
+--- input
+<asd@example-.com>
+--- expected
+<p>&lt;asd@example-.com&gt;</p>
+--- end
+--- case 40 options - label-bytes 61 input-bytes 14 expected-bytes 27
+should not support an at sign at the start of email autolinks
+--- input
+<@example.com>
+--- expected
+<p>&lt;@example.com&gt;</p>
+--- end

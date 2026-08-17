@@ -1,0 +1,23 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/misc_url.rs
+role: upstream-input
+count: 5
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 11
+<https://%>
+--- end
+--- case 2 profile commonmark bytes 7
+[](<%>)
+--- end
+--- case 3 profile commonmark bytes 10
+[](<%%20>)
+--- end
+--- case 4 profile commonmark bytes 11
+[](<%a%20>)
+--- end
+--- case 5 profile commonmark bytes 10
+[](<🤔>)
+--- end

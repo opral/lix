@@ -1,0 +1,80 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/description_lists.rs
+role: upstream-input
+count: 9
+profiles: extras
+
+--- case 1 profile extras bytes 68
+Term 1
+
+: Definition 1
+
+Term 2 with *inline markup*
+
+: Definition 2
+
+--- end
+--- case 2 profile extras bytes 99
+* Nested
+
+    Term 1
+
+    :   Definition 1
+
+    Term 2 with *inline markup*
+
+    :   Definition 2
+
+
+--- end
+--- case 3 profile extras bytes 66
+Term 1
+: Definition 1
+
+Term 2 with *inline markup*
+: Definition 2
+
+--- end
+--- case 4 profile extras bytes 97
+* Nested
+
+    Term 1
+    :   Definition 1
+
+    Term 2 with *inline markup*
+    :   Definition 2
+
+
+--- end
+--- case 5 profile extras bytes 1
+:
+--- end
+--- case 6 profile extras bytes 5
+: foo
+--- end
+--- case 7 profile extras bytes 3
+a
+:
+--- end
+--- case 8 profile extras bytes 22
+- foo
+- : bar
+  - baz
+
+--- end
+--- case 9 profile extras bytes 33
+ta
+
+: da
+
+t*b*
+
+: d*b*
+
+tc
+
+: dc
+
+--- end

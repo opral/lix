@@ -1,0 +1,389 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/attention.rs
+role: upstream-input
+count: 125
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 27
+*<img src="foo" title="*"/>
+--- end
+--- case 2 profile commonmark bytes 15
+**<a href="**">
+--- end
+--- case 3 profile commonmark bytes 15
+__<a href="__">
+--- end
+--- case 4 profile commonmark bytes 9
+*foo bar*
+--- end
+--- case 5 profile commonmark bytes 12
+a * foo bar*
+--- end
+--- case 6 profile commonmark bytes 8
+a*"foo"*
+--- end
+--- case 7 profile commonmark bytes 7
+* a *
+--- end
+--- case 8 profile commonmark bytes 8
+foo*bar*
+--- end
+--- case 9 profile commonmark bytes 6
+5*6*78
+--- end
+--- case 10 profile commonmark bytes 9
+_foo bar_
+--- end
+--- case 11 profile commonmark bytes 10
+_ foo bar_
+--- end
+--- case 12 profile commonmark bytes 8
+a_"foo"_
+--- end
+--- case 13 profile commonmark bytes 8
+foo_bar_
+--- end
+--- case 14 profile commonmark bytes 6
+5_6_78
+--- end
+--- case 15 profile commonmark bytes 38
+пристаням_стремятся_
+--- end
+--- case 16 profile commonmark bytes 10
+aa_"bb"_cc
+--- end
+--- case 17 profile commonmark bytes 11
+foo-_(bar)_
+--- end
+--- case 18 profile commonmark bytes 5
+_foo*
+--- end
+--- case 19 profile commonmark bytes 10
+*foo bar *
+--- end
+--- case 20 profile commonmark bytes 10
+*foo bar
+*
+--- end
+--- case 21 profile commonmark bytes 7
+*(*foo)
+--- end
+--- case 22 profile commonmark bytes 9
+*(*foo*)*
+--- end
+--- case 23 profile commonmark bytes 10
+_foo bar _
+--- end
+--- case 24 profile commonmark bytes 7
+_(_foo)
+--- end
+--- case 25 profile commonmark bytes 9
+_(_foo_)_
+--- end
+--- case 26 profile commonmark bytes 8
+_foo_bar
+--- end
+--- case 27 profile commonmark bytes 38
+_пристаням_стремятся
+--- end
+--- case 28 profile commonmark bytes 13
+_foo_bar_baz_
+--- end
+--- case 29 profile commonmark bytes 8
+_(bar)_.
+--- end
+--- case 30 profile commonmark bytes 11
+**foo bar**
+--- end
+--- case 31 profile commonmark bytes 12
+** foo bar**
+--- end
+--- case 32 profile commonmark bytes 10
+a**"foo"**
+--- end
+--- case 33 profile commonmark bytes 10
+foo**bar**
+--- end
+--- case 34 profile commonmark bytes 11
+__foo bar__
+--- end
+--- case 35 profile commonmark bytes 12
+__ foo bar__
+--- end
+--- case 36 profile commonmark bytes 12
+__
+foo bar__
+--- end
+--- case 37 profile commonmark bytes 10
+a__"foo"__
+--- end
+--- case 38 profile commonmark bytes 10
+foo__bar__
+--- end
+--- case 39 profile commonmark bytes 8
+5__6__78
+--- end
+--- case 40 profile commonmark bytes 40
+пристаням__стремятся__
+--- end
+--- case 41 profile commonmark bytes 21
+__foo, __bar__, baz__
+--- end
+--- case 42 profile commonmark bytes 13
+foo-__(bar)__
+--- end
+--- case 43 profile commonmark bytes 12
+**foo bar **
+--- end
+--- case 44 profile commonmark bytes 9
+**(**foo)
+--- end
+--- case 45 profile commonmark bytes 11
+*(**foo**)*
+--- end
+--- case 46 profile commonmark bytes 74
+**Gomphocarpus (*Gomphocarpus physocarpus*, syn.
+*Asclepias physocarpa*)**
+--- end
+--- case 47 profile commonmark bytes 19
+**foo "*bar*" foo**
+--- end
+--- case 48 profile commonmark bytes 10
+**foo**bar
+--- end
+--- case 49 profile commonmark bytes 12
+__foo bar __
+--- end
+--- case 50 profile commonmark bytes 9
+__(__foo)
+--- end
+--- case 51 profile commonmark bytes 11
+_(__foo__)_
+--- end
+--- case 52 profile commonmark bytes 10
+__foo__bar
+--- end
+--- case 53 profile commonmark bytes 40
+__пристаням__стремятся
+--- end
+--- case 54 profile commonmark bytes 17
+__foo__bar__baz__
+--- end
+--- case 55 profile commonmark bytes 10
+__(bar)__.
+--- end
+--- case 56 profile commonmark bytes 17
+*foo [bar](/url)*
+--- end
+--- case 57 profile commonmark bytes 9
+*foo
+bar*
+--- end
+--- case 58 profile commonmark bytes 17
+_foo __bar__ baz_
+--- end
+--- case 59 profile commonmark bytes 15
+_foo _bar_ baz_
+--- end
+--- case 60 profile commonmark bytes 11
+__foo_ bar_
+--- end
+--- case 61 profile commonmark bytes 11
+*foo *bar**
+--- end
+--- case 62 profile commonmark bytes 17
+*foo **bar** baz*
+--- end
+--- case 63 profile commonmark bytes 15
+*foo**bar**baz*
+--- end
+--- case 64 profile commonmark bytes 13
+***foo** bar*
+--- end
+--- case 65 profile commonmark bytes 13
+*foo **bar***
+--- end
+--- case 66 profile commonmark bytes 12
+*foo**bar***
+--- end
+--- case 67 profile commonmark bytes 24
+foo******bar*********baz
+--- end
+--- case 68 profile commonmark bytes 27
+*foo **bar *baz* bim** bop*
+--- end
+--- case 69 profile commonmark bytes 19
+*foo [*bar*](/url)*
+--- end
+--- case 70 profile commonmark bytes 27
+** is not an empty emphasis
+--- end
+--- case 71 profile commonmark bytes 29
+**** is not an empty emphasis
+--- end
+--- case 72 profile commonmark bytes 19
+**foo [bar](/url)**
+--- end
+--- case 73 profile commonmark bytes 11
+**foo
+bar**
+--- end
+--- case 74 profile commonmark bytes 17
+__foo _bar_ baz__
+--- end
+--- case 75 profile commonmark bytes 19
+__foo __bar__ baz__
+--- end
+--- case 76 profile commonmark bytes 15
+____foo__ bar__
+--- end
+--- case 77 profile commonmark bytes 17
+**foo *bar* baz**
+--- end
+--- case 78 profile commonmark bytes 13
+***foo* bar**
+--- end
+--- case 79 profile commonmark bytes 13
+**foo *bar***
+--- end
+--- case 80 profile commonmark bytes 29
+**foo *bar **baz**
+bim* bop**
+--- end
+--- case 81 profile commonmark bytes 21
+**foo [*bar*](/url)**
+--- end
+--- case 82 profile commonmark bytes 27
+__ is not an empty emphasis
+--- end
+--- case 83 profile commonmark bytes 29
+____ is not an empty emphasis
+--- end
+--- case 84 profile commonmark bytes 7
+foo ***
+--- end
+--- case 85 profile commonmark bytes 8
+foo *\**
+--- end
+--- case 86 profile commonmark bytes 7
+foo *_*
+--- end
+--- case 87 profile commonmark bytes 9
+foo *****
+--- end
+--- case 88 profile commonmark bytes 10
+foo **\***
+--- end
+--- case 89 profile commonmark bytes 9
+foo **_**
+--- end
+--- case 90 profile commonmark bytes 6
+**foo*
+--- end
+--- case 91 profile commonmark bytes 6
+*foo**
+--- end
+--- case 92 profile commonmark bytes 8
+***foo**
+--- end
+--- case 93 profile commonmark bytes 8
+**foo***
+--- end
+--- case 94 profile commonmark bytes 8
+*foo****
+--- end
+--- case 95 profile commonmark bytes 7
+foo ___
+--- end
+--- case 96 profile commonmark bytes 8
+foo _\__
+--- end
+--- case 97 profile commonmark bytes 7
+foo _X_
+--- end
+--- case 98 profile commonmark bytes 9
+foo _____
+--- end
+--- case 99 profile commonmark bytes 10
+foo __\___
+--- end
+--- case 100 profile commonmark bytes 9
+foo __X__
+--- end
+--- case 101 profile commonmark bytes 6
+__foo_
+--- end
+--- case 102 profile commonmark bytes 6
+_foo__
+--- end
+--- case 103 profile commonmark bytes 8
+___foo__
+--- end
+--- case 104 profile commonmark bytes 8
+____foo_
+--- end
+--- case 105 profile commonmark bytes 8
+__foo___
+--- end
+--- case 106 profile commonmark bytes 8
+_foo____
+--- end
+--- case 107 profile commonmark bytes 7
+**foo**
+--- end
+--- case 108 profile commonmark bytes 7
+*_foo_*
+--- end
+--- case 109 profile commonmark bytes 7
+__foo__
+--- end
+--- case 110 profile commonmark bytes 7
+_*foo*_
+--- end
+--- case 111 profile commonmark bytes 11
+****foo****
+--- end
+--- case 112 profile commonmark bytes 11
+____foo____
+--- end
+--- case 113 profile commonmark bytes 15
+******foo******
+--- end
+--- case 114 profile commonmark bytes 9
+***foo***
+--- end
+--- case 115 profile commonmark bytes 9
+___foo___
+--- end
+--- case 116 profile commonmark bytes 15
+*foo _bar* baz_
+--- end
+--- case 117 profile commonmark bytes 26
+*foo __bar *baz bim__ bam*
+--- end
+--- case 118 profile commonmark bytes 14
+*foo *bar baz*
+--- end
+--- case 119 profile commonmark bytes 13
+*[bar*](/url)
+--- end
+--- case 120 profile commonmark bytes 13
+_[bar_](/url)
+--- end
+--- case 121 profile commonmark bytes 7
+*a `*`*
+--- end
+--- case 122 profile commonmark bytes 7
+_a `_`_
+--- end
+--- case 123 profile commonmark bytes 25
+**a<http://foo.bar/?q=**>
+--- end
+--- case 124 profile commonmark bytes 25
+__a<http://foo.bar/?q=__>
+--- end
+--- case 125 profile commonmark bytes 24
+a *alpha* b **bravo** c.
+--- end

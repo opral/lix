@@ -1,0 +1,61 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: gfm_task_list_item
+count: 6
+
+--- case 1 options - label-bytes 46 input-bytes 8 expected-bytes 26
+should ignore task list item checks by default
+--- input
+* [x] y.
+--- expected
+<ul>
+<li>[x] y.</li>
+</ul>
+--- end
+--- case 2 options gfm label-bytes 36 input-bytes 8 expected-bytes 71
+should support task list item checks
+--- input
+* [x] y.
+--- expected
+<ul>
+<li><input type="checkbox" disabled="" checked="" /> y.</li>
+</ul>
+--- end
+--- case 3 options gfm label-bytes 46 input-bytes 8 expected-bytes 60
+should support unchecked task list item checks
+--- input
+* [ ] z.
+--- expected
+<ul>
+<li><input type="checkbox" disabled="" /> z.</li>
+</ul>
+--- end
+--- case 4 options gfm,tasklist_checkable label-bytes 67 input-bytes 8 expected-bytes 59
+should support option for enabled (checkable) task list item checks
+--- input
+* [x] y.
+--- expected
+<ul>
+<li><input type="checkbox" checked="" /> y.</li>
+</ul>
+--- end
+--- case 5 options gfm label-bytes 31 input-bytes 9 expected-bytes 23
+should not support laziness (1)
+--- input
+*
+    [x]
+--- expected
+<ul>
+<li>[x]</li>
+</ul>
+--- end
+--- case 6 options gfm label-bytes 31 input-bytes 5 expected-bytes 31
+should not support laziness (2)
+--- input
+*
+[x]
+--- expected
+<ul>
+<li></li>
+</ul>
+<p>[x]</p>
+--- end

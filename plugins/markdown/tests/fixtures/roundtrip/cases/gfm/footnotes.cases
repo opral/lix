@@ -1,0 +1,100 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/footnotes.rs
+role: upstream-input
+count: 11
+profiles: gfm
+
+--- case 1 profile gfm bytes 344
+Here is a[^nowhere] footnote reference,[^1] and another.[^longnote]
+
+This is another note.[^note] And footnote[^longnote] is referenced again.
+
+[^note]: Hi.
+
+[^1]: Here is the footnote.
+
+[^longnote]: Here's one with multiple blocks.
+
+    Subsequent paragraphs are indented.
+
+        code
+
+This is regular content.
+
+[^unused]: This is not used.
+
+--- end
+--- case 2 profile gfm bytes 36
+Here's my footnote![^a]
+
+[^a]: Yep.
+
+--- end
+--- case 3 profile gfm bytes 121
+A footnote in a paragraph[^1]
+
+| Column1   | Column2 |
+| --------- | ------- |
+| foot [^1] | note    |
+
+[^1]: a footnote
+
+--- end
+--- case 4 profile gfm bytes 153
+Here is a footnote reference.[^1]
+
+Here is a longer footnote reference.[^ref]
+
+e = mc^2^.
+
+[^1]: Here is the footnote.
+[^ref]: Here is another footnote.
+
+--- end
+--- case 5 profile gfm bytes 75
+Here is a footnote reference.[^😄ref]
+
+[^😄ref]: Here is the footnote.
+
+--- end
+--- case 6 profile gfm bytes 75
+Here is a footnote reference.[^AB] and [^ab]
+
+[^aB]: Here is the footnote.
+
+--- end
+--- case 7 profile gfm bytes 42
+Foo.[^_ab]
+
+[^_ab]: Here is the footnote.
+
+--- end
+--- case 8 profile gfm bytes 36
+Foo.[^]
+
+[^]: Here is the footnote.
+
+--- end
+--- case 9 profile gfm bytes 50
+Foo.[^one two]
+
+[^one two]: Here is the footnote.
+
+--- end
+--- case 10 profile gfm bytes 30
+Foo[^**one**]
+[^**one**]: bar
+
+--- end
+--- case 11 profile gfm bytes 142
+Here is a footnote reference.[^1]
+
+[^1]: Here is the footnote.
+
+Here is a longer footnote reference.[^ref]
+
+[^ref]: Here is another footnote.
+
+--- end

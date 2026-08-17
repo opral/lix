@@ -1,0 +1,48 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: shortcodes
+count: 5
+
+--- case 1 options extension.shortcodes label-bytes 6 input-bytes 27 expected-bytes 31
+emojis
+--- input
+Hello, happy days! :smile:
+
+--- expected
+<p>Hello, happy days! 😄</p>
+
+--- end
+--- case 2 options extension.shortcodes label-bytes 6 input-bytes 29 expected-bytes 24
+emojis
+--- input
+:smile::smile::smile::smile:
+
+--- expected
+<p>😄😄😄😄</p>
+
+--- end
+--- case 3 options extension.shortcodes label-bytes 6 input-bytes 32 expected-bytes 27
+emojis
+--- input
+:smile:::smile:::smile:::smile:
+
+--- expected
+<p>😄:😄:😄:😄</p>
+
+--- end
+--- case 4 options extension.shortcodes label-bytes 6 input-bytes 27 expected-bytes 34
+emojis
+--- input
+Hello, happy days! :diego:
+
+--- expected
+<p>Hello, happy days! :diego:</p>
+
+--- end
+--- case 5 options extension.shortcodes label-bytes 15 input-bytes 72 expected-bytes 41
+emojis_specials
+--- input
+:+1: :-1: :clock12::1234: :1st_place_medal: :e-mail: :non-potable_water:
+--- expected
+<p>👍 👎 🕛🔢 🥇 📧 🚱</p>
+
+--- end

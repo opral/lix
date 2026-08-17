@@ -1,0 +1,132 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: comrak_html_edges
+count: 5
+
+--- case 1 options render.r#unsafe,extension.tasklist label-bytes 48 input-bytes 150 expected-bytes 611
+tasklist_mixed_containers_without_relaxed_marker
+--- input
+* [ ] Red
+* [x] Green
+* [ ] `Blue`
+<!-- end list -->
+1. [ ] Bird
+2. [ ] McHale
+3. [x] Parish
+<!-- end list -->
+* [ ] Red
+  * [x] Green
+    * [ ] Blue
+
+--- expected
+<ul>
+<li><input type="checkbox" disabled="" /> Red</li>
+<li><input type="checkbox" checked="" disabled="" /> Green</li>
+<li><input type="checkbox" disabled="" /> <code>Blue</code></li>
+</ul>
+<!-- end list -->
+<ol>
+<li><input type="checkbox" disabled="" /> Bird</li>
+<li><input type="checkbox" disabled="" /> McHale</li>
+<li><input type="checkbox" checked="" disabled="" /> Parish</li>
+</ol>
+<!-- end list -->
+<ul>
+<li><input type="checkbox" disabled="" /> Red
+<ul>
+<li><input type="checkbox" checked="" disabled="" /> Green
+<ul>
+<li><input type="checkbox" disabled="" /> Blue</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+--- end
+--- case 2 options extension.tasklist label-bytes 50 input-bytes 100 expected-bytes 217
+tasklist_mixed_plain_items_and_following_paragraph
+--- input
+- [ ] bullet point one
+- bullet point two and some extra text
+- [x] bullet point three
+
+hello world
+
+--- expected
+<ul>
+<li><input type="checkbox" disabled="" /> bullet point one</li>
+<li>bullet point two and some extra text</li>
+<li><input type="checkbox" checked="" disabled="" /> bullet point three</li>
+</ul>
+<p>hello world</p>
+
+--- end
+--- case 3 options extension.table label-bytes 46 input-bytes 16 expected-bytes 66
+table_with_trailing_paragraph_after_empty_body
+--- input
+| a |
+| - |
+
+ok
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>a</th>
+</tr>
+</thead>
+</table>
+<p>ok</p>
+
+--- end
+--- case 4 options extension.table label-bytes 27 input-bytes 16 expected-bytes 116
+table_missing_trailing_cell
+--- input
+|a|b|
+|-|-|
+|c|
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>a</th>
+<th>b</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>c</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 5 options extension.table label-bytes 37 input-bytes 20 expected-bytes 137
+table_missing_multiple_trailing_cells
+--- input
+|a|b|c|
+|-|-|-|
+|d|
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>a</th>
+<th>b</th>
+<th>c</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>d</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+
+--- end
