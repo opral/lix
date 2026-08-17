@@ -1,12 +1,12 @@
 ---
-description: Lix is a repository backend for AI products. One repository holds files for agents, a SQL database for your app, and version control over both.
+description: Lix combines files, a SQL database, and version control in one repository that you embed in your product.
 ---
 
 # What is Lix?
 
-Lix is a **repository backend for AI products**. One repository holds files for agents, a SQL database for your app, and version control over both. You embed it in your product.
+Lix combines **files, a SQL database, and version control in one repository**. You embed it in your product.
 
-Agents and tools read and write normal files. Your app queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge.
+Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge.
 
 Unlike Git, Lix tracks the rows inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
 
