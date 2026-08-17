@@ -10,7 +10,7 @@ CommonMark, GFM, comrak, and markdown-rs. Their provenance and applicable
 notices are preserved within `fixtures/conformance/THIRD-PARTY-LICENSES`,
 `fixtures/roundtrip/cases`, and `fixtures/roundtrip/examples`.
 
-The Rust harness lives in `src/markdown_syntax/upstream_tests` so it exercises
-the plugin's integrated parser directly. Its HTML renderer is test-only and is
-used to measure the parser AST against the conformance oracle; it is not part of
-the production Wasm component.
+The applicable Rust harness lives in `src/markdown_syntax/upstream_tests` so it
+exercises the plugin's integrated parser directly. The upstream HTML renderer
+and renderer-dependent tests are intentionally not included because the
+Markdown plugin does not render HTML.

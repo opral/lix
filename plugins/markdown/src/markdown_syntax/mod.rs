@@ -10,8 +10,6 @@ pub(crate) mod unicode_punctuation;
 
 pub(crate) mod ast;
 pub(crate) mod diagnostic;
-#[cfg(test)]
-pub(crate) mod html;
 pub(crate) mod options;
 pub(crate) mod parse;
 pub(crate) mod serialize;
@@ -27,7 +25,6 @@ pub(crate) use span::Span;
 pub(crate) use {
     ast::*,
     diagnostic::{Diagnostic, DiagnosticCode},
-    html::{HtmlError, HtmlOptions, SafeRawHtmlForm, TasklistAttrOrder},
     options::{Construct, Constructs, ParseOptions, SyntaxConfigError, WikiLinkOrder},
     parse::{ParseOutput, ParseStrictError, parse},
     serialize::SerializeError,
