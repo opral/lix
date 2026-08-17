@@ -477,15 +477,44 @@ where
                 // lazy replica's local catalog. Match switch_branch's retry
                 // contract: demand the control-plane scope, then retry the
                 // ordinary local session open without adding a sync API.
-                let current_branch_id = self.active_branch_id().await?;
-                self.engine.sync_mode().invalidate_scopes_for_branch(
-                    &current_branch_id,
-                    &[crate::sync::CONTROL_SYNC_SCOPE],
-                );
-                self.ensure_sync_api_scope("SELECT * FROM lix_branch")
-                    .await?;
-                self.open_internal_session(retry_branch_id, retry_account_id)
-                    .await
+                //
+                // The catalog pass runs on a background worker and can finish
+                // one iteration after the readiness marker is published. A
+                // small bounded retry closes that scheduling race without
+                // putting normal reads on a network path or exposing sync
+                // machinery through the public session API.
+                let mut last_error = error;
+                for attempt in 0..3 {
+                    let current_branch_id = self.active_branch_id().await?;
+                    self.engine.sync_mode().invalidate_scopes_for_branch(
+                        &current_branch_id,
+                        &[crate::sync::CONTROL_SYNC_SCOPE],
+                    );
+                    self.ensure_sync_api_scope("SELECT * FROM lix_branch")
+                        .await?;
+                    match self
+                        .open_internal_session(retry_branch_id.clone(), retry_account_id.clone())
+                        .await
+                    {
+                        Ok(session) => return Ok(session),
+                        Err(next_error)
+                            if matches!(
+                                next_error.code.as_str(),
+                                LixError::CODE_BRANCH_NOT_FOUND | LixError::CODE_COMMIT_NOT_FOUND
+                            ) =>
+                        {
+                            last_error = next_error;
+                            if attempt < 2 {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    25 * (attempt + 1) as u64,
+                                ))
+                                .await;
+                            }
+                        }
+                        Err(next_error) => return Err(next_error),
+                    }
+                }
+                Err(last_error)
             }
             Err(error) => Err(error),
         }
