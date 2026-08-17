@@ -586,12 +586,12 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               Open source · MIT
             </p>
             <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Repository backend for AI products
+              Files, a SQL database, and version control in one repository
             </h1>
             <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              AI products want a repository: files for agents, a SQL database
-              for your app, and version control over both. Lix is that
-              repository, an embeddable backend.
+              Lix is a repository you embed in your product. Agents read and
+              write normal files. Your product queries SQL. Lix versions
+              everything both write: branch, diff, merge, roll back.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
