@@ -1,0 +1,5 @@
+Document
+  MdxEsm "import X from './x'"
+  MdxJsx "<X value={1} />"
+  MdxExpression "1 + 1"
+

@@ -1,0 +1,14 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/tagfilter.rs
+role: upstream-input
+count: 1
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 19
+hi <xmp> ok
+
+<xmp>
+
+--- end

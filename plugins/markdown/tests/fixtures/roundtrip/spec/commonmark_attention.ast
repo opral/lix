@@ -1,0 +1,48 @@
+Document
+  Paragraph
+    Emphasis
+      Text "foo bar"
+  Paragraph
+    Text "a * foo bar*"
+  Paragraph
+    Text "a*\"foo\"*"
+  Paragraph
+    Text "foo"
+    Emphasis
+      Text "bar"
+  Paragraph
+    Text "5"
+    Emphasis
+      Text "6"
+    Text "78"
+  Paragraph
+    Text "_ foo bar_"
+  Paragraph
+    Text "foo_bar_"
+  Paragraph
+    Text "foo-"
+    Emphasis
+      Text "(bar)"
+  Paragraph
+    Text "*foo bar *"
+  Paragraph
+    Emphasis
+      Text "("
+      Emphasis
+        Text "foo"
+      Text ")"
+  Paragraph
+    Text "__foo__bar"
+  Paragraph
+    Text "foo-"
+    Strong
+      Text "(bar)"
+  Paragraph
+    Emphasis
+      Text "foo"
+      Strong
+        Text "bar"
+      Text "baz"
+  Paragraph
+    Emphasis
+      Text "foo**bar"

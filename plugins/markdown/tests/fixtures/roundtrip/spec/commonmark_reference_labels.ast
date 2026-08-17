@@ -1,0 +1,17 @@
+Document
+  Definition label=Foo\] destination=/escaped title="Bracket"
+  Definition label=A &amp; B destination=/entity title=none
+  Paragraph
+    Text "Use "
+    LinkReference identifier=foo\]
+      Text "escaped ] label"
+    Text " and "
+    LinkReference identifier=a &amp; b
+      Text "entity"
+    Text "."
+    SoftBreak
+    Link destination=/nested title=none
+      Text "nested [label]"
+    SoftBreak
+    Image destination=/img title=none
+      Text "alt ] [inner]"

@@ -1,0 +1,5 @@
+Document
+  CodeBlock kind=fenced info="rs"
+    Value "let x = 1;"
+  HtmlBlock "<div>raw</div>"
+

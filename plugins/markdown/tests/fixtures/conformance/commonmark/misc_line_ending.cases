@@ -1,0 +1,293 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: misc_line_ending
+count: 30
+
+--- case 1 options - label-bytes 31 input-bytes 1 expected-bytes 0
+should support just a line feed
+--- input
+
+
+--- expected
+
+--- end
+--- case 2 options - label-bytes 37 input-bytes 1 expected-bytes 0
+should support just a carriage return
+--- input
+
+--- expected
+
+--- end
+--- case 3 options - label-bytes 49 input-bytes 2 expected-bytes 0
+should support just a carriage return + line feed
+--- input
+
+
+--- expected
+
+--- end
+--- case 4 options - label-bytes 34 input-bytes 2 expected-bytes 0
+should support just two line feeds
+--- input
+
+
+
+--- expected
+
+--- end
+--- case 5 options - label-bytes 39 input-bytes 2 expected-bytes 0
+should support just two carriage return
+--- input
+
+--- expected
+
+--- end
+--- case 6 options - label-bytes 52 input-bytes 4 expected-bytes 0
+should support just two carriage return + line feeds
+--- input
+
+
+
+--- expected
+
+--- end
+--- case 7 options - label-bytes 63 input-bytes 3 expected-bytes 10
+should support a line feed for a line ending inside a paragraph
+--- input
+a
+b
+--- expected
+<p>a
+b</p>
+--- end
+--- case 8 options - label-bytes 69 input-bytes 3 expected-bytes 10
+should support a carriage return for a line ending inside a paragraph
+--- input
+ab
+--- expected
+<p>ab</p>
+--- end
+--- case 9 options - label-bytes 81 input-bytes 4 expected-bytes 11
+should support a carriage return + line feed for a line ending inside a paragraph
+--- input
+a
+b
+--- expected
+<p>a
+b</p>
+--- end
+--- case 10 options - label-bytes 59 input-bytes 5 expected-bytes 28
+should support a line feed in indented code (and prefer it)
+--- input
+	a
+	b
+--- expected
+<pre><code>a
+b
+</code></pre>
+--- end
+--- case 11 options - label-bytes 65 input-bytes 5 expected-bytes 28
+should support a carriage return in indented code (and prefer it)
+--- input
+	a	b
+--- expected
+<pre><code>ab</code></pre>
+--- end
+--- case 12 options - label-bytes 77 input-bytes 6 expected-bytes 30
+should support a carriage return + line feed in indented code (and prefer it)
+--- input
+	a
+	b
+--- expected
+<pre><code>a
+b
+</code></pre>
+--- end
+--- case 13 options - label-bytes 39 input-bytes 15 expected-bytes 23
+should support a line feed between flow
+--- input
+***
+### Heading
+--- expected
+<hr />
+<h3>Heading</h3>
+--- end
+--- case 14 options - label-bytes 45 input-bytes 15 expected-bytes 23
+should support a carriage return between flow
+--- input
+***### Heading
+--- expected
+<hr /><h3>Heading</h3>
+--- end
+--- case 15 options - label-bytes 57 input-bytes 16 expected-bytes 24
+should support a carriage return + line feed between flow
+--- input
+***
+### Heading
+--- expected
+<hr />
+<h3>Heading</h3>
+--- end
+--- case 16 options - label-bytes 46 input-bytes 18 expected-bytes 24
+should support several line feeds between flow
+--- input
+***
+
+
+### Heading
+
+--- expected
+<hr />
+<h3>Heading</h3>
+
+--- end
+--- case 17 options - label-bytes 52 input-bytes 18 expected-bytes 24
+should support several carriage returns between flow
+--- input
+***### Heading
+--- expected
+<hr /><h3>Heading</h3>
+--- end
+--- case 18 options - label-bytes 64 input-bytes 22 expected-bytes 26
+should support several carriage return + line feeds between flow
+--- input
+***
+
+
+### Heading
+
+--- expected
+<hr />
+<h3>Heading</h3>
+
+--- end
+--- case 19 options - label-bytes 48 input-bytes 17 expected-bytes 50
+should support several line feeds in fenced code
+--- input
+```x
+
+
+y
+
+
+```
+
+
+
+--- expected
+<pre><code class="language-x">
+
+y
+
+
+</code></pre>
+
+--- end
+--- case 20 options - label-bytes 54 input-bytes 17 expected-bytes 50
+should support several carriage returns in fenced code
+--- input
+```xy```
+--- expected
+<pre><code class="language-x">y</code></pre>
+--- end
+--- case 21 options - label-bytes 66 input-bytes 26 expected-bytes 56
+should support several carriage return + line feeds in fenced code
+--- input
+```x
+
+
+y
+
+
+```
+
+
+
+--- expected
+<pre><code class="language-x">
+
+y
+
+
+</code></pre>
+
+--- end
+--- case 22 options - label-bytes 55 input-bytes 10 expected-bytes 23
+should support a carriage return + line feed in content
+--- input
+A
+B
+-
+C
+--- expected
+<h2>A
+B</h2>
+<p>C</p>
+--- end
+--- case 23 options allow_dangerous_html,allow_dangerous_protocol label-bytes 43 input-bytes 5 expected-bytes 5
+should support a carriage return after html
+--- input
+<div
+--- expected
+<div
+--- end
+--- case 24 options allow_dangerous_html,allow_dangerous_protocol label-bytes 55 input-bytes 6 expected-bytes 6
+should support a carriage return + line feed after html
+--- input
+<div
+
+--- expected
+<div
+
+--- end
+--- case 25 options allow_dangerous_html,allow_dangerous_protocol label-bytes 52 input-bytes 8 expected-bytes 14
+should support a blank line w/ line feeds after html
+--- input
+<div>
+
+x
+--- expected
+<div>
+<p>x</p>
+--- end
+--- case 26 options allow_dangerous_html,allow_dangerous_protocol label-bytes 58 input-bytes 8 expected-bytes 14
+should support a blank line w/ carriage returns after html
+--- input
+<div>x
+--- expected
+<div><p>x</p>
+--- end
+--- case 27 options allow_dangerous_html,allow_dangerous_protocol label-bytes 70 input-bytes 10 expected-bytes 15
+should support a blank line w/ carriage return + line feeds after html
+--- input
+<div>
+
+x
+--- expected
+<div>
+<p>x</p>
+--- end
+--- case 28 options allow_dangerous_html,allow_dangerous_protocol label-bytes 52 input-bytes 7 expected-bytes 7
+should support a non-blank line w/ line feed in html
+--- input
+<div>
+x
+--- expected
+<div>
+x
+--- end
+--- case 29 options allow_dangerous_html,allow_dangerous_protocol label-bytes 58 input-bytes 7 expected-bytes 7
+should support a non-blank line w/ carriage return in html
+--- input
+<div>x
+--- expected
+<div>x
+--- end
+--- case 30 options allow_dangerous_html,allow_dangerous_protocol label-bytes 70 input-bytes 8 expected-bytes 8
+should support a non-blank line w/ carriage return + line feed in html
+--- input
+<div>
+x
+--- expected
+<div>
+x
+--- end

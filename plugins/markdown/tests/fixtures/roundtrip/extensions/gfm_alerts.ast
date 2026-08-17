@@ -1,0 +1,9 @@
+Document
+  Alert kind=note title=none
+    Paragraph
+      Text "Pay attention"
+    Paragraph
+      Text "Paragraph two."
+  Alert kind=warning title="Be careful"
+    Paragraph
+      Text "Nested alert."

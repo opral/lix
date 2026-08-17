@@ -1,0 +1,21 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/insert.rs
+role: upstream-input
+count: 1
+profiles: extras
+
+--- case 1 profile extras bytes 149
+This is ++important!++.
+
+This is ++very important++ OK?
+
+++It is a 
+ shrubbery++
+
+Vendo ++Opel Corsa **em bom estado**++
+
+Ceci n'est pas +important+
+
+--- end

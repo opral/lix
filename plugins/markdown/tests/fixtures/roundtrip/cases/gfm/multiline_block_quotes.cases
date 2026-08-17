@@ -1,0 +1,102 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/multiline_block_quotes.rs
+role: upstream-input
+count: 13
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 33
+>>>
+Paragraph 1
+
+Paragraph 2
+>>>
+
+--- end
+--- case 2 profile commonmark bytes 64
+- item one
+
+  >>>
+  Paragraph 1
+
+  Paragraph 2
+  >>>
+- item two
+
+--- end
+--- case 3 profile commonmark bytes 49
+- item one
+
+  >>>
+  Paragraph 1
+  >>>
+- item two
+
+--- end
+--- case 4 profile commonmark bytes 12
+>>>
+> a
+>>>
+
+--- end
+--- case 5 profile commonmark bytes 15
+>>>
+> a
+
+b
+>>>
+
+--- end
+--- case 6 profile commonmark bytes 12
+>>>
+* a
+>>>
+
+--- end
+--- case 7 profile commonmark bytes 15
+>>>
+* a
+
+b
+>>>
+
+--- end
+--- case 8 profile commonmark bytes 14
+>>>
+> * a
+>>>
+
+--- end
+--- case 9 profile commonmark bytes 17
+>>>
+> * a
+
+b
+>>>
+
+--- end
+--- case 10 profile commonmark bytes 20
+>>>
+>> a
+>> * b
+>>>
+
+--- end
+--- case 11 profile commonmark bytes 24
+>>>
+<div>test</div>
+>>>
+
+--- end
+--- case 12 profile commonmark bytes 26
+>>>
+> <div>test</div>
+>>>
+
+--- end
+--- case 13 profile commonmark bytes 25
+ -  >>>
+    - foo
+    >>>
+--- end

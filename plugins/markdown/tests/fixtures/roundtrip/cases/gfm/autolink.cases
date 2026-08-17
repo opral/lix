@@ -1,0 +1,131 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/autolink.rs
+role: upstream-input
+count: 36
+profiles: commonmark,gfm,wikilink-after,wikilink-before
+
+--- case 1 profile gfm bytes 17
+www.autolink.com
+
+--- end
+--- case 2 profile gfm bytes 15
+john@smith.com
+
+--- end
+--- case 3 profile gfm bytes 51
+https://google.com/search
+rdar://localhost.com/blah
+--- end
+--- case 4 profile gfm bytes 53
+https://google.com/search
+https://www.google.com/maps
+--- end
+--- case 5 profile gfm bytes 18
+@a.b.c@. x
+
+n@. x
+
+--- end
+--- case 6 profile gfm bytes 29
+http://example.com/[abc]]...
+
+--- end
+--- case 7 profile gfm bytes 29
+http://example.com/{abc}}...
+
+--- end
+--- case 8 profile gfm bytes 29
+http://example.com/(abc))...
+
+--- end
+--- case 9 profile commonmark bytes 26
+ab _cde_ f@g.ee h*ijklm* n
+--- end
+--- case 10 profile gfm bytes 26
+ab _cde_ f@g.ee h*ijklm* n
+--- end
+--- case 11 profile gfm bytes 47
+See &lt;&lt;&lt;http://example.com/&gt;&gt;&gt;
+--- end
+--- case 12 profile gfm bytes 40
+http://example.com/src/_mocks_/vscode.js
+--- end
+--- case 13 profile gfm bytes 234
+Here's an autolink: https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022 and another one https://www.unicode.org/review/pri453/feedback.html#:~:text=Fri%20Jun%2024%2009:56:01%20CDT%202022.
+--- end
+--- case 14 profile gfm bytes 61
+https://www.wolframalpha.com/input/?i=x^2+(y-(x^2)^(1/3))^2=1
+--- end
+--- case 15 profile gfm bytes 51
+![http://inline.com/image](http://inline.com/image)
+--- end
+--- case 16 profile gfm bytes 53
+Underscores not allowed in host name www.xxx.yyy._zzz
+--- end
+--- case 17 profile gfm bytes 4
+://-
+--- end
+--- case 18 profile gfm bytes 6
+we://w
+--- end
+--- case 19 profile gfm bytes 63
+a  www.makea.fish  x
+
+b  https://www.com  y
+
+c  foo@www.com  z
+
+--- end
+--- case 20 profile gfm bytes 40
+scyther@pokemon.com/beedrill@pokemon.com
+--- end
+--- case 21 profile gfm bytes 41
+scyther@pokemon.com--beedrill@pokemon.com
+--- end
+--- case 22 profile gfm bytes 63
+[Contact user@example.com for help](http://support.example.com)
+--- end
+--- case 23 profile gfm bytes 51
+[Visit https://www.example.com](http://example.com)
+--- end
+--- case 24 profile gfm bytes 47
+[Check out www.example.com](http://example.com)
+--- end
+--- case 25 profile gfm bytes 38
+![Contact user@example.com](image.png)
+--- end
+--- case 26 profile gfm bytes 43
+![Visit https://www.example.com](image.png)
+--- end
+--- case 27 profile gfm bytes 35
+![Check www.example.com](image.png)
+--- end
+--- case 28 profile wikilink-after bytes 47
+[[http://example.com|Contact user@example.com]]
+--- end
+--- case 29 profile wikilink-after bytes 52
+[[http://example.com|Visit https://www.example.com]]
+--- end
+--- case 30 profile wikilink-before bytes 44
+[[Check www.example.com|http://example.com]]
+--- end
+--- case 31 profile gfm bytes 48
+scoped https://[fe80::1ff:fe23:4567:890a%25eth2]
+--- end
+--- case 32 profile gfm bytes 47
+hi: nex://[fe80::1ff:fe23:4567:890a%25eth2]/z/x
+--- end
+--- case 33 profile gfm bytes 12
+foo www. foo
+--- end
+--- case 34 profile gfm bytes 15
+foo http:// foo
+--- end
+--- case 35 profile gfm bytes 24
+https://www.example.com/
+--- end
+--- case 36 profile gfm bytes 30
+⁨https://www.example.com/⁩
+--- end

@@ -1,0 +1,17 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/text.rs
+role: upstream-input
+count: 3
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 15
+hello $.;'there
+--- end
+--- case 2 profile commonmark bytes 13
+Foo χρῆν
+--- end
+--- case 3 profile commonmark bytes 19
+Multiple     spaces
+--- end

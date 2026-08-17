@@ -1,0 +1,60 @@
+Document
+  List ordered=false tight=true
+    ListItem checked=false
+      Paragraph
+        Text "todo"
+    ListItem checked=true
+      Paragraph
+        Text "done"
+    ListItem checked=true
+      Paragraph
+        Text "upper"
+    ListItem checked=none
+      Paragraph
+        Text "[y] not a task"
+  List ordered=false tight=true
+    ListItem checked=false
+      Paragraph
+        Text "parent"
+      List ordered=false tight=true
+        ListItem checked=true
+          Paragraph
+            Text "child done"
+        ListItem checked=false
+          Paragraph
+            Text "child todo"
+  List ordered=false tight=true
+    ListItem checked=none
+      Heading depth=1 kind=setext
+        Text "[ ] In a setext heading"
+  List ordered=false tight=false
+    ListItem checked=false
+      Paragraph
+        Text "In a lazy line"
+    ListItem checked=none
+  Paragraph
+    Text "[x]"
+  List ordered=false tight=true
+    ListItem checked=none
+      Paragraph
+        Text "[x]"
+  List ordered=false tight=true
+    ListItem checked=none
+      Paragraph
+        Text "[ ]No space?"
+  List ordered=false tight=false
+    ListItem checked=none
+      Paragraph
+        Text "[ ]"
+    ListItem checked=none
+      Paragraph
+        Text "[ ] "
+  List ordered=false tight=true
+    ListItem checked=false
+      Paragraph
+        Text "Text."
+  BlockQuote
+    List ordered=false tight=true
+      ListItem checked=true
+        Paragraph
+          Text "In a list in a block quote"

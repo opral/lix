@@ -20,3 +20,21 @@ pub(crate) use diagnostic::DiagnosticSeverity;
 pub(crate) use options::SyntaxOptions;
 pub(crate) use serialize::{LineEnding, SerializeOptions};
 pub(crate) use span::Span;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use {
+    ast::*,
+    diagnostic::{Diagnostic, DiagnosticCode},
+    options::{Construct, Constructs, ParseOptions, SyntaxConfigError, WikiLinkOrder},
+    parse::{ParseOutput, ParseStrictError, parse},
+    serialize::SerializeError,
+    span::{LineIndex, LinePosition},
+};
+
+#[cfg(test)]
+pub(crate) mod prelude {
+    pub(crate) use super::*;
+}
+
+#[cfg(test)]
+mod upstream_tests;

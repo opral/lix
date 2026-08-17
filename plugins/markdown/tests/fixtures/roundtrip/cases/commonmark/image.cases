@@ -1,0 +1,146 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/image.rs
+role: upstream-input
+count: 35
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 20
+[link](/uri "title")
+--- end
+--- case 2 profile commonmark bytes 20
+![foo](/url "title")
+--- end
+--- case 3 profile commonmark bytes 53
+[foo *bar*]: train.jpg "train & tracks"
+
+![foo *bar*]
+--- end
+--- case 4 profile commonmark bytes 26
+![foo ![bar](/url)](/url2)
+--- end
+--- case 5 profile commonmark bytes 25
+![foo [bar](/url)](/url2)
+--- end
+--- case 6 profile commonmark bytes 55
+[foo *bar*]: train.jpg "train & tracks"
+
+![foo *bar*][]
+--- end
+--- case 7 profile commonmark bytes 58
+[FOOBAR]: train.jpg "train & tracks"
+
+![foo *bar*][foobar]
+--- end
+--- case 8 profile commonmark bytes 17
+![foo](train.jpg)
+--- end
+--- case 9 profile commonmark bytes 45
+My ![foo bar](/path/to/train.jpg  "title"   )
+--- end
+--- case 10 profile commonmark bytes 13
+![foo](<url>)
+--- end
+--- case 11 profile commonmark bytes 9
+![](/url)
+--- end
+--- case 12 profile commonmark bytes 24
+[bar]: /url
+
+![foo][bar]
+--- end
+--- case 13 profile commonmark bytes 24
+[BAR]: /url
+
+![foo][bar]
+--- end
+--- case 14 profile commonmark bytes 29
+[foo]: /url "title"
+
+![foo][]
+--- end
+--- case 15 profile commonmark bytes 41
+[*foo* bar]: /url "title"
+
+![*foo* bar][]
+--- end
+--- case 16 profile commonmark bytes 29
+[foo]: /url "title"
+
+![Foo][]
+--- end
+--- case 17 profile commonmark bytes 31
+[foo]: /url "title"
+
+![foo] 
+[]
+--- end
+--- case 18 profile commonmark bytes 27
+[foo]: /url "title"
+
+![foo]
+--- end
+--- case 19 profile commonmark bytes 39
+[*foo* bar]: /url "title"
+
+![*foo* bar]
+--- end
+--- case 20 profile commonmark bytes 31
+[[foo]]: /url "title"
+
+![[foo]]
+--- end
+--- case 21 profile commonmark bytes 27
+[foo]: /url "title"
+
+![Foo]
+--- end
+--- case 22 profile commonmark bytes 28
+[foo]: /url "title"
+
+!\[foo]
+--- end
+--- case 23 profile commonmark bytes 28
+[foo]: /url "title"
+
+\![foo]
+--- end
+--- case 24 profile commonmark bytes 8
+![foo]()
+--- end
+--- case 25 profile commonmark bytes 10
+![foo](<>)
+--- end
+--- case 26 profile commonmark bytes 16
+![](example.png)
+--- end
+--- case 27 profile commonmark bytes 22
+![alpha](bravo.png "")
+--- end
+--- case 28 profile commonmark bytes 22
+![alpha](bravo.png '')
+--- end
+--- case 29 profile commonmark bytes 22
+![alpha](bravo.png ())
+--- end
+--- case 30 profile commonmark bytes 56
+![&amp;&copy;&](example.com/&amp;&copy;& "&amp;&copy;&")
+--- end
+--- case 31 profile commonmark bytes 10
+![](<> "")
+--- end
+--- case 32 profile commonmark bytes 6
+![x]()
+--- end
+--- case 33 profile commonmark bytes 24
+![](javascript:alert(1))
+--- end
+--- case 34 profile commonmark bytes 43
+a ![alpha]() b ![bravo](charlie 'delta') c.
+--- end
+--- case 35 profile commonmark bytes 36
+[x]: y
+
+a ![x] b ![x][] c ![d][x] e.
+--- end

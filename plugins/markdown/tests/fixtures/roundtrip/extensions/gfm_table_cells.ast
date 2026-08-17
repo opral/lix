@@ -1,0 +1,74 @@
+Document
+  Table
+    Alignments none,none
+    Row
+      Cell
+      Cell
+        Text "a"
+  Table
+    Alignments none,none
+    Row
+      Cell
+        Text "a"
+      Cell
+  Table
+    Alignments none,none,none
+    Row
+      Cell
+        Text "a"
+      Cell
+      Cell
+        Text "b"
+  Table
+    Alignments none,none
+    Row
+      Cell
+        Text "a"
+      Cell
+        Text "b"
+    Row
+      Cell
+      Cell
+        Text "c"
+  Table
+    Alignments none,none
+    Row
+      Cell
+        Text "a"
+      Cell
+        Text "b"
+    Row
+      Cell
+        Text "c"
+      Cell
+  Table
+    Alignments none,none,none
+    Row
+      Cell
+        Text "a"
+      Cell
+        Text "b"
+      Cell
+        Text "c"
+    Row
+      Cell
+        Text "d"
+      Cell
+      Cell
+        Text "e"
+  Table
+    Alignments left,center,right
+    Row
+      Cell
+        Text "left"
+      Cell
+        Text "center"
+      Cell
+        Text "right"
+    Row
+      Cell
+        Text "l"
+      Cell
+        Text "c"
+      Cell
+        Text "r"

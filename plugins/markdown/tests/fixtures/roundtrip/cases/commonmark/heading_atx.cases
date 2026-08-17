@@ -1,0 +1,115 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/heading_atx.rs
+role: upstream-input
+count: 32
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 5
+# foo
+--- end
+--- case 2 profile commonmark bytes 6
+## foo
+--- end
+--- case 3 profile commonmark bytes 7
+### foo
+--- end
+--- case 4 profile commonmark bytes 8
+#### foo
+--- end
+--- case 5 profile commonmark bytes 9
+##### foo
+--- end
+--- case 6 profile commonmark bytes 10
+###### foo
+--- end
+--- case 7 profile commonmark bytes 11
+####### foo
+--- end
+--- case 8 profile commonmark bytes 7
+#5 bolt
+--- end
+--- case 9 profile commonmark bytes 8
+#hashtag
+--- end
+--- case 10 profile commonmark bytes 7
+\## foo
+--- end
+--- case 11 profile commonmark bytes 19
+# foo *bar* \*baz\*
+--- end
+--- case 12 profile commonmark bytes 43
+#                  foo                     
+--- end
+--- case 13 profile commonmark bytes 8
+ ### foo
+--- end
+--- case 14 profile commonmark bytes 8
+  ## foo
+--- end
+--- case 15 profile commonmark bytes 8
+   # foo
+--- end
+--- case 16 profile commonmark bytes 9
+    # foo
+--- end
+--- case 17 profile commonmark bytes 13
+foo
+    # bar
+--- end
+--- case 18 profile commonmark bytes 9
+## foo ##
+--- end
+--- case 19 profile commonmark bytes 18
+  ###   bar    ###
+--- end
+--- case 20 profile commonmark bytes 40
+# foo ##################################
+--- end
+--- case 21 profile commonmark bytes 12
+##### foo ##
+--- end
+--- case 22 profile commonmark bytes 16
+### foo ###     
+--- end
+--- case 23 profile commonmark bytes 13
+### foo ### b
+--- end
+--- case 24 profile commonmark bytes 6
+# foo#
+--- end
+--- case 25 profile commonmark bytes 16
+****
+## foo
+****
+--- end
+--- case 26 profile commonmark bytes 21
+Foo bar
+# baz
+Bar foo
+--- end
+--- case 27 profile commonmark bytes 13
+## 
+#
+### ###
+--- end
+--- case 28 profile commonmark bytes 7
+#
+a
+# b
+--- end
+--- case 29 profile commonmark bytes 5
+> #
+a
+--- end
+--- case 30 profile commonmark bytes 5
+> a
+#
+--- end
+--- case 31 profile commonmark bytes 3
+# a
+--- end
+--- case 32 profile commonmark bytes 10
+## alpha #
+--- end

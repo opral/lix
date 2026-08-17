@@ -1,0 +1,101 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/misc_dangerous_protocol.rs
+role: upstream-input
+count: 31
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 21
+<javascript:alert(1)>
+--- end
+--- case 2 profile commonmark bytes 10
+<http://a>
+--- end
+--- case 3 profile commonmark bytes 11
+<https://a>
+--- end
+--- case 4 profile commonmark bytes 13
+<irc:///help>
+--- end
+--- case 5 profile commonmark bytes 10
+<mailto:a>
+--- end
+--- case 6 profile commonmark bytes 24
+![](javascript:alert(1))
+--- end
+--- case 7 profile commonmark bytes 13
+![](http://a)
+--- end
+--- case 8 profile commonmark bytes 14
+![](https://a)
+--- end
+--- case 9 profile commonmark bytes 16
+![](irc:///help)
+--- end
+--- case 10 profile commonmark bytes 13
+![](mailto:a)
+--- end
+--- case 11 profile commonmark bytes 7
+![](#a)
+--- end
+--- case 12 profile commonmark bytes 7
+![](?a)
+--- end
+--- case 13 profile commonmark bytes 7
+![](/a)
+--- end
+--- case 14 profile commonmark bytes 8
+![](./a)
+--- end
+--- case 15 profile commonmark bytes 9
+![](../a)
+--- end
+--- case 16 profile commonmark bytes 10
+![](a#b:c)
+--- end
+--- case 17 profile commonmark bytes 10
+![](a?b:c)
+--- end
+--- case 18 profile commonmark bytes 10
+![](a/b:c)
+--- end
+--- case 19 profile commonmark bytes 23
+[](javascript:alert(1))
+--- end
+--- case 20 profile commonmark bytes 12
+[](http://a)
+--- end
+--- case 21 profile commonmark bytes 13
+[](https://a)
+--- end
+--- case 22 profile commonmark bytes 15
+[](irc:///help)
+--- end
+--- case 23 profile commonmark bytes 12
+[](mailto:a)
+--- end
+--- case 24 profile commonmark bytes 6
+[](#a)
+--- end
+--- case 25 profile commonmark bytes 6
+[](?a)
+--- end
+--- case 26 profile commonmark bytes 6
+[](/a)
+--- end
+--- case 27 profile commonmark bytes 7
+[](./a)
+--- end
+--- case 28 profile commonmark bytes 8
+[](../a)
+--- end
+--- case 29 profile commonmark bytes 9
+[](a#b:c)
+--- end
+--- case 30 profile commonmark bytes 9
+[](a?b:c)
+--- end
+--- case 31 profile commonmark bytes 9
+[](a/b:c)
+--- end

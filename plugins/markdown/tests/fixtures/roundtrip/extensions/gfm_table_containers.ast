@@ -1,0 +1,29 @@
+Document
+  BlockQuote
+    Paragraph
+      Text "| a |"
+      SoftBreak
+      Text "| - |"
+  BlockQuote
+    Paragraph
+      Text "a"
+      SoftBreak
+      Text "| b |"
+      SoftBreak
+      Text "|-"
+  Paragraph
+    Text "| a |"
+  BlockQuote
+    Paragraph
+      Text "| - |"
+  BlockQuote
+    Table
+      Alignments none
+      Row
+        Cell
+          Text "A"
+      Row
+        Cell
+          Text "1"
+  Paragraph
+    Text "| 2 |"

@@ -1,0 +1,20 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/underline.rs
+role: upstream-input
+count: 3
+profiles: extras
+
+--- case 1 profile extras bytes 20
+__underlined text__
+
+--- end
+--- case 2 profile extras bytes 9
+__this__
+
+--- end
+--- case 3 profile extras bytes 11
+___this___
+
+--- end

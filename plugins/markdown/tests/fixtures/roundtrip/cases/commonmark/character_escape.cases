@@ -1,0 +1,60 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/character_escape.rs
+role: upstream-input
+count: 13
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 64
+\!\"\#\$\%\&\'\(\)\*\+\,\-\.\/\:\;\<\=\>\?\@\[\\\]\^\_\`\{\|\}\~
+--- end
+--- case 2 profile commonmark bytes 18
+\→\A\a\ \3\φ\«
+--- end
+--- case 3 profile commonmark bytes 174
+\*not emphasized*
+\<br/> not a tag
+\[not a link](/foo)
+\`not code`
+1\. not a list
+\* not a list
+\# not a heading
+\[foo]: /url "not a reference"
+\&ouml; not a character entity
+--- end
+--- case 4 profile commonmark bytes 8
+foo\
+bar
+--- end
+--- case 5 profile commonmark bytes 10
+`` \[\` ``
+--- end
+--- case 6 profile commonmark bytes 8
+    \[\]
+--- end
+--- case 7 profile commonmark bytes 28
+<http://example.com?find=\*>
+--- end
+--- case 8 profile commonmark bytes 18
+<a href="/bar\/)">
+--- end
+--- case 9 profile commonmark bytes 23
+[foo](/bar\* "ti\*tle")
+--- end
+--- case 10 profile commonmark bytes 30
+[foo]: /bar\* "ti\*tle"
+
+[foo]
+--- end
+--- case 11 profile commonmark bytes 20
+``` foo\+bar
+foo
+```
+--- end
+--- case 12 profile commonmark bytes 4
+\> a
+--- end
+--- case 13 profile commonmark bytes 6
+a \* b
+--- end

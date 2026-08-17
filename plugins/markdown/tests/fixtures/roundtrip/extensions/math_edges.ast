@@ -1,0 +1,38 @@
+Document
+  Paragraph
+    Text "Let "
+    Math "x" dollars=1
+    Text " and "
+    Math "y = z + 2" dollars=2
+    Text " be values."
+  Paragraph
+    Text "This is not math: 2000$."
+    SoftBreak
+    Text "And neither is this $ 4 $."
+    SoftBreak
+    Text "Or this $4"
+    SoftBreak
+    Text "$."
+  Paragraph
+    Text "The cost is between $10 and 30$."
+  Paragraph
+    Math "b<a>c" dollars=1
+    Text " and "
+    Math "x *y* z" dollars=1
+    Text "."
+  Paragraph
+    Text "Code math "
+    Math "2+2" code
+    Text " and "
+    Math "1+\\$2" code
+    Text "."
+    SoftBreak
+    Text "Unclosed code math stays text: $"
+    Code value="2+2" raw="2+2" fence=1
+    Text "."
+  Paragraph
+    Text "This is block math"
+  MathBlock "1+2"
+  Paragraph
+    Text "This fence contains dollars"
+  MathBlock "a $$ b"

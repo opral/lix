@@ -1,0 +1,651 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/html_flow.rs
+role: upstream-input
+count: 147
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 12
+<!-- asd -->
+--- end
+--- case 2 profile commonmark bytes 3
+<x>
+--- end
+--- case 3 profile commonmark bytes 18
+<div>
+stuff
+</div>
+--- end
+--- case 4 profile commonmark bytes 119
+<pre language="haskell"><code>
+import Text.HTML.TagSoup
+
+main :: IO ()
+main = print $ parseTags tags
+</code></pre>
+okay
+--- end
+--- case 5 profile commonmark bytes 134
+<script type="text/javascript">
+// JavaScript example
+
+document.getElementById("demo").innerHTML = "Hello JavaScript!";
+</script>
+okay
+--- end
+--- case 6 profile commonmark bytes 72
+<style
+  type="text/css">
+h1 {color:red;}
+
+p {color:blue;}
+</style>
+okay
+--- end
+--- case 7 profile commonmark bytes 30
+<style
+  type="text/css">
+
+foo
+--- end
+--- case 8 profile commonmark bytes 34
+<style>p{color:red;}</style>
+*foo*
+--- end
+--- case 9 profile commonmark bytes 30
+<script>
+foo
+</script>1. *bar*
+--- end
+--- case 10 profile commonmark bytes 7
+<script
+--- end
+--- case 11 profile commonmark bytes 13
+</script
+more
+--- end
+--- case 12 profile commonmark bytes 8
+<script/
+--- end
+--- case 13 profile commonmark bytes 14
+<script/
+*asd*
+--- end
+--- case 14 profile commonmark bytes 9
+<script/>
+--- end
+--- case 15 profile commonmark bytes 11
+<script/>
+a
+--- end
+--- case 16 profile commonmark bytes 10
+<script/>a
+--- end
+--- case 17 profile commonmark bytes 9
+<script>a
+--- end
+--- case 18 profile commonmark bytes 11
+Foo
+<script
+--- end
+--- case 19 profile commonmark bytes 19
+<script>a</script
+b
+--- end
+--- case 20 profile commonmark bytes 24
+<script>
+  
+  
+</script>
+--- end
+--- case 21 profile commonmark bytes 12
+> <script>
+a
+--- end
+--- case 22 profile commonmark bytes 12
+> a
+<script>
+--- end
+--- case 23 profile commonmark bytes 29
+<!-- Foo
+
+bar
+   baz -->
+okay
+--- end
+--- case 24 profile commonmark bytes 23
+<!-- foo -->*bar*
+*baz*
+--- end
+--- case 25 profile commonmark bytes 9
+<!-asd-->
+--- end
+--- case 26 profile commonmark bytes 5
+<!-->
+--- end
+--- case 27 profile commonmark bytes 6
+<!--->
+--- end
+--- case 28 profile commonmark bytes 7
+<!---->
+--- end
+--- case 29 profile commonmark bytes 9
+<!--
+->
+"
+--- end
+--- case 30 profile commonmark bytes 10
+<!--
+-->
+"
+--- end
+--- case 31 profile commonmark bytes 11
+<!--
+--->
+"
+--- end
+--- case 32 profile commonmark bytes 12
+<!--
+---->
+"
+--- end
+--- case 33 profile commonmark bytes 14
+  <!-- foo -->
+--- end
+--- case 34 profile commonmark bytes 16
+    <!-- foo -->
+--- end
+--- case 35 profile commonmark bytes 8
+Foo
+<!--
+--- end
+--- case 36 profile commonmark bytes 14
+<!--
+  
+  
+-->
+--- end
+--- case 37 profile commonmark bytes 8
+> <!--
+a
+--- end
+--- case 38 profile commonmark bytes 8
+> a
+<!--
+--- end
+--- case 39 profile commonmark bytes 27
+<?php
+
+  echo ">";
+
+?>
+okay
+--- end
+--- case 40 profile commonmark bytes 3
+<?>
+--- end
+--- case 41 profile commonmark bytes 4
+<??>
+--- end
+--- case 42 profile commonmark bytes 6
+Foo
+<?
+--- end
+--- case 43 profile commonmark bytes 11
+<?
+  
+  
+?>
+--- end
+--- case 44 profile commonmark bytes 6
+> <?
+a
+--- end
+--- case 45 profile commonmark bytes 6
+> a
+<?
+--- end
+--- case 46 profile commonmark bytes 15
+<!DOCTYPE html>
+--- end
+--- case 47 profile commonmark bytes 6
+<!123>
+--- end
+--- case 48 profile commonmark bytes 3
+<!>
+--- end
+--- case 49 profile commonmark bytes 4
+<!a>
+--- end
+--- case 50 profile commonmark bytes 7
+Foo
+<!d
+--- end
+--- case 51 profile commonmark bytes 11
+<!a
+  
+  
+>
+--- end
+--- case 52 profile commonmark bytes 7
+> <!a
+b
+--- end
+--- case 53 profile commonmark bytes 7
+> a
+<!b
+--- end
+--- case 54 profile commonmark bytes 118
+<![CDATA[
+function matchwo(a,b)
+{
+  if (a < b && a < 0) then {
+    return 1;
+
+  } else {
+
+    return 0;
+  }
+}
+]]>
+okay
+--- end
+--- case 55 profile commonmark bytes 12
+<![CDATA[]]>
+--- end
+--- case 56 profile commonmark bytes 11
+<![CDATA]]>
+--- end
+--- case 57 profile commonmark bytes 13
+<![CDATA[]]]>
+--- end
+--- case 58 profile commonmark bytes 13
+Foo
+<![CDATA[
+--- end
+--- case 59 profile commonmark bytes 12
+<![cdata[]]>
+--- end
+--- case 60 profile commonmark bytes 19
+<![CDATA[
+  
+  
+]]>
+--- end
+--- case 61 profile commonmark bytes 13
+> <![CDATA[
+a
+--- end
+--- case 62 profile commonmark bytes 13
+> a
+<![CDATA[
+--- end
+--- case 63 profile commonmark bytes 68
+<table><tr><td>
+<pre>
+**Hello**,
+
+_world_.
+</pre>
+</td></tr></table>
+--- end
+--- case 64 profile commonmark bytes 71
+<table>
+  <tr>
+    <td>
+           hi
+    </td>
+  </tr>
+</table>
+
+okay.
+--- end
+--- case 65 profile commonmark bytes 34
+ <div>
+  *hello*
+         <foo><a>
+--- end
+--- case 66 profile commonmark bytes 12
+</div>
+*foo*
+--- end
+--- case 67 profile commonmark bytes 37
+<DIV CLASS="foo">
+
+*Markdown*
+
+</DIV>
+--- end
+--- case 68 profile commonmark bytes 35
+<div id="foo"
+  class="bar">
+</div>
+--- end
+--- case 69 profile commonmark bytes 39
+<div id="foo" class="bar
+  baz">
+</div>
+--- end
+--- case 70 profile commonmark bytes 18
+<div>
+*foo*
+
+*bar*
+--- end
+--- case 71 profile commonmark bytes 18
+<div id="foo"
+*hi*
+--- end
+--- case 72 profile commonmark bytes 14
+<div class
+foo
+--- end
+--- case 73 profile commonmark bytes 24
+<div *???-&&&-<---
+*foo*
+--- end
+--- case 74 profile commonmark bytes 34
+<div><a href="bar">*foo*</a></div>
+--- end
+--- case 75 profile commonmark bytes 38
+<table><tr><td>
+foo
+</td></tr></table>
+--- end
+--- case 76 profile commonmark bytes 33
+<div></div>
+``` c
+int x = 33;
+```
+--- end
+--- case 77 profile commonmark bytes 18
+> <div>
+> foo
+
+bar
+--- end
+--- case 78 profile commonmark bytes 13
+- <div>
+- foo
+--- end
+--- case 79 profile commonmark bytes 7
+  <div>
+--- end
+--- case 80 profile commonmark bytes 9
+    <div>
+--- end
+--- case 81 profile commonmark bytes 20
+Foo
+<div>
+bar
+</div>
+--- end
+--- case 82 profile commonmark bytes 22
+<div>
+bar
+</div>
+*foo*
+--- end
+--- case 83 profile commonmark bytes 33
+<div>
+
+*Emphasized* text.
+
+</div>
+--- end
+--- case 84 profile commonmark bytes 31
+<div>
+*Emphasized* text.
+</div>
+--- end
+--- case 85 profile commonmark bytes 45
+<table>
+
+<tr>
+
+<td>
+Hi
+</td>
+
+</tr>
+
+</table>
+--- end
+--- case 86 profile commonmark bytes 63
+<table>
+
+  <tr>
+
+    <td>
+      Hi
+    </td>
+
+  </tr>
+
+</table>
+--- end
+--- case 87 profile commonmark bytes 4
+</1>
+--- end
+--- case 88 profile commonmark bytes 4
+<div
+--- end
+--- case 89 profile commonmark bytes 5
+<div
+
+--- end
+--- case 90 profile commonmark bytes 5
+<div 
+--- end
+--- case 91 profile commonmark bytes 5
+<div/
+--- end
+--- case 92 profile commonmark bytes 11
+<div/
+*asd*
+--- end
+--- case 93 profile commonmark bytes 6
+<div/>
+--- end
+--- case 94 profile commonmark bytes 8
+<div/>
+a
+--- end
+--- case 95 profile commonmark bytes 7
+<div/>a
+--- end
+--- case 96 profile commonmark bytes 6
+<div>a
+--- end
+--- case 97 profile commonmark bytes 10
+Foo
+<div/>
+--- end
+--- case 98 profile commonmark bytes 12
+<div
+  
+  
+>
+--- end
+--- case 99 profile commonmark bytes 8
+> <div
+a
+--- end
+--- case 100 profile commonmark bytes 8
+> a
+<div
+--- end
+--- case 101 profile commonmark bytes 25
+<a href="foo">
+*bar*
+</a>
+--- end
+--- case 102 profile commonmark bytes 26
+<Warning>
+*bar*
+</Warning>
+--- end
+--- case 103 profile commonmark bytes 26
+<i class="foo">
+*bar*
+</i>
+--- end
+--- case 104 profile commonmark bytes 18
+<del>
+*foo*
+</del>
+--- end
+--- case 105 profile commonmark bytes 12
+</ins>
+*bar*
+--- end
+--- case 106 profile commonmark bytes 20
+<del>
+
+*foo*
+
+</del>
+--- end
+--- case 107 profile commonmark bytes 16
+<del>*foo*</del>
+--- end
+--- case 108 profile commonmark bytes 12
+<div>
+  
+asd
+--- end
+--- case 109 profile commonmark bytes 22
+Foo
+<a href="bar">
+baz
+--- end
+--- case 110 profile commonmark bytes 2
+<x
+--- end
+--- case 111 profile commonmark bytes 3
+<x/
+--- end
+--- case 112 profile commonmark bytes 3
+<x
+
+--- end
+--- case 113 profile commonmark bytes 3
+<x 
+--- end
+--- case 114 profile commonmark bytes 9
+<x/
+*asd*
+--- end
+--- case 115 profile commonmark bytes 4
+<x/>
+--- end
+--- case 116 profile commonmark bytes 6
+<x/>
+a
+--- end
+--- case 117 profile commonmark bytes 5
+<x/>a
+--- end
+--- case 118 profile commonmark bytes 4
+<x>a
+--- end
+--- case 119 profile commonmark bytes 5
+<x y>
+--- end
+--- case 120 profile commonmark bytes 5
+<x
+y>
+--- end
+--- case 121 profile commonmark bytes 7
+<x
+  y>
+--- end
+--- case 122 profile commonmark bytes 8
+<x
+  
+y>
+--- end
+--- case 123 profile commonmark bytes 7
+<x y
+z>
+--- end
+--- case 124 profile commonmark bytes 9
+<x y   z>
+--- end
+--- case 125 profile commonmark bytes 5
+<x:y>
+--- end
+--- case 126 profile commonmark bytes 5
+<x_y>
+--- end
+--- case 127 profile commonmark bytes 5
+<x.y>
+--- end
+--- case 128 profile commonmark bytes 6
+<x :y>
+--- end
+--- case 129 profile commonmark bytes 6
+<x _y>
+--- end
+--- case 130 profile commonmark bytes 6
+<x .y>
+--- end
+--- case 131 profile commonmark bytes 6
+<x y:>
+--- end
+--- case 132 profile commonmark bytes 6
+<x y_>
+--- end
+--- case 133 profile commonmark bytes 6
+<x y.>
+--- end
+--- case 134 profile commonmark bytes 8
+<x y123>
+--- end
+--- case 135 profile commonmark bytes 9
+<x data->
+--- end
+--- case 136 profile commonmark bytes 6
+<x y=>
+--- end
+--- case 137 profile commonmark bytes 7
+<x y==>
+--- end
+--- case 138 profile commonmark bytes 7
+<x y=z>
+--- end
+--- case 139 profile commonmark bytes 8
+<x y="">
+--- end
+--- case 140 profile commonmark bytes 9
+<x y="
+">
+--- end
+--- case 141 profile commonmark bytes 9
+<w x=y
+z>
+--- end
+--- case 142 profile commonmark bytes 9
+<w x=y"z>
+--- end
+--- case 143 profile commonmark bytes 9
+<w x=y'z>
+--- end
+--- case 144 profile commonmark bytes 9
+<x y=""z>
+--- end
+--- case 145 profile commonmark bytes 11
+<x>
+  
+  
+>
+--- end
+--- case 146 profile commonmark bytes 11
+> <a>
+*bar*
+--- end
+--- case 147 profile commonmark bytes 7
+> a
+<a>
+--- end

@@ -1,0 +1,28 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/spoiler.rs
+role: upstream-input
+count: 4
+profiles: extras,gfm
+
+--- case 1 profile extras bytes 46
+The ||dog dies at the end of Marley and Me||.
+
+--- end
+--- case 2 profile gfm bytes 70
+Text | Result
+--- | ---
+`||some clever text||` | ||some clever text||
+
+--- end
+--- case 3 profile extras bytes 89
+|should not be spoiler|
+||should be spoiler||
+|||should be spoiler surrounded by pipes|||
+--- end
+--- case 4 profile extras bytes 105
+|||this is a spoiler with pipe in front||
+||this is not a spoiler|
+||this is a spoiler with pipe after|||
+--- end

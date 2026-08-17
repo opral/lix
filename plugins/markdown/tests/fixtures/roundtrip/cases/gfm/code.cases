@@ -1,0 +1,99 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/code.rs
+role: upstream-input
+count: 14
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 12
+```
+code
+```
+--- end
+--- case 2 profile commonmark bytes 9
+```
+code
+
+--- end
+--- case 3 profile commonmark bytes 11
+```
+> code
+
+--- end
+--- case 4 profile commonmark bytes 16
+> ```
+paragraph
+
+--- end
+--- case 5 profile commonmark bytes 13
+> ```
+> code
+
+--- end
+--- case 6 profile commonmark bytes 16
+* ```
+paragraph
+
+--- end
+--- case 7 profile commonmark bytes 11
+```
+* code
+
+--- end
+--- case 8 profile commonmark bytes 18
+* ```
+* paragraph
+
+--- end
+--- case 9 profile commonmark bytes 33
+```
+code
+```
+- list
+```
+code
+```
+
+--- end
+--- case 10 profile commonmark bytes 20
+- list
+```
+code
+```
+
+--- end
+--- case 11 profile commonmark bytes 20
+```
+code
+```
+- list
+
+--- end
+--- case 12 profile commonmark bytes 52
+```
+code
+```
+1. list
+    * nested list
+```
+code
+```
+
+--- end
+--- case 13 profile commonmark bytes 39
+1. list
+    * nested list
+```
+code
+```
+
+--- end
+--- case 14 profile commonmark bytes 39
+```
+code
+```
+1. list
+    * nested list
+
+--- end

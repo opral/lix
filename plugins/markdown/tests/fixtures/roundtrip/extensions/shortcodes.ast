@@ -1,0 +1,34 @@
+Document
+  Paragraph
+    Text "Hello, happy days! "
+    Shortcode "smile"
+  Paragraph
+    Shortcode "smile"
+    Shortcode "smile"
+    Shortcode "smile"
+    Shortcode "smile"
+  Paragraph
+    Shortcode "smile"
+    Text ":"
+    Shortcode "smile"
+    Text ":"
+    Shortcode "smile"
+    Text ":"
+    Shortcode "smile"
+  Paragraph
+    Text "Unknown names stay syntax: "
+    Shortcode "diego"
+  Paragraph
+    Text "Specials: "
+    Shortcode "+1"
+    Text " "
+    Shortcode "-1"
+    Text " "
+    Shortcode "clock12"
+    Shortcode "1234"
+    Text " "
+    Shortcode "1st_place_medal"
+    Text " "
+    Shortcode "e-mail"
+    Text " "
+    Shortcode "non-potable_water"

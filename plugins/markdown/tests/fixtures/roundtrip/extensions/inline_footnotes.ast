@@ -1,0 +1,49 @@
+Document
+  Paragraph
+    Text "Here is inline "
+    InlineFootnote
+      Text "This is the footnote content"
+    Text "."
+  Paragraph
+    Text "Text"
+    InlineFootnote
+      Text "With "
+      Emphasis
+        Text "emphasis"
+      Text " and "
+      Strong
+        Text "strong"
+    Text "."
+  Paragraph
+    Text "Regular"
+    FootnoteReference 1
+    Text " and inline"
+    InlineFootnote
+      Text "Inline note"
+    Text "."
+  Paragraph
+    Code value="^[nope]" raw="^[nope]" fence=1
+    Text " and yes "
+    InlineFootnote
+      Text "ok"
+    Text "."
+  Paragraph
+    Text "A "
+    InlineFootnote
+      Text "square bracket ] inside"
+    Text "."
+  Paragraph
+    Text "A "
+    InlineFootnote
+      Text "outer and "
+      InlineFootnote
+        Text "inner"
+      Text " literal"
+    Text "."
+  Paragraph
+    Text "Text^[] and Text^[   ] should stay literal."
+  Paragraph
+    Text "Escaped: ^[not a note]. Text^ [not a note]."
+  FootnoteDefinition label=1
+    Paragraph
+      Text "First regular footnote."

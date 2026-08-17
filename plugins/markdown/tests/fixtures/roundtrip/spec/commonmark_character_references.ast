@@ -1,0 +1,9 @@
+Document
+  Paragraph
+    Text "Entities & < > \" # A stay &unknown;."
+    SoftBreak
+    Text "Named   & © Æ Ď."
+    SoftBreak
+    Text "More ¾ ℋ ⅆ ∲ ≧̸ ö ä."
+    SoftBreak
+    Text "Invalid &nbsp &x; &#; &#x; &#87654321; &#xabcdef0; &copy."

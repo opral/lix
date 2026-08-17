@@ -1,0 +1,619 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/gfm_footnote.rs
+role: upstream-input
+count: 48
+profiles: commonmark,gfm
+
+--- case 1 profile commonmark bytes 26
+A call.[^a]
+
+[^a]: whatevs
+--- end
+--- case 2 profile gfm bytes 26
+A call.[^a]
+
+[^a]: whatevs
+--- end
+--- case 3 profile gfm bytes 23
+Noot.[^a]
+
+[^a]: dingen
+--- end
+--- case 4 profile gfm bytes 13
+[^a]
+
+[^a]: b
+--- end
+--- case 5 profile gfm bytes 27
+A paragraph.
+
+[^a]: whatevs
+--- end
+--- case 6 profile gfm bytes 5
+a[^b]
+--- end
+--- case 7 profile gfm bytes 22
+a[^b]
+
+[^b]: c
+[^b]: d
+--- end
+--- case 8 profile gfm bytes 21
+a[^b], c[^b]
+
+[^b]: d
+--- end
+--- case 9 profile gfm bytes 8
+![^a](b)
+--- end
+--- case 10 profile gfm bytes 16
+![^a][b]
+
+[b]: c
+--- end
+--- case 11 profile gfm bytes 5
+[^]()
+--- end
+--- case 12 profile gfm bytes 6
+![^]()
+--- end
+--- case 13 profile gfm bytes 25
+Call.[^a\+b].
+
+[^a\+b]: y
+--- end
+--- case 14 profile gfm bytes 33
+Call.[^a&copy;b].
+
+[^a&copy;b]: y
+--- end
+--- case 15 profile gfm bytes 25
+Call.[^a\]b].
+
+[^a\]b]: y
+--- end
+--- case 16 profile gfm bytes 31
+Call.[^a&#91;b].
+
+[^a&#91;b]: y
+--- end
+--- case 17 profile gfm bytes 24
+Call.[^a\+b].
+
+[^a+b]: y
+--- end
+--- case 18 profile gfm bytes 28
+Call.[^a&#91;b].
+
+[^a\[b]: y
+--- end
+--- case 19 profile gfm bytes 16
+[^1].
+
+[^1]: a
+b
+--- end
+--- case 20 profile gfm bytes 18
+[^1].
+
+> [^1]: a
+b
+--- end
+--- case 21 profile gfm bytes 20
+[^1].
+
+> [^1]: a
+> b
+--- end
+--- case 22 profile gfm bytes 23
+[^1].
+
+[^1]: a
+
+    > b
+--- end
+--- case 23 profile gfm bytes 22
+[^a]
+
+[^a]: b
+  
+    c
+--- end
+--- case 24 profile gfm bytes 6
+a![^1]
+--- end
+--- case 25 profile gfm bytes 16
+a![^1]
+
+[^1]: b
+
+--- end
+--- case 26 profile gfm bytes 324
+Calls may not be empty: [^].
+
+Calls cannot contain whitespace only: [^ ].
+
+Calls cannot contain whitespace at all: [^ ], [^	], [^
+].
+
+Calls can contain other characters, such as numbers [^1234567890], or [^^]
+even another caret.
+
+[^]: empty
+
+[^ ]: space
+
+[^	]: tab
+
+[^
+]&#x3A; line feed
+
+[^1234567890]: numbers
+
+[^^]: caret
+
+--- end
+--- case 27 profile gfm bytes 202
+[^a]: # b
+
+[^c d]: # e
+
+[^f	g]: # h
+
+[^i
+j]: # k
+
+[^ l]: # l
+
+[^m ]: # m
+
+xxx[^a], [^c d], [^f	g], [^i
+j], [^ l], [^m ]
+
+---
+
+Some calls.[^ w][^x ][^y][^z]
+
+[^w]: # w
+
+[^x]: # x
+
+[^ y]: # y
+
+[^x ]: # z
+
+--- end
+--- case 28 profile gfm bytes 291
+[^*emphasis*]
+
+[^**strong**]
+
+[^`code`]
+
+[^www.example.com]
+
+[^https://example.com]
+
+[^://example.com]
+
+[^[link](#)]
+
+[^![image](#)]
+
+[^*emphasis*]: a
+
+[^**strong**]: a
+
+[^`code`]: a
+
+[^www.example.com]: a
+
+[^https://example.com]: a
+
+[^://example.com]: a
+
+[^[link](#)]: a
+
+[^![image](#)]: a
+
+--- end
+--- case 29 profile gfm bytes 178
+Call[^1][^2][^3][^4]
+
+> [^1]: Defined in a block quote.
+>
+> More.
+[^2]: Directly after a block quote.
+
+* [^3]: Defined in a list item.
+
+  More.
+[^4]: Directly after a list item.
+
+--- end
+--- case 30 profile gfm bytes 254
+[^1][^2][^3][^4]
+
+[^1]: Paragraph
+…continuation
+
+# Heading
+
+[^2]: Paragraph
+…continuation
+
+    “code”, which is paragraphs…
+
+    …because of the indent!
+
+[^3]: Paragraph
+…continuation
+
+> block quote
+
+[^4]: Paragraph
+…continuation
+
+- list
+
+--- end
+--- case 31 profile gfm bytes 117
+Call[^1][^2][^3][^4][^5].
+
+[^1]:
+    ---
+
+[^2]:
+    Paragraph.
+
+[^3]:
+Lazy?
+
+[^4]:
+
+    Another blank.
+
+[^5]:
+
+Lazy!
+
+--- end
+--- case 32 profile gfm bytes 241
+Note![^0][^1][^2][^3][^4][^5][^6][^7][^8][^9][^10]
+
+[^0]: alpha
+
+[^1]: bravo
+
+[^2]: charlie
+    indented delta
+
+[^3]:    echo
+
+[^4]:     foxtrot
+
+[^5]:> golf
+
+[^6]:    > hotel
+
+[^7]:     > india
+
+[^8]: # juliett
+
+[^9]: ---
+
+[^10]:- - - kilo
+
+--- end
+--- case 33 profile gfm bytes 38
+Call[^1][^1]
+
+[^1]: Recursion[^1][^1]
+
+--- end
+--- case 34 profile gfm bytes 27
+Call[^1]
+
+[^1]: a
+
+[^1]: b
+
+--- end
+--- case 35 profile gfm bytes 120
+*emphasis[^1]*
+
+**strong[^2]**
+
+`code[^3]`
+
+![image[^4]](#)
+
+[link[^5]](#)
+
+[^1]: a
+
+[^2]: b
+
+[^3]: c
+
+[^4]: d
+
+[^5]: e
+
+--- end
+--- case 36 profile gfm bytes 74
+What are these![^1], ![^2][], and ![this][^3].
+
+[^1]: a
+
+[^2]: b
+
+[^3]: c
+
+--- end
+--- case 37 profile gfm bytes 303
+[^0][^1][^2][^3][^4][^5]
+
+[^0]: Paragraph
+…continuation
+[^1]: Another
+[^2]: Paragraph
+…continuation
+# Heading
+[^3]: Paragraph
+…continuation
+    “code”, which is paragraphs…
+
+    …because of the indent!
+[^4]: Paragraph
+…continuation
+> block quote
+[^5]: Paragraph
+…continuation
+*   list
+
+--- end
+--- case 38 profile gfm bytes 71
+What are these[^1], [^2][], and [this][^3].
+
+[^1]: a
+
+[^2]: b
+
+[^3]: c
+
+--- end
+--- case 39 profile gfm bytes 198
+[^1][^2][^3][^4]
+
+[^1]: Paragraph
+
+
+# Heading
+
+
+[^2]: Paragraph
+
+
+    “code”, which is paragraphs…
+
+
+    …because of the indent!
+
+
+[^3]: Paragraph
+
+
+> block quote
+
+
+[^4]: Paragraph
+
+
+- list
+
+--- end
+--- case 40 profile gfm bytes 172
+[^1][^2][^3][^4]
+
+[^1]: Paragraph
+
+
+    # Heading
+
+
+[^2]: Paragraph
+
+
+        code
+
+
+        more code
+
+
+[^3]: Paragraph
+
+
+    > block quote
+
+
+[^4]: Paragraph
+
+
+    - list
+
+--- end
+--- case 41 profile gfm bytes 83
+Note![^1][^2][^3][^4]
+
+- [^1]: Paragraph
+
+> [^2]: Paragraph
+
+[^3]: [^4]: Paragraph
+
+--- end
+--- case 42 profile gfm bytes 190
+[^1][^2][^3][^4]
+
+[^1]: Paragraph
+
+# Heading
+
+[^2]: Paragraph
+
+    “code”, which is paragraphs…
+
+    …because of the indent!
+
+[^3]: Paragraph
+
+> block quote
+
+[^4]: Paragraph
+
+- list
+
+--- end
+--- case 43 profile gfm bytes 164
+[^1][^2][^3][^4]
+
+[^1]: Paragraph
+
+    # Heading
+
+[^2]: Paragraph
+
+        code
+
+        more code
+
+[^3]: Paragraph
+
+    > block quote
+
+[^4]: Paragraph
+
+    - list
+
+--- end
+--- case 44 profile gfm bytes 476
+Here is a footnote reference,[^1] and another.[^longnote]
+
+[^1]: Here is the footnote.
+
+[^longnote]: Here’s one with multiple blocks.
+
+    Subsequent paragraphs are indented to show that they
+belong to the previous footnote.
+
+        { some.code }
+
+    The whole paragraph can be indented, or just the first
+    line.  In this way, multi-paragraph footnotes work like
+    multi-paragraph list items.
+
+This paragraph won’t be part of the note, because it
+isn’t indented.
+
+--- end
+--- case 45 profile gfm bytes 245
+Call[^1][^2][^3][^4][^5][^6][^7][^8][^9][^10][^11][^12].
+
+     [^1]: 5
+
+    [^2]: 4
+
+   [^3]: 3
+
+  [^4]: 2
+
+ [^5]: 1
+
+[^6]: 0
+
+***
+
+   [^7]: 3
+
+     5
+
+   [^8]: 3
+
+    4
+
+   [^9]: 3
+
+   3
+
+  [^10]: 2
+
+     5
+
+  [^11]: 2
+
+    4
+
+  [^12]: 2
+
+   3
+
+--- end
+--- case 46 profile gfm bytes 186
+Call[^1][^2][^3][^4][^5][^6][^7][^8][^9].
+
+[^1]: a
+
+        8
+
+[^2]: a
+
+       7
+
+[^3]: a
+
+      6
+
+[^4]: a
+
+     5
+
+[^5]: a
+
+    4
+
+[^6]: a
+
+   3
+
+[^7]: a
+
+  2
+
+[^8]: a
+
+ 1
+
+[^9]: a
+
+0
+
+--- end
+--- case 47 profile gfm bytes 99
+Here is a short reference,[1], a collapsed one,[2][], and a full [one][3].
+
+[1]: a
+
+[2]: b
+
+[3]: c
+
+--- end
+--- case 48 profile gfm bytes 21
+[^a]: b
+	c
+
+d [^a] e.
+--- end

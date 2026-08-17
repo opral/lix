@@ -1,0 +1,14 @@
+Document
+  Paragraph
+    Link destination="title" title=none
+      Text "title"
+  Paragraph
+    Link destination= title=""
+  Paragraph
+    Text "[a]("
+    HtmlInline "<b>"
+    Text "\"c\")"
+  Paragraph
+    Link destination=< title=none
+  Paragraph
+    Link destination=< title=none

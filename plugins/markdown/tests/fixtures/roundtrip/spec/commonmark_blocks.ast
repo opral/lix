@@ -1,0 +1,27 @@
+Document
+  Heading depth=1 kind=atx
+    Text "Title"
+  Paragraph
+    Text "Paragraph line"
+    SoftBreak
+    Text "continued."
+  BlockQuote
+    Paragraph
+      Text "Quote"
+    List ordered=false tight=true
+      ListItem checked=none
+        Paragraph
+          Text "one"
+      ListItem checked=none
+        Paragraph
+          Text "two"
+  List ordered=true tight=true
+    ListItem checked=none
+      Paragraph
+        Text "first"
+    ListItem checked=none
+      Paragraph
+        Text "second"
+  CodeBlock kind=fenced info="rust"
+    Value "fn main() {}"
+  ThematicBreak

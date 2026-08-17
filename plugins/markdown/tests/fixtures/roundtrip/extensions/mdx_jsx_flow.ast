@@ -1,0 +1,4 @@
+Document
+  MdxJsx "<>\n  * a\n</>"
+  MdxJsx "<x\n  y\n>\nb\n</x>"
+  MdxJsx "<Box value={'} > '} other={\"}\"}>\ninside\n</Box>"

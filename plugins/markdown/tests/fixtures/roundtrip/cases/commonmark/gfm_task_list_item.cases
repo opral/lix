@@ -1,0 +1,36 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/gfm_task_list_item.rs
+role: upstream-input
+count: 7
+profiles: commonmark,gfm
+
+--- case 1 profile commonmark bytes 8
+* [x] y.
+--- end
+--- case 2 profile gfm bytes 8
+* [x] y.
+--- end
+--- case 3 profile gfm bytes 8
+* [ ] z.
+--- end
+--- case 4 profile gfm bytes 9
+*
+    [x]
+--- end
+--- case 5 profile gfm bytes 5
+*
+[x]
+--- end
+--- case 6 profile gfm bytes 19
+* [x] a
+* [ ] b
+* c
+--- end
+--- case 7 profile gfm bytes 32
+* [x]
+  a
+* [ ]   b
+* [x]	 *c*
+--- end

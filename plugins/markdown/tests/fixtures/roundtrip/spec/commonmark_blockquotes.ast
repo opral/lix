@@ -1,0 +1,49 @@
+Document
+  BlockQuote
+    Heading depth=1 kind=atx
+      Text "a"
+    Paragraph
+      Text "b"
+      SoftBreak
+      Text "c"
+  BlockQuote
+    Paragraph
+      Text "a"
+      SoftBreak
+      Text "b"
+      SoftBreak
+      Text "c"
+  BlockQuote
+    Heading depth=2 kind=setext
+      Text "a"
+  BlockQuote
+    Paragraph
+      Text "a"
+  ThematicBreak
+  BlockQuote
+    List ordered=false tight=true
+      ListItem checked=none
+        Paragraph
+          Text "a"
+  List ordered=false tight=true
+    ListItem checked=none
+      Paragraph
+        Text "b"
+  BlockQuote
+    Paragraph
+      Text "a"
+  BlockQuote
+    Paragraph
+      Text "b"
+  BlockQuote
+    Paragraph
+      Text "a"
+    Paragraph
+      Text "b"
+  BlockQuote
+    CodeBlock kind=fenced info=none
+      Value ""
+  Paragraph
+    Text "a"
+  CodeBlock kind=fenced info=none
+    Value ""

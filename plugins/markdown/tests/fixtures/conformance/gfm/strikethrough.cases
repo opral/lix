@@ -1,0 +1,19 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: strikethrough
+count: 1
+
+--- case 1 options extension.strikethrough label-bytes 13 input-bytes 81 expected-bytes 125
+strikethrough
+--- input
+This is ~strikethrough~.
+
+As is ~~this, okay~~?
+
+This ~text~~~~ is ~~~~curious~.
+
+--- expected
+<p>This is <del>strikethrough</del>.</p>
+<p>As is <del>this, okay</del>?</p>
+<p>This <del>text~~~~ is ~~~~curious</del>.</p>
+
+--- end

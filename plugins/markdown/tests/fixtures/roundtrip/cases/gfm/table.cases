@@ -1,0 +1,126 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/table.rs
+role: upstream-input
+count: 19
+profiles: gfm
+
+--- case 1 profile gfm bytes 30
+| a | b |
+|---|:-:|
+| c | d |
+
+--- end
+--- case 2 profile gfm bytes 37
+123
+456
+| a | b |
+| ---| --- |
+d | e
+
+--- end
+--- case 3 profile gfm bytes 4
+a
+-b
+--- end
+--- case 4 profile gfm bytes 7
+a
+-b
+-c
+--- end
+--- case 5 profile gfm bytes 35
+- p
+
+    |a|b|
+    |-|-|
+    |c|d|
+
+--- end
+--- case 6 profile gfm bytes 24
+- |a|b|
+  |-|-|
+  |c|d|
+
+--- end
+--- case 7 profile gfm bytes 24
+> |a|b|
+> |-|-|
+> |c|d|
+
+--- end
+--- case 8 profile gfm bytes 38
+123
+456
+| a | b |
+| - | - |
+| c | d |
+
+--- end
+--- case 9 profile gfm bytes 41
+123
+456
+ | a | b |
+ | - | - |
+ | c | d |
+
+--- end
+--- case 10 profile gfm bytes 41
+ 123
+  456
+| a | b |
+| - | - |
+| c | d |
+
+--- end
+--- case 11 profile gfm bytes 44
+ 123
+  456
+ | a | b |
+ | - | - |
+ | c | d |
+
+--- end
+--- case 12 profile gfm bytes 33
+| a | b |
+| - | - |
+| c | d |
+
+--- end
+--- case 13 profile gfm bytes 30
+| a | b || - | - || c | d |
+--- end
+--- case 14 profile gfm bytes 11
+| a |
+| - |
+--- end
+--- case 15 profile gfm bytes 15
+| a |
+| - |
+
+ok
+--- end
+--- case 16 profile gfm bytes 21
+  | a  |
+  | - |
+
+ ok
+--- end
+--- case 17 profile gfm bytes 16
+|a|b|
+|-|-|
+|c|
+
+--- end
+--- case 18 profile gfm bytes 17
+|a|b|
+|-|-|
+|c|d
+
+--- end
+--- case 19 profile gfm bytes 20
+|a|b|c|
+|-|-|-|
+|d|
+
+--- end

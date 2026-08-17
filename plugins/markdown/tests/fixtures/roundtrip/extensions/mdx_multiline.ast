@@ -1,0 +1,4 @@
+Document
+  MdxEsm "import X from './x'"
+  MdxJsx "<Callout kind=\"info\">\n  <X value={1} />\n</Callout>"
+  MdxExpression "\n  1 + 1"

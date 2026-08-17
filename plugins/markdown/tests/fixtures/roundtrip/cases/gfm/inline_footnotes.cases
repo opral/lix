@@ -1,0 +1,133 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/inline_footnotes.rs
+role: upstream-input
+count: 29
+profiles: extras,gfm
+
+--- case 1 profile gfm bytes 59
+Here is an inline footnote^[This is the footnote content].
+
+--- end
+--- case 2 profile gfm bytes 39
+Text^[With *emphasis* and **strong**].
+
+--- end
+--- case 3 profile gfm bytes 43
+Text^[See [example](https://example.com)].
+
+--- end
+--- case 4 profile gfm bytes 45
+First^[First note] and second^[Second note].
+
+--- end
+--- case 5 profile gfm bytes 124
+Regular[^1] and inline^[Inline note] and another regular[^2].
+
+[^1]: First regular footnote.
+[^2]: Second regular footnote.
+
+--- end
+--- case 6 profile gfm bytes 26
+Text^[] should not parse.
+
+--- end
+--- case 7 profile gfm bytes 15
+Text^[	]more.
+
+--- end
+--- case 8 profile gfm bytes 16
+Text^[   ]more.
+
+--- end
+--- case 9 profile gfm bytes 15
+Text^[	
+]more.
+
+--- end
+--- case 10 profile extras bytes 30
+Text^[note] should not parse.
+
+--- end
+--- case 11 profile gfm bytes 27
+Text^[With `code` inline].
+
+--- end
+--- case 12 profile gfm bytes 135
+Here is an inline note.^[Inline notes are easier to write, since
+you don't have to pick an identifier and move down to type the
+note.]
+
+--- end
+--- case 13 profile gfm bytes 39
+Escaped: \^[not a note]. Real: ^[yes].
+
+--- end
+--- case 14 profile gfm bytes 20
+Text^ [not a note].
+
+--- end
+--- case 15 profile gfm bytes 31
+A ^[square bracket \] inside].
+
+--- end
+--- case 16 profile gfm bytes 22
+2^32 is big. ^[note].
+
+--- end
+--- case 17 profile gfm bytes 25
+`^[nope]` and yes ^[ok].
+
+--- end
+--- case 18 profile gfm bytes 15
+A^[one]^[two].
+
+--- end
+--- case 19 profile gfm bytes 17
+word^[tight]word
+
+--- end
+--- case 20 profile gfm bytes 17
+^[start] begins.
+
+--- end
+--- case 21 profile gfm bytes 17
+ends here ^[fin]
+
+--- end
+--- case 22 profile gfm bytes 20
+*emph ^[note] text*
+
+--- end
+--- case 23 profile gfm bytes 33
+A ^[outer and ^[inner] literal].
+
+--- end
+--- case 24 profile gfm bytes 26
+X ^[see ![alt](img.png)].
+
+--- end
+--- case 25 profile gfm bytes 26
+X ^[π ≈ 3.14159 😊].
+
+--- end
+--- case 26 profile gfm bytes 16
+- a ^[note]
+- b
+
+--- end
+--- case 27 profile gfm bytes 14
+> quote ^[q].
+
+--- end
+--- case 28 profile gfm bytes 12
+# H ^[note]
+
+--- end
+--- case 29 profile gfm bytes 26
+| H |
+| - |
+| c ^[cell] |
+
+--- end

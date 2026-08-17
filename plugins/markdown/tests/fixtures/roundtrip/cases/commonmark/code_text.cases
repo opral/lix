@@ -1,0 +1,100 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/code_text.rs
+role: upstream-input
+count: 28
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 5
+`foo`
+--- end
+--- case 2 profile commonmark bytes 15
+`` foo ` bar ``
+--- end
+--- case 3 profile commonmark bytes 6
+` `` `
+--- end
+--- case 4 profile commonmark bytes 8
+`  ``  `
+--- end
+--- case 5 profile commonmark bytes 4
+` a`
+--- end
+--- case 6 profile commonmark bytes 7
+` b `
+--- end
+--- case 7 profile commonmark bytes 8
+` `
+`  `
+--- end
+--- case 8 profile commonmark bytes 19
+``
+foo
+bar  
+baz
+``
+--- end
+--- case 9 profile commonmark bytes 10
+``
+foo 
+``
+--- end
+--- case 10 profile commonmark bytes 16
+`foo   bar 
+baz`
+--- end
+--- case 11 profile commonmark bytes 10
+`foo\`bar`
+--- end
+--- case 12 profile commonmark bytes 11
+``foo`bar``
+--- end
+--- case 13 profile commonmark bytes 14
+` foo `` bar `
+--- end
+--- case 14 profile commonmark bytes 7
+*foo`*`
+--- end
+--- case 15 profile commonmark bytes 20
+[not a `link](/foo`)
+--- end
+--- case 16 profile commonmark bytes 14
+`<a href="`">`
+--- end
+--- case 17 profile commonmark bytes 13
+<a href="`">`
+--- end
+--- case 18 profile commonmark bytes 23
+`<http://foo.bar.`baz>`
+--- end
+--- case 19 profile commonmark bytes 22
+<http://foo.bar.`baz>`
+--- end
+--- case 20 profile commonmark bytes 8
+```foo``
+--- end
+--- case 21 profile commonmark bytes 4
+`foo
+--- end
+--- case 22 profile commonmark bytes 11
+`foo``bar``
+--- end
+--- case 23 profile commonmark bytes 10
+`foo		bar`
+--- end
+--- case 24 profile commonmark bytes 5
+\``x`
+--- end
+--- case 25 profile commonmark bytes 3
+`a`
+--- end
+--- case 26 profile commonmark bytes 12
+a `alpha` b.
+--- end
+--- case 27 profile commonmark bytes 10
+`  alpha `
+--- end
+--- case 28 profile commonmark bytes 5
+`   `
+--- end

@@ -1,0 +1,163 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: table
+count: 7
+
+--- case 1 options extension.table label-bytes 5 input-bytes 30 expected-bytes 147
+table
+--- input
+| a | b |
+|---|:-:|
+| c | d |
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>a</th>
+<th align="center">b</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>c</td>
+<td align="center">d</td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 2 options extension.table label-bytes 16 input-bytes 37 expected-bytes 132
+table_regression
+--- input
+123
+456
+| a | b |
+| ---| --- |
+d | e
+
+--- expected
+<p>123
+456</p>
+<table>
+<thead>
+<tr>
+<th>a</th>
+<th>b</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>d</td>
+<td>e</td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 3 options extension.table label-bytes 16 input-bytes 4 expected-bytes 12
+table_misparse_1
+--- input
+a
+-b
+--- expected
+<p>a
+-b</p>
+
+--- end
+--- case 4 options extension.table label-bytes 16 input-bytes 7 expected-bytes 15
+table_misparse_2
+--- input
+a
+-b
+-c
+--- expected
+<p>a
+-b
+-c</p>
+
+--- end
+--- case 5 options extension.table label-bytes 15 input-bytes 35 expected-bytes 148
+nested_tables_1
+--- input
+- p
+
+    |a|b|
+    |-|-|
+    |c|d|
+
+--- expected
+<ul>
+<li>
+<p>p</p>
+<table>
+<thead>
+<tr>
+<th>a</th>
+<th>b</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>c</td>
+<td>d</td>
+</tr>
+</tbody>
+</table>
+</li>
+</ul>
+
+--- end
+--- case 6 options extension.table label-bytes 15 input-bytes 24 expected-bytes 139
+nested_tables_2
+--- input
+- |a|b|
+  |-|-|
+  |c|d|
+
+--- expected
+<ul>
+<li>
+<table>
+<thead>
+<tr>
+<th>a</th>
+<th>b</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>c</td>
+<td>d</td>
+</tr>
+</tbody>
+</table>
+</li>
+</ul>
+
+--- end
+--- case 7 options extension.table label-bytes 15 input-bytes 24 expected-bytes 144
+nested_tables_3
+--- input
+> |a|b|
+> |-|-|
+> |c|d|
+
+--- expected
+<blockquote>
+<table>
+<thead>
+<tr>
+<th>a</th>
+<th>b</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>c</td>
+<td>d</td>
+</tr>
+</tbody>
+</table>
+</blockquote>
+
+--- end

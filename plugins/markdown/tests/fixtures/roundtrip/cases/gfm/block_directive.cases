@@ -1,0 +1,54 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/block_directive.rs
+role: upstream-input
+count: 6
+profiles: extras
+
+--- case 1 profile extras bytes 40
+:::foo bar
+Paragraph 1
+
+Paragraph 2
+:::
+
+--- end
+--- case 2 profile extras bytes 71
+- item one
+
+  :::foo bar
+  Paragraph 1
+
+  Paragraph 2
+  :::
+- item two
+
+--- end
+--- case 3 profile extras bytes 56
+- item one
+
+  :::foo bar
+  Paragraph 1
+  :::
+- item two
+
+--- end
+--- case 4 profile extras bytes 19
+:::foo bar
+> a
+:::
+
+--- end
+--- case 5 profile extras bytes 19
+:::foo bar
+* a
+:::
+
+--- end
+--- case 6 profile extras bytes 23
+> :::foo bar
+> a
+> :::
+
+--- end

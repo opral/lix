@@ -1,0 +1,547 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/list.rs
+role: upstream-input
+count: 94
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 34
+- foo
+- bar
+
+<!-- -->
+
+- baz
+- bim
+--- end
+--- case 2 profile commonmark bytes 49
+-   foo
+
+    notcode
+
+-   foo
+
+<!-- -->
+
+    code
+--- end
+--- case 3 profile commonmark bytes 17
+* a
+
+<!---->
+
+* b
+--- end
+--- case 4 profile commonmark bytes 64
+A paragraph
+with two lines.
+
+    indented code
+
+> A block quote.
+--- end
+--- case 5 profile commonmark bytes 33
+1.  a
+    b.
+
+        c
+
+    > d.
+--- end
+--- case 6 profile commonmark bytes 11
+- one
+
+ two
+--- end
+--- case 7 profile commonmark bytes 8
+- a
+
+  b
+--- end
+--- case 8 profile commonmark bytes 19
+ -    one
+
+     two
+--- end
+--- case 9 profile commonmark bytes 28
+   > > 1.  one
+>>
+>>     two
+--- end
+--- case 10 profile commonmark bytes 21
+>>- one
+>>
+  >  > two
+--- end
+--- case 11 profile commonmark bytes 11
+-one
+
+2.two
+--- end
+--- case 12 profile commonmark bytes 13
+- foo
+
+
+  bar
+--- end
+--- case 13 profile commonmark bytes 52
+1.  foo
+
+    ```
+    bar
+    ```
+
+    baz
+
+    > bam
+--- end
+--- case 14 profile commonmark bytes 28
+- Foo
+
+      bar
+
+
+      baz
+--- end
+--- case 15 profile commonmark bytes 13
+123456789. ok
+--- end
+--- case 16 profile commonmark bytes 18
+1234567890. not ok
+--- end
+--- case 17 profile commonmark bytes 5
+0. ok
+--- end
+--- case 18 profile commonmark bytes 7
+003. ok
+--- end
+--- case 19 profile commonmark bytes 10
+-1. not ok
+--- end
+--- case 20 profile commonmark bytes 16
+- foo
+
+      bar
+--- end
+--- case 21 profile commonmark bytes 26
+  10.  foo
+
+           bar
+--- end
+--- case 22 profile commonmark bytes 43
+    indented code
+
+paragraph
+
+    more code
+--- end
+--- case 23 profile commonmark bytes 52
+1.     indented code
+
+   paragraph
+
+       more code
+--- end
+--- case 24 profile commonmark bytes 53
+1.      indented code
+
+   paragraph
+
+       more code
+--- end
+--- case 25 profile commonmark bytes 11
+   foo
+
+bar
+--- end
+--- case 26 profile commonmark bytes 15
+-    foo
+
+  bar
+--- end
+--- case 27 profile commonmark bytes 14
+-  foo
+
+   bar
+--- end
+--- case 28 profile commonmark bytes 39
+-
+  foo
+-
+  ```
+  bar
+  ```
+-
+      baz
+--- end
+--- case 29 profile commonmark bytes 10
+-   
+  foo
+--- end
+--- case 30 profile commonmark bytes 8
+-
+
+  foo
+--- end
+--- case 31 profile commonmark bytes 13
+- foo
+-
+- bar
+--- end
+--- case 32 profile commonmark bytes 16
+- foo
+-   
+- bar
+--- end
+--- case 33 profile commonmark bytes 16
+1. foo
+2.
+3. bar
+--- end
+--- case 34 profile commonmark bytes 1
+*
+--- end
+--- case 35 profile commonmark bytes 13
+foo
+*
+
+foo
+1.
+--- end
+--- case 36 profile commonmark bytes 84
+ 1.  A paragraph
+     with two lines.
+
+         indented code
+
+     > A block quote.
+--- end
+--- case 37 profile commonmark bytes 88
+  1.  A paragraph
+      with two lines.
+
+          indented code
+
+      > A block quote.
+--- end
+--- case 38 profile commonmark bytes 92
+   1.  A paragraph
+       with two lines.
+
+           indented code
+
+       > A block quote.
+--- end
+--- case 39 profile commonmark bytes 96
+    1.  A paragraph
+        with two lines.
+
+            indented code
+
+        > A block quote.
+--- end
+--- case 40 profile commonmark bytes 82
+  1.  A paragraph
+with two lines.
+
+          indented code
+
+      > A block quote.
+--- end
+--- case 41 profile commonmark bytes 37
+  1.  A paragraph
+    with two lines.
+--- end
+--- case 42 profile commonmark bytes 33
+> 1. > Blockquote
+continued here.
+--- end
+--- case 43 profile commonmark bytes 35
+> 1. > Blockquote
+> continued here.
+--- end
+--- case 44 profile commonmark bytes 5
+- [
+a
+--- end
+--- case 45 profile commonmark bytes 10
+- [a]: b
+c
+--- end
+--- case 46 profile commonmark bytes 35
+- foo
+  - bar
+    - baz
+      - boo
+--- end
+--- case 47 profile commonmark bytes 29
+- foo
+ - bar
+  - baz
+   - boo
+--- end
+--- case 48 profile commonmark bytes 17
+10) foo
+    - bar
+--- end
+--- case 49 profile commonmark bytes 16
+10) foo
+   - bar
+--- end
+--- case 50 profile commonmark bytes 7
+- - foo
+--- end
+--- case 51 profile commonmark bytes 11
+1. - 2. foo
+--- end
+--- case 52 profile commonmark bytes 25
+- # Foo
+- Bar
+  ---
+  baz
+--- end
+--- case 53 profile commonmark bytes 17
+- foo
+- bar
++ baz
+--- end
+--- case 54 profile commonmark bytes 20
+1. foo
+2. bar
+3) baz
+--- end
+--- case 55 profile commonmark bytes 15
+Foo
+- bar
+- baz
+--- end
+--- case 56 profile commonmark bytes 6
+a
+2. b
+--- end
+--- case 57 profile commonmark bytes 5
+
+2. a
+--- end
+--- case 58 profile commonmark bytes 7
+a
+
+2. b
+--- end
+--- case 59 profile commonmark bytes 6
+a
+1. b
+--- end
+--- case 60 profile commonmark bytes 20
+- foo
+
+- bar
+
+
+- baz
+--- end
+--- case 61 profile commonmark bytes 35
+- foo
+  - bar
+    - baz
+
+
+      bim
+--- end
+--- case 62 profile commonmark bytes 36
+- a
+ - b
+  - c
+   - d
+  - e
+ - f
+- g
+--- end
+--- case 63 profile commonmark bytes 21
+1. a
+
+  2. b
+
+   3. c
+--- end
+--- case 64 profile commonmark bytes 29
+- a
+ - b
+  - c
+   - d
+    - e
+--- end
+--- case 65 profile commonmark bytes 22
+1. a
+
+  2. b
+
+    3. c
+--- end
+--- case 66 profile commonmark bytes 12
+- a
+- b
+
+- c
+--- end
+--- case 67 profile commonmark bytes 10
+* a
+*
+
+* c
+--- end
+--- case 68 profile commonmark bytes 16
+- a
+- b
+
+  c
+- d
+--- end
+--- case 69 profile commonmark bytes 26
+- a
+- b
+
+  [ref]: /url
+- d
+--- end
+--- case 70 profile commonmark bytes 25
+- a
+- ```
+  b
+
+
+  ```
+- c
+--- end
+--- case 71 profile commonmark bytes 20
+- a
+  - b
+
+    c
+- d
+--- end
+--- case 72 profile commonmark bytes 17
+* a
+  > b
+  >
+* c
+--- end
+--- case 73 profile commonmark bytes 29
+- a
+  > b
+  ```
+  c
+  ```
+- d
+--- end
+--- case 74 profile commonmark bytes 3
+- a
+--- end
+--- case 75 profile commonmark bytes 9
+- a
+  - b
+--- end
+--- case 76 profile commonmark bytes 28
+1. ```
+   foo
+   ```
+
+   bar
+--- end
+--- case 77 profile commonmark bytes 20
+* foo
+  * bar
+
+  baz
+--- end
+--- case 78 profile commonmark bytes 32
+- a
+  - b
+  - c
+
+- d
+  - e
+  - f
+--- end
+--- case 79 profile commonmark bytes 15
+* a
+*
+
+  
+	
+* b
+--- end
+--- case 80 profile commonmark bytes 15
+*
+  ~~~p
+
+  ~~~
+--- end
+--- case 81 profile commonmark bytes 61
+* a tight item that ends with an html element: `x`
+
+Paragraph
+--- end
+--- case 82 profile commonmark bytes 19
+*   foo
+
+*
+
+*   bar
+--- end
+--- case 83 profile commonmark bytes 12
+- ```
+
+  ```
+--- end
+--- case 84 profile commonmark bytes 13
+- ```
+ 
+  ```
+--- end
+--- case 85 profile commonmark bytes 14
+- ```
+  
+  ```
+--- end
+--- case 86 profile commonmark bytes 15
+- ```
+   
+  ```
+--- end
+--- case 87 profile commonmark bytes 16
+- ```
+    
+  ```
+--- end
+--- case 88 profile commonmark bytes 13
+- ```
+	
+  ```
+--- end
+--- case 89 profile commonmark bytes 5
+- +
+-
+--- end
+--- case 90 profile commonmark bytes 6
+- 1.
+-
+--- end
+--- case 91 profile commonmark bytes 9
+* - +
+* -
+--- end
+--- case 92 profile commonmark bytes 3
+* a
+--- end
+--- case 93 profile commonmark bytes 9
+3. a
+4. b
+--- end
+--- case 94 profile commonmark bytes 12
+* a
+
+  b
+* c
+--- end

@@ -1,0 +1,128 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/autolink.rs
+role: upstream-input
+count: 40
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 20
+<http://foo.bar.baz>
+--- end
+--- case 2 profile commonmark bytes 47
+<http://foo.bar.baz/test?q=hello&id=22&boolean>
+--- end
+--- case 3 profile commonmark bytes 24
+<irc://foo.bar:2233/baz>
+--- end
+--- case 4 profile commonmark bytes 20
+<MAILTO:FOO@BAR.BAZ>
+--- end
+--- case 5 profile commonmark bytes 9
+<a+b+c:d>
+--- end
+--- case 6 profile commonmark bytes 26
+<made-up-scheme://foo,bar>
+--- end
+--- case 7 profile commonmark bytes 12
+<http://../>
+--- end
+--- case 8 profile commonmark bytes 20
+<localhost:5001/foo>
+--- end
+--- case 9 profile commonmark bytes 24
+<http://foo.bar/baz bim>
+--- end
+--- case 10 profile commonmark bytes 24
+<http://example.com/\[\>
+--- end
+--- case 11 profile commonmark bytes 21
+<foo@bar.example.com>
+--- end
+--- case 12 profile commonmark bytes 30
+<foo+special@Bar.baz-bar0.com>
+--- end
+--- case 13 profile commonmark bytes 7
+<a@b.c>
+--- end
+--- case 14 profile commonmark bytes 23
+<foo\+@bar.example.com>
+--- end
+--- case 15 profile commonmark bytes 2
+<>
+--- end
+--- case 16 profile commonmark bytes 18
+< http://foo.bar >
+--- end
+--- case 17 profile commonmark bytes 7
+<m:abc>
+--- end
+--- case 18 profile commonmark bytes 13
+<foo.bar.baz>
+--- end
+--- case 19 profile commonmark bytes 18
+http://example.com
+--- end
+--- case 20 profile commonmark bytes 19
+foo@bar.example.com
+--- end
+--- case 21 profile commonmark bytes 15
+<*@example.com>
+--- end
+--- case 22 profile commonmark bytes 16
+<a*@example.com>
+--- end
+--- case 23 profile commonmark bytes 17
+<aa*@example.com>
+--- end
+--- case 24 profile commonmark bytes 19
+<aaa©@example.com>
+--- end
+--- case 25 profile commonmark bytes 19
+<a*a©@example.com>
+--- end
+--- case 26 profile commonmark bytes 18
+<asd@.example.com>
+--- end
+--- case 27 profile commonmark bytes 19
+<asd@e..xample.com>
+--- end
+--- case 28 profile commonmark bytes 69
+<asd@012345678901234567890123456789012345678901234567890123456789012>
+--- end
+--- case 29 profile commonmark bytes 70
+<asd@0123456789012345678901234567890123456789012345678901234567890123>
+--- end
+--- case 30 profile commonmark bytes 71
+<asd@012345678901234567890123456789012345678901234567890123456789012.a>
+--- end
+--- case 31 profile commonmark bytes 72
+<asd@0123456789012345678901234567890123456789012345678901234567890123.a>
+--- end
+--- case 32 profile commonmark bytes 71
+<asd@a.012345678901234567890123456789012345678901234567890123456789012>
+--- end
+--- case 33 profile commonmark bytes 72
+<asd@a.0123456789012345678901234567890123456789012345678901234567890123>
+--- end
+--- case 34 profile commonmark bytes 18
+<asd@-example.com>
+--- end
+--- case 35 profile commonmark bytes 18
+<asd@e-xample.com>
+--- end
+--- case 36 profile commonmark bytes 19
+<asd@e--xample.com>
+--- end
+--- case 37 profile commonmark bytes 18
+<asd@example-.com>
+--- end
+--- case 38 profile commonmark bytes 14
+<@example.com>
+--- end
+--- case 39 profile commonmark bytes 8
+<a@b.co>
+--- end
+--- case 40 profile commonmark bytes 46
+a <https://alpha.com> b <bravo@charlie.com> c.
+--- end

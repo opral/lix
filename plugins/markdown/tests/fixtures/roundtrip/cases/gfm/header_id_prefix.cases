@@ -1,0 +1,21 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/header_id_prefix.rs
+role: upstream-input
+count: 2
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 76
+# Hi.
+## Hi 1.
+### Hi.
+#### Hello.
+##### Hi.
+###### Hello.
+# Isn't it grand?
+--- end
+--- case 2 profile commonmark bytes 6
+# Hi.
+
+--- end

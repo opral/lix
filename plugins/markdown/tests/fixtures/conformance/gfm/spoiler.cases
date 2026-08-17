@@ -1,0 +1,61 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: spoiler
+count: 4
+
+--- case 1 options extension.spoiler label-bytes 7 input-bytes 46 expected-bytes 78
+spoiler
+--- input
+The ||dog dies at the end of Marley and Me||.
+
+--- expected
+<p>The <span class="spoiler">dog dies at the end of Marley and Me</span>.</p>
+
+--- end
+--- case 2 options extension.table,extension.spoiler label-bytes 16 input-bytes 70 expected-bytes 201
+spoiler_in_table
+--- input
+Text | Result
+--- | ---
+`||some clever text||` | ||some clever text||
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>Text</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>||some clever text||</code></td>
+<td><span class="spoiler">some clever text</span></td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 3 options extension.spoiler label-bytes 19 input-bytes 89 expected-bytes 147
+spoiler_regressions
+--- input
+|should not be spoiler|
+||should be spoiler||
+|||should be spoiler surrounded by pipes|||
+--- expected
+<p>|should not be spoiler|
+<span class="spoiler">should be spoiler</span>
+|<span class="spoiler">should be spoiler surrounded by pipes</span>|</p>
+
+--- end
+--- case 4 options extension.spoiler label-bytes 19 input-bytes 105 expected-bytes 163
+mismatched_spoilers
+--- input
+|||this is a spoiler with pipe in front||
+||this is not a spoiler|
+||this is a spoiler with pipe after|||
+--- expected
+<p>|<span class="spoiler">this is a spoiler with pipe in front</span>
+||this is not a spoiler|
+<span class="spoiler">this is a spoiler with pipe after</span>|</p>
+
+--- end

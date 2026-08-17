@@ -1,0 +1,117 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/character_reference.rs
+role: upstream-input
+count: 31
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 109
+&nbsp; &amp; &copy; &AElig; &Dcaron;
+&frac34; &HilbertSpace; &DifferentialD;
+&ClockwiseContourIntegral; &ngE;
+--- end
+--- case 2 profile commonmark bytes 25
+&#35; &#1234; &#992; &#0;
+--- end
+--- case 3 profile commonmark bytes 22
+&#X22; &#XD06; &#xcab;
+--- end
+--- case 4 profile commonmark bytes 67
+&nbsp &x; &#; &#x;
+&#987654321;
+&#abcdef0;
+&ThisIsNotDefined; &hi?;
+--- end
+--- case 5 profile commonmark bytes 5
+&copy
+--- end
+--- case 6 profile commonmark bytes 14
+&MadeUpEntity;
+--- end
+--- case 7 profile commonmark bytes 28
+<a href="&ouml;&ouml;.html">
+--- end
+--- case 8 profile commonmark bytes 37
+[foo](/f&ouml;&ouml; "f&ouml;&ouml;")
+--- end
+--- case 9 profile commonmark bytes 44
+[foo]: /f&ouml;&ouml; "f&ouml;&ouml;"
+
+[foo]
+--- end
+--- case 10 profile commonmark bytes 25
+``` f&ouml;&ouml;
+foo
+```
+--- end
+--- case 11 profile commonmark bytes 15
+`f&ouml;&ouml;`
+--- end
+--- case 12 profile commonmark bytes 18
+    f&ouml;f&ouml;
+--- end
+--- case 13 profile commonmark bytes 19
+&#42;foo&#42;
+*foo*
+--- end
+--- case 14 profile commonmark bytes 16
+&#42; foo
+
+* foo
+--- end
+--- case 15 profile commonmark bytes 24
+[a](url &quot;tit&quot;)
+--- end
+--- case 16 profile commonmark bytes 16
+foo&#10;&#10;bar
+--- end
+--- case 17 profile commonmark bytes 7
+&#9;foo
+--- end
+--- case 18 profile commonmark bytes 33
+&CounterClockwiseContourIntegral;
+--- end
+--- case 19 profile commonmark bytes 10
+&#xff9999;
+--- end
+--- case 20 profile commonmark bytes 10
+&#9999999;
+--- end
+--- case 21 profile commonmark bytes 34
+&CounterClockwiseContourIntegrali;
+--- end
+--- case 22 profile commonmark bytes 11
+&#xff99999;
+--- end
+--- case 23 profile commonmark bytes 11
+&#99999999;
+--- end
+--- case 24 profile commonmark bytes 3
+&-;
+--- end
+--- case 25 profile commonmark bytes 4
+&#-;
+--- end
+--- case 26 profile commonmark bytes 5
+&#x-;
+--- end
+--- case 27 profile commonmark bytes 5
+&lt-;
+--- end
+--- case 28 profile commonmark bytes 5
+&#9-;
+--- end
+--- case 29 profile commonmark bytes 6
+&#x9-;
+--- end
+--- case 30 profile commonmark bytes 5
+&amp;
+--- end
+--- case 31 profile commonmark bytes 158
+&nbsp; &amp; &copy; &AElig; &Dcaron;
+&frac34; &HilbertSpace; &DifferentialD;
+&ClockwiseContourIntegral; &ngE;
+&#35; &#1234; &#992; &#0;
+&#X22; &#XD06; &#xcab;
+--- end

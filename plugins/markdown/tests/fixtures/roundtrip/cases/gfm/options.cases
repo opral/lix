@@ -1,0 +1,30 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/options.rs
+role: upstream-input
+count: 6
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 31
+Why 'hello' "there". It's good.
+--- end
+--- case 2 profile commonmark bytes 38
+Hm. Hm.. hm... yes- indeed-- quite---!
+--- end
+--- case 3 profile commonmark bytes 10
+<<hello>>
+
+--- end
+--- case 4 profile commonmark bytes 22
+<< guillemets >> here
+
+--- end
+--- case 5 profile commonmark bytes 10
+a < b > c
+
+--- end
+--- case 6 profile commonmark bytes 22
+<https://example.com>
+
+--- end

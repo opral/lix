@@ -1,0 +1,537 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: link_reference
+count: 54
+
+--- case 1 options - label-bytes 30 input-bytes 31 expected-bytes 43
+should support link references
+--- input
+[bar]: /url "title"
+
+[foo][bar]
+--- expected
+<p><a href="/url" title="title">foo</a></p>
+--- end
+--- case 2 options - label-bytes 51 input-bytes 36 expected-bytes 42
+should support balanced brackets in link references
+--- input
+[ref]: /uri
+
+[link [foo [bar]]][ref]
+--- expected
+<p><a href="/uri">link [foo [bar]]</a></p>
+--- end
+--- case 3 options - label-bytes 50 input-bytes 30 expected-bytes 35
+should support escaped brackets in link references
+--- input
+[ref]: /uri
+
+[link \[bar][ref]
+--- expected
+<p><a href="/uri">link [bar</a></p>
+--- end
+--- case 4 options - label-bytes 41 input-bytes 42 expected-bytes 79
+should support content in link references
+--- input
+[ref]: /uri
+
+[link *foo **bar** `#`*][ref]
+--- expected
+<p><a href="/uri">link <em>foo <strong>bar</strong> <code>#</code></em></a></p>
+--- end
+--- case 5 options - label-bytes 40 input-bytes 37 expected-bytes 59
+should support images in link references
+--- input
+[ref]: /uri
+
+[![moon](moon.jpg)][ref]
+--- expected
+<p><a href="/uri"><img src="moon.jpg" alt="moon" /></a></p>
+--- end
+--- case 6 options - label-bytes 43 input-bytes 35 expected-bytes 57
+should not support links in link references
+--- input
+[ref]: /uri
+
+[foo [bar](/uri)][ref]
+--- expected
+<p>[foo <a href="/uri">bar</a>]<a href="/uri">ref</a></p>
+--- end
+--- case 7 options - label-bytes 48 input-bytes 40 expected-bytes 70
+should not support deep links in link references
+--- input
+[ref]: /uri
+
+[foo *bar [baz][ref]*][ref]
+--- expected
+<p>[foo <em>bar <a href="/uri">baz</a></em>]<a href="/uri">ref</a></p>
+--- end
+--- case 8 options - label-bytes 47 input-bytes 25 expected-bytes 31
+should prefer link references over emphasis (1)
+--- input
+[ref]: /uri
+
+*[foo*][ref]
+--- expected
+<p>*<a href="/uri">foo*</a></p>
+--- end
+--- case 9 options - label-bytes 47 input-bytes 28 expected-bytes 34
+should prefer link references over emphasis (2)
+--- input
+[ref]: /uri
+
+[foo *bar][ref]
+--- expected
+<p><a href="/uri">foo *bar</a></p>
+--- end
+--- case 10 options allow_dangerous_html,allow_dangerous_protocol label-bytes 39 input-bytes 37 expected-bytes 31
+should prefer HTML over link references
+--- input
+[ref]: /uri
+
+[foo <bar attr="][ref]">
+--- expected
+<p>[foo <bar attr="][ref]"></p>
+--- end
+--- case 11 options - label-bytes 39 input-bytes 25 expected-bytes 30
+should prefer code over link references
+--- input
+[ref]: /uri
+
+[foo`][ref]`
+--- expected
+<p>[foo<code>][ref]</code></p>
+--- end
+--- case 12 options - label-bytes 44 input-bytes 52 expected-bytes 98
+should prefer autolinks over link references
+--- input
+[ref]: /uri
+
+[foo<http://example.com/?search=][ref]>
+--- expected
+<p>[foo<a href="http://example.com/?search=%5D%5Bref%5D">http://example.com/?search=][ref]</a></p>
+--- end
+--- case 13 options - label-bytes 57 input-bytes 31 expected-bytes 43
+should match references to definitions case-insensitively
+--- input
+[bar]: /url "title"
+
+[foo][BaR]
+--- expected
+<p><a href="/url" title="title">foo</a></p>
+--- end
+--- case 14 options - label-bytes 62 input-bytes 69 expected-bytes 57
+should match references to definitions w/ unicode case-folding
+--- input
+[ТОЛПОЙ]: /url
+
+[Толпой][Толпой] is a Russian word.
+--- expected
+<p><a href="/url">Толпой</a> is a Russian word.</p>
+--- end
+--- case 15 options - label-bytes 52 input-bytes 33 expected-bytes 29
+should match references to definitions w/ collapsing
+--- input
+[Foo
+  bar]: /url
+
+[Baz][Foo bar]
+--- expected
+<p><a href="/url">Baz</a></p>
+--- end
+--- case 16 options - label-bytes 61 input-bytes 32 expected-bytes 49
+should not support whitespace between label and reference (1)
+--- input
+[bar]: /url "title"
+
+[foo] [bar]
+--- expected
+<p>[foo] <a href="/url" title="title">bar</a></p>
+--- end
+--- case 17 options - label-bytes 61 input-bytes 32 expected-bytes 49
+should not support whitespace between label and reference (2)
+--- input
+[bar]: /url "title"
+
+[foo]
+[bar]
+--- expected
+<p>[foo]
+<a href="/url" title="title">bar</a></p>
+--- end
+--- case 18 options - label-bytes 33 input-bytes 38 expected-bytes 30
+should prefer earlier definitions
+--- input
+[foo]: /url1
+
+[foo]: /url2
+
+[bar][foo]
+--- expected
+<p><a href="/url1">bar</a></p>
+--- end
+--- case 19 options - label-bytes 53 input-bytes 26 expected-bytes 18
+should not match references to definitions w/ escapes
+--- input
+[foo!]: /url
+
+[bar][foo\!]
+--- expected
+<p>[bar][foo!]</p>
+--- end
+--- case 20 options - label-bytes 45 input-bytes 25 expected-bytes 38
+should not support references w/ brackets (1)
+--- input
+[ref[]: /uri
+
+[foo][ref[]
+--- expected
+<p>[ref[]: /uri</p>
+<p>[foo][ref[]</p>
+--- end
+--- case 21 options - label-bytes 45 input-bytes 33 expected-bytes 46
+should not support references w/ brackets (2)
+--- input
+[ref[bar]]: /uri
+
+[foo][ref[bar]]
+--- expected
+<p>[ref[bar]]: /uri</p>
+<p>[foo][ref[bar]]</p>
+--- end
+--- case 22 options - label-bytes 45 input-bytes 26 expected-bytes 39
+should not support references w/ brackets (3)
+--- input
+[[[foo]]]: /url
+
+[[[foo]]]
+--- expected
+<p>[[[foo]]]: /url</p>
+<p>[[[foo]]]</p>
+--- end
+--- case 23 options - label-bytes 58 input-bytes 27 expected-bytes 29
+should match references to definitions w/ matching escapes
+--- input
+[ref\[]: /uri
+
+[foo][ref\[]
+--- expected
+<p><a href="/uri">foo</a></p>
+--- end
+--- case 24 options - label-bytes 22 input-bytes 22 expected-bytes 30
+should support escapes
+--- input
+[bar\\]: /uri
+
+[bar\\]
+--- expected
+<p><a href="/uri">bar\</a></p>
+--- end
+--- case 25 options - label-bytes 35 input-bytes 12 expected-bytes 25
+should not support empty references
+--- input
+[]: /uri
+
+[]
+--- expected
+<p>[]: /uri</p>
+<p>[]</p>
+--- end
+--- case 26 options - label-bytes 35 input-bytes 16 expected-bytes 27
+should not support blank references
+--- input
+[
+ ]: /uri
+
+[
+ ]
+--- expected
+<p>[
+]: /uri</p>
+<p>[
+]</p>
+--- end
+--- case 27 options - label-bytes 34 input-bytes 28 expected-bytes 43
+should support collaped references
+--- input
+[foo]: /url "title"
+
+[foo][]
+--- expected
+<p><a href="/url" title="title">foo</a></p>
+--- end
+--- case 28 options - label-bytes 45 input-bytes 40 expected-bytes 56
+should support content in collaped references
+--- input
+[*foo* bar]: /url "title"
+
+[*foo* bar][]
+--- expected
+<p><a href="/url" title="title"><em>foo</em> bar</a></p>
+--- end
+--- case 29 options - label-bytes 57 input-bytes 28 expected-bytes 43
+should match references to definitions case-insensitively
+--- input
+[foo]: /url "title"
+
+[Foo][]
+--- expected
+<p><a href="/url" title="title">Foo</a></p>
+--- end
+--- case 30 options - label-bytes 66 input-bytes 30 expected-bytes 46
+should not support whitespace between label and collaped reference
+--- input
+[foo]: /url "title"
+
+[foo] 
+[]
+--- expected
+<p><a href="/url" title="title">foo</a>
+[]</p>
+--- end
+--- case 31 options - label-bytes 49 input-bytes 38 expected-bytes 56
+should support content in shortcut references (1)
+--- input
+[*foo* bar]: /url "title"
+
+[*foo* bar]
+--- expected
+<p><a href="/url" title="title"><em>foo</em> bar</a></p>
+--- end
+--- case 32 options - label-bytes 49 input-bytes 40 expected-bytes 58
+should support content in shortcut references (2)
+--- input
+[*foo* bar]: /url "title"
+
+[[*foo* bar]]
+--- expected
+<p>[<a href="/url" title="title"><em>foo</em> bar</a>]</p>
+--- end
+--- case 33 options - label-bytes 49 input-bytes 24 expected-bytes 35
+should support content in shortcut references (3)
+--- input
+[foo]: /url
+
+[[bar [foo]
+--- expected
+<p>[[bar <a href="/url">foo</a></p>
+--- end
+--- case 34 options - label-bytes 66 input-bytes 26 expected-bytes 43
+should match shortcut references to definitions case-insensitively
+--- input
+[foo]: /url "title"
+
+[Foo]
+--- expected
+<p><a href="/url" title="title">Foo</a></p>
+--- end
+--- case 35 options - label-bytes 52 input-bytes 22 expected-bytes 33
+should support whitespace after a shortcut reference
+--- input
+[foo]: /url
+
+[foo] bar
+--- expected
+<p><a href="/url">foo</a> bar</p>
+--- end
+--- case 36 options - label-bytes 50 input-bytes 27 expected-bytes 12
+should “support” an escaped shortcut reference
+--- input
+[foo]: /url "title"
+
+\[foo]
+--- expected
+<p>[foo]</p>
+--- end
+--- case 37 options - label-bytes 47 input-bytes 21 expected-bytes 31
+should prefer shortcut references over emphasis
+--- input
+[foo*]: /url
+
+*[foo*]
+--- expected
+<p>*<a href="/url">foo*</a></p>
+--- end
+--- case 38 options - label-bytes 54 input-bytes 37 expected-bytes 30
+should prefer full references over shortcut references
+--- input
+[foo]: /url1
+[bar]: /url2
+
+[foo][bar]
+--- expected
+<p><a href="/url2">foo</a></p>
+--- end
+--- case 39 options - label-bytes 59 input-bytes 21 expected-bytes 30
+should prefer collapsed references over shortcut references
+--- input
+[foo]: /url1
+
+[foo][]
+--- expected
+<p><a href="/url1">foo</a></p>
+--- end
+--- case 40 options - label-bytes 52 input-bytes 20 expected-bytes 25
+should prefer resources over shortcut references (1)
+--- input
+[foo]: /url
+
+[foo]()
+--- expected
+<p><a href="">foo</a></p>
+--- end
+--- case 41 options - label-bytes 52 input-bytes 28 expected-bytes 25
+should prefer resources over shortcut references (2)
+--- input
+[foo]: /url "title"
+
+[foo]()
+--- expected
+<p><a href="">foo</a></p>
+--- end
+--- case 42 options - label-bytes 75 input-bytes 31 expected-bytes 42
+should support shortcut references when followed by nonconforming resources
+--- input
+[foo]: /url1
+
+[foo](not a link)
+--- expected
+<p><a href="/url1">foo</a>(not a link)</p>
+--- end
+--- case 43 options - label-bytes 19 input-bytes 28 expected-bytes 34
+stable/unstable (1)
+--- input
+[baz]: /url
+
+[foo][bar][baz]
+--- expected
+<p>[foo]<a href="/url">bar</a></p>
+--- end
+--- case 44 options - label-bytes 19 input-bytes 42 expected-bytes 53
+stable/unstable (2)
+--- input
+[baz]: /url1
+[bar]: /url2
+
+[foo][bar][baz]
+--- expected
+<p><a href="/url2">foo</a><a href="/url1">baz</a></p>
+--- end
+--- case 45 options - label-bytes 19 input-bytes 42 expected-bytes 35
+stable/unstable (3)
+--- input
+[baz]: /url1
+[foo]: /url2
+
+[foo][bar][baz]
+--- expected
+<p>[foo]<a href="/url1">bar</a></p>
+--- end
+--- case 46 options - label-bytes 50 input-bytes 40 expected-bytes 51
+should not support whitespace-only full references
+--- input
+[x]: /url
+
+[x][ ], [x][	], [x][
+], [x][]
+--- expected
+<p>[x][ ], [x][	], [x][
+], <a href="/url">x</a></p>
+--- end
+--- case 47 options - label-bytes 60 input-bytes 59 expected-bytes 29
+should not support mismatched character escapes in shortcuts
+--- input
+[+]: example.com
+[\;]: example.com
+
+Will it link? [\+], [;]
+--- expected
+<p>Will it link? [+], [;]</p>
+--- end
+--- case 48 options - label-bytes 63 input-bytes 67 expected-bytes 34
+should not support mismatched character references in shortcuts
+--- input
+[©]: example.com
+[&amp;]: example.com
+
+Will it link? [&copy;], [&]
+--- expected
+<p>Will it link? [©], [&amp;]</p>
+--- end
+--- case 49 options - label-bytes 60 input-bytes 63 expected-bytes 33
+should not support mismatched character escapes in collapsed
+--- input
+[+]: example.com
+[\;]: example.com
+
+Will it link? [\+][], [;][]
+--- expected
+<p>Will it link? [+][], [;][]</p>
+--- end
+--- case 50 options - label-bytes 63 input-bytes 71 expected-bytes 38
+should not support mismatched character references in collapsed
+--- input
+[©]: example.com
+[&amp;]: example.com
+
+Will it link? [&copy;][], [&][]
+--- expected
+<p>Will it link? [©][], [&amp;][]</p>
+--- end
+--- case 51 options - label-bytes 56 input-bytes 69 expected-bytes 39
+should not support mismatched character escapes in fulls
+--- input
+[+]: example.com
+[\;]: example.com
+
+Will it link? [a][ \+ ], [b][ ; ]
+--- expected
+<p>Will it link? [a][ + ], [b][ ; ]</p>
+--- end
+--- case 52 options - label-bytes 59 input-bytes 77 expected-bytes 44
+should not support mismatched character references in fulls
+--- input
+[©]: example.com
+[&amp;]: example.com
+
+Will it link? [a][ &copy; ], [b][ & ]
+--- expected
+<p>Will it link? [a][ © ], [b][ &amp; ]</p>
+--- end
+--- case 53 options - label-bytes 80 input-bytes 167 expected-bytes 202
+should properly handle labels w/ character references and -escapes, and phrasing
+--- input
+[*f*][]
+[&semi;][]
+[\;][]
+[;][]
+[*f*&semi;][]
+[*f*\;][]
+[*f*;][]
+
+[*f*]: alpha
+[&semi;]: bravo
+[\;]: charlie
+[;]: delta
+[*f*&semi;]: echo
+[*f*\;]: foxtrot
+[*f*;]: golf
+--- expected
+<p><a href="alpha"><em>f</em></a>
+<a href="bravo">;</a>
+<a href="charlie">;</a>
+<a href="delta">;</a>
+<a href="echo"><em>f</em>;</a>
+<a href="foxtrot"><em>f</em>;</a>
+<a href="golf"><em>f</em>;</a></p>
+
+--- end
+--- case 54 options - label-bytes 50 input-bytes 36 expected-bytes 49
+should not fail on a missing colon in a definition
+--- input
+[x] missing-colon
+
+Will it link? [x]
+--- expected
+<p>[x] missing-colon</p>
+<p>Will it link? [x]</p>
+--- end

@@ -1,0 +1,479 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: code_fenced
+count: 42
+
+--- case 1 options - label-bytes 43 input-bytes 12 expected-bytes 35
+should support fenced code w/ grave accents
+--- input
+```
+<
+ >
+```
+--- expected
+<pre><code>&lt;
+ &gt;
+</code></pre>
+--- end
+--- case 2 options - label-bytes 36 input-bytes 12 expected-bytes 35
+should support fenced code w/ tildes
+--- input
+~~~
+<
+ >
+~~~
+--- expected
+<pre><code>&lt;
+ &gt;
+</code></pre>
+--- end
+--- case 3 options - label-bytes 57 input-bytes 9 expected-bytes 23
+should not support fenced code w/ less than three markers
+--- input
+``
+foo
+``
+--- expected
+<p><code>foo</code></p>
+--- end
+--- case 4 options - label-bytes 79 input-bytes 15 expected-bytes 32
+should not support a tilde closing sequence for a grave accent opening sequence
+--- input
+```
+aaa
+~~~
+```
+--- expected
+<pre><code>aaa
+~~~
+</code></pre>
+--- end
+--- case 5 options - label-bytes 79 input-bytes 15 expected-bytes 32
+should not support a grave accent closing sequence for a tilde opening sequence
+--- input
+~~~
+aaa
+```
+~~~
+--- expected
+<pre><code>aaa
+```
+</code></pre>
+--- end
+--- case 6 options - label-bytes 75 input-bytes 19 expected-bytes 32
+should support a closing sequence longer, but not shorter than, the opening
+--- input
+````
+aaa
+```
+``````
+--- expected
+<pre><code>aaa
+```
+</code></pre>
+--- end
+--- case 7 options - label-bytes 77 input-bytes 17 expected-bytes 32
+should support a closing sequence equal to, but not shorter than, the opening
+--- input
+~~~~
+aaa
+~~~
+~~~~
+--- expected
+<pre><code>aaa
+~~~
+</code></pre>
+--- end
+--- case 8 options - label-bytes 53 input-bytes 3 expected-bytes 25
+should support an eof right after an opening sequence
+--- input
+```
+--- expected
+<pre><code></code></pre>
+
+--- end
+--- case 9 options - label-bytes 42 input-bytes 15 expected-bytes 34
+should support an eof somewhere in content
+--- input
+`````
+
+```
+aaa
+
+--- expected
+<pre><code>
+```
+aaa
+</code></pre>
+
+--- end
+--- case 10 options - label-bytes 51 input-bytes 16 expected-bytes 66
+should support no closing sequence in a block quote
+--- input
+> ```
+> aaa
+
+bbb
+--- expected
+<blockquote>
+<pre><code>aaa
+</code></pre>
+</blockquote>
+<p>bbb</p>
+--- end
+--- case 11 options - label-bytes 41 input-bytes 11 expected-bytes 28
+should support blank lines in fenced code
+--- input
+```
+
+  
+```
+--- expected
+<pre><code>
+  
+</code></pre>
+--- end
+--- case 12 options - label-bytes 32 input-bytes 7 expected-bytes 24
+should support empty fenced code
+--- input
+```
+```
+--- expected
+<pre><code></code></pre>
+--- end
+--- case 13 options - label-bytes 93 input-bytes 17 expected-bytes 32
+should remove up to one space from the content if the opening sequence is indented w/ 1 space
+--- input
+ ```
+ aaa
+aaa
+```
+--- expected
+<pre><code>aaa
+aaa
+</code></pre>
+--- end
+--- case 14 options - label-bytes 94 input-bytes 25 expected-bytes 36
+should remove up to two space from the content if the opening sequence is indented w/ 2 spaces
+--- input
+  ```
+aaa
+  aaa
+aaa
+  ```
+--- expected
+<pre><code>aaa
+aaa
+aaa
+</code></pre>
+--- end
+--- case 15 options - label-bytes 96 input-bytes 34 expected-bytes 37
+should remove up to three space from the content if the opening sequence is indented w/ 3 spaces
+--- input
+   ```
+   aaa
+    aaa
+  aaa
+   ```
+--- expected
+<pre><code>aaa
+ aaa
+aaa
+</code></pre>
+--- end
+--- case 16 options - label-bytes 63 input-bytes 23 expected-bytes 36
+should not support indenteding the opening sequence w/ 4 spaces
+--- input
+    ```
+    aaa
+    ```
+--- expected
+<pre><code>```
+aaa
+```
+</code></pre>
+--- end
+--- case 17 options - label-bytes 43 input-bytes 13 expected-bytes 28
+should support an indented closing sequence
+--- input
+```
+aaa
+  ```
+--- expected
+<pre><code>aaa
+</code></pre>
+--- end
+--- case 18 options - label-bytes 80 input-bytes 16 expected-bytes 28
+should support a differently indented closing sequence than the opening sequence
+--- input
+   ```
+aaa
+  ```
+--- expected
+<pre><code>aaa
+</code></pre>
+--- end
+--- case 19 options - label-bytes 59 input-bytes 16 expected-bytes 37
+should not support an indented closing sequence w/ 4 spaces
+--- input
+```
+aaa
+    ```
+
+--- expected
+<pre><code>aaa
+    ```
+</code></pre>
+
+--- end
+--- case 20 options - label-bytes 80 input-bytes 11 expected-bytes 25
+should not support grave accents in the opening fence after the opening sequence
+--- input
+``` ```
+aaa
+--- expected
+<p><code> </code>
+aaa</p>
+--- end
+--- case 21 options - label-bytes 49 input-bytes 18 expected-bytes 36
+should not support spaces in the closing sequence
+--- input
+~~~~~~
+aaa
+~~~ ~~
+
+--- expected
+<pre><code>aaa
+~~~ ~~
+</code></pre>
+
+--- end
+--- case 22 options - label-bytes 38 input-bytes 19 expected-bytes 50
+should support interrupting paragraphs
+--- input
+foo
+```
+bar
+```
+baz
+--- expected
+<p>foo</p>
+<pre><code>bar
+</code></pre>
+<p>baz</p>
+--- end
+--- case 23 options - label-bytes 41 input-bytes 25 expected-bytes 54
+should support interrupting other content
+--- input
+foo
+---
+~~~
+bar
+~~~
+# baz
+--- expected
+<h2>foo</h2>
+<pre><code>bar
+</code></pre>
+<h1>baz</h1>
+--- end
+--- case 24 options - label-bytes 57 input-bytes 37 expected-bytes 72
+should support the info string as a `language-` class (1)
+--- input
+```ruby
+def foo(x)
+  return 3
+end
+```
+--- expected
+<pre><code class="language-ruby">def foo(x)
+  return 3
+end
+</code></pre>
+--- end
+--- case 25 options - label-bytes 57 input-bytes 10 expected-bytes 43
+should support the info string as a `language-` class (2)
+--- input
+````;
+````
+--- expected
+<pre><code class="language-;"></code></pre>
+--- end
+--- case 26 options - label-bytes 78 input-bytes 64 expected-bytes 72
+should support the info string as a `language-` class, but not the meta string
+--- input
+~~~~    ruby startline=3 $%@#$
+def foo(x)
+  return 3
+end
+~~~~~~~
+--- expected
+<pre><code class="language-ruby">def foo(x)
+  return 3
+end
+</code></pre>
+--- end
+--- case 27 options - label-bytes 51 input-bytes 14 expected-bytes 26
+should not support grave accents in the meta string
+--- input
+``` aa ```
+foo
+--- expected
+<p><code>aa</code>
+foo</p>
+--- end
+--- case 28 options - label-bytes 79 input-bytes 22 expected-bytes 48
+should support grave accents and tildes in the meta string of tilde fenced code
+--- input
+~~~ aa ``` ~~~
+foo
+~~~
+--- expected
+<pre><code class="language-aa">foo
+</code></pre>
+--- end
+--- case 29 options - label-bytes 51 input-bytes 15 expected-bytes 32
+should not support info string on closing sequences
+--- input
+```
+``` aaa
+```
+--- expected
+<pre><code>``` aaa
+</code></pre>
+--- end
+--- case 30 options - label-bytes 70 input-bytes 5 expected-bytes 25
+should support an eof after whitespace, after the start fence sequence
+--- input
+```  
+--- expected
+<pre><code></code></pre>
+
+--- end
+--- case 31 options - label-bytes 66 input-bytes 20 expected-bytes 53
+should support whitespace between the sequence and the info string
+--- input
+```  js
+alert(1)
+```
+--- expected
+<pre><code class="language-js">alert(1)
+</code></pre>
+--- end
+--- case 32 options - label-bytes 43 input-bytes 5 expected-bytes 45
+should support an eof after the info string
+--- input
+```js
+--- expected
+<pre><code class="language-js"></code></pre>
+
+--- end
+--- case 33 options - label-bytes 47 input-bytes 21 expected-bytes 53
+should support whitespace after the info string
+--- input
+```  js 
+alert(1)
+```
+--- expected
+<pre><code class="language-js">alert(1)
+</code></pre>
+--- end
+--- case 34 options - label-bytes 49 input-bytes 6 expected-bytes 28
+should support an eof after whitespace in content
+--- input
+```
+  
+--- expected
+<pre><code>  
+</code></pre>
+
+--- end
+--- case 35 options - label-bytes 47 input-bytes 7 expected-bytes 25
+should support an eof in the prefix, in content
+--- input
+  ```
+ 
+--- expected
+<pre><code></code></pre>
+
+--- end
+--- case 36 options - label-bytes 73 input-bytes 13 expected-bytes 48
+should support character escapes and character references in info strings
+--- input
+```j\+s&copy;
+--- expected
+<pre><code class="language-j+s©"></code></pre>
+
+--- end
+--- case 37 options - label-bytes 47 input-bytes 9 expected-bytes 54
+should encode dangerous characters in languages
+--- input
+```a\&b c
+--- expected
+<pre><code class="language-a&amp;b�c"></code></pre>
+
+--- end
+--- case 38 options - label-bytes 92 input-bytes 18 expected-bytes 34
+should not support a closing sequence w/ too much indent, regardless of opening sequence (1)
+--- input
+   ```
+aaa
+    ```
+--- expected
+<pre><code>aaa
+ ```
+</code></pre>
+
+--- end
+--- case 39 options - label-bytes 92 input-bytes 14 expected-bytes 63
+should not support a closing sequence w/ too much indent, regardless of opening sequence (2)
+--- input
+> ```
+>
+>
+>
+
+a
+--- expected
+<blockquote>
+<pre><code>
+
+
+</code></pre>
+</blockquote>
+<p>a</p>
+--- end
+--- case 40 options - label-bytes 31 input-bytes 8 expected-bytes 79
+should not support lazyness (1)
+--- input
+> ```a
+b
+--- expected
+<blockquote>
+<pre><code class="language-a"></code></pre>
+</blockquote>
+<p>b</p>
+--- end
+--- case 41 options - label-bytes 31 input-bytes 8 expected-bytes 80
+should not support lazyness (2)
+--- input
+> a
+```b
+--- expected
+<blockquote>
+<p>a</p>
+</blockquote>
+<pre><code class="language-b"></code></pre>
+
+--- end
+--- case 42 options - label-bytes 31 input-bytes 10 expected-bytes 96
+should not support lazyness (3)
+--- input
+> ```a
+```
+--- expected
+<blockquote>
+<pre><code class="language-a"></code></pre>
+</blockquote>
+<pre><code></code></pre>
+
+--- end

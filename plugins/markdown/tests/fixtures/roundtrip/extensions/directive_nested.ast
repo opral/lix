@@ -1,0 +1,17 @@
+Document
+  ContainerDirective name=outer attrs=id:one
+    Label
+      Text "Outer"
+    Paragraph
+      Text "Before."
+    ContainerDirective name=inner attrs=class:two
+      Label
+        Text "Inner"
+      Paragraph
+        Text "Inside "
+        TextDirective name=badge attrs=flag
+          Label
+            Text "ok"
+        Text "."
+    Paragraph
+      Text "After."

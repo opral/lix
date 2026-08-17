@@ -1,0 +1,17 @@
+Document
+  Paragraph
+    Text "Backslash"
+    LineBreak kind=backslash
+    Text "next."
+  Paragraph
+    Text "Spaces"
+    LineBreak kind=spaces
+    Text "next."
+  Paragraph
+    Text "Three spaces"
+    LineBreak kind=spaces
+    Text "next."
+  Paragraph
+    Text "Soft"
+    SoftBreak
+    Text "next."

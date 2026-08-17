@@ -1,0 +1,37 @@
+Document
+  Paragraph
+    Text "This is "
+    Insert
+      Text "important!"
+    Text "."
+  Paragraph
+    Text "This is "
+    Insert
+      Text "very "
+      Strong
+        Text "important"
+    Text " OK?"
+  Paragraph
+    Insert
+      Text "It is a"
+      SoftBreak
+      Text "shrubbery"
+  Paragraph
+    Text "This is "
+    Mark
+      Text "important!"
+    Text "."
+  Paragraph
+    Text "This is "
+    Mark
+      Text "very "
+      Strong
+        Text "important"
+    Text " OK?"
+  Paragraph
+    Mark
+      Text "It is a"
+      SoftBreak
+      Text "shrubbery"
+  Paragraph
+    Text "Ceci n'est pas +important+ or =important=."

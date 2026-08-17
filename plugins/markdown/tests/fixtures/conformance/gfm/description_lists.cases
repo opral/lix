@@ -1,0 +1,148 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: description_lists
+count: 8
+
+--- case 1 options extension.description_lists label-bytes 23 input-bytes 68 expected-bytes 133
+description_lists_loose
+--- input
+Term 1
+
+: Definition 1
+
+Term 2 with *inline markup*
+
+: Definition 2
+
+--- expected
+<dl>
+<dt>Term 1</dt>
+<dd>
+<p>Definition 1</p>
+</dd>
+<dt>Term 2 with <em>inline markup</em></dt>
+<dd>
+<p>Definition 2</p>
+</dd>
+</dl>
+
+--- end
+--- case 2 options extension.description_lists label-bytes 23 input-bytes 99 expected-bytes 169
+description_lists_loose
+--- input
+* Nested
+
+    Term 1
+
+    :   Definition 1
+
+    Term 2 with *inline markup*
+
+    :   Definition 2
+
+
+--- expected
+<ul>
+<li>
+<p>Nested</p>
+<dl>
+<dt>Term 1</dt>
+<dd>
+<p>Definition 1</p>
+</dd>
+<dt>Term 2 with <em>inline markup</em></dt>
+<dd>
+<p>Definition 2</p>
+</dd>
+</dl>
+</li>
+</ul>
+
+--- end
+--- case 3 options extension.description_lists label-bytes 23 input-bytes 66 expected-bytes 115
+description_lists_tight
+--- input
+Term 1
+: Definition 1
+
+Term 2 with *inline markup*
+: Definition 2
+
+--- expected
+<dl>
+<dt>Term 1</dt>
+<dd>Definition 1</dd>
+<dt>Term 2 with <em>inline markup</em></dt>
+<dd>Definition 2</dd>
+</dl>
+
+--- end
+--- case 4 options extension.description_lists label-bytes 23 input-bytes 97 expected-bytes 151
+description_lists_tight
+--- input
+* Nested
+
+    Term 1
+    :   Definition 1
+
+    Term 2 with *inline markup*
+    :   Definition 2
+
+
+--- expected
+<ul>
+<li>
+<p>Nested</p>
+<dl>
+<dt>Term 1</dt>
+<dd>Definition 1</dd>
+<dt>Term 2 with <em>inline markup</em></dt>
+<dd>Definition 2</dd>
+</dl>
+</li>
+</ul>
+
+--- end
+--- case 5 options extension.description_lists label-bytes 28 input-bytes 1 expected-bytes 9
+description_lists_edge_cases
+--- input
+:
+--- expected
+<p>:</p>
+
+--- end
+--- case 6 options extension.description_lists label-bytes 28 input-bytes 5 expected-bytes 13
+description_lists_edge_cases
+--- input
+: foo
+--- expected
+<p>: foo</p>
+
+--- end
+--- case 7 options extension.description_lists label-bytes 28 input-bytes 3 expected-bytes 11
+description_lists_edge_cases
+--- input
+a
+:
+--- expected
+<p>a
+:</p>
+
+--- end
+--- case 8 options extension.description_lists label-bytes 28 input-bytes 22 expected-bytes 64
+description_lists_edge_cases
+--- input
+- foo
+- : bar
+  - baz
+
+--- expected
+<ul>
+<li>foo</li>
+<li>: bar
+<ul>
+<li>baz</li>
+</ul>
+</li>
+</ul>
+
+--- end

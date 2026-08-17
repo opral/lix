@@ -1,0 +1,22 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: misc_soft_break
+count: 2
+
+--- case 1 options - label-bytes 27 input-bytes 7 expected-bytes 14
+should support line endings
+--- input
+foo
+baz
+--- expected
+<p>foo
+baz</p>
+--- end
+--- case 2 options - label-bytes 38 input-bytes 9 expected-bytes 14
+should trim spaces around line endings
+--- input
+foo 
+ baz
+--- expected
+<p>foo
+baz</p>
+--- end
