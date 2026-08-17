@@ -20,7 +20,11 @@
 	],
 	"scripts": {
 		"build": "npm run clean && tsc -p tsconfig.json && esbuild js/provider.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=dist/provider.js",
+		"benchmark": "vitest run --config vitest.browser.config.ts tests/storage-path.bench.browser.test.ts tests/opfs-scale.bench.browser.test.ts",
 		"clean": "node -e \"import('node:fs/promises').then(({ rm }) => rm('dist', { recursive: true, force: true }))\"",
+		"test:browser": "npm run build && npm run test:browser:built",
+		"test:browser:built": "vitest run --config vitest.browser.config.ts --exclude 'tests/*.bench.browser.test.ts'",
+		"test:browser:production": "node ./scripts/test-packed-vite.js",
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
 	},
 	"dependencies": {
@@ -31,7 +35,11 @@
 	},
 	"devDependencies": {
 		"@lix-js/sdk": "file:../js-sdk",
-		"esbuild": "^0.25.0",
-		"typescript": "^5.5.4"
+		"@vitest/browser-playwright": "4.1.10",
+		"esbuild": "^0.27.0",
+		"playwright": "1.57.0",
+		"typescript": "^5.5.4",
+		"vite": "8.1.4",
+		"vitest": "4.1.10"
 	}
 }

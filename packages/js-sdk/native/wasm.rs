@@ -48,7 +48,7 @@ struct StorageBridgeBenchmarkEntry {
 }
 
 /// Measures the actual wasm-bindgen + Promise + serde bridge used by browser
-/// storage without mixing SQLite or OPFS I/O into the result. `calls` controls
+/// storage without mixing provider I/O into the result. `calls` controls
 /// boundary crossings and `items_per_call` controls batching.
 #[cfg(feature = "storage-bridge-bench")]
 #[wasm_bindgen(js_name = benchmarkStorageBridge)]

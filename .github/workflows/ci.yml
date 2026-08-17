@@ -384,3 +384,10 @@ jobs:
         run: |
           npm run test:browser:built
           node ./scripts/test-packed-vite.js
+
+      - name: Run OPFS storage browser tests
+        if: matrix.runtime == 'browser'
+        working-directory: packages/storage-opfs
+        run: |
+          npm run test:browser:built
+          npm run test:browser:production

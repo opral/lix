@@ -3,7 +3,7 @@
 import type {
 	LixStorageProvider,
 	LixStorageSpace,
-} from "./storage-adapter.js";
+} from "@lix-js/sdk";
 import { OpfsStorage } from "@lix-js/storage-opfs";
 
 type BenchmarkRequest = { name: string; rows: number };
@@ -67,8 +67,8 @@ async function run(request: BenchmarkRequest) {
 		BENCH_SPACE,
 		{ lower: { kind: "unbounded" }, upper: { kind: "unbounded" } },
 		{
-		order: "ascending",
-		projection: "keyOnly",
+			order: "ascending",
+			projection: "keyOnly",
 		},
 	);
 	const firstPage = await firstScan.nextPage(1_000);
@@ -82,8 +82,8 @@ async function run(request: BenchmarkRequest) {
 	await deleteWrite.deleteRange(BENCH_SPACE, {
 		lower: { kind: "included", key: encodeKey(0) },
 		upper: {
-					kind: "excluded",
-					key: encodeKey(Math.floor(request.rows / 2)),
+			kind: "excluded",
+			key: encodeKey(Math.floor(request.rows / 2)),
 		},
 	});
 	await deleteWrite.commit();
