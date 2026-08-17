@@ -98,9 +98,9 @@ await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 // Your UI shows the diff. The customer clicks accept or undo.
 ```
 
-### Sync local files
+### Sync files
 
-Sync the local files that coding agents and applications work on, to make them collaborative or cloud-based.
+Sync the files that coding agents and applications work on, between machines and with a server.
 
 <img src="./website/public/assets/file-sync.svg" alt="Client A and client B each hold the same project files on their own filesystem and synchronize them with a Lix server" width="760" />
 

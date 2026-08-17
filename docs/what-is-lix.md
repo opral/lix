@@ -22,9 +22,9 @@ Give each agent task its own branch. The agent can edit files and SQL rows witho
 
 See [Lix for AI Agents](./lix-for-ai-agents.md).
 
-### Sync local files
+### Sync files
 
-Sync the local files that coding agents and applications work on, to make them collaborative or cloud-based.
+Sync the files that coding agents and applications work on, between machines and with a server.
 
 <img src="../website/public/assets/file-sync.svg" alt="Client A and client B each hold the same project files on their own filesystem and synchronize them with a Lix server" width="760" />
 
