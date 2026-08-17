@@ -112,7 +112,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("hot_index_aging_probe", "cfg(test) measurement probe"),
     ("hot_row_tombstone_probe", "cfg(test) measurement probe"),
     ("init", "entry point; reaches everywhere by design"),
-    ("json_predicate_pushdown_probe", "cfg(test) measurement probe"),
+    (
+        "json_predicate_pushdown_probe",
+        "cfg(test) measurement probe",
+    ),
     ("lib", "crate root"),
     ("module_layers", "this guard"),
     ("observe_coordinator", "not yet analysed"),
@@ -131,6 +134,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     (
         "server_protocol",
         "optional public HTTP facade; orchestrates sessions and engine APIs",
+    ),
+    (
+        "sync",
+        "optional row-first synchronization coordinator spanning sessions and server admission",
     ),
     ("session", "cyclic with `transaction` and with `gc`"),
     (
@@ -460,9 +467,10 @@ fn production_references(known: &std::collections::BTreeSet<String>) -> Vec<Refe
                         nested += 1;
                     }
                     let nested_start = nested;
-                    while bytes.get(nested).is_some_and(|byte| {
-                        byte.is_ascii_alphanumeric() || *byte == b'_'
-                    }) {
+                    while bytes
+                        .get(nested)
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
                         nested += 1;
                     }
                     target = match &production[nested_start..nested] {

@@ -20,7 +20,10 @@ pub(crate) use codec::encode_commit_record;
 pub(crate) use context::ChangelogContext;
 #[cfg(test)]
 pub(crate) use gc::{stage_delete_changes, stage_delete_commits};
-pub(crate) use gc::{stage_delete_commit_projection, stage_delete_standalone_change};
+pub(crate) use gc::{
+    stage_delete_commit_projection,
+    stage_delete_standalone_change,
+};
 #[cfg(test)]
 pub(crate) use materialization::MaterializedChangeIdentity;
 pub(crate) use materialization::{

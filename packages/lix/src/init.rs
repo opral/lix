@@ -182,7 +182,24 @@ pub struct InitReceipt {
 /// pointers and therefore live in direct control records instead of the
 /// changelog or flat current state.
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
-    let main_branch_id = functions.call_uuid_v7().to_string();
+    plan_init_seed_with_main_branch_id(functions, None)
+}
+
+/// Plans the repository seed with an optional externally selected main branch.
+/// Sync mode uses this only for a brand-new local store: the handshake already
+/// identified the server's default branch, so seeding the local selector with
+/// that same identity avoids a bootstrap rebind transaction and its synthetic
+/// local commit. Ordinary local opens keep the generated UUID path above.
+pub(crate) fn plan_init_seed_with_main_branch_id(
+    functions: FunctionProviderHandle,
+    requested_main_branch_id: Option<&str>,
+) -> Result<InitSeedPlan, LixError> {
+    let main_branch_id = if let Some(branch_id) = requested_main_branch_id {
+        crate::sync::validate_sync_branch_id(branch_id)?;
+        branch_id.to_owned()
+    } else {
+        functions.call_uuid_v7().to_string()
+    };
     let lix_id = functions.call_uuid_v7().to_string();
     let initial_commit_id = CommitId::with_change_address_space(functions.call_uuid_v7());
     let timestamp = functions.call_timestamp();
@@ -342,6 +359,17 @@ pub(crate) async fn initialize<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    initialize_with_main_branch_id(storage, tracked_state, None).await
+}
+
+pub(crate) async fn initialize_with_main_branch_id<StorageImpl>(
+    storage: StorageAdapter<StorageImpl>,
+    tracked_state: &TrackedStateContext,
+    requested_main_branch_id: Option<&str>,
+) -> Result<InitReceipt, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let mut read = SharedStorageAdapterRead::new(
         storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
@@ -350,7 +378,7 @@ where
     assert_empty_repository_for_initialize::<StorageImpl>(&read).await?;
 
     let functions = FunctionProviderHandle::system();
-    let plan = plan_init_seed(functions)?;
+    let plan = plan_init_seed_with_main_branch_id(functions, requested_main_branch_id)?;
     let receipt = plan.receipt.clone();
     let mut writes = StorageWriteSet::new();
     let authored_changes = plan

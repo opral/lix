@@ -90,6 +90,21 @@ name = "registered_row_returning"
 path = "benches/registered_row_returning.rs"
 harness = false
 
+[[bench]]
+name = "sync_state_serialization"
+path = "benches/sync_state_serialization.rs"
+harness = false
+
+[[bench]]
+name = "sync_lazy_profile"
+path = "benches/sync_lazy_profile.rs"
+harness = false
+
+[[bench]]
+name = "sync_strategy_scorecard"
+path = "benches/sync_strategy_scorecard.rs"
+harness = false
+
 # `lix::storage_adapter` is only `pub` behind `storage-benches`.
 [[bench]]
 name = "commit_graph_scale"
@@ -180,7 +195,8 @@ wit-bindgen-rust = "0.57"
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [target.'cfg(all(target_family = "wasm", not(all(target_os = "wasi", target_env = "p2"))))'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }

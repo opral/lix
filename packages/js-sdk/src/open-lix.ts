@@ -28,11 +28,20 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		throw new TypeError("openLix() telemetry requires an onSpan callback");
 	}
 	if (options.server !== undefined) {
-		const { openRemoteLixBinding } = await import("./remote/client.js");
-		if ("storage" in options && options.storage !== undefined) {
-			throw new TypeError("openLix() remote mode does not accept storage");
+		if (options.server.mode === "remote") {
+			const { openRemoteLixBinding } = await import("./remote/client.js");
+			if ("storage" in options && options.storage !== undefined) {
+				throw new TypeError("openLix() remote mode does not accept storage");
+			}
+			return new Lix(await openRemoteLixBinding(options.server));
 		}
-		return new Lix(await openRemoteLixBinding(options.server));
+	}
+	const syncServerUrl =
+		options.server?.mode === "sync"
+			? new URL(options.server.url).toString()
+			: undefined;
+	if (options.server !== undefined && syncServerUrl === undefined) {
+		throw new TypeError("openLix() server mode must be 'remote' or 'sync'");
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
@@ -41,11 +50,16 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				{ kind: "memory" },
 				undefined,
 				options.telemetry,
+				syncServerUrl,
 			),
 		);
 	}
 	if (isJsProviderLixStorage(options.storage)) {
-		return openJsProviderStorage(options.storage, options.telemetry);
+		return openJsProviderStorage(
+			options.storage,
+			options.telemetry,
+			syncServerUrl,
+		);
 	}
 	if (isLixStorage(options.storage)) {
 		const storage = options.storage;
@@ -63,6 +77,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				storage.lixStorage.config,
 				disconnect,
 				options.telemetry,
+				syncServerUrl,
 			);
 			storage.lixStorage.connect({
 				importFilesystemPaths: (paths) =>
@@ -88,6 +103,7 @@ async function openJsProviderStorage(
 		};
 	},
 	telemetry: OpenLixOptions["telemetry"],
+	syncServerUrl: string | undefined,
 ): Promise<Lix> {
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (openStorages.has(storage)) throw storageAlreadyOpen();
@@ -102,6 +118,7 @@ async function openJsProviderStorage(
 			},
 			() => openStorages.delete(storage),
 			telemetry,
+			syncServerUrl,
 		);
 		binding = opened;
 		return new Lix(opened);

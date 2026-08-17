@@ -13,12 +13,14 @@ use crate::binary_cas::{
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
-use crate::row_pk::RowPk;
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::{CertifiedCurrentStatePredecessor, MaterializedHotStateRow};
 use crate::json_store::JsonRef;
+use crate::plugin::runtime::{
+    WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedRowBatch,
+};
+use crate::row_pk::RowPk;
 use crate::tracked_state::OrderedAddressableCommitDeltaStage;
-use crate::plugin::runtime::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedRowBatch};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
@@ -647,10 +649,7 @@ impl CertifiedParameterBatch {
         })
     }
 
-    pub(crate) fn with_row_columnar(
-        mut self,
-        row_columnar: crate::sql2::EncodedRowGroups,
-    ) -> Self {
+    pub(crate) fn with_row_columnar(mut self, row_columnar: crate::sql2::EncodedRowGroups) -> Self {
         self.row_columnar = Some(row_columnar);
         self
     }
@@ -848,6 +847,28 @@ pub(crate) struct RawWriteRowRef<'a> {
 }
 
 impl RawWriteRowRef<'_> {
+    /// Copies this borrowed ingress row into the owned shape used by the
+    /// trusted sync-owner lane. Sync admission keeps owner metadata out of
+    /// the public row-write path, but it still uses the compact raw batch
+    /// representation shared by ordinary writes.
+    pub(crate) fn to_owned_row(self) -> TransactionWriteRow {
+        TransactionWriteRow {
+            row_pk: self.row_pk.cloned(),
+            schema_key: self.schema_key.clone(),
+            file_id: self.file_id.cloned(),
+            snapshot: self.snapshot.cloned(),
+            metadata: self.metadata.cloned(),
+            origin: self.origin.cloned(),
+            created_at: self.created_at.map(ToString::to_string),
+            updated_at: self.updated_at.map(ToString::to_string),
+            global: self.global,
+            change_id: self.change_id.map(ToString::to_string),
+            commit_id: self.commit_id.map(ToString::to_string),
+            untracked: self.untracked,
+            branch_id: self.branch_id.clone(),
+        }
+    }
+
     pub(crate) fn schema_scope_branch_id(&self) -> &str {
         if self.global {
             crate::GLOBAL_BRANCH_ID
@@ -3143,6 +3164,28 @@ impl PreparedStateBatch {
         self.len() == 0
     }
 
+    /// Rebinds the commit identity assigned by the local staging path to a
+    /// canonical identity supplied by the sync protocol. This is deliberately
+    /// private to transaction materialization: ordinary SQL writes continue
+    /// to allocate their own commit IDs, while a replicated event can retain
+    /// the server identity that other replicas observe.
+    pub(crate) fn replace_commit_id(&mut self, from: CommitId, to: CommitId) {
+        if from == to {
+            return;
+        }
+        if let Some(dense) = self.dense_certified_parameter.as_mut() {
+            if dense.commit_id == Some(from) {
+                dense.commit_id = Some(to);
+            }
+            return;
+        }
+        for slot in &mut self.slots {
+            if slot.commit_id == Some(from) {
+                slot.commit_id = Some(to);
+            }
+        }
+    }
+
     pub(crate) fn certified_tracked_keys_strictly_ordered(&self) -> bool {
         self.certified_tracked_keys_strictly_ordered
     }
@@ -3600,8 +3643,7 @@ impl PreparedStateBatch {
         other.expand_dense_certified_parameter();
         self.certified_tracked_keys_strictly_ordered = false;
         self.complete_collection_replacement = None;
-        let row_base =
-            u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
+        let row_base = u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
         let json_base = u32::try_from(self.json.len()).expect("prepared JSON column must fit u32");
         let predecessor_base = u32::try_from(self.durable_predecessors.len())
             .expect("prepared predecessor column must fit u32");
@@ -3966,8 +4008,7 @@ impl PreparedStateBatch {
     }
 
     fn push_row_pk(&mut self, value: RowPk) -> u32 {
-        let index =
-            u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
+        let index = u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
         self.row_pks.push(value);
         index
     }
@@ -4946,11 +4987,7 @@ mod tests {
             r#"{"id":"a","version":64}"#
         );
         assert_eq!(
-            batch
-                .row(1)
-                .row_pk
-                .as_single_string()
-                .expect("scalar pk"),
+            batch.row(1).row_pk.as_single_string().expect("scalar pk"),
             "b"
         );
     }

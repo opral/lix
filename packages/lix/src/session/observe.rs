@@ -18,6 +18,7 @@ struct ObserveQuery {
     scope: ObserveSessionScope,
     sql: String,
     params: Vec<Value>,
+    sync_scopes: Vec<String>,
     shared_state: Option<Arc<ObserveQueryState>>,
 }
 
@@ -26,12 +27,14 @@ impl ObserveQuery {
         scope: ObserveSessionScope,
         sql: impl Into<String>,
         params: Vec<Value>,
+        sync_scopes: Vec<String>,
         shared_state: Option<Arc<ObserveQueryState>>,
     ) -> Self {
         Self {
             scope,
             sql: sql.into(),
             params,
+            sync_scopes,
             shared_state,
         }
     }
@@ -77,6 +80,9 @@ where
             return Ok(None);
         }
         if self.last_rows.is_none() {
+            self.session
+                .wait_for_sync_scope_hydration(&self.query.sync_scopes)
+                .await?;
             let Some((mutation_sequence, evaluation)) =
                 Box::pin(self.evaluate_stable_snapshot()).await?
             else {
@@ -258,6 +264,7 @@ where
                 "observe requires a non-empty SQL string",
             ));
         }
+        let sync_scopes = self.register_sync_sql_scope(sql);
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             return Err(LixError::new(
@@ -277,7 +284,7 @@ where
 
         Ok(ObserveEvents {
             session: self.clone(),
-            query: ObserveQuery::new(scope, sql, params.to_vec(), shared_state),
+            query: ObserveQuery::new(scope, sql, params.to_vec(), sync_scopes, shared_state),
             receiver: Some(self.observe_invalidation.subscribe()),
             sequence: 0,
             last_rows: None,

@@ -53,6 +53,7 @@ export type {
 	LixTelemetrySpan,
 	RemoteLixFetch,
 	RemoteLixServerOptions,
+	SyncLixServerOptions,
 	UndoReceipt,
 	SqlParam,
 	SwitchBranchOptions,

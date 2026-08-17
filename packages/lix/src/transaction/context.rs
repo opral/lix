@@ -36,7 +36,7 @@ use crate::checkpoint::{
     CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head, checkpoint_stage_row,
 };
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
-use crate::common::{LixTimestamp, SharedStr};
+use crate::common::{LixPath, LixTimestamp, SharedStr};
 use crate::domain::Domain;
 use crate::filesystem::{
     BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
@@ -82,8 +82,8 @@ use crate::session::{
 use crate::sql2::{
     CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
     HistoryQuerySource, MaterializedChange, SessionFileViewKey, SessionFileViewMutation,
-    SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource,
+    SessionFileViews, SessionPluginFileView, SessionSyncFileView, SqlChangelogQuerySource,
+    SqlExecutionContext, SqlHistoryQuerySource,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -366,7 +366,9 @@ fn common_registry_column_merger(
         (Some(opening), Some(current)) if opening == current => Ok(Some(current.clone())),
         _ => Err(LixError::new(
             LixError::CODE_MERGE_CONFLICT,
-            format!("column merger generation for schema '{schema_key}' changed during the transaction"),
+            format!(
+                "column merger generation for schema '{schema_key}' changed during the transaction"
+            ),
         )
         .with_hint("commit the plugin generation change before retrying the row edit")),
     }
@@ -698,6 +700,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// uses this lane for its completed manifest and upload receipt.
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
+    suppress_ordinary_sync_event: bool,
+    sync_role: crate::sync::SyncRole,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -1583,6 +1587,8 @@ where
                     idempotency_receipt: None,
                     atomic_metadata_writes: None,
                     atomic_metadata_preconditions: Vec::new(),
+                    suppress_ordinary_sync_event: false,
+                    sync_role: crate::sync::SyncRole::Disabled,
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
@@ -1732,6 +1738,51 @@ where
                 .await;
             return Err(error);
         }
+        // A local file write supersedes any late raw-file projection cached
+        // for the same file. Remove that secondary metadata in the same
+        // backend commit as the canonical file rows. Doing this at commit
+        // time (rather than while staging each SQL statement) avoids duplicate
+        // write-set mutations and keeps statement rollback semantics intact.
+        if let crate::sync::SyncRole::Replica { remote_id } = &transaction.sync_role {
+            let mut file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
+            for file in &prepared_writes.file_content_writes {
+                if file.global || file.untracked {
+                    continue;
+                }
+                file_ids_by_branch
+                    .entry(file.branch_id.clone())
+                    .or_default()
+                    .insert(file.file_id.clone());
+            }
+            // A row-only canonical pull can advance a blob reference without
+            // carrying source bytes. That still invalidates an older late
+            // projection; otherwise a cached file read could return bytes for
+            // the previous blob until a later file-scope pull arrives.
+            for row in prepared_writes.state_rows.iter() {
+                if row.schema_key != BLOB_REF_SCHEMA_KEY
+                    || row.global
+                    || row.untracked
+                    || row.file_id.is_none()
+                {
+                    continue;
+                }
+                file_ids_by_branch
+                    .entry(row.branch_id.to_string())
+                    .or_default()
+                    .insert(row.file_id.expect("checked file_id presence").to_string());
+            }
+            if !file_ids_by_branch.is_empty() {
+                let writes = transaction
+                    .atomic_metadata_writes
+                    .get_or_insert_with(|| transaction.storage.new_write_set());
+                for (branch_id, file_ids) in file_ids_by_branch {
+                    crate::sync::clear_sync_file_projection_metadata(
+                        writes, remote_id, &branch_id, file_ids,
+                    )?;
+                }
+                transaction.await_durable_commit = true;
+            }
+        }
         // The delta itself is projected out of the commit below, once
         // addressable rows hold their final commit-delta change ids. Only its
         // *projectability* is decided here, because the revision the cached
@@ -1753,6 +1804,47 @@ where
         };
         let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
         let previous_filesystem_revision = loaded_filesystem_revision.flatten();
+        let mut automatic_sync_writes = transaction.storage.new_write_set();
+        let mut automatic_sync_preconditions = Vec::new();
+        let sync_blob_reader = TransactionBlobDataReader {
+            base: Arc::new(transaction.binary_cas.reader(read.clone())),
+            staged_writes: Arc::clone(&transaction.staged_writes),
+        };
+        if !transaction.suppress_ordinary_sync_event {
+            match &transaction.sync_role {
+                crate::sync::SyncRole::Disabled => {}
+                crate::sync::SyncRole::Authority => {
+                    if crate::sync::stage_ordinary_transaction_event(
+                        &read,
+                        &sync_blob_reader,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        &prepared_writes,
+                        &commit_parent_heads,
+                        &transaction.active_branch_id,
+                    )
+                    .await?
+                    {
+                        transaction.await_durable_commit = true;
+                    }
+                }
+                crate::sync::SyncRole::Replica { remote_id } => {
+                    if crate::sync::stage_local_transaction_outbox(
+                        &read,
+                        &sync_blob_reader,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        &prepared_writes,
+                        &transaction.active_branch_id,
+                        remote_id,
+                    )
+                    .await?
+                    {
+                        transaction.await_durable_commit = true;
+                    }
+                }
+            }
+        }
         let (mut writes, materialization_preconditions, filesystem_delta_rows) =
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
@@ -1793,6 +1885,7 @@ where
         if tracked_state_changed {
             StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
         }
+        writes.extend(automatic_sync_writes);
         if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
             writes.extend(metadata_writes);
         }
@@ -1801,6 +1894,9 @@ where
         write_options
             .preconditions
             .extend(materialization_preconditions);
+        write_options
+            .preconditions
+            .append(&mut automatic_sync_preconditions);
         write_options
             .preconditions
             .append(&mut transaction.atomic_metadata_preconditions);
@@ -1817,6 +1913,7 @@ where
             // A protocol acknowledgement may replay only from a durable
             // receipt, so ask the storage to cross its durability boundary
             // before it reports this commit as successful.
+            write_options.await_durable = true;
             write_options.idempotency_key = Some(key.0.clone());
             write_options
                 .preconditions
@@ -1950,6 +2047,10 @@ where
 
     pub(crate) fn attach_commit_boundary(&mut self, boundary: TransactionCommitBoundary) {
         self.commit_boundary = Some(boundary);
+    }
+
+    pub(crate) fn set_sync_role(&mut self, role: crate::sync::SyncRole) {
+        self.sync_role = role;
     }
 
     pub(crate) fn trust_serialized_filesystem_planner(&mut self) {
@@ -2276,6 +2377,13 @@ where
         }
         let (affects_filesystem_path_index, mut filesystem_delta_rows) =
             prepared_transaction_write_filesystem_index_impact(&write);
+        let file_projection_keys = match &write {
+            PreparedTransactionWrite::Rows { .. } => Vec::new(),
+            PreparedTransactionWrite::RowsWithFileContent { file_content, .. } => file_content
+                .iter()
+                .map(|file| SessionFileViewKey::new(&file.branch_id, &file.file_id))
+                .collect::<Vec<_>>(),
+        };
         let stage_result = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.transaction_buffer_stage"
@@ -2293,6 +2401,10 @@ where
                 return Err(error);
             }
         };
+        for key in file_projection_keys {
+            self.pending_file_view_mutations
+                .insert(key.clone(), SessionFileViewMutation::RemoveSyncFile { key });
+        }
         if affects_filesystem_path_index {
             let tracked_branch_ids = filesystem_delta_rows
                 .iter()
@@ -3302,9 +3414,10 @@ where
                 {
                     Some(view.clone())
                 }
-                SessionFileViewMutation::Set { .. } | SessionFileViewMutation::Remove { .. } => {
-                    None
-                }
+                SessionFileViewMutation::Set { .. }
+                | SessionFileViewMutation::Remove { .. }
+                | SessionFileViewMutation::SetSyncFile { .. }
+                | SessionFileViewMutation::RemoveSyncFile { .. } => None,
             };
         }
         self.session_file_views.plugin_file_view(
@@ -6637,7 +6750,6 @@ where
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
-    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_rows(
         &mut self,
         rows: RawWriteBatch,
@@ -6647,6 +6759,264 @@ where
             rows,
         })
         .await
+    }
+
+    /// Stages file bytes as an internal durable projection.
+    ///
+    /// Canonical sync events carry file bytes as a projection of their row
+    /// changes. A filtered pull can deliver that projection after the
+    /// canonical commit has already been applied, so it must not create a
+    /// second tracked commit or a duplicate untracked descriptor/blob row
+    /// (the hot-state retention invariant rejects that identity transition).
+    /// The canonical descriptor/blob rows are already present; retaining the
+    /// payload in the internal projection space leaves the canonical graph and
+    /// filesystem rows untouched while making the requested bytes restart-safe.
+    pub(crate) async fn stage_sync_file_projection(
+        &mut self,
+        remote_id: &str,
+        files: Vec<crate::sync::SyncFileMutation>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        if files.is_empty() {
+            return Ok(TransactionWriteOutcome { count: 0 });
+        }
+
+        let mut pending_views = Vec::with_capacity(files.len());
+        for file in &files {
+            let path = file.path.clone().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync file mutation is missing its logical path",
+                )
+            })?;
+            // Preserve the same path validation as the ordinary file planner,
+            // even though this late lane does not rewrite descriptor rows.
+            LixPath::try_from_file_path(&path)?;
+            pending_views.push((
+                SessionFileViewKey::new(&self.active_branch_id, &file.file_id),
+                SessionSyncFileView {
+                    path: path.clone(),
+                    content: Arc::new(file.content.clone()),
+                },
+            ));
+        }
+
+        // Bypass plugin reconciliation: this is a durable local cache payload
+        // for an already-admitted canonical blob-ref row, not a new semantic
+        // filesystem mutation. Metadata writes are appended to the same
+        // transaction as the applied marker, so restart cannot lose bytes
+        // after the cursor/marker has advanced. No prepared state rows are
+        // staged, therefore this lane cannot create a second graph commit.
+        let writes = self
+            .atomic_metadata_writes
+            .get_or_insert_with(|| self.storage.new_write_set());
+        crate::sync::stage_sync_file_projection_metadata(
+            writes,
+            remote_id,
+            &self.active_branch_id,
+            &files,
+        )?;
+        for (key, view) in pending_views {
+            self.pending_file_view_mutations.insert(
+                key.clone(),
+                SessionFileViewMutation::SetSyncFile { key, view },
+            );
+        }
+        self.await_durable_commit = true;
+        Ok(TransactionWriteOutcome { count: 0 })
+    }
+
+    pub(crate) fn clear_sync_file_projection(&mut self, file_id: &str) -> Result<(), LixError> {
+        let key = SessionFileViewKey::new(&self.active_branch_id, file_id);
+        self.pending_file_view_mutations
+            .insert(key.clone(), SessionFileViewMutation::RemoveSyncFile { key });
+        Ok(())
+    }
+
+    /// Stages the row payload of a canonical sync event. Plugin-owner rows are
+    /// admitted through a narrow engine-owned lane before ordinary semantic
+    /// rows are reconciled. They are validated against the canonical owner
+    /// snapshot and never accepted through the public row-write frontend.
+    pub(crate) async fn stage_sync_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        // Client admission must never be able to manufacture durable plugin
+        // ownership or reservation state. Canonical pull uses the separate
+        // renderer/trusted lanes below after the server has authenticated the
+        // event and its pack fingerprint.
+        reject_external_plugin_registry_rows(&rows)?;
+        self.stage_rows(rows).await
+    }
+
+    /// Replays a server-authored canonical pack through the local plugin
+    /// renderer. The owner row is staged first because it is an engine fact,
+    /// not a user mutation; ordinary rows still take the normal renderer path
+    /// so initialized replicas refresh their derived file projection.
+    pub(crate) async fn stage_sync_canonical_renderer_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.ensure_plugin_generation_read_guard().await;
+        let mut owner_rows = RawWriteBatch::with_capacity(rows.len());
+        let mut ordinary_rows = RawWriteBatch::with_capacity(rows.len());
+        for row in rows.iter() {
+            if is_sync_plugin_owner_row(row) {
+                owner_rows.push(row.to_owned_row());
+            } else {
+                ordinary_rows.push(row.to_owned_row());
+            }
+        }
+        if !owner_rows.is_empty() {
+            self.stage_sync_plugin_owner_rows(owner_rows).await?;
+        }
+        if ordinary_rows.is_empty() {
+            return Ok(TransactionWriteOutcome { count: 0 });
+        }
+        self.stage_rows(ordinary_rows).await
+    }
+
+    /// Stages a canonical event on a replica after the row payload has already
+    /// been rendered and validated by the authoritative server. The trusted
+    /// lane is used only for a row-scope fallback when the local replica does
+    /// not retain source bytes/materialization state for the plugin.
+    pub(crate) async fn stage_sync_canonical_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        // This is deliberately a separate async function from the normal
+        // admission lane. Keeping the trusted frame small matters for the
+        // default Tokio test stack and for deeply nested plugin transactions.
+        self.ensure_plugin_generation_read_guard().await;
+        let mut owner_rows = RawWriteBatch::with_capacity(rows.len());
+        let mut filesystem_rows = RawWriteBatch::with_capacity(rows.len());
+        let mut ordinary_rows = RawWriteBatch::with_capacity(rows.len());
+        for row in rows.iter() {
+            if is_sync_plugin_owner_row(row) {
+                owner_rows.push(row.to_owned_row());
+            } else if is_sync_filesystem_projection_row(row) {
+                filesystem_rows.push(row.to_owned_row());
+            } else {
+                ordinary_rows.push(row.to_owned_row());
+            }
+        }
+        if !owner_rows.is_empty() {
+            self.stage_sync_plugin_owner_rows(owner_rows).await?;
+        }
+        let has_plugin_semantic_rows = ordinary_rows.iter().any(is_sync_plugin_semantic_row);
+        // Component semantic reconciliation resolves the owning file through
+        // the transaction path index. Stage the canonical descriptor/blob
+        // projection first so a fresh row-only replica can resolve that path
+        // without retaining the source file bytes.
+        if !filesystem_rows.is_empty() {
+            if has_plugin_semantic_rows {
+                self.stage_sync_trusted_rows(filesystem_rows).await?;
+            } else {
+                self.stage_rows(filesystem_rows).await?;
+            }
+        }
+        if ordinary_rows.is_empty() {
+            return Ok(TransactionWriteOutcome { count: 0 });
+        }
+        if has_plugin_semantic_rows {
+            self.stage_sync_trusted_rows(ordinary_rows).await
+        } else {
+            self.stage_rows(ordinary_rows).await
+        }
+    }
+
+    async fn stage_sync_plugin_owner_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let mut trusted_rows = RawWriteBatch::with_capacity(rows.len());
+        for row in rows.iter() {
+            if row.schema_key != KEY_VALUE_SCHEMA_KEY || row.global {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    "sync plugin owner row must be branch-local lix_key_value state",
+                ));
+            }
+            let Some(row_pk) = row.row_pk else {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync plugin owner row is missing its primary key",
+                ));
+            };
+            if row_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync plugin owner row has an invalid primary key",
+                ));
+            }
+            if row
+                .snapshot
+                .and_then(|snapshot| snapshot.get("key"))
+                .and_then(JsonValue::as_str)
+                .is_some_and(|key| key != PLUGIN_OWNER_KEY)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync plugin owner row snapshot key does not match its primary key",
+                ));
+            }
+            let Some(file_id) = row.file_id else {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync plugin owner row is missing its file_id",
+                ));
+            };
+            if row.metadata.is_some() || row.origin.is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync plugin owner row contains unsupported metadata",
+                ));
+            }
+            let file_id = file_id.to_string();
+            let mut owner_row = match row.snapshot {
+                Some(snapshot) => {
+                    let owner = PluginFileOwner::from_snapshot(file_id.clone(), snapshot)?;
+                    owner.write_row(row.branch_id.as_str(), row.untracked)?
+                }
+                None => {
+                    PluginFileOwner::delete_row(file_id, row.branch_id.as_str(), row.untracked)?
+                }
+            };
+            owner_row.change_id = Some(
+                row.change_id
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| self.functions.call_uuid_v7().to_string()),
+            );
+            owner_row.commit_id = row.commit_id.map(ToString::to_string);
+            trusted_rows.push(owner_row);
+        }
+        self.stage_sync_trusted_rows(trusted_rows).await
+    }
+
+    /// Stages canonical sync rows after their transport-level validation. This
+    /// deliberately skips plugin byte reconciliation: the semantic row pack
+    /// is already the authoritative plugin result, and invoking a renderer
+    /// would require a source blob that a row-scope pull intentionally omits.
+    async fn stage_sync_trusted_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let affects_filesystem_path_index = rows.iter().any(is_sync_filesystem_projection_row);
+        let prepared = self.prepare_transaction_rows(rows).await?;
+        let outcome = self
+            .staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared,
+            })?;
+        if affects_filesystem_path_index {
+            // The direct trusted lane bypasses stage_write_inner's cache
+            // bookkeeping. Bump the transaction-local epoch so the next
+            // plugin semantic group reads the newly staged descriptors through
+            // the overlay rather than the committed base snapshot.
+            self.filesystem_path_index_epoch
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -6733,6 +7103,163 @@ where
             ));
         }
         self.idempotency_receipt = Some(encode_receipt(idempotency, receipt)?);
+        Ok(())
+    }
+
+    pub(crate) fn suppress_ordinary_sync_event(&mut self) {
+        self.suppress_ordinary_sync_event = true;
+    }
+
+    /// Keeps the canonical server commit identity when replaying a sync
+    /// event. The event has already passed the normal row/plugin planner, so
+    /// this only relabels the commit refs and prepared rows before commit
+    /// materialization.
+    pub(crate) fn relabel_sync_commit(&self, canonical_commit_id: &str) -> Result<(), LixError> {
+        let canonical = CommitId::parse_lix(canonical_commit_id, "sync canonical commit_id")?;
+        let generated = self
+            .staged_writes
+            .commit_id_for_branch(&self.active_branch_id)?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync replay has no staged commit to relabel",
+                )
+            })?;
+        self.staged_writes
+            .replace_commit_id(&self.active_branch_id, generated, canonical)
+    }
+
+    pub(crate) fn stage_sync_commit_parents(
+        &self,
+        parent_commit_ids: &[String],
+    ) -> Result<(), LixError> {
+        let Some(first) = parent_commit_ids.first() else {
+            return Ok(());
+        };
+        let first = CommitId::parse_lix(first, "sync canonical first parent commit_id")?;
+        self.staged_writes
+            .set_first_commit_parent(self.active_branch_id.clone(), first)?;
+        for parent in parent_commit_ids.iter().skip(1) {
+            let parent = CommitId::parse_lix(parent, "sync canonical parent commit_id")?;
+            self.staged_writes
+                .add_commit_parent(self.active_branch_id.clone(), parent)?;
+        }
+        Ok(())
+    }
+
+    /// Stages a canonical commit whose payload is intentionally outside the
+    /// requested lazy scope.  Control-plane commits (for example a branch
+    /// descriptor/ref update) can have no semantic rows on the receiving
+    /// replica, but their graph identity and parents are still required by
+    /// `lix_commit`, diff, merge, and history surfaces.  An empty change batch
+    /// is a legitimate graph commit; commit materialization creates the
+    /// canonical node and moving branch ref without inventing a user row.
+    pub(crate) fn stage_sync_topology_commit(
+        &self,
+        canonical_commit_id: &str,
+        parent_commit_ids: &[String],
+    ) -> Result<(), LixError> {
+        let branch_id = self.active_branch_id.clone();
+        self.staged_writes
+            .stage_selected_commit_change_refs(branch_id, StagedCommitChangeBatch::default())?;
+        self.stage_sync_commit_parents(parent_commit_ids)?;
+        self.relabel_sync_commit(canonical_commit_id)
+    }
+
+    pub(crate) async fn stage_sync_admission_receipt(
+        &mut self,
+        idempotency: &ExecuteIdempotency,
+        pack: &crate::sync::SyncTransactionPack,
+        plan: crate::sync::SyncAdmissionPlan,
+    ) -> Result<crate::sync::SyncAdmission, LixError> {
+        self.flush_prepared_mutations().await?;
+        let canonical_commit_id = self
+            .staged_writes
+            .commit_id_for_branch(&self.active_branch_id)?
+            .or(self.opening_active_branch_head)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    "sync admission target branch has no commit",
+                )
+            })?
+            .to_string();
+        let result = crate::ExecuteResult::from_rows(
+            vec!["canonical_commit_id".to_owned(), "cursor".to_owned()],
+            vec![vec![
+                Value::Text(canonical_commit_id.clone()),
+                Value::Integer(i64::try_from(plan.cursor).map_err(|_| {
+                    LixError::new(LixError::CODE_INTERNAL_ERROR, "sync cursor exceeds i64")
+                })?),
+            ]],
+        );
+        let receipt = ExecuteIdempotencyReceipt::single(idempotency, &result)?;
+        self.stage_execute_idempotency_receipt(idempotency, &receipt)?;
+        if self.atomic_metadata_writes.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync admission cannot share another atomic metadata publication",
+            ));
+        }
+        let mut writes = self.storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let parent_commit_ids = if pack.parent_commit_ids.is_empty() {
+            (pack.base_server_commit_id != canonical_commit_id)
+                .then(|| pack.base_server_commit_id.clone())
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            pack.parent_commit_ids.clone()
+        };
+        let parent_commit_ids = parent_commit_ids
+            .into_iter()
+            .filter(|parent| parent != &canonical_commit_id)
+            .collect::<Vec<_>>();
+        crate::sync::stage_sync_event_publication(
+            &mut writes,
+            &mut preconditions,
+            pack,
+            &canonical_commit_id,
+            &plan,
+            &parent_commit_ids,
+        )?;
+        self.atomic_metadata_writes = Some(writes);
+        self.atomic_metadata_preconditions = preconditions;
+        Ok(crate::sync::SyncAdmission {
+            operation_id: pack.operation_id.clone(),
+            branch_id: pack.branch_id.clone(),
+            canonical_commit_id,
+            cursor: plan.cursor,
+        })
+    }
+
+    /// Publishes the replica-side applied-event receipts in the same storage
+    /// commit as the canonical rows/files they protect. This is the crash
+    /// fence for cursor replay: a cursor manifest may lag, but a committed
+    /// marker proves the plugin transaction already ran.
+    pub(crate) fn stage_sync_applied_event_markers(
+        &mut self,
+        markers: &[(crate::sync::SyncAppliedEventMarker, Option<Vec<u8>>)],
+    ) -> Result<(), LixError> {
+        if markers.is_empty() {
+            return Ok(());
+        }
+        let mut preconditions = Vec::new();
+        if self.atomic_metadata_writes.is_none() {
+            self.atomic_metadata_writes = Some(self.storage.new_write_set());
+        }
+        let writes = self
+            .atomic_metadata_writes
+            .as_mut()
+            .expect("sync marker metadata write set should be initialized");
+        crate::sync::stage_sync_applied_event_markers(writes, &mut preconditions, markers)?;
+        self.atomic_metadata_preconditions.extend(preconditions);
+        // The cursor manifest is persisted only after this transaction
+        // returns. The marker must therefore cross the backend's durability
+        // boundary before acknowledgement; otherwise a power loss could keep
+        // the durable cursor while losing the marker+row commit, making the
+        // replica skip canonical data on restart.
+        self.await_durable_commit = true;
         Ok(())
     }
 
@@ -10159,6 +10686,31 @@ fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixE
         }
     }
     Ok(())
+}
+
+fn is_sync_plugin_owner_row(row: RawWriteRowRef<'_>) -> bool {
+    if row.schema_key != KEY_VALUE_SCHEMA_KEY {
+        return false;
+    }
+    row.row_pk
+        .and_then(|row_pk| row_pk.as_single_string().ok())
+        .is_some_and(|key| key == PLUGIN_OWNER_KEY)
+        || row
+            .snapshot
+            .and_then(|snapshot| snapshot.get("key"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|key| key == PLUGIN_OWNER_KEY)
+}
+
+fn is_sync_filesystem_projection_row(row: RawWriteRowRef<'_>) -> bool {
+    matches!(
+        row.schema_key.as_str(),
+        FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY
+    )
+}
+
+fn is_sync_plugin_semantic_row(row: RawWriteRowRef<'_>) -> bool {
+    !row.global && row.file_id.is_some() && !row.schema_key.starts_with("lix_")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

@@ -1,13 +1,16 @@
 import {
 	existsSync,
+	mkdtempSync,
 	mkdirSync,
 	readFileSync,
+	rmSync,
 	statSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { execFile } from "node:child_process";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -43,6 +46,110 @@ test("filesystem storage is owned by its adapter package", async () => {
 	expect("FilesystemStorage" in sdk).toBe(false);
 	expect("LocalFilesystem" in sdk).toBe(false);
 });
+
+test("sync mode rejects browser IndexedDB storage until a local transport exists", async () => {
+	const { IndexedDbStorage } = await import("./open-lix.js");
+	const storage = new IndexedDbStorage({
+		name: `sync-unsupported-${Math.random().toString(36).slice(2)}`,
+	});
+	await expect(
+		openLix({
+			storage,
+			server: { mode: "sync", url: "https://sync.example.test/repository" },
+		}),
+	).rejects.toThrow(
+		"openLix() sync mode is not available with IndexedDbStorage yet",
+	);
+});
+
+test("sync mode keeps cached native reads local after bootstrap", async () => {
+	const storagePath = mkdtempSync(join(tmpdir(), "lix-js-sync-"));
+	const seed = await openLix({
+		storage: new FilesystemStorage({ path: storagePath }),
+	});
+	const branchId = await seed.activeBranchId();
+	const headResult = await seed.execute(
+		"SELECT lix_active_branch_commit_id() AS commit_id",
+	);
+	const headCommitId = get(headResult, "commit_id");
+	await seed.close();
+
+	let requestCount = 0;
+	const server = createServer((request, response) => {
+		requestCount += 1;
+		response.setHeader("content-type", "application/json");
+		if (request.url?.endsWith("/lix/v1")) {
+			response.end(
+				JSON.stringify({
+					activeBranchId: branchId,
+					sessionId: "js-sync-test-session",
+				}),
+			);
+			return;
+		}
+		if (request.url?.includes("/sync/pull")) {
+			response.end(
+				JSON.stringify({
+					branchId,
+					events: [],
+					nextCursor: 0,
+					headCursor: 0,
+					headCommitId,
+				}),
+			);
+			return;
+		}
+		if (request.url?.includes("/sync/branches")) {
+			response.end("[]");
+			return;
+		}
+		response.statusCode = 404;
+		response.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "not found" } }));
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const address = server.address();
+	if (!address || typeof address === "string") {
+		server.close();
+		rmSync(storagePath, { recursive: true, force: true });
+		throw new Error("sync test server did not expose a TCP address");
+	}
+
+	const lix = await openLix({
+		storage: new FilesystemStorage({ path: storagePath }),
+		server: {
+			mode: "sync",
+			url: `http://127.0.0.1:${address.port}/repository`,
+		},
+	});
+	// Materialize the key/value scope while the transport is available. The
+	// assertions below then exercise the cached local-read and local-write path
+	// after disconnect, rather than intentionally querying an uncached scope.
+	const emptyKeyValue = await lix.execute(
+		"SELECT value FROM lix_key_value WHERE key = 'offline-sync-js'",
+	);
+	expect(emptyKeyValue.rows).toHaveLength(0);
+	const requestsAfterBootstrap = requestCount;
+	await new Promise<void>((resolve, reject) =>
+		server.close((error) => (error ? reject(error) : resolve())),
+	);
+
+	const cachedResult = await lix.execute("SELECT 1 AS value");
+	expect(get(cachedResult, "value")).toBe(1);
+	expect(requestCount).toBe(requestsAfterBootstrap);
+	// The local write path remains available after disconnect. It commits and
+	// is readable immediately; the native sync worker can retry its durable
+	// outbox later without putting the network on this API's hot path.
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('offline-sync-js', 'local')",
+	);
+	const offlineWrite = await lix.execute(
+		"SELECT value FROM lix_key_value WHERE key = 'offline-sync-js'",
+	);
+	expect(get(offlineWrite, "value")).toBe("local");
+	expect(requestCount).toBe(requestsAfterBootstrap);
+	await lix.close();
+	rmSync(storagePath, { recursive: true, force: true });
+}, 30_000);
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	let resolveSpan!: (span: LixTelemetrySpan) => void;
