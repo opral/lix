@@ -1,0 +1,37 @@
+{
+	"name": "@lix-js/storage-opfs",
+	"type": "module",
+	"version": "0.12.2",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/opral/lix",
+		"directory": "packages/storage-opfs"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"build": "npm run clean && tsc -p tsconfig.json && esbuild js/provider.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=dist/provider.js",
+		"clean": "node -e \"import('node:fs/promises').then(({ rm }) => rm('dist', { recursive: true, force: true }))\"",
+		"typecheck": "tsc -p tsconfig.test.json --noEmit"
+	},
+	"dependencies": {
+		"@sqlite.org/sqlite-wasm": "3.53.0-build1"
+	},
+	"peerDependencies": {
+		"@lix-js/sdk": "0.12.2"
+	},
+	"devDependencies": {
+		"@lix-js/sdk": "file:../js-sdk",
+		"esbuild": "^0.25.0",
+		"typescript": "^5.5.4"
+	}
+}

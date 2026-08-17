@@ -8,21 +8,6 @@ registerMemoryStorageContract({
 	supportsPluginExecution: false,
 });
 
-registerMemoryStorageContract({
-	name: "browser WASM IndexedDB",
-	loadSdk: async () => await import("@lix-js/sdk"),
-	openStorage: async () => {
-		const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
-		return openLix({
-			storage: new IndexedDbStorage({
-				name: `lix-indexed-db-contract:${crypto.randomUUID()}`,
-			}),
-		});
-	},
-	operationTimeoutMs: 30_000,
-	supportsPluginExecution: false,
-});
-
 test("forwards opt-in SQL telemetry from browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	let resolveSpan!: (span: { attributes: Record<string, unknown> }) => void;
@@ -146,15 +131,16 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 	}
 });
 
-test("IndexedDbStorage persists a complete local Lix", async () => {
-	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
-	const storage = new IndexedDbStorage({
-		name: `lix-indexed-db-test:${crypto.randomUUID()}`,
+test("OpfsStorage persists a complete local Lix", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const { OpfsStorage } = await import("@lix-js/storage-opfs");
+	const storage = new OpfsStorage({
+		name: `lix-opfs-test:${crypto.randomUUID()}`,
 	});
 	const first = await openLix({ storage });
 	await first.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-		["durable", { value: 42 }],
+		["durable-opfs", { value: 42 }],
 	);
 	await first.close();
 
@@ -163,7 +149,7 @@ test("IndexedDbStorage persists a complete local Lix", async () => {
 		expect(
 			(
 				await second.execute("SELECT value FROM lix_key_value WHERE key = $1", [
-					"durable",
+					"durable-opfs",
 				])
 			).rows[0]?.get("value"),
 		).toEqual({ value: 42 });
@@ -172,85 +158,26 @@ test("IndexedDbStorage persists a complete local Lix", async () => {
 	}
 });
 
-test("IndexedDbStorage exclusively owns a database name", async () => {
-	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
-	const name = `lix-indexed-db-owner-test:${crypto.randomUUID()}`;
-	const firstStorage = new IndexedDbStorage({ name });
-	const secondStorage = new IndexedDbStorage({ name });
-	const first = await openLix({ storage: firstStorage });
-
-	await expect(openLix({ storage: secondStorage })).rejects.toThrow(
+test("OpfsStorage exclusively owns a name across handles", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const { OpfsStorage } = await import("@lix-js/storage-opfs");
+	const name = `lix-opfs-owner-test:${crypto.randomUUID()}`;
+	const first = await openLix({ storage: new OpfsStorage({ name }) });
+	await expect(openLix({ storage: new OpfsStorage({ name }) })).rejects.toThrow(
 		"already open",
 	);
 	await first.close();
-
-	const second = await openLix({ storage: secondStorage });
-	await second.close();
 });
 
-test("IndexedDbStorage releases ownership after corrupt data rejects open", async () => {
-	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
-	const name = `lix-indexed-db-corrupt-test:${crypto.randomUUID()}`;
-	await seedMalformedIndexedDbEntry(name);
-
-	await expect(
-		openLix({ storage: new IndexedDbStorage({ name }) }),
-	).rejects.toThrow("not binary data");
-	await deleteIndexedDb(name);
-
-	const recovered = await openLix({ storage: new IndexedDbStorage({ name }) });
-	await recovered.close();
+test("distinct OPFS repositories can open in parallel workers", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const { OpfsStorage } = await import("@lix-js/storage-opfs");
+	const first = openLix({
+		storage: new OpfsStorage({ name: `lix-opfs-parallel-a:${crypto.randomUUID()}` }),
+	});
+	const second = openLix({
+		storage: new OpfsStorage({ name: `lix-opfs-parallel-b:${crypto.randomUUID()}` }),
+	});
+	const [left, right] = await Promise.all([first, second]);
+	await Promise.all([left.close(), right.close()]);
 });
-
-test("IndexedDbStorage close can retry after an active transaction", async () => {
-	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
-	const storage = new IndexedDbStorage({
-		name: `lix-indexed-db-close-test:${crypto.randomUUID()}`,
-	});
-	const lix = await openLix({ storage });
-	const tx = await lix.beginTransaction();
-
-	await expect(lix.close()).rejects.toMatchObject({
-		code: "LIX_INVALID_TRANSACTION_STATE",
-	});
-	await tx.rollback();
-	await lix.execute(
-		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-		["after-failed-close", true],
-	);
-	await lix.close();
-
-	const reopened = await openLix({ storage });
-	const result = await reopened.execute(
-		"SELECT value FROM lix_key_value WHERE key = $1",
-		["after-failed-close"],
-	);
-	expect(result.rows[0]?.get("value")).toBe(true);
-	await reopened.close();
-});
-
-async function seedMalformedIndexedDbEntry(name: string): Promise<void> {
-	const request = indexedDB.open(name, 1);
-	request.onupgradeneeded = () => request.result.createObjectStore("entries");
-	const database = await new Promise<IDBDatabase>((resolve, reject) => {
-		request.onsuccess = () => resolve(request.result);
-		request.onerror = () => reject(request.error);
-	});
-	const transaction = database.transaction("entries", "readwrite");
-	transaction.objectStore("entries").put("not-binary", new Uint8Array([0, 0, 0, 1]));
-	await new Promise<void>((resolve, reject) => {
-		transaction.oncomplete = () => resolve();
-		transaction.onerror = () => reject(transaction.error);
-		transaction.onabort = () => reject(transaction.error);
-	});
-	database.close();
-}
-
-async function deleteIndexedDb(name: string): Promise<void> {
-	const request = indexedDB.deleteDatabase(name);
-	await new Promise<void>((resolve, reject) => {
-		request.onsuccess = () => resolve();
-		request.onerror = () => reject(request.error);
-		request.onblocked = () => reject(new Error("IndexedDB delete was blocked"));
-	});
-}

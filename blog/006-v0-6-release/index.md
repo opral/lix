@@ -80,7 +80,7 @@ The important change since the [April update](/blog/april-2026-update): the stor
       └── custom synchronous storage
 ```
 
-In-memory and SQLite ship today. Anything else implements the storage interface. Postgres, S3/R2, IndexedDB, and Cloudflare-style storage are the direction, not built-in adapters in this release.
+In-memory and SQLite ship today. Anything else implements the storage interface. Postgres, S3/R2, and Cloudflare-style storage are the direction, not built-in adapters in this release.
 
 SQLite is the local default, but not the product boundary. The product boundary is the storage interface: Lix owns the version-control model, the storage owns persistence.
 

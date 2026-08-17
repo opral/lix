@@ -597,7 +597,7 @@ pub struct WriteOptions {
     /// |---|---|---|
     /// | **RocksDB** | the batch is applied into the OS page cache before ack: a process crash cannot lose it, a power loss can | the WAL is fsynced before ack |
     /// | **SlateDB** | `commit()` acks once the write set is queued in-process: a SIGKILL discards it | waits for the WAL upload |
-    /// | **IndexedDB** | the browser's normal transaction durability | forwarded as `strict_durability` |
+    /// | **SQLite on OPFS** | SQLite `synchronous=NORMAL` | temporarily raises SQLite to `synchronous=FULL` |
     ///
     /// RocksDB syncs **one WAL fsync per commit that raises the flag** —
     /// measured by strace as exactly `2.0` per single-part resumable upload,

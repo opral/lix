@@ -1,15 +1,27 @@
-export {
-	IndexedDbStorage,
-	Lix,
-	LixTransaction,
-	ObserveEvents,
-	openLix,
-} from "./open-lix.js";
+export { Lix, LixTransaction, ObserveEvents, openLix } from "./open-lix.js";
 export type {
 	LixStorage,
-	LixStorageAdapterConfig,
-	LixStorageConnection,
+	LixStorageBound,
+	LixStorageCommitResult,
+	LixStorageErrorCode,
+	LixStorageGetManyRequest,
+	LixStorageKeyRange,
+	LixStoragePrecondition,
+	LixStorageProjectedValue,
+	LixStorageProvider,
+	LixStorageProviderRegistration,
+	LixStoragePutEntry,
+	LixStorageRead,
+	LixStorageReadEntry,
+	LixStorageReadOptions,
+	LixStorageScanOrder,
+	LixStorageScanSource,
+	LixStorageSpace,
+	LixStorageWrite,
+	LixStorageWriteOptions,
+	LixStorageWriteStats,
 } from "./storage-adapter.js";
+export { LixStorageError } from "./storage-adapter.js";
 export {
 	bundledPluginArchives,
 	type BundledPluginArchive,
@@ -25,7 +37,6 @@ export type {
 	ExecuteResult,
 	LixBatchOptions,
 	LixBatchStatement,
-	IndexedDbStorageOptions,
 	JsonValue,
 	LixValue,
 	MergeBranchOptions,

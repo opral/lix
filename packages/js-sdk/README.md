@@ -143,12 +143,19 @@ try {
 ## Notes
 
 - `openLix()` opens a fresh in-memory Lix. Install `@lix-js/storage-filesystem` and pass `new FilesystemStorage({ path })` for a filesystem repository directory backed by `<path>/.lix/.internal/rocksdb`.
-- In browsers, pass `new IndexedDbStorage({ name })` to persist a complete local Lix across reloads.
-- Only one Lix handle may open an IndexedDB storage name at a time, including across browser tabs.
+- In browsers, install `@lix-js/storage-opfs` and pass `new OpfsStorage({ name })`. It uses the maintained
+  SQLite WASM OPFS SAH-pool VFS, indexed point reads, and bounded range pages; it does not
+  replay the repository into a JavaScript or Rust map on reopen.
+- OPFS storage is worker-only and requires OPFS plus Web Locks. One handle owns a storage name
+  across tabs; a second opener receives an already-open error rather than risking corruption.
+- JavaScript storage packages register a worker-loadable module URL. That module exports
+  `createLixStorageProvider(options)` and returns the SDK's Rust-shaped `LixStorageProvider`:
+  `beginRead`, `beginWrite`, read/scan handles, write mutation methods, `commit`, and `rollback`.
+  The provider module is loaded beside the Lix Wasm engine in its dedicated worker; it does not
+  bundle or select a Lix engine version.
 - Pass `syncAllFiles: false` to start filesystem sync with no regular repository files, then call `storage.importPaths(["notes/today.md"])` on the `FilesystemStorage` instance to sync selected files. Imported paths are exact repository-relative file paths, not directories or globs.
-- In browsers, local mode and remote mode with IndexedDB storage load the Rust
-  engine as WebAssembly. In remote mode, the local engine contains only client
-  state.
+- Browser-local storage loads the Rust engine as WebAssembly. Remote mode does
+  not open a local storage provider.
 - `FilesystemStorage` is Node.js-only. Constructing it is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.
@@ -160,6 +167,9 @@ try {
   plugin execution still require the native addon.
 - Every browser `openLix()` owns one dedicated worker, so database work does
   not block the page's main thread. Node.js uses the native binding's actor.
+- The browser scale scorecard is `src/opfs-scale.bench.browser.test.ts`; it
+  records raw 10k/1M-row seed, page, reopen, and deletion samples
+  and reports p50/p95 reopen timings on the reference Chromium hardware.
 - Node.js executes installed Component API v1 plugins with the Rust SDK's
   Wasmtime runtime. The browser and Workerd bindings currently open without a
   component runtime: they can use ordinary Lix storage and SQL, but do not

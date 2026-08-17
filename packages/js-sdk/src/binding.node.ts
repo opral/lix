@@ -107,8 +107,8 @@ export async function openNativeLixBinding(
 			if (nativeTelemetry) return nativeAddon.Lix.openMemory(nativeTelemetry);
 			return nativeAddon.Lix.openMemory();
 		}
-		case "indexedDb":
-			throw new Error("IndexedDbStorage is only available in browsers");
+		case "jsStorage":
+			throw new Error("JavaScript storage providers are only available in browsers");
 		case "filesystem": {
 			const nativeAddon = loadNativeAddon();
 			const nativeTelemetry = telemetry

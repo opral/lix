@@ -22,7 +22,7 @@
 
 - Added first-class browser and filesystem storage backends.
 
-  Browser applications can persist repositories with `IndexedDbStorage`, while filesystem storage is available through the dedicated `@lix-js/storage-filesystem` package.
+  Browser applications can persist repositories through the dedicated `@lix-js/storage-opfs` package, while filesystem storage is available through `@lix-js/storage-filesystem`.
 - Plugin authoring and the Lix Server Protocol are now provided directly by Lix.
 
   Rust plugins use `lix::plugin`, server hosts can use the canonical Server Protocol API, and plugins can read and edit untracked files as rows.

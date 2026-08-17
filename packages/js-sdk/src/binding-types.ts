@@ -14,7 +14,7 @@ import type {
 	LixTelemetrySpan,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
-import type { LixStorageAdapterConfig } from "./storage-adapter.js";
+import type { LixStorageProvider } from "./storage-adapter.js";
 
 export type BindingExecuteResult = {
 	statementIndex?: number;
@@ -88,7 +88,19 @@ export type ObserveEventsBinding = {
 
 export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 
+export type LixStorageProviderModule = {
+	createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
+};
+
 export type LixStorageConfig =
 	| { kind: "memory" }
-	| { kind: "indexedDb"; name: string }
-	| LixStorageAdapterConfig;
+	| {
+			kind: "jsStorage";
+			moduleUrl: string;
+			options: unknown;
+	  }
+	| {
+			kind: "filesystem";
+			path: string;
+			syncAllFiles: boolean;
+	  };

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
 const packageDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+const storageOpfsPackageDir = join(packageDir, "..", "storage-opfs");
 const fixtureSource = join(
 	packageDir,
 	"test-fixtures",
@@ -41,6 +42,19 @@ try {
 		throw new Error(`npm pack did not report a tarball: ${packOutput}`);
 	}
 	const tarballPath = join(tempRoot, tarballName);
+	const storagePackOutput = await output(
+		"npm",
+		["pack", "--json", "--pack-destination", tempRoot],
+		{ cwd: storageOpfsPackageDir },
+	);
+	const storagePacked = JSON.parse(storagePackOutput);
+	const storageTarballName = storagePacked[0]?.filename;
+	if (typeof storageTarballName !== "string") {
+		throw new Error(
+			`npm pack did not report an OPFS storage tarball: ${storagePackOutput}`,
+		);
+	}
+	const storageTarballPath = join(tempRoot, storageTarballName);
 
 	await run(
 		"npm",
@@ -52,6 +66,7 @@ try {
 			"--no-package-lock",
 			"--omit=optional",
 			tarballPath,
+			storageTarballPath,
 		],
 		{ cwd: fixtureDir },
 	);
@@ -213,6 +228,7 @@ async function runBrowserSmoke(browser, port, cspMode) {
 
 		assert.deepEqual(result, {
 			message: "production",
+			opfsMessage: "persistent-production",
 			bundledPluginKeys: [
 				"plugin_csv",
 				"plugin_markdown",

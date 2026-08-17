@@ -1,5 +1,5 @@
 ---
-description: Lix has pluggable storage. Open Lix in memory, on the local filesystem, or against a remote server, or implement the Rust storage traits for another store.
+description: Lix has pluggable storage. Open Lix in memory, in browser OPFS, on the local filesystem, or against a remote server.
 ---
 
 # Persistence and Storage
@@ -11,13 +11,13 @@ Lix has pluggable storage. A storage adapter decides where the bytes live. The L
 | Adapter            | Available in     | Use for                                        |
 | ------------------ | ---------------- | ---------------------------------------------- |
 | `Memory` (default) | JavaScript, Rust | tests, demos, and ephemeral work               |
-| `IndexedDbStorage` | JavaScript       | persistent local browser repositories          |
+| `OpfsStorage`     | JavaScript       | persistent local browser repositories          |
 | `FilesystemStorage`  | JavaScript, Rust | a local directory synchronized with Lix        |
 | `RocksDB`          | Rust             | native embedded persistence                    |
 | `SlateDB`          | Rust             | object storage, for example S3                 |
 | Remote server      | any client       | shared repositories; the server owns persistence |
 
-In JavaScript, `FilesystemStorage` requires Node.js. The default `Memory` storage and `IndexedDbStorage` work in browsers.
+In JavaScript, `FilesystemStorage` requires Node.js. The default `Memory` storage and the separate `@lix-js/storage-opfs` package work in browsers.
 
 ## In-memory (default)
 
@@ -69,23 +69,25 @@ or repository instance performs a best-effort shutdown.
 Pass `syncAllFiles: false` to begin with no regular repository files and import
 selected paths with `storage.importPaths(paths)`.
 
-## IndexedDB
+## Browser OPFS
 
 Persist a complete local browser repository across reloads with
-`IndexedDbStorage`:
+`OpfsStorage`:
 
 ```ts
-import { IndexedDbStorage, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { OpfsStorage } from "@lix-js/storage-opfs";
 
 const lix = await openLix({
-  storage: new IndexedDbStorage({ name: "atelier" }),
+  storage: new OpfsStorage({ name: "atelier" }),
 });
 ```
 
 The name identifies one Lix database within the current browser origin. Only
 one Lix handle may open that database name at a time, including from other tabs.
-IndexedDB commits use the same transactional storage boundary as native Lix
-storage.
+The provider uses SQLite Wasm on OPFS and a cross-tab Web Lock. It implements
+the same generic storage protocol as other JavaScript providers; the Lix SDK
+does not expose OPFS-specific APIs.
 
 Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
 
