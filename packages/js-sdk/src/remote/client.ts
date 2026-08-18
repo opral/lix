@@ -55,6 +55,8 @@ const REQUEST_BLOB_BASE_MAX_ENTRIES = 8;
 // new base is retained, so repeated large-file edits stay bounded.
 const REQUEST_BLOB_BASE_MAX_BYTES = 16 * 1024 * 1024;
 const REMOTE_BLOB_BASE_MISSING = "LIX_REMOTE_BLOB_BASE_MISSING";
+const PROTOCOL_SESSION_GONE_CODE = "LIX_ERROR_PROTOCOL_SESSION_GONE";
+const REMOTE_SESSION_EXPIRED_CODE = "LIX_REMOTE_SESSION_EXPIRED";
 const WIRE_BLOB_JSON_ENVELOPE_BYTES = JSON.stringify({
 	kind: "blob",
 	base64: "",
@@ -91,6 +93,8 @@ class RemoteLixBinding implements LixBinding {
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
 	#closePromise: Promise<void> | undefined;
+	#reopenPromise: Promise<void> | undefined;
+	#reopening = false;
 
 	constructor(
 		options: RemoteLixServerOptions,
@@ -130,17 +134,15 @@ class RemoteLixBinding implements LixBinding {
 				this.#requestObserveStream(subscriptions, signal),
 			refreshObservation: (subscription) =>
 				this.#refreshObservation(subscription),
+			recoverGoneSession: () => this.#reopenClientSession(),
 		});
 	}
 
 	async open(): Promise<void> {
-		const query = new URLSearchParams();
-		if (this.#initialActiveBranchId !== undefined) {
-			query.set("activeBranchId", this.#initialActiveBranchId);
-		}
-		const path = query.size === 0 ? "" : `?${query}`;
 		const handshake = decodeHandshake(
-			await this.#requestJson(path, { method: "GET" }),
+			await this.#requestJson(this.#handshakePath(this.#initialActiveBranchId), {
+				method: "GET",
+			}),
 		);
 		this.#sessionId = handshake.sessionId;
 		this.#activeBranchId = handshake.activeBranchId;
@@ -536,51 +538,68 @@ class RemoteLixBinding implements LixBinding {
 		responseKind: "json" | "empty" = "json",
 		onRequestAttempt?: () => void,
 	): Promise<unknown> {
-		const headers = new Headers(await resolveHeaders(this.#headers));
-		new Headers(init.headers).forEach((value, name) => headers.set(name, value));
-		if (this.#sessionId === undefined) headers.delete(REMOTE_SESSION_HEADER);
-		else headers.set(REMOTE_SESSION_HEADER, this.#sessionId);
-		headers.set("accept", "application/json");
-		headers.delete("content-encoding");
-		let requestInit = init;
-		if (init.body !== undefined) {
-			headers.set("content-type", "application/json");
-			if (
-				typeof init.body === "string" &&
-				init.body.length >= MIN_COMPRESSIBLE_JSON_BYTES
-			) {
-				const prepared = await prepareJsonRequestBody(init.body);
-				requestInit = { ...init, body: prepared.body };
-				if (prepared.compressed) headers.set("content-encoding", "gzip");
+		let retried = false;
+		for (;;) {
+			const headers = new Headers(await resolveHeaders(this.#headers));
+			new Headers(init.headers).forEach((value, name) =>
+				headers.set(name, value),
+			);
+			if (this.#sessionId === undefined) headers.delete(REMOTE_SESSION_HEADER);
+			else headers.set(REMOTE_SESSION_HEADER, this.#sessionId);
+			headers.set("accept", "application/json");
+			headers.delete("content-encoding");
+			let requestInit = init;
+			if (init.body !== undefined) {
+				headers.set("content-type", "application/json");
+				if (
+					typeof init.body === "string" &&
+					init.body.length >= MIN_COMPRESSIBLE_JSON_BYTES
+				) {
+					const prepared = await prepareJsonRequestBody(init.body);
+					requestInit = { ...init, body: prepared.body };
+					if (prepared.compressed) headers.set("content-encoding", "gzip");
+				}
 			}
-		}
-		let response: Response;
-		const url = new URL(path, this.#baseUrl);
-		const fetchInit = {
-			...requestInit,
-			headers,
-		};
-		// A custom fetch may transmit before throwing, so failures become
-		// ambiguous only once control is handed to it.
-		onRequestAttempt?.();
-		try {
-			response = await this.#fetch(url, fetchInit);
-		} catch (cause) {
-			throw remoteError(
-				"LIX_REMOTE_UNAVAILABLE",
-				"The remote Lix server is unavailable",
-				{ details: { cause: errorMessage(cause) } },
-			);
-		}
-		if (!response.ok) throw await errorFromHttpResponse(response);
-		if (responseKind === "empty" || response.status === 204) return undefined;
-		const text = await response.text();
-		try {
-			return JSON.parse(text);
-		} catch {
-			throw protocolError(
-				`remote response ${response.status} did not contain valid JSON`,
-			);
+			let response: Response;
+			const url = new URL(path, this.#baseUrl);
+			const fetchInit = {
+				...requestInit,
+				headers,
+			};
+			// A custom fetch may transmit before throwing, so failures become
+			// ambiguous only once control is handed to it.
+			onRequestAttempt?.();
+			try {
+				response = await this.#fetch(url, fetchInit);
+			} catch (cause) {
+				throw remoteError(
+					"LIX_REMOTE_UNAVAILABLE",
+					"The remote Lix server is unavailable",
+					{ details: { cause: errorMessage(cause) } },
+				);
+			}
+			if (response.ok) {
+				if (responseKind === "empty" || response.status === 204) {
+					return undefined;
+				}
+				const text = await response.text();
+				try {
+					return JSON.parse(text);
+				} catch {
+					throw protocolError(
+						`remote response ${response.status} did not contain valid JSON`,
+					);
+				}
+			}
+			const error = await errorFromHttpResponse(response);
+			if (
+				retried ||
+				!this.#shouldReopenGoneSession(init, error)
+			) {
+				throw error;
+			}
+			await this.#reopenClientSession();
+			retried = true;
 		}
 	}
 
@@ -718,6 +737,74 @@ class RemoteLixBinding implements LixBinding {
 			}
 			this.#requestBlobBases.set(update.slot, update.base);
 			this.#requestBlobBaseBytes += update.base.bytes.byteLength;
+		}
+	}
+
+	#handshakePath(activeBranchId: string | undefined): string {
+		if (activeBranchId === undefined) return "";
+		const query = new URLSearchParams();
+		query.set("activeBranchId", activeBranchId);
+		return `?${query}`;
+	}
+
+	#canReopenGoneSession(): boolean {
+		return (
+			this.#acceptingOperations &&
+			!this.#reopening &&
+			this.#sessionId !== undefined
+		);
+	}
+
+	#shouldReopenGoneSession(init: RequestInit, error: unknown): boolean {
+		if (!this.#canReopenGoneSession()) return false;
+		if ((init.method ?? "GET").toUpperCase() === "DELETE") return false;
+		if (requestHasTransactionId(init)) return false;
+		return isProtocolSessionGoneError(error);
+	}
+
+	/**
+	 * Protocol sessions are server-owned leases. The server creates one on
+	 * handshake (GET /lix/v1/ without Lix-Session-Id), expires idle unleased
+	 * sessions, evicts idle ones at capacity, and drops the registry on
+	 * runtime recover/restart. The protocol's 410 tells the client to open a
+	 * new session. This is that default path: handshake again, restore the
+	 * pinned branch, restart observations, then retry the failed RPC.
+	 */
+	#reopenClientSession(): Promise<void> {
+		if (this.#reopenPromise !== undefined) return this.#reopenPromise;
+		this.#reopenPromise = this.#reopenClientSessionOnce().finally(() => {
+			this.#reopenPromise = undefined;
+		});
+		return this.#reopenPromise;
+	}
+
+	async #reopenClientSessionOnce(): Promise<void> {
+		this.#assertOpen();
+		this.#reopening = true;
+		const preferredBranchId =
+			this.#activeBranchId ?? this.#initialActiveBranchId;
+		this.#sessionId = undefined;
+		this.#activeAccountId = undefined;
+		try {
+			let handshake;
+			try {
+				handshake = decodeHandshake(
+					await this.#requestJson(this.#handshakePath(preferredBranchId), {
+						method: "GET",
+					}),
+				);
+			} catch (error) {
+				if (preferredBranchId === undefined) throw error;
+				handshake = decodeHandshake(
+					await this.#requestJson("", { method: "GET" }),
+				);
+			}
+			this.#sessionId = handshake.sessionId;
+			this.#activeBranchId = handshake.activeBranchId;
+			this.#activeAccountId = handshake.activeAccountId;
+			this.#observationHub.restart();
+		} finally {
+			this.#reopening = false;
 		}
 	}
 
@@ -998,11 +1085,13 @@ type RemoteObservationHubOptions = {
 	refreshObservation(
 		subscription: ServerProtocolObserveSubscription,
 	): Promise<BindingExecuteResult>;
+	recoverGoneSession(): Promise<void>;
 };
 
 class RemoteObservationHub {
 	readonly #openStream: RemoteObservationHubOptions["openStream"];
 	readonly #refreshObservation: RemoteObservationHubOptions["refreshObservation"];
+	readonly #recoverGoneSession: RemoteObservationHubOptions["recoverGoneSession"];
 	readonly #observations = new Map<string, RemoteObservation>();
 	#nextObservationId = 0;
 	#controller: AbortController | undefined;
@@ -1016,6 +1105,7 @@ class RemoteObservationHub {
 	constructor(options: RemoteObservationHubOptions) {
 		this.#openStream = options.openStream;
 		this.#refreshObservation = options.refreshObservation;
+		this.#recoverGoneSession = options.recoverGoneSession;
 	}
 
 	observe(
@@ -1110,6 +1200,12 @@ class RemoteObservationHub {
 					reconnect = true;
 					return;
 				}
+				if (isProtocolSessionGoneStatus(response.status)) {
+					void response.body?.cancel();
+					await this.#recoverGoneSession();
+					reconnect = true;
+					return;
+				}
 				const error = await errorFromHttpResponse(response);
 				if (this.#isCurrent(generation, controller)) {
 					this.#failStream(error, controller);
@@ -1195,6 +1291,15 @@ class RemoteObservationHub {
 							);
 						}
 						const error = errorFromResponseBody(payload);
+						if (isProtocolSessionGoneError(error)) {
+							await this.#recoverGoneSession();
+							for (const observation of this.#observations.values()) {
+								observation.recover(error);
+							}
+							reconnect = true;
+							controller.abort();
+							return;
+						}
 						const subscriptionId = payload.subscriptionId;
 						if (subscriptionId !== undefined) {
 							if (typeof subscriptionId !== "string") {
@@ -1492,6 +1597,34 @@ function isDefinitiveClientError(error: unknown): boolean {
 
 function isRetryableObserveStatus(status: number): boolean {
 	return status === 408 || status === 429 || status >= 500;
+}
+
+function isProtocolSessionGoneStatus(status: number): boolean {
+	return status === 410;
+}
+
+function isProtocolSessionGoneError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = errorCode(error);
+	if (
+		code === PROTOCOL_SESSION_GONE_CODE ||
+		code === REMOTE_SESSION_EXPIRED_CODE
+	) {
+		return true;
+	}
+	if (
+		"status" in error &&
+		typeof (error as { status?: unknown }).status === "number" &&
+		isProtocolSessionGoneStatus((error as { status: number }).status)
+	) {
+		return true;
+	}
+	return /open a new client session/i.test(error.message);
+}
+
+function requestHasTransactionId(init: RequestInit): boolean {
+	const value = new Headers(init.headers).get(REMOTE_TRANSACTION_HEADER);
+	return value !== null && value.length > 0;
 }
 
 function isRetryableObserveError(error: unknown): boolean {

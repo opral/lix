@@ -1,6 +1,63 @@
 import { expect, test, vi } from "vitest";
 import { openLix } from "../index.js";
 
+test("remote observe reopens a gone protocol session and reconnects", async () => {
+	let handshakeCalls = 0;
+	let observeCalls = 0;
+	const observedSessionIds: Array<string | null> = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeCalls}`,
+					});
+				}
+				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/execute")) {
+					return executeValueResponse("hello");
+				}
+				observeCalls += 1;
+				observedSessionIds.push(request.headers.get("lix-session-id"));
+				if (observeCalls === 1) {
+					return Response.json(
+						{
+							error: {
+								code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+								message:
+									"the Lix protocol session is unknown, expired, or closed; open a new client session",
+							},
+						},
+						{ status: 410 },
+					);
+				}
+				return sseResponse(
+					sseFrame(
+						"next",
+						multiplexObservePayload("observe-1", "stale", 0, 7),
+					),
+				);
+			},
+		},
+	});
+
+	const events = lix.observe("SELECT $1 AS value", ["hello"]);
+	const initial = await events.next();
+	expect(initial?.result.rows[0]?.get("value")).toBe("hello");
+	expect(handshakeCalls).toBe(2);
+	expect(observedSessionIds).toEqual(["session-1", "session-2"]);
+	events.close();
+	await lix.close();
+});
+
 test("remote observe streams native Lix results", async () => {
 	const requests: Request[] = [];
 	const lix = await openLix({

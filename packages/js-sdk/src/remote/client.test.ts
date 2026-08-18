@@ -1261,9 +1261,163 @@ test("active branch reads reuse the initial handshake without another GET", asyn
 	await lix.close();
 });
 
-test("an expired session mutation is propagated without a new handshake or retry", async () => {
+test("a gone protocol session mutation opens a new handshake and retries", async () => {
 	let handshakeCalls = 0;
 	let executeCalls = 0;
+	const sessionIds: string[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					const sessionId = `session-${handshakeCalls}`;
+					sessionIds.push(sessionId);
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId,
+					});
+				}
+				if (request.method === "DELETE") {
+					expect(request.headers.get("lix-session-id")).toBe("session-2");
+					return new Response(null, { status: 204 });
+				}
+				executeCalls += 1;
+				if (request.headers.get("lix-session-id") === "session-1") {
+					return Response.json(
+						{
+							error: {
+								code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+								message:
+									"the Lix protocol session is unknown, expired, or closed; open a new client session",
+							},
+						},
+						{ status: 410 },
+					);
+				}
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+
+	await lix.execute("UPDATE lix_file SET content = $1");
+	expect(handshakeCalls).toBe(2);
+	expect(executeCalls).toBe(2);
+	expect(sessionIds).toEqual(["session-1", "session-2"]);
+	expect(await lix.activeBranchId()).toBe("main-id");
+	await lix.close();
+});
+
+test("reopening a gone session restores the pinned active branch", async () => {
+	const handshakeBranches: Array<string | null> = [];
+	let executeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					const requestedBranch = new URL(request.url).searchParams.get(
+						"activeBranchId",
+					);
+					handshakeBranches.push(requestedBranch);
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: requestedBranch ?? "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeBranches.length}`,
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				if (pathname.endsWith("/branch/switch")) {
+					return Response.json({ branchId: "draft-id" });
+				}
+				executeCalls += 1;
+				if (request.headers.get("lix-session-id") === "session-1") {
+					return Response.json(
+						{
+							error: {
+								code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+								message:
+									"the Lix protocol session is unknown, expired, or closed; open a new client session",
+							},
+						},
+						{ status: 410 },
+					);
+				}
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+
+	await lix.switchBranch({ branchId: "draft-id" });
+	await lix.execute("SELECT 1");
+	expect(handshakeBranches).toEqual([null, "draft-id"]);
+	expect(executeCalls).toBe(2);
+	expect(await lix.activeBranchId()).toBe("draft-id");
+	await lix.close();
+});
+
+test("a gone protocol session that remains gone after reopen is propagated", async () => {
+	let handshakeCalls = 0;
+	let executeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeCalls}`,
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				executeCalls += 1;
+				return Response.json(
+					{
+						error: {
+							code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+							message:
+								"the Lix protocol session is unknown, expired, or closed; open a new client session",
+						},
+					},
+					{ status: 410 },
+				);
+			},
+		},
+	});
+
+	await expect(
+		lix.execute("UPDATE lix_file SET content = $1"),
+	).rejects.toMatchObject({
+		code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+		status: 410,
+	});
+	expect(handshakeCalls).toBe(2);
+	expect(executeCalls).toBe(2);
+	await lix.close();
+});
+
+test("a gone protocol session inside a transaction is not retried", async () => {
+	let handshakeCalls = 0;
+	let transactionExecutes = 0;
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -1283,28 +1437,38 @@ test("an expired session mutation is propagated without a new handshake or retry
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
-				executeCalls += 1;
-				return Response.json(
-					{
-						error: {
-							code: "LIX_REMOTE_SESSION_EXPIRED",
-							message: "Remote session expired",
+				if (pathname.endsWith("/transaction/begin")) {
+					return Response.json({ transactionId: "transaction-1" });
+				}
+				if (pathname.endsWith("/transaction/rollback")) {
+					return new Response(null, { status: 204 });
+				}
+				if (pathname.endsWith("/transaction/execute")) {
+					transactionExecutes += 1;
+					return Response.json(
+						{
+							error: {
+								code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+								message:
+									"the Lix protocol session is unknown, expired, or closed; open a new client session",
+							},
 						},
-					},
-					{ status: 410 },
-				);
+						{ status: 410 },
+					);
+				}
+				throw new Error(`unexpected ${request.method} ${pathname}`);
 			},
 		},
 	});
 
-	await expect(
-		lix.execute("UPDATE lix_file SET content = $1"),
-	).rejects.toMatchObject({
-		code: "LIX_REMOTE_SESSION_EXPIRED",
+	const transaction = await lix.beginTransaction();
+	await expect(transaction.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
 		status: 410,
 	});
 	expect(handshakeCalls).toBe(1);
-	expect(executeCalls).toBe(1);
+	expect(transactionExecutes).toBe(1);
+	await transaction.rollback();
 	await lix.close();
 });
 
