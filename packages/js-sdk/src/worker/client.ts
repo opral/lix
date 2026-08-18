@@ -276,7 +276,11 @@ export class LixWorkerClient {
 	terminateImmediately(): void {
 		if (this.disposed) return;
 		this.disposed = true;
-		this.rejectPending(workerClosedError());
+		// The document realm is being discarded. Rejecting pending observations
+		// schedules application error handlers during pagehide and creates noisy
+		// false failures; abandoning them is safe because their realm cannot resume.
+		this.pending.clear();
+		this.connection.unref();
 		try {
 			this.connection.terminateImmediately();
 		} finally {
