@@ -14,7 +14,7 @@ use crate::branch::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
     branch_head_control_precondition,
 };
-use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
+use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRoot, GcSweepSet};
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
 #[cfg(any(test, feature = "storage-benches"))]
@@ -1608,7 +1608,6 @@ where
                 changes: Vec::new(),
                 json_payloads: sweep_json_payloads,
             },
-            repair: GcRepairSet::default(),
         },
         sweep: RepositoryGcSweep {
             live_manifest_count,
@@ -2261,7 +2260,6 @@ where
             changes: sweep_changes,
             json_payloads: sweep_json_payloads,
         },
-        repair: GcRepairSet::default(),
     })
 }
 

@@ -823,14 +823,10 @@ pub(crate) struct GcSweepSet {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GcRepairSet {}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcPlan {
     pub(crate) roots: Vec<GcRoot>,
     pub(crate) live: GcLiveSet,
     pub(crate) sweep: GcSweepSet,
-    pub(crate) repair: GcRepairSet,
 }
 
 /// Canonical derived `lix_commit` row snapshot.
