@@ -159,7 +159,11 @@ where
                 .await
                 .map(|change| change.into_iter().collect());
         }
-        ChangeScanRoute::All => {}
+        ChangeScanRoute::All => {
+            if limit == Some(0) {
+                return Ok(Vec::new());
+            }
+        }
     }
     let packed_changes =
         crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
