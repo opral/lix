@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
   push:
@@ -20,7 +21,7 @@ defaults:
 jobs:
   changelog:
     name: Changelog
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
 
     steps:
@@ -35,7 +36,7 @@ jobs:
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -59,7 +60,7 @@ jobs:
 
   cargo:
     name: Cargo ${{ matrix.name }}
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
     strategy:
       fail-fast: false
@@ -113,7 +114,7 @@ jobs:
         if: matrix.task == 'clippy'
         run: |
           cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
-          cargo clippy --manifest-path tooling/Cargo.toml --profile test --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --locked --manifest-path tooling/Cargo.toml --profile test --workspace --all-targets --all-features -- -D warnings
 
       # The one supported configuration nothing else here builds: `cfg(test)`
       # with `storage-benches` OFF, which is exactly what a plain
@@ -170,8 +171,8 @@ jobs:
         if: matrix.task == 'test'
         run: |
           cargo test --profile test --workspace --all-features --no-run
-          cargo test --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-run
-          cargo test --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-run
+          cargo test --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-run
+          cargo test --locked --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-run
 
       - name: Run Rust workspace tests
         # Deliberately no stack-size override here. Production operations and
@@ -187,8 +188,8 @@ jobs:
         if: matrix.task == 'test'
         run: |
           cargo test --profile test --workspace --all-features --no-fail-fast
-          cargo test --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
-          cargo test --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
+          cargo test --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
+          cargo test --locked --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
 
       # Examples are compiled by `--all-targets` but never executed, so the SQL
       # strings inside them are never checked. `checkpoints.rs` selected two
@@ -233,7 +234,7 @@ jobs:
 
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
     strategy:
       fail-fast: false
