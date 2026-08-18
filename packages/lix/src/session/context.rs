@@ -40,6 +40,7 @@ use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
 
+use super::MAX_EXPIRED_READ_RETRIES;
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 use crate::transaction::CommitCoordinator;
 
@@ -388,21 +389,48 @@ where
             .branch
             .get()
             .expect("session branch selector should be readable");
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let read = SharedStorageAdapterRead::new(read);
-        let projections =
-            crate::sync::load_sync_file_projections(&read, remote_id, &branch_id).await?;
-        for projection in projections {
-            self.file_views.remember_sync_file_view(
-                crate::sql2::SessionFileViewKey::new(branch_id.clone(), projection.file_id),
-                projection.path,
-                projection.content,
-            );
+        let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
+        loop {
+            let attempt = async {
+                let read = self
+                    .storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?;
+                let read = SharedStorageAdapterRead::new(read);
+                crate::sync::load_sync_file_projections(&read, remote_id, &branch_id).await
+            }
+            .await;
+            match attempt {
+                Ok(projections) => {
+                    for projection in projections {
+                        self.file_views.remember_sync_file_view(
+                            crate::sql2::SessionFileViewKey::new(
+                                branch_id.clone(),
+                                projection.file_id,
+                            ),
+                            projection.path,
+                            projection.content,
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error)
+                    if error.code == LixError::CODE_STORAGE_READ_EXPIRED
+                        && expired_read_retries < MAX_EXPIRED_READ_RETRIES =>
+                {
+                    expired_read_retries += 1;
+                    if read_quiescence_guard.is_none() {
+                        read_quiescence_guard = Some(
+                            Arc::clone(&self.collaboration_write_gate)
+                                .lock_owned()
+                                .await,
+                        );
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(())
     }
 
     pub fn is_closed(&self) -> bool {

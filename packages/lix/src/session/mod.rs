@@ -14,6 +14,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+const MAX_EXPIRED_READ_RETRIES: usize = 16;
+
 mod checkpoint;
 mod context;
 mod create_branch;
@@ -98,7 +100,6 @@ where
         unsafe { self.map_unchecked_mut(|wrapped| &mut wrapped.0) }.poll(context)
     }
 }
-
 
 /// A storage adapter whose `Read<'a>` genuinely borrows `'a`.
 ///

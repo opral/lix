@@ -33,14 +33,13 @@ use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
 
-use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
+use super::{ExecuteIdempotency, MAX_EXPIRED_READ_RETRIES};
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
-const MAX_EXPIRED_READ_RETRIES: usize = 16;
 const MAX_AUTO_COMMIT_RETRIES: usize = 16;
 
 enum LiteralParameterBuilder {

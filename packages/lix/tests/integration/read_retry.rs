@@ -117,6 +117,32 @@ async fn active_branch_id_does_not_open_a_storage_snapshot() {
 }
 
 #[tokio::test]
+async fn sync_file_projection_restore_waits_for_a_quiescent_retry() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+
+    let writer = lix.lock_collaboration_writes().await;
+    storage.expire_next_read_call();
+    let mut restore = Box::pin(lix.restore_sync_file_projections("https://sync.example/repo"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), restore.as_mut())
+            .await
+            .is_err(),
+        "an expired projection read must wait for the in-flight writer",
+    );
+
+    drop(writer);
+    tokio::time::timeout(Duration::from_secs(1), restore)
+        .await
+        .expect("quiescent projection retry should make forward progress")
+        .expect("quiescent projection retry should succeed");
+    assert_eq!(storage.expired_calls(), 1);
+}
+
+#[tokio::test]
 async fn auto_commit_query_restarts_after_its_snapshot_expires() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()
