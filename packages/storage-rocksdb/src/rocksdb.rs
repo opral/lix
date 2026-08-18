@@ -782,11 +782,19 @@ impl EncodedBounds {
 fn rocksdb_delete_range_bounds(range: &KeyRange) -> Option<(Vec<u8>, Vec<u8>)> {
     let lower = match &range.lower {
         Bound::Included(key) => key.0.to_vec(),
-        Bound::Excluded(key) => next_lexicographic_key(key)?,
+        Bound::Excluded(key) => {
+            let mut bytes = key.0.to_vec();
+            bytes.push(0);
+            bytes
+        }
         Bound::Unbounded => Vec::new(),
     };
     let upper = match &range.upper {
-        Bound::Included(key) => next_lexicographic_key(key)?,
+        Bound::Included(key) => {
+            let mut bytes = key.0.to_vec();
+            bytes.push(0);
+            bytes
+        }
         Bound::Excluded(key) => key.0.to_vec(),
         Bound::Unbounded => return None,
     };
@@ -796,12 +804,6 @@ fn rocksdb_delete_range_bounds(range: &KeyRange) -> Option<(Vec<u8>, Vec<u8>)> {
     } else {
         Some((lower, upper))
     }
-}
-
-fn next_lexicographic_key(key: &Key) -> Option<Vec<u8>> {
-    let mut bytes = key.0.to_vec();
-    bytes.push(0);
-    Some(bytes)
 }
 
 fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDBInner>, StorageError> {
