@@ -97,6 +97,26 @@ impl StorageRead for ExpiringRead {
 }
 
 #[tokio::test]
+async fn active_branch_id_does_not_open_a_storage_snapshot() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+    let expected = lix.active_branch_id().await.expect("active branch");
+
+    storage.expire_next_read_call();
+    let actual = lix.active_branch_id().await.expect("active branch");
+
+    assert_eq!(actual, expected);
+    assert_eq!(
+        storage.expired_calls(),
+        0,
+        "the in-memory session selector must not touch coherent storage",
+    );
+}
+
+#[tokio::test]
 async fn auto_commit_query_restarts_after_its_snapshot_expires() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()

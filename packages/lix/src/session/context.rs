@@ -644,16 +644,11 @@ where
     /// it; independently opened sessions do not.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let result = self.active_branch_id_from_reader(&read).await;
-        match result {
-            Ok(branch_id) => Ok(branch_id),
-            Err(error) => Err(error),
-        }
+        // The selector is session-local state, not repository storage. Opening
+        // a coherent storage read here made this metadata-only operation race
+        // browser OPFS commits performed by sync bootstrap for no reason.
+        self.ensure_open()?;
+        self.branch.get()
     }
 
     /// Reads the session's branch selector without waiting for the session
