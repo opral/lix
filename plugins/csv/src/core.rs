@@ -390,7 +390,6 @@ impl PersistentBlob {
             .sum::<usize>()
             + self.pieces.len() * size_of::<BlobPiece>()
     }
-
 }
 
 fn push_blob_piece(output: &mut Vec<BlobPiece>, piece: BlobPiece) {
@@ -1895,7 +1894,8 @@ impl Document {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
         let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator = preferred_terminator_for_document(&drafts, Terminator::Lf);
+        dialect.terminator =
+            preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
         let identities = IdentityStore::initial(namespace, drafts.len())?;
         assign_initial_rows(&mut drafts);
         let document = Self(Arc::new(DocumentInner {
@@ -2117,7 +2117,8 @@ impl Document {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(after_path);
         let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator = preferred_terminator_for_document(&drafts, Terminator::Lf);
+        dialect.terminator =
+            preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
         let old_locations = self.0.index.locations().collect::<Vec<_>>();
         let mut identities = self.0.identities.clone();
         match_rows(
@@ -2711,7 +2712,8 @@ impl ColdInitialImport {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
         let (rows, fields) = scan_cold_rows(&bytes, dialect)?;
-        dialect.terminator = preferred_cold_terminator(&rows);
+        dialect.terminator =
+            preferred_terminator(rows.iter().map(|row| row.ending), Terminator::Lf);
         let order_denominator =
             u64::try_from(rows.len() + 1).map_err(|_| "CSV has too many rows".to_owned())?;
         Ok(Self {
@@ -3069,10 +3071,13 @@ fn assign_initial_rows(rows: &mut [RowDraft]) {
     }
 }
 
-fn preferred_terminator_for_document(rows: &[RowDraft], fallback: Terminator) -> Terminator {
+fn preferred_terminator(
+    endings: impl Iterator<Item = Option<Terminator>>,
+    fallback: Terminator,
+) -> Terminator {
     let mut counts = [0usize; 3];
-    for row in rows {
-        match row.ending {
+    for ending in endings {
+        match ending {
             Some(Terminator::Lf) => counts[0] += 1,
             Some(Terminator::CrLf) => counts[1] += 1,
             Some(Terminator::Cr) => counts[2] += 1,
@@ -3084,24 +3089,6 @@ fn preferred_terminator_for_document(rows: &[RowDraft], fallback: Terminator) ->
         Some((1, count)) if *count > 0 => Terminator::CrLf,
         Some((2, count)) if *count > 0 => Terminator::Cr,
         _ => fallback,
-    }
-}
-
-fn preferred_cold_terminator(rows: &[ColdRowDraft]) -> Terminator {
-    let mut counts = [0usize; 3];
-    for row in rows {
-        match row.ending {
-            Some(Terminator::Lf) => counts[0] += 1,
-            Some(Terminator::CrLf) => counts[1] += 1,
-            Some(Terminator::Cr) => counts[2] += 1,
-            None => {}
-        }
-    }
-    match counts.iter().enumerate().max_by_key(|(_, count)| *count) {
-        Some((0, count)) if *count > 0 => Terminator::Lf,
-        Some((1, count)) if *count > 0 => Terminator::CrLf,
-        Some((2, count)) if *count > 0 => Terminator::Cr,
-        _ => Terminator::Lf,
     }
 }
 
