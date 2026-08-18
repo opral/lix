@@ -1078,6 +1078,151 @@ mod tests {
             .expect_err("built-in accounts must remain active");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }
+
+    #[tokio::test]
+    async fn bootstrap_accounts_are_global_rows_inherited_by_branches() {
+        const AUTHOR_ID: &str = "01920000-0000-7000-8000-0000000006a1";
+        let root = open_lix().await.expect("open root Lix");
+
+        // SELECT on the default (main) session inherits the two built-ins.
+        // Before this fix those rows were staged onto main as local copies
+        // (`lixcol_global = false`) that shadowed the global rows.
+        let accounts = root
+            .execute(
+                "SELECT id, name, lixcol_global FROM lix_account ORDER BY name",
+                &[],
+            )
+            .await
+            .expect("query accounts should succeed");
+        assert_eq!(
+            accounts.rows().len(),
+            2,
+            "should see exactly two bootstrap accounts"
+        );
+        for row in accounts.rows() {
+            assert_eq!(
+                &row.values()[2],
+                &Value::Boolean(true),
+                "bootstrap account should have lixcol_global=true"
+            );
+        }
+
+        // Physical copies materialize as `lixcol_global = false`. Unfiltered
+        // `*_by_branch` also *projects* inherited global rows onto every
+        // visible branch with `lixcol_global = true` — that is the same
+        // visibility overlay `ensure_account` uses, not a second seed write.
+        let local_copies = root
+            .execute(
+                "SELECT id, lixcol_branch_id FROM lix_account_by_branch \
+                 WHERE id IN ($1, $2) AND lixcol_global = false",
+                &[
+                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
+                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
+                ],
+            )
+            .await
+            .expect("query local account copies should succeed");
+        assert!(
+            local_copies.rows().is_empty(),
+            "built-in accounts must not have branch-local copies"
+        );
+
+        let home_rows = root
+            .execute(
+                "SELECT id, name, lixcol_global, lixcol_branch_id \
+                 FROM lix_account_by_branch \
+                 WHERE id IN ($1, $2) AND lixcol_branch_id = $3 \
+                 ORDER BY name",
+                &[
+                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
+                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
+                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
+            .await
+            .expect("query home account rows should succeed");
+        assert_eq!(
+            home_rows.rows().len(),
+            2,
+            "built-in accounts live on GLOBAL_BRANCH_ID"
+        );
+        for row in home_rows.rows() {
+            let values = row.values();
+            assert_eq!(&values[2], &Value::Boolean(true));
+            assert_eq!(
+                &values[3],
+                &Value::Text(lix::GLOBAL_BRANCH_ID.to_string())
+            );
+        }
+
+        // A later ensure_account write has the same physical/home shape.
+        root.ensure_account(AUTHOR_ID, "Ada", "human")
+            .await
+            .expect("provision author");
+        let author_copies = root
+            .execute(
+                "SELECT id FROM lix_account_by_branch \
+                 WHERE id = $1 AND lixcol_global = false",
+                &[Value::Text(AUTHOR_ID.to_string())],
+            )
+            .await
+            .expect("query ensure_account copies should succeed");
+        assert!(
+            author_copies.rows().is_empty(),
+            "ensure_account must not create branch-local copies either"
+        );
+
+        let draft = root
+            .create_branch(CreateBranchOptions {
+                id: None,
+                name: "draft".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create draft branch");
+        root.switch_branch(SwitchBranchOptions {
+            branch_id: draft.id.clone(),
+        })
+        .await
+        .expect("switch to draft branch");
+
+        let draft_accounts = root
+            .execute(
+                "SELECT id, name, lixcol_global FROM lix_account ORDER BY name",
+                &[],
+            )
+            .await
+            .expect("query accounts on draft branch should succeed");
+        assert_eq!(
+            draft_accounts.rows().len(),
+            3,
+            "draft branch should inherit the two built-ins plus the ensure_account row"
+        );
+        for row in draft_accounts.rows() {
+            assert_eq!(
+                &row.values()[2],
+                &Value::Boolean(true),
+                "inherited account should still have lixcol_global=true on draft"
+            );
+        }
+
+        let draft_local_copies = root
+            .execute(
+                "SELECT id FROM lix_account_by_branch \
+                 WHERE id IN ($1, $2, $3) AND lixcol_global = false",
+                &[
+                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
+                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
+                    Value::Text(AUTHOR_ID.to_string()),
+                ],
+            )
+            .await
+            .expect("query draft local copies should succeed");
+        assert!(
+            draft_local_copies.rows().is_empty(),
+            "creating a branch must not copy global accounts onto the new branch"
+        );
+    }
 }
 
 

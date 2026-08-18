@@ -3542,6 +3542,13 @@ fn packed_current_base_working_diff_baseline(
     }
 }
 
+/// Account rows are global facts. A root-backed branch must inherit them
+/// from `GLOBAL_BRANCH_ID` rather than restating the commit's account rows
+/// as branch-local copies (`lixcol_global = false`).
+fn root_current_base_row_belongs_on_branch(branch_id: &str, schema_key: &str) -> bool {
+    branch_id == crate::GLOBAL_BRANCH_ID || schema_key != "lix_account"
+}
+
 fn push_root_current_base_row(
     rows: &mut MaterializedHotStateBatchBuilder,
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
@@ -3677,7 +3684,8 @@ async fn scan_root_current_base_rows(
             &active_generations,
             &stored_controls,
             &mut scope_memo,
-        ) {
+        ) || !root_current_base_row_belongs_on_branch(branch_id, row.schema_key())
+        {
             continue;
         }
         push_root_current_base_row(&mut rows, row, branch_id, active_checkpoint_commit_id);
@@ -3895,7 +3903,7 @@ async fn load_root_current_base_exact(
                         &active_generations,
                         &stored_controls,
                         &mut scope_memo,
-                    )
+                    ) && root_current_base_row_belongs_on_branch(branch_id, row.schema_key())
                 })
                 .map(|row| {
                     let ordinal = u32::try_from(rows.len())
