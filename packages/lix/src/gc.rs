@@ -2457,6 +2457,7 @@ mod tests {
         stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
 
+    #[cfg(feature = "storage-benches")]
     async fn space_inventory<R>(read: &R, space: StorageSpace) -> Vec<(Vec<u8>, Vec<u8>)>
     where
         R: crate::storage_adapter::StorageAdapterRead,
