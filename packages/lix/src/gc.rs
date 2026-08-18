@@ -2426,10 +2426,12 @@ mod tests {
     };
     use crate::storage_adapter::{
         MAX_SCAN_PAGE_ROWS, Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter,
-        StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey,
+        StorageBeginScanOptions, StorageGetOptions, StorageKey,
         StoragePrefix, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
         StorageWriteSet,
     };
+    #[cfg(feature = "storage-benches")]
+    use crate::storage_adapter::StorageCoreProjection;
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
