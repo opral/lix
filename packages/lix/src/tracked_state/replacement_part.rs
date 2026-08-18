@@ -206,7 +206,6 @@ impl ReplacementPartDirectoryEntry {
     pub(crate) fn row_count(&self) -> u16 {
         self.row_count
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,21 +335,6 @@ impl ReplacementPartDirectory {
         Self::decode(encoded)
     }
 
-    pub(crate) fn route_key(&self, encoded_key: &[u8]) -> Option<&ReplacementPartDirectoryEntry> {
-        let mut lower = 0usize;
-        let mut upper = self.entries.len();
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            if self.entries[middle].first_key.as_ref() <= encoded_key {
-                lower = middle + 1;
-            } else {
-                upper = middle;
-            }
-        }
-        let entry = self.entries.get(lower.checked_sub(1)?)?;
-        (encoded_key <= entry.last_key.as_ref()).then_some(entry)
-    }
-
     pub(crate) fn route_ordinal(&self, ordinal: u32) -> Option<ReplacementPartOrdinalRoute<'_>> {
         if ordinal >= self.row_count {
             return None;
@@ -431,12 +415,6 @@ impl ReplacementPartDirectory {
         }
         Ok(())
     }
-}
-
-pub(crate) fn encode_replacement_part(
-    rows: &[ReplacementPartRowRef<'_>],
-) -> Result<EncodedReplacementPart, LixError> {
-    encode_replacement_part_with_compressor(rows, &mut None)
 }
 
 pub(crate) fn encode_replacement_part_with_compressor(
@@ -781,8 +759,14 @@ fn replacement_part_error(message: impl Into<String>) -> LixError {
 mod tests {
     use super::{
         ReplacementPartDirectory, ReplacementPartRowRef, decode_replacement_part,
-        decode_replacement_part_for_entry, encode_replacement_part,
+        decode_replacement_part_for_entry, encode_replacement_part_with_compressor,
     };
+
+    fn encode_replacement_part(
+        rows: &[ReplacementPartRowRef<'_>],
+    ) -> Result<super::EncodedReplacementPart, crate::LixError> {
+        encode_replacement_part_with_compressor(rows, &mut None)
+    }
 
     fn rows<'a>(keys: &'a [&'a [u8]]) -> Vec<ReplacementPartRowRef<'a>> {
         keys.iter()
@@ -866,11 +850,6 @@ mod tests {
             decoded.digest().expect("directory digest"),
             directory.digest().unwrap()
         );
-        assert_eq!(
-            decoded.route_key(b"beta").expect("beta route").digest(),
-            first.digest()
-        );
-        assert!(decoded.route_key(b"charlie").is_none());
         let ordinal = decoded.route_ordinal(3).expect("ordinal route");
         assert_eq!(ordinal.entry.digest(), second.digest());
         assert_eq!(ordinal.local_ordinal, 1);
