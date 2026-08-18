@@ -5601,7 +5601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fenced_resumed_handshake_reports_terminal_storage_signal() {
+    async fn fenced_storage_does_not_affect_resumed_cached_handshake() {
         let storage = FencedReadStorage::new();
         let root = Arc::new(
             open_lix()
@@ -5624,7 +5624,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/lix/v1")
-                    .header(SESSION_ID_HEADER, session_id)
+                    .header(SESSION_ID_HEADER, &session_id)
                     .extension(notifier)
                     .body(Body::empty())
                     .expect("resumed handshake request"),
@@ -5632,13 +5632,18 @@ mod tests {
             .await
             .expect("resumed handshake response");
 
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(storage.fenced_read_count.load(Ordering::Acquire), 0);
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage(),)
+            !tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage())
                 .await
-                .expect("fenced handshake should wake the request observer"),
-            "the resumed handshake should preserve its terminal storage result"
+                .expect("cached handshake notifier should close"),
+            "a cached resumed handshake must not report a terminal storage signal",
         );
+        server
+            .delete_session(&session_id)
+            .await
+            .expect("close resumed handshake session");
     }
 
     #[tokio::test]
