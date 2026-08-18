@@ -17,10 +17,10 @@ use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobId};
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
-use crate::row_pk::RowPk;
 use crate::plugin::runtime::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
+use crate::row_pk::RowPk;
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
     TrackedStateStoreReader,
@@ -37,7 +37,7 @@ use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-    HISTORY_COL_ROW_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ROW_PK,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes, validate_history_anchor_filter,
@@ -180,19 +180,23 @@ where
                     schema,
                     metadata_projection,
                 )| async move {
-                    let mut rows = load_file_history_rows(
-                        commit_graph,
-                        query_source,
-                        &blob_reader,
-                        &plugin_host,
-                        &route,
-                        &public_predicate,
-                        lookup_ids.as_ref(),
-                        needs_data,
-                        metadata_projection,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+                    let mut rows = if limit == Some(0) {
+                        Vec::new()
+                    } else {
+                        load_file_history_rows(
+                            commit_graph,
+                            query_source,
+                            &blob_reader,
+                            &plugin_host,
+                            &route,
+                            &public_predicate,
+                            lookup_ids.as_ref(),
+                            needs_data,
+                            metadata_projection,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                    };
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
@@ -1165,9 +1169,9 @@ fn descriptor_name_needles(names: &BTreeSet<String>) -> Option<Vec<String>> {
     let mut needles = Vec::with_capacity(names.len());
     for name in names {
         if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| (byte.is_ascii_graphic() || byte == b' ') && byte != b'"' && byte != b'\\')
+            || !name.bytes().all(|byte| {
+                (byte.is_ascii_graphic() || byte == b' ') && byte != b'"' && byte != b'\\'
+            })
         {
             return None;
         }
@@ -2612,11 +2616,11 @@ mod tests {
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::SharedStr;
-    use crate::row_pk::RowPk;
     use crate::plugin::runtime::{
         PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
         plugin_storage_archive_file_id, plugin_storage_archive_path,
     };
+    use crate::row_pk::RowPk;
     use crate::sql2::change_materialization::MaterializedChange;
     use crate::sql2::history_route::HistoryEntry;
     use crate::tracked_state::{MaterializedTrackedStateBatch, MaterializedTrackedStateRow};
