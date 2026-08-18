@@ -14,7 +14,7 @@ use crate::branch::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
     branch_head_control_precondition,
 };
-use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
+use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRoot, GcSweepSet};
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
 #[cfg(any(test, feature = "storage-benches"))]
@@ -1608,7 +1608,6 @@ where
                 changes: Vec::new(),
                 json_payloads: sweep_json_payloads,
             },
-            repair: GcRepairSet::default(),
         },
         sweep: RepositoryGcSweep {
             live_manifest_count,
@@ -2261,7 +2260,6 @@ where
             changes: sweep_changes,
             json_payloads: sweep_json_payloads,
         },
-        repair: GcRepairSet::default(),
     })
 }
 
@@ -2428,10 +2426,12 @@ mod tests {
     };
     use crate::storage_adapter::{
         MAX_SCAN_PAGE_ROWS, Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter,
-        StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey,
+        StorageBeginScanOptions, StorageGetOptions, StorageKey,
         StoragePrefix, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
         StorageWriteSet,
     };
+    #[cfg(feature = "storage-benches")]
+    use crate::storage_adapter::StorageCoreProjection;
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
@@ -2457,6 +2457,7 @@ mod tests {
         stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
 
+    #[cfg(feature = "storage-benches")]
     async fn space_inventory<R>(read: &R, space: StorageSpace) -> Vec<(Vec<u8>, Vec<u8>)>
     where
         R: crate::storage_adapter::StorageAdapterRead,
