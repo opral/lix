@@ -255,27 +255,6 @@ impl PersistentBlob {
         Ok(output)
     }
 
-    fn contiguous_range(&self, start: usize, end: usize) -> Option<&[u8]> {
-        let start = u32::try_from(start).ok()?;
-        let end = u32::try_from(end).ok()?;
-        if start > end || end > self.len {
-            return None;
-        }
-        let mut logical_start = 0u32;
-        for piece in self.pieces.iter() {
-            let logical_end = logical_start.checked_add(piece.len)?;
-            if start >= logical_start && end <= logical_end {
-                let selected_start = piece.start.checked_add(start - logical_start)?;
-                let selected_end = piece.start.checked_add(end - logical_start)?;
-                return piece.bytes.get(
-                    usize::try_from(selected_start).ok()?..usize::try_from(selected_end).ok()?,
-                );
-            }
-            logical_start = logical_end;
-        }
-        (start == end).then_some(&[])
-    }
-
     fn byte(&self, offset: usize) -> Option<u8> {
         let offset = u32::try_from(offset).ok()?;
         if offset >= self.len {
