@@ -2759,11 +2759,6 @@ impl Document {
         self.bytes.materialize()
     }
 
-    #[cfg(test)]
-    pub(crate) fn accepted_bytes(&self) -> Vec<u8> {
-        self.bytes()
-    }
-
 }
 
 /// A single base-relative text replacement. Keeping this deliberately narrow
