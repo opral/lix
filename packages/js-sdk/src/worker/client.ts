@@ -142,6 +142,9 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 			request({ kind: "mergeBranchPreview", options }),
 		mergeBranch: (options) => request({ kind: "mergeBranch", options }),
 		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
+		beginClose: () => {
+			void request({ kind: "beginClose" }).catch(() => undefined);
+		},
 		close: async () => {
 			if (closed) return;
 			await request({ kind: "close" });

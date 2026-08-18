@@ -58,6 +58,7 @@ export type WorkerOperation =
 	| { kind: "syncDiskToLix" }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
+	| { kind: "beginClose" }
 	| { kind: "close" };
 
 export type WorkerNotification =

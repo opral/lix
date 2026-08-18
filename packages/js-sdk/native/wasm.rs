@@ -398,6 +398,11 @@ impl WasmLix {
             .await
             .map_err(|error| lix_error_to_js(error.into()))
     }
+
+    #[wasm_bindgen(js_name = beginClose)]
+    pub fn begin_close(&self) {
+        self.inner.begin_close();
+    }
 }
 
 #[wasm_bindgen]

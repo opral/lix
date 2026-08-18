@@ -68,6 +68,8 @@ export type LixBinding = {
 	syncDiskToLix(): Promise<void>;
 	/** Explicit snapshot utility available on direct in-memory WASM bindings. */
 	exportSnapshot?(): Promise<Uint8Array>;
+	/** Signals background work to stop before asynchronous close drainage. */
+	beginClose?(): void;
 	close(): Promise<void>;
 };
 

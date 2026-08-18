@@ -1052,6 +1052,16 @@ where
         self.session.close().await
     }
 
+    /// Signals background synchronization to stop before asynchronous close
+    /// drainage begins. Browser hosts use this during page teardown so the
+    /// active fetch can be aborted while the document is still alive.
+    #[doc(hidden)]
+    pub fn begin_close(&self) {
+        if let Some(runtime) = &self.sync_runtime {
+            runtime.stop();
+        }
+    }
+
     pub(crate) fn set_sync_role(&self, role: crate::sync::SyncRole) -> Result<(), LixError> {
         self.engine.sync_mode().set_role(role)
     }

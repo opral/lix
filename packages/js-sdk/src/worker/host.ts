@@ -31,6 +31,10 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			void respond(message, () => handleObserveNext(observeId));
 			return;
 		}
+		if (message.operation.kind === "beginClose") {
+			void respond(message, () => handleFiniteOperation(message.operation));
+			return;
+		}
 		finiteQueue = finiteQueue.then(async () => {
 			await respond(message, () => handleFiniteOperation(message.operation));
 		});
@@ -153,6 +157,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				observations.set(observeId, events);
 				return observeId;
 			}
+			case "beginClose":
+				requiredLix().beginClose?.();
+				return undefined;
 			case "close": {
 				const openLix = requiredLix();
 				await openLix.close();

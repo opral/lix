@@ -10,6 +10,9 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 	});
 	const binding = {
 		execute,
+		beginClose: () => {
+			order.push("remote shutdown signaled");
+		},
 		switchBranch: async () => {
 			order.push("remote switch started");
 			const receipt = await remoteSwitch.promise;
@@ -31,7 +34,7 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 		code: "LIX_ERROR_CLOSED",
 	});
 	expect(execute).not.toHaveBeenCalled();
-	expect(order).toEqual(["remote switch started"]);
+	expect(order).toEqual(["remote switch started", "remote shutdown signaled"]);
 
 	remoteSwitch.resolve({ branchId: "draft" });
 	await expect(switching).resolves.toEqual({ branchId: "draft" });
@@ -39,6 +42,7 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 	expect(branchListener).toHaveBeenCalledOnce();
 	expect(order).toEqual([
 		"remote switch started",
+		"remote shutdown signaled",
 		"remote switch finished",
 		"remote binding closed",
 	]);

@@ -210,6 +210,7 @@ export class Lix {
 			// Flip the public lifecycle gate before the first await. Operations that
 			// already entered the gate are allowed to finish; later calls fail closed.
 			this.#acceptingOperations = false;
+			this.beginClose();
 			for (const observation of this.#observations.values()) {
 				observation.deref()?.close();
 			}
@@ -228,6 +229,11 @@ export class Lix {
 			})();
 		}
 		await this.closePromise;
+	}
+
+	/** @internal Signals background work before asynchronous close drainage. */
+	beginClose(): void {
+		this.binding.beginClose?.();
 	}
 
 	#runOperation<T>(operation: () => Promise<T>): Promise<T> {
