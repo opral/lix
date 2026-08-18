@@ -56,6 +56,7 @@ const REQUEST_BLOB_BASE_MAX_ENTRIES = 8;
 const REQUEST_BLOB_BASE_MAX_BYTES = 16 * 1024 * 1024;
 const REMOTE_BLOB_BASE_MISSING = "LIX_REMOTE_BLOB_BASE_MISSING";
 const PROTOCOL_SESSION_GONE_CODE = "LIX_ERROR_PROTOCOL_SESSION_GONE";
+const PROTOCOL_SERVER_CLOSED_CODE = "LIX_ERROR_PROTOCOL_SERVER_CLOSED";
 const REMOTE_SESSION_EXPIRED_CODE = "LIX_REMOTE_SESSION_EXPIRED";
 const WIRE_BLOB_JSON_ENVELOPE_BYTES = JSON.stringify({
 	kind: "blob",
@@ -763,12 +764,12 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	/**
-	 * Protocol sessions are server-owned leases. The server creates one on
-	 * handshake (GET /lix/v1/ without Lix-Session-Id), expires idle unleased
-	 * sessions, evicts idle ones at capacity, and drops the registry on
-	 * runtime recover/restart. The protocol's 410 tells the client to open a
-	 * new session. This is that default path: handshake again, restore the
-	 * pinned branch, restart observations, then retry the failed RPC.
+	 * Protocol sessions are an in-process HashMap on the protocol server.
+	 * They are not durable: idle timeout, capacity eviction, close(), and
+	 * host recover()/recycle wipe the map. 410 SESSION_GONE is a miss;
+	 * 503 SERVER_CLOSED is the same server going away. The contract is
+	 * handshake again (GET /lix/v1/ without Lix-Session-Id), restore the
+	 * pinned branch, restart observations, and retry the failed RPC once.
 	 */
 	#reopenClientSession(): Promise<void> {
 		if (this.#reopenPromise !== undefined) return this.#reopenPromise;
@@ -1195,11 +1196,6 @@ class RemoteObservationHub {
 			streamOpened = true;
 			const initialSubscriptions = new Set(this.#observations.keys());
 			if (!response.ok) {
-				if (isRetryableObserveStatus(response.status)) {
-					void response.body?.cancel();
-					reconnect = true;
-					return;
-				}
 				if (isProtocolSessionGoneStatus(response.status)) {
 					void response.body?.cancel();
 					await this.#recoverGoneSession();
@@ -1207,6 +1203,15 @@ class RemoteObservationHub {
 					return;
 				}
 				const error = await errorFromHttpResponse(response);
+				if (isProtocolSessionGoneError(error)) {
+					await this.#recoverGoneSession();
+					reconnect = true;
+					return;
+				}
+				if (isRetryableObserveStatus(response.status)) {
+					reconnect = true;
+					return;
+				}
 				if (this.#isCurrent(generation, controller)) {
 					this.#failStream(error, controller);
 				}
@@ -1608,6 +1613,7 @@ function isProtocolSessionGoneError(error: unknown): boolean {
 	const code = errorCode(error);
 	if (
 		code === PROTOCOL_SESSION_GONE_CODE ||
+		code === PROTOCOL_SERVER_CLOSED_CODE ||
 		code === REMOTE_SESSION_EXPIRED_CODE
 	) {
 		return true;

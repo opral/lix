@@ -58,6 +58,59 @@ test("remote observe reopens a gone protocol session and reconnects", async () =
 	await lix.close();
 });
 
+test("remote observe reopens after the protocol server closes", async () => {
+	let handshakeCalls = 0;
+	let observeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeCalls}`,
+					});
+				}
+				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/execute")) {
+					return executeValueResponse("hello");
+				}
+				observeCalls += 1;
+				if (observeCalls === 1) {
+					return Response.json(
+						{
+							error: {
+								code: "LIX_ERROR_PROTOCOL_SERVER_CLOSED",
+								message: "the Lix protocol server is closing or closed",
+							},
+						},
+						{ status: 503 },
+					);
+				}
+				return sseResponse(
+					sseFrame(
+						"next",
+						multiplexObservePayload("observe-1", "stale", 0, 7),
+					),
+				);
+			},
+		},
+	});
+
+	const events = lix.observe("SELECT $1 AS value", ["hello"]);
+	const initial = await events.next();
+	expect(initial?.result.rows[0]?.get("value")).toBe("hello");
+	expect(handshakeCalls).toBe(2);
+	events.close();
+	await lix.close();
+});
+
 test("remote observe streams native Lix results", async () => {
 	const requests: Request[] = [];
 	const lix = await openLix({

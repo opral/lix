@@ -1313,6 +1313,51 @@ test("a gone protocol session mutation opens a new handshake and retries", async
 	await lix.close();
 });
 
+test("a closed protocol server opens a new handshake and retries", async () => {
+	let handshakeCalls = 0;
+	let executeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeCalls}`,
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				executeCalls += 1;
+				if (request.headers.get("lix-session-id") === "session-1") {
+					return Response.json(
+						{
+							error: {
+								code: "LIX_ERROR_PROTOCOL_SERVER_CLOSED",
+								message: "the Lix protocol server is closing or closed",
+							},
+						},
+						{ status: 503 },
+					);
+				}
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+
+	await lix.execute("UPDATE lix_file SET content = $1");
+	expect(handshakeCalls).toBe(2);
+	expect(executeCalls).toBe(2);
+	await lix.close();
+});
+
 test("reopening a gone session restores the pinned active branch", async () => {
 	const handshakeBranches: Array<string | null> = [];
 	let executeCalls = 0;
