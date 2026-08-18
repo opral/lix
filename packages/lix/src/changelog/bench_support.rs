@@ -8,7 +8,7 @@ use super::context::ChangelogContext;
 use super::store::{ChangelogReader, ChangelogWriter};
 use super::types::{
     ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitId, CommitLoadRequest,
-    CommitRecord, RebuildIndexStats,
+    CommitRecord,
 };
 use crate::LixError;
 use crate::row_pk::RowPk;
@@ -473,7 +473,7 @@ pub async fn rebuild_mandatory_indexes<StorageImpl>(
 where
     StorageImpl: BenchStorage + Sync,
 {
-    Ok(RebuildIndexStats::default().into())
+    Ok(BenchRebuildStats::default())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,17 +685,6 @@ impl From<StorageWriteSetStats> for BenchWriteStats {
             puts: stats.staged_puts as usize,
             deletes: stats.staged_deletes as usize,
             bytes_written: stats.written_bytes as usize,
-        }
-    }
-}
-
-impl From<RebuildIndexStats> for BenchRebuildStats {
-    fn from(stats: RebuildIndexStats) -> Self {
-        Self {
-            expected: stats.expected,
-            put: stats.put,
-            deleted: stats.deleted,
-            unchanged: stats.unchanged,
         }
     }
 }

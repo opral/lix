@@ -455,51 +455,6 @@ impl Document {
         self.0.bytes.as_ref().clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn source_spans_match_rows(&self) -> Result<(), String> {
-        for element in self.0.elements.iter() {
-            let span = self
-                .0
-                .element_spans
-                .get(&element.id)
-                .ok_or_else(|| format!("missing source span for element {:?}", element.id))?;
-            let start = usize::try_from(span.offset)
-                .map_err(|_| "element span offset exceeds usize".to_owned())?;
-            let length = usize::try_from(span.length)
-                .map_err(|_| "element span length exceeds usize".to_owned())?;
-            let end = start
-                .checked_add(length)
-                .ok_or_else(|| "element span overflows usize".to_owned())?;
-            if self.0.bytes.get(start..end) != Some(element.element_json.as_bytes()) {
-                return Err(format!(
-                    "element {:?} source span does not point at its accepted bytes",
-                    element.id
-                ));
-            }
-        }
-        for file in self.0.files.iter() {
-            let span = self
-                .0
-                .file_spans
-                .get(&file.id)
-                .ok_or_else(|| format!("missing source span for file {:?}", file.id))?;
-            let start = usize::try_from(span.offset)
-                .map_err(|_| "file span offset exceeds usize".to_owned())?;
-            let length = usize::try_from(span.length)
-                .map_err(|_| "file span length exceeds usize".to_owned())?;
-            let end = start
-                .checked_add(length)
-                .ok_or_else(|| "file span overflows usize".to_owned())?;
-            if self.0.bytes.get(start..end) != Some(file.file_json.as_bytes()) {
-                return Err(format!(
-                    "file {:?} source span does not point at its accepted bytes",
-                    file.id
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub fn initial_changes(&self) -> InitialChanges {
         let mut changes = VecDeque::with_capacity(1 + self.0.elements.len() + self.0.files.len());
         changes.push_back(RowChange::upsert(

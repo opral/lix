@@ -255,27 +255,6 @@ impl PersistentBlob {
         Ok(output)
     }
 
-    fn contiguous_range(&self, start: usize, end: usize) -> Option<&[u8]> {
-        let start = u32::try_from(start).ok()?;
-        let end = u32::try_from(end).ok()?;
-        if start > end || end > self.len {
-            return None;
-        }
-        let mut logical_start = 0u32;
-        for piece in self.pieces.iter() {
-            let logical_end = logical_start.checked_add(piece.len)?;
-            if start >= logical_start && end <= logical_end {
-                let selected_start = piece.start.checked_add(start - logical_start)?;
-                let selected_end = piece.start.checked_add(end - logical_start)?;
-                return piece.bytes.get(
-                    usize::try_from(selected_start).ok()?..usize::try_from(selected_end).ok()?,
-                );
-            }
-            logical_start = logical_end;
-        }
-        (start == end).then_some(&[])
-    }
-
     fn byte(&self, offset: usize) -> Option<u8> {
         let offset = u32::try_from(offset).ok()?;
         if offset >= self.len {
@@ -410,12 +389,6 @@ impl PersistentBlob {
             })
             .sum::<usize>()
             + self.pieces.len() * size_of::<BlobPiece>()
-    }
-
-    #[cfg(test)]
-    fn single_backing(&self) -> Option<&Arc<Vec<u8>>> {
-        (self.pieces.len() == 1 && self.pieces[0].start == 0 && self.pieces[0].len == self.len)
-            .then(|| &self.pieces[0].bytes)
     }
 }
 
@@ -1921,7 +1894,8 @@ impl Document {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
         let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator = preferred_terminator(&drafts);
+        dialect.terminator =
+            preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
         let identities = IdentityStore::initial(namespace, drafts.len())?;
         assign_initial_rows(&mut drafts);
         let document = Self(Arc::new(DocumentInner {
@@ -2034,36 +2008,6 @@ impl Document {
             + self.0.order_overrides.estimated_bytes()
     }
 
-    #[cfg(test)]
-    pub(crate) fn shares_single_blob_with(&self, bytes: &Arc<Vec<u8>>) -> bool {
-        self.0
-            .blob
-            .single_backing()
-            .is_some_and(|backing| Arc::ptr_eq(backing, bytes))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_blob_backing_with(&self, other: &Self) -> bool {
-        self.0.blob.pieces.iter().any(|left| {
-            other
-                .0
-                .blob
-                .pieces
-                .iter()
-                .any(|right| Arc::ptr_eq(&left.bytes, &right.bytes))
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn blob_piece_count(&self) -> usize {
-        self.0.blob.pieces.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sparse_rows_touched(&self) -> usize {
-        self.0.sparse_rows_touched
-    }
-
     pub fn dialect(&self) -> Dialect {
         self.0.dialect
     }
@@ -2173,7 +2117,8 @@ impl Document {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(after_path);
         let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator = preferred_terminator(&drafts);
+        dialect.terminator =
+            preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
         let old_locations = self.0.index.locations().collect::<Vec<_>>();
         let mut identities = self.0.identities.clone();
         match_rows(
@@ -2767,7 +2712,8 @@ impl ColdInitialImport {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
         let (rows, fields) = scan_cold_rows(&bytes, dialect)?;
-        dialect.terminator = preferred_cold_terminator(&rows);
+        dialect.terminator =
+            preferred_terminator(rows.iter().map(|row| row.ending), Terminator::Lf);
         let order_denominator =
             u64::try_from(rows.len() + 1).map_err(|_| "CSV has too many rows".to_owned())?;
         Ok(Self {
@@ -3125,14 +3071,13 @@ fn assign_initial_rows(rows: &mut [RowDraft]) {
     }
 }
 
-fn preferred_terminator(rows: &[RowDraft]) -> Terminator {
-    preferred_terminator_for_document(rows, Terminator::Lf)
-}
-
-fn preferred_terminator_for_document(rows: &[RowDraft], fallback: Terminator) -> Terminator {
+fn preferred_terminator(
+    endings: impl Iterator<Item = Option<Terminator>>,
+    fallback: Terminator,
+) -> Terminator {
     let mut counts = [0usize; 3];
-    for row in rows {
-        match row.ending {
+    for ending in endings {
+        match ending {
             Some(Terminator::Lf) => counts[0] += 1,
             Some(Terminator::CrLf) => counts[1] += 1,
             Some(Terminator::Cr) => counts[2] += 1,
@@ -3144,24 +3089,6 @@ fn preferred_terminator_for_document(rows: &[RowDraft], fallback: Terminator) ->
         Some((1, count)) if *count > 0 => Terminator::CrLf,
         Some((2, count)) if *count > 0 => Terminator::Cr,
         _ => fallback,
-    }
-}
-
-fn preferred_cold_terminator(rows: &[ColdRowDraft]) -> Terminator {
-    let mut counts = [0usize; 3];
-    for row in rows {
-        match row.ending {
-            Some(Terminator::Lf) => counts[0] += 1,
-            Some(Terminator::CrLf) => counts[1] += 1,
-            Some(Terminator::Cr) => counts[2] += 1,
-            None => {}
-        }
-    }
-    match counts.iter().enumerate().max_by_key(|(_, count)| *count) {
-        Some((0, count)) if *count > 0 => Terminator::Lf,
-        Some((1, count)) if *count > 0 => Terminator::CrLf,
-        Some((2, count)) if *count > 0 => Terminator::Cr,
-        _ => Terminator::Lf,
     }
 }
 

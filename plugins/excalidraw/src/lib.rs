@@ -463,18 +463,6 @@ fn replace_element_index(
     Ok(())
 }
 
-fn delete_element_index_from_sink(
-    before: &sdk::Snapshot<'_>,
-    sink: &mut impl StateOutput,
-) -> sdk::Result<()> {
-    let page_count = element_index_page_count(before)?;
-    sink.delete_state(ELEMENT_INDEX_KEY)?;
-    for ordinal in 0..page_count {
-        sink.delete_state(&element_index_page_key(ordinal))?;
-    }
-    Ok(())
-}
-
 fn element_index_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
     let Some(header) = root.read_state_range(ELEMENT_INDEX_KEY, 0, ELEMENT_INDEX_HEADER_BYTES)?
     else {

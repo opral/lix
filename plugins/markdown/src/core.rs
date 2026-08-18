@@ -2067,15 +2067,6 @@ impl Document {
         Self::open_file_with_literal_fast_path(bytes, path, namespace, true)
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_file_forced_canonical_fallback(
-        bytes: Vec<u8>,
-        path: Option<&str>,
-        namespace: IdNamespace,
-    ) -> Result<(Self, Vec<RowChange>), PluginError> {
-        Self::open_file_with_literal_fast_path(bytes, path, namespace, false)
-    }
-
     fn open_file_with_literal_fast_path(
         bytes: Vec<u8>,
         path: Option<&str>,
@@ -2768,15 +2759,6 @@ impl Document {
         self.bytes.materialize()
     }
 
-    #[cfg(test)]
-    pub(crate) fn accepted_bytes(&self) -> Vec<u8> {
-        self.bytes()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_base_tree_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.tree.base, &other.tree.base)
-    }
 }
 
 /// A single base-relative text replacement. Keeping this deliberately narrow

@@ -788,15 +788,6 @@ pub(crate) struct ChangeScanBatch {
     pub(crate) next_start_after: Option<ChangeId>,
 }
 
-#[cfg(feature = "storage-benches")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RebuildIndexStats {
-    pub(crate) expected: usize,
-    pub(crate) put: usize,
-    pub(crate) deleted: usize,
-    pub(crate) unchanged: usize,
-}
-
 #[allow(dead_code)] // Activated by the checkpoint GC integration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GcRoot {
@@ -823,14 +814,10 @@ pub(crate) struct GcSweepSet {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GcRepairSet {}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcPlan {
     pub(crate) roots: Vec<GcRoot>,
     pub(crate) live: GcLiveSet,
     pub(crate) sweep: GcSweepSet,
-    pub(crate) repair: GcRepairSet,
 }
 
 /// Canonical derived `lix_commit` row snapshot.

@@ -464,7 +464,7 @@ function applyObserveRowSplice(
 	}
 	let destination = 0;
 	for (let index = 0; index < prefixRows; index += 1) {
-		rows[destination++] = base.rows.rows[index] as NativeLixValue[];
+		rows[destination++] = base.rows.rows[index];
 	}
 	for (let rowIndex = 0; rowIndex < delta.insertRows.length; rowIndex += 1) {
 		const row = delta.insertRows[rowIndex];
@@ -479,7 +479,7 @@ function applyObserveRowSplice(
 		rows[destination++] = row.map((entry) => decodeWireValue(entry));
 	}
 	for (let index = suffixStart; index < base.rows.rows.length; index += 1) {
-		rows[destination++] = base.rows.rows[index] as NativeLixValue[];
+		rows[destination++] = base.rows.rows[index];
 	}
 	return {
 		columns: [...base.rows.columns],
@@ -548,10 +548,6 @@ export function record(
 		throw protocolError(`${description} must be an object`);
 	}
 	return value as Record<string, unknown>;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function decodeWireValue(value: unknown): NativeLixValue {

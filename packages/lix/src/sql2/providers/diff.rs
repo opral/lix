@@ -145,7 +145,7 @@ where
                     self.to_commit_id.clone(),
                 ),
                 move |(store, schema, route, from_commit_id, to_commit_id)| async move {
-                    if route.contradictory {
+                    if limit == Some(0) || route.contradictory {
                         return DIFF_COLS.build(schema, &[]).map_err(diff_batch_error);
                     }
                     let mut tracked = TrackedStateContext::new().reader(store);

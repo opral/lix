@@ -173,7 +173,10 @@ fn replace_identities(
     successor: &mut impl StateOutput,
     document: &Document,
 ) -> sdk::Result<()> {
-    let old_page_count = identity_page_count(before)?;
+    let old_page_count = match before.get_state(LINE_IDENTITIES_STATE)? {
+        Some(manifest) => decode_identity_manifest(&manifest)?.1,
+        None => 0,
+    };
     let (manifest, pages) = encode_identities(&document.identities())?;
     successor.put_state(LINE_IDENTITIES_STATE, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
@@ -247,13 +250,6 @@ fn decode_identity_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
         u32::from_le_bytes(bytes[4..8].try_into().expect("fixed identity manifest")),
         u32::from_le_bytes(bytes[8..12].try_into().expect("fixed identity manifest")),
     ))
-}
-
-fn identity_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
-    let Some(manifest) = root.get_state(LINE_IDENTITIES_STATE)? else {
-        return Ok(0);
-    };
-    decode_identity_manifest(&manifest).map(|(_, page_count)| page_count)
 }
 
 fn line_identity_page_key(ordinal: u32) -> Vec<u8> {

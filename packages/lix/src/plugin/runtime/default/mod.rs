@@ -54,7 +54,7 @@ fn create_engine(consume_fuel: bool, epoch_interruption: bool) -> wasmtime::Resu
 /// deterministic.
 fn configure_component_cache(config: &mut Config) -> wasmtime::Result<()> {
     let mut cache_config = CacheConfig::new();
-    let directory = lix_wasmtime_cache_dir()?;
+    let directory = lix_wasmtime_cache_dir_from(env::var_os(LIX_WASMTIME_CACHE_DIR_ENV))?;
     let explicitly_configured = directory.is_some();
     if let Some(directory) = directory {
         cache_config.with_directory(directory);
@@ -70,10 +70,6 @@ fn configure_component_cache(config: &mut Config) -> wasmtime::Result<()> {
         Err(error) => return Err(error),
     }
     Ok(())
-}
-
-fn lix_wasmtime_cache_dir() -> wasmtime::Result<Option<PathBuf>> {
-    lix_wasmtime_cache_dir_from(env::var_os(LIX_WASMTIME_CACHE_DIR_ENV))
 }
 
 fn lix_wasmtime_cache_dir_from(directory: Option<OsString>) -> wasmtime::Result<Option<PathBuf>> {

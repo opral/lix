@@ -202,7 +202,7 @@ impl sdk::FileProjection for JsonPlugin {
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
         store_fallback_rows_in_transaction(&update.before, sink, &document)?;
-        let (old_index_page_count, old_scalar_page_count) = scalar_page_counts(&update)?;
+        let (old_index_page_count, old_scalar_page_count) = scalar_page_counts_root(&update.before)?;
         sink.delete_state(SCALAR_INDEX_STATE)?;
         for ordinal in 0..old_index_page_count {
             sink.delete_state(&scalar_index_page_key(ordinal))?;
@@ -953,10 +953,6 @@ fn scalar_index_page_key(ordinal: u32) -> Vec<u8> {
     let mut key = b"json/scalar-index-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
-}
-
-fn scalar_page_counts(update: &sdk::ParseChangesInput<'_>) -> sdk::Result<(u32, u32)> {
-    scalar_page_counts_root(&update.before)
 }
 
 fn scalar_page_counts_root(root: &sdk::Snapshot<'_>) -> sdk::Result<(u32, u32)> {
