@@ -10,11 +10,7 @@ import type {
 export function createWorkerConnection(): WorkerConnection {
 	const worker = new Worker(new URL("./entry.node.js", import.meta.url), {
 		name: "lix",
-		execArgv: process.execArgv.filter(
-			(arg, index, args) =>
-				!arg.startsWith("--input-type=") &&
-				!(index > 0 && args[index - 1] === "--input-type"),
-		),
+		execArgv: [],
 	});
 	let terminating = false;
 	return {
