@@ -1417,7 +1417,10 @@ test("a second gone protocol session after recovery is not retried", async () =>
 });
 
 test("an active branch read adopts a new session after protocol session gone", async () => {
-	let handshakeCalls = 0;
+	const handshakes: Array<{
+		sessionId: string | null;
+		issuedSessionId?: string;
+	}> = [];
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -1429,14 +1432,20 @@ test("an active branch read adopts a new session after protocol session gone", a
 					return new Response(null, { status: 204 });
 				}
 				if (pathname.endsWith("/lix/v1/")) {
-					handshakeCalls += 1;
 					const presented = request.headers.get("lix-session-id");
-					if (presented !== null) return protocolSessionGone();
+					if (presented !== null) {
+						handshakes.push({ sessionId: presented });
+						return protocolSessionGone();
+					}
+					const issuedSessionId =
+						handshakes.length === 0 ? "session-1" : "session-2";
+					handshakes.push({ sessionId: null, issuedSessionId });
 					return Response.json({
 						protocolVersion: 2,
-						activeBranchId: handshakeCalls === 1 ? "main-id" : "draft-id",
+						activeBranchId:
+							issuedSessionId === "session-1" ? "main-id" : "draft-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
-						sessionId: `session-${handshakeCalls}`,
+						sessionId: issuedSessionId,
 					});
 				}
 				if (pathname.endsWith("/branch/switch")) {
@@ -1453,7 +1462,11 @@ test("an active branch read adopts a new session after protocol session gone", a
 		code: "LIX_SERVER_PROTOCOL_ERROR",
 	});
 	await expect(lix.activeBranchId()).resolves.toBe("draft-id");
-	expect(handshakeCalls).toBe(2);
+	expect(handshakes).toEqual([
+		{ sessionId: null, issuedSessionId: "session-1" },
+		{ sessionId: "session-1" },
+		{ sessionId: null, issuedSessionId: "session-2" },
+	]);
 	await lix.close();
 });
 
