@@ -8,26 +8,22 @@ use std::future::Future;
 use std::pin::Pin;
 
 #[cfg(not(target_family = "wasm"))]
-#[path = "platform/native.rs"]
 mod native;
 #[cfg(not(target_family = "wasm"))]
-#[path = "platform/native_http.rs"]
-mod native_transport;
+mod native_http;
 #[cfg(target_family = "wasm")]
-#[path = "platform/wasm.rs"]
 mod wasm;
 #[cfg(target_family = "wasm")]
-#[path = "platform/wasm_http.rs"]
-mod wasm_transport;
+mod wasm_http;
 
 #[cfg(not(target_family = "wasm"))]
 pub(super) use native::{SyncTask, deadline, sleep, spawn_sync_task};
 #[cfg(not(target_family = "wasm"))]
-pub(super) use native_transport::HttpSyncTransport;
+pub(super) use native_http::HttpSyncTransport;
 #[cfg(target_family = "wasm")]
 pub(super) use wasm::{SyncTask, deadline, sleep, spawn_sync_task};
 #[cfg(target_family = "wasm")]
-pub(super) use wasm_transport::HttpSyncTransport;
+pub(super) use wasm_http::HttpSyncTransport;
 
 /// Target-appropriate future returned by a synchronization transport.
 ///
