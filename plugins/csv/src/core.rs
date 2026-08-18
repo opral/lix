@@ -391,11 +391,6 @@ impl PersistentBlob {
             + self.pieces.len() * size_of::<BlobPiece>()
     }
 
-    #[cfg(test)]
-    fn single_backing(&self) -> Option<&Arc<Vec<u8>>> {
-        (self.pieces.len() == 1 && self.pieces[0].start == 0 && self.pieces[0].len == self.len)
-            .then(|| &self.pieces[0].bytes)
-    }
 }
 
 fn push_blob_piece(output: &mut Vec<BlobPiece>, piece: BlobPiece) {
@@ -2011,36 +2006,6 @@ impl Document {
             + self.0.index.estimated_bytes()
             + self.0.identities.estimated_bytes()
             + self.0.order_overrides.estimated_bytes()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_single_blob_with(&self, bytes: &Arc<Vec<u8>>) -> bool {
-        self.0
-            .blob
-            .single_backing()
-            .is_some_and(|backing| Arc::ptr_eq(backing, bytes))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_blob_backing_with(&self, other: &Self) -> bool {
-        self.0.blob.pieces.iter().any(|left| {
-            other
-                .0
-                .blob
-                .pieces
-                .iter()
-                .any(|right| Arc::ptr_eq(&left.bytes, &right.bytes))
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn blob_piece_count(&self) -> usize {
-        self.0.blob.pieces.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sparse_rows_touched(&self) -> usize {
-        self.0.sparse_rows_touched
     }
 
     pub fn dialect(&self) -> Dialect {
