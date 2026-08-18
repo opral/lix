@@ -145,6 +145,11 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 		beginClose: () => {
 			void request({ kind: "beginClose" }).catch(() => undefined);
 		},
+		terminateForPageUnload: () => {
+			if (closed) return;
+			closed = true;
+			client.terminateImmediately();
+		},
 		close: async () => {
 			if (closed) return;
 			await request({ kind: "close" });
@@ -263,6 +268,17 @@ export class LixWorkerClient {
 		this.rejectPending(workerClosedError());
 		try {
 			await this.connection.terminate();
+		} finally {
+			this.endLease();
+		}
+	}
+
+	terminateImmediately(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.rejectPending(workerClosedError());
+		try {
+			this.connection.terminateImmediately();
 		} finally {
 			this.endLease();
 		}

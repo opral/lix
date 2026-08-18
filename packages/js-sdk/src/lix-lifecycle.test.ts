@@ -116,6 +116,23 @@ test("a remote close failure is reported", async () => {
 	expect(binding.close).toHaveBeenCalledOnce();
 });
 
+test("page unload synchronously terminates the execution transport", async () => {
+	const terminateForPageUnload = vi.fn();
+	const binding = {
+		execute: vi.fn(async () => ({ rows: [] })),
+		terminateForPageUnload,
+		close: vi.fn(async () => undefined),
+	} as unknown as LixBinding;
+	const lix = new Lix(binding);
+
+	lix.terminateForPageUnload();
+
+	expect(terminateForPageUnload).toHaveBeenCalledOnce();
+	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
+});
+
 function deferred<T>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;
 	let reject!: (reason?: unknown) => void;

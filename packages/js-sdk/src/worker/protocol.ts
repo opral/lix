@@ -73,6 +73,7 @@ export type WorkerConnection = {
 	onFatal(listener: (error: Error) => void): void;
 	ref(): void;
 	unref(): void;
+	terminateImmediately(): void;
 	terminate(): Promise<void>;
 };
 

@@ -70,6 +70,8 @@ export type LixBinding = {
 	exportSnapshot?(): Promise<Uint8Array>;
 	/** Signals background work to stop before asynchronous close drainage. */
 	beginClose?(): void;
+	/** Immediately tears down the execution transport during document unload. */
+	terminateForPageUnload?(): void;
 	close(): Promise<void>;
 };
 

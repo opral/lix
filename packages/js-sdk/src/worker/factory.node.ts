@@ -38,6 +38,9 @@ export function createWorkerConnection(): WorkerConnection {
 		unref() {
 			worker.unref();
 		},
+		terminateImmediately() {
+			void worker.terminate();
+		},
 		async terminate() {
 			terminating = true;
 			await worker.terminate();
