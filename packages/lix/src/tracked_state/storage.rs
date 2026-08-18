@@ -1876,7 +1876,7 @@ impl CommitDeltaLiveMembershipCursor {
             .expect("membership cursor loaded its current immutable part");
         let mut linear_probes = 0_usize;
         while self.next_entry_index < segment.leaf.len() {
-            let entry = segment.leaf.entry(self.next_entry_index)?.ok_or_else(|| {
+            let entry = segment.leaf.entry(self.next_entry_index).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "tracked_state packed commit_delta leaf has a missing entry",
@@ -6735,7 +6735,7 @@ where
 {
     let change_id = locator.change_id;
     let ordinal = usize::from(locator.ordinal);
-    let entry = leaf.entry(ordinal)?.ok_or_else(|| {
+    let entry = leaf.entry(ordinal).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -11146,7 +11146,7 @@ fn collect_strict_commit_delta_members(
         // "how much did it return" are distinguishable.
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_commit_delta_segment_entry_decoded();
-        let entry = leaf.entry(entry_index)?.ok_or_else(|| {
+        let entry = leaf.entry(entry_index).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state packed commit_delta leaf has a missing entry",
@@ -12456,7 +12456,7 @@ fn visit_commit_delta_leaf(
 ) -> Result<(), LixError> {
     let mut previous_key: Option<&[u8]> = None;
     for entry_index in 0..leaf.len() {
-        let entry = leaf.entry(entry_index)?.ok_or_else(|| {
+        let entry = leaf.entry(entry_index).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state packed commit_delta leaf has a missing entry",
@@ -12492,7 +12492,7 @@ fn find_commit_delta_value(
     let Some(index) = find_commit_delta_entry_index(leaf, target_key)? else {
         return Ok(None);
     };
-    let entry = leaf.entry(index)?.ok_or_else(|| {
+    let entry = leaf.entry(index).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state packed commit_delta leaf has a missing entry",
@@ -12548,7 +12548,7 @@ fn load_commit_delta_entry_at_index<S>(
 where
     S: AsRef<[u8]>,
 {
-    let entry = leaf.entry(index)?.ok_or_else(|| {
+    let entry = leaf.entry(index).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state packed commit_delta leaf has a missing entry",
@@ -12616,7 +12616,7 @@ fn find_commit_delta_entry_index(
     target_key: &[u8],
 ) -> Result<Option<usize>, LixError> {
     let lower = commit_delta_entry_lower_bound_from(leaf, target_key, 0)?;
-    let Some(entry) = leaf.entry(lower)? else {
+    let Some(entry) = leaf.entry(lower) else {
         return Ok(None);
     };
     if entry.key != target_key {

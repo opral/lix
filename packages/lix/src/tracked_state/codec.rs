@@ -176,12 +176,11 @@ impl DecodedLeafNodeRef {
             .map(|span| self.arena.slice(span.key_start..span.key_end))
     }
 
-    #[expect(clippy::unnecessary_wraps)]
-    pub(crate) fn entry(&self, index: usize) -> Result<Option<EncodedLeafEntryRef<'_>>, LixError> {
-        Ok(self.entries.get(index).map(|span| EncodedLeafEntryRef {
+    pub(crate) fn entry(&self, index: usize) -> Option<EncodedLeafEntryRef<'_>> {
+        self.entries.get(index).map(|span| EncodedLeafEntryRef {
             key: &self.arena[span.key_start..span.key_end],
             value: &self.arena[span.value_start..span.value_end],
-        }))
+        })
     }
 
     pub(crate) fn entry_owned(&self, index: usize) -> Option<EncodedLeafEntry> {
@@ -1534,7 +1533,6 @@ fn verify_leaf_round_trip(encoded: &[u8], entries: &[EncodedLeafEntryRef<'_>]) {
     for (index, entry) in entries.iter().enumerate() {
         let round_tripped = decoded
             .entry(index)
-            .expect("leaf round trip entry should read")
             .expect("leaf round trip entry should exist");
         assert_eq!(round_tripped.key, entry.key, "leaf round trip key {index}");
         assert_eq!(
@@ -2274,7 +2272,6 @@ mod tests {
         for (index, (key, value)) in entries.iter().enumerate() {
             let entry = decoded
                 .entry(index)
-                .expect("entry should read")
                 .expect("entry should exist");
             assert_eq!(entry.key, key.as_slice(), "key {index}");
             assert_eq!(entry.value, value.as_slice(), "value {index}");
@@ -3357,7 +3354,6 @@ mod tests {
         assert_eq!(leaf.key(1), Some(b"bravo".as_ref()));
         let second = leaf
             .entry(1)
-            .expect("second entry")
             .expect("second entry exists");
         assert_eq!(second.key, b"bravo");
         assert_eq!(second.value, raw_value(4, 5, 6));
@@ -3376,7 +3372,7 @@ mod tests {
             panic!("expected leaf node");
         };
         assert_eq!(leaf.len(), 0);
-        assert!(leaf.entry(0).expect("missing entry").is_none());
+        assert!(leaf.entry(0).is_none());
     }
 
     #[test]
