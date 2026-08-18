@@ -1,9 +1,5 @@
 #![cfg_attr(not(feature = "storage-benches"), allow(dead_code, unused_imports))]
 
-use std::collections::BTreeSet;
-
-use crate::LixError;
-
 #[cfg(feature = "storage-benches")]
 mod bench_support;
 mod codec;
@@ -153,29 +149,6 @@ pub(crate) use types::{
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 
-/// Builds an authenticated content-addressed closure for a set of retained
-/// tracked-state roots. This is deliberately a read-only maintenance helper:
-/// the returned hashes are a rebuildable sweep inventory, never serving
-/// authority or a replacement for the immutable root metadata.
-#[allow(dead_code)]
-pub(crate) async fn collect_reachable_tree_chunk_hashes<S>(
-    store: &S,
-    roots: &[TrackedStateRootId],
-) -> Result<BTreeSet<[u8; types::TRACKED_STATE_HASH_BYTES]>, LixError>
-where
-    S: crate::storage_adapter::StorageAdapterRead + ?Sized,
-{
-    let tree = tree::TrackedStateTree::new();
-    let overlay = storage::TrackedStateChunkOverlay::new();
-    let mut reachable = BTreeSet::new();
-    for root in roots {
-        reachable.extend(
-            tree.reachable_chunk_hashes_with_overlay(store, &overlay, root)
-                .await?,
-        );
-    }
-    Ok(reachable)
-}
 #[cfg(feature = "storage-benches")]
 pub mod bench {
     pub use super::bench_support::*;
