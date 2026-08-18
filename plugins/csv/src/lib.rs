@@ -131,8 +131,8 @@ impl sdk::FileProjection for CsvPlugin {
             sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
         }
         let records = successor.row_records().map_err(sdk::Error::invalid_input)?;
-        store_fallback_rows_from_sink(&update.before, sink, &records)?;
-        delete_csv_index_from_sink(&update.before, sink)?;
+        store_fallback_rows_in_transaction(&update.before, sink, &records)?;
+        delete_csv_index(&update.before, sink)?;
         Ok(())
     }
 
@@ -356,18 +356,6 @@ fn delete_csv_index(
     Ok(())
 }
 
-fn delete_csv_index_from_sink(
-    before: &sdk::Snapshot<'_>,
-    sink: &mut impl StateOutput,
-) -> sdk::Result<()> {
-    let page_count = csv_index_page_count(before)?;
-    sink.delete_state(CSV_INDEX_KEY)?;
-    for ordinal in 0..page_count {
-        sink.delete_state(&csv_index_page_key(ordinal))?;
-    }
-    Ok(())
-}
-
 fn csv_index_page_key(ordinal: u32) -> Vec<u8> {
     let mut key = b"csv/index-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
@@ -434,23 +422,6 @@ fn fallback_file_changed(
     delete_csv_index(&update.before, sink)?;
     for change in changes {
         emit_change(change, update.creates, sink)?;
-    }
-    Ok(())
-}
-
-fn store_fallback_rows_from_sink(
-    before: &sdk::Snapshot<'_>,
-    sink: &mut impl StateOutput,
-    records: &[RowRecord],
-) -> sdk::Result<()> {
-    let old_page_count = fallback_row_page_count(before)?;
-    let (manifest, pages) = encode_row_records(records)?;
-    sink.put_state(CSV_FALLBACK_ROWS_KEY, &manifest)?;
-    for (ordinal, page) in pages.iter().enumerate() {
-        sink.put_state(&csv_fallback_page_key(ordinal as u32), page)?;
-    }
-    for ordinal in pages.len() as u32..old_page_count {
-        sink.delete_state(&csv_fallback_page_key(ordinal))?;
     }
     Ok(())
 }
