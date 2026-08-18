@@ -1,8 +1,25 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { test } from "vitest";
+import { expect, test } from "vitest";
+import { workerExecArgv } from "./factory.node.js";
 
 const execFileAsync = promisify(execFile);
+
+test("preserves host security arguments", () => {
+	expect(
+		workerExecArgv([
+			"--permission",
+			"--allow-worker",
+			"--allow-fs-read=/workspace",
+			"--expose-gc",
+			"--input-type=module",
+		]),
+	).toEqual([
+		"--permission",
+		"--allow-worker",
+		"--allow-fs-read=/workspace",
+	]);
+});
 
 test("starts when the host has worker-incompatible exec arguments", async () => {
 	await execFileAsync(process.execPath, [
