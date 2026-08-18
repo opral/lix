@@ -3369,14 +3369,12 @@ where
         .into_iter()
         .map(crate::json_store::JsonRef::from_hash_bytes)
         .collect::<Vec<_>>();
-    let loaded = crate::json_store::JsonStoreContext::new()
-        .load_bytes_many(
-            read,
-            crate::json_store::JsonLoadRequestRef {
-                refs: &json_refs,
-                scope: crate::json_store::JsonReadScopeRef::OutOfBand,
-            },
-        )
+    let mut json_reader = crate::json_store::JsonStoreContext::new().reader(read);
+    let loaded = json_reader
+        .load_bytes_many(crate::json_store::JsonLoadRequestRef {
+            refs: &json_refs,
+            scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+        })
         .await?;
     for value in loaded.into_values().into_iter().flatten() {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&value) {
