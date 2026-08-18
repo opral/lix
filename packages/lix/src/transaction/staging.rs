@@ -4527,11 +4527,8 @@ mod tests {
             vec![vec!["b"], vec!["c"]]
         );
         let mut exact_bounded = request(("b", true), ("c", true));
-        exact_bounded.filter.row_pks = vec![
-            RowPk::single("a"),
-            RowPk::single("b"),
-            RowPk::single("d"),
-        ];
+        exact_bounded.filter.row_pks =
+            vec![RowPk::single("a"), RowPk::single("b"), RowPk::single("d")];
         let exact_rows = overlay
             .scan(&exact_bounded)
             .expect("exact staged candidates must intersect range bounds");
@@ -6544,8 +6541,7 @@ mod tests {
         let snapshot = stage_json_from_value(
             TransactionJson::from_value_for_test(serde_json::json!({ "key": key, "value": value })),
             "test staged row snapshot_content",
-        )
-        .expect("test snapshot should prepare");
+        );
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),

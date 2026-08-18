@@ -20,7 +20,6 @@ use crate::changelog::{
     TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
-use crate::row_pk::RowPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::hot_state::{
@@ -31,6 +30,7 @@ use crate::hot_state::{
 use crate::json_store::{
     JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 #[cfg(test)]
 use crate::tracked_state::stage_commit_state_manifest;
@@ -354,11 +354,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         deleted_checkpoint_files.remove(&(write.branch_id.clone(), write.file_id.clone()));
     }
     let mut insert_selection = prepared_writes.insert_selection;
-    let mut row_columnar_write_sets = prepare_row_columnar_write_sets(
-        &mut state_rows,
-        &insert_selection,
-        row_schema_catalog,
-    )?;
+    let mut row_columnar_write_sets =
+        prepare_row_columnar_write_sets(&mut state_rows, &insert_selection, row_schema_catalog)?;
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_content_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -906,10 +903,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     })
 }
 
-fn certified_batch_requires_root_expansion(batch: &crate::plugin::runtime::WasmCertifiedRowBatch) -> bool {
+fn certified_batch_requires_root_expansion(
+    batch: &crate::plugin::runtime::WasmCertifiedRowBatch,
+) -> bool {
     !matches!(
         batch.format,
-        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+            | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
     )
 }
 
@@ -2504,15 +2504,16 @@ async fn stage_tracked_commit_delta_index(
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
             let mut delta = tracked_commit_delta_from_state_row(row)?;
-            delta.base_coordinate = row_columnar_write_sets
-                .state_row_location(row_index)
-                .map(
-                    |location| crate::tracked_state::TrackedStateBaseCoordinate {
-                        base_commit_id: root.commit_id,
-                        group_index: location.group_index,
-                        row_index: location.row_index,
-                    },
-                );
+            delta.base_coordinate =
+                row_columnar_write_sets
+                    .state_row_location(row_index)
+                    .map(
+                        |location| crate::tracked_state::TrackedStateBaseCoordinate {
+                            base_commit_id: root.commit_id,
+                            group_index: location.group_index,
+                            row_index: location.row_index,
+                        },
+                    );
             deltas.push(delta);
         }
         for (row, json_refs) in certified_root_rows.iter().zip(certified_root_json_refs) {
@@ -2748,11 +2749,8 @@ fn try_stage_lossless_columnar_mutations(
     }
     let parts = crate::tracked_state::ColumnarMutationPartSet {
         owner_commit_id: *commit_id.as_uuid().as_bytes(),
-        row_group_set_id: crate::hot_state::row_group_set_id(
-            commit_id,
-            first.schema_key.as_str(),
-        )
-        .as_bytes(),
+        row_group_set_id: crate::hot_state::row_group_set_id(commit_id, first.schema_key.as_str())
+            .as_bytes(),
         manifest_digest: encoded.manifest.content_digest()?,
         schema_key: first.schema_key.to_string(),
         row_count: u32::try_from(state_row_indices.len()).map_err(|_| {
@@ -3712,8 +3710,13 @@ async fn stage_tracked_head(
     let mut controls = BTreeMap::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
-    let transaction_global_schema_keys =
-        global_branch_schema_keys(state_rows, engine_rows, tracked_roots, staged_commits, &tracked_snapshots);
+    let transaction_global_schema_keys = global_branch_schema_keys(
+        state_rows,
+        engine_rows,
+        tracked_roots,
+        staged_commits,
+        &tracked_snapshots,
+    );
 
     for root in tracked_roots_parent_first(tracked_roots)?
         .into_iter()
@@ -5577,10 +5580,9 @@ fn prepare_row_columnar_write_sets(
                     crate::hot_state::RowColumnarWriteSets::with_dense_state_rows(row_count)
                 }
                 crate::sql2::RowGroupLocations::Explicit(locations) => {
-                    let mut encoded =
-                        crate::hot_state::RowColumnarWriteSets::with_state_row_count(
-                            state_rows.len(),
-                        );
+                    let mut encoded = crate::hot_state::RowColumnarWriteSets::with_state_row_count(
+                        state_rows.len(),
+                    );
                     for (state_row_index, location) in locations.into_iter().enumerate() {
                         encoded.set_state_row_location(state_row_index, location);
                     }
@@ -5592,8 +5594,7 @@ fn prepare_row_columnar_write_sets(
         }
     }
     if let Some((commit_id, schema_key, snapshots)) = state_rows.dense_row_columnar_input() {
-        let Some(schema) = row_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
-        else {
+        let Some(schema) = row_schema_catalog.and_then(|catalog| catalog.schema(schema_key)) else {
             return Ok(crate::hot_state::RowColumnarWriteSets::new());
         };
         let Ok(spec) = crate::sql2::derive_schema_surface_spec_from_schema(schema) else {
@@ -7540,16 +7541,13 @@ mod tests {
             RowPk::single("ordinary"),
             "ordinary_schema".into(),
             None,
-            Some(
-                crate::transaction_types::stage_json_from_value(
-                    crate::transaction_types::TransactionJson::from_value_for_test(
-                        serde_json::from_str(large_snapshot.as_str())
-                            .expect("large ordinary snapshot should parse"),
-                    ),
-                    "mixed certified ordinary snapshot",
-                )
-                .expect("ordinary snapshot should stage"),
-            ),
+            Some(crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
+                    serde_json::from_str(large_snapshot.as_str())
+                        .expect("large ordinary snapshot should parse"),
+                ),
+                "mixed certified ordinary snapshot",
+            )),
             None,
             None,
             None,
@@ -8763,15 +8761,12 @@ mod tests {
         second.commit_id = Some(commit_id("rootless-second-commit"));
         second.created_at = ts("2026-01-02T00:00:00Z");
         second.updated_at = second.created_at;
-        second.snapshot = Some(
-            crate::transaction_types::stage_json_from_value(
-                crate::transaction_types::TransactionJson::from_value_for_test(
-                    serde_json::json!({ "value": 2 }),
-                ),
-                "second rootless tracked row snapshot",
-            )
-            .expect("second snapshot should stage"),
-        );
+        second.snapshot = Some(crate::transaction_types::stage_json_from_value(
+            crate::transaction_types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "value": 2 }),
+            ),
+            "second rootless tracked row snapshot",
+        ));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -8815,15 +8810,12 @@ mod tests {
         third.commit_id = Some(commit_id("rootless-third-commit"));
         third.created_at = ts("2026-01-03T00:00:00Z");
         third.updated_at = third.created_at;
-        third.snapshot = Some(
-            crate::transaction_types::stage_json_from_value(
-                crate::transaction_types::TransactionJson::from_value_for_test(
-                    serde_json::json!({ "value": 3 }),
-                ),
-                "third rootless tracked row snapshot",
-            )
-            .expect("third snapshot should stage"),
-        );
+        third.snapshot = Some(crate::transaction_types::stage_json_from_value(
+            crate::transaction_types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "value": 3 }),
+            ),
+            "third rootless tracked row snapshot",
+        ));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -10703,17 +10695,14 @@ mod tests {
         row.row_pk = RowPk::single(file_id);
         row.schema_key = "lix_binary_blob_ref".into();
         row.file_id = Some(file_id.into());
-        row.snapshot = Some(
-            crate::transaction_types::stage_json_from_value(
-                crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
-                    "id": file_id,
-                    "blob_hash": blob_id.to_hex(),
-                    "size_bytes": payload.len(),
-                })),
-                "ordinary CAS epoch test blob reference",
-            )
-            .expect("ordinary file blob reference should stage"),
-        );
+        row.snapshot = Some(crate::transaction_types::stage_json_from_value(
+            crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
+                "id": file_id,
+                "blob_hash": blob_id.to_hex(),
+                "size_bytes": payload.len(),
+            })),
+            "ordinary CAS epoch test blob reference",
+        ));
         PreparedWriteSet {
             insert_selection: PreparedInsertSelection::new(),
             state_rows: prepared_rows![row],
@@ -10848,15 +10837,12 @@ mod tests {
             row_pk: RowPk::single("row-1"),
             schema_key: "test_schema".into(),
             file_id: None,
-            snapshot: Some(
-                crate::transaction_types::stage_json_from_value(
-                    crate::transaction_types::TransactionJson::from_value_for_test(
-                        serde_json::json!({ "value": 1 }),
-                    ),
-                    "test tracked row snapshot",
-                )
-                .expect("test snapshot should stage"),
-            ),
+            snapshot: Some(crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
+                    serde_json::json!({ "value": 1 }),
+                ),
+                "test tracked row snapshot",
+            )),
             metadata: None,
             origin: None,
             origin_key: None,
@@ -10884,15 +10870,12 @@ mod tests {
 
     fn untracked_global_row(change_id: &str) -> TestPreparedStateRow {
         let mut row = tracked_global_row(change_id);
-        row.snapshot = Some(
-            crate::transaction_types::stage_json_from_value(
-                crate::transaction_types::TransactionJson::from_value_for_test(
-                    serde_json::json!({ "value": "untracked" }),
-                ),
-                "test untracked row snapshot",
-            )
-            .expect("test snapshot should stage"),
-        );
+        row.snapshot = Some(crate::transaction_types::stage_json_from_value(
+            crate::transaction_types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "value": "untracked" }),
+            ),
+            "test untracked row snapshot",
+        ));
         TestPreparedStateRow {
             change_id: Some(ChangeId::for_test_label(change_id)),
             commit_id: None,
@@ -10909,16 +10892,13 @@ mod tests {
         let mut row = untracked_global_row(change_id);
         row.row_pk = RowPk::single(branch_id);
         row.schema_key = BRANCH_REF_SCHEMA_KEY.into();
-        row.snapshot = Some(
-            crate::transaction_types::stage_json_from_value(
-                crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
-                    "id": branch_id,
-                    "commit_id": commit_id(target_commit_label).to_string(),
-                })),
-                "test direct branch-ref snapshot",
-            )
-            .expect("branch-ref snapshot should stage"),
-        );
+        row.snapshot = Some(crate::transaction_types::stage_json_from_value(
+            crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
+                "id": branch_id,
+                "commit_id": commit_id(target_commit_label).to_string(),
+            })),
+            "test direct branch-ref snapshot",
+        ));
         row
     }
 
@@ -10930,15 +10910,12 @@ mod tests {
         let mut row = untracked_global_row(change_id);
         row.row_pk = RowPk::single(key);
         row.schema_key = "lix_key_value".into();
-        row.snapshot = Some(
-            crate::transaction_types::stage_json_from_value(
-                crate::transaction_types::TransactionJson::from_value_for_test(
-                    serde_json::json!({ "key": key, "value": value }),
-                ),
-                "test untracked key-value snapshot",
-            )
-            .expect("test key-value snapshot should stage"),
-        );
+        row.snapshot = Some(crate::transaction_types::stage_json_from_value(
+            crate::transaction_types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "key": key, "value": value }),
+            ),
+            "test untracked key-value snapshot",
+        ));
         row
     }
 
