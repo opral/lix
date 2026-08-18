@@ -3542,13 +3542,11 @@ fn packed_current_base_working_diff_baseline(
     }
 }
 
-/// Accounts (and checkpoints) are global facts. A root-backed branch must
-/// inherit them from `GLOBAL_BRANCH_ID` rather than restating the commit's
-/// account rows as branch-local copies (`lixcol_global = false`).
+/// Account rows are global facts. A root-backed branch must inherit them
+/// from `GLOBAL_BRANCH_ID` rather than restating the commit's account rows
+/// as branch-local copies (`lixcol_global = false`).
 fn root_current_base_row_belongs_on_branch(branch_id: &str, schema_key: &str) -> bool {
-    branch_id == crate::GLOBAL_BRANCH_ID
-        || (schema_key != "lix_account"
-            && schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY)
+    branch_id == crate::GLOBAL_BRANCH_ID || schema_key != "lix_account"
 }
 
 fn push_root_current_base_row(
