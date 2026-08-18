@@ -1,6 +1,5 @@
 use crate::LixError;
 use crate::branch::{BranchHead, BranchHeadControlContext, BranchRefReader};
-use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Typed access to moving branch heads stored in the direct control plane.
@@ -49,13 +48,6 @@ where
             }))
     }
 
-    pub(crate) async fn load_head_commit_id(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<CommitId>, LixError> {
-        Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
-    }
-
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
         Ok(self
             .controls
@@ -77,10 +69,6 @@ where
 {
     async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         Self::load_head(self, branch_id).await
-    }
-
-    async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
-        Self::load_head_commit_id(self, branch_id).await
     }
 
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
