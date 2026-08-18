@@ -79,14 +79,6 @@ impl BinaryCasContext {
         Self
     }
 
-    pub(crate) fn prepared_manifest_is_staged(
-        &self,
-        writes: &StorageWriteSet,
-        blob_id: BlobId,
-    ) -> bool {
-        writes.contains_put(super::kv::BINARY_CAS_MANIFEST_SPACE, blob_id.as_bytes())
-    }
-
     /// Creates a Binary CAS reader over any storage reader.
     ///
     /// The reader can be a read transaction or the active write transaction

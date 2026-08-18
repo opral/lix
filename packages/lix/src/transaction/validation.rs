@@ -3747,7 +3747,6 @@ mod tests {
         let parsed = test_json_text(value).expect("test staged JSON should parse");
         crate::transaction_types::stage_json_from_value(
             TransactionJson::from_value_for_test(parsed),
-            "test staged JSON",
         )
     }
 
