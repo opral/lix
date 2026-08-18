@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Blob, LixError, Value};
 
@@ -17,9 +16,6 @@ pub(crate) struct PreparedDmlParameterBatch {
     cells: Arc<[PreparedDmlCell]>,
     bytes: Arc<[u8]>,
 }
-
-static PREPARED_DML_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
-static PREPARED_DML_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -57,21 +53,6 @@ pub(crate) enum PreparedDmlValueRef<'a> {
 }
 
 impl PreparedDmlParameterBatch {
-    pub(crate) fn record_execution(row_count: usize) {
-        PREPARED_DML_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
-        PREPARED_DML_BATCH_ROWS.fetch_add(row_count as u64, Ordering::Relaxed);
-    }
-
-    /// Returns and resets page executions and rows. This is an observability
-    /// certificate for real production callers, not a routing switch.
-    #[allow(dead_code)]
-    pub(crate) fn take_execution_counters() -> (u64, u64) {
-        (
-            PREPARED_DML_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed),
-            PREPARED_DML_BATCH_ROWS.swap(0, Ordering::Relaxed),
-        )
-    }
-
     /// Packs owned parameter rows into one compact arena.
     pub(crate) fn from_rows(rows: impl IntoIterator<Item = Vec<Value>>) -> Result<Self, LixError> {
         let mut row_count = 0usize;
