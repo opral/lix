@@ -932,10 +932,10 @@ where
                 "atomic transaction metadata was staged more than once",
             ));
         }
-        if !self
-            .binary_cas
-            .prepared_manifest_is_staged(&writes, blob_id)
-        {
+        if !writes.contains_put(
+            crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
+            blob_id.as_bytes(),
+        ) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "atomic CAS publication is missing its prepared manifest",
