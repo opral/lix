@@ -103,6 +103,49 @@ test("interrupts the browser long poll for local work and shutdown", async () =>
 	);
 }, 30_000);
 
+test("page unload termination aborts the browser long poll", async () => {
+	const storage = new OpfsStorage({
+		name: `lix-opfs-sync-page-unload:${crypto.randomUUID()}`,
+	});
+	const seed = await openLix({ storage });
+	const branchId = await seed.activeBranchId();
+	const headCommitId = (
+		await seed.execute("SELECT lix_active_branch_commit_id() AS commit_id")
+	).rows[0]?.get("commit_id");
+	await seed.close();
+	expect(typeof headCommitId).toBe("string");
+
+	await fetch("/__lix_sync_test/config", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ branchId, headCommitId }),
+	});
+	const lix = await openLix({
+		storage,
+		server: {
+			mode: "sync",
+			url: `${location.origin}/__lix_sync_test/repository`,
+		},
+	});
+
+	await waitForSyncTestState((state) => state.activeLongPolls === 1);
+	const terminateStarted = performance.now();
+	lix.terminateForPageUnload();
+	const finalState = await waitForSyncTestState(
+		(state) => state.abortedLongPolls >= 1 && state.activeLongPolls === 0,
+	);
+	const terminateMs = performance.now() - terminateStarted;
+	expect(terminateMs).toBeLessThan(250);
+	console.info(
+		JSON.stringify({
+			benchmark: "lix-opfs-sync-page-unload",
+			terminateTargetMs: 250,
+			terminateMs,
+			...finalState,
+		}),
+	);
+}, 30_000);
+
 test("shares a name across Lix workers", async () => {
 	const name = `lix-opfs-shared-test:${crypto.randomUUID()}`;
 	const first = await openLix({ storage: new OpfsStorage({ name }) });
