@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.3 - 2026-08-18
+
+### Patch
+
+- Fixed Node.js worker startup when the host process uses worker-incompatible runtime flags such as `--expose-gc`.
+
+  The JavaScript SDK no longer forwards worker-incompatible runtime flags while preserving host security restrictions.
+
 ## 0.12.2 - 2026-08-15
 
 ### Patch
