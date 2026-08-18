@@ -7679,14 +7679,12 @@ mod tests {
             certified.change.snapshot,
             crate::json_store::JsonSlot::Ref(large_snapshot_ref)
         );
-        let loaded = JsonStoreContext::new()
-            .load_bytes_many(
-                &read,
-                crate::json_store::JsonLoadRequestRef {
-                    refs: &[large_snapshot_ref],
-                    scope: crate::json_store::JsonReadScopeRef::OutOfBand,
-                },
-            )
+        let mut json_reader = JsonStoreContext::new().reader(&read);
+        let loaded = json_reader
+            .load_bytes_many(crate::json_store::JsonLoadRequestRef {
+                refs: &[large_snapshot_ref],
+                scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+            })
             .await
             .expect("large certified JSON ref should resolve")
             .into_values();

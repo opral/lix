@@ -4323,14 +4323,12 @@ async fn scan_packed_current_base_rows(
     if json_refs.is_empty() {
         return Ok(rows.finish());
     }
-    let mut json_values = JsonStoreContext::new()
-        .load_bytes_many(
-            store,
-            JsonLoadRequestRef {
-                refs: &json_refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            },
-        )
+    let mut json_reader = JsonStoreContext::new().reader(store);
+    let mut json_values = json_reader
+        .load_bytes_many(JsonLoadRequestRef {
+            refs: &json_refs,
+            scope: JsonReadScopeRef::OutOfBand,
+        })
         .await?
         .into_values();
     for (index, deferred) in deferred.into_iter().enumerate() {
@@ -4551,14 +4549,12 @@ async fn load_packed_current_base_exact(
         }
     }
     if !json_refs.is_empty() {
-        let mut json_values = JsonStoreContext::new()
-            .load_bytes_many(
-                store,
-                JsonLoadRequestRef {
-                    refs: &json_refs,
-                    scope: JsonReadScopeRef::OutOfBand,
-                },
-            )
+        let mut json_reader = JsonStoreContext::new().reader(store);
+        let mut json_values = json_reader
+            .load_bytes_many(JsonLoadRequestRef {
+                refs: &json_refs,
+                scope: JsonReadScopeRef::OutOfBand,
+            })
             .await?
             .into_values();
         for (index, deferred) in deferred.into_iter().enumerate() {
@@ -5833,14 +5829,12 @@ where
             )));
         }
         if !deferred_refs.is_empty() {
-            let loaded = JsonStoreContext::new()
-                .load_bytes_many(
-                    &self.store,
-                    JsonLoadRequestRef {
-                        refs: &deferred_refs,
-                        scope: JsonReadScopeRef::OutOfBand,
-                    },
-                )
+            let mut json_reader = JsonStoreContext::new().reader(&self.store);
+            let loaded = json_reader
+                .load_bytes_many(JsonLoadRequestRef {
+                    refs: &deferred_refs,
+                    scope: JsonReadScopeRef::OutOfBand,
+                })
                 .await?
                 .into_values();
             for (row_index, value) in deferred_rows.into_iter().zip(loaded) {
