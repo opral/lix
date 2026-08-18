@@ -3,7 +3,6 @@
 #![cfg_attr(test, allow(dead_code))]
 
 use lix::plugin::runtime::WasmRuntime;
-use lix::plugin::runtime::WasmTransitionCounters;
 use lix::storage::Storage;
 use lix::telemetry::TelemetrySink;
 use lix::{
@@ -685,16 +684,6 @@ where
         self.session.close().await
     }
 
-    /// Returns engine-local transition counters for profiling and
-    /// production invariant monitoring.
-    pub(crate) fn plugin_transition_counters(&self) -> WasmTransitionCounters {
-        self.engine.plugin_transition_counters()
-    }
-
-    /// Starts a new engine-local transition measurement window.
-    pub(crate) fn reset_plugin_transition_counters(&self) {
-        self.engine.reset_plugin_transition_counters();
-    }
 }
 
 #[expect(missing_debug_implementations)]
