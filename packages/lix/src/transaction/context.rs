@@ -1738,49 +1738,46 @@ where
                 .await;
             return Err(error);
         }
-        // A local file write supersedes any late raw-file projection cached
-        // for the same file. Remove that secondary metadata in the same
-        // backend commit as the canonical file rows. Doing this at commit
-        // time (rather than while staging each SQL statement) avoids duplicate
-        // write-set mutations and keeps statement rollback semantics intact.
-        if let crate::sync::SyncRole::Replica { remote_id } = &transaction.sync_role {
-            let mut file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
+        // Reduce every prepared file/blob write to one final projection
+        // intent. Trusted canonical staging can bypass the ordinary statement
+        // path, so derive invalidation from the complete prepared transaction.
+        // A matching late byte projection is authoritative for this commit
+        // and therefore retains its existing `SetSyncFile` intent.
+        if matches!(
+            transaction.sync_role,
+            crate::sync::SyncRole::Replica { .. }
+        ) {
+            let mut projection_keys = BTreeSet::new();
             for file in &prepared_writes.file_content_writes {
-                if file.global || file.untracked {
-                    continue;
+                if !file.global && !file.untracked {
+                    projection_keys
+                        .insert(SessionFileViewKey::new(&file.branch_id, &file.file_id));
                 }
-                file_ids_by_branch
-                    .entry(file.branch_id.clone())
-                    .or_default()
-                    .insert(file.file_id.clone());
             }
-            // A row-only canonical pull can advance a blob reference without
-            // carrying source bytes. That still invalidates an older late
-            // projection; otherwise a cached file read could return bytes for
-            // the previous blob until a later file-scope pull arrives.
             for row in prepared_writes.state_rows.iter() {
-                if row.schema_key != BLOB_REF_SCHEMA_KEY
-                    || row.global
-                    || row.untracked
-                    || row.file_id.is_none()
+                if row.schema_key == BLOB_REF_SCHEMA_KEY
+                    && !row.global
+                    && !row.untracked
+                    && row.file_id.is_some()
                 {
+                    projection_keys.insert(SessionFileViewKey::new(
+                        row.branch_id.to_string(),
+                        row.file_id.expect("checked file_id presence").to_string(),
+                    ));
+                }
+            }
+            for key in projection_keys {
+                // Reconciliation may already have staged a stronger session
+                // cache mutation for this file. `Set`, `Remove`, and
+                // `SetSyncFile` all include the required durable sync
+                // projection update during final lowering, so only fill an
+                // otherwise vacant key.
+                if transaction.pending_file_view_mutations.contains_key(&key) {
                     continue;
                 }
-                file_ids_by_branch
-                    .entry(row.branch_id.to_string())
-                    .or_default()
-                    .insert(row.file_id.expect("checked file_id presence").to_string());
-            }
-            if !file_ids_by_branch.is_empty() {
-                let writes = transaction
-                    .atomic_metadata_writes
-                    .get_or_insert_with(|| transaction.storage.new_write_set());
-                for (branch_id, file_ids) in file_ids_by_branch {
-                    crate::sync::clear_sync_file_projection_metadata(
-                        writes, remote_id, &branch_id, file_ids,
-                    )?;
-                }
-                transaction.await_durable_commit = true;
+                transaction
+                    .pending_file_view_mutations
+                    .insert(key.clone(), SessionFileViewMutation::RemoveSyncFile { key });
             }
         }
         // The delta itself is projected out of the commit below, once
@@ -1886,6 +1883,41 @@ where
             StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
         }
         writes.extend(automatic_sync_writes);
+        // Session and durable raw-file projections share one final intent map.
+        // Statement rollback restores this map, and its key uniqueness means
+        // each `(branch, file)` emits exactly one metadata put or delete.
+        if let crate::sync::SyncRole::Replica { remote_id } = &transaction.sync_role
+            && !transaction.pending_file_view_mutations.is_empty()
+        {
+            let metadata_writes = transaction
+                .atomic_metadata_writes
+                .get_or_insert_with(|| transaction.storage.new_write_set());
+            for mutation in transaction.pending_file_view_mutations.values() {
+                match mutation {
+                    SessionFileViewMutation::SetSyncFile { key, view } => {
+                        crate::sync::set_sync_file_projection_metadata(
+                            metadata_writes,
+                            remote_id,
+                            &key.branch_id,
+                            &key.file_id,
+                            &view.path,
+                            view.content.as_ref(),
+                        )?;
+                    }
+                    SessionFileViewMutation::Set { key, .. }
+                    | SessionFileViewMutation::Remove { key }
+                    | SessionFileViewMutation::RemoveSyncFile { key } => {
+                        crate::sync::remove_sync_file_projection_metadata(
+                            metadata_writes,
+                            remote_id,
+                            &key.branch_id,
+                            &key.file_id,
+                        )?;
+                    }
+                }
+            }
+            transaction.await_durable_commit = true;
+        }
         if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
             writes.extend(metadata_writes);
         }
@@ -6802,26 +6834,30 @@ where
 
         // Bypass plugin reconciliation: this is a durable local cache payload
         // for an already-admitted canonical blob-ref row, not a new semantic
-        // filesystem mutation. Metadata writes are appended to the same
-        // transaction as the applied marker, so restart cannot lose bytes
-        // after the cursor/marker has advanced. No prepared state rows are
-        // staged, therefore this lane cannot create a second graph commit.
-        let writes = self
-            .atomic_metadata_writes
-            .get_or_insert_with(|| self.storage.new_write_set());
-        crate::sync::stage_sync_file_projection_metadata(
-            writes,
-            remote_id,
-            &self.active_branch_id,
-            &files,
-        )?;
+        // filesystem mutation. The final keyed mutation map emits durable
+        // metadata in the same commit as the applied marker; no prepared state
+        // rows are staged, so this cannot create a second graph commit.
+        let configured_remote_id = match &self.sync_role {
+            crate::sync::SyncRole::Replica { remote_id } => remote_id,
+            crate::sync::SyncRole::Disabled | crate::sync::SyncRole::Authority => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late sync file projection requires replica mode",
+                ));
+            }
+        };
+        if configured_remote_id != remote_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late sync file projection remote does not match replica configuration",
+            ));
+        }
         for (key, view) in pending_views {
             self.pending_file_view_mutations.insert(
                 key.clone(),
                 SessionFileViewMutation::SetSyncFile { key, view },
             );
         }
-        self.await_durable_commit = true;
         Ok(TransactionWriteOutcome { count: 0 })
     }
 

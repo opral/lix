@@ -1792,6 +1792,77 @@ async fn file_renames_and_deletes_follow_sync_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_replica_hydrates_create_then_delete_file_history_as_empty() {
+    let server_lix = Arc::new(open_lix().await.expect("open server repository"));
+    let protocol = LixServerProtocol::new(Arc::clone(&server_lix));
+    let (server_url, server_task) = serve_protocol(protocol).await;
+
+    let writer = open_lix()
+        .with_storage(Memory::new())
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open writer replica");
+    writer
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/deleted-before-sync.bin', $1)",
+            &[Value::Blob(b"deleted-before-sync".to_vec().into())],
+        )
+        .await
+        .expect("create file before replica exists");
+    wait_for_file_at(
+        server_lix.as_ref(),
+        "/deleted-before-sync.bin",
+        b"deleted-before-sync",
+    )
+    .await;
+    writer
+        .execute(
+            "DELETE FROM lix_file WHERE path = '/deleted-before-sync.bin'",
+            &[],
+        )
+        .await
+        .expect("delete file before replica exists");
+    wait_for_file_absent(server_lix.as_ref(), "/deleted-before-sync.bin").await;
+    writer.close().await.expect("close writer replica");
+
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_lix()
+        .with_storage(
+            FilesystemStorage::new(replica_dir.path())
+                .open()
+                .expect("open fresh replica storage"),
+        )
+        .with_server(ServerOptions::sync(&server_url))
+        .await
+        .expect("open fresh replica");
+
+    // Match the browser bootstrap ordering: first materialize the complete
+    // canonical row/commit history without demanding raw file bytes. The
+    // later lix_file query must then hydrate those bytes onto commits whose
+    // final row state already reflects the deletion.
+    replica
+        .execute("SELECT COUNT(*) AS count FROM lix_change", &[])
+        .await
+        .expect("hydrate canonical history before file view");
+
+    let files = tokio::time::timeout(
+        SYNC_TEST_TIMEOUT,
+        replica.execute("SELECT path FROM lix_file ORDER BY path", &[]),
+    )
+    .await
+    .expect("fresh file history hydration before timeout")
+    .expect("hydrate create-then-delete file history");
+    assert!(
+        files.rows().is_empty(),
+        "a file deleted before first synchronization must remain absent"
+    );
+
+    replica.close().await.expect("close fresh replica");
+    server_lix.close().await.expect("close server");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn initialized_filesystem_replica_reopens_and_accepts_writes_offline() {
     let server_lix = Arc::new(open_lix().await.expect("open server repository"));
     let protocol = LixServerProtocol::new(Arc::clone(&server_lix));

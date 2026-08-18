@@ -1097,11 +1097,18 @@ pub(crate) fn validate_sync_transaction_pack(
             ));
         }
     }
+    let mut file_ids = BTreeSet::new();
     for file in &pack.files {
         if file.file_id.is_empty() || file.file_id.len() > MAX_SYNC_SCOPE_KEY_BYTES {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "sync fileId must contain 1 to 255 bytes",
+            ));
+        }
+        if !file_ids.insert(file.file_id.as_str()) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("sync file projection repeats fileId '{}'", file.file_id),
             ));
         }
         if file.global || file.untracked {
@@ -2261,24 +2268,24 @@ pub(crate) struct SyncFileProjection {
 }
 
 impl SyncFileProjection {
-    fn new(remote_id: &str, branch_id: &str, file: &SyncFileMutation) -> Result<Self, LixError> {
-        let path = file.path.clone().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "sync file mutation is missing its logical path",
-            )
-        })?;
+    fn new(
+        remote_id: &str,
+        branch_id: &str,
+        file_id: &str,
+        path: &str,
+        content: &[u8],
+    ) -> Result<Self, LixError> {
         validate_sync_remote_id(remote_id)?;
         validate_sync_branch_id(branch_id)?;
-        validate_sync_identity_component("fileId", &file.file_id, MAX_SYNC_SCOPE_KEY_BYTES)?;
-        crate::common::LixPath::try_from_file_path(&path)?;
+        validate_sync_identity_component("fileId", file_id, MAX_SYNC_SCOPE_KEY_BYTES)?;
+        crate::common::LixPath::try_from_file_path(path)?;
         Ok(Self {
             version: SYNC_FILE_PROJECTION_VERSION,
             remote_id: remote_id.to_owned(),
             branch_id: branch_id.to_owned(),
-            file_id: file.file_id.clone(),
-            path,
-            content: file.content.clone(),
+            file_id: file_id.to_owned(),
+            path: path.to_owned(),
+            content: content.to_owned(),
         })
     }
 }
@@ -2336,49 +2343,40 @@ fn sync_file_projection_prefix(
     })
 }
 
-/// Adds durable lazy-file puts to an existing transaction metadata write set.
-/// The caller commits applied-event markers into the same set, so a crash
-/// cannot leave a cursor/marker that claims the bytes were applied while the
-/// projection itself is missing.
-pub(crate) fn stage_sync_file_projection_metadata(
+/// Adds one durable lazy-file projection to an existing transaction metadata
+/// write set. The transaction's final file-view mutation map calls this once
+/// per `(branch, file)` identity, so competing projection decisions cannot
+/// emit contradictory writes for the same storage key.
+pub(crate) fn set_sync_file_projection_metadata(
     writes: &mut StorageWriteSet,
     remote_id: &str,
     branch_id: &str,
-    files: &[SyncFileMutation],
+    file_id: &str,
+    path: &str,
+    content: &[u8],
 ) -> Result<(), LixError> {
-    let mut seen = BTreeSet::new();
-    for file in files {
-        if !seen.insert(file.file_id.clone()) {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("sync file projection repeats fileId '{}'", file.file_id),
-            ));
-        }
-        let projection = SyncFileProjection::new(remote_id, branch_id, file)?;
-        let key = sync_file_projection_key(remote_id, branch_id, &file.file_id)?;
-        let value = serde_json::to_vec(&projection).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("encode sync file projection: {error}"),
-            )
-        })?;
-        writes.put(SYNC_CLIENT_FILE_PROJECTION_SPACE, key, value);
-    }
+    let projection = SyncFileProjection::new(remote_id, branch_id, file_id, path, content)?;
+    let key = sync_file_projection_key(remote_id, branch_id, file_id)?;
+    let value = serde_json::to_vec(&projection).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("encode sync file projection: {error}"),
+        )
+    })?;
+    writes.put(SYNC_CLIENT_FILE_PROJECTION_SPACE, key, value);
     Ok(())
 }
 
-/// Removes durable lazy-file projections after a canonical or local tracked
-/// file write makes the blob-ref row authoritative again.
-pub(crate) fn clear_sync_file_projection_metadata(
+/// Removes one durable lazy-file projection after a canonical or local
+/// tracked file write makes the blob-ref row authoritative again.
+pub(crate) fn remove_sync_file_projection_metadata(
     writes: &mut StorageWriteSet,
     remote_id: &str,
     branch_id: &str,
-    file_ids: impl IntoIterator<Item = String>,
+    file_id: &str,
 ) -> Result<(), LixError> {
-    for file_id in file_ids {
-        let key = sync_file_projection_key(remote_id, branch_id, &file_id)?;
-        writes.delete(SYNC_CLIENT_FILE_PROJECTION_SPACE, key);
-    }
+    let key = sync_file_projection_key(remote_id, branch_id, file_id)?;
+    writes.delete(SYNC_CLIENT_FILE_PROJECTION_SPACE, key);
     Ok(())
 }
 
@@ -7373,11 +7371,11 @@ mod tests {
         CONTROL_SYNC_PULL_SCOPE, CONTROL_SYNC_SCOPE, FULL_SYNC_PULL_SCOPE, FULL_SYNC_SCOPE,
         GLOBAL_BRANCH_ID, MAX_SYNC_PACK_ROWS, SyncBranch, SyncCanonicalEvent, SyncFileMutation,
         SyncFilterScope, SyncModeState, SyncRole, SyncRowMutation, SyncTransactionPack,
-        TOPOLOGY_SYNC_PULL_SCOPE, clear_sync_file_projection_metadata,
-        extract_sql_scope_schema_keys, filter_sync_event, filter_sync_pack,
-        is_engine_managed_sync_row, load_sync_file_projections, should_retry_canonical_row_lane,
-        stage_sync_file_projection_metadata, sync_pack_fingerprint,
-        validate_sync_branch_catalog_entry, validate_sync_transaction_pack,
+        TOPOLOGY_SYNC_PULL_SCOPE, extract_sql_scope_schema_keys, filter_sync_event,
+        filter_sync_pack, is_engine_managed_sync_row, load_sync_file_projections,
+        remove_sync_file_projection_metadata, set_sync_file_projection_metadata,
+        should_retry_canonical_row_lane, sync_pack_fingerprint, validate_sync_branch_catalog_entry,
+        validate_sync_transaction_pack,
     };
     use crate::plugin::runtime::PLUGIN_OWNER_KEY;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
@@ -7429,11 +7427,13 @@ mod tests {
             content: b"durable projection".to_vec(),
         };
         let mut writes = adapter.new_write_set();
-        stage_sync_file_projection_metadata(
+        set_sync_file_projection_metadata(
             &mut writes,
             "https://sync.example/repository",
             branch_id,
-            std::slice::from_ref(&file),
+            &file.file_id,
+            file.path.as_deref().expect("test file path"),
+            &file.content,
         )
         .expect("projection metadata stages");
         adapter
@@ -7455,11 +7455,11 @@ mod tests {
         assert_eq!(projections[0].content, file.content);
 
         let mut clear = adapter.new_write_set();
-        clear_sync_file_projection_metadata(
+        remove_sync_file_projection_metadata(
             &mut clear,
             "https://sync.example/repository",
             branch_id,
-            [file.file_id.clone()],
+            &file.file_id,
         )
         .expect("projection metadata clears");
         adapter
@@ -7707,7 +7707,7 @@ mod tests {
             pack_fingerprint: String::new(),
             pack: SyncTransactionPack {
                 operation_id: "operation-marker-order".to_owned(),
-                branch_id,
+                branch_id: branch_id.clone(),
                 base_server_commit_id: "base".to_owned(),
                 local_commit_id: "local".to_owned(),
                 parent_commit_ids: Vec::new(),
@@ -7769,6 +7769,13 @@ mod tests {
         // Exercise the same filtered payloads that a scoped server pull
         // returns. Semantic hydration owns the row but deliberately leaves
         // the raw file payload for a later file demand.
+        lix.set_sync_role(SyncRole::Replica {
+            remote_id: "remote-order".to_owned(),
+        })
+        .expect("set replica role before canonical replay");
+        let generation = lix.sync_mode_state().scope_generation();
+        lix.sync_mode_state()
+            .mark_scope_hydrated_for_branch(&branch_id, "lix_file", generation);
         let semantic_keys = vec!["sync_marker_row".to_owned()];
         let semantic_event =
             filter_sync_event(event.clone(), Some(&SyncFilterScope::new(&semantic_keys)));
@@ -7794,12 +7801,7 @@ mod tests {
 
         // A fresh session must restore the durable lazy projection rather
         // than requiring another network pull before an offline read.
-        lix.set_sync_role(SyncRole::Replica {
-            remote_id: "remote-order".to_owned(),
-        })
-        .expect("set replica role for fresh-session restore");
         let branch_id = lix.active_branch_id().await.expect("fresh-session branch");
-        let generation = lix.sync_mode_state().scope_generation();
         lix.sync_mode_state()
             .mark_scope_hydrated_for_branch(&branch_id, "lix_file", generation);
         lix.sync_mode_state().mark_scope_hydrated_for_branch(
@@ -7935,6 +7937,32 @@ mod tests {
         };
         let error = validate_sync_transaction_pack(&pack).expect_err("row fanout is bounded");
         assert_eq!(error.code, crate::LixError::CODE_INVALID_PARAM);
+    }
+
+    #[test]
+    fn sync_pack_rejects_duplicate_file_identities() {
+        let file = SyncFileMutation {
+            file_id: "file".to_owned(),
+            path: Some("/file.bin".to_owned()),
+            filename: None,
+            global: false,
+            untracked: false,
+            content: vec![1, 2, 3],
+        };
+        let pack = SyncTransactionPack {
+            operation_id: "op".to_owned(),
+            branch_id: "branch".to_owned(),
+            base_server_commit_id: "base".to_owned(),
+            local_commit_id: "local".to_owned(),
+            parent_commit_ids: Vec::new(),
+            rows: Vec::new(),
+            files: vec![file.clone(), file],
+        };
+
+        let error = validate_sync_transaction_pack(&pack)
+            .expect_err("duplicate file identities are ambiguous");
+        assert_eq!(error.code, crate::LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("repeats fileId 'file'"));
     }
 
     #[test]
