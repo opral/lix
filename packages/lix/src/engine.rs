@@ -131,19 +131,6 @@ where
         Self::new_with_options(storage, EngineOptions::new()).await
     }
 
-    /// Creates an engine with a WASM component runtime for installed plugins.
-    #[allow(dead_code)]
-    pub(crate) async fn new_with_wasm_runtime(
-        storage: StorageImpl,
-        wasm_runtime: Arc<dyn WasmRuntime>,
-    ) -> Result<Self, LixError> {
-        Self::new_with_options(
-            storage,
-            EngineOptions::new().with_wasm_runtime(wasm_runtime),
-        )
-        .await
-    }
-
     pub(crate) async fn new_with_options(
         storage: StorageImpl,
         options: EngineOptions,
