@@ -36,10 +36,6 @@ enum TransactionJsonStorage {
         value: Arc<JsonValue>,
         normalized: OnceLock<Arc<str>>,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
-    Certified {
-        normalized: Arc<str>,
-    },
     CertifiedShared {
         normalized: SharedStr,
         certificate: TransactionJsonCertificate,
@@ -99,20 +95,6 @@ impl TransactionJson {
     pub(crate) fn from_canonical_batch(value: WasmCanonicalJson) -> Self {
         Self {
             storage: TransactionJsonStorage::CanonicalBatch(value),
-        }
-    }
-
-    /// Constructs canonical row content whose schema semantics and identity
-    /// were proven by a typed lowerer.
-    ///
-    /// The decoded JSON stays lazy because ordinary staging and durable
-    /// placement only consume canonical bytes. Callers may issue this
-    /// certificate only for complete replacement rows whose unchanged
-    /// identity and row-local schema constraints were already established.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_certified_normalized_row_content(normalized: Arc<str>) -> Self {
-        Self {
-            storage: TransactionJsonStorage::Certified { normalized },
         }
     }
 
@@ -228,14 +210,13 @@ impl TransactionJson {
     }
 
     pub(crate) fn row_content_certified(&self) -> bool {
-        matches!(self.storage, TransactionJsonStorage::Certified { .. })
-            || matches!(
-                self.storage,
-                TransactionJsonStorage::CertifiedShared {
-                    certificate: TransactionJsonCertificate::RowContent,
-                    ..
-                }
-            )
+        matches!(
+            self.storage,
+            TransactionJsonStorage::CertifiedShared {
+                certificate: TransactionJsonCertificate::RowContent,
+                ..
+            }
+        )
     }
 
     pub(crate) fn metadata_content_certified(&self) -> bool {
@@ -260,9 +241,6 @@ impl TransactionJson {
                 normalized,
                 certificate: TransactionJsonCertificate::RowContent,
             } => Self::from_unvalidated_shared_normalized_content(normalized),
-            TransactionJsonStorage::Certified { normalized } => {
-                Self::from_unvalidated_shared_normalized_content(normalized.as_ref().into())
-            }
             storage => Self { storage },
         }
     }
@@ -273,7 +251,6 @@ impl TransactionJson {
         match &self.storage {
             TransactionJsonStorage::CanonicalBatch(value) => value.certificate(),
             TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::Certified { .. }
             | TransactionJsonStorage::CertifiedShared { .. }
             | TransactionJsonStorage::CanonicalShared { .. } => None,
         }
@@ -283,7 +260,6 @@ impl TransactionJson {
         match &self.storage {
             TransactionJsonStorage::CanonicalBatch(value) => Some(value.normalized_shared()),
             TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::Certified { .. }
             | TransactionJsonStorage::CertifiedShared { .. }
             | TransactionJsonStorage::CanonicalShared { .. } => None,
         }
@@ -305,8 +281,7 @@ impl TransactionJson {
                     )
                 })
                 .as_ref(),
-            TransactionJsonStorage::Certified { .. }
-            | TransactionJsonStorage::CertifiedShared { .. } => {
+            TransactionJsonStorage::CertifiedShared { .. } => {
                 panic!("certified transaction JSON must be prepared before decoding is requested")
             }
         }
@@ -321,7 +296,6 @@ impl TransactionJson {
                         .into()
                 })
                 .as_ref(),
-            TransactionJsonStorage::Certified { normalized } => normalized.as_ref(),
             TransactionJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),
             TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized.as_str(),
             TransactionJsonStorage::CanonicalBatch(value) => value.normalized(),
@@ -333,7 +307,6 @@ impl TransactionJson {
         match &self.storage {
             TransactionJsonStorage::CanonicalBatch(value) => Some(value),
             TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::Certified { .. }
             | TransactionJsonStorage::CertifiedShared { .. }
             | TransactionJsonStorage::CanonicalShared { .. } => None,
         }
@@ -357,8 +330,7 @@ impl TransactionJson {
                 });
                 Arc::try_unwrap(value).unwrap_or_else(|value| value.as_ref().clone())
             }
-            TransactionJsonStorage::Certified { .. }
-            | TransactionJsonStorage::CertifiedShared { .. } => {
+            TransactionJsonStorage::CertifiedShared { .. } => {
                 panic!("certified transaction JSON must bypass semantic normalization")
             }
         }
@@ -2445,10 +2417,6 @@ pub(crate) fn stage_json_from_value(value: TransactionJson, _context: &str) -> S
                 panic!("transaction JSON was normalized while computing its JSON ref")
             }),
         },
-        TransactionJsonStorage::Certified { normalized } => StageJsonStorage::Owned {
-            value: OnceLock::new(),
-            normalized,
-        },
         TransactionJsonStorage::CertifiedShared {
             normalized,
             certificate:
@@ -2529,11 +2497,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                 positions.push(position);
                 values.push(value);
                 cached_normalized.push(normalized.into_inner());
-            }
-            TransactionJsonStorage::Certified { normalized } => {
-                **slot = Some(TransactionJson {
-                    storage: TransactionJsonStorage::Certified { normalized },
-                });
             }
             TransactionJsonStorage::CertifiedShared {
                 normalized,
@@ -5112,8 +5075,8 @@ mod tests {
     }
 
     #[test]
-    fn certified_normalized_content_can_materialize_from_the_prepared_boundary() {
-        let transaction_json = TransactionJson::from_certified_normalized_row_content(
+    fn certified_shared_content_can_materialize_from_the_prepared_boundary() {
+        let transaction_json = TransactionJson::from_certified_shared_normalized_row_content(
             r#"{"path":"/a","value":{"nested":true}}"#.into(),
         );
         assert!(transaction_json.row_content_certified());
@@ -5138,7 +5101,7 @@ mod tests {
         );
         let expected = JsonRef::for_content(normalized.as_bytes());
         let staged = stage_json_from_value(
-            TransactionJson::from_certified_normalized_row_content(normalized.into()),
+            TransactionJson::from_certified_shared_normalized_row_content(normalized.into()),
             "large certified test row",
         );
 
@@ -5247,10 +5210,16 @@ mod tests {
                     prepared_fixture_row(
                         &format!("row-{index}"),
                         Some(stage_json_from_value(
-                            TransactionJson::from_certified_normalized_row_content(Arc::clone(
-                                source,
-                            )),
-                            "certified direct replacement",
+                            TransactionJson {
+                                storage: TransactionJsonStorage::Decoded {
+                                    value: Arc::new(
+                                        serde_json::from_str(source)
+                                            .expect("certified direct replacement JSON"),
+                                    ),
+                                    normalized: OnceLock::from(Arc::clone(source)),
+                                },
+                            },
+                            "direct replacement",
                         )),
                         TransactionWriteOperation::Update,
                         &origin_key,
