@@ -5165,6 +5165,14 @@ mod tests {
         fn release_blocked_read(&self) {
             self.gate.release.notify_one();
         }
+
+        fn assert_next_read_remains_armed_and_disarm(&self) {
+            assert_eq!(
+                self.gate.remaining.swap(0, Ordering::AcqRel),
+                1,
+                "expected the next storage read gate to remain armed",
+            );
+        }
     }
 
     impl Storage for BlockingReadStorage {
@@ -11399,7 +11407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_resumed_handshake_releases_session_for_close() {
+    async fn resumed_handshake_uses_cached_session_identity_and_closes() {
         let storage = BlockingReadStorage::new();
         let root = Arc::new(
             open_lix()
@@ -11417,29 +11425,19 @@ mod tests {
         drop(lease);
 
         storage.block_next_read();
-        let read_router = router.clone();
-        let read_session_id = session_id.clone();
-        let operation = tokio::spawn(async move {
-            request(&read_router, "GET", "/lix/v1", Some(&read_session_id), None).await
-        });
-        storage.wait_for_blocked_read().await;
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(1),
+            request(&router, "GET", "/lix/v1", Some(&session_id), None),
+        )
+        .await
+        .expect("resumed handshake should use cached session identity");
+        assert_eq!(resumed.status(), StatusCode::OK);
+        storage.assert_next_read_remains_armed_and_disarm();
 
-        operation.abort();
-        assert!(
-            operation
-                .await
-                .expect_err("outer HTTP-equivalent future was cancelled")
-                .is_cancelled()
-        );
-
-        let close =
-            tokio::time::timeout(Duration::from_secs(1), server.delete_session(&session_id)).await;
-        // Keep a failing regression self-cleaning: if cancellation ever stops
-        // reaching storage, release the blocked read before asserting below.
-        storage.release_blocked_read();
-        close
-            .expect("cancelled handshake must release the session read lock")
-            .expect("close cancelled handshake session");
+        tokio::time::timeout(Duration::from_secs(1), server.delete_session(&session_id))
+            .await
+            .expect("cached handshake must release the session lease")
+            .expect("close resumed handshake session");
     }
 
     #[tokio::test]
