@@ -214,12 +214,6 @@ pub(crate) struct ReplacementPartDirectory {
     row_count: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReplacementPartOrdinalRoute<'a> {
-    pub(crate) entry: &'a ReplacementPartDirectoryEntry,
-    pub(crate) local_ordinal: u16,
-}
-
 impl ReplacementPartDirectory {
     pub(crate) fn try_new(
         entries: Vec<ReplacementPartDirectoryEntry>,
@@ -333,28 +327,6 @@ impl ReplacementPartDirectory {
             ));
         }
         Self::decode(encoded)
-    }
-
-    pub(crate) fn route_ordinal(&self, ordinal: u32) -> Option<ReplacementPartOrdinalRoute<'_>> {
-        if ordinal >= self.row_count {
-            return None;
-        }
-        let mut lower = 0usize;
-        let mut upper = self.entries.len();
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            if self.entries[middle].first_ordinal <= ordinal {
-                lower = middle + 1;
-            } else {
-                upper = middle;
-            }
-        }
-        let entry = self.entries.get(lower.checked_sub(1)?)?;
-        let local = ordinal.checked_sub(entry.first_ordinal)?;
-        (local < u32::from(entry.row_count)).then_some(ReplacementPartOrdinalRoute {
-            entry,
-            local_ordinal: u16::try_from(local).expect("local ordinal is bounded by u16 row count"),
-        })
     }
 
     /// Returns the contiguous directory slice whose key bounds may intersect
@@ -850,10 +822,6 @@ mod tests {
             decoded.digest().expect("directory digest"),
             directory.digest().unwrap()
         );
-        let ordinal = decoded.route_ordinal(3).expect("ordinal route");
-        assert_eq!(ordinal.entry.digest(), second.digest());
-        assert_eq!(ordinal.local_ordinal, 1);
-        assert!(decoded.route_ordinal(4).is_none());
         assert_eq!(
             decoded.parts_overlapping(Some(b"beta"), Some(b"omega")),
             0..2
