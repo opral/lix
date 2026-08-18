@@ -207,9 +207,6 @@ impl ReplacementPartDirectoryEntry {
         self.row_count
     }
 
-    pub(crate) fn end_ordinal(&self) -> u32 {
-        self.first_ordinal + u32::from(self.row_count)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
