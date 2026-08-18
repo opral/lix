@@ -7546,7 +7546,6 @@ mod tests {
                     serde_json::from_str(large_snapshot.as_str())
                         .expect("large ordinary snapshot should parse"),
                 ),
-                "mixed certified ordinary snapshot",
             )),
             None,
             None,
@@ -8765,7 +8764,6 @@ mod tests {
             crate::transaction_types::TransactionJson::from_value_for_test(
                 serde_json::json!({ "value": 2 }),
             ),
-            "second rootless tracked row snapshot",
         ));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -8814,7 +8812,6 @@ mod tests {
             crate::transaction_types::TransactionJson::from_value_for_test(
                 serde_json::json!({ "value": 3 }),
             ),
-            "third rootless tracked row snapshot",
         ));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -10701,7 +10698,6 @@ mod tests {
                 "blob_hash": blob_id.to_hex(),
                 "size_bytes": payload.len(),
             })),
-            "ordinary CAS epoch test blob reference",
         ));
         PreparedWriteSet {
             insert_selection: PreparedInsertSelection::new(),
@@ -10841,7 +10837,6 @@ mod tests {
                 crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": 1 }),
                 ),
-                "test tracked row snapshot",
             )),
             metadata: None,
             origin: None,
@@ -10874,7 +10869,6 @@ mod tests {
             crate::transaction_types::TransactionJson::from_value_for_test(
                 serde_json::json!({ "value": "untracked" }),
             ),
-            "test untracked row snapshot",
         ));
         TestPreparedStateRow {
             change_id: Some(ChangeId::for_test_label(change_id)),
@@ -10897,7 +10891,6 @@ mod tests {
                 "id": branch_id,
                 "commit_id": commit_id(target_commit_label).to_string(),
             })),
-            "test direct branch-ref snapshot",
         ));
         row
     }
@@ -10914,7 +10907,6 @@ mod tests {
             crate::transaction_types::TransactionJson::from_value_for_test(
                 serde_json::json!({ "key": key, "value": value }),
             ),
-            "test untracked key-value snapshot",
         ));
         row
     }

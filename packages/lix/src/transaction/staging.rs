@@ -6540,7 +6540,6 @@ mod tests {
     fn state_row(key: &str, value: &str) -> TestPreparedStateRow {
         let snapshot = stage_json_from_value(
             TransactionJson::from_value_for_test(serde_json::json!({ "key": key, "value": value })),
-            "test staged row snapshot_content",
         );
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
