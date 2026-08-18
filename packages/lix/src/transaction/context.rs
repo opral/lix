@@ -8888,12 +8888,10 @@ fn push_prepared_state_row_from_planned_parts(
     let branch_id = row.branch_id.clone();
     let snapshot = rows
         .take_snapshot(row_index)
-        .map(|value| stage_json_from_value(value, "prepared row snapshot_content"))
-        .transpose()?;
+        .map(|value| stage_json_from_value(value, "prepared row snapshot_content"));
     let metadata = rows
         .take_metadata(row_index)
-        .map(|value| stage_json_from_value(value, "prepared row metadata"))
-        .transpose()?;
+        .map(|value| stage_json_from_value(value, "prepared row metadata"));
     let row_pk = rows.take_row_pk(row_index).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
