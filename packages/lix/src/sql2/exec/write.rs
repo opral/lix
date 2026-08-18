@@ -399,7 +399,6 @@ pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
     .await
     .map_err(normalize_bound_public_write_error)?
     {
-        PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
         return Ok(Some(results));
     }
     if let Some(results) = super::bound_public_write::try_execute_row_insert_prepared_batch(
@@ -410,7 +409,6 @@ pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
     .await
     .map_err(normalize_bound_public_write_error)?
     {
-        PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
         return Ok(Some(results));
     }
     let results = super::bound_public_write::try_execute_row_update_prepared_batch(
@@ -420,9 +418,6 @@ pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
     )
     .await
     .map_err(normalize_bound_public_write_error)?;
-    if results.is_some() {
-        PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
-    }
     Ok(results)
 }
 
