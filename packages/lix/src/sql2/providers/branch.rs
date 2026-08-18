@@ -20,11 +20,11 @@ use crate::branch::{
     branch_ref_stage_row, branch_ref_tombstone_row,
 };
 use crate::changelog::CommitId;
-use crate::row_pk::RowPk;
 use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
     HotStateReader, HotStateScanRequest, MaterializedHotStateRowRef,
 };
+use crate::row_pk::RowPk;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
@@ -120,7 +120,7 @@ impl TableSpec for BranchSpec {
         &self,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&lix_branch_schema(), projection);
@@ -136,16 +136,21 @@ impl TableSpec for BranchSpec {
                     schema,
                     self.head_read_strategy,
                     descriptor_scope,
+                    limit,
                 ),
-                |(hot_state, branch_ref, schema, head_read_strategy, descriptor_scope)| async move {
-                    let rows = load_branch_rows_scoped(
-                        hot_state,
-                        branch_ref,
-                        head_read_strategy,
-                        descriptor_scope,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+                |(hot_state, branch_ref, schema, head_read_strategy, descriptor_scope, limit)| async move {
+                    let rows = if limit == Some(0) {
+                        Vec::new()
+                    } else {
+                        load_branch_rows_scoped(
+                            hot_state,
+                            branch_ref,
+                            head_read_strategy,
+                            descriptor_scope,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                    };
                     LIX_BRANCH_COLS
                         .build(schema, &rows)
                         .map_err(branch_batch_error)
@@ -1560,6 +1565,22 @@ mod tests {
             branch_ref.point_read_ids.lock().unwrap().as_slice(),
             &["01920000-0000-7000-8000-0000000000b1".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn branch_read_limit_zero_skips_storage_reads() {
+        let (spec, hot_state, branch_ref) = routing_spec();
+        let planned = spec
+            .plan_scan(None, &[], Some(0), &ExecutionProps::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            planned.source.load_single_batch().await.unwrap().num_rows(),
+            0
+        );
+        assert!(hot_state.requests.lock().unwrap().is_empty());
+        assert!(branch_ref.point_read_ids.lock().unwrap().is_empty());
     }
 
     #[test]
