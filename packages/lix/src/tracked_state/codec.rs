@@ -191,12 +191,10 @@ impl DecodedLeafNodeRef {
         })
     }
 
-    #[expect(clippy::unnecessary_wraps)]
-    pub(crate) fn key(&self, index: usize) -> Result<Option<&[u8]>, LixError> {
-        Ok(self
-            .entries
+    pub(crate) fn key(&self, index: usize) -> Option<&[u8]> {
+        self.entries
             .get(index)
-            .map(|span| &self.arena[span.key_start..span.key_end]))
+            .map(|span| &self.arena[span.key_start..span.key_end])
     }
 
     /// Materializes per-entry buffers only for mutation paths that need to
@@ -3356,7 +3354,7 @@ mod tests {
             panic!("expected leaf node");
         };
         assert_eq!(leaf.len(), 2);
-        assert_eq!(leaf.key(1).expect("second key"), Some(b"bravo".as_ref()));
+        assert_eq!(leaf.key(1), Some(b"bravo".as_ref()));
         let second = leaf
             .entry(1)
             .expect("second entry")

@@ -177,7 +177,7 @@ impl TrackedStateTree {
                     let mut high = leaf.len();
                     while low < high {
                         let mid = low + (high - low) / 2;
-                        let key = leaf.key(mid)?.ok_or_else(|| {
+                        let key = leaf.key(mid).ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_STORAGE_ERROR,
                                 "tracked-state leaf key disappeared during lower-bound seek",
@@ -2382,7 +2382,7 @@ fn binary_search_leaf_key(
     let mut high = leaf.len();
     while low < high {
         let mid = low + (high - low) / 2;
-        let key = leaf.key(mid)?.ok_or_else(|| {
+        let key = leaf.key(mid).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked-state leaf key disappeared during binary search",
