@@ -550,10 +550,6 @@ export function record(
 	return value as Record<string, unknown>;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function decodeWireValue(value: unknown): NativeLixValue {
 	const wire = record(value, "wire value");
 	switch (wire.kind) {
