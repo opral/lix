@@ -10,11 +10,7 @@ import type {
 export function createWorkerConnection(): WorkerConnection {
 	const worker = new Worker(new URL("./entry.node.js", import.meta.url), {
 		name: "lix",
-		execArgv: process.execArgv.filter(
-			(arg, index, args) =>
-				!arg.startsWith("--input-type=") &&
-				!(index > 0 && args[index - 1] === "--input-type"),
-		),
+		execArgv: workerExecArgv(process.execArgv),
 	});
 	let terminating = false;
 	return {
@@ -43,6 +39,20 @@ export function createWorkerConnection(): WorkerConnection {
 			await worker.terminate();
 		},
 	};
+}
+
+export function workerExecArgv(execArgv: readonly string[]): string[] {
+	const filtered: string[] = [];
+	for (let index = 0; index < execArgv.length; index++) {
+		const arg = execArgv[index];
+		if (arg === "--input-type") {
+			index += 1;
+			continue;
+		}
+		if (arg === "--expose-gc" || arg.startsWith("--input-type=")) continue;
+		filtered.push(arg);
+	}
+	return filtered;
 }
 
 /// Native Lix already owns a dedicated serialized engine actor. Routing it
