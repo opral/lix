@@ -480,6 +480,9 @@ where
         let absence_guards = std::collections::BTreeSet::default();
         for branch in &plan.branch_controls {
             let mut head_deltas = tracked_head_deltas.clone();
+            // Checkpoints and built-in accounts are global facts. Staging them
+            // onto main would materialize branch-local copies (`lixcol_global =
+            // false`) that shadow inheritance from GLOBAL_BRANCH_ID.
             if branch.branch_id != GLOBAL_BRANCH_ID {
                 head_deltas.retain(|delta| {
                     delta.schema_key != CHECKPOINT_SCHEMA_KEY
@@ -1088,7 +1091,9 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_accounts_are_global_rows_inherited_by_branches() {
-        use crate::storage_adapter::{Memory, StorageAdapter};
+        use crate::branch::BranchHeadControlContext;
+        use crate::hot_state::TrackedHeadContext;
+        use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
         use crate::tracked_state::TrackedStateContext;
 
         let storage = StorageAdapter::new(Memory::new());
@@ -1097,11 +1102,38 @@ mod tests {
             .await
             .expect("initialize should succeed");
 
-        // Scan accounts at the initial commit (which both branches share).
         let read = storage
-            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        let controls = BranchHeadControlContext::new()
+            .reader(&read)
+            .scan()
+            .await
+            .expect("scan branch-head controls");
+        let tracked_head = TrackedHeadContext::new();
+        let mut saw_global = false;
+        for (branch_id, control) in &controls {
+            let has_accounts = tracked_head
+                .reader(&read)
+                .has_schema_rows(branch_id, *control, ACCOUNT_SCHEMA_KEY)
+                .await
+                .expect("schema presence probe should succeed");
+            if branch_id == GLOBAL_BRANCH_ID {
+                saw_global = true;
+                assert!(
+                    has_accounts,
+                    "GLOBAL_BRANCH_ID must physically store bootstrap accounts"
+                );
+            } else {
+                assert!(
+                    !has_accounts,
+                    "branch {branch_id} must not physically store bootstrap accounts"
+                );
+            }
+        }
+        assert!(saw_global, "initialization must publish a global branch");
+
         let mut tracked_reader = tracked_state.reader(read);
         let rows = tracked_reader
             .scan_batch_at_commit(
@@ -1123,8 +1155,6 @@ mod tests {
             2,
             "tracked state should contain exactly two bootstrap accounts"
         );
-
-        // Verify that the accounts were authored in the initial commit
         for row in &account_rows {
             assert_eq!(
                 row.commit_id,
