@@ -1921,7 +1921,7 @@ impl Document {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
         let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator = preferred_terminator(&drafts);
+        dialect.terminator = preferred_terminator_for_document(&drafts, Terminator::Lf);
         let identities = IdentityStore::initial(namespace, drafts.len())?;
         assign_initial_rows(&mut drafts);
         let document = Self(Arc::new(DocumentInner {
@@ -2173,7 +2173,7 @@ impl Document {
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(after_path);
         let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator = preferred_terminator(&drafts);
+        dialect.terminator = preferred_terminator_for_document(&drafts, Terminator::Lf);
         let old_locations = self.0.index.locations().collect::<Vec<_>>();
         let mut identities = self.0.identities.clone();
         match_rows(
@@ -3123,10 +3123,6 @@ fn assign_initial_rows(rows: &mut [RowDraft]) {
         let rank = u64::try_from(numerator / denominator).expect("ratio fits u64") | 1;
         row.order_rank = Some(rank);
     }
-}
-
-fn preferred_terminator(rows: &[RowDraft]) -> Terminator {
-    preferred_terminator_for_document(rows, Terminator::Lf)
 }
 
 fn preferred_terminator_for_document(rows: &[RowDraft], fallback: Terminator) -> Terminator {
