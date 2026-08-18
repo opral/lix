@@ -32,6 +32,7 @@ import {
 	protocolError,
 	record,
 	SERVER_PROTOCOL_PATH,
+	SERVER_PROTOCOL_VERSION,
 	remoteError,
 	type ServerProtocolHandshakeRequest,
 	type ServerProtocolObserveSubscription,
@@ -55,6 +56,8 @@ const REQUEST_BLOB_BASE_MAX_ENTRIES = 8;
 // new base is retained, so repeated large-file edits stay bounded.
 const REQUEST_BLOB_BASE_MAX_BYTES = 16 * 1024 * 1024;
 const REMOTE_BLOB_BASE_MISSING = "LIX_REMOTE_BLOB_BASE_MISSING";
+const PROTOCOL_SESSION_GONE = "LIX_ERROR_PROTOCOL_SESSION_GONE";
+const PROTOCOL_SERVER_CLOSED = "LIX_ERROR_PROTOCOL_SERVER_CLOSED";
 const WIRE_BLOB_JSON_ENVELOPE_BYTES = JSON.stringify({
 	kind: "blob",
 	base64: "",
@@ -87,6 +90,7 @@ class RemoteLixBinding implements LixBinding {
 	#sessionId: string | undefined;
 	#activeBranchId: string | undefined;
 	#activeAccountId: string | undefined;
+	#sessionRecovery: Promise<unknown> | undefined;
 	#requestBlobBaseBytes = 0;
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
@@ -134,13 +138,8 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async open(): Promise<void> {
-		const query = new URLSearchParams();
-		if (this.#initialActiveBranchId !== undefined) {
-			query.set("activeBranchId", this.#initialActiveBranchId);
-		}
-		const path = query.size === 0 ? "" : `?${query}`;
 		const handshake = decodeHandshake(
-			await this.#requestJson(path, { method: "GET" }),
+			await this.#requestJson(this.#handshakePath(), { method: "GET" }),
 		);
 		this.#sessionId = handshake.sessionId;
 		this.#activeBranchId = handshake.activeBranchId;
@@ -536,6 +535,28 @@ class RemoteLixBinding implements LixBinding {
 		responseKind: "json" | "empty" = "json",
 		onRequestAttempt?: () => void,
 	): Promise<unknown> {
+		const deadSessionId = this.#sessionId;
+		try {
+			return await this.#sendJson(path, init, responseKind, onRequestAttempt);
+		} catch (error) {
+			if (
+				!this.#acceptingOperations ||
+				!isRecoverableProtocolSessionLoss(error)
+			) {
+				throw error;
+			}
+			const handshake = await this.#recoverProtocolSession(deadSessionId);
+			if (isHandshakeGet(path, init)) return handshake;
+			return await this.#sendJson(path, init, responseKind, onRequestAttempt);
+		}
+	}
+
+	async #sendJson(
+		path: string,
+		init: RequestInit,
+		responseKind: "json" | "empty" = "json",
+		onRequestAttempt?: () => void,
+	): Promise<unknown> {
 		const headers = new Headers(await resolveHeaders(this.#headers));
 		new Headers(init.headers).forEach((value, name) => headers.set(name, value));
 		if (this.#sessionId === undefined) headers.delete(REMOTE_SESSION_HEADER);
@@ -588,6 +609,33 @@ class RemoteLixBinding implements LixBinding {
 		subscriptions: ServerProtocolObserveSubscription[],
 		signal: AbortSignal,
 	): Promise<Response> {
+		if (this.#sessionRecovery !== undefined) {
+			await this.#sessionRecovery;
+		}
+		const deadSessionId = this.#sessionId;
+		const response = await this.#sendObserveStream(subscriptions, signal);
+		if (response.ok || !this.#acceptingOperations) return response;
+		const error = await peekHttpError(response);
+		if (error === undefined || !isRecoverableProtocolSessionLoss(error)) {
+			return response;
+		}
+		await this.#recoverProtocolSession(deadSessionId);
+		const retry = await this.#sendObserveStream(subscriptions, signal);
+		if (retry.ok) return retry;
+		const retryError = await peekHttpError(retry);
+		if (
+			retryError !== undefined &&
+			isRecoverableProtocolSessionLoss(retryError)
+		) {
+			throw retryError;
+		}
+		return retry;
+	}
+
+	async #sendObserveStream(
+		subscriptions: ServerProtocolObserveSubscription[],
+		signal: AbortSignal,
+	): Promise<Response> {
 		let headers: Headers;
 		try {
 			headers = new Headers(await resolveHeaders(this.#headers));
@@ -630,6 +678,48 @@ class RemoteLixBinding implements LixBinding {
 				{ details: { cause: errorMessage(cause) } },
 			);
 		}
+	}
+
+	#handshakePath(): string {
+		const pinBranch = this.#activeBranchId ?? this.#initialActiveBranchId;
+		if (pinBranch === undefined) return "";
+		const query = new URLSearchParams();
+		query.set("activeBranchId", pinBranch);
+		return `?${query}`;
+	}
+
+	async #recoverProtocolSession(
+		deadSessionId: string | undefined,
+	): Promise<unknown> {
+		if (this.#sessionId !== undefined && this.#sessionId !== deadSessionId) {
+			return this.#currentHandshakeValue();
+		}
+		if (this.#sessionRecovery !== undefined) return this.#sessionRecovery;
+		this.#sessionRecovery = this.#openNewProtocolSession().finally(() => {
+			this.#sessionRecovery = undefined;
+		});
+		return this.#sessionRecovery;
+	}
+
+	async #openNewProtocolSession(): Promise<unknown> {
+		this.#sessionId = undefined;
+		this.#requestBlobBases.clear();
+		this.#requestBlobBaseBytes = 0;
+		const value = await this.#sendJson(this.#handshakePath(), { method: "GET" });
+		const handshake = decodeHandshake(value);
+		this.#sessionId = handshake.sessionId;
+		this.#activeBranchId = handshake.activeBranchId;
+		this.#activeAccountId = handshake.activeAccountId;
+		return value;
+	}
+
+	#currentHandshakeValue(): unknown {
+		return {
+			protocolVersion: SERVER_PROTOCOL_VERSION,
+			activeBranchId: this.#activeBranchId,
+			activeAccountId: this.#activeAccountId,
+			sessionId: this.#sessionId,
+		};
 	}
 
 	async #refreshObservation(
@@ -975,6 +1065,24 @@ function errorCode(error: unknown): string | undefined {
 		: undefined;
 }
 
+function isRecoverableProtocolSessionLoss(error: unknown): boolean {
+	const code = errorCode(error);
+	return code === PROTOCOL_SESSION_GONE || code === PROTOCOL_SERVER_CLOSED;
+}
+
+function isHandshakeGet(path: string, init: RequestInit): boolean {
+	const method = (init.method ?? "GET").toUpperCase();
+	return method === "GET" && (path === "" || path.startsWith("?"));
+}
+
+async function peekHttpError(response: Response): Promise<Error | undefined> {
+	try {
+		return await errorFromHttpResponse(response.clone());
+	} catch {
+		return undefined;
+	}
+}
+
 function copyArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	const copy = new Uint8Array(bytes.byteLength);
 	copy.set(bytes);
@@ -1195,6 +1303,11 @@ class RemoteObservationHub {
 							);
 						}
 						const error = errorFromResponseBody(payload);
+						if (isRecoverableProtocolSessionLoss(error)) {
+							reconnect = true;
+							controller.abort();
+							return;
+						}
 						const subscriptionId = payload.subscriptionId;
 						if (subscriptionId !== undefined) {
 							if (typeof subscriptionId !== "string") {

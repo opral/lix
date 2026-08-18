@@ -1261,6 +1261,202 @@ test("active branch reads reuse the initial handshake without another GET", asyn
 	await lix.close();
 });
 
+test("execute recovers a gone protocol session once by opening a new handshake", async () => {
+	const requests: Request[] = [];
+	let nextSession = 0;
+	let goneOnce = false;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					const presented = request.headers.get("lix-session-id");
+					if (presented !== null) {
+						return protocolSessionGone();
+					}
+					nextSession += 1;
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${nextSession}`,
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				if (pathname.endsWith("/execute")) {
+					const sessionId = request.headers.get("lix-session-id");
+					if (sessionId === "session-1" && !goneOnce) {
+						goneOnce = true;
+						return protocolSessionGone();
+					}
+					if (sessionId !== `session-${nextSession}`) {
+						return protocolSessionGone();
+					}
+					return Response.json(emptyExecuteResponse());
+				}
+				throw new Error(`Unexpected request: ${pathname}`);
+			},
+		},
+	});
+
+	await expect(lix.execute("SELECT 1")).resolves.toMatchObject({
+		rowsAffected: 1,
+	});
+	expect(requests.map(describeRemoteRequest)).toEqual([
+		{
+			method: "GET",
+			path: "/@acme/repository/lix/v1/",
+			sessionId: null,
+			activeBranchId: null,
+		},
+		{
+			method: "POST",
+			path: "/@acme/repository/lix/v1/execute",
+			sessionId: "session-1",
+		},
+		{
+			method: "GET",
+			path: "/@acme/repository/lix/v1/",
+			sessionId: null,
+			activeBranchId: "main-id",
+		},
+		{
+			method: "POST",
+			path: "/@acme/repository/lix/v1/execute",
+			sessionId: "session-2",
+		},
+	]);
+	expect(await lix.activeBranchId()).toBe("main-id");
+	await lix.close();
+});
+
+test("execute recovers a closed protocol server once then retries with the new session", async () => {
+	const sessionIds: Array<string | null> = [];
+	let executeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					sessionIds.push(request.headers.get("lix-session-id"));
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId:
+							request.headers.get("lix-session-id") === null
+								? sessionIds.filter((id) => id === null).length === 1
+									? "session-1"
+									: "session-2"
+								: request.headers.get("lix-session-id"),
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				executeCalls += 1;
+				if (executeCalls === 1) return protocolServerClosed();
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+
+	await expect(lix.execute("SELECT 1")).resolves.toMatchObject({
+		rowsAffected: 1,
+	});
+	expect(sessionIds).toEqual([null, null]);
+	expect(executeCalls).toBe(2);
+	await lix.close();
+});
+
+test("a second gone protocol session after recovery is not retried", async () => {
+	let handshakeCalls = 0;
+	let executeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					expect(request.headers.has("lix-session-id")).toBe(false);
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeCalls}`,
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				executeCalls += 1;
+				return protocolSessionGone();
+			},
+		},
+	});
+
+	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+		status: 410,
+	});
+	expect(handshakeCalls).toBe(2);
+	expect(executeCalls).toBe(2);
+	await lix.close();
+});
+
+test("an active branch read adopts a new session after protocol session gone", async () => {
+	let handshakeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					const presented = request.headers.get("lix-session-id");
+					if (presented !== null) return protocolSessionGone();
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: handshakeCalls === 1 ? "main-id" : "draft-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeCalls}`,
+					});
+				}
+				if (pathname.endsWith("/branch/switch")) {
+					return Response.json({ branchId: "malformed-response" });
+				}
+				throw new Error(`Unexpected request: ${pathname}`);
+			},
+		},
+	});
+
+	await expect(
+		lix.switchBranch({ branchId: "draft-id" }),
+	).rejects.toMatchObject({
+		code: "LIX_SERVER_PROTOCOL_ERROR",
+	});
+	await expect(lix.activeBranchId()).resolves.toBe("draft-id");
+	expect(handshakeCalls).toBe(2);
+	await lix.close();
+});
+
 test("an expired session mutation is propagated without a new handshake or retry", async () => {
 	let handshakeCalls = 0;
 	let executeCalls = 0;
@@ -1363,6 +1559,43 @@ function handshakeResponse() {
 		activeAccountId: "00000000-0000-7000-8000-000000000002",
 		sessionId: "session-1",
 	});
+}
+
+function protocolSessionGone() {
+	return Response.json(
+		{
+			error: {
+				code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+				message:
+					"the Lix protocol session is unknown, expired, or closed; open a new client session",
+			},
+		},
+		{ status: 410 },
+	);
+}
+
+function protocolServerClosed() {
+	return Response.json(
+		{
+			error: {
+				code: "LIX_ERROR_PROTOCOL_SERVER_CLOSED",
+				message: "the Lix protocol server is closing or closed",
+			},
+		},
+		{ status: 503 },
+	);
+}
+
+function describeRemoteRequest(request: Request) {
+	const url = new URL(request.url);
+	return {
+		method: request.method,
+		path: url.pathname,
+		sessionId: request.headers.get("lix-session-id"),
+		...(request.method === "GET"
+			? { activeBranchId: url.searchParams.get("activeBranchId") }
+			: {}),
+	};
 }
 
 function emptyExecuteResponse() {
