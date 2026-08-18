@@ -3,12 +3,11 @@ use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
-use super::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, SyncAdmission, SyncBranch, SyncPullResponse,
-    SyncTransactionPack, SyncTransport, SyncTransportFuture, validate_sync_branch_id,
-    validate_sync_remote_id,
-};
 use crate::LixError;
+use crate::sync::{
+    MAX_SYNC_PULL_RESPONSE_BYTES, SyncAdmission, SyncBranch, SyncPullResponse, SyncTransactionPack,
+    SyncTransport, SyncTransportFuture, validate_sync_branch_id, validate_sync_remote_id,
+};
 
 const SESSION_HEADER: &str = "lix-session-id";
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
@@ -190,8 +189,8 @@ async fn fetch(
         .map_err(js_transport_error)?
         .dyn_into::<Function>()
         .map_err(js_transport_error)?;
-    let controller = Reflect::construct(&controller_constructor, &Array::new())
-        .map_err(js_transport_error)?;
+    let controller =
+        Reflect::construct(&controller_constructor, &Array::new()).map_err(js_transport_error)?;
     let signal = Reflect::get(&controller, &"signal".into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"signal".into(), &signal).map_err(js_transport_error)?;
     // Dropping the Rust future is how the shared runtime interrupts a held
@@ -203,8 +202,7 @@ async fn fetch(
         armed: true,
     };
     Reflect::set(&init, &"method".into(), &method.into()).map_err(js_transport_error)?;
-    Reflect::set(&init, &"credentials".into(), &"include".into())
-        .map_err(js_transport_error)?;
+    Reflect::set(&init, &"credentials".into(), &"include".into()).map_err(js_transport_error)?;
     let header_pairs = Array::new();
     for (name, value) in headers {
         let pair = Array::new();

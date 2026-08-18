@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{FutureExt, select_biased};
@@ -427,8 +427,7 @@ where
                 .hydrated_scopes_snapshot_for_branch(&active_branch_for_worker);
             let had_pending_inactive_branches = !pending_inactive_branches.is_empty();
             for branch_id in pending_inactive_branches {
-                if let Err(error) =
-                    flush_inactive_branch(lix, remote_id, headers, branch_id).await
+                if let Err(error) = flush_inactive_branch(lix, remote_id, headers, branch_id).await
                 {
                     tracing::warn!(
                         error = ?error,

@@ -1,11 +1,11 @@
 use serde::Deserialize;
 
-use super::{
+use crate::LixError;
+use crate::sync::{
     MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SyncAdmission, SyncBranch,
     SyncPullResponse, SyncTransactionPack, SyncTransport, SyncTransportFuture,
     validate_sync_branch_id, validate_sync_remote_id,
 };
-use crate::LixError;
 
 const SESSION_HEADER: &str = "lix-session-id";
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
@@ -57,12 +57,13 @@ impl HttpSyncTransport {
         let protocol_url = format!("{repository_url}/lix/v1");
         let mut default_headers = reqwest::header::HeaderMap::new();
         for (name, value) in headers {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!("invalid sync HTTP header name: {error}"),
-                )
-            })?;
+            let name =
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("invalid sync HTTP header name: {error}"),
+                    )
+                })?;
             let value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INVALID_PARAM,

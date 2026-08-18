@@ -15,31 +15,22 @@
 //! payloads remain a later blob-transfer optimization; the 90% path uses the
 //! inline bytes already present in the transaction.
 
+mod contract;
 mod platform;
-#[cfg(not(target_family = "wasm"))]
-mod platform_native;
-#[cfg(target_family = "wasm")]
-mod platform_wasm;
 mod runtime;
-#[cfg(not(target_family = "wasm"))]
-mod transport;
 
-#[cfg(target_family = "wasm")]
-mod transport_wasm;
-
+pub use contract::SyncTransport;
 pub(crate) use runtime::{SyncRuntime, activate_sync_mode};
 
 /// Performs the one fresh-store handshake needed to seed a local repository's
 /// main branch with the server's default branch identity. Reopened stores do
 /// not call this path; they use their durable branch binding and reconnect in
 /// the worker so offline reads remain local.
-pub(crate) async fn probe_sync_branch_id(server: &crate::ServerOptions) -> Result<String, LixError> {
-    let transport = platform::HttpSyncTransport::connect(
-        &server.url,
-        &server.headers,
-        None,
-    )
-    .await?;
+pub(crate) async fn probe_sync_branch_id(
+    server: &crate::ServerOptions,
+) -> Result<String, LixError> {
+    let transport =
+        platform::HttpSyncTransport::connect(&server.url, &server.headers, None).await?;
     let branch_id = transport.branch_id().to_owned();
     transport.close().await?;
     Ok(branch_id)
@@ -48,7 +39,7 @@ pub(crate) async fn probe_sync_branch_id(server: &crate::ServerOptions) -> Resul
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{future::Future, time::Duration};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -617,89 +608,42 @@ impl SyncModeState {
         requested_scopes: &[String],
         branch_id: &str,
     ) -> Result<(), LixError> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            if !self.is_replica() || requested_scopes.is_empty() {
-                return Ok(());
-            }
-            let deadline = Duration::from_secs(5);
-            let wait = async {
-                loop {
-                    let ready = self
-                        .hydrated_scopes_by_branch
-                        .read()
-                        .ok()
-                        .and_then(|branches| branches.get(branch_id).cloned())
-                        .is_some_and(|hydrated| {
-                            (hydrated.contains(FULL_SYNC_SCOPE)
-                                && requested_scopes.iter().all(|scope| scope != "lix_file"))
-                                || requested_scopes
-                                    .iter()
-                                    .all(|scope| hydrated.contains(scope))
-                        });
-                    if ready {
-                        return;
-                    }
-                    self.scope_notify.notified().await;
-                }
-            };
-            tokio::time::timeout(deadline, wait).await.map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync scope hydration did not complete before the readiness deadline",
-                )
-                .with_hint(
-                    "Retry after the replica reconnects, or query only data already hydrated locally.",
-                )
-            })?;
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            use futures_util::future::{Either, select};
+        use futures_util::future::{Either, select};
 
-            if !self.is_replica() || requested_scopes.is_empty() {
-                return Ok(());
-            }
-            let wait = async {
-                loop {
-                    let ready = self
-                        .hydrated_scopes_by_branch
-                        .read()
-                        .ok()
-                        .and_then(|branches| branches.get(branch_id).cloned())
-                        .is_some_and(|hydrated| {
-                            (hydrated.contains(FULL_SYNC_SCOPE)
-                                && requested_scopes.iter().all(|scope| scope != "lix_file"))
-                                || requested_scopes
-                                    .iter()
-                                    .all(|scope| hydrated.contains(scope))
+        if !self.is_replica() || requested_scopes.is_empty() {
+            return Ok(());
+        }
+        let wait = async {
+            loop {
+                let ready = self
+                    .hydrated_scopes_by_branch
+                    .read()
+                    .ok()
+                    .and_then(|branches| branches.get(branch_id).cloned())
+                    .is_some_and(|hydrated| {
+                        (hydrated.contains(FULL_SYNC_SCOPE)
+                            && requested_scopes.iter().all(|scope| scope != "lix_file"))
+                            || requested_scopes
+                                .iter()
+                                .all(|scope| hydrated.contains(scope))
                     });
-                    if ready {
-                        return Ok::<(), LixError>(());
-                    }
-                    self.scope_notify.notified().await;
+                if ready {
+                    return;
                 }
-            };
-            // Browser WASM is single-threaded. The shared session API keeps a
-            // `Send` future signature for native callers, so erase the
-            // non-Send marker carried by JavaScript's Promise future here.
-            let timeout = unsafe {
-                crate::session::AssumeSendFuture::new(platform::sleep(Duration::from_secs(5)))
-            };
-            futures_util::pin_mut!(wait, timeout);
-            match select(wait, timeout).await {
-                Either::Left((result, _)) => result?,
-                Either::Right((timer, _)) => {
-                    timer?;
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync scope hydration did not complete before the readiness deadline",
-                    )
-                    .with_hint(
-                        "Retry after the replica reconnects, or query only data already hydrated locally.",
-                    ));
-                }
+                self.scope_notify.notified().await;
             }
+        };
+        let deadline = platform::deadline(Duration::from_secs(5));
+        futures_util::pin_mut!(wait, deadline);
+        if let Either::Right((timer, _)) = select(wait, deadline).await {
+            timer?;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync scope hydration did not complete before the readiness deadline",
+            )
+            .with_hint(
+                "Retry after the replica reconnects, or query only data already hydrated locally.",
+            ));
         }
         Ok(())
     }
@@ -1085,7 +1029,7 @@ pub(crate) fn validate_sync_transaction_pack(
     let mut parent_ids = BTreeSet::new();
     for parent in &pack.parent_commit_ids {
         let parent = CommitId::parse_lix(parent, "sync parent_commit_id")?;
-if pack.local_commit_id == parent || !parent_ids.insert(parent) {
+        if pack.local_commit_id == parent || !parent_ids.insert(parent) {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "sync pack contains an invalid parent topology",
@@ -1211,7 +1155,7 @@ fn validate_sync_topology_event_pack(pack: &SyncTransactionPack) -> Result<usize
     let mut parents = BTreeSet::new();
     for parent in &pack.parent_commit_ids {
         let parent = CommitId::parse_lix(parent, "sync topology parent_commit_id")?;
-if parent == pack.local_commit_id || !parents.insert(parent) {
+        if parent == pack.local_commit_id || !parents.insert(parent) {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "sync topology pack contains an invalid parent topology",
@@ -1369,12 +1313,9 @@ pub struct SyncBranch {
 }
 
 /// A boxed request future returned by [`SyncTransport`].
-#[cfg(not(target_family = "wasm"))]
-pub type SyncTransportFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, LixError>> + Send + 'a>>;
-
-#[cfg(target_family = "wasm")]
-pub type SyncTransportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LixError>> + 'a>>;
+#[doc(hidden)]
+pub use platform::SyncTransportBounds;
+pub use platform::SyncTransportFuture;
 
 /// Returns true for errors that mean the remote cannot currently be reached.
 /// A manual client may still queue a local write against its last durable
@@ -1397,74 +1338,6 @@ fn is_sync_transport_unavailable(error: &LixError) -> bool {
     ]
     .iter()
     .any(|marker| message.contains(marker))
-}
-
-/// The two operations required from a remote sync server.
-///
-/// The Server Protocol is one transport for this interface. Keeping the core
-/// state machine transport-neutral also lets embedded hosts and tests connect
-/// two Lix repositories without making the database depend on an HTTP client.
-#[cfg(not(target_family = "wasm"))]
-pub trait SyncTransport: Send + Sync {
-    /// Stable identity of the remote repository (normally its canonical URL).
-    fn remote_id(&self) -> &str;
-
-    fn admit<'a>(&'a self, pack: &'a SyncTransactionPack)
-    -> SyncTransportFuture<'a, SyncAdmission>;
-
-    fn pull<'a>(
-        &'a self,
-        branch_id: &'a str,
-        after_cursor: u64,
-        limit: usize,
-        // Empty means an unscoped/head-only request; non-empty requests only
-        // materialize row/file payloads for these schema keys.
-        schema_keys: &'a [String],
-    ) -> SyncTransportFuture<'a, SyncPullResponse>;
-
-    /// Returns the current global branch catalog. Transports that do not
-    /// expose control-plane enumeration can leave this empty; row sync remains
-    /// fully functional and the runtime retries topology after reconnect.
-    fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    /// Whether [`list_branches`](Self::list_branches) is an authoritative
-    /// catalog for this transport. The default is deliberately false: an
-    /// empty result from an embedded or test transport must not be interpreted
-    /// as proof that every local branch was deleted. Only an explicit catalog
-    /// implementation may drive destructive branch pruning.
-    fn has_authoritative_branch_catalog(&self) -> bool {
-        false
-    }
-}
-
-/// Browser/WASM variant of [`SyncTransport`] whose fetch futures and handles
-/// are not required to cross threads.
-#[cfg(target_family = "wasm")]
-pub trait SyncTransport {
-    fn remote_id(&self) -> &str;
-
-    fn admit<'a>(&'a self, pack: &'a SyncTransactionPack)
-    -> SyncTransportFuture<'a, SyncAdmission>;
-
-    fn pull<'a>(
-        &'a self,
-        branch_id: &'a str,
-        after_cursor: u64,
-        limit: usize,
-        // Empty means an unscoped/head-only request; non-empty requests only
-        // materialize row/file payloads for these schema keys.
-        schema_keys: &'a [String],
-    ) -> SyncTransportFuture<'a, SyncPullResponse>;
-
-    fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn has_authoritative_branch_catalog(&self) -> bool {
-        false
-    }
 }
 
 /// Applies the remote global branch catalog to a local repository. This is a
@@ -1685,8 +1558,7 @@ where
                     );
                 }
                 if let Err(error) =
-                    hydrate_sync_commit_from_active_branch(lix, transport, &remote.commit_id)
-                        .await
+                    hydrate_sync_commit_from_active_branch(lix, transport, &remote.commit_id).await
                 {
                     tracing::warn!(
                         error = ?error,
@@ -2004,9 +1876,7 @@ where
         // query. Probe the finite head first; an event-bearing pull at the
         // current head is intentionally a 30-second server long-poll, which
         // would make an otherwise local query hit the readiness deadline.
-        let probe = transport
-            .pull(branch_id, cursor, 0, &history_scope)
-            .await?;
+        let probe = transport.pull(branch_id, cursor, 0, &history_scope).await?;
         require_sync_identity("branch topology head probe", branch_id, &probe.branch_id)?;
         validate_sync_pull_head_commit_id(&probe.head_commit_id)?;
         if cursor >= probe.head_cursor {
@@ -2047,10 +1917,9 @@ where
                 if branch_id != GLOBAL_BRANCH_ID {
                     continue;
                 }
-                if control_marker
-                    .as_ref()
-                    .is_some_and(|(_, marker)| marker_covers_event(marker, &event, &event.pack_fingerprint))
-                {
+                if control_marker.as_ref().is_some_and(|(_, marker)| {
+                    marker_covers_event(marker, &event, &event.pack_fingerprint)
+                }) {
                     continue;
                 }
             }
@@ -2062,17 +1931,7 @@ where
             // safe missing-parent fallback; branch-local history can still
             // use the targeted parent assist below.
             if branch_id != GLOBAL_BRANCH_ID {
-            // Global catalog events are control-plane topology. Do not recurse
-            // from that stream into every source branch while the global
-            // stream is still being replayed: a pre-sync branch may point at
-            // a global parent and the reciprocal lookup otherwise walks the
-            // same two streams indefinitely. The branch-ref bridge below
-            // materializes the required commit identities; semantic/full
-            // history hydration repairs exact parent edges on demand.
-            if branch_id != GLOBAL_BRANCH_ID {
-                hydrate_missing_sync_parent_branches(lix, transport, &event, branch_id)
-                    .await?;
-            }
+                hydrate_missing_sync_parent_branches(lix, transport, &event, branch_id).await?;
             }
             if branch_id == GLOBAL_BRANCH_ID && !event.pack.rows.is_empty() {
                 // The wire scope has already removed application rows and
@@ -2448,7 +2307,7 @@ fn sync_file_projection_key(
         key.extend_from_slice(&length.to_be_bytes());
         key.extend_from_slice(component.as_bytes());
     }
-Ok(StorageKey(Bytes::from(key)))
+    Ok(StorageKey(Bytes::from(key)))
 }
 
 fn sync_file_projection_prefix(
@@ -2473,7 +2332,7 @@ fn sync_file_projection_prefix(
         prefix.extend_from_slice(component.as_bytes());
     }
     Ok(StoragePrefix {
-bytes: Bytes::from(prefix),
+        bytes: Bytes::from(prefix),
     })
 }
 
@@ -4882,7 +4741,11 @@ where
             // catalog immediately after the authoritative receipt. The
             // worker's periodic pass remains the retry path if this best
             // effort read races another global write.
-            if pack.rows.iter().any(|row| is_sync_control_schema(&row.schema_key)) {
+            if pack
+                .rows
+                .iter()
+                .any(|row| is_sync_control_schema(&row.schema_key))
+            {
                 let topology_session = self
                     .lix
                     .open_internal_session_suppressed(
@@ -4919,13 +4782,11 @@ where
 
     /// Continuously flushes at `interval` until `shutdown` resolves.
     ///
-    /// This polling loop is the MVP real-time motion. Admission and cursor
-    /// correctness remain in [`Self::flush`], so a later push notification or
-    /// subscription can wake the same state machine without changing it.
-    #[cfg(not(target_family = "wasm"))]
+    /// This compatibility helper is for explicit/manual clients. Lifecycle
+    /// sync mode uses the shared cancellable long-poll runtime instead.
     pub async fn run_polling_until<Shutdown>(
         &mut self,
-interval: Duration,
+        interval: Duration,
         shutdown: Shutdown,
     ) -> Result<(), LixError>
     where
@@ -4948,9 +4809,12 @@ interval: Duration,
             {
                 return Err(error);
             }
-            let delay = Box::pin(tokio::time::sleep(interval));
+            let delay = Box::pin(platform::deadline(interval));
             match select(delay, shutdown).await {
-                Either::Left(((), pending_shutdown)) => shutdown = pending_shutdown,
+                Either::Left((result, pending_shutdown)) => {
+                    result?;
+                    shutdown = pending_shutdown;
+                }
                 Either::Right(((), _pending_delay)) => return Ok(()),
             }
         }
@@ -6179,7 +6043,7 @@ fn sync_client_state_key(remote_id: &str, branch_id: &str) -> StorageKey {
             .to_be_bytes(),
     );
     key.extend_from_slice(branch);
-StorageKey(Bytes::from(key))
+    StorageKey(Bytes::from(key))
 }
 
 fn sync_client_pending_key(remote_id: &str, branch_id: &str, operation_id: &str) -> StorageKey {
@@ -6205,7 +6069,7 @@ fn sync_client_pending_key(remote_id: &str, branch_id: &str, operation_id: &str)
             .to_be_bytes(),
     );
     key.extend_from_slice(operation);
-StorageKey(Bytes::from(key))
+    StorageKey(Bytes::from(key))
 }
 
 fn sync_client_applied_key(remote_id: &str, branch_id: &str, scope: &str) -> StorageKey {
@@ -6221,7 +6085,7 @@ fn sync_client_applied_key(remote_id: &str, branch_id: &str, scope: &str) -> Sto
         );
         key.extend_from_slice(component);
     }
-StorageKey(Bytes::from(key))
+    StorageKey(Bytes::from(key))
 }
 
 /// Loads the receipt that protects a canonical event from being applied twice
@@ -6451,7 +6315,7 @@ fn marker_covers_event(
 }
 
 fn sync_replica_config_key(remote_id: &str) -> StorageKey {
-StorageKey(Bytes::copy_from_slice(remote_id.as_bytes()))
+    StorageKey(Bytes::copy_from_slice(remote_id.as_bytes()))
 }
 
 pub(crate) fn stage_sync_event_publication(
@@ -7275,7 +7139,7 @@ where
 }
 
 fn sync_head_key(branch_id: &str) -> StorageKey {
-StorageKey(Bytes::copy_from_slice(branch_id.as_bytes()))
+    StorageKey(Bytes::copy_from_slice(branch_id.as_bytes()))
 }
 
 fn sync_event_key(branch_id: &str, cursor: u64) -> StorageKey {
@@ -7288,7 +7152,7 @@ fn sync_event_key(branch_id: &str, cursor: u64) -> StorageKey {
     );
     key.extend_from_slice(branch_bytes);
     key.extend_from_slice(&cursor.to_be_bytes());
-StorageKey(Bytes::from(key))
+    StorageKey(Bytes::from(key))
 }
 
 fn sync_write_batch(
@@ -8018,9 +7882,7 @@ mod tests {
             vec![CONTROL_SYNC_SCOPE.to_owned()]
         );
         assert_eq!(
-            extract_sql_scope_schema_keys(
-                "SELECT lix_active_branch_id(), value FROM project_rows"
-            ),
+            extract_sql_scope_schema_keys("SELECT lix_active_branch_id(), value FROM project_rows"),
             vec![CONTROL_SYNC_SCOPE.to_owned(), "project_rows".to_owned()]
         );
         assert_eq!(

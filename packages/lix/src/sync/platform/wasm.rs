@@ -11,14 +11,12 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::LixError;
 
-pub(super) use super::transport_wasm::HttpSyncTransport;
-
 #[derive(Debug)]
-pub(super) struct SyncTask {
+pub(in crate::sync) struct SyncTask {
     finished: Arc<AtomicBool>,
 }
 
-pub(super) fn spawn_sync_task<Worker>(worker: Worker) -> Result<SyncTask, LixError>
+pub(in crate::sync) fn spawn_sync_task<Worker>(worker: Worker) -> Result<SyncTask, LixError>
 where
     Worker: Future<Output = ()> + 'static,
 {
@@ -32,7 +30,7 @@ where
 }
 
 impl SyncTask {
-    pub(super) async fn join(&self) -> Result<(), LixError> {
+    pub(in crate::sync) async fn join(&self) -> Result<(), LixError> {
         while !self.finished.load(Ordering::Acquire) {
             sleep(Duration::from_millis(10)).await?;
         }
@@ -40,7 +38,7 @@ impl SyncTask {
     }
 }
 
-pub(super) async fn sleep(duration: Duration) -> Result<(), LixError> {
+pub(in crate::sync) async fn sleep(duration: Duration) -> Result<(), LixError> {
     let promise = Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();
         if let Ok(timer) = Reflect::get(&global, &"setTimeout".into())
@@ -60,4 +58,14 @@ pub(super) async fn sleep(duration: Duration) -> Result<(), LixError> {
         )
     })?;
     Ok(())
+}
+
+pub(in crate::sync) fn deadline(
+    duration: Duration,
+) -> impl Future<Output = Result<(), LixError>> + Send {
+    // Browser timers carry JavaScript Promise state and therefore are not
+    // marked `Send`. Browser WASM is single-threaded, while the shared Lix
+    // session surface intentionally retains its native `Send` future shape.
+    // Keep that target-specific proof at the adapter boundary.
+    unsafe { crate::session::AssumeSendFuture::new(sleep(duration)) }
 }

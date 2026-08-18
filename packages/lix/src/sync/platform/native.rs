@@ -8,16 +8,14 @@ use std::time::Duration;
 
 use crate::LixError;
 
-pub(super) use super::transport::HttpSyncTransport;
-
 #[derive(Debug)]
-pub(super) struct SyncTask {
+pub(in crate::sync) struct SyncTask {
     finished: Arc<AtomicBool>,
     finished_notify: Arc<tokio::sync::Notify>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-pub(super) fn spawn_sync_task<Worker>(worker: Worker) -> Result<SyncTask, LixError>
+pub(in crate::sync) fn spawn_sync_task<Worker>(worker: Worker) -> Result<SyncTask, LixError>
 where
     Worker: Future<Output = ()> + Send + 'static,
 {
@@ -58,7 +56,7 @@ where
 }
 
 impl SyncTask {
-    pub(super) async fn join(&self) -> Result<(), LixError> {
+    pub(in crate::sync) async fn join(&self) -> Result<(), LixError> {
         loop {
             let notified = self.finished_notify.notified();
             if self.finished.load(Ordering::Acquire) {
@@ -85,9 +83,15 @@ impl SyncTask {
     }
 }
 
-pub(super) async fn sleep(duration: Duration) -> Result<(), LixError> {
+pub(in crate::sync) async fn sleep(duration: Duration) -> Result<(), LixError> {
     tokio::time::sleep(duration).await;
     Ok(())
+}
+
+pub(in crate::sync) fn deadline(
+    duration: Duration,
+) -> impl Future<Output = Result<(), LixError>> + Send {
+    sleep(duration)
 }
 
 struct WorkerDone {
