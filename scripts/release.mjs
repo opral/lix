@@ -470,6 +470,20 @@ export function updatePackageVersion(root, version) {
 	}
 }
 
+export function updateCargoLockfiles(root, { runCargo = execFileSync } = {}) {
+	for (const manifestPath of ["Cargo.toml", "tooling/Cargo.toml"]) {
+		if (!existsSync(join(root, manifestPath))) continue;
+		runCargo(
+			"cargo",
+			["update", "--workspace", "--manifest-path", manifestPath],
+			{
+				cwd: root,
+				stdio: "inherit",
+			},
+		);
+	}
+}
+
 export function updateChangelog(root, version, date, changes) {
 	const path = "CHANGELOG.md";
 	const existing = existsSync(join(root, path)) ? readText(root, path).trimEnd() : "# Changelog\n";
@@ -495,10 +509,7 @@ export function prepareRelease(root, { date = new Date().toISOString().slice(0, 
 	for (const change of changes) {
 		rmSync(join(root, change.path));
 	}
-	execFileSync("cargo", ["update", "--workspace"], {
-		cwd: root,
-		stdio: "inherit",
-	});
+	updateCargoLockfiles(root);
 	return { version, type, changes };
 }
 

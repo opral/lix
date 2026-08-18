@@ -7,6 +7,7 @@ on:
       - main
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -53,6 +54,13 @@ jobs:
 
             Merging this PR updates `CHANGELOG.md`, bumps lockstep package versions,
             and enables the release workflow to create `v${{ steps.prepare.outputs.version }}` and publish packages.
+
+      - name: Run CI for release changes
+        if: steps.prepare.outputs.has_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_BRANCH: release/v${{ steps.prepare.outputs.version }}
+        run: gh workflow run ci.yml --ref "$TARGET_BRANCH"
 
       - name: Close superseded release PRs
         if: steps.prepare.outputs.has_release == 'true'
