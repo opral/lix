@@ -132,7 +132,7 @@ where
                     self.kind,
                 ),
                 move |(active_branch_id, branch_ref, _commit_graph, store, schema, route, kind)| async move {
-                    if route.contradictory {
+                    if limit == Some(0) || route.contradictory {
                         return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
                             .map_err(batch_error);
