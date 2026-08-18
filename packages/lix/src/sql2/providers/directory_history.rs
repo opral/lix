@@ -24,7 +24,7 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-    HISTORY_COL_ROW_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ROW_PK,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes, validate_history_anchor_filter,
@@ -130,14 +130,18 @@ where
                     metadata_projection,
                 ),
                 |(commit_graph, query_source, schema, route, limit, metadata_projection)| async move {
-                    let mut rows = load_directory_history_rows(
-                        commit_graph,
-                        query_source,
-                        &route,
-                        metadata_projection,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+                    let mut rows = if limit == Some(0) {
+                        Vec::new()
+                    } else {
+                        load_directory_history_rows(
+                            commit_graph,
+                            query_source,
+                            &route,
+                            metadata_projection,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                    };
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
