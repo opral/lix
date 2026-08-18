@@ -1,0 +1,75 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/wikilinks.rs
+role: upstream-input
+count: 17
+profiles: wikilink-after,wikilink-before
+
+--- case 1 profile wikilink-after bytes 60
+This is [[&lt;script&gt;alert(0)&lt;/script&gt;|a &lt;link]]
+--- end
+--- case 2 profile wikilink-before bytes 60
+This is [[a &lt;link|&lt;script&gt;alert(0)&lt;/script&gt;]]
+--- end
+--- case 3 profile wikilink-after bytes 91
+[[http:'"injected=attribute&gt;&lt;img/src="0"onerror="alert(0)"&gt;https://example.com|a]]
+--- end
+--- case 4 profile wikilink-before bytes 91
+[[a|http:'"injected=attribute&gt;&lt;img/src="0"onerror="alert(0)"&gt;https://example.com]]
+--- end
+--- case 5 profile wikilink-after bytes 153
+<i>[['"&gt;&lt;svg&gt;&lt;i/class=gl-show-field-errors&gt;&lt;input/title="&lt;script&gt;alert(0)&lt;/script&gt;"/&gt;&lt;/svg&gt;https://example.com|a]]
+--- end
+--- case 6 profile wikilink-before bytes 153
+<i>[[a|'"&gt;&lt;svg&gt;&lt;i/class=gl-show-field-errors&gt;&lt;input/title="&lt;script&gt;alert(0)&lt;/script&gt;"/&gt;&lt;/svg&gt;https://example.com]]
+--- end
+--- case 7 profile wikilink-before bytes 39
+[[Name \[of\] page|http://example.com]]
+--- end
+--- case 8 profile wikilink-after bytes 22
+[[http://example.com]]
+--- end
+--- case 9 profile wikilink-before bytes 22
+[[http://example.com]]
+--- end
+--- case 10 profile wikilink-after bytes 36
+| header  |
+| ------- |
+| [[url]] |
+
+--- end
+--- case 11 profile wikilink-before bytes 36
+| header  |
+| ------- |
+| [[url]] |
+
+--- end
+--- case 12 profile wikilink-after bytes 47
+| header  |
+| ------- |
+| [[url|link label]] |
+
+--- end
+--- case 13 profile wikilink-before bytes 47
+| header  |
+| ------- |
+| [[link label|url]] |
+
+--- end
+--- case 14 profile wikilink-after bytes 44
+This [[http://example.com|link label]] that
+
+--- end
+--- case 15 profile wikilink-before bytes 44
+This [[link label|http://example.com]] that
+
+--- end
+--- case 16 profile wikilink-before bytes 33
+This [[http://example.com]] that
+
+--- end
+--- case 17 profile wikilink-before bytes 45
+This [[link\[label|http://example.com]] that
+
+--- end

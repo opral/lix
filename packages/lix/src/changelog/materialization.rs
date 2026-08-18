@@ -289,14 +289,12 @@ where
     if json_refs.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(JsonStoreContext::new()
-        .load_bytes_many(
-            store,
-            JsonLoadRequestRef {
-                refs: json_refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            },
-        )
+    let mut reader = JsonStoreContext::new().reader(store);
+    Ok(reader
+        .load_bytes_many(JsonLoadRequestRef {
+            refs: json_refs,
+            scope: JsonReadScopeRef::OutOfBand,
+        })
         .await?
         .into_values())
 }

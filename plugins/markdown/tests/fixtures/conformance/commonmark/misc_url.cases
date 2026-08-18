@@ -1,0 +1,39 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: misc_url
+count: 5
+
+--- case 1 options - label-bytes 54 input-bytes 11 expected-bytes 42
+should support incorrect percentage encoded values (0)
+--- input
+<https://%>
+--- expected
+<p><a href="https://%25">https://%</a></p>
+--- end
+--- case 2 options - label-bytes 54 input-bytes 7 expected-bytes 25
+should support incorrect percentage encoded values (1)
+--- input
+[](<%>)
+--- expected
+<p><a href="%25"></a></p>
+--- end
+--- case 3 options - label-bytes 54 input-bytes 10 expected-bytes 28
+should support incorrect percentage encoded values (2)
+--- input
+[](<%%20>)
+--- expected
+<p><a href="%25%20"></a></p>
+--- end
+--- case 4 options - label-bytes 54 input-bytes 11 expected-bytes 29
+should support incorrect percentage encoded values (3)
+--- input
+[](<%a%20>)
+--- expected
+<p><a href="%25a%20"></a></p>
+--- end
+--- case 5 options - label-bytes 23 input-bytes 10 expected-bytes 34
+should support an emoji
+--- input
+[](<🤔>)
+--- expected
+<p><a href="%F0%9F%A4%94"></a></p>
+--- end

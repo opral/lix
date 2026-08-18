@@ -1,0 +1,25 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: misc_dangerous_html
+count: 3
+
+--- case 1 options - label-bytes 34 input-bytes 3 expected-bytes 9
+should be safe by default for flow
+--- input
+<x>
+--- expected
+&lt;x&gt;
+--- end
+--- case 2 options - label-bytes 34 input-bytes 4 expected-bytes 17
+should be safe by default for text
+--- input
+a<b>
+--- expected
+<p>a&lt;b&gt;</p>
+--- end
+--- case 3 options allow_dangerous_html,allow_dangerous_protocol label-bytes 40 input-bytes 3 expected-bytes 3
+should be unsafe w/ `allowDangerousHtml`
+--- input
+<x>
+--- expected
+<x>
+--- end

@@ -1,0 +1,37 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/front_matter.rs
+role: upstream-input
+count: 4
+profiles: frontmatter
+
+--- case 1 profile frontmatter bytes 22
+q
+layout: post
+q
+Text
+
+--- end
+--- case 2 profile frontmatter bytes 26
+---
+a: b
+---
+
+hello world
+
+--- end
+--- case 3 profile frontmatter bytes 26
+q
+layout: post
+q
+Text
+
+--- end
+--- case 4 profile frontmatter bytes 24
+Ӽ
+layout: post
+Ӽ
+Text
+
+--- end

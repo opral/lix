@@ -1,0 +1,13 @@
+Document
+  Paragraph
+    Text "Visit "
+    Autolink "https://a.bc/d/e/" kind=gfm-literal original="https://a.bc/d/e/"
+    Text ")."
+    SoftBreak
+    Text "Pokemon "
+    Autolink "http://www.pokemon.com/Pikachu_(Electric)" kind=gfm-literal original="http://www.pokemon.com/Pikachu_(Electric)"
+    Text ") ok"
+    SoftBreak
+    Text "Balanced "
+    Autolink "http://www.pokemon.com/Pikachu_((Electric))" kind=gfm-literal original="http://www.pokemon.com/Pikachu_((Electric))"
+    Text " ok"

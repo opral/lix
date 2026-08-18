@@ -1,0 +1,27 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: insert
+count: 1
+
+--- case 1 options extension.insert label-bytes 6 input-bytes 149 expected-bytes 219
+insert
+--- input
+This is ++important!++.
+
+This is ++very important++ OK?
+
+++It is a 
+ shrubbery++
+
+Vendo ++Opel Corsa **em bom estado**++
+
+Ceci n'est pas +important+
+
+--- expected
+<p>This is <ins>important!</ins>.</p>
+<p>This is <ins>very important</ins> OK?</p>
+<p><ins>It is a
+shrubbery</ins></p>
+<p>Vendo <ins>Opel Corsa <strong>em bom estado</strong></ins></p>
+<p>Ceci n'est pas +important+</p>
+
+--- end

@@ -1,0 +1,352 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: misc_tabs
+count: 44
+
+--- case 1 options - label-bytes 35 input-bytes 5 expected-bytes 26
+should support a 4*SP to start code
+--- input
+    x
+--- expected
+<pre><code>x
+</code></pre>
+--- end
+--- case 2 options - label-bytes 33 input-bytes 2 expected-bytes 26
+should support a HT to start code
+--- input
+	x
+--- expected
+<pre><code>x
+</code></pre>
+--- end
+--- case 3 options - label-bytes 38 input-bytes 3 expected-bytes 26
+should support a SP + HT to start code
+--- input
+ 	x
+--- expected
+<pre><code>x
+</code></pre>
+--- end
+--- case 4 options - label-bytes 40 input-bytes 4 expected-bytes 26
+should support a 2*SP + HT to start code
+--- input
+  	x
+--- expected
+<pre><code>x
+</code></pre>
+--- end
+--- case 5 options - label-bytes 40 input-bytes 5 expected-bytes 26
+should support a 3*SP + HT to start code
+--- input
+   	x
+--- expected
+<pre><code>x
+</code></pre>
+--- end
+--- case 6 options - label-bytes 71 input-bytes 6 expected-bytes 27
+should support a 4*SP to start code, and leave the next HT as code data
+--- input
+    	x
+--- expected
+<pre><code>	x
+</code></pre>
+--- end
+--- case 7 options - label-bytes 54 input-bytes 7 expected-bytes 28
+should not support a 3*SP + HT to start an ATX heading
+--- input
+   	# x
+--- expected
+<pre><code># x
+</code></pre>
+--- end
+--- case 8 options - label-bytes 53 input-bytes 7 expected-bytes 31
+should not support a 3*SP + HT to start a block quote
+--- input
+   	> x
+--- expected
+<pre><code>&gt; x
+</code></pre>
+--- end
+--- case 9 options - label-bytes 51 input-bytes 7 expected-bytes 28
+should not support a 3*SP + HT to start a list item
+--- input
+   	- x
+--- expected
+<pre><code>- x
+</code></pre>
+--- end
+--- case 10 options - label-bytes 56 input-bytes 7 expected-bytes 28
+should not support a 3*SP + HT to start a thematic break
+--- input
+   	---
+--- expected
+<pre><code>---
+</code></pre>
+--- end
+--- case 11 options - label-bytes 53 input-bytes 7 expected-bytes 28
+should not support a 3*SP + HT to start a fenced code
+--- input
+   	```
+--- expected
+<pre><code>```
+</code></pre>
+--- end
+--- case 12 options - label-bytes 44 input-bytes 9 expected-bytes 36
+should not support a 3*SP + HT to start HTML
+--- input
+   	<div>
+--- expected
+<pre><code>&lt;div&gt;
+</code></pre>
+--- end
+--- case 13 options - label-bytes 48 input-bytes 6 expected-bytes 10
+should support tabs around ATX heading sequences
+--- input
+#	x	#	
+--- expected
+<h1>x</h1>
+--- end
+--- case 14 options - label-bytes 58 input-bytes 9 expected-bytes 10
+should support arbitrary tabs around ATX heading sequences
+--- input
+#		x		#		
+--- expected
+<h1>x</h1>
+--- end
+--- case 15 options - label-bytes 61 input-bytes 13 expected-bytes 43
+should support tabs around fenced code fences, info, and meta
+--- input
+```	x	y	
+```	
+--- expected
+<pre><code class="language-x"></code></pre>
+--- end
+--- case 16 options - label-bytes 71 input-bytes 17 expected-bytes 43
+should support arbitrary tabs around fenced code fences, info, and meta
+--- input
+```		x		y		
+```		
+--- expected
+<pre><code class="language-x"></code></pre>
+--- end
+--- case 17 options - label-bytes 57 input-bytes 9 expected-bytes 49
+should not support tabs before fenced code closing fences
+--- input
+```x
+	```
+--- expected
+<pre><code class="language-x">	```
+</code></pre>
+
+--- end
+--- case 18 options allow_dangerous_html,allow_dangerous_protocol label-bytes 54 input-bytes 15 expected-bytes 15
+should support tabs in HTML (if whitespace is allowed)
+--- input
+<x	y	z	=	"	x	">
+--- expected
+<x	y	z	=	"	x	">
+--- end
+--- case 19 options - label-bytes 38 input-bytes 6 expected-bytes 6
+should support tabs in thematic breaks
+--- input
+*	*	*	
+--- expected
+<hr />
+--- end
+--- case 20 options - label-bytes 48 input-bytes 9 expected-bytes 6
+should support arbitrary tabs in thematic breaks
+--- input
+*		*		*		
+--- expected
+<hr />
+--- end
+--- case 21 options - label-bytes 66 input-bytes 8 expected-bytes 21
+should not support a tab to start an autolink w/ protocol’s rest
+--- input
+<http:	>
+--- expected
+<p>&lt;http:	&gt;</p>
+--- end
+--- case 22 options - label-bytes 60 input-bytes 9 expected-bytes 22
+should not support a tab in an autolink w/ protocol’s rest
+--- input
+<http:x	>
+--- expected
+<p>&lt;http:x	&gt;</p>
+--- end
+--- case 23 options - label-bytes 60 input-bytes 16 expected-bytes 29
+should not support a tab in an email autolink’s local part
+--- input
+<example	@x.com>
+--- expected
+<p>&lt;example	@x.com&gt;</p>
+--- end
+--- case 24 options - label-bytes 55 input-bytes 17 expected-bytes 30
+should not support a tab in an email autolink’s label
+--- input
+<example@x	y.com>
+--- expected
+<p>&lt;example@x	y.com&gt;</p>
+--- end
+--- case 25 options - label-bytes 40 input-bytes 3 expected-bytes 10
+should not support character escaped tab
+--- input
+\	x
+--- expected
+<p>\	x</p>
+--- end
+--- case 26 options - label-bytes 53 input-bytes 4 expected-bytes 8
+should support character reference resolving to a tab
+--- input
+&#9;
+--- expected
+<p>	</p>
+--- end
+--- case 27 options - label-bytes 34 input-bytes 4 expected-bytes 22
+should support a tab starting code
+--- input
+`	x`
+--- expected
+<p><code>	x</code></p>
+--- end
+--- case 28 options - label-bytes 32 input-bytes 4 expected-bytes 22
+should support a tab ending code
+--- input
+`x	`
+--- expected
+<p><code>x	</code></p>
+--- end
+--- case 29 options - label-bytes 31 input-bytes 5 expected-bytes 23
+should support tabs around code
+--- input
+`	x	`
+--- expected
+<p><code>	x	</code></p>
+--- end
+--- case 30 options - label-bytes 55 input-bytes 5 expected-bytes 23
+should support a tab starting, and a space ending, code
+--- input
+`	x `
+--- expected
+<p><code>	x </code></p>
+--- end
+--- case 31 options - label-bytes 55 input-bytes 5 expected-bytes 23
+should support a space starting, and a tab ending, code
+--- input
+` x	`
+--- expected
+<p><code> x	</code></p>
+--- end
+--- case 32 options - label-bytes 61 input-bytes 4 expected-bytes 10
+should support a trailing tab at a line ending in a paragraph
+--- input
+x	
+y
+--- expected
+<p>x
+y</p>
+--- end
+--- case 33 options - label-bytes 64 input-bytes 4 expected-bytes 10
+should support an initial tab after a line ending in a paragraph
+--- input
+x
+	y
+--- expected
+<p>x
+y</p>
+--- end
+--- case 34 options - label-bytes 45 input-bytes 8 expected-bytes 26
+should support an initial tab in a link label
+--- input
+x[	y](z)
+--- expected
+<p>x<a href="z">	y</a></p>
+--- end
+--- case 35 options - label-bytes 42 input-bytes 8 expected-bytes 26
+should support a final tab in a link label
+--- input
+x[y	](z)
+--- expected
+<p>x<a href="z">y	</a></p>
+--- end
+--- case 36 options - label-bytes 36 input-bytes 8 expected-bytes 26
+should support a tab in a link label
+--- input
+[x	y](z)
+--- expected
+<p><a href="z">x	y</a></p>
+--- end
+--- case 37 options - label-bytes 45 input-bytes 7 expected-bytes 24
+should support a tab starting a link resource
+--- input
+[x](	y)
+--- expected
+<p><a href="y">x</a></p>
+--- end
+--- case 38 options - label-bytes 43 input-bytes 7 expected-bytes 24
+should support a tab ending a link resource
+--- input
+[x](y	)
+--- expected
+<p><a href="y">x</a></p>
+--- end
+--- case 39 options - label-bytes 57 input-bytes 10 expected-bytes 34
+should support a tab between a link destination and title
+--- input
+[x](y	"z")
+--- expected
+<p><a href="y" title="z">x</a></p>
+--- end
+--- case 40 options - label-bytes 35 input-bytes 6 expected-bytes 28
+should support a tab in fenced code
+--- input
+```
+	x
+--- expected
+<pre><code>	x
+</code></pre>
+
+--- end
+--- case 41 options - label-bytes 96 input-bytes 7 expected-bytes 30
+should strip 1 space from an initial tab in fenced code if the opening fence is indented as such
+--- input
+ ```
+	x
+--- expected
+<pre><code>   x
+</code></pre>
+
+--- end
+--- case 42 options - label-bytes 97 input-bytes 8 expected-bytes 29
+should strip 2 spaces from an initial tab in fenced code if the opening fence is indented as such
+--- input
+  ```
+	x
+--- expected
+<pre><code>  x
+</code></pre>
+
+--- end
+--- case 43 options - label-bytes 97 input-bytes 9 expected-bytes 28
+should strip 3 spaces from an initial tab in fenced code if the opening fence is indented as such
+--- input
+   ```
+	x
+--- expected
+<pre><code> x
+</code></pre>
+
+--- end
+--- case 44 options - label-bytes 76 input-bytes 7 expected-bytes 40
+should support a part of a tab as a container, and the rest of a tab as flow
+--- input
+-	a
+
+	b
+--- expected
+<ul>
+<li>
+<p>a</p>
+<p>	b</p>
+</li>
+</ul>
+--- end

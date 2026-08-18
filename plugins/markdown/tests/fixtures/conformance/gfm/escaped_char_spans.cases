@@ -1,0 +1,20 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: escaped_char_spans
+count: 2
+
+--- case 1 options - label-bytes 29 input-bytes 6 expected-bytes 13
+disabled_escaped_char_spans#0
+--- input
+\@user
+--- expected
+<p>@user</p>
+
+--- end
+--- case 2 options - label-bytes 29 input-bytes 10 expected-bytes 17
+disabled_escaped_char_spans#1
+--- input
+This\@that
+--- expected
+<p>This@that</p>
+
+--- end

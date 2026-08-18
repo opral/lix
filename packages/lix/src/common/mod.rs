@@ -12,9 +12,9 @@ pub(crate) mod wire;
 
 pub use error::LixError;
 pub(crate) use exact_batch::{ExactBatch, ExactValue};
-pub use execution_metadata::{
-    ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
-};
+pub use execution_metadata::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
+#[cfg(feature = "server-protocol")]
+pub(crate) use execution_metadata::VerifiedRequestBlob;
 pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};
 pub(crate) use json_pointer::format_json_pointer;

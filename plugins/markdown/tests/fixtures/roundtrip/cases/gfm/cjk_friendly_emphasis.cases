@@ -1,0 +1,80 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/cjk_friendly_emphasis.rs
+role: upstream-input
+count: 4
+profiles: commonmark,gfm
+
+--- case 1 profile commonmark bytes 222
+**이 [링크](https://example.kr/)**만을 강조하고 싶다.
+
+**스크립트(script)**라고
+
+패키지를 발행하려면 **`npm publish`**를 실행하십시오.
+
+**안녕(hello)**하세요.
+
+ᅡ**(a)**
+
+**(k)**ᄏ
+
+
+--- end
+--- case 2 profile commonmark bytes 250
+__注意__：注意事項
+
+注意：__注意事項__
+
+正體字。︁_Traditional._
+
+正體字。︁__Hong Kong and Taiwan.__
+
+简体字 / 新字体。︀_Simplified._
+
+简体字 / 新字体。︀__Mainland China or Japan.__
+
+“︁Git”︁__Hub__
+
+
+--- end
+--- case 3 profile gfm bytes 179
+a~~a()~~あ
+
+あ~~()a~~a
+
+𩸽~~()a~~a
+
+a~~a()~~𩸽
+
+葛󠄀~~()a~~a
+
+羽︀~~()a~~a
+
+a~~「a~~」
+
+「~~a」~~a
+
+~~a~~：~~a~~
+
+~~日本語。︀~~English.
+
+~~“︁a”︁~~a
+
+
+--- end
+--- case 4 profile commonmark bytes 68
+a**〰**a
+
+a**〽**a
+
+a**🈂**a
+
+a**🈷**a
+
+a**㊗**a
+
+a**㊙**a
+
+
+--- end

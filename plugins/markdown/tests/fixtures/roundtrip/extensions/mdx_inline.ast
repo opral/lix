@@ -1,0 +1,9 @@
+Document
+  Paragraph
+    Text "A "
+    MdxExpression "a ? {b: '}'} : c"
+    Text " value."
+    SoftBreak
+    Text "Comment "
+    MdxExpression "/* } */ ok"
+    Text " done."

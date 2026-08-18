@@ -1,0 +1,1704 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/gfm_autolink_literal.rs
+role: upstream-input
+count: 61
+profiles: commonmark,gfm
+
+--- case 1 profile commonmark bytes 19
+https://example.com
+--- end
+--- case 2 profile commonmark bytes 15
+www.example.com
+--- end
+--- case 3 profile commonmark bytes 16
+user@example.com
+--- end
+--- case 4 profile gfm bytes 19
+https://example.com
+--- end
+--- case 5 profile gfm bytes 15
+www.example.com
+--- end
+--- case 6 profile gfm bytes 16
+user@example.com
+--- end
+--- case 7 profile gfm bytes 26
+[https://example.com](xxx)
+--- end
+--- case 8 profile gfm bytes 22
+[www.example.com](xxx)
+--- end
+--- case 9 profile gfm bytes 23
+[user@example.com](xxx)
+--- end
+--- case 10 profile gfm bytes 7
+www.a.)
+--- end
+--- case 11 profile gfm bytes 7
+www.a b
+--- end
+--- case 12 profile gfm bytes 9
+www.a/b c
+--- end
+--- case 13 profile gfm bytes 8
+www.�a
+--- end
+--- case 14 profile gfm bytes 17
+http://點看.com
+--- end
+--- case 15 profile gfm bytes 14
+www.點看.com
+--- end
+--- case 16 profile gfm bytes 18
+點看@example.com
+--- end
+--- case 17 profile gfm bytes 18
+example@點看.com
+--- end
+--- case 18 profile gfm bytes 16
+www.a.com/點看
+--- end
+--- case 19 profile gfm bytes 8
+www.-a.b
+--- end
+--- case 20 profile gfm bytes 5
+www.$
+--- end
+--- case 21 profile gfm bytes 10
+www.a..b.c
+--- end
+--- case 22 profile gfm bytes 8
+www.a&a;
+--- end
+--- case 23 profile gfm bytes 19
+https://a.bc/d/e/).
+--- end
+--- case 24 profile gfm bytes 19
+https://a.bc/d/e/.)
+--- end
+--- case 25 profile gfm bytes 14
+https://a.bc).
+--- end
+--- case 26 profile gfm bytes 14
+https://a.bc.)
+--- end
+--- case 27 profile gfm bytes 15
+https://a.bc).d
+--- end
+--- case 28 profile gfm bytes 15
+https://a.bc.)d
+--- end
+--- case 29 profile gfm bytes 16
+https://a.bc/))d
+--- end
+--- case 30 profile gfm bytes 15
+ftp://a/b/c.txt
+--- end
+--- case 31 profile gfm bytes 22
+，https://example.com
+--- end
+--- case 32 profile gfm bytes 22
+，example@example.com
+--- end
+--- case 33 profile gfm bytes 59
+http&#x3A;//user:password@host:port/path?key=value#fragment
+--- end
+--- case 34 profile gfm bytes 24
+http://example.com/ab<cd
+--- end
+--- case 35 profile gfm bytes 401
+
+mailto:scyther@pokemon.com
+
+This is a mailto:scyther@pokemon.com
+
+mailto:scyther@pokemon.com.
+
+mmmmailto:scyther@pokemon.com
+
+mailto:scyther@pokemon.com/
+
+mailto:scyther@pokemon.com/message
+
+mailto:scyther@pokemon.com/mailto:beedrill@pokemon.com
+
+xmpp:scyther@pokemon.com
+
+xmpp:scyther@pokemon.com.
+
+xmpp:scyther@pokemon.com/message
+
+xmpp:scyther@pokemon.com/message.
+
+Email me at:scyther@pokemon.com
+--- end
+--- case 36 profile gfm bytes 353
+
+a www.example.com&xxx;b c
+
+a www.example.com&xxx;. b
+
+a www.example.com&xxxxxxxxx;. b
+
+a www.example.com&xxxxxxxxxx;. b
+
+a www.example.com&xxxxxxxxxxx;. b
+
+a www.example.com&xxx. b
+
+a www.example.com&#123. b
+
+a www.example.com&123. b
+
+a www.example.com&x. b
+
+a www.example.com&#1. b
+
+a www.example.com&1. b
+
+a www.example.com&. b
+
+a www.example.com& b
+
+--- end
+--- case 37 profile gfm bytes 299
+
+[ www.example.com
+
+[ https://example.com
+
+[ contact@example.com
+
+[ www.example.com ]
+
+[ https://example.com ]
+
+[ contact@example.com ]
+
+[ www.example.com ](#)
+
+[ https://example.com ](#)
+
+[ contact@example.com ](#)
+
+![ www.example.com ](#)
+
+![ https://example.com ](#)
+
+![ contact@example.com ](#)
+
+--- end
+--- case 38 profile gfm bytes 434
+
+www.example.com/?=a(b)cccccc
+
+www.example.com/?=a(b(c)ccccc
+
+www.example.com/?=a(b(c)c)cccc
+
+www.example.com/?=a(b(c)c)c)ccc
+
+www.example.com/?q=a(business)
+
+www.example.com/?q=a(business)))
+
+(www.example.com/?q=a(business))
+
+(www.example.com/?q=a(business)
+
+www.example.com/?q=a(business)".
+
+www.example.com/?q=a(business)))
+
+(www.example.com/?q=a(business))".
+
+(www.example.com/?q=a(business)".)
+
+(www.example.com/?q=a(business)".
+
+--- end
+--- case 39 profile gfm bytes 1749
+
+# Literal autolinks
+
+## WWW autolinks
+
+w.commonmark.org
+
+ww.commonmark.org
+
+www.commonmark.org
+
+Www.commonmark.org
+
+wWw.commonmark.org
+
+wwW.commonmark.org
+
+WWW.COMMONMARK.ORG
+
+Visit www.commonmark.org/help for more information.
+
+Visit www.commonmark.org.
+
+Visit www.commonmark.org/a.b.
+
+www.aaa.bbb.ccc_ccc
+
+www.aaa_bbb.ccc
+
+www.aaa.bbb.ccc.ddd_ddd
+
+www.aaa.bbb.ccc_ccc.ddd
+
+www.aaa.bbb_bbb.ccc.ddd
+
+www.aaa_aaa.bbb.ccc.ddd
+
+Visit www.commonmark.org.
+
+Visit www.commonmark.org/a.b.
+
+www.google.com/search?q=Markup+(business)
+
+www.google.com/search?q=Markup+(business)))
+
+(www.google.com/search?q=Markup+(business))
+
+(www.google.com/search?q=Markup+(business)
+
+www.google.com/search?q=(business))+ok
+
+www.google.com/search?q=commonmark&hl=en
+
+www.google.com/search?q=commonmark&hl;en
+
+www.google.com/search?q=commonmark&hl;
+
+www.commonmark.org/he<lp
+
+## HTTP autolinks
+
+hexample.com
+
+htexample.com
+
+httexample.com
+
+httpexample.com
+
+http:example.com
+
+http:/example.com
+
+https:/example.com
+
+http://example.com
+
+https://example.com
+
+https://example
+
+http://commonmark.org
+
+(Visit https://encrypted.google.com/search?q=Markup+(business))
+
+## Email autolinks
+
+No dot: foo@barbaz
+
+No dot: foo@barbaz.
+
+foo@bar.baz
+
+hello@mail+xyz.example isn’t valid, but hello+xyz@mail.example is.
+
+a.b-c_d@a.b
+
+a.b-c_d@a.b.
+
+a.b-c_d@a.b-
+
+a.b-c_d@a.b_
+
+a@a_b.c
+
+a@a-b.c
+
+Can’t end in an underscore followed by a period: aaa@a.b_.
+
+Can contain an underscore followed by a period: aaa@a.b_.c
+
+## Link text should not be expanded
+
+[Visit www.example.com](http://www.example.com) please.
+
+[Visit http://www.example.com](http://www.example.com) please.
+
+[Mail example@example.com](mailto:example@example.com) please.
+
+[link]() <http://autolink> should still be expanded.
+
+--- end
+--- case 40 profile gfm bytes 299
+H0.
+
+[https://a.com&copy;b
+
+[www.a.com&copy;b
+
+H1.
+
+[]https://a.com&copy;b
+
+[]www.a.com&copy;b
+
+H2.
+
+[] https://a.com&copy;b
+
+[] www.a.com&copy;b
+
+H3.
+
+[[https://a.com&copy;b
+
+[[www.a.com&copy;b
+
+H4.
+
+[[]https://a.com&copy;b
+
+[[]www.a.com&copy;b
+
+H5.
+
+[[]]https://a.com&copy;b
+
+[[]]www.a.com&copy;b
+
+--- end
+--- case 41 profile gfm bytes 515
+Image start.
+
+![https://a.com
+
+![http://a.com
+
+![www.a.com
+
+![a@b.c
+
+Image start and label end.
+
+![https://a.com]
+
+![http://a.com]
+
+![www.a.com]
+
+![a@b.c]
+
+Image label with reference (note: GH cleans hashes here, but we keep them in).
+
+![https://a.com][x]
+
+![http://a.com][x]
+
+![www.a.com][x]
+
+![a@b.c][x]
+
+[x]: #
+
+Image label with resource.
+
+![https://a.com]()
+
+![http://a.com]()
+
+![www.a.com]()
+
+![a@b.c]()
+
+Autolink literal after image.
+
+![a]() https://a.com
+
+![a]() http://a.com
+
+![a]() www.a.com
+
+![a]() a@b.c
+
+--- end
+--- case 42 profile gfm bytes 1060
+Link start.
+
+[https://a.com
+
+[http://a.com
+
+[www.a.com
+
+[a@b.c
+
+Label end.
+
+https://a.com]
+
+http://a.com]
+
+www.a.com]
+
+a@b.c]
+
+Link start and label end.
+
+[https://a.com]
+
+[http://a.com]
+
+[www.a.com]
+
+[a@b.c]
+
+What naïvely seems like a label end (A).
+
+https://a.com`]`
+
+http://a.com`]`
+
+www.a.com`]`
+
+a@b.c`]`
+
+Link start and what naïvely seems like a balanced brace (B).
+
+[https://a.com`]`
+
+[http://a.com`]`
+
+[www.a.com`]`
+
+[a@b.c`]`
+
+What naïvely seems like a label end (C).
+
+https://a.com `]`
+
+http://a.com `]`
+
+www.a.com `]`
+
+a@b.c `]`
+
+Link start and what naïvely seems like a balanced brace (D).
+
+[https://a.com `]`
+
+[http://a.com `]`
+
+[www.a.com `]`
+
+[a@b.c `]`
+
+Link label with reference.
+
+[https://a.com][x]
+
+[http://a.com][x]
+
+[www.a.com][x]
+
+[a@b.c][x]
+
+[x]: #
+
+Link label with resource.
+
+[https://a.com]()
+
+[http://a.com]()
+
+[www.a.com]()
+
+[a@b.c]()
+
+More in link.
+
+[a https://b.com c]()
+
+[a http://b.com c]()
+
+[a www.b.com c]()
+
+[a b@c.d e]()
+
+Autolink literal after link.
+
+[a]() https://a.com
+
+[a]() http://a.com
+
+[a]() www.a.com
+
+[a]() a@b.c
+
+--- end
+--- case 43 profile gfm bytes 374
+# “character reference”
+
+www.a&b (space)
+
+www.a&b!
+
+www.a&b"
+
+www.a&b#
+
+www.a&b$
+
+www.a&b%
+
+www.a&b&
+
+www.a&b'
+
+www.a&b(
+
+www.a&b)
+
+www.a&b*
+
+www.a&b+
+
+www.a&b,
+
+www.a&b-
+
+www.a&b
+
+www.a&b.
+
+www.a&b/
+
+www.a&b:
+
+www.a&b;
+
+www.a&b<
+
+www.a&b=
+
+www.a&b>
+
+www.a&b?
+
+www.a&b@
+
+www.a&b[
+
+www.a&b\
+
+www.a&b]
+
+www.a&b^
+
+www.a&b_
+
+www.a&b`
+
+www.a&b{
+
+www.a&b|
+
+www.a&b}
+
+www.a&b~
+
+--- end
+--- case 44 profile gfm bytes 442
+# “character reference”
+
+www.a&#35 (space)
+
+www.a&#35!
+
+www.a&#35"
+
+www.a&#35#
+
+www.a&#35$
+
+www.a&#35%
+
+www.a&#35&
+
+www.a&#35'
+
+www.a&#35(
+
+www.a&#35)
+
+www.a&#35*
+
+www.a&#35+
+
+www.a&#35,
+
+www.a&#35-
+
+www.a&#35
+
+www.a&#35.
+
+www.a&#35/
+
+www.a&#35:
+
+www.a&#35;
+
+www.a&#35<
+
+www.a&#35=
+
+www.a&#35>
+
+www.a&#35?
+
+www.a&#35@
+
+www.a&#35[
+
+www.a&#35\
+
+www.a&#35]
+
+www.a&#35^
+
+www.a&#35_
+
+www.a&#35`
+
+www.a&#35{
+
+www.a&#35|
+
+www.a&#35}
+
+www.a&#35~
+
+--- end
+--- case 45 profile gfm bytes 269
+a@0.0
+
+a@0.b
+
+a@a.29
+
+a@a.b
+
+a@0.0.c
+
+react@0.11.1
+
+react@0.12.0-rc1
+
+react@0.14.0-alpha1
+
+react@16.7.0-alpha.2
+
+react@0.0.0-experimental-aae83a4b9
+
+[ react@0.11.1
+
+[ react@0.12.0-rc1
+
+[ react@0.14.0-alpha1
+
+[ react@16.7.0-alpha.2
+
+[ react@0.0.0-experimental-aae83a4b9
+
+--- end
+--- case 46 profile gfm bytes 396
+# httpshhh? (2)
+
+http://a (space)
+
+http://a!
+
+http://a"
+
+http://a#
+
+http://a$
+
+http://a%
+
+http://a&
+
+http://a'
+
+http://a(
+
+http://a)
+
+http://a*
+
+http://a+
+
+http://a,
+
+http://a-
+
+http://a
+
+http://a.
+
+http://a/
+
+http://a:
+
+http://a;
+
+http://a<
+
+http://a=
+
+http://a>
+
+http://a?
+
+http://a@
+
+http://a[
+
+http://a\
+
+http://a]
+
+http://a^
+
+http://a_
+
+http://a`
+
+http://a{
+
+http://a|
+
+http://a}
+
+http://a~
+
+--- end
+--- case 47 profile gfm bytes 362
+# httpshhh? (1)
+
+http:// (space)
+
+http://!
+
+http://"
+
+http://#
+
+http://$
+
+http://%
+
+http://&
+
+http://'
+
+http://(
+
+http://)
+
+http://*
+
+http://+
+
+http://,
+
+http://-
+
+http://
+
+http://.
+
+http:///
+
+http://:
+
+http://;
+
+http://<
+
+http://=
+
+http://>
+
+http://?
+
+http://@
+
+http://[
+
+http://\
+
+http://]
+
+http://^
+
+http://_
+
+http://`
+
+http://{
+
+http://|
+
+http://}
+
+http://~
+
+--- end
+--- case 48 profile gfm bytes 464
+# httpshhh? (4)
+
+http://a/b (space)
+
+http://a/b!
+
+http://a/b"
+
+http://a/b#
+
+http://a/b$
+
+http://a/b%
+
+http://a/b&
+
+http://a/b'
+
+http://a/b(
+
+http://a/b)
+
+http://a/b*
+
+http://a/b+
+
+http://a/b,
+
+http://a/b-
+
+http://a/b
+
+http://a/b.
+
+http://a/b/
+
+http://a/b:
+
+http://a/b;
+
+http://a/b<
+
+http://a/b=
+
+http://a/b>
+
+http://a/b?
+
+http://a/b@
+
+http://a/b[
+
+http://a/b\
+
+http://a/b]
+
+http://a/b^
+
+http://a/b_
+
+http://a/b`
+
+http://a/b{
+
+http://a/b|
+
+http://a/b}
+
+http://a/b~
+
+--- end
+--- case 49 profile gfm bytes 430
+# httpshhh? (3)
+
+http://a/ (space)
+
+http://a/!
+
+http://a/"
+
+http://a/#
+
+http://a/$
+
+http://a/%
+
+http://a/&
+
+http://a/'
+
+http://a/(
+
+http://a/)
+
+http://a/*
+
+http://a/+
+
+http://a/,
+
+http://a/-
+
+http://a/
+
+http://a/.
+
+http://a//
+
+http://a/:
+
+http://a/;
+
+http://a/<
+
+http://a/=
+
+http://a/>
+
+http://a/?
+
+http://a/@
+
+http://a/[
+
+http://a/\
+
+http://a/]
+
+http://a/^
+
+http://a/_
+
+http://a/`
+
+http://a/{
+
+http://a/|
+
+http://a/}
+
+http://a/~
+
+--- end
+--- case 50 profile gfm bytes 158
+[www.example.com/a&copy;](#)
+
+www.example.com/a&copy;
+
+[www.example.com/a&bogus;](#)
+
+www.example.com/a&bogus;
+
+[www.example.com/a\.](#)
+
+www.example.com/a\.
+
+--- end
+--- case 51 profile gfm bytes 442
+# “character reference”
+
+www.a/b&c (space)
+
+www.a/b&c!
+
+www.a/b&c"
+
+www.a/b&c#
+
+www.a/b&c$
+
+www.a/b&c%
+
+www.a/b&c&
+
+www.a/b&c'
+
+www.a/b&c(
+
+www.a/b&c)
+
+www.a/b&c*
+
+www.a/b&c+
+
+www.a/b&c,
+
+www.a/b&c-
+
+www.a/b&c
+
+www.a/b&c.
+
+www.a/b&c/
+
+www.a/b&c:
+
+www.a/b&c;
+
+www.a/b&c<
+
+www.a/b&c=
+
+www.a/b&c>
+
+www.a/b&c?
+
+www.a/b&c@
+
+www.a/b&c[
+
+www.a/b&c\
+
+www.a/b&c]
+
+www.a/b&c^
+
+www.a/b&c_
+
+www.a/b&c`
+
+www.a/b&c{
+
+www.a/b&c|
+
+www.a/b&c}
+
+www.a/b&c~
+
+--- end
+--- case 52 profile gfm bytes 510
+# “character reference”
+
+www.a/b&#35 (space)
+
+www.a/b&#35!
+
+www.a/b&#35"
+
+www.a/b&#35#
+
+www.a/b&#35$
+
+www.a/b&#35%
+
+www.a/b&#35&
+
+www.a/b&#35'
+
+www.a/b&#35(
+
+www.a/b&#35)
+
+www.a/b&#35*
+
+www.a/b&#35+
+
+www.a/b&#35,
+
+www.a/b&#35-
+
+www.a/b&#35
+
+www.a/b&#35.
+
+www.a/b&#35/
+
+www.a/b&#35:
+
+www.a/b&#35;
+
+www.a/b&#35<
+
+www.a/b&#35=
+
+www.a/b&#35>
+
+www.a/b&#35?
+
+www.a/b&#35@
+
+www.a/b&#35[
+
+www.a/b&#35\
+
+www.a/b&#35]
+
+www.a/b&#35^
+
+www.a/b&#35_
+
+www.a/b&#35`
+
+www.a/b&#35{
+
+www.a/b&#35|
+
+www.a/b&#35}
+
+www.a/b&#35~
+
+--- end
+--- case 53 profile gfm bytes 457
+In autolink literal path or link end?
+
+[https://a.com/d]()
+
+[http://a.com/d]()
+
+[www.a.com/d]()
+
+https://a.com/d]()
+
+http://a.com/d]()
+
+www.a.com/d]()
+
+In autolink literal search or link end?
+
+[https://a.com?d]()
+
+[http://a.com?d]()
+
+[www.a.com?d]()
+
+https://a.com?d]()
+
+http://a.com?d]()
+
+www.a.com?d]()
+
+In autolink literal hash or link end?
+
+[https://a.com#d]()
+
+[http://a.com#d]()
+
+[www.a.com#d]()
+
+https://a.com#d]()
+
+http://a.com#d]()
+
+www.a.com#d]()
+
+--- end
+--- case 54 profile gfm bytes 2247
+Last non-markdown ASCII whitespace (FF): noreply@example.com, http://example.com, https://example.com, www.example.com
+
+Last non-whitespace ASCII control (US): noreply@example.com, http://example.com, https://example.com, www.example.com
+
+First punctuation after controls: !noreply@example.com, !http://example.com, !https://example.com, !www.example.com
+
+Last punctuation before digits: /noreply@example.com, /http://example.com, /https://example.com, /www.example.com
+
+First digit: 0noreply@example.com, 0http://example.com, 0https://example.com, 0www.example.com
+
+First punctuation after digits: :noreply@example.com, :http://example.com, :https://example.com, :www.example.com
+
+Last punctuation before caps: @noreply@example.com, @http://example.com, @https://example.com, @www.example.com
+
+First uppercase: Anoreply@example.com, Ahttp://example.com, Ahttps://example.com, Awww.example.com
+
+Punctuation after uppercase: \noreply@example.com, \http://example.com, \https://example.com, \www.example.com
+
+Last punctuation before lowercase (1): `noreply@example.com;
+
+(2) `http://example.com;
+
+(3) `https://example.com;
+
+(4) `www.example.com; (broken up to prevent code from forming)
+
+First lowercase: anoreply@example.com, ahttp://example.com, ahttps://example.com, awww.example.com
+
+First punctuation after lowercase: {noreply@example.com, {http://example.com, {https://example.com, {www.example.com
+
+Last punctuation: ~noreply@example.com, ~http://example.com, ~https://example.com, ~www.example.com
+
+First non-ASCII unicode whitespace (0x80): noreply@example.com, http://example.com, https://example.com, www.example.com
+
+Last non-ASCII unicode whitespace (0x3000): 　noreply@example.com, 　http://example.com, 　https://example.com, 　www.example.com
+
+First non-ASCII punctuation: ¡noreply@example.com, ¡http://example.com, ¡https://example.com, ¡www.example.com
+
+Last non-ASCII punctuation: ･noreply@example.com, ･http://example.com, ･https://example.com, ･www.example.com
+
+Some non-ascii: 中noreply@example.com, 中http://example.com, 中https://example.com, 中www.example.com
+
+Some more non-ascii: 🤷‍noreply@example.com, 🤷‍http://example.com, 🤷‍https://example.com, 🤷‍www.example.com
+
+--- end
+--- case 55 profile gfm bytes 1442
+# HTTP
+
+https://a.b can start after EOF
+
+Can start after EOL:
+https://a.b
+
+Can start after tab:	https://a.b.
+
+Can start after space: https://a.b.
+
+Can start after left paren (https://a.b.
+
+Can start after asterisk *https://a.b.
+
+Can start after underscore *_https://a.b.
+
+Can start after tilde ~https://a.b.
+
+# www
+
+www.a.b can start after EOF
+
+Can start after EOL:
+www.a.b
+
+Can start after tab:	www.a.b.
+
+Can start after space: www.a.b.
+
+Can start after left paren (www.a.b.
+
+Can start after asterisk *www.a.b.
+
+Can start after underscore *_www.a.b.
+
+Can start after tilde ~www.a.b.
+
+# Email
+
+## Correct character before
+
+a@b.c can start after EOF
+
+Can start after EOL:
+a@b.c
+
+Can start after tab:	a@b.c.
+
+Can start after space: a@b.c.
+
+Can start after left paren(a@b.c.
+
+Can start after asterisk*a@b.c.
+
+While theoretically it’s possible to start at an underscore, that underscore
+is part of the email, so it’s in fact part of the link: _a@b.c.
+
+Can start after tilde~a@b.c.
+
+## Others characters before
+
+While other characters before the email aren’t allowed by GFM, they work on
+github.com: !a@b.c, "a@b.c, #a@b.c, $a@b.c, &a@b.c, 'a@b.c, )a@b.c, +a@b.c,
+,a@b.c, -a@b.c, .a@b.c, /a@b.c, :a@b.c, ;a@b.c, <a@b.c, =a@b.c, >a@b.c, ?a@b.c,
+@a@b.c, \a@b.c, ]a@b.c, ^a@b.c, `a@b.c, {a@b.c, }a@b.c.
+
+## Commas
+
+See `https://github.com/remarkjs/remark/discussions/678`.
+
+,https://github.com
+
+[ ,https://github.com
+
+[asd] ,https://github.com
+
+--- end
+--- case 56 profile gfm bytes 289
+# wwwtf 2?
+
+www.a (space)
+
+www.a!
+
+www.a"
+
+www.a#
+
+www.a$
+
+www.a%
+
+www.a&
+
+www.a'
+
+www.a(
+
+www.a)
+
+www.a*
+
+www.a+
+
+www.a,
+
+www.a-
+
+www.a
+
+www.a.
+
+www.a/
+
+www.a:
+
+www.a;
+
+www.a<
+
+www.a=
+
+www.a>
+
+www.a?
+
+www.a@
+
+www.a[
+
+www.a\
+
+www.a]
+
+www.a^
+
+www.a_
+
+www.a`
+
+www.a{
+
+www.a|
+
+www.a}
+
+www.a~
+
+--- end
+--- case 57 profile gfm bytes 323
+# wwwtf 5?
+
+www.a. (space)
+
+www.a.!
+
+www.a."
+
+www.a.#
+
+www.a.$
+
+www.a.%
+
+www.a.&
+
+www.a.'
+
+www.a.(
+
+www.a.)
+
+www.a.*
+
+www.a.+
+
+www.a.,
+
+www.a.-
+
+www.a.
+
+www.a..
+
+www.a./
+
+www.a.:
+
+www.a.;
+
+www.a.<
+
+www.a.=
+
+www.a.>
+
+www.a.?
+
+www.a.@
+
+www.a.[
+
+www.a.\
+
+www.a.]
+
+www.a.^
+
+www.a._
+
+www.a.`
+
+www.a.{
+
+www.a.|
+
+www.a.}
+
+www.a.~
+
+--- end
+--- case 58 profile gfm bytes 253
+# wwwtf?
+
+www. (space)
+
+www.!
+
+www."
+
+www.#
+
+www.$
+
+www.%
+
+www.&
+
+www.'
+
+www.(
+
+www.)
+
+www.*
+
+www.+
+
+www.,
+
+www.-
+
+www.
+
+www..
+
+www./
+
+www.:
+
+www.;
+
+www.<
+
+www.=
+
+www.>
+
+www.?
+
+www.@
+
+www.[
+
+www.\
+
+www.]
+
+www.^
+
+www._
+
+www.`
+
+www.{
+
+www.|
+
+www.}
+
+www.~
+
+--- end
+--- case 59 profile gfm bytes 359
+# wwwtf? (4)
+
+www.a/b (space)
+
+www.a/b!
+
+www.a/b"
+
+www.a/b#
+
+www.a/b$
+
+www.a/b%
+
+www.a/b&
+
+www.a/b'
+
+www.a/b(
+
+www.a/b)
+
+www.a/b*
+
+www.a/b+
+
+www.a/b,
+
+www.a/b-
+
+www.a/b
+
+www.a/b.
+
+www.a/b/
+
+www.a/b:
+
+www.a/b;
+
+www.a/b<
+
+www.a/b=
+
+www.a/b>
+
+www.a/b?
+
+www.a/b@
+
+www.a/b[
+
+www.a/b\
+
+www.a/b]
+
+www.a/b^
+
+www.a/b_
+
+www.a/b`
+
+www.a/b{
+
+www.a/b|
+
+www.a/b}
+
+www.a/b~
+
+--- end
+--- case 60 profile gfm bytes 325
+# wwwtf? (3)
+
+www.a/ (space)
+
+www.a/!
+
+www.a/"
+
+www.a/#
+
+www.a/$
+
+www.a/%
+
+www.a/&
+
+www.a/'
+
+www.a/(
+
+www.a/)
+
+www.a/*
+
+www.a/+
+
+www.a/,
+
+www.a/-
+
+www.a/
+
+www.a/.
+
+www.a//
+
+www.a/:
+
+www.a/;
+
+www.a/<
+
+www.a/=
+
+www.a/>
+
+www.a/?
+
+www.a/@
+
+www.a/[
+
+www.a/\
+
+www.a/]
+
+www.a/^
+
+www.a/_
+
+www.a/`
+
+www.a/{
+
+www.a/|
+
+www.a/}
+
+www.a/~
+
+--- end
+--- case 61 profile gfm bytes 106
+a https://alpha.com b bravo@charlie.com c www.delta.com d xmpp:echo@foxtrot.com e mailto:golf@hotel.com f.
+--- end

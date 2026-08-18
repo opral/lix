@@ -20,7 +20,7 @@ use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
     ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueIntegrity,
+    StorageRead, StorageScanSource, StorageSpace, StorageWrite, ValueIntegrity,
     ValueSemantics, WriteOptions, WriteStats,
 };
 use rocksdb::{
@@ -618,7 +618,7 @@ impl StorageWrite for RocksDBWrite {
                 physical_key.clear();
                 physical_key.extend_from_slice(&space_prefix);
                 physical_key.extend_from_slice(&entry.key.0);
-                let value = stored_value_bytes(entry.value);
+                let value = entry.value.bytes;
                 if space.value_semantics == ValueSemantics::Immutable {
                     if let Some(staged) = self.immutable_values.get(physical_key.as_slice()) {
                         if staged != &value {
@@ -796,11 +796,19 @@ impl EncodedBounds {
 fn rocksdb_delete_range_bounds(range: &KeyRange) -> Option<(Vec<u8>, Vec<u8>)> {
     let lower = match &range.lower {
         Bound::Included(key) => key.0.to_vec(),
-        Bound::Excluded(key) => next_lexicographic_key(key)?,
+        Bound::Excluded(key) => {
+            let mut bytes = key.0.to_vec();
+            bytes.push(0);
+            bytes
+        }
         Bound::Unbounded => Vec::new(),
     };
     let upper = match &range.upper {
-        Bound::Included(key) => next_lexicographic_key(key)?,
+        Bound::Included(key) => {
+            let mut bytes = key.0.to_vec();
+            bytes.push(0);
+            bytes
+        }
         Bound::Excluded(key) => key.0.to_vec(),
         Bound::Unbounded => return None,
     };
@@ -810,12 +818,6 @@ fn rocksdb_delete_range_bounds(range: &KeyRange) -> Option<(Vec<u8>, Vec<u8>)> {
     } else {
         Some((lower, upper))
     }
-}
-
-fn next_lexicographic_key(key: &Key) -> Option<Vec<u8>> {
-    let mut bytes = key.0.to_vec();
-    bytes.push(0);
-    Some(bytes)
 }
 
 fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDBInner>, StorageError> {
@@ -928,10 +930,6 @@ fn column_family_options() -> Options {
     table_options.set_optimize_filters_for_memory(true);
     options.set_block_based_table_factory(&table_options);
     options
-}
-
-fn stored_value_bytes(value: StoredValue) -> Bytes {
-    value.bytes
 }
 
 /// Reclaims the iterator-owned physical key and removes its four-byte space

@@ -1,0 +1,521 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: link_resource
+count: 72
+
+--- case 1 options - label-bytes 30 input-bytes 12 expected-bytes 30
+should support links w/o title
+--- input
+[link](/uri)
+--- expected
+<p><a href="/uri">link</a></p>
+--- end
+--- case 2 options - label-bytes 36 input-bytes 8 expected-bytes 26
+should support links w/o destination
+--- input
+[link]()
+--- expected
+<p><a href="">link</a></p>
+--- end
+--- case 3 options - label-bytes 50 input-bytes 10 expected-bytes 26
+should support links w/ empty enclosed destination
+--- input
+[link](<>)
+--- expected
+<p><a href="">link</a></p>
+--- end
+--- case 4 options - label-bytes 49 input-bytes 15 expected-bytes 22
+should not support links w/ spaces in destination
+--- input
+[link](/my uri)
+--- expected
+<p>[link](/my uri)</p>
+--- end
+--- case 5 options - label-bytes 54 input-bytes 17 expected-bytes 35
+should support links w/ spaces in enclosed destination
+--- input
+[link](</my uri>)
+--- expected
+<p><a href="/my%20uri">link</a></p>
+--- end
+--- case 6 options - label-bytes 55 input-bytes 15 expected-bytes 22
+should not support links w/ line endings in destination
+--- input
+[link](foo
+bar)
+--- expected
+<p>[link](foo
+bar)</p>
+--- end
+--- case 7 options allow_dangerous_html,allow_dangerous_protocol label-bytes 64 input-bytes 17 expected-bytes 24
+should not support links w/ line endings in enclosed destination
+--- input
+[link](<foo
+bar>)
+--- expected
+<p>[link](<foo
+bar>)</p>
+--- end
+--- case 8 options - label-bytes 53 input-bytes 10 expected-bytes 26
+should support links w/ closing parens in destination
+--- input
+[a](<b)c>)
+--- expected
+<p><a href="b)c">a</a></p>
+--- end
+--- case 9 options - label-bytes 57 input-bytes 14 expected-bytes 26
+should not support links w/ enclosed destinations w/o end
+--- input
+[link](<foo\>)
+--- expected
+<p>[link](&lt;foo&gt;)</p>
+--- end
+--- case 10 options allow_dangerous_html,allow_dangerous_protocol label-bytes 59 input-bytes 28 expected-bytes 44
+should not support links w/ unmatched enclosed destinations
+--- input
+[a](<b)c
+[a](<b)c>
+[a](<b>c)
+--- expected
+<p>[a](&lt;b)c
+[a](&lt;b)c&gt;
+[a](<b>c)</p>
+--- end
+--- case 11 options - label-bytes 54 input-bytes 15 expected-bytes 31
+should support links w/ destinations w/ escaped parens
+--- input
+[link](\(foo\))
+--- expected
+<p><a href="(foo)">link</a></p>
+--- end
+--- case 12 options - label-bytes 55 input-bytes 21 expected-bytes 39
+should support links w/ destinations w/ balanced parens
+--- input
+[link](foo(and(bar)))
+--- expected
+<p><a href="foo(and(bar))">link</a></p>
+--- end
+--- case 13 options - label-bytes 54 input-bytes 23 expected-bytes 38
+should support links w/ destinations w/ escaped parens
+--- input
+[link](foo\(and\(bar\))
+--- expected
+<p><a href="foo(and(bar)">link</a></p>
+--- end
+--- case 14 options - label-bytes 55 input-bytes 22 expected-bytes 38
+should support links w/ enclosed destinations w/ parens
+--- input
+[link](<foo(and(bar)>)
+--- expected
+<p><a href="foo(and(bar)">link</a></p>
+--- end
+--- case 15 options allow_dangerous_html,allow_dangerous_protocol label-bytes 47 input-bytes 15 expected-bytes 31
+should support links w/ escapes in destinations
+--- input
+[link](foo\)\:)
+--- expected
+<p><a href="foo):">link</a></p>
+--- end
+--- case 16 options - label-bytes 49 input-bytes 17 expected-bytes 35
+should support links w/ destinations to fragments
+--- input
+[link](#fragment)
+--- expected
+<p><a href="#fragment">link</a></p>
+--- end
+--- case 17 options - label-bytes 57 input-bytes 35 expected-bytes 53
+should support links w/ destinations to URLs w/ fragments
+--- input
+[link](http://example.com#fragment)
+--- expected
+<p><a href="http://example.com#fragment">link</a></p>
+--- end
+--- case 18 options - label-bytes 68 input-bytes 37 expected-bytes 55
+should support links w/ destinations to URLs w/ search and fragments
+--- input
+[link](http://example.com?foo=3#frag)
+--- expected
+<p><a href="http://example.com?foo=3#frag">link</a></p>
+--- end
+--- case 19 options - label-bytes 61 input-bytes 15 expected-bytes 35
+should not support non-punctuation character escapes in links
+--- input
+[link](foo\bar)
+--- expected
+<p><a href="foo%5Cbar">link</a></p>
+--- end
+--- case 20 options - label-bytes 44 input-bytes 21 expected-bytes 39
+should support character references in links
+--- input
+[link](foo%20b&auml;)
+--- expected
+<p><a href="foo%20b%C3%A4">link</a></p>
+--- end
+--- case 21 options - label-bytes 40 input-bytes 15 expected-bytes 37
+should not support links w/ only a title
+--- input
+[link]("title")
+--- expected
+<p><a href="%22title%22">link</a></p>
+--- end
+--- case 22 options - label-bytes 38 input-bytes 20 expected-bytes 44
+should support titles w/ double quotes
+--- input
+[link](/url "title")
+--- expected
+<p><a href="/url" title="title">link</a></p>
+--- end
+--- case 23 options - label-bytes 38 input-bytes 20 expected-bytes 44
+should support titles w/ single quotes
+--- input
+[link](/url 'title')
+--- expected
+<p><a href="/url" title="title">link</a></p>
+--- end
+--- case 24 options - label-bytes 31 input-bytes 20 expected-bytes 44
+should support titles w/ parens
+--- input
+[link](/url (title))
+--- expected
+<p><a href="/url" title="title">link</a></p>
+--- end
+--- case 25 options - label-bytes 57 input-bytes 29 expected-bytes 57
+should support character references and escapes in titles
+--- input
+[link](/url "title \"&quot;")
+--- expected
+<p><a href="/url" title="title &quot;&quot;">link</a></p>
+--- end
+--- case 26 options - label-bytes 67 input-bytes 21 expected-bytes 47
+should not support unicode whitespace between destination and title
+--- input
+[link](/url "title")
+--- expected
+<p><a href="/url%C2%A0%22title%22">link</a></p>
+--- end
+--- case 27 options - label-bytes 50 input-bytes 32 expected-bytes 59
+should not support nested balanced quotes in title
+--- input
+[link](/url "title "and" title")
+--- expected
+<p>[link](/url &quot;title &quot;and&quot; title&quot;)</p>
+--- end
+--- case 28 options - label-bytes 41 input-bytes 32 expected-bytes 66
+should support the other quotes in titles
+--- input
+[link](/url 'title "and" title')
+--- expected
+<p><a href="/url" title="title &quot;and&quot; title">link</a></p>
+--- end
+--- case 29 options - label-bytes 58 input-bytes 27 expected-bytes 44
+should support whitespace around destination and title (1)
+--- input
+[link](   /uri
+  "title"  )
+--- expected
+<p><a href="/uri" title="title">link</a></p>
+--- end
+--- case 30 options - label-bytes 58 input-bytes 22 expected-bytes 44
+should support whitespace around destination and title (2)
+--- input
+[link](	
+/uri "title")
+--- expected
+<p><a href="/uri" title="title">link</a></p>
+--- end
+--- case 31 options - label-bytes 58 input-bytes 23 expected-bytes 44
+should support whitespace around destination and title (3)
+--- input
+[link](/uri  "title"	
+)
+--- expected
+<p><a href="/uri" title="title">link</a></p>
+--- end
+--- case 32 options - label-bytes 56 input-bytes 13 expected-bytes 20
+should not support whitespace between label and resource
+--- input
+[link] (/uri)
+--- expected
+<p>[link] (/uri)</p>
+--- end
+--- case 33 options - label-bytes 32 input-bytes 24 expected-bytes 42
+should support balanced brackets
+--- input
+[link [foo [bar]]](/uri)
+--- expected
+<p><a href="/uri">link [foo [bar]]</a></p>
+--- end
+--- case 34 options - label-bytes 42 input-bytes 17 expected-bytes 24
+should not support unbalanced brackets (1)
+--- input
+[link] bar](/uri)
+--- expected
+<p>[link] bar](/uri)</p>
+--- end
+--- case 35 options - label-bytes 42 input-bytes 17 expected-bytes 35
+should not support unbalanced brackets (2)
+--- input
+[link [bar](/uri)
+--- expected
+<p>[link <a href="/uri">bar</a></p>
+--- end
+--- case 36 options - label-bytes 31 input-bytes 18 expected-bytes 35
+should support characer escapes
+--- input
+[link \[bar](/uri)
+--- expected
+<p><a href="/uri">link [bar</a></p>
+--- end
+--- case 37 options - label-bytes 22 input-bytes 30 expected-bytes 79
+should support content
+--- input
+[link *foo **bar** `#`*](/uri)
+--- expected
+<p><a href="/uri">link <em>foo <strong>bar</strong> <code>#</code></em></a></p>
+--- end
+--- case 38 options - label-bytes 34 input-bytes 25 expected-bytes 59
+should support an image as content
+--- input
+[![moon](moon.jpg)](/uri)
+--- expected
+<p><a href="/uri"><img src="moon.jpg" alt="moon" /></a></p>
+--- end
+--- case 39 options - label-bytes 37 input-bytes 23 expected-bytes 41
+should not support links in links (1)
+--- input
+[foo [bar](/uri)](/uri)
+--- expected
+<p>[foo <a href="/uri">bar</a>](/uri)</p>
+--- end
+--- case 40 options - label-bytes 37 input-bytes 37 expected-bytes 62
+should not support links in links (2)
+--- input
+[foo *[bar [baz](/uri)](/uri)*](/uri)
+--- expected
+<p>[foo <em>[bar <a href="/uri">baz</a>](/uri)</em>](/uri)</p>
+--- end
+--- case 41 options - label-bytes 37 input-bytes 28 expected-bytes 43
+should not support links in links (3)
+--- input
+![[[foo](uri1)](uri2)](uri3)
+--- expected
+<p><img src="uri3" alt="[foo](uri2)" /></p>
+--- end
+--- case 42 options - label-bytes 37 input-bytes 13 expected-bytes 31
+should prefer links over emphasis (1)
+--- input
+*[foo*](/uri)
+--- expected
+<p>*<a href="/uri">foo*</a></p>
+--- end
+--- case 43 options - label-bytes 37 input-bytes 16 expected-bytes 34
+should prefer links over emphasis (2)
+--- input
+[foo *bar](baz*)
+--- expected
+<p><a href="baz*">foo *bar</a></p>
+--- end
+--- case 44 options allow_dangerous_html,allow_dangerous_protocol label-bytes 29 input-bytes 24 expected-bytes 31
+should prefer HTML over links
+--- input
+[foo <bar attr="](baz)">
+--- expected
+<p>[foo <bar attr="](baz)"></p>
+--- end
+--- case 45 options - label-bytes 29 input-bytes 13 expected-bytes 31
+should prefer code over links
+--- input
+[foo`](/uri)`
+--- expected
+<p>[foo<code>](/uri)</code></p>
+--- end
+--- case 46 options - label-bytes 34 input-bytes 39 expected-bytes 94
+should prefer autolinks over links
+--- input
+[foo<http://example.com/?search=](uri)>
+--- expected
+<p>[foo<a href="http://example.com/?search=%5D(uri)">http://example.com/?search=](uri)</a></p>
+--- end
+--- case 47 options - label-bytes 28 input-bytes 4 expected-bytes 22
+should support an empty link
+--- input
+[]()
+--- expected
+<p><a href=""></a></p>
+--- end
+--- case 48 options - label-bytes 28 input-bytes 9 expected-bytes 22
+should ignore an empty title
+--- input
+[](<> "")
+--- expected
+<p><a href=""></a></p>
+--- end
+--- case 49 options allow_dangerous_html,allow_dangerous_protocol label-bytes 64 input-bytes 11 expected-bytes 28
+should require whitespace between enclosed destination and title
+--- input
+[a](<b>"c")
+--- expected
+<p>[a](<b>&quot;c&quot;)</p>
+--- end
+--- case 50 options - label-bytes 51 input-bytes 4 expected-bytes 14
+should not support an unclosed enclosed destination
+--- input
+[](<
+--- expected
+<p>[](&lt;</p>
+--- end
+--- case 51 options - label-bytes 42 input-bytes 3 expected-bytes 10
+should not support an unclosed destination
+--- input
+[](
+--- expected
+<p>[](</p>
+--- end
+--- case 52 options - label-bytes 62 input-bytes 6 expected-bytes 25
+should support unenclosed link destination starting w/ escapes
+--- input
+[](\<)
+--- expected
+<p><a href="%3C"></a></p>
+--- end
+--- case 53 options - label-bytes 60 input-bytes 8 expected-bytes 25
+should support enclosed link destination starting w/ escapes
+--- input
+[](<\<>)
+--- expected
+<p><a href="%3C"></a></p>
+--- end
+--- case 54 options - label-bytes 78 input-bytes 4 expected-bytes 11
+should not support unenclosed link destination starting w/ an incorrect escape
+--- input
+[](\
+--- expected
+<p>[](\</p>
+--- end
+--- case 55 options - label-bytes 76 input-bytes 5 expected-bytes 15
+should not support enclosed link destination starting w/ an incorrect escape
+--- input
+[](<\
+--- expected
+<p>[](&lt;\</p>
+--- end
+--- case 56 options - label-bytes 45 input-bytes 6 expected-bytes 18
+should not support an eof in a link title (1)
+--- input
+[](a "
+--- expected
+<p>[](a &quot;</p>
+--- end
+--- case 57 options - label-bytes 45 input-bytes 6 expected-bytes 13
+should not support an eof in a link title (2)
+--- input
+[](a '
+--- expected
+<p>[](a '</p>
+--- end
+--- case 58 options - label-bytes 45 input-bytes 6 expected-bytes 13
+should not support an eof in a link title (3)
+--- input
+[](a (
+--- expected
+<p>[](a (</p>
+--- end
+--- case 59 options - label-bytes 52 input-bytes 7 expected-bytes 19
+should not support an eof in a link title escape (1)
+--- input
+[](a "\
+--- expected
+<p>[](a &quot;\</p>
+--- end
+--- case 60 options - label-bytes 52 input-bytes 7 expected-bytes 14
+should not support an eof in a link title escape (2)
+--- input
+[](a '\
+--- expected
+<p>[](a '\</p>
+--- end
+--- case 61 options - label-bytes 52 input-bytes 7 expected-bytes 14
+should not support an eof in a link title escape (3)
+--- input
+[](a (\
+--- expected
+<p>[](a (\</p>
+--- end
+--- case 62 options - label-bytes 59 input-bytes 10 expected-bytes 38
+should support a character escape to start a link title (1)
+--- input
+[](a "\"")
+--- expected
+<p><a href="a" title="&quot;"></a></p>
+--- end
+--- case 63 options - label-bytes 59 input-bytes 10 expected-bytes 33
+should support a character escape to start a link title (2)
+--- input
+[](a '\'')
+--- expected
+<p><a href="a" title="'"></a></p>
+--- end
+--- case 64 options - label-bytes 59 input-bytes 10 expected-bytes 33
+should support a character escape to start a link title (3)
+--- input
+[](a (\)))
+--- expected
+<p><a href="a" title=")"></a></p>
+--- end
+--- case 65 options - label-bytes 44 input-bytes 55 expected-bytes 83
+should support character references in links
+--- input
+[&amp;&copy;&](example.com/&amp;&copy;& "&amp;&copy;&")
+--- expected
+<p><a href="example.com/&amp;%C2%A9&amp;" title="&amp;©&amp;">&amp;©&amp;</a></p>
+--- end
+--- case 66 options - label-bytes 30 input-bytes 8 expected-bytes 26
+should support 1 set of parens
+--- input
+[a](1())
+--- expected
+<p><a href="1()">a</a></p>
+--- end
+--- case 67 options - label-bytes 31 input-bytes 11 expected-bytes 29
+should support 2 sets of parens
+--- input
+[a](1(2()))
+--- expected
+<p><a href="1(2())">a</a></p>
+--- end
+--- case 68 options - label-bytes 32 input-bytes 124 expected-bytes 142
+should support 32 sets of parens
+--- input
+[a](1(2(3(4(5(6(7(8(9(10(11(12(13(14(15(16(17(18(19(20(21(22(23(24(25(26(27(28(29(30(31(32()))))))))))))))))))))))))))))))))
+--- expected
+<p><a href="1(2(3(4(5(6(7(8(9(10(11(12(13(14(15(16(17(18(19(20(21(22(23(24(25(26(27(28(29(30(31(32())))))))))))))))))))))))))))))))">a</a></p>
+--- end
+--- case 69 options - label-bytes 44 input-bytes 128 expected-bytes 135
+should not support 33 or more sets of parens
+--- input
+[a](1(2(3(4(5(6(7(8(9(10(11(12(13(14(15(16(17(18(19(20(21(22(23(24(25(26(27(28(29(30(31(32(33())))))))))))))))))))))))))))))))))
+--- expected
+<p>[a](1(2(3(4(5(6(7(8(9(10(11(12(13(14(15(16(17(18(19(20(21(22(23(24(25(26(27(28(29(30(31(32(33())))))))))))))))))))))))))))))))))</p>
+--- end
+--- case 70 options - label-bytes 45 input-bytes 12 expected-bytes 35
+should support an eol at the start of a title
+--- input
+[a](b "
+ c")
+--- expected
+<p><a href="b" title="
+c">a</a></p>
+--- end
+--- case 71 options - label-bytes 66 input-bytes 11 expected-bytes 28
+should not support whitespace when unbalanced in a raw destination
+--- input
+[a](b( "c")
+--- expected
+<p>[a](b( &quot;c&quot;)</p>
+--- end
+--- case 72 options - label-bytes 56 input-bytes 6 expected-bytes 32
+should support a single NUL character as a link resource
+--- input
+[a]( )
+--- expected
+<p><a href="%EF%BF%BD">a</a></p>
+--- end

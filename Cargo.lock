@@ -2947,7 +2947,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "lix"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "ahash",
  "async-executor",
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "lix-schema"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "blake3",
  "chrono",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-filesystem"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "futures-lite",
  "lix",
@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-rocksdb"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "blake3",
  "bytes",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-slatedb"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3059,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "lix_collaboration_test_support"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "lix_js_sdk"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "blake3",
  "bytes",
@@ -3163,10 +3163,6 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "markdown-syntax"
-version = "0.2.0"
 
 [[package]]
 name = "matchers"
@@ -3739,14 +3735,14 @@ dependencies = [
 
 [[package]]
 name = "plugin_conversation"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "lix",
 ]
 
 [[package]]
 name = "plugin_csv"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "base64",
  "lix",
@@ -3756,7 +3752,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_excalidraw"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "lix",
  "serde_json",
@@ -3765,7 +3761,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_json"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "base64",
  "blake3",
@@ -3776,13 +3772,12 @@ dependencies = [
 
 [[package]]
 name = "plugin_markdown"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "base64",
  "chardetng",
  "encoding_rs",
  "lix",
- "markdown-syntax",
  "serde",
  "serde_json",
  "uuid",
@@ -3790,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_text"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "base64",
  "lix",

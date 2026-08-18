@@ -1,0 +1,104 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/sourcepos_chars.rs
+role: upstream-input
+count: 20
+profiles: commonmark,extras,frontmatter,gfm
+
+--- case 1 profile commonmark bytes 7
+a**a**a
+--- end
+--- case 2 profile commonmark bytes 10
+ɽ**ɽ**ɽ
+--- end
+--- case 3 profile commonmark bytes 13
+好**好**好
+--- end
+--- case 4 profile commonmark bytes 16
+𐀀**𐀀**𐀀
+--- end
+--- case 5 profile extras bytes 21
+>>> [!note]
+𐀀
+>>>
+
+--- end
+--- case 6 profile commonmark bytes 31
+스크립트**안녕**하세요
+--- end
+--- case 7 profile commonmark bytes 6
+`𐀀`
+--- end
+--- case 8 profile commonmark bytes 13
+```
+𐀀
+```
+
+--- end
+--- case 9 profile frontmatter bytes 33
+---
+title: 𐀀
+---
+
+# 𐀀
+
+𐀀
+--- end
+--- case 10 profile commonmark bytes 12
+[𐀀](𐀁)
+--- end
+--- case 11 profile commonmark bytes 19
+[𐀀](𐀁 "𐀂")
+--- end
+--- case 12 profile commonmark bytes 14
+- 𐀀
+- 𐀁
+
+--- end
+--- case 13 profile commonmark bytes 16
+1. 𐀀
+2. 𐀁
+
+--- end
+--- case 14 profile commonmark bytes 4
+a
+b
+
+--- end
+--- case 15 profile commonmark bytes 6
+ɽ
+ɾ
+
+--- end
+--- case 16 profile commonmark bytes 8
+好
+奾
+
+--- end
+--- case 17 profile commonmark bytes 10
+𐀀
+𐀁
+
+--- end
+--- case 18 profile gfm bytes 42
+| 𐀀 | 𐀁 |
+| - | - |
+| 𐀂 | 𐀃 |
+
+--- end
+--- case 19 profile gfm bytes 48
+- [x] 𐀀
+  - [ ] 𐀁
+  - [x] 𐀂
+- [ ] 𐀃
+
+--- end
+--- case 20 profile commonmark bytes 16
+𐀀
+
+---
+
+𐀁
+
+--- end

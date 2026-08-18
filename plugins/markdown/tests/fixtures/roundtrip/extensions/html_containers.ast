@@ -1,0 +1,32 @@
+Document
+  HtmlContainer tag=details open="<details>" close="</details>"
+    HtmlContainer tag=summary open="<summary>" close="</summary>"
+      Text "Install"
+    Paragraph
+      Text "Run "
+      Code value="cargo test" raw="cargo test" fence=1
+      Text "."
+    HtmlContainer tag=details open="<details>" close="</details>"
+      HtmlContainer tag=summary open="<summary>" close="</summary>"
+        Text "Nested"
+      Paragraph
+        Text "Nested "
+        Strong
+          Text "body"
+        Text "."
+  HtmlContainer tag=details open="<details>" close="</details>"
+    HtmlContainer tag=summary open="<summary>" close="</summary>"
+      Text "Compact"
+    Paragraph
+      Text "Compact "
+      Strong
+        Text "body"
+      Text "."
+  HtmlContainer tag=details open="<details>" close="</details>"
+    HtmlContainer tag=summary open="<summary>" close="</summary>"
+      Text "Compact tight"
+    Paragraph
+      Text "Compact "
+      Strong
+        Text "body"
+      Text "."

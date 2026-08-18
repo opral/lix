@@ -1,0 +1,2 @@
+# Parser fixtures are byte-exact test inputs. Do not normalize line endings.
+* -text

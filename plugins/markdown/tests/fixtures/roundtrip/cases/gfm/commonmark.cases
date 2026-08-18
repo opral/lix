@@ -1,0 +1,35 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/commonmark.rs
+role: upstream-input
+count: 7
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 31
+$$x^2$$ and $1 + 2$ and $`y^2`$
+--- end
+--- case 2 profile commonmark bytes 9
+$$
+x^2
+$$
+--- end
+--- case 3 profile commonmark bytes 15
+```math
+x^2
+```
+--- end
+--- case 4 profile commonmark bytes 17
+This [[url]] that
+--- end
+--- case 5 profile commonmark bytes 28
+This [[url|link label]] that
+--- end
+--- case 6 profile commonmark bytes 18
+> [!note]
+> A note
+--- end
+--- case 7 profile commonmark bytes 24
+> [!note] Title
+> A note
+--- end

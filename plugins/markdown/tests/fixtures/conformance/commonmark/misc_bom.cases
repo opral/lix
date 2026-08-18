@@ -1,0 +1,18 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: misc_bom
+count: 2
+
+--- case 1 options - label-bytes 24 input-bytes 3 expected-bytes 0
+should ignore just a bom
+--- input
+﻿
+--- expected
+
+--- end
+--- case 2 options - label-bytes 19 input-bytes 15 expected-bytes 19
+should ignore a bom
+--- input
+﻿# hea﻿ding
+--- expected
+<h1>hea﻿ding</h1>
+--- end

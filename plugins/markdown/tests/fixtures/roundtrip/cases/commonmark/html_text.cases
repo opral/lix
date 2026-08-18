@@ -1,0 +1,225 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/html_text.rs
+role: upstream-input
+count: 69
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 7
+a <b> c
+--- end
+--- case 2 profile commonmark bytes 13
+<a><bab><c2c>
+--- end
+--- case 3 profile commonmark bytes 9
+<a/><b2/>
+--- end
+--- case 4 profile commonmark bytes 22
+<a  /><b2
+data="foo" >
+--- end
+--- case 5 profile commonmark bytes 63
+<a foo="bar" bam = 'baz <em>"</em>'
+_boolean zoop:33=zoop:33 />
+--- end
+--- case 6 profile commonmark bytes 38
+Foo <responsive-image src="foo.jpg" />
+--- end
+--- case 7 profile commonmark bytes 9
+<33> <__>
+--- end
+--- case 8 profile commonmark bytes 15
+<a h*#ref="hi">
+--- end
+--- case 9 profile commonmark bytes 26
+<a href="hi'> <a href=hi'>
+--- end
+--- case 10 profile commonmark bytes 41
+< a><
+foo><bar/ >
+<foo bar=baz
+bim!bop />
+--- end
+--- case 11 profile commonmark bytes 25
+<a href='bar'title=title>
+--- end
+--- case 12 profile commonmark bytes 11
+</a></foo >
+--- end
+--- case 13 profile commonmark bytes 15
+</a href="foo">
+--- end
+--- case 14 profile commonmark bytes 44
+foo <!-- this is a
+comment - with hyphen -->
+--- end
+--- case 15 profile commonmark bytes 41
+foo <!-- not a comment -- two hyphens -->
+--- end
+--- case 16 profile commonmark bytes 17
+foo <!--> foo -->
+--- end
+--- case 17 profile commonmark bytes 16
+foo <!-- foo--->
+--- end
+--- case 18 profile commonmark bytes 21
+foo <?php echo $a; ?>
+--- end
+--- case 19 profile commonmark bytes 23
+foo <!ELEMENT br EMPTY>
+--- end
+--- case 20 profile commonmark bytes 19
+foo <![CDATA[>&<]]>
+--- end
+--- case 21 profile commonmark bytes 21
+foo <a href="&ouml;">
+--- end
+--- case 22 profile commonmark bytes 17
+foo <a href="\*">
+--- end
+--- case 23 profile commonmark bytes 13
+<a href="\"">
+--- end
+--- case 24 profile commonmark bytes 8
+foo <!1>
+--- end
+--- case 25 profile commonmark bytes 21
+foo <!-not enough!-->
+--- end
+--- case 26 profile commonmark bytes 14
+foo <!---ok-->
+--- end
+--- case 27 profile commonmark bytes 10
+foo <!--->
+--- end
+--- case 28 profile commonmark bytes 15
+foo <!-- -> -->
+--- end
+--- case 29 profile commonmark bytes 8
+foo <!--
+--- end
+--- case 30 profile commonmark bytes 9
+foo <!--a
+--- end
+--- case 31 profile commonmark bytes 10
+foo <!--a-
+--- end
+--- case 32 profile commonmark bytes 11
+foo <!--a--
+--- end
+--- case 33 profile commonmark bytes 16
+foo <![cdata[]]>
+--- end
+--- case 34 profile commonmark bytes 12
+foo <![CDATA
+--- end
+--- case 35 profile commonmark bytes 13
+foo <![CDATA[
+--- end
+--- case 36 profile commonmark bytes 14
+foo <![CDATA[]
+--- end
+--- case 37 profile commonmark bytes 15
+foo <![CDATA[]]
+--- end
+--- case 38 profile commonmark bytes 16
+foo <![CDATA[asd
+--- end
+--- case 39 profile commonmark bytes 18
+foo <![CDATA[]]]]>
+--- end
+--- case 40 profile commonmark bytes 13
+foo <!doctype
+--- end
+--- case 41 profile commonmark bytes 9
+foo <?php
+--- end
+--- case 42 profile commonmark bytes 10
+foo <?php?
+--- end
+--- case 43 profile commonmark bytes 9
+foo <???>
+--- end
+--- case 44 profile commonmark bytes 8
+foo </3>
+--- end
+--- case 45 profile commonmark bytes 9
+foo </a->
+--- end
+--- case 46 profile commonmark bytes 11
+foo </a   >
+--- end
+--- case 47 profile commonmark bytes 9
+foo </a!>
+--- end
+--- case 48 profile commonmark bytes 8
+foo <a->
+--- end
+--- case 49 profile commonmark bytes 10
+foo <a   >
+--- end
+--- case 50 profile commonmark bytes 8
+foo <a!>
+--- end
+--- case 51 profile commonmark bytes 9
+foo <a !>
+--- end
+--- case 52 profile commonmark bytes 10
+foo <a b!>
+--- end
+--- case 53 profile commonmark bytes 10
+foo <a b/>
+--- end
+--- case 54 profile commonmark bytes 9
+foo <a b>
+--- end
+--- case 55 profile commonmark bytes 11
+foo <a b=<>
+--- end
+--- case 56 profile commonmark bytes 11
+foo <a b=>>
+--- end
+--- case 57 profile commonmark bytes 11
+foo <a b==>
+--- end
+--- case 58 profile commonmark bytes 11
+foo <a b=`>
+--- end
+--- case 59 profile commonmark bytes 13
+foo <a b="asd
+--- end
+--- case 60 profile commonmark bytes 13
+foo <a b='asd
+--- end
+--- case 61 profile commonmark bytes 12
+foo <a b=asd
+--- end
+--- case 62 profile commonmark bytes 14
+foo <a b=
+asd>
+--- end
+--- case 63 profile commonmark bytes 5
+<x> a
+--- end
+--- case 64 profile commonmark bytes 10
+<span foo=
+--- end
+--- case 65 profile commonmark bytes 8
+a <!b
+c>
+--- end
+--- case 66 profile commonmark bytes 15
+a <![CDATA[
+]]>
+--- end
+--- case 67 profile commonmark bytes 7
+a <?
+?>
+--- end
+--- case 68 profile commonmark bytes 5
+a <x>
+--- end
+--- case 69 profile commonmark bytes 27
+alpha <i>bravo</b> charlie.
+--- end

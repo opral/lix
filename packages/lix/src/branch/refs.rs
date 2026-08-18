@@ -1,30 +1,6 @@
 use crate::LixError;
 use crate::branch::{BranchHead, BranchHeadControlContext, BranchRefReader};
-use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
-
-/// Typed access to moving branch heads stored in the direct control plane.
-///
-/// The control record is deliberately below live-state visibility, keeping
-/// the dependency acyclic: `branch-control -> tracked-head -> live-state`.
-pub(super) struct BranchRefContext {}
-
-impl BranchRefContext {
-    pub(super) fn new() -> Self {
-        Self {}
-    }
-
-    /// Creates a branch-ref reader over a caller-provided KV store.
-    #[expect(clippy::unused_self)]
-    pub(super) fn reader<S>(&self, store: S) -> BranchRefStoreReader<S>
-    where
-        S: StorageAdapterRead,
-    {
-        BranchRefStoreReader {
-            controls: BranchHeadControlContext::new().reader(store),
-        }
-    }
-}
 
 /// Read side for branch heads.
 pub(super) struct BranchRefStoreReader<S>
@@ -38,6 +14,12 @@ impl<S> BranchRefStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(super) fn new(store: S) -> Self {
+        Self {
+            controls: BranchHeadControlContext::new().reader(store),
+        }
+    }
+
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         Ok(self
             .controls
@@ -47,13 +29,6 @@ where
                 branch_id: branch_id.to_string(),
                 commit_id: control.head_commit_id,
             }))
-    }
-
-    pub(crate) async fn load_head_commit_id(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<CommitId>, LixError> {
-        Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
@@ -79,10 +54,6 @@ where
         Self::load_head(self, branch_id).await
     }
 
-    async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
-        Self::load_head_commit_id(self, branch_id).await
-    }
-
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
         Self::scan_heads(self).await
     }
@@ -101,14 +72,12 @@ mod tests {
     #[tokio::test]
     async fn load_head_returns_none_when_missing() {
         let storage = StorageAdapter::new(Memory::new());
-        let branch_ref = test_branch_ref();
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
 
-        let head = branch_ref
-            .reader(read)
+        let head = BranchRefStoreReader::new(read)
             .load_head("missing-branch")
             .await
             .expect("missing branch ref should load cleanly");
@@ -119,7 +88,6 @@ mod tests {
     #[tokio::test]
     async fn advance_head_writes_direct_control() {
         let storage = StorageAdapter::new(Memory::new());
-        let branch_ref = BranchRefContext::new();
 
         stage_branch_head(&storage, "01920000-0000-7000-8000-0000000000a1", "commit-a")
             .await
@@ -129,8 +97,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let head = branch_ref
-            .reader(read)
+        let head = BranchRefStoreReader::new(read)
             .load_head("01920000-0000-7000-8000-0000000000a1")
             .await
             .expect("branch head should load")
@@ -142,7 +109,6 @@ mod tests {
     #[tokio::test]
     async fn scan_heads_returns_sorted_branch_heads() {
         let storage = StorageAdapter::new(Memory::new());
-        let branch_ref = test_branch_ref();
 
         stage_branch_head(&storage, "01920000-0000-7000-8000-0000000000b1", "commit-b")
             .await
@@ -155,8 +121,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let heads = branch_ref
-            .reader(read)
+        let heads = BranchRefStoreReader::new(read)
             .scan_heads()
             .await
             .expect("heads should scan");
@@ -174,10 +139,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    fn test_branch_ref() -> BranchRefContext {
-        BranchRefContext::new()
     }
 
     async fn stage_branch_head(

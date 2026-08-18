@@ -40,4 +40,4 @@ pub(crate) use types::{
     CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
     commit_row_snapshot_json, next_first_parent_jump,
 };
-pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
+pub(crate) use types::{GcLiveSet, GcPlan, GcRoot, GcSweepSet};

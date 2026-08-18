@@ -1,0 +1,114 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/tasklist.rs
+role: upstream-input
+count: 15
+profiles: commonmark,gfm
+
+--- case 1 profile gfm bytes 167
+* [ ] Red
+* [x] Green
+* [ ] `Blue`
+* [!] Papayawhip
+<!-- end list -->
+1. [ ] Bird
+2. [ ] McHale
+3. [x] Parish
+<!-- end list -->
+* [ ] Red
+  * [x] Green
+    * [ ] Blue
+
+--- end
+--- case 2 profile gfm bytes 165
+* [ ] Red
+* [x] Green
+* [ ] Blue
+* [!] Papayawhip
+<!-- end list -->
+1. [ ] Bird
+2. [ ] McHale
+3. [x] Parish
+<!-- end list -->
+* [ ] Red
+  * [x] Green
+    * [ ] Blue
+
+--- end
+--- case 3 profile gfm bytes 10
+* [!] Red
+
+--- end
+--- case 4 profile gfm bytes 83
+- [ ] List item 1
+- [ ] This list item is **bold**
+- [x] There is some `code` here
+
+--- end
+--- case 5 profile gfm bytes 60
+|     | name |
+| --- | ---- |
+| [ ] | Rell |
+| [x] | Kai  |
+
+--- end
+--- case 6 profile gfm bytes 95
+|         | name |
+| ------- | ---- |
+| [~]     | Rell |
+| [x]     | Kai  |
+| [x] No. | Ez   |
+
+--- end
+--- case 7 profile gfm bytes 18
+o
+-	[ ] W@W.I[ ] 
+--- end
+--- case 8 profile commonmark bytes 22
+h
+- [ ] xy
+  - [x] zw
+
+--- end
+--- case 9 profile gfm bytes 11
+- [ ] item
+
+--- end
+--- case 10 profile gfm bytes 23
+- [ ] item
+- [x] item2
+
+--- end
+--- case 11 profile gfm bytes 51
+- [x] item
+  - [ ] item2
+  - [x] item3
+- [ ] item4
+
+--- end
+--- case 12 profile gfm bytes 87
+- [ ] bullet point one
+- bullet point two and some extra text
+- [x] bullet point three
+
+--- end
+--- case 13 profile gfm bytes 100
+- [ ] bullet point one
+- bullet point two and some extra text
+- [x] bullet point three
+
+hello world
+
+--- end
+--- case 14 profile gfm bytes 22
+h
+- [ ] xy
+  - [x] zw
+
+--- end
+--- case 15 profile gfm bytes 24
+- [あ] xy
+  - [い] zw
+
+--- end

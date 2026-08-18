@@ -1,0 +1,225 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: footnotes
+count: 10
+
+--- case 1 options extension.footnotes label-bytes 9 input-bytes 344 expected-bytes 1422
+footnotes
+--- input
+Here is a[^nowhere] footnote reference,[^1] and another.[^longnote]
+
+This is another note.[^note] And footnote[^longnote] is referenced again.
+
+[^note]: Hi.
+
+[^1]: Here is the footnote.
+
+[^longnote]: Here's one with multiple blocks.
+
+    Subsequent paragraphs are indented.
+
+        code
+
+This is regular content.
+
+[^unused]: This is not used.
+
+--- expected
+<p>Here is a[^nowhere] footnote reference,<sup class="footnote-ref"><a href="#fn-1" id="fnref-1" data-footnote-ref>1</a></sup> and another.<sup class="footnote-ref"><a href="#fn-longnote" id="fnref-longnote" data-footnote-ref>2</a></sup></p>
+<p>This is another note.<sup class="footnote-ref"><a href="#fn-note" id="fnref-note" data-footnote-ref>3</a></sup> And footnote<sup class="footnote-ref"><a href="#fn-longnote" id="fnref-longnote-2" data-footnote-ref>2</a></sup> is referenced again.</p>
+<p>This is regular content.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-1">
+<p>Here is the footnote. <a href="#fnref-1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="fn-longnote">
+<p>Here's one with multiple blocks.</p>
+<p>Subsequent paragraphs are indented.</p>
+<pre><code>code
+</code></pre>
+<a href="#fnref-longnote" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2" aria-label="Back to reference 2">↩</a> <a href="#fnref-longnote-2" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2-2" aria-label="Back to reference 2-2">↩<sup class="footnote-ref">2</sup></a>
+</li>
+<li id="fn-note">
+<p>Hi. <a href="#fnref-note" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="3" aria-label="Back to reference 3">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 2 options extension.footnotes label-bytes 33 input-bytes 36 expected-bytes 346
+footnote_does_not_eat_exclamation
+--- input
+Here's my footnote![^a]
+
+[^a]: Yep.
+
+--- expected
+<p>Here's my footnote!<sup class="footnote-ref"><a href="#fn-a" id="fnref-a" data-footnote-ref>1</a></sup></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-a">
+<p>Yep. <a href="#fnref-a" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 3 options extension.table,extension.footnotes label-bytes 17 input-bytes 121 expected-bytes 756
+footnote_in_table
+--- input
+A footnote in a paragraph[^1]
+
+| Column1   | Column2 |
+| --------- | ------- |
+| foot [^1] | note    |
+
+[^1]: a footnote
+
+--- expected
+<p>A footnote in a paragraph<sup class="footnote-ref"><a href="#fn-1" id="fnref-1" data-footnote-ref>1</a></sup></p>
+<table>
+<thead>
+<tr>
+<th>Column1</th>
+<th>Column2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>foot <sup class="footnote-ref"><a href="#fn-1" id="fnref-1-2" data-footnote-ref>1</a></sup></td>
+<td>note</td>
+</tr>
+</tbody>
+</table>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-1">
+<p>a footnote <a href="#fnref-1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a> <a href="#fnref-1-2" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1-2" aria-label="Back to reference 1-2">↩<sup class="footnote-ref">2</sup></a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 4 options extension.superscript,extension.footnotes label-bytes 25 input-bytes 153 expected-bytes 727
+footnote_with_superscript
+--- input
+Here is a footnote reference.[^1]
+
+Here is a longer footnote reference.[^ref]
+
+e = mc^2^.
+
+[^1]: Here is the footnote.
+[^ref]: Here is another footnote.
+
+--- expected
+<p>Here is a footnote reference.<sup class="footnote-ref"><a href="#fn-1" id="fnref-1" data-footnote-ref>1</a></sup></p>
+<p>Here is a longer footnote reference.<sup class="footnote-ref"><a href="#fn-ref" id="fnref-ref" data-footnote-ref>2</a></sup></p>
+<p>e = mc<sup>2</sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-1">
+<p>Here is the footnote. <a href="#fnref-1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="fn-ref">
+<p>Here is another footnote. <a href="#fnref-ref" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2" aria-label="Back to reference 2">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 5 options extension.footnotes label-bytes 21 input-bytes 75 expected-bytes 429
+footnote_escapes_name
+--- input
+Here is a footnote reference.[^😄ref]
+
+[^😄ref]: Here is the footnote.
+
+--- expected
+<p>Here is a footnote reference.<sup class="footnote-ref"><a href="#fn-%F0%9F%98%84ref" id="fnref-%F0%9F%98%84ref" data-footnote-ref>1</a></sup></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-%F0%9F%98%84ref">
+<p>Here is the footnote. <a href="#fnref-%F0%9F%98%84ref" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 6 options extension.footnotes label-bytes 45 input-bytes 75 expected-bytes 647
+footnote_case_insensitive_and_case_preserving
+--- input
+Here is a footnote reference.[^AB] and [^ab]
+
+[^aB]: Here is the footnote.
+
+--- expected
+<p>Here is a footnote reference.<sup class="footnote-ref"><a href="#fn-aB" id="fnref-aB" data-footnote-ref>1</a></sup> and <sup class="footnote-ref"><a href="#fn-aB" id="fnref-aB-2" data-footnote-ref>1</a></sup></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-aB">
+<p>Here is the footnote. <a href="#fnref-aB" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a> <a href="#fnref-aB-2" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1-2" aria-label="Back to reference 1-2">↩<sup class="footnote-ref">2</sup></a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 7 options extension.footnotes label-bytes 40 input-bytes 42 expected-bytes 356
+footnote_name_parsed_into_multiple_nodes
+--- input
+Foo.[^_ab]
+
+[^_ab]: Here is the footnote.
+
+--- expected
+<p>Foo.<sup class="footnote-ref"><a href="#fn-_ab" id="fnref-_ab" data-footnote-ref>1</a></sup></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-_ab">
+<p>Here is the footnote. <a href="#fnref-_ab" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 8 options extension.footnotes label-bytes 34 input-bytes 36 expected-bytes 49
+footnote_invalid_with_missing_name
+--- input
+Foo.[^]
+
+[^]: Here is the footnote.
+
+--- expected
+<p>Foo.[^]</p>
+<p>[^]: Here is the footnote.</p>
+
+--- end
+--- case 9 options extension.footnotes label-bytes 38 input-bytes 50 expected-bytes 63
+footnote_does_not_allow_spaces_in_name
+--- input
+Foo.[^one two]
+
+[^one two]: Here is the footnote.
+
+--- expected
+<p>Foo.[^one two]</p>
+<p>[^one two]: Here is the footnote.</p>
+
+--- end
+--- case 10 options extension.footnotes label-bytes 41 input-bytes 30 expected-bytes 353
+footnote_does_not_expand_emphasis_in_name
+--- input
+Foo[^**one**]
+[^**one**]: bar
+
+--- expected
+<p>Foo<sup class="footnote-ref"><a href="#fn-**one**" id="fnref-**one**" data-footnote-ref>1</a></sup></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-**one**">
+<p>bar <a href="#fnref-**one**" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end

@@ -7913,14 +7913,12 @@ mod tests {
             crate::json_store::JsonRef::for_content(at_threshold.as_bytes()),
             crate::json_store::JsonRef::for_content(over_threshold.as_bytes()),
         ];
-        let stored = crate::json_store::JsonStoreContext::new()
-            .load_bytes_many(
-                &read,
-                crate::json_store::JsonLoadRequestRef {
-                    refs: &json_refs,
-                    scope: crate::json_store::JsonReadScopeRef::OutOfBand,
-                },
-            )
+        let mut json_reader = crate::json_store::JsonStoreContext::new().reader(&read);
+        let stored = json_reader
+            .load_bytes_many(crate::json_store::JsonLoadRequestRef {
+                refs: &json_refs,
+                scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+            })
             .await
             .expect("json_store boundary rows should load")
             .into_values();

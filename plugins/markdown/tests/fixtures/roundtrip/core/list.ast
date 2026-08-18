@@ -1,0 +1,9 @@
+Document
+  List ordered=false tight=true
+    ListItem checked=none
+      Paragraph
+        Text "one"
+    ListItem checked=none
+      Paragraph
+        Text "two"
+

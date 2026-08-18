@@ -36,10 +36,6 @@ enum TransactionJsonStorage {
         value: Arc<JsonValue>,
         normalized: OnceLock<Arc<str>>,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
-    Certified {
-        normalized: Arc<str>,
-    },
     CertifiedShared {
         normalized: SharedStr,
         certificate: TransactionJsonCertificate,
@@ -99,20 +95,6 @@ impl TransactionJson {
     pub(crate) fn from_canonical_batch(value: WasmCanonicalJson) -> Self {
         Self {
             storage: TransactionJsonStorage::CanonicalBatch(value),
-        }
-    }
-
-    /// Constructs canonical row content whose schema semantics and identity
-    /// were proven by a typed lowerer.
-    ///
-    /// The decoded JSON stays lazy because ordinary staging and durable
-    /// placement only consume canonical bytes. Callers may issue this
-    /// certificate only for complete replacement rows whose unchanged
-    /// identity and row-local schema constraints were already established.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_certified_normalized_row_content(normalized: Arc<str>) -> Self {
-        Self {
-            storage: TransactionJsonStorage::Certified { normalized },
         }
     }
 
@@ -228,14 +210,13 @@ impl TransactionJson {
     }
 
     pub(crate) fn row_content_certified(&self) -> bool {
-        matches!(self.storage, TransactionJsonStorage::Certified { .. })
-            || matches!(
-                self.storage,
-                TransactionJsonStorage::CertifiedShared {
-                    certificate: TransactionJsonCertificate::RowContent,
-                    ..
-                }
-            )
+        matches!(
+            self.storage,
+            TransactionJsonStorage::CertifiedShared {
+                certificate: TransactionJsonCertificate::RowContent,
+                ..
+            }
+        )
     }
 
     pub(crate) fn metadata_content_certified(&self) -> bool {
@@ -260,9 +241,6 @@ impl TransactionJson {
                 normalized,
                 certificate: TransactionJsonCertificate::RowContent,
             } => Self::from_unvalidated_shared_normalized_content(normalized),
-            TransactionJsonStorage::Certified { normalized } => {
-                Self::from_unvalidated_shared_normalized_content(normalized.as_ref().into())
-            }
             storage => Self { storage },
         }
     }
@@ -273,7 +251,6 @@ impl TransactionJson {
         match &self.storage {
             TransactionJsonStorage::CanonicalBatch(value) => value.certificate(),
             TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::Certified { .. }
             | TransactionJsonStorage::CertifiedShared { .. }
             | TransactionJsonStorage::CanonicalShared { .. } => None,
         }
@@ -283,7 +260,6 @@ impl TransactionJson {
         match &self.storage {
             TransactionJsonStorage::CanonicalBatch(value) => Some(value.normalized_shared()),
             TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::Certified { .. }
             | TransactionJsonStorage::CertifiedShared { .. }
             | TransactionJsonStorage::CanonicalShared { .. } => None,
         }
@@ -305,8 +281,7 @@ impl TransactionJson {
                     )
                 })
                 .as_ref(),
-            TransactionJsonStorage::Certified { .. }
-            | TransactionJsonStorage::CertifiedShared { .. } => {
+            TransactionJsonStorage::CertifiedShared { .. } => {
                 panic!("certified transaction JSON must be prepared before decoding is requested")
             }
         }
@@ -321,7 +296,6 @@ impl TransactionJson {
                         .into()
                 })
                 .as_ref(),
-            TransactionJsonStorage::Certified { normalized } => normalized.as_ref(),
             TransactionJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),
             TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized.as_str(),
             TransactionJsonStorage::CanonicalBatch(value) => value.normalized(),
@@ -333,7 +307,6 @@ impl TransactionJson {
         match &self.storage {
             TransactionJsonStorage::CanonicalBatch(value) => Some(value),
             TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::Certified { .. }
             | TransactionJsonStorage::CertifiedShared { .. }
             | TransactionJsonStorage::CanonicalShared { .. } => None,
         }
@@ -357,8 +330,7 @@ impl TransactionJson {
                 });
                 Arc::try_unwrap(value).unwrap_or_else(|value| value.as_ref().clone())
             }
-            TransactionJsonStorage::Certified { .. }
-            | TransactionJsonStorage::CertifiedShared { .. } => {
+            TransactionJsonStorage::CertifiedShared { .. } => {
                 panic!("certified transaction JSON must bypass semantic normalization")
             }
         }
@@ -770,10 +742,7 @@ impl CertifiedParameterBatch {
         });
         let mut json = Vec::with_capacity(row_count);
         for snapshot in snapshots {
-            json.push(stage_json_from_value(
-                snapshot,
-                "certified parameter snapshot_content",
-            )?);
+            json.push(stage_json_from_value(snapshot));
         }
         let string_index = strings
             .iter()
@@ -1344,8 +1313,7 @@ impl RawWriteBatch {
                     "certified transaction row is missing snapshot_content",
                 )
             })?;
-            let snapshot =
-                stage_json_from_value(snapshot, "certified prepared row snapshot_content")?;
+            let snapshot = stage_json_from_value(snapshot);
             prepared_row_pks.push(row_pk);
             json.push(snapshot);
             let untracked = slot.flags & RAW_WRITE_UNTRACKED != 0;
@@ -2450,11 +2418,7 @@ impl PartialEq for StageJson {
 
 impl Eq for StageJson {}
 
-#[expect(clippy::unnecessary_wraps)]
-pub(crate) fn stage_json_from_value(
-    value: TransactionJson,
-    _context: &str,
-) -> Result<StageJson, LixError> {
+pub(crate) fn stage_json_from_value(value: TransactionJson) -> StageJson {
     // Inline values carry their bytes as the authoritative durable payload.
     // Computing and retaining a content hash for every small row only to
     // discard it at `JsonSlotRef::Inline` doubled the canonical-byte walk on
@@ -2471,10 +2435,6 @@ pub(crate) fn stage_json_from_value(
                 panic!("transaction JSON was normalized while computing its JSON ref")
             }),
         },
-        TransactionJsonStorage::Certified { normalized } => StageJsonStorage::Owned {
-            value: OnceLock::new(),
-            normalized,
-        },
         TransactionJsonStorage::CertifiedShared {
             normalized,
             certificate:
@@ -2488,7 +2448,7 @@ pub(crate) fn stage_json_from_value(
         }
         TransactionJsonStorage::CanonicalBatch(value) => StageJsonStorage::CanonicalBatch(value),
     };
-    Ok(StageJson { storage, json_ref })
+    StageJson { storage, json_ref }
 }
 
 /// Coalesces decoded JSON values into one Arrow-style values column plus one
@@ -2555,11 +2515,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                 positions.push(position);
                 values.push(value);
                 cached_normalized.push(normalized.into_inner());
-            }
-            TransactionJsonStorage::Certified { normalized } => {
-                **slot = Some(TransactionJson {
-                    storage: TransactionJsonStorage::Certified { normalized },
-                });
             }
             TransactionJsonStorage::CertifiedShared {
                 normalized,
@@ -4877,25 +4832,17 @@ mod tests {
         let batch = PreparedStateBatch::from_test_rows(vec![
             prepared_fixture_row(
                 "a",
-                Some(
-                    stage_json_from_value(
-                        TransactionJson::from_canonical_batch(first),
-                        "insert fixture",
-                    )
-                    .expect("insert fixture should stage"),
-                ),
+                Some(stage_json_from_value(
+                    TransactionJson::from_canonical_batch(first),
+                )),
                 TransactionWriteOperation::Insert,
                 &origin_key,
             ),
             prepared_fixture_row(
                 "b",
-                Some(
-                    stage_json_from_value(
-                        TransactionJson::from_canonical_batch(second),
-                        "update fixture",
-                    )
-                    .expect("update fixture should stage"),
-                ),
+                Some(stage_json_from_value(
+                    TransactionJson::from_canonical_batch(second),
+                )),
                 TransactionWriteOperation::Update,
                 &origin_key,
             ),
@@ -4940,9 +4887,7 @@ mod tests {
         let staged_snapshot = |value: String| {
             stage_json_from_value(
                 TransactionJson::from_certified_shared_normalized_row_content(value.into()),
-                "compaction fixture",
             )
-            .expect("fixture should stage")
         };
         let mut batch = PreparedStateBatch::from_test_rows(vec![
             prepared_fixture_row(
@@ -5057,16 +5002,12 @@ mod tests {
                 TransactionJson::from_certified_shared_normalized_row_content(
                     format!(r#"{{"id":"row-{index}"}}"#).into(),
                 ),
-                "capacity snapshot",
-            )
-            .expect("snapshot should stage");
+            );
             let metadata = stage_json_from_value(
                 TransactionJson::from_certified_shared_normalized_row_content(
                     format!(r#"{{"row":{index}}}"#).into(),
                 ),
-                "capacity metadata",
-            )
-            .expect("metadata should stage");
+            );
             batch.push_test_row(TestPreparedStateRow {
                 schema_plan_id: SchemaPlanId::for_test(0),
                 facts: PreparedRowFacts::default(),
@@ -5169,14 +5110,13 @@ mod tests {
     }
 
     #[test]
-    fn certified_normalized_content_can_materialize_from_the_prepared_boundary() {
-        let transaction_json = TransactionJson::from_certified_normalized_row_content(
+    fn certified_shared_content_can_materialize_from_the_prepared_boundary() {
+        let transaction_json = TransactionJson::from_certified_shared_normalized_row_content(
             r#"{"path":"/a","value":{"nested":true}}"#.into(),
         );
         assert!(transaction_json.row_content_certified());
 
-        let staged = stage_json_from_value(transaction_json, "certified test row")
-            .expect("certified JSON should prepare");
+        let staged = stage_json_from_value(transaction_json);
         assert_eq!(
             staged.value(),
             &serde_json::json!({"path": "/a", "value": {"nested": true}})
@@ -5196,10 +5136,8 @@ mod tests {
         );
         let expected = JsonRef::for_content(normalized.as_bytes());
         let staged = stage_json_from_value(
-            TransactionJson::from_certified_normalized_row_content(normalized.into()),
-            "large certified test row",
-        )
-        .expect("large certified JSON should prepare");
+            TransactionJson::from_certified_shared_normalized_row_content(normalized.into()),
+        );
 
         assert!(!staged.is_inline());
         assert_eq!(staged.json_ref, expected);
@@ -5220,8 +5158,7 @@ mod tests {
         let batch_row = batch.pop().expect("canonical row");
         let transaction_json = TransactionJson::from_canonical_batch(batch_row.clone());
 
-        let staged =
-            stage_json_from_value(transaction_json, "canonical batch row").expect("stage JSON");
+        let staged = stage_json_from_value(transaction_json);
         let staged_batch_row = staged
             .canonical_batch_row()
             .expect("staging must retain canonical batch ownership");
@@ -5252,11 +5189,7 @@ mod tests {
         .expect("canonical batch");
         let batch_row = batch.pop().expect("canonical row");
         let source = batch_row.normalized_shared();
-        let mut staged = stage_json_from_value(
-            TransactionJson::from_canonical_batch(batch_row),
-            "validated canonical batch row",
-        )
-        .expect("stage JSON");
+        let mut staged = stage_json_from_value(TransactionJson::from_canonical_batch(batch_row));
 
         assert!(staged.release_validated_canonical_value_column());
         assert!(!staged.release_validated_canonical_value_column());
@@ -5275,8 +5208,7 @@ mod tests {
             transaction_json.value(),
             &serde_json::json!({"id": "row-1", "value": "hello"})
         );
-        let mut staged = stage_json_from_value(transaction_json, "shared canonical row")
-            .expect("shared canonical JSON should stage");
+        let mut staged = stage_json_from_value(transaction_json);
         assert!(staged.retains_decoded_value_for_tests());
 
         assert!(staged.release_validated_canonical_value_column());
@@ -5308,15 +5240,15 @@ mod tests {
                 .map(|(index, source)| {
                     prepared_fixture_row(
                         &format!("row-{index}"),
-                        Some(
-                            stage_json_from_value(
-                                TransactionJson::from_certified_normalized_row_content(Arc::clone(
-                                    source,
-                                )),
-                                "certified direct replacement",
-                            )
-                            .expect("certified direct JSON should stage"),
-                        ),
+                        Some(stage_json_from_value(TransactionJson {
+                            storage: TransactionJsonStorage::Decoded {
+                                value: Arc::new(
+                                    serde_json::from_str(source)
+                                        .expect("certified direct replacement JSON"),
+                                ),
+                                normalized: OnceLock::from(Arc::clone(source)),
+                            },
+                        })),
                         TransactionWriteOperation::Update,
                         &origin_key,
                     )
@@ -5373,10 +5305,7 @@ mod tests {
                 .map(|(index, snapshot)| {
                     prepared_fixture_row(
                         &format!("row-{index}"),
-                        Some(
-                            stage_json_from_value(snapshot, "certified transaction arena")
-                                .expect("certified JSON should stage"),
-                        ),
+                        Some(stage_json_from_value(snapshot)),
                         TransactionWriteOperation::Insert,
                         &origin_key,
                     )
@@ -5449,8 +5378,7 @@ mod tests {
         .expect("certified transaction arena")
         .pop()
         .expect("certified row");
-        let mut staged =
-            stage_json_from_value(snapshot, "certified transaction arena").expect("staged JSON");
+        let mut staged = stage_json_from_value(snapshot);
 
         assert!(!staged.retains_decoded_value_for_tests());
         assert_eq!(staged.value()["id"], "row-1");
@@ -5490,13 +5418,9 @@ mod tests {
                 .map(|(index, value)| {
                     prepared_fixture_row(
                         &format!("row-{index}"),
-                        Some(
-                            stage_json_from_value(
-                                TransactionJson::from_canonical_batch(value),
-                                "sparse canonical fixture",
-                            )
-                            .expect("fixture should stage"),
-                        ),
+                        Some(stage_json_from_value(
+                            TransactionJson::from_canonical_batch(value),
+                        )),
                         TransactionWriteOperation::Update,
                         &origin_key,
                     )
@@ -5570,13 +5494,9 @@ mod tests {
                 .map(|(index, value)| {
                     prepared_fixture_row(
                         &format!("row-{index}"),
-                        Some(
-                            stage_json_from_value(
-                                TransactionJson::from_canonical_batch(value),
-                                "skewed canonical fixture",
-                            )
-                            .expect("fixture should stage"),
-                        ),
+                        Some(stage_json_from_value(
+                            TransactionJson::from_canonical_batch(value),
+                        )),
                         TransactionWriteOperation::Update,
                         &origin_key,
                     )

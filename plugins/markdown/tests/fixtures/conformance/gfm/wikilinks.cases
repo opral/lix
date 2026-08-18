@@ -1,0 +1,172 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: wikilinks
+count: 14
+
+--- case 1 options extension.wikilinks_title_after_pipe label-bytes 55 input-bytes 60 expected-bytes 95
+wikilinks_does_not_unescape_html_entities_in_link_label
+--- input
+This is [[&lt;script&gt;alert(0)&lt;/script&gt;|a &lt;link]]
+--- expected
+<p>This is <a href="%3Cscript%3Ealert(0)%3C/script%3E" data-wikilink="true">a &lt;link</a></p>
+
+--- end
+--- case 2 options extension.wikilinks_title_before_pipe label-bytes 55 input-bytes 60 expected-bytes 95
+wikilinks_does_not_unescape_html_entities_in_link_label
+--- input
+This is [[a &lt;link|&lt;script&gt;alert(0)&lt;/script&gt;]]
+--- expected
+<p>This is <a href="%3Cscript%3Ealert(0)%3C/script%3E" data-wikilink="true">a &lt;link</a></p>
+
+--- end
+--- case 3 options extension.wikilinks_title_after_pipe label-bytes 45 input-bytes 91 expected-bytes 142
+wikilinks_sanitizes_the_href_attribute_case_1
+--- input
+[[http:'"injected=attribute&gt;&lt;img/src="0"onerror="alert(0)"&gt;https://example.com|a]]
+--- expected
+<p><a href="http:&#x27;%22injected=attribute%3E%3Cimg/src=%220%22onerror=%22alert(0)%22%3Ehttps://example.com" data-wikilink="true">a</a></p>
+
+--- end
+--- case 4 options extension.wikilinks_title_before_pipe label-bytes 45 input-bytes 91 expected-bytes 142
+wikilinks_sanitizes_the_href_attribute_case_1
+--- input
+[[a|http:'"injected=attribute&gt;&lt;img/src="0"onerror="alert(0)"&gt;https://example.com]]
+--- expected
+<p><a href="http:&#x27;%22injected=attribute%3E%3Cimg/src=%220%22onerror=%22alert(0)%22%3Ehttps://example.com" data-wikilink="true">a</a></p>
+
+--- end
+--- case 5 options extension.wikilinks_title_after_pipe label-bytes 45 input-bytes 153 expected-bytes 212
+wikilinks_sanitizes_the_href_attribute_case_2
+--- input
+<i>[['"&gt;&lt;svg&gt;&lt;i/class=gl-show-field-errors&gt;&lt;input/title="&lt;script&gt;alert(0)&lt;/script&gt;"/&gt;&lt;/svg&gt;https://example.com|a]]
+--- expected
+<p><!-- raw HTML omitted --><a href="&#x27;%22%3E%3Csvg%3E%3Ci/class=gl-show-field-errors%3E%3Cinput/title=%22%3Cscript%3Ealert(0)%3C/script%3E%22/%3E%3C/svg%3Ehttps://example.com" data-wikilink="true">a</a></p>
+
+--- end
+--- case 6 options extension.wikilinks_title_before_pipe label-bytes 45 input-bytes 153 expected-bytes 212
+wikilinks_sanitizes_the_href_attribute_case_2
+--- input
+<i>[[a|'"&gt;&lt;svg&gt;&lt;i/class=gl-show-field-errors&gt;&lt;input/title="&lt;script&gt;alert(0)&lt;/script&gt;"/&gt;&lt;/svg&gt;https://example.com]]
+--- expected
+<p><!-- raw HTML omitted --><a href="&#x27;%22%3E%3Csvg%3E%3Ci/class=gl-show-field-errors%3E%3Cinput/title=%22%3Cscript%3Ealert(0)%3C/script%3E%22/%3E%3C/svg%3Ehttps://example.com" data-wikilink="true">a</a></p>
+
+--- end
+--- case 7 options extension.wikilinks_title_after_pipe,parse.relaxed_autolinks label-bytes 38 input-bytes 22 expected-bytes 80
+wikilinks_supersedes_relaxed_autolinks
+--- input
+[[http://example.com]]
+--- expected
+<p><a href="http://example.com" data-wikilink="true">http://example.com</a></p>
+
+--- end
+--- case 8 options extension.wikilinks_title_before_pipe,parse.relaxed_autolinks label-bytes 38 input-bytes 22 expected-bytes 80
+wikilinks_supersedes_relaxed_autolinks
+--- input
+[[http://example.com]]
+--- expected
+<p><a href="http://example.com" data-wikilink="true">http://example.com</a></p>
+
+--- end
+--- case 9 options extension.wikilinks_title_after_pipe,extension.table label-bytes 28 input-bytes 36 expected-bytes 141
+wikilinks_only_url_in_tables
+--- input
+| header  |
+| ------- |
+| [[url]] |
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>header</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="url" data-wikilink="true">url</a></td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 10 options extension.wikilinks_title_before_pipe,extension.table label-bytes 28 input-bytes 36 expected-bytes 141
+wikilinks_only_url_in_tables
+--- input
+| header  |
+| ------- |
+| [[url]] |
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>header</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="url" data-wikilink="true">url</a></td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 11 options extension.wikilinks_title_after_pipe,extension.table label-bytes 38 input-bytes 47 expected-bytes 104
+wikilinks_full_in_tables_not_supported
+--- input
+| header  |
+| ------- |
+| [[url|link label]] |
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>header</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>[[url</td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 12 options extension.wikilinks_title_before_pipe,extension.table label-bytes 38 input-bytes 47 expected-bytes 111
+wikilinks_full_in_tables_not_supported
+--- input
+| header  |
+| ------- |
+| [[link label|url]] |
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>header</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>[[link label</td>
+</tr>
+</tbody>
+</table>
+
+--- end
+--- case 13 options extension.wikilinks_title_after_pipe,extension.autolink label-bytes 28 input-bytes 22 expected-bytes 80
+wikilinks_autolinker_ignored
+--- input
+[[http://example.com]]
+--- expected
+<p><a href="http://example.com" data-wikilink="true">http://example.com</a></p>
+
+--- end
+--- case 14 options extension.wikilinks_title_before_pipe,extension.autolink label-bytes 28 input-bytes 22 expected-bytes 80
+wikilinks_autolinker_ignored
+--- input
+[[http://example.com]]
+--- expected
+<p><a href="http://example.com" data-wikilink="true">http://example.com</a></p>
+
+--- end

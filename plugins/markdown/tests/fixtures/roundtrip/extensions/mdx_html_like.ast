@@ -1,0 +1,9 @@
+Document
+  MdxJsx "<div data-x=\"1\">\n  <span>{value}</span>\n</div>"
+  Paragraph
+    Text "Text "
+    MdxJsx "<em>{value}</em>"
+    Text " and "
+    MdxJsx "<br />"
+    Text "."
+  MdxExpression "foo ? {bar: \"}\"} : /* } */ baz"

@@ -1,0 +1,1467 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: list
+count: 91
+
+--- case 1 options - label-bytes 24 input-bytes 64 expected-bytes 122
+should support documents
+--- input
+A paragraph
+with two lines.
+
+    indented code
+
+> A block quote.
+--- expected
+<p>A paragraph
+with two lines.</p>
+<pre><code>indented code
+</code></pre>
+<blockquote>
+<p>A block quote.</p>
+</blockquote>
+--- end
+--- case 2 options - label-bytes 38 input-bytes 33 expected-bytes 97
+should support documents in list items
+--- input
+1.  a
+    b.
+
+        c
+
+    > d.
+--- expected
+<ol>
+<li>
+<p>a
+b.</p>
+<pre><code>c
+</code></pre>
+<blockquote>
+<p>d.</p>
+</blockquote>
+</li>
+</ol>
+--- end
+--- case 3 options - label-bytes 58 input-bytes 11 expected-bytes 34
+should not support 1 space for a two-character list prefix
+--- input
+- one
+
+ two
+--- expected
+<ul>
+<li>one</li>
+</ul>
+<p>two</p>
+--- end
+--- case 4 options - label-bytes 40 input-bytes 8 expected-bytes 39
+should support blank lines in list items
+--- input
+- a
+
+  b
+--- expected
+<ul>
+<li>
+<p>a</p>
+<p>b</p>
+</li>
+</ul>
+--- end
+--- case 5 options - label-bytes 40 input-bytes 19 expected-bytes 53
+should support indented code after lists
+--- input
+ -    one
+
+     two
+--- expected
+<ul>
+<li>one</li>
+</ul>
+<pre><code> two
+</code></pre>
+--- end
+--- case 6 options - label-bytes 54 input-bytes 28 expected-bytes 97
+should support proper indent mixed w/ block quotes (1)
+--- input
+   > > 1.  one
+>>
+>>     two
+--- expected
+<blockquote>
+<blockquote>
+<ol>
+<li>
+<p>one</p>
+<p>two</p>
+</li>
+</ol>
+</blockquote>
+</blockquote>
+--- end
+--- case 7 options - label-bytes 54 input-bytes 21 expected-bytes 88
+should support proper indent mixed w/ block quotes (2)
+--- input
+>>- one
+>>
+  >  > two
+--- expected
+<blockquote>
+<blockquote>
+<ul>
+<li>one</li>
+</ul>
+<p>two</p>
+</blockquote>
+</blockquote>
+--- end
+--- case 8 options - label-bytes 47 input-bytes 11 expected-bytes 24
+should not support a missing space after marker
+--- input
+-one
+
+2.two
+--- expected
+<p>-one</p>
+<p>2.two</p>
+--- end
+--- case 9 options - label-bytes 49 input-bytes 13 expected-bytes 43
+should support multiple blank lines between items
+--- input
+- foo
+
+
+  bar
+--- expected
+<ul>
+<li>
+<p>foo</p>
+<p>bar</p>
+</li>
+</ul>
+--- end
+--- case 10 options - label-bytes 28 input-bytes 52 expected-bytes 110
+should support flow in items
+--- input
+1.  foo
+
+    ```
+    bar
+    ```
+
+    baz
+
+    > bam
+--- expected
+<ol>
+<li>
+<p>foo</p>
+<pre><code>bar
+</code></pre>
+<p>baz</p>
+<blockquote>
+<p>bam</p>
+</blockquote>
+</li>
+</ol>
+--- end
+--- case 11 options - label-bytes 52 input-bytes 28 expected-bytes 67
+should support blank lines in indented code in items
+--- input
+- Foo
+
+      bar
+
+
+      baz
+--- expected
+<ul>
+<li>
+<p>Foo</p>
+<pre><code>bar
+
+
+baz
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 12 options - label-bytes 43 input-bytes 13 expected-bytes 40
+should support start on the first list item
+--- input
+123456789. ok
+--- expected
+<ol start="123456789">
+<li>ok</li>
+</ol>
+--- end
+--- case 13 options - label-bytes 53 input-bytes 18 expected-bytes 25
+should not support ordered item values over 10 digits
+--- input
+1234567890. not ok
+--- expected
+<p>1234567890. not ok</p>
+--- end
+--- case 14 options - label-bytes 41 input-bytes 5 expected-bytes 32
+should support ordered item values of `0`
+--- input
+0. ok
+--- expected
+<ol start="0">
+<li>ok</li>
+</ol>
+--- end
+--- case 15 options - label-bytes 51 input-bytes 7 expected-bytes 32
+should support ordered item values starting w/ `0`s
+--- input
+003. ok
+--- expected
+<ol start="3">
+<li>ok</li>
+</ol>
+--- end
+--- case 16 options - label-bytes 53 input-bytes 10 expected-bytes 17
+should not support “negative” ordered item values
+--- input
+-1. not ok
+--- expected
+<p>-1. not ok</p>
+--- end
+--- case 17 options - label-bytes 46 input-bytes 16 expected-bytes 61
+should support indented code in list items (1)
+--- input
+- foo
+
+      bar
+--- expected
+<ul>
+<li>
+<p>foo</p>
+<pre><code>bar
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 18 options - label-bytes 46 input-bytes 26 expected-bytes 72
+should support indented code in list items (2)
+--- input
+  10.  foo
+
+           bar
+--- expected
+<ol start="10">
+<li>
+<p>foo</p>
+<pre><code>bar
+</code></pre>
+</li>
+</ol>
+--- end
+--- case 19 options - label-bytes 46 input-bytes 43 expected-bytes 90
+should support indented code in list items (3)
+--- input
+    indented code
+
+paragraph
+
+    more code
+--- expected
+<pre><code>indented code
+</code></pre>
+<p>paragraph</p>
+<pre><code>more code
+</code></pre>
+--- end
+--- case 20 options - label-bytes 46 input-bytes 52 expected-bytes 112
+should support indented code in list items (4)
+--- input
+1.     indented code
+
+   paragraph
+
+       more code
+--- expected
+<ol>
+<li>
+<pre><code>indented code
+</code></pre>
+<p>paragraph</p>
+<pre><code>more code
+</code></pre>
+</li>
+</ol>
+--- end
+--- case 21 options - label-bytes 46 input-bytes 53 expected-bytes 113
+should support indented code in list items (5)
+--- input
+1.      indented code
+
+   paragraph
+
+       more code
+--- expected
+<ol>
+<li>
+<pre><code> indented code
+</code></pre>
+<p>paragraph</p>
+<pre><code>more code
+</code></pre>
+</li>
+</ol>
+--- end
+--- case 22 options - label-bytes 46 input-bytes 11 expected-bytes 21
+should support indented code in list items (6)
+--- input
+   foo
+
+bar
+--- expected
+<p>foo</p>
+<p>bar</p>
+--- end
+--- case 23 options - label-bytes 46 input-bytes 15 expected-bytes 34
+should support indented code in list items (7)
+--- input
+-    foo
+
+  bar
+--- expected
+<ul>
+<li>foo</li>
+</ul>
+<p>bar</p>
+--- end
+--- case 24 options - label-bytes 46 input-bytes 14 expected-bytes 43
+should support indented code in list items (8)
+--- input
+-  foo
+
+   bar
+--- expected
+<ul>
+<li>
+<p>foo</p>
+<p>bar</p>
+</li>
+</ul>
+--- end
+--- case 25 options - label-bytes 36 input-bytes 39 expected-bytes 103
+should support blank first lines (1)
+--- input
+-
+  foo
+-
+  ```
+  bar
+  ```
+-
+      baz
+--- expected
+<ul>
+<li>foo</li>
+<li>
+<pre><code>bar
+</code></pre>
+</li>
+<li>
+<pre><code>baz
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 26 options - label-bytes 36 input-bytes 10 expected-bytes 23
+should support blank first lines (2)
+--- input
+-   
+  foo
+--- expected
+<ul>
+<li>foo</li>
+</ul>
+--- end
+--- case 27 options - label-bytes 31 input-bytes 8 expected-bytes 31
+should support empty only items
+--- input
+-
+
+  foo
+--- expected
+<ul>
+<li></li>
+</ul>
+<p>foo</p>
+--- end
+--- case 28 options - label-bytes 36 input-bytes 13 expected-bytes 46
+should support empty continued items
+--- input
+- foo
+-
+- bar
+--- expected
+<ul>
+<li>foo</li>
+<li></li>
+<li>bar</li>
+</ul>
+--- end
+--- case 29 options - label-bytes 36 input-bytes 16 expected-bytes 46
+should support blank continued items
+--- input
+- foo
+-   
+- bar
+--- expected
+<ul>
+<li>foo</li>
+<li></li>
+<li>bar</li>
+</ul>
+--- end
+--- case 30 options - label-bytes 46 input-bytes 16 expected-bytes 46
+should support empty continued items (ordered)
+--- input
+1. foo
+2.
+3. bar
+--- expected
+<ol>
+<li>foo</li>
+<li></li>
+<li>bar</li>
+</ol>
+--- end
+--- case 31 options - label-bytes 34 input-bytes 1 expected-bytes 20
+should support a single empty item
+--- input
+*
+--- expected
+<ul>
+<li></li>
+</ul>
+--- end
+--- case 32 options - label-bytes 54 input-bytes 13 expected-bytes 26
+should not support empty items to interrupt paragraphs
+--- input
+foo
+*
+
+foo
+1.
+--- expected
+<p>foo
+*</p>
+<p>foo
+1.</p>
+--- end
+--- case 33 options - label-bytes 35 input-bytes 84 expected-bytes 144
+should support indenting w/ 1 space
+--- input
+ 1.  A paragraph
+     with two lines.
+
+         indented code
+
+     > A block quote.
+--- expected
+<ol>
+<li>
+<p>A paragraph
+with two lines.</p>
+<pre><code>indented code
+</code></pre>
+<blockquote>
+<p>A block quote.</p>
+</blockquote>
+</li>
+</ol>
+--- end
+--- case 34 options - label-bytes 36 input-bytes 88 expected-bytes 144
+should support indenting w/ 2 spaces
+--- input
+  1.  A paragraph
+      with two lines.
+
+          indented code
+
+      > A block quote.
+--- expected
+<ol>
+<li>
+<p>A paragraph
+with two lines.</p>
+<pre><code>indented code
+</code></pre>
+<blockquote>
+<p>A block quote.</p>
+</blockquote>
+</li>
+</ol>
+--- end
+--- case 35 options - label-bytes 36 input-bytes 92 expected-bytes 144
+should support indenting w/ 3 spaces
+--- input
+   1.  A paragraph
+       with two lines.
+
+           indented code
+
+       > A block quote.
+--- expected
+<ol>
+<li>
+<p>A paragraph
+with two lines.</p>
+<pre><code>indented code
+</code></pre>
+<blockquote>
+<p>A block quote.</p>
+</blockquote>
+</li>
+</ol>
+--- end
+--- case 36 options - label-bytes 40 input-bytes 96 expected-bytes 108
+should not support indenting w/ 4 spaces
+--- input
+    1.  A paragraph
+        with two lines.
+
+            indented code
+
+        > A block quote.
+--- expected
+<pre><code>1.  A paragraph
+    with two lines.
+
+        indented code
+
+    &gt; A block quote.
+</code></pre>
+--- end
+--- case 37 options - label-bytes 25 input-bytes 82 expected-bytes 144
+should support lazy lines
+--- input
+  1.  A paragraph
+with two lines.
+
+          indented code
+
+      > A block quote.
+--- expected
+<ol>
+<li>
+<p>A paragraph
+with two lines.</p>
+<pre><code>indented code
+</code></pre>
+<blockquote>
+<p>A block quote.</p>
+</blockquote>
+</li>
+</ol>
+--- end
+--- case 38 options - label-bytes 35 input-bytes 37 expected-bytes 47
+should support partially lazy lines
+--- input
+  1.  A paragraph
+    with two lines.
+--- expected
+<ol>
+<li>A paragraph
+with two lines.</li>
+</ol>
+--- end
+--- case 39 options - label-bytes 54 input-bytes 33 expected-bytes 109
+should support lazy lines combined w/ other containers
+--- input
+> 1. > Blockquote
+continued here.
+--- expected
+<blockquote>
+<ol>
+<li>
+<blockquote>
+<p>Blockquote
+continued here.</p>
+</blockquote>
+</li>
+</ol>
+</blockquote>
+--- end
+--- case 40 options - label-bytes 85 input-bytes 35 expected-bytes 109
+should support partially continued, partially lazy lines combined w/ other containers
+--- input
+> 1. > Blockquote
+> continued here.
+--- expected
+<blockquote>
+<ol>
+<li>
+<blockquote>
+<p>Blockquote
+continued here.</p>
+</blockquote>
+</li>
+</ol>
+</blockquote>
+--- end
+--- case 41 options - label-bytes 42 input-bytes 5 expected-bytes 23
+should support lazy, definition-like lines
+--- input
+- [
+a
+--- expected
+<ul>
+<li>[
+a</li>
+</ul>
+--- end
+--- case 42 options - label-bytes 57 input-bytes 10 expected-bytes 21
+should support a definition, followed by a lazy paragraph
+--- input
+- [a]: b
+c
+--- expected
+<ul>
+<li>c</li>
+</ul>
+--- end
+--- case 43 options - label-bytes 44 input-bytes 35 expected-bytes 98
+should support sublists w/ enough spaces (1)
+--- input
+- foo
+  - bar
+    - baz
+      - boo
+--- expected
+<ul>
+<li>foo
+<ul>
+<li>bar
+<ul>
+<li>baz
+<ul>
+<li>boo</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+--- end
+--- case 44 options - label-bytes 45 input-bytes 29 expected-bytes 62
+should not support sublists w/ too few spaces
+--- input
+- foo
+ - bar
+  - baz
+   - boo
+--- expected
+<ul>
+<li>foo</li>
+<li>bar</li>
+<li>baz</li>
+<li>boo</li>
+</ul>
+--- end
+--- case 45 options - label-bytes 44 input-bytes 17 expected-bytes 59
+should support sublists w/ enough spaces (2)
+--- input
+10) foo
+    - bar
+--- expected
+<ol start="10">
+<li>foo
+<ul>
+<li>bar</li>
+</ul>
+</li>
+</ol>
+--- end
+--- case 46 options - label-bytes 49 input-bytes 16 expected-bytes 58
+should not support sublists w/ too few spaces (2)
+--- input
+10) foo
+   - bar
+--- expected
+<ol start="10">
+<li>foo</li>
+</ol>
+<ul>
+<li>bar</li>
+</ul>
+--- end
+--- case 47 options - label-bytes 27 input-bytes 7 expected-bytes 45
+should support sublists (1)
+--- input
+- - foo
+--- expected
+<ul>
+<li>
+<ul>
+<li>foo</li>
+</ul>
+</li>
+</ul>
+--- end
+--- case 48 options - label-bytes 27 input-bytes 11 expected-bytes 77
+should support sublists (2)
+--- input
+1. - 2. foo
+--- expected
+<ol>
+<li>
+<ul>
+<li>
+<ol start="2">
+<li>foo</li>
+</ol>
+</li>
+</ul>
+</li>
+</ol>
+--- end
+--- case 49 options - label-bytes 37 input-bytes 25 expected-bytes 61
+should support headings in list items
+--- input
+- # Foo
+- Bar
+  ---
+  baz
+--- expected
+<ul>
+<li>
+<h1>Foo</h1>
+</li>
+<li>
+<h2>Bar</h2>
+baz</li>
+</ul>
+--- end
+--- case 50 options - label-bytes 60 input-bytes 17 expected-bytes 60
+should support a new list by changing the marker (unordered)
+--- input
+- foo
+- bar
++ baz
+--- expected
+<ul>
+<li>foo</li>
+<li>bar</li>
+</ul>
+<ul>
+<li>baz</li>
+</ul>
+--- end
+--- case 51 options - label-bytes 58 input-bytes 20 expected-bytes 70
+should support a new list by changing the marker (ordered)
+--- input
+1. foo
+2. bar
+3) baz
+--- expected
+<ol>
+<li>foo</li>
+<li>bar</li>
+</ol>
+<ol start="3">
+<li>baz</li>
+</ol>
+--- end
+--- case 52 options - label-bytes 39 input-bytes 15 expected-bytes 47
+should support interrupting a paragraph
+--- input
+Foo
+- bar
+- baz
+--- expected
+<p>Foo</p>
+<ul>
+<li>bar</li>
+<li>baz</li>
+</ul>
+--- end
+--- case 53 options - label-bytes 70 input-bytes 6 expected-bytes 13
+should not support interrupting a paragraph with a non-1 numbered item
+--- input
+a
+2. b
+--- expected
+<p>a
+2. b</p>
+--- end
+--- case 54 options - label-bytes 39 input-bytes 5 expected-bytes 31
+should “interrupt” a blank line (1)
+--- input
+
+2. a
+--- expected
+<ol start="2">
+<li>a</li>
+</ol>
+--- end
+--- case 55 options - label-bytes 39 input-bytes 7 expected-bytes 40
+should “interrupt” a blank line (2)
+--- input
+a
+
+2. b
+--- expected
+<p>a</p>
+<ol start="2">
+<li>b</li>
+</ol>
+--- end
+--- case 56 options - label-bytes 62 input-bytes 6 expected-bytes 30
+should support interrupting a paragraph with a 1 numbered item
+--- input
+a
+1. b
+--- expected
+<p>a</p>
+<ol>
+<li>b</li>
+</ol>
+--- end
+--- case 57 options - label-bytes 44 input-bytes 20 expected-bytes 76
+should support blank lines between items (1)
+--- input
+- foo
+
+- bar
+
+
+- baz
+--- expected
+<ul>
+<li>
+<p>foo</p>
+</li>
+<li>
+<p>bar</p>
+</li>
+<li>
+<p>baz</p>
+</li>
+</ul>
+--- end
+--- case 58 options - label-bytes 44 input-bytes 35 expected-bytes 93
+should support blank lines between items (2)
+--- input
+- foo
+  - bar
+    - baz
+
+
+      bim
+--- expected
+<ul>
+<li>foo
+<ul>
+<li>bar
+<ul>
+<li>
+<p>baz</p>
+<p>bim</p>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+--- end
+--- case 59 options allow_dangerous_html,allow_dangerous_protocol label-bytes 42 input-bytes 34 expected-bytes 82
+should support HTML comments between lists
+--- input
+- foo
+- bar
+
+<!-- -->
+
+- baz
+- bim
+--- expected
+<ul>
+<li>foo</li>
+<li>bar</li>
+</ul>
+<!-- -->
+<ul>
+<li>baz</li>
+<li>bim</li>
+</ul>
+--- end
+--- case 60 options allow_dangerous_html,allow_dangerous_protocol label-bytes 60 input-bytes 49 expected-bytes 108
+should support HTML comments between lists and indented code
+--- input
+-   foo
+
+    notcode
+
+-   foo
+
+<!-- -->
+
+    code
+--- expected
+<ul>
+<li>
+<p>foo</p>
+<p>notcode</p>
+</li>
+<li>
+<p>foo</p>
+</li>
+</ul>
+<!-- -->
+<pre><code>code
+</code></pre>
+--- end
+--- case 61 options - label-bytes 55 input-bytes 36 expected-bytes 87
+should not support lists in lists w/ too few spaces (1)
+--- input
+- a
+ - b
+  - c
+   - d
+  - e
+ - f
+- g
+--- expected
+<ul>
+<li>a</li>
+<li>b</li>
+<li>c</li>
+<li>d</li>
+<li>e</li>
+<li>f</li>
+<li>g</li>
+</ul>
+--- end
+--- case 62 options - label-bytes 55 input-bytes 21 expected-bytes 70
+should not support lists in lists w/ too few spaces (2)
+--- input
+1. a
+
+  2. b
+
+   3. c
+--- expected
+<ol>
+<li>
+<p>a</p>
+</li>
+<li>
+<p>b</p>
+</li>
+<li>
+<p>c</p>
+</li>
+</ol>
+--- end
+--- case 63 options - label-bytes 55 input-bytes 29 expected-bytes 58
+should not support lists in lists w/ too few spaces (3)
+--- input
+- a
+ - b
+  - c
+   - d
+    - e
+--- expected
+<ul>
+<li>a</li>
+<li>b</li>
+<li>c</li>
+<li>d
+- e</li>
+</ul>
+--- end
+--- case 64 options - label-bytes 55 input-bytes 22 expected-bytes 80
+should not support lists in lists w/ too few spaces (3)
+--- input
+1. a
+
+  2. b
+
+    3. c
+--- expected
+<ol>
+<li>
+<p>a</p>
+</li>
+<li>
+<p>b</p>
+</li>
+</ol>
+<pre><code>3. c
+</code></pre>
+--- end
+--- case 65 options - label-bytes 54 input-bytes 12 expected-bytes 70
+should support loose lists w/ a blank line between (1)
+--- input
+- a
+- b
+
+- c
+--- expected
+<ul>
+<li>
+<p>a</p>
+</li>
+<li>
+<p>b</p>
+</li>
+<li>
+<p>c</p>
+</li>
+</ul>
+--- end
+--- case 66 options - label-bytes 54 input-bytes 10 expected-bytes 60
+should support loose lists w/ a blank line between (2)
+--- input
+* a
+*
+
+* c
+--- expected
+<ul>
+<li>
+<p>a</p>
+</li>
+<li></li>
+<li>
+<p>c</p>
+</li>
+</ul>
+--- end
+--- case 67 options - label-bytes 57 input-bytes 16 expected-bytes 79
+should support loose lists w/ a blank line in an item (1)
+--- input
+- a
+- b
+
+  c
+- d
+--- expected
+<ul>
+<li>
+<p>a</p>
+</li>
+<li>
+<p>b</p>
+<p>c</p>
+</li>
+<li>
+<p>d</p>
+</li>
+</ul>
+--- end
+--- case 68 options - label-bytes 57 input-bytes 26 expected-bytes 70
+should support loose lists w/ a blank line in an item (2)
+--- input
+- a
+- b
+
+  [ref]: /url
+- d
+--- expected
+<ul>
+<li>
+<p>a</p>
+</li>
+<li>
+<p>b</p>
+</li>
+<li>
+<p>d</p>
+</li>
+</ul>
+--- end
+--- case 69 options - label-bytes 57 input-bytes 25 expected-bytes 72
+should support tight lists w/ a blank line in fenced code
+--- input
+- a
+- ```
+  b
+
+
+  ```
+- c
+--- expected
+<ul>
+<li>a</li>
+<li>
+<pre><code>b
+
+
+</code></pre>
+</li>
+<li>c</li>
+</ul>
+--- end
+--- case 70 options - label-bytes 55 input-bytes 20 expected-bytes 73
+should support tight lists w/ a blank line in a sublist
+--- input
+- a
+  - b
+
+    c
+- d
+--- expected
+<ul>
+<li>a
+<ul>
+<li>
+<p>b</p>
+<p>c</p>
+</li>
+</ul>
+</li>
+<li>d</li>
+</ul>
+--- end
+--- case 71 options - label-bytes 59 input-bytes 17 expected-bytes 69
+should support tight lists w/ a blank line in a block quote
+--- input
+* a
+  > b
+  >
+* c
+--- expected
+<ul>
+<li>a
+<blockquote>
+<p>b</p>
+</blockquote>
+</li>
+<li>c</li>
+</ul>
+--- end
+--- case 72 options - label-bytes 49 input-bytes 29 expected-bytes 96
+should support tight lists w/ flow w/o blank line
+--- input
+- a
+  > b
+  ```
+  c
+  ```
+- d
+--- expected
+<ul>
+<li>a
+<blockquote>
+<p>b</p>
+</blockquote>
+<pre><code>c
+</code></pre>
+</li>
+<li>d</li>
+</ul>
+--- end
+--- case 73 options - label-bytes 46 input-bytes 3 expected-bytes 21
+should support tight lists w/ a single content
+--- input
+- a
+--- expected
+<ul>
+<li>a</li>
+</ul>
+--- end
+--- case 74 options - label-bytes 39 input-bytes 9 expected-bytes 44
+should support tight lists w/ a sublist
+--- input
+- a
+  - b
+--- expected
+<ul>
+<li>a
+<ul>
+<li>b</li>
+</ul>
+</li>
+</ul>
+--- end
+--- case 75 options - label-bytes 53 input-bytes 28 expected-bytes 61
+should support loose lists w/ a blank line in an item
+--- input
+1. ```
+   foo
+   ```
+
+   bar
+--- expected
+<ol>
+<li>
+<pre><code>foo
+</code></pre>
+<p>bar</p>
+</li>
+</ol>
+--- end
+--- case 76 options - label-bytes 48 input-bytes 20 expected-bytes 67
+should support loose lists w/ tight sublists (1)
+--- input
+* foo
+  * bar
+
+  baz
+--- expected
+<ul>
+<li>
+<p>foo</p>
+<ul>
+<li>bar</li>
+</ul>
+<p>baz</p>
+</li>
+</ul>
+--- end
+--- case 77 options - label-bytes 48 input-bytes 32 expected-bytes 116
+should support loose lists w/ tight sublists (2)
+--- input
+- a
+  - b
+  - c
+
+- d
+  - e
+  - f
+--- expected
+<ul>
+<li>
+<p>a</p>
+<ul>
+<li>b</li>
+<li>c</li>
+</ul>
+</li>
+<li>
+<p>d</p>
+<ul>
+<li>e</li>
+<li>f</li>
+</ul>
+</li>
+</ul>
+--- end
+--- case 78 options - label-bytes 80 input-bytes 15 expected-bytes 60
+should support continued list items after an empty list item w/ many blank lines
+--- input
+* a
+*
+
+  
+	
+* b
+--- expected
+<ul>
+<li>
+<p>a</p>
+</li>
+<li></li>
+<li>
+<p>b</p>
+</li>
+</ul>
+--- end
+--- case 79 options - label-bytes 62 input-bytes 15 expected-bytes 66
+should support blank lines in code after an initial blank line
+--- input
+*
+  ~~~p
+
+  ~~~
+--- expected
+<ul>
+<li>
+<pre><code class="language-p">
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 80 options - label-bytes 59 input-bytes 61 expected-bytes 96
+should ignore line endings after tight items ending in tags
+--- input
+* a tight item that ends with an html element: `x`
+
+Paragraph
+--- expected
+<ul>
+<li>a tight item that ends with an html element: <code>x</code></li>
+</ul>
+<p>Paragraph</p>
+--- end
+--- case 81 options - label-bytes 43 input-bytes 19 expected-bytes 64
+should support empty items in a spread list
+--- input
+*   foo
+
+*
+
+*   bar
+--- expected
+<ul>
+<li>
+<p>foo</p>
+</li>
+<li></li>
+<li>
+<p>bar</p>
+</li>
+</ul>
+--- end
+--- case 82 options - label-bytes 55 input-bytes 12 expected-bytes 47
+should remove indent of code (fenced) in list (0 space)
+--- input
+- ```
+
+  ```
+--- expected
+<ul>
+<li>
+<pre><code>
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 83 options - label-bytes 55 input-bytes 13 expected-bytes 47
+should remove indent of code (fenced) in list (1 space)
+--- input
+- ```
+ 
+  ```
+--- expected
+<ul>
+<li>
+<pre><code>
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 84 options - label-bytes 56 input-bytes 14 expected-bytes 47
+should remove indent of code (fenced) in list (2 spaces)
+--- input
+- ```
+  
+  ```
+--- expected
+<ul>
+<li>
+<pre><code>
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 85 options - label-bytes 56 input-bytes 15 expected-bytes 48
+should remove indent of code (fenced) in list (3 spaces)
+--- input
+- ```
+   
+  ```
+--- expected
+<ul>
+<li>
+<pre><code> 
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 86 options - label-bytes 56 input-bytes 16 expected-bytes 49
+should remove indent of code (fenced) in list (4 spaces)
+--- input
+- ```
+    
+  ```
+--- expected
+<ul>
+<li>
+<pre><code>  
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 87 options - label-bytes 53 input-bytes 13 expected-bytes 49
+should remove indent of code (fenced) in list (1 tab)
+--- input
+- ```
+	
+  ```
+--- expected
+<ul>
+<li>
+<pre><code>  
+</code></pre>
+</li>
+</ul>
+--- end
+--- case 88 options - label-bytes 49 input-bytes 5 expected-bytes 52
+should support complex nested and empty lists (1)
+--- input
+- +
+-
+--- expected
+<ul>
+<li>
+<ul>
+<li></li>
+</ul>
+</li>
+<li></li>
+</ul>
+--- end
+--- case 89 options - label-bytes 49 input-bytes 6 expected-bytes 52
+should support complex nested and empty lists (2)
+--- input
+- 1.
+-
+--- expected
+<ul>
+<li>
+<ol>
+<li></li>
+</ol>
+</li>
+<li></li>
+</ul>
+--- end
+--- case 90 options - label-bytes 49 input-bytes 9 expected-bytes 96
+should support complex nested and empty lists (3)
+--- input
+* - +
+* -
+--- expected
+<ul>
+<li>
+<ul>
+<li>
+<ul>
+<li></li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<ul>
+<li></li>
+</ul>
+</li>
+</ul>
+--- end
+--- case 91 options allow_dangerous_html,allow_dangerous_protocol label-bytes 54 input-bytes 17 expected-bytes 51
+should support the common list breaking comment method
+--- input
+* a
+
+<!---->
+
+* b
+--- expected
+<ul>
+<li>a</li>
+</ul>
+<!---->
+<ul>
+<li>b</li>
+</ul>
+--- end

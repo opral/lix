@@ -1,0 +1,27 @@
+Document
+  Table
+    Alignments left,right
+    Row
+      Cell
+        Text "A"
+      Cell
+        Text "B"
+    Row
+      Cell
+        Math "x" dollars=1
+      Cell
+        TextDirective name=badge attrs=id:id,class:green
+          Label
+            Text "ok"
+  MathBlock "x + y"
+  LeafDirective name=note attrs=kind:info
+    Label
+      Text "Read"
+  ContainerDirective name=callout attrs=id:main
+    Label
+      Text "Tip"
+    Paragraph
+      Text "Inside "
+      Strong
+        Text "now"
+      Text "."

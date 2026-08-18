@@ -206,7 +206,12 @@ export class Lix {
 	async close(): Promise<void> {
 		if (!this.closePromise) {
 			if (this.#transactionsOpening > 0 || this.#activeTransactions > 0) {
-				throw activeTransactionCloseError();
+				const error = new Error(
+					"cannot close Lix while an explicit transaction is active",
+				) as Error & { code: string };
+				error.name = "LixError";
+				error.code = "LIX_INVALID_TRANSACTION_STATE";
+				throw error;
 			}
 			// Flip the public lifecycle gate before the first await. Operations that
 			// already entered the gate are allowed to finish; later calls fail closed.
@@ -280,15 +285,6 @@ export class Lix {
 		error.code = "LIX_ERROR_CLOSED";
 		throw error;
 	}
-}
-
-function activeTransactionCloseError(): Error & { code: string } {
-	const error = new Error(
-		"cannot close Lix while an explicit transaction is active",
-	) as Error & { code: string };
-	error.name = "LixError";
-	error.code = "LIX_INVALID_TRANSACTION_STATE";
-	return error;
 }
 
 export class ObserveEvents {

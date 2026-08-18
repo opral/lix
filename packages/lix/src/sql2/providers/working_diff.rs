@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use crate::branch::{BranchHeadControlContext, BranchRefReader};
 use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head};
 use crate::commit_graph::CommitGraphReader;
-use crate::row_pk::RowPk;
 use crate::hot_state::TrackedHeadContext;
+use crate::row_pk::RowPk;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
@@ -117,7 +117,7 @@ where
                     route,
                 ),
                 move |(active_branch_id, branch_ref, _commit_graph, store, schema, route)| async move {
-                    if route.contradictory {
+                    if limit == Some(0) || route.contradictory {
                         return WORKING_DIFF_COLS
                             .build(schema, &[])
                             .map_err(working_diff_batch_error);
@@ -232,9 +232,9 @@ impl WorkingDiffRoute {
             &conjuncts,
             "schema_key",
         )?);
-        let row_pk_values = string_constraint_values(
-            exact_string_column_constraint_from_filters(&conjuncts, "row_pk")?,
-        );
+        let row_pk_values = string_constraint_values(exact_string_column_constraint_from_filters(
+            &conjuncts, "row_pk",
+        )?);
         let file_ids = string_constraint_values(exact_string_column_constraint_from_filters(
             &conjuncts, "file_id",
         )?);

@@ -1,0 +1,29 @@
+Document
+  Paragraph
+    Text "Call"
+    FootnoteReference 1
+    Text " and "
+    FootnoteReference ^
+    Text " and "
+    FootnoteReference a\]b
+    Text "."
+  FootnoteDefinition label=1
+    Paragraph
+      Text "a"
+      SoftBreak
+      Text "b"
+  FootnoteDefinition label=^
+    Paragraph
+      Text "caret"
+  FootnoteDefinition label=a\]b
+    Paragraph
+      Text "escaped close"
+  FootnoteDefinition label=multi
+    Paragraph
+      Text "first"
+    Paragraph
+      Text "second paragraph"
+    List ordered=false tight=true
+      ListItem checked=none
+        Paragraph
+          Text "nested"

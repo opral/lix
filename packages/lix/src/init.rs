@@ -39,6 +39,7 @@ const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ID_KEY: &str = "lix_id";
 pub(crate) const DEFAULT_BRANCH_KEY: &str = "lix_default_branch_id";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
@@ -251,7 +252,7 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
         functions.call_uuid_v7(),
         RowPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
             .expect("system account ID is a canonical UUID"),
-        "lix_account",
+        ACCOUNT_SCHEMA_KEY,
         account_snapshot(crate::SYSTEM_ACCOUNT_ID, "System", "system")?,
         timestamp,
     );
@@ -259,7 +260,7 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
         functions.call_uuid_v7(),
         RowPk::uuid_from_canonical(crate::ANONYMOUS_ACCOUNT_ID)
             .expect("anonymous account ID is a canonical UUID"),
-        "lix_account",
+        ACCOUNT_SCHEMA_KEY,
         account_snapshot(crate::ANONYMOUS_ACCOUNT_ID, "Anonymous", "anonymous")?,
         timestamp,
     );
@@ -507,8 +508,14 @@ where
         let absence_guards = std::collections::BTreeSet::default();
         for branch in &plan.branch_controls {
             let mut head_deltas = tracked_head_deltas.clone();
+            // Checkpoints and built-in accounts are global facts. Staging them
+            // onto main would materialize branch-local copies (`lixcol_global =
+            // false`) that shadow inheritance from GLOBAL_BRANCH_ID.
             if branch.branch_id != GLOBAL_BRANCH_ID {
-                head_deltas.retain(|delta| delta.schema_key != CHECKPOINT_SCHEMA_KEY);
+                head_deltas.retain(|delta| {
+                    delta.schema_key != CHECKPOINT_SCHEMA_KEY
+                        && delta.schema_key != ACCOUNT_SCHEMA_KEY
+                });
             }
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
@@ -1108,5 +1115,81 @@ mod tests {
 
     fn test_uuid_value(index: usize) -> uuid::Uuid {
         uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_accounts_are_global_rows_inherited_by_branches() {
+        use crate::branch::BranchHeadControlContext;
+        use crate::hot_state::TrackedHeadContext;
+        use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
+        use crate::tracked_state::TrackedStateContext;
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let receipt = initialize(storage.clone(), &tracked_state)
+            .await
+            .expect("initialize should succeed");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let controls = BranchHeadControlContext::new()
+            .reader(&read)
+            .scan()
+            .await
+            .expect("scan branch-head controls");
+        let tracked_head = TrackedHeadContext::new();
+        let mut saw_global = false;
+        for (branch_id, control) in &controls {
+            let has_accounts = tracked_head
+                .reader(&read)
+                .has_schema_rows(branch_id, *control, ACCOUNT_SCHEMA_KEY)
+                .await
+                .expect("schema presence probe should succeed");
+            if branch_id == GLOBAL_BRANCH_ID {
+                saw_global = true;
+                assert!(
+                    has_accounts,
+                    "GLOBAL_BRANCH_ID must physically store bootstrap accounts"
+                );
+            } else {
+                assert!(
+                    !has_accounts,
+                    "branch {branch_id} must not physically store bootstrap accounts"
+                );
+            }
+        }
+        assert!(saw_global, "initialization must publish a global branch");
+
+        let mut tracked_reader = tracked_state.reader(read);
+        let rows = tracked_reader
+            .scan_batch_at_commit(
+                &receipt.initial_commit_id,
+                &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec![ACCOUNT_SCHEMA_KEY.to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scan should succeed");
+
+        let account_rows = rows.into_rows();
+        assert_eq!(
+            account_rows.len(),
+            2,
+            "tracked state should contain exactly two bootstrap accounts"
+        );
+        for row in &account_rows {
+            assert_eq!(
+                row.commit_id,
+                receipt.initial_commit_id,
+                "account {:?} should be in the initial commit",
+                row.row_pk
+            );
+        }
     }
 }

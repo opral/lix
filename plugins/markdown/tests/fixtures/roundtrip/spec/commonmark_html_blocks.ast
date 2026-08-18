@@ -1,0 +1,22 @@
+Document
+  Paragraph
+    HtmlInline "<script/>"
+    Text "a"
+  Paragraph
+    Text "<script/"
+  HtmlBlock "<div"
+  Paragraph
+    Text "<div/"
+  HtmlBlock "<div/>"
+  HtmlBlock "<div>\n*foo*"
+  Paragraph
+    Emphasis
+      Text "bar"
+  HtmlBlock "<div *???-&&&-<---\n*raw*"
+  Paragraph
+    Text "Text "
+    HtmlInline "<a b=ok>"
+    Text "ok"
+    HtmlInline "</a>"
+    Text " and <a b=a`b>bad."
+  HtmlBlock "<script/>"

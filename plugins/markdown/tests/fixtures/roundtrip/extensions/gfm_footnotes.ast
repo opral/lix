@@ -1,0 +1,17 @@
+Document
+  Paragraph
+    Text "Here"
+    FootnoteReference a
+    Text "."
+  FootnoteDefinition label=a
+    Paragraph
+      Text "First paragraph"
+      SoftBreak
+      Text "continued."
+    List ordered=false tight=true
+      ListItem checked=none
+        Paragraph
+          Text "item"
+      ListItem checked=none
+        Paragraph
+          Text "second"

@@ -1,0 +1,27 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/shortcodes.rs
+role: upstream-input
+count: 5
+profiles: extras
+
+--- case 1 profile extras bytes 27
+Hello, happy days! :smile:
+
+--- end
+--- case 2 profile extras bytes 29
+:smile::smile::smile::smile:
+
+--- end
+--- case 3 profile extras bytes 32
+:smile:::smile:::smile:::smile:
+
+--- end
+--- case 4 profile extras bytes 27
+Hello, happy days! :diego:
+
+--- end
+--- case 5 profile extras bytes 72
+:+1: :-1: :clock12::1234: :1st_place_medal: :e-mail: :non-potable_water:
+--- end

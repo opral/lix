@@ -1,12 +1,12 @@
 ---
-description: Lix is a repository backend for AI products. One repository holds files for agents, a SQL database for your app, and version control over both.
+description: Lix combines files, a SQL database, and version control in one repository that you embed in your product.
 ---
 
 # What is Lix?
 
-Lix is a **repository backend for AI products**. One repository holds files for agents, a SQL database for your app, and version control over both. You embed it in your product.
+Lix combines **files, a SQL database, and version control in one repository**. You embed it in your product.
 
-Agents and tools read and write normal files. Your app queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge.
+Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge.
 
 Unlike Git, Lix tracks the rows inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
 
@@ -22,9 +22,9 @@ Give each agent task its own branch. The agent can edit files and SQL rows witho
 
 See [Lix for AI Agents](./lix-for-ai-agents.md).
 
-### Sync local files
+### Sync files
 
-Sync the local files that coding agents and applications work on, to make them collaborative or cloud-based.
+Sync the files that coding agents and applications work on, between machines and with a server.
 
 <img src="../website/public/assets/file-sync.svg" alt="Client A and client B each hold the same project files on their own filesystem and synchronize them with a Lix server" width="760" />
 

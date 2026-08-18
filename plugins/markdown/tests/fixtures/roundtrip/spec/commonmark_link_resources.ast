@@ -1,0 +1,25 @@
+Document
+  Paragraph
+    Link destination=foo(and(bar)) title="paren title"
+      Text "paren"
+    SoftBreak
+    Link destination=foo)bar title="single title"
+      Text "escaped"
+    SoftBreak
+    Link destination=foo bar (baz) title="paren title"
+      Text "angle"
+    SoftBreak
+    Image destination=img(1).png title="image title"
+      Text "image "
+      Emphasis
+        Text "alt"
+    SoftBreak
+    Link destination= title="empty title"
+      Text "empty"
+    SoftBreak
+    Link destination=/url title="wrapped title"
+      Text "wrapped"
+  Paragraph
+    Text "[blank](/url"
+  Paragraph
+    Text "\"not title\")"

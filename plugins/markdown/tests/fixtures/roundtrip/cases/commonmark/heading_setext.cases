@@ -1,0 +1,224 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/heading_setext.rs
+role: upstream-input
+count: 47
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 19
+Foo *bar*
+=========
+--- end
+--- case 2 profile commonmark bytes 19
+Foo *bar*
+---------
+--- end
+--- case 3 profile commonmark bytes 18
+Foo *bar
+baz*
+====
+--- end
+--- case 4 profile commonmark bytes 21
+  Foo *bar
+baz*	
+====
+--- end
+--- case 5 profile commonmark bytes 29
+Foo
+-------------------------
+--- end
+--- case 6 profile commonmark bytes 5
+Foo
+=
+--- end
+--- case 7 profile commonmark bytes 10
+ Foo
+  ===
+--- end
+--- case 8 profile commonmark bytes 9
+  Foo
+---
+--- end
+--- case 9 profile commonmark bytes 10
+   Foo
+---
+--- end
+--- case 10 profile commonmark bytes 15
+    Foo
+    ---
+--- end
+--- case 11 profile commonmark bytes 11
+    Foo
+---
+--- end
+--- case 12 profile commonmark bytes 17
+Foo
+   ----      
+--- end
+--- case 13 profile commonmark bytes 8
+Foo
+   =
+--- end
+--- case 14 profile commonmark bytes 9
+Foo
+    =
+--- end
+--- case 15 profile commonmark bytes 6
+Foo
+	=
+--- end
+--- case 16 profile commonmark bytes 7
+Foo
+= =
+--- end
+--- case 17 profile commonmark bytes 9
+Foo
+--- -
+--- end
+--- case 18 profile commonmark bytes 11
+Foo  
+-----
+--- end
+--- case 19 profile commonmark bytes 10
+Foo\
+-----
+--- end
+--- case 20 profile commonmark bytes 11
+`Foo
+----
+`
+--- end
+--- case 21 profile commonmark bytes 32
+<a title="a lot
+---
+of dashes"/>
+--- end
+--- case 22 profile commonmark bytes 9
+> Foo
+---
+--- end
+--- case 23 profile commonmark bytes 13
+> foo
+bar
+===
+--- end
+--- case 24 profile commonmark bytes 9
+- Foo
+---
+--- end
+--- case 25 profile commonmark bytes 11
+Foo
+Bar
+---
+--- end
+--- case 26 profile commonmark bytes 23
+---
+Foo
+---
+Bar
+---
+Baz
+--- end
+--- case 27 profile commonmark bytes 5
+
+====
+--- end
+--- case 28 profile commonmark bytes 7
+---
+---
+--- end
+--- case 29 profile commonmark bytes 11
+- foo
+-----
+--- end
+--- case 30 profile commonmark bytes 11
+    foo
+---
+--- end
+--- case 31 profile commonmark bytes 11
+> foo
+-----
+--- end
+--- case 32 profile commonmark bytes 13
+\> foo
+------
+--- end
+--- case 33 profile commonmark bytes 15
+Foo
+bar
+---
+baz
+--- end
+--- case 34 profile commonmark bytes 16
+Foo
+
+bar
+---
+baz
+--- end
+--- case 35 profile commonmark bytes 17
+Foo
+bar
+
+---
+
+baz
+--- end
+--- case 36 profile commonmark bytes 17
+Foo
+bar
+* * *
+baz
+--- end
+--- case 37 profile commonmark bytes 16
+Foo
+bar
+\---
+baz
+--- end
+--- case 38 profile commonmark bytes 15
+Foo  
+bar
+-----
+--- end
+--- case 39 profile commonmark bytes 14
+Foo\
+bar
+-----
+--- end
+--- case 40 profile commonmark bytes 5
+a
+-
+b
+--- end
+--- case 41 profile commonmark bytes 10
+[a]: b
+=
+=
+--- end
+--- case 42 profile commonmark bytes 7
+> ===
+a
+--- end
+--- case 43 profile commonmark bytes 7
+> a
+===
+--- end
+--- case 44 profile commonmark bytes 7
+a
+- ===
+--- end
+--- case 45 profile commonmark bytes 7
+a
+* ---
+--- end
+--- case 46 profile commonmark bytes 3
+a
+-
+--- end
+--- case 47 profile commonmark bytes 14
+alpha
+bravo
+==
+--- end

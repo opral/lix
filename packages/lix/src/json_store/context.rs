@@ -31,16 +31,6 @@ impl JsonStoreContext {
     pub(crate) fn writer(&self) -> JsonStoreWriter {
         JsonStoreWriter::new()
     }
-
-    pub(crate) async fn load_bytes_many(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        request: JsonLoadRequestRef<'_>,
-    ) -> Result<JsonLoadBatch, LixError> {
-        store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
-            .await
-            .map(JsonLoadBatch::new)
-    }
 }
 
 pub(crate) struct JsonStoreReader<S> {
@@ -239,14 +229,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let loaded = JsonStoreContext::new()
-            .load_bytes_many(
-                &read,
-                JsonLoadRequestRef {
-                    refs: &refs,
-                    scope: JsonReadScopeRef::OutOfBand,
-                },
-            )
+        let mut reader = JsonStoreContext::new().reader(read);
+        let loaded = reader
+            .load_bytes_many(JsonLoadRequestRef {
+                refs: &refs,
+                scope: JsonReadScopeRef::OutOfBand,
+            })
             .await
             .expect("shared JSON batch should decode")
             .into_values();

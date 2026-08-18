@@ -1,0 +1,54 @@
+# markdown-syntax selected CommonMark official input stability cases v1
+origin: commonmark generated CommonMark suite
+commit: 1506572
+source: upstream-tests/commonmark.rs
+role: input-stability-subset
+count: 8
+profiles: commonmark
+
+# Tabs (10)
+--- case 1 profile commonmark bytes 6
+#	Foo
+
+--- end
+# Tabs (11)
+--- case 2 profile commonmark bytes 7
+*	*	*	
+
+--- end
+# Emphasis and strong emphasis
+--- case 3 profile commonmark bytes 10
+Foo *bar*
+
+--- end
+# Block quotes
+--- case 4 profile commonmark bytes 14
+> # Foo
+> bar
+
+--- end
+# Fenced code blocks
+--- case 5 profile commonmark bytes 12
+```
+foo
+```
+
+--- end
+# Link reference definitions
+--- case 6 profile commonmark bytes 27
+[foo]: /url "title"
+
+[foo]
+
+--- end
+# Autolinks
+--- case 7 profile commonmark bytes 21
+<http://example.com>
+
+--- end
+# Ordered lists
+--- case 8 profile commonmark bytes 14
+1. foo
+2. bar
+
+--- end

@@ -1,0 +1,157 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/block_quote.rs
+role: upstream-input
+count: 33
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 13
+> # a
+> b
+> c
+--- end
+--- case 2 profile commonmark bytes 11
+># a
+>b
+> c
+--- end
+--- case 3 profile commonmark bytes 20
+   > # a
+   > b
+ > c
+--- end
+--- case 4 profile commonmark bytes 25
+    > # a
+    > b
+    > c
+--- end
+--- case 5 profile commonmark bytes 11
+> # a
+> b
+c
+--- end
+--- case 6 profile commonmark bytes 9
+> a
+b
+> c
+--- end
+--- case 7 profile commonmark bytes 9
+> a
+> ---
+--- end
+--- case 8 profile commonmark bytes 7
+> a
+---
+--- end
+--- case 9 profile commonmark bytes 11
+> - a
+> - b
+--- end
+--- case 10 profile commonmark bytes 9
+> - a
+- b
+--- end
+--- case 11 profile commonmark bytes 13
+>     a
+    b
+--- end
+--- case 12 profile commonmark bytes 11
+> ```
+a
+```
+--- end
+--- case 13 profile commonmark bytes 9
+> a
+```
+b
+--- end
+--- case 14 profile commonmark bytes 11
+> a
+    - b
+--- end
+--- case 15 profile commonmark bytes 5
+> [
+a
+--- end
+--- case 16 profile commonmark bytes 10
+> [a]: b
+c
+--- end
+--- case 17 profile commonmark bytes 1
+>
+--- end
+--- case 18 profile commonmark bytes 8
+>
+>  
+> 
+--- end
+--- case 19 profile commonmark bytes 9
+>
+> a
+>  
+--- end
+--- case 20 profile commonmark bytes 8
+> a
+
+> b
+--- end
+--- case 21 profile commonmark bytes 7
+> a
+> b
+--- end
+--- case 22 profile commonmark bytes 9
+> a
+>
+> b
+--- end
+--- case 23 profile commonmark bytes 13
+[a]
+
+> [a]: b
+--- end
+--- case 24 profile commonmark bytes 13
+> [a]: b
+
+[a]
+--- end
+--- case 25 profile commonmark bytes 5
+a
+> b
+--- end
+--- case 26 profile commonmark bytes 11
+> a
+***
+> b
+--- end
+--- case 27 profile commonmark bytes 5
+> a
+b
+--- end
+--- case 28 profile commonmark bytes 6
+> a
+
+b
+--- end
+--- case 29 profile commonmark bytes 7
+> a
+>
+b
+--- end
+--- case 30 profile commonmark bytes 9
+> > > a
+b
+--- end
+--- case 31 profile commonmark bytes 13
+>>> a
+> b
+>>c
+--- end
+--- case 32 profile commonmark bytes 15
+>     a
+
+>    b
+--- end
+--- case 33 profile commonmark bytes 3
+> a
+--- end

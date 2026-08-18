@@ -1,0 +1,17 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/escaped_char_spans.rs
+role: upstream-input
+count: 3
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 6
+\@user
+--- end
+--- case 2 profile commonmark bytes 10
+This\@that
+--- end
+--- case 3 profile commonmark bytes 2
+\]
+--- end

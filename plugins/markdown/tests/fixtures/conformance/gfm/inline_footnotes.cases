@@ -1,0 +1,470 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: inline_footnotes
+count: 29
+
+--- case 1 options extension.footnotes,extension.inline_footnotes label-bytes 21 input-bytes 59 expected-bytes 414
+basic_inline_footnote
+--- input
+Here is an inline footnote^[This is the footnote content].
+
+--- expected
+<p>Here is an inline footnote<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>This is the footnote content <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 2 options extension.footnotes,extension.inline_footnotes label-bytes 29 input-bytes 39 expected-bytes 414
+inline_footnote_with_emphasis
+--- input
+Text^[With *emphasis* and **strong**].
+
+--- expected
+<p>Text<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>With <em>emphasis</em> and <strong>strong</strong> <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 3 options extension.footnotes,extension.inline_footnotes label-bytes 25 input-bytes 43 expected-bytes 409
+inline_footnote_with_link
+--- input
+Text^[See [example](https://example.com)].
+
+--- expected
+<p>Text<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>See <a href="https://example.com">example</a> <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 4 options extension.footnotes,extension.inline_footnotes label-bytes 25 input-bytes 45 expected-bytes 683
+multiple_inline_footnotes
+--- input
+First^[First note] and second^[Second note].
+
+--- expected
+<p>First<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup> and second<sup class="footnote-ref"><a href="#fn-__inline_2" id="fnref-__inline_2" data-footnote-ref>2</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>First note <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="fn-__inline_2">
+<p>Second note <a href="#fnref-__inline_2" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2" aria-label="Back to reference 2">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 5 options extension.footnotes,extension.inline_footnotes label-bytes 34 input-bytes 124 expected-bytes 956
+mixed_inline_and_regular_footnotes
+--- input
+Regular[^1] and inline^[Inline note] and another regular[^2].
+
+[^1]: First regular footnote.
+[^2]: Second regular footnote.
+
+--- expected
+<p>Regular<sup class="footnote-ref"><a href="#fn-1" id="fnref-1" data-footnote-ref>1</a></sup> and inline<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>2</a></sup> and another regular<sup class="footnote-ref"><a href="#fn-2" id="fnref-2" data-footnote-ref>3</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-1">
+<p>First regular footnote. <a href="#fnref-1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="fn-__inline_1">
+<p>Inline note <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2" aria-label="Back to reference 2">↩</a></p>
+</li>
+<li id="fn-2">
+<p>Second regular footnote. <a href="#fnref-2" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="3" aria-label="Back to reference 3">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 6 options extension.footnotes,extension.inline_footnotes label-bytes 32 input-bytes 26 expected-bytes 33
+empty_inline_footnote_not_parsed
+--- input
+Text^[] should not parse.
+
+--- expected
+<p>Text^[] should not parse.</p>
+
+--- end
+--- case 7 options extension.footnotes,extension.inline_footnotes label-bytes 42 input-bytes 15 expected-bytes 21
+whitespace_only_inline_footnote_not_parsed
+--- input
+Text^[	]more.
+
+--- expected
+<p>Text^[
+]more.</p>
+
+--- end
+--- case 8 options extension.footnotes,extension.inline_footnotes label-bytes 42 input-bytes 16 expected-bytes 23
+whitespace_only_inline_footnote_not_parsed
+--- input
+Text^[   ]more.
+
+--- expected
+<p>Text^[   ]more.</p>
+
+--- end
+--- case 9 options extension.footnotes,extension.inline_footnotes label-bytes 42 input-bytes 15 expected-bytes 21
+whitespace_only_inline_footnote_not_parsed
+--- input
+Text^[	
+]more.
+
+--- expected
+<p>Text^[
+]more.</p>
+
+--- end
+--- case 10 options extension.inline_footnotes label-bytes 41 input-bytes 30 expected-bytes 37
+inline_footnote_without_footnotes_enabled
+--- input
+Text^[note] should not parse.
+
+--- expected
+<p>Text^[note] should not parse.</p>
+
+--- end
+--- case 11 options extension.footnotes,extension.inline_footnotes label-bytes 25 input-bytes 27 expected-bytes 393
+inline_footnote_with_code
+--- input
+Text^[With `code` inline].
+
+--- expected
+<p>Text<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>With <code>code</code> inline <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 12 options extension.footnotes,extension.inline_footnotes label-bytes 25 input-bytes 135 expected-bytes 490
+inline_footnote_multiline
+--- input
+Here is an inline note.^[Inline notes are easier to write, since
+you don't have to pick an identifier and move down to type the
+note.]
+
+--- expected
+<p>Here is an inline note.<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>Inline notes are easier to write, since
+you don't have to pick an identifier and move down to type the
+note. <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 13 options extension.footnotes,extension.inline_footnotes label-bytes 24 input-bytes 39 expected-bytes 393
+escaped_caret_not_parsed
+--- input
+Escaped: \^[not a note]. Real: ^[yes].
+
+--- expected
+<p>Escaped: ^[not a note]. Real: <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>yes <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 14 options extension.footnotes,extension.inline_footnotes label-bytes 36 input-bytes 20 expected-bytes 27
+whitespace_between_caret_and_bracket
+--- input
+Text^ [not a note].
+
+--- expected
+<p>Text^ [not a note].</p>
+
+--- end
+--- case 15 options extension.footnotes,extension.inline_footnotes label-bytes 27 input-bytes 31 expected-bytes 385
+escaped_bracket_inside_body
+--- input
+A ^[square bracket \] inside].
+
+--- expected
+<p>A <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>square bracket ] inside <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 16 options extension.footnotes,extension.inline_footnotes label-bytes 23 input-bytes 22 expected-bytes 377
+caret_in_other_contexts
+--- input
+2^32 is big. ^[note].
+
+--- expected
+<p>2^32 is big. <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>note <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 17 options extension.footnotes,extension.inline_footnotes label-bytes 27 input-bytes 25 expected-bytes 391
+inline_code_protects_marker
+--- input
+`^[nope]` and yes ^[ok].
+
+--- expected
+<p><code>^[nope]</code> and yes <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>ok <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 18 options extension.footnotes,extension.inline_footnotes label-bytes 29 input-bytes 15 expected-bytes 653
+back_to_back_inline_footnotes
+--- input
+A^[one]^[two].
+
+--- expected
+<p>A<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup><sup class="footnote-ref"><a href="#fn-__inline_2" id="fnref-__inline_2" data-footnote-ref>2</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>one <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="fn-__inline_2">
+<p>two <a href="#fnref-__inline_2" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2" aria-label="Back to reference 2">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 19 options extension.footnotes,extension.inline_footnotes label-bytes 21 input-bytes 17 expected-bytes 372
+no_surrounding_spaces
+--- input
+word^[tight]word
+
+--- expected
+<p>word<sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>word</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>tight <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 20 options extension.footnotes,extension.inline_footnotes label-bytes 18 input-bytes 17 expected-bytes 372
+at_paragraph_start
+--- input
+^[start] begins.
+
+--- expected
+<p><sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup> begins.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>start <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 21 options extension.footnotes,extension.inline_footnotes label-bytes 16 input-bytes 17 expected-bytes 372
+at_paragraph_end
+--- input
+ends here ^[fin]
+
+--- expected
+<p>ends here <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>fin <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 22 options extension.footnotes,extension.inline_footnotes label-bytes 15 input-bytes 20 expected-bytes 382
+inside_emphasis
+--- input
+*emph ^[note] text*
+
+--- expected
+<p><em>emph <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup> text</em></p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>note <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 23 options extension.footnotes,extension.inline_footnotes label-bytes 32 input-bytes 33 expected-bytes 671
+nested_inline_footnote_supported
+--- input
+A ^[outer and ^[inner] literal].
+
+--- expected
+<p>A <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>outer and <sup class="footnote-ref"><a href="#fn-__inline_2" id="fnref-__inline_2" data-footnote-ref>2</a></sup> literal <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="fn-__inline_2">
+<p>inner <a href="#fnref-__inline_2" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2" aria-label="Back to reference 2">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 24 options extension.footnotes,extension.inline_footnotes label-bytes 10 input-bytes 26 expected-bytes 397
+with_image
+--- input
+X ^[see ![alt](img.png)].
+
+--- expected
+<p>X <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>see <img src="img.png" alt="alt" /> <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 25 options extension.footnotes,extension.inline_footnotes label-bytes 22 input-bytes 26 expected-bytes 381
+with_unicode_and_emoji
+--- input
+X ^[π ≈ 3.14159 😊].
+
+--- expected
+<p>X <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>π ≈ 3.14159 😊 <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 26 options extension.footnotes,extension.inline_footnotes label-bytes 12 input-bytes 16 expected-bytes 389
+in_list_item
+--- input
+- a ^[note]
+- b
+
+--- expected
+<ul>
+<li>a <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup></li>
+<li>b</li>
+</ul>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>note <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 27 options extension.footnotes,extension.inline_footnotes label-bytes 13 input-bytes 14 expected-bytes 394
+in_blockquote
+--- input
+> quote ^[q].
+
+--- expected
+<blockquote>
+<p>quote <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup>.</p>
+</blockquote>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>q <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 28 options extension.footnotes,extension.inline_footnotes label-bytes 10 input-bytes 12 expected-bytes 367
+in_heading
+--- input
+# H ^[note]
+
+--- expected
+<h1>H <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup></h1>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>note <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end
+--- case 29 options extension.footnotes,extension.inline_footnotes,extension.table label-bytes 13 input-bytes 26 expected-bytes 451
+in_table_cell
+--- input
+| H |
+| - |
+| c ^[cell] |
+
+--- expected
+<table>
+<thead>
+<tr>
+<th>H</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>c <sup class="footnote-ref"><a href="#fn-__inline_1" id="fnref-__inline_1" data-footnote-ref>1</a></sup></td>
+</tr>
+</tbody>
+</table>
+<section class="footnotes" data-footnotes>
+<ol>
+<li id="fn-__inline_1">
+<p>cell <a href="#fnref-__inline_1" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+</ol>
+</section>
+
+--- end

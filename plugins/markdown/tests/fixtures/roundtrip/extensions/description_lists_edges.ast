@@ -1,0 +1,16 @@
+Document
+  DescriptionList tight=true
+    Item
+      Term
+        Text "apple"
+      Details
+        Paragraph
+          Text "red fruit"
+    Item
+      Term
+        Text "multi"
+        SoftBreak
+        Text "line"
+      Details
+        Paragraph
+          Text "first"

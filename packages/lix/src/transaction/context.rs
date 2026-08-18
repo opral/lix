@@ -936,10 +936,10 @@ where
                 "atomic transaction metadata was staged more than once",
             ));
         }
-        if !self
-            .binary_cas
-            .prepared_manifest_is_staged(&writes, blob_id)
-        {
+        if !writes.contains_put(
+            crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
+            blob_id.as_bytes(),
+        ) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "atomic CAS publication is missing its prepared manifest",
@@ -9451,12 +9451,10 @@ fn push_prepared_state_row_from_planned_parts(
     let branch_id = row.branch_id.clone();
     let snapshot = rows
         .take_snapshot(row_index)
-        .map(|value| stage_json_from_value(value, "prepared row snapshot_content"))
-        .transpose()?;
+        .map(stage_json_from_value);
     let metadata = rows
         .take_metadata(row_index)
-        .map(|value| stage_json_from_value(value, "prepared row metadata"))
-        .transpose()?;
+        .map(stage_json_from_value);
     let row_pk = rows.take_row_pk(row_index).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",

@@ -1,6 +1,7 @@
 const SITE_URL = "https://lix.dev";
 const DEFAULT_OG_IMAGE_PATH = "/og.png";
-const DEFAULT_OG_IMAGE_ALT = "Lix - repository backend for AI products";
+const DEFAULT_OG_IMAGE_ALT =
+  "Lix - files, a SQL database, and version control in one repository";
 const DESCRIPTION_MAX_LENGTH = 160;
 const DESCRIPTION_SENTENCE_MIN_LENGTH = 120;
 

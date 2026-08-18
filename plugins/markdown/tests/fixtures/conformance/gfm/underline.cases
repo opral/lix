@@ -1,0 +1,13 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: underline
+count: 1
+
+--- case 1 options extension.underline label-bytes 9 input-bytes 20 expected-bytes 30
+underline
+--- input
+__underlined text__
+
+--- expected
+<p><u>underlined text</u></p>
+
+--- end

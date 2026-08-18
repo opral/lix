@@ -2258,14 +2258,12 @@ where
     if json_refs.is_empty() {
         return Ok(rows.finish());
     }
-    let mut json_values = JsonStoreContext::new()
-        .load_bytes_many(
-            store,
-            JsonLoadRequestRef {
-                refs: &json_refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            },
-        )
+    let mut json_reader = JsonStoreContext::new().reader(store);
+    let mut json_values = json_reader
+        .load_bytes_many(JsonLoadRequestRef {
+            refs: &json_refs,
+            scope: JsonReadScopeRef::OutOfBand,
+        })
         .await?
         .into_values();
     for (index, deferred) in deferred.into_iter().enumerate() {

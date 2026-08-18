@@ -177,7 +177,7 @@ impl TrackedStateTree {
                     let mut high = leaf.len();
                     while low < high {
                         let mid = low + (high - low) / 2;
-                        let key = leaf.key(mid)?.ok_or_else(|| {
+                        let key = leaf.key(mid).ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_STORAGE_ERROR,
                                 "tracked-state leaf key disappeared during lower-bound seek",
@@ -248,9 +248,7 @@ impl TrackedStateTree {
             match self.load_node(store, &current).await? {
                 DecodedNode::Leaf(leaf) => {
                     let entry = binary_search_leaf_key(&leaf, &encoded_key)?
-                        .map(|index| leaf.entry(index))
-                        .transpose()?
-                        .flatten();
+                        .and_then(|index| leaf.entry(index));
                     return entry.map(|entry| decode_value(entry.value)).transpose();
                 }
                 DecodedNode::Internal(internal) => {
@@ -1653,7 +1651,7 @@ impl TrackedStateTree {
                         if scan_limit_reached(request, rows.len()) {
                             break;
                         }
-                        let entry = leaf.entry(index)?.ok_or_else(|| {
+                        let entry = leaf.entry(index).ok_or_else(|| {
                             LixError::new(
                                 "LIX_ERROR_UNKNOWN",
                                 "tracked-state leaf entry disappeared during scan",
@@ -1728,7 +1726,7 @@ impl TrackedStateTree {
                 DecodedNodeRef::Leaf(leaf) => {
                     for (original_index, encoded_key) in encoded_keys {
                         if let Some(entry_index) = binary_search_leaf_key(&leaf, encoded_key)? {
-                            let entry = leaf.entry(entry_index)?.ok_or_else(|| {
+                            let entry = leaf.entry(entry_index).ok_or_else(|| {
                                 LixError::new(
                                     "LIX_ERROR_UNKNOWN",
                                     "tracked-state leaf entry disappeared during get_many",
@@ -2382,7 +2380,7 @@ fn binary_search_leaf_key(
     let mut high = leaf.len();
     while low < high {
         let mid = low + (high - low) / 2;
-        let key = leaf.key(mid)?.ok_or_else(|| {
+        let key = leaf.key(mid).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked-state leaf key disappeared during binary search",

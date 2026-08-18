@@ -1,0 +1,22 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/misc_default_line_ending.rs
+role: upstream-input
+count: 4
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 3
+> a
+--- end
+--- case 2 profile commonmark bytes 4
+> a
+
+--- end
+--- case 3 profile commonmark bytes 4
+> a
+--- end
+--- case 4 profile commonmark bytes 5
+> a
+
+--- end

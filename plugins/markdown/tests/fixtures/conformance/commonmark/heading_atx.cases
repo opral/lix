@@ -1,0 +1,262 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: heading_atx
+count: 33
+
+--- case 1 options - label-bytes 34 input-bytes 5 expected-bytes 12
+should support a heading w/ rank 1
+--- input
+# foo
+--- expected
+<h1>foo</h1>
+--- end
+--- case 2 options - label-bytes 34 input-bytes 6 expected-bytes 12
+should support a heading w/ rank 2
+--- input
+## foo
+--- expected
+<h2>foo</h2>
+--- end
+--- case 3 options - label-bytes 34 input-bytes 7 expected-bytes 12
+should support a heading w/ rank 3
+--- input
+### foo
+--- expected
+<h3>foo</h3>
+--- end
+--- case 4 options - label-bytes 34 input-bytes 8 expected-bytes 12
+should support a heading w/ rank 4
+--- input
+#### foo
+--- expected
+<h4>foo</h4>
+--- end
+--- case 5 options - label-bytes 34 input-bytes 9 expected-bytes 12
+should support a heading w/ rank 5
+--- input
+##### foo
+--- expected
+<h5>foo</h5>
+--- end
+--- case 6 options - label-bytes 34 input-bytes 10 expected-bytes 12
+should support a heading w/ rank 6
+--- input
+###### foo
+--- expected
+<h6>foo</h6>
+--- end
+--- case 7 options - label-bytes 38 input-bytes 11 expected-bytes 18
+should not support a heading w/ rank 7
+--- input
+####### foo
+--- expected
+<p>####### foo</p>
+--- end
+--- case 8 options - label-bytes 77 input-bytes 7 expected-bytes 14
+should not support a heading for a number sign not followed by whitespace (1)
+--- input
+#5 bolt
+--- expected
+<p>#5 bolt</p>
+--- end
+--- case 9 options - label-bytes 77 input-bytes 8 expected-bytes 15
+should not support a heading for a number sign not followed by whitespace (2)
+--- input
+#hashtag
+--- expected
+<p>#hashtag</p>
+--- end
+--- case 10 options - label-bytes 55 input-bytes 7 expected-bytes 13
+should not support a heading for an escaped number sign
+--- input
+\## foo
+--- expected
+<p>## foo</p>
+--- end
+--- case 11 options - label-bytes 39 input-bytes 19 expected-bytes 31
+should support text content in headings
+--- input
+# foo *bar* \*baz\*
+--- expected
+<h1>foo <em>bar</em> *baz*</h1>
+--- end
+--- case 12 options - label-bytes 53 input-bytes 43 expected-bytes 12
+should support arbitrary initial and final whitespace
+--- input
+#                  foo                     
+--- expected
+<h1>foo</h1>
+--- end
+--- case 13 options - label-bytes 31 input-bytes 8 expected-bytes 12
+should support an initial space
+--- input
+ ### foo
+--- expected
+<h3>foo</h3>
+--- end
+--- case 14 options - label-bytes 33 input-bytes 8 expected-bytes 12
+should support two initial spaces
+--- input
+  ## foo
+--- expected
+<h2>foo</h2>
+--- end
+--- case 15 options - label-bytes 35 input-bytes 8 expected-bytes 12
+should support three initial spaces
+--- input
+   # foo
+--- expected
+<h1>foo</h1>
+--- end
+--- case 16 options - label-bytes 38 input-bytes 9 expected-bytes 30
+should not support four initial spaces
+--- input
+    # foo
+--- expected
+<pre><code># foo
+</code></pre>
+--- end
+--- case 17 options - label-bytes 56 input-bytes 13 expected-bytes 16
+should not support four initial spaces when interrupting
+--- input
+foo
+    # bar
+--- expected
+<p>foo
+# bar</p>
+--- end
+--- case 18 options - label-bytes 37 input-bytes 9 expected-bytes 12
+should support a closing sequence (1)
+--- input
+## foo ##
+--- expected
+<h2>foo</h2>
+--- end
+--- case 19 options - label-bytes 37 input-bytes 18 expected-bytes 12
+should support a closing sequence (2)
+--- input
+  ###   bar    ###
+--- expected
+<h3>bar</h3>
+--- end
+--- case 20 options - label-bytes 76 input-bytes 40 expected-bytes 12
+should support a closing sequence w/ an arbitrary number of number signs (1)
+--- input
+# foo ##################################
+--- expected
+<h1>foo</h1>
+--- end
+--- case 21 options - label-bytes 76 input-bytes 12 expected-bytes 12
+should support a closing sequence w/ an arbitrary number of number signs (2)
+--- input
+##### foo ##
+--- expected
+<h5>foo</h5>
+--- end
+--- case 22 options - label-bytes 59 input-bytes 16 expected-bytes 12
+should support trailing whitespace after a closing sequence
+--- input
+### foo ###     
+--- expected
+<h3>foo</h3>
+--- end
+--- case 23 options - label-bytes 57 input-bytes 13 expected-bytes 18
+should not support other content after a closing sequence
+--- input
+### foo ### b
+--- expected
+<h3>foo ### b</h3>
+--- end
+--- case 24 options - label-bytes 62 input-bytes 6 expected-bytes 13
+should not support a closing sequence w/o whitespace before it
+--- input
+# foo#
+--- expected
+<h1>foo#</h1>
+--- end
+--- case 25 options - label-bytes 56 input-bytes 12 expected-bytes 16
+should not support an “escaped” closing sequence (1)
+--- input
+### foo \###
+--- expected
+<h3>foo ###</h3>
+--- end
+--- case 26 options - label-bytes 56 input-bytes 11 expected-bytes 16
+should not support an “escaped” closing sequence (2)
+--- input
+## foo #\##
+--- expected
+<h2>foo ###</h2>
+--- end
+--- case 27 options - label-bytes 56 input-bytes 8 expected-bytes 14
+should not support an “escaped” closing sequence (3)
+--- input
+# foo \#
+--- expected
+<h1>foo #</h1>
+--- end
+--- case 28 options - label-bytes 62 input-bytes 16 expected-bytes 26
+should support atx headings when not surrounded by blank lines
+--- input
+****
+## foo
+****
+--- expected
+<hr />
+<h2>foo</h2>
+<hr />
+--- end
+--- case 29 options - label-bytes 51 input-bytes 21 expected-bytes 42
+should support atx headings interrupting paragraphs
+--- input
+Foo bar
+# baz
+Bar foo
+--- expected
+<p>Foo bar</p>
+<h1>baz</h1>
+<p>Bar foo</p>
+--- end
+--- case 30 options - label-bytes 37 input-bytes 13 expected-bytes 29
+should support empty atx headings (1)
+--- input
+## 
+#
+### ###
+--- expected
+<h2></h2>
+<h1></h1>
+<h3></h3>
+--- end
+--- case 31 options - label-bytes 37 input-bytes 7 expected-bytes 29
+should support empty atx headings (2)
+--- input
+#
+a
+# b
+--- expected
+<h1></h1>
+<p>a</p>
+<h1>b</h1>
+--- end
+--- case 32 options - label-bytes 31 input-bytes 5 expected-bytes 45
+should not support lazyness (1)
+--- input
+> #
+a
+--- expected
+<blockquote>
+<h1></h1>
+</blockquote>
+<p>a</p>
+--- end
+--- case 33 options - label-bytes 31 input-bytes 5 expected-bytes 45
+should not support lazyness (2)
+--- input
+> a
+#
+--- expected
+<blockquote>
+<p>a</p>
+</blockquote>
+<h1></h1>
+--- end

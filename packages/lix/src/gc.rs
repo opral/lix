@@ -14,7 +14,7 @@ use crate::branch::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
     branch_head_control_precondition,
 };
-use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
+use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRoot, GcSweepSet};
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
 #[cfg(any(test, feature = "storage-benches"))]
@@ -1608,7 +1608,6 @@ where
                 changes: Vec::new(),
                 json_payloads: sweep_json_payloads,
             },
-            repair: GcRepairSet::default(),
         },
         sweep: RepositoryGcSweep {
             live_manifest_count,
@@ -2261,7 +2260,6 @@ where
             changes: sweep_changes,
             json_payloads: sweep_json_payloads,
         },
-        repair: GcRepairSet::default(),
     })
 }
 
@@ -2428,10 +2426,12 @@ mod tests {
     };
     use crate::storage_adapter::{
         MAX_SCAN_PAGE_ROWS, Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter,
-        StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey,
+        StorageBeginScanOptions, StorageGetOptions, StorageKey,
         StoragePrefix, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
         StorageWriteSet,
     };
+    #[cfg(feature = "storage-benches")]
+    use crate::storage_adapter::StorageCoreProjection;
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
@@ -2457,6 +2457,7 @@ mod tests {
         stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
 
+    #[cfg(feature = "storage-benches")]
     async fn space_inventory<R>(read: &R, space: StorageSpace) -> Vec<(Vec<u8>, Vec<u8>)>
     where
         R: crate::storage_adapter::StorageAdapterRead,
@@ -4985,168 +4986,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "default_wasm_runtime")]
-    #[cfg(any())]
-    #[tokio::test]
-    async fn repository_gc_keeps_plugin_wasm_for_cold_runtime_execution() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("plugin-GC repository should initialize");
-        let engine = Engine::new_with_wasm_runtime(
-            backend.clone(),
-            crate::plugin::runtime::default::runtime().expect("WASM runtime should initialize"),
-        )
-        .await
-        .expect("plugin-GC repository should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("plugin-GC session should open");
-        let (archive, wasm) = gc_csv_plugin_archive();
-        let wasm_hash = crate::binary_cas::BlobId::from_content(&wasm);
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES \
-                 ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-                &[Value::Blob(archive.into())],
-            )
-            .await
-            .expect("CSV plugin should install");
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/owned.csv', $1)",
-                &[Value::Blob(b"before,gc\n".to_vec().into())],
-            )
-            .await
-            .expect("installed plugin should execute before GC");
-
-        let storage = StorageAdapter::new(backend.clone());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("plugin-GC orphan read should open");
-        let mut orphan_writes = storage.new_write_set();
-        let orphan = crate::binary_cas::BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
-            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
-                b"plugin-gc-unrelated-orphan".to_vec(),
-            ))
-            .await
-            .expect("plugin-GC orphan should stage");
-        drop(read);
-        storage
-            .commit_write_set(orphan_writes, StorageWriteOptions::default())
-            .await
-            .expect("plugin-GC orphan should commit");
-
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, wasm_hash, true).await;
-        assert_binary_cas_presence(&storage, orphan.hash, false).await;
-
-        // A new Engine owns an empty runtime-host factory/actor cache. Updating
-        // the semantic file therefore has to cold-load the registry-owned WASM
-        // from binary CAS and execute it after the sweep.
-        drop(session);
-        drop(engine);
-        let engine = Engine::new_with_wasm_runtime(
-            backend.clone(),
-            crate::plugin::runtime::default::runtime()
-                .expect("cold WASM runtime should initialize"),
-        )
-        .await
-        .expect("plugin-GC repository should cold reopen");
-        let session = engine
-            .open_session()
-            .await
-            .expect("cold plugin-GC session should open");
-        session
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = '/owned.csv'",
-                &[Value::Blob(b"after,gc\n".to_vec().into())],
-            )
-            .await
-            .expect("cold plugin runtime should load and execute after GC");
-        let content = session
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/owned.csv'",
-                &[],
-            )
-            .await
-            .expect("cold plugin output should remain readable");
-        assert_eq!(
-            content.rows()[0].get::<Vec<u8>>("content").unwrap(),
-            b"after,gc\n"
-        );
-        assert_binary_cas_presence(&storage, wasm_hash, true).await;
-    }
-
-    #[cfg(feature = "default_wasm_runtime")]
-    #[cfg(any())]
-    #[tokio::test]
-    async fn repository_gc_reclaims_plugin_wasm_only_after_final_registry_root_releases() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("shared-plugin repository should initialize");
-        let engine = Engine::new_with_wasm_runtime(
-            backend.clone(),
-            crate::plugin::runtime::default::runtime().expect("WASM runtime should initialize"),
-        )
-        .await
-        .expect("shared-plugin repository should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("shared-plugin session should open");
-        let (archive, wasm) = gc_csv_plugin_archive();
-        let wasm_hash = crate::binary_cas::BlobId::from_content(&wasm);
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES \
-                 ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-                &[Value::Blob(archive.into())],
-            )
-            .await
-            .expect("shared CSV plugin should install");
-        let storage = StorageAdapter::new(backend);
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, wasm_hash, true).await;
-        let branch = session
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01990000-0000-7000-8000-000000000035".to_owned()),
-                name: "plugin-gc-retained".to_owned(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("retained plugin branch should create");
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, wasm_hash, true).await;
-        session
-            .execute(
-                "DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
-                &[],
-            )
-            .await
-            .expect("plugin should uninstall from main");
-        session
-            .create_checkpoint()
-            .await
-            .expect("uninstalled main should release its undo interval");
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, wasm_hash, true).await;
-
-        session
-            .execute(
-                "DELETE FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch.id)],
-            )
-            .await
-            .expect("final plugin registry branch should retire");
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, wasm_hash, false).await;
-    }
-
     #[tokio::test]
     async fn repository_gc_fails_closed_on_corrupt_current_plugin_registry() {
         let backend = Memory::new();
@@ -5238,45 +5077,6 @@ mod tests {
                 .expect_err("corrupt current plugin registry must fail GC closed");
         assert!(error.message.contains("unsupported version"), "{error:?}");
         assert!(sweep.is_empty(), "corruption must stage no GC mutations");
-    }
-
-    #[cfg(feature = "default_wasm_runtime")]
-    #[cfg(any())]
-    fn gc_csv_plugin_archive() -> (Vec<u8>, Vec<u8>) {
-        let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")))
-            .expect("CSV plugin WASM should read");
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (path, bytes) in [
-            (
-                "manifest.json",
-                include_str!("../../../plugins/csv/manifest.json").as_bytes(),
-            ),
-            (
-                "schema/csv_table.json",
-                include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
-            ),
-            (
-                "schema/csv_row.json",
-                include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
-            ),
-            ("plugin.wasm", wasm.as_slice()),
-        ] {
-            writer
-                .start_file(path, options)
-                .expect("plugin archive entry should start");
-            writer
-                .write_all(bytes)
-                .expect("plugin archive entry should write");
-        }
-        (
-            writer
-                .finish()
-                .expect("plugin archive should finish")
-                .into_inner(),
-            wasm,
-        )
     }
 
     /// The derivation replaces `gc.reachability_delta.v1`. It must name every

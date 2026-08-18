@@ -1,0 +1,14 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/misc_bom.rs
+role: upstream-input
+count: 2
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 3
+﻿
+--- end
+--- case 2 profile commonmark bytes 15
+﻿# hea﻿ding
+--- end

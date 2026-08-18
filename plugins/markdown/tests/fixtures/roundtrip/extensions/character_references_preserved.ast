@@ -1,0 +1,25 @@
+Document
+  Paragraph
+    Text "Named "
+    CharacterReference reference="&amp;" value="&"
+    Text " "
+    CharacterReference reference="&copy;" value="©"
+    Text " "
+    CharacterReference reference="&AElig;" value="Æ"
+    Text "."
+  Paragraph
+    Text "Numeric "
+    CharacterReference reference="&#35;" value="#"
+    Text " "
+    CharacterReference reference="&#x41;" value="A"
+    Text " "
+    CharacterReference reference="&#X22;" value="\""
+    Text "."
+  Paragraph
+    Text "Invalid &unknown; &copy and &#x; stay text."
+  Paragraph
+    Text "Markup "
+    CharacterReference reference="&#42;" value="*"
+    Text "not emphasis"
+    CharacterReference reference="&#42;" value="*"
+    Text " stays text markers."

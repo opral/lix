@@ -159,7 +159,11 @@ where
                 .await
                 .map(|change| change.into_iter().collect());
         }
-        ChangeScanRoute::All => {}
+        ChangeScanRoute::All => {
+            if limit == Some(0) {
+                return Ok(Vec::new());
+            }
+        }
     }
     let hidden_commits = crate::sync::load_sync_hidden_commit_ids(&store).await?;
     let packed_changes = crate::tracked_state::scan_change_records_from_commit_deltas_excluding_commits(

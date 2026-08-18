@@ -26,13 +26,13 @@ use crate::common::{json_pointer_get, validate_row_metadata};
 #[cfg(test)]
 use crate::domain::DomainFileScope;
 use crate::domain::{Domain, DomainRowIdentity, committed_row_ref_is_exact_branch_scoped};
-use crate::row_pk::{RowPk, RowPkError, canonical_json_text};
 use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
     HotStateReadDomain, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRowRef,
 };
 use crate::plugin::runtime::PLUGIN_OWNER_KEY;
+use crate::row_pk::{RowPk, RowPkError, canonical_json_text};
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{
@@ -2304,9 +2304,8 @@ impl PendingConstraintIndexes {
                 pointer_group: unique_paths.clone(),
                 value,
             };
-            if let Some(existing_row_pk) = self
-                .unique_values
-                .insert(key.clone(), row.row_pk().clone())
+            if let Some(existing_row_pk) =
+                self.unique_values.insert(key.clone(), row.row_pk().clone())
             {
                 if existing_row_pk != *row.row_pk() {
                     return Err(LixError::new(
@@ -2567,9 +2566,7 @@ fn validate_pending_delete_restrictions(
                         schema_key: tombstone.identity.schema_key_owned(),
                         domain,
                         pointer_group: primary_key_paths.clone(),
-                        value: UniqueConstraintValue::from_row_pk(
-                            tombstone.identity.row_pk(),
-                        ),
+                        value: UniqueConstraintValue::from_row_pk(tombstone.identity.row_pk()),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -3750,9 +3747,7 @@ mod tests {
         let parsed = test_json_text(value).expect("test staged JSON should parse");
         crate::transaction_types::stage_json_from_value(
             TransactionJson::from_value_for_test(parsed),
-            "test staged JSON",
         )
-        .expect("test staged JSON should prepare")
     }
 
     fn test_json_text(value: &str) -> Result<serde_json::Value, LixError> {
@@ -4849,10 +4844,7 @@ mod tests {
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![
                 pending_registered_schema_row("pending_schema"),
-                staged_row(
-                    "pending_schema",
-                    Some(json!({ "id": "row-1" }).to_string()),
-                ),
+                staged_row("pending_schema", Some(json!({ "id": "row-1" }).to_string()),),
             ],
             ..empty_staged_write_set()
         };
@@ -6586,8 +6578,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.row_pk =
-            RowPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
+        row.row_pk = RowPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
         row.file_id = Some(file_id.into());
         row.branch_id = branch_id.into();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;
@@ -7801,11 +7792,7 @@ mod tests {
         row
     }
 
-    fn nullable_unique_row(
-        row_pk: &str,
-        scope: Option<&str>,
-        name: &str,
-    ) -> TestPreparedStateRow {
+    fn nullable_unique_row(row_pk: &str, scope: Option<&str>, name: &str) -> TestPreparedStateRow {
         let mut row = staged_row(
             "nullable_unique_schema",
             Some(
@@ -7872,8 +7859,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.row_pk =
-            RowPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
+        row.row_pk = RowPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
         row.file_id = Some(file_id.into());
         row.branch_id = branch_id.into();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;

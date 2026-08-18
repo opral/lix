@@ -1,0 +1,9 @@
+Document
+  HtmlBlock "<!-- a\n*b*\n-->"
+  HtmlBlock "<?pi\ndata?>"
+  HtmlBlock "<!DOCTYPE html>"
+  HtmlBlock "<![CDATA[\n<not>\n]]>"
+  HtmlBlock "<script>\n*a*\n</script>"
+  HtmlBlock "<pre>\n**raw**\n</pre>"
+  HtmlBlock "<style>\na { color: red; }\n</style>"
+  HtmlBlock "<textarea>\nx\n</textarea>"

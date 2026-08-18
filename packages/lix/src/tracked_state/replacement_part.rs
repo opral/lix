@@ -206,22 +206,12 @@ impl ReplacementPartDirectoryEntry {
     pub(crate) fn row_count(&self) -> u16 {
         self.row_count
     }
-
-    pub(crate) fn end_ordinal(&self) -> u32 {
-        self.first_ordinal + u32::from(self.row_count)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReplacementPartDirectory {
     entries: Vec<ReplacementPartDirectoryEntry>,
     row_count: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReplacementPartOrdinalRoute<'a> {
-    pub(crate) entry: &'a ReplacementPartDirectoryEntry,
-    pub(crate) local_ordinal: u16,
 }
 
 impl ReplacementPartDirectory {
@@ -339,43 +329,6 @@ impl ReplacementPartDirectory {
         Self::decode(encoded)
     }
 
-    pub(crate) fn route_key(&self, encoded_key: &[u8]) -> Option<&ReplacementPartDirectoryEntry> {
-        let mut lower = 0usize;
-        let mut upper = self.entries.len();
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            if self.entries[middle].first_key.as_ref() <= encoded_key {
-                lower = middle + 1;
-            } else {
-                upper = middle;
-            }
-        }
-        let entry = self.entries.get(lower.checked_sub(1)?)?;
-        (encoded_key <= entry.last_key.as_ref()).then_some(entry)
-    }
-
-    pub(crate) fn route_ordinal(&self, ordinal: u32) -> Option<ReplacementPartOrdinalRoute<'_>> {
-        if ordinal >= self.row_count {
-            return None;
-        }
-        let mut lower = 0usize;
-        let mut upper = self.entries.len();
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            if self.entries[middle].first_ordinal <= ordinal {
-                lower = middle + 1;
-            } else {
-                upper = middle;
-            }
-        }
-        let entry = self.entries.get(lower.checked_sub(1)?)?;
-        let local = ordinal.checked_sub(entry.first_ordinal)?;
-        (local < u32::from(entry.row_count)).then_some(ReplacementPartOrdinalRoute {
-            entry,
-            local_ordinal: u16::try_from(local).expect("local ordinal is bounded by u16 row count"),
-        })
-    }
-
     /// Returns the contiguous directory slice whose key bounds may intersect
     /// `[lower, upper)`. Gaps between parts remain gaps; callers still verify
     /// exact membership inside each decoded part.
@@ -434,12 +387,6 @@ impl ReplacementPartDirectory {
         }
         Ok(())
     }
-}
-
-pub(crate) fn encode_replacement_part(
-    rows: &[ReplacementPartRowRef<'_>],
-) -> Result<EncodedReplacementPart, LixError> {
-    encode_replacement_part_with_compressor(rows, &mut None)
 }
 
 pub(crate) fn encode_replacement_part_with_compressor(
@@ -784,8 +731,14 @@ fn replacement_part_error(message: impl Into<String>) -> LixError {
 mod tests {
     use super::{
         ReplacementPartDirectory, ReplacementPartRowRef, decode_replacement_part,
-        decode_replacement_part_for_entry, encode_replacement_part,
+        decode_replacement_part_for_entry, encode_replacement_part_with_compressor,
     };
+
+    fn encode_replacement_part(
+        rows: &[ReplacementPartRowRef<'_>],
+    ) -> Result<super::EncodedReplacementPart, crate::LixError> {
+        encode_replacement_part_with_compressor(rows, &mut None)
+    }
 
     fn rows<'a>(keys: &'a [&'a [u8]]) -> Vec<ReplacementPartRowRef<'a>> {
         keys.iter()
@@ -869,15 +822,6 @@ mod tests {
             decoded.digest().expect("directory digest"),
             directory.digest().unwrap()
         );
-        assert_eq!(
-            decoded.route_key(b"beta").expect("beta route").digest(),
-            first.digest()
-        );
-        assert!(decoded.route_key(b"charlie").is_none());
-        let ordinal = decoded.route_ordinal(3).expect("ordinal route");
-        assert_eq!(ordinal.entry.digest(), second.digest());
-        assert_eq!(ordinal.local_ordinal, 1);
-        assert!(decoded.route_ordinal(4).is_none());
         assert_eq!(
             decoded.parts_overlapping(Some(b"beta"), Some(b"omega")),
             0..2

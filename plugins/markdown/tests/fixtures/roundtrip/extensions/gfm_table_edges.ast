@@ -1,0 +1,42 @@
+Document
+  Table
+    Alignments none,none,none
+    Row
+      Cell
+        Text "A|B"
+      Cell
+        Text "Code"
+      Cell
+        Text "Link"
+    Row
+      Cell
+        Text "x|y"
+      Cell
+        Code value="a|b" raw="a|b" fence=1
+      Cell
+        Link destination=https://example.com title=none
+          Text "p|q"
+  Table
+    Alignments none
+    Row
+      Cell
+        Text "a"
+  Table
+    Alignments none
+    Row
+      Cell
+        Text "One"
+    Row
+      Cell
+        Text "two"
+  Paragraph
+    Text "| Literal |"
+    SoftBreak
+    Text "| - |"
+  Table
+    Alignments none
+    Row
+      Cell
+        Text "Code"
+  CodeBlock kind=indented info=none
+    Value "| not a cell |"

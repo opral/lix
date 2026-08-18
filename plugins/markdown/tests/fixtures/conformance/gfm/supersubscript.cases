@@ -1,0 +1,40 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: supersubscript
+count: 4
+
+--- case 1 options extension.superscript label-bytes 11 input-bytes 11 expected-bytes 27
+superscript
+--- input
+e = mc^2^.
+
+--- expected
+<p>e = mc<sup>2</sup>.</p>
+
+--- end
+--- case 2 options extension.superscript label-bytes 39 input-bytes 12 expected-bytes 28
+superscript_negative_exponents_are_real
+--- input
+i^-2^ = -1.
+
+--- expected
+<p>i<sup>-2</sup> = -1.</p>
+
+--- end
+--- case 3 options extension.subscript label-bytes 9 input-bytes 28 expected-bytes 62
+subscript
+--- input
+f~i~ = f~i - 2~ + f~i - 1~.
+
+--- expected
+<p>f<sub>i</sub> = f<sub>i - 2</sub> + f<sub>i - 1</sub>.</p>
+
+--- end
+--- case 4 options extension.subscript label-bytes 33 input-bytes 30 expected-bytes 64
+subscript_negative_terms_are_real
+--- input
+f~i~ = f~-2 + i~ + f~-1 + i~.
+
+--- expected
+<p>f<sub>i</sub> = f<sub>-2 + i</sub> + f<sub>-1 + i</sub>.</p>
+
+--- end

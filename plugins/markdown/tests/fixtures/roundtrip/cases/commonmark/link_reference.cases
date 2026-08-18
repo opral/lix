@@ -1,0 +1,317 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/link_reference.rs
+role: upstream-input
+count: 56
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 37
+[ref]: /uri
+
+[foo <bar attr="][ref]">
+--- end
+--- case 2 profile commonmark bytes 31
+[bar]: /url "title"
+
+[foo][bar]
+--- end
+--- case 3 profile commonmark bytes 36
+[ref]: /uri
+
+[link [foo [bar]]][ref]
+--- end
+--- case 4 profile commonmark bytes 30
+[ref]: /uri
+
+[link \[bar][ref]
+--- end
+--- case 5 profile commonmark bytes 42
+[ref]: /uri
+
+[link *foo **bar** `#`*][ref]
+--- end
+--- case 6 profile commonmark bytes 37
+[ref]: /uri
+
+[![moon](moon.jpg)][ref]
+--- end
+--- case 7 profile commonmark bytes 35
+[ref]: /uri
+
+[foo [bar](/uri)][ref]
+--- end
+--- case 8 profile commonmark bytes 40
+[ref]: /uri
+
+[foo *bar [baz][ref]*][ref]
+--- end
+--- case 9 profile commonmark bytes 25
+[ref]: /uri
+
+*[foo*][ref]
+--- end
+--- case 10 profile commonmark bytes 28
+[ref]: /uri
+
+[foo *bar][ref]
+--- end
+--- case 11 profile commonmark bytes 25
+[ref]: /uri
+
+[foo`][ref]`
+--- end
+--- case 12 profile commonmark bytes 52
+[ref]: /uri
+
+[foo<http://example.com/?search=][ref]>
+--- end
+--- case 13 profile commonmark bytes 31
+[bar]: /url "title"
+
+[foo][BaR]
+--- end
+--- case 14 profile commonmark bytes 69
+[ТОЛПОЙ]: /url
+
+[Толпой][Толпой] is a Russian word.
+--- end
+--- case 15 profile commonmark bytes 33
+[Foo
+  bar]: /url
+
+[Baz][Foo bar]
+--- end
+--- case 16 profile commonmark bytes 32
+[bar]: /url "title"
+
+[foo] [bar]
+--- end
+--- case 17 profile commonmark bytes 32
+[bar]: /url "title"
+
+[foo]
+[bar]
+--- end
+--- case 18 profile commonmark bytes 38
+[foo]: /url1
+
+[foo]: /url2
+
+[bar][foo]
+--- end
+--- case 19 profile commonmark bytes 26
+[foo!]: /url
+
+[bar][foo\!]
+--- end
+--- case 20 profile commonmark bytes 25
+[ref[]: /uri
+
+[foo][ref[]
+--- end
+--- case 21 profile commonmark bytes 33
+[ref[bar]]: /uri
+
+[foo][ref[bar]]
+--- end
+--- case 22 profile commonmark bytes 26
+[[[foo]]]: /url
+
+[[[foo]]]
+--- end
+--- case 23 profile commonmark bytes 27
+[ref\[]: /uri
+
+[foo][ref\[]
+--- end
+--- case 24 profile commonmark bytes 22
+[bar\\]: /uri
+
+[bar\\]
+--- end
+--- case 25 profile commonmark bytes 12
+[]: /uri
+
+[]
+--- end
+--- case 26 profile commonmark bytes 16
+[
+ ]: /uri
+
+[
+ ]
+--- end
+--- case 27 profile commonmark bytes 28
+[foo]: /url "title"
+
+[foo][]
+--- end
+--- case 28 profile commonmark bytes 40
+[*foo* bar]: /url "title"
+
+[*foo* bar][]
+--- end
+--- case 29 profile commonmark bytes 28
+[foo]: /url "title"
+
+[Foo][]
+--- end
+--- case 30 profile commonmark bytes 30
+[foo]: /url "title"
+
+[foo] 
+[]
+--- end
+--- case 31 profile commonmark bytes 26
+[foo]: /url "title"
+
+[foo]
+--- end
+--- case 32 profile commonmark bytes 38
+[*foo* bar]: /url "title"
+
+[*foo* bar]
+--- end
+--- case 33 profile commonmark bytes 40
+[*foo* bar]: /url "title"
+
+[[*foo* bar]]
+--- end
+--- case 34 profile commonmark bytes 24
+[foo]: /url
+
+[[bar [foo]
+--- end
+--- case 35 profile commonmark bytes 26
+[foo]: /url "title"
+
+[Foo]
+--- end
+--- case 36 profile commonmark bytes 22
+[foo]: /url
+
+[foo] bar
+--- end
+--- case 37 profile commonmark bytes 27
+[foo]: /url "title"
+
+\[foo]
+--- end
+--- case 38 profile commonmark bytes 21
+[foo*]: /url
+
+*[foo*]
+--- end
+--- case 39 profile commonmark bytes 37
+[foo]: /url1
+[bar]: /url2
+
+[foo][bar]
+--- end
+--- case 40 profile commonmark bytes 21
+[foo]: /url1
+
+[foo][]
+--- end
+--- case 41 profile commonmark bytes 20
+[foo]: /url
+
+[foo]()
+--- end
+--- case 42 profile commonmark bytes 28
+[foo]: /url "title"
+
+[foo]()
+--- end
+--- case 43 profile commonmark bytes 31
+[foo]: /url1
+
+[foo](not a link)
+--- end
+--- case 44 profile commonmark bytes 28
+[baz]: /url
+
+[foo][bar][baz]
+--- end
+--- case 45 profile commonmark bytes 42
+[baz]: /url1
+[bar]: /url2
+
+[foo][bar][baz]
+--- end
+--- case 46 profile commonmark bytes 42
+[baz]: /url1
+[foo]: /url2
+
+[foo][bar][baz]
+--- end
+--- case 47 profile commonmark bytes 40
+[x]: /url
+
+[x][ ], [x][	], [x][
+], [x][]
+--- end
+--- case 48 profile commonmark bytes 59
+[+]: example.com
+[\;]: example.com
+
+Will it link? [\+], [;]
+--- end
+--- case 49 profile commonmark bytes 67
+[©]: example.com
+[&amp;]: example.com
+
+Will it link? [&copy;], [&]
+--- end
+--- case 50 profile commonmark bytes 63
+[+]: example.com
+[\;]: example.com
+
+Will it link? [\+][], [;][]
+--- end
+--- case 51 profile commonmark bytes 71
+[©]: example.com
+[&amp;]: example.com
+
+Will it link? [&copy;][], [&][]
+--- end
+--- case 52 profile commonmark bytes 69
+[+]: example.com
+[\;]: example.com
+
+Will it link? [a][ \+ ], [b][ ; ]
+--- end
+--- case 53 profile commonmark bytes 77
+[©]: example.com
+[&amp;]: example.com
+
+Will it link? [a][ &copy; ], [b][ & ]
+--- end
+--- case 54 profile commonmark bytes 167
+[*f*][]
+[&semi;][]
+[\;][]
+[;][]
+[*f*&semi;][]
+[*f*\;][]
+[*f*;][]
+
+[*f*]: alpha
+[&semi;]: bravo
+[\;]: charlie
+[;]: delta
+[*f*&semi;]: echo
+[*f*\;]: foxtrot
+[*f*;]: golf
+--- end
+--- case 55 profile commonmark bytes 36
+[x] missing-colon
+
+Will it link? [x]
+--- end
+--- case 56 profile commonmark bytes 33
+[x]: y
+
+a [x] b [x][] c [d][x] e.
+--- end

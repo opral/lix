@@ -1,0 +1,15 @@
+Document
+  Paragraph
+    Text "This "
+    WikiLink target="https://example.org" label="title" order=after
+    Text " and "
+    WikiLink target="Name [of] page" label="Name [of] page" order=after
+    Text "."
+  Table
+    Alignments none
+    Row
+      Cell
+        Text "header"
+    Row
+      Cell
+        WikiLink target="url" label="url" order=after

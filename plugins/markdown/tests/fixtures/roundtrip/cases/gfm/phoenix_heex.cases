@@ -1,0 +1,678 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/phoenix_heex.rs
+role: upstream-input
+count: 114
+profiles: commonmark
+
+--- case 1 profile commonmark bytes 13
+Hello World!
+
+--- end
+--- case 2 profile commonmark bytes 60
+I am some text!
+<%# Look a comment! %>
+I am more some text!
+
+--- end
+--- case 3 profile commonmark bytes 45
+I am some text!
+<%#  %>
+I am more some text!
+
+--- end
+--- case 4 profile commonmark bytes 49
+<%# I
+    AM
+    A
+    COMMENT
+%>
+and some text!
+
+--- end
+--- case 5 profile commonmark bytes 39
+<%= foo
+    # |> bar()
+    |> baz() %>
+
+--- end
+--- case 6 profile commonmark bytes 51
+<%!--
+  Where'd the directive go?
+  <%= @x %>
+--%>
+
+--- end
+--- case 7 profile commonmark bytes 11
+<%!-- --%>
+
+--- end
+--- case 8 profile commonmark bytes 40
+<%= if true do %>
+  <%= @x %>
+<% end %>
+
+--- end
+--- case 9 profile commonmark bytes 73
+<%= case @x do %>
+  <%= ^x -> %>X, <%= x %>
+  <%= _ -> %>Not X
+<% end %>
+
+--- end
+--- case 10 profile commonmark bytes 29
+<Root.render>
+</Root.render>
+
+--- end
+--- case 11 profile commonmark bytes 32
+<MyApp.Components.Root.render/>
+
+--- end
+--- case 12 profile commonmark bytes 61
+<Root.render>
+  <Grid>
+    <Card />
+  </Card>
+</Root.render>
+
+--- end
+--- case 13 profile commonmark bytes 32
+<MyComponent.btn text="Save" />
+
+--- end
+--- case 14 profile commonmark bytes 21
+<.btn text="Save" />
+
+--- end
+--- case 15 profile commonmark bytes 114
+<.modal>
+  <:header>
+    This is the top of the modal.
+  </:header>
+  This is the content of the modal.
+</.modal>
+
+--- end
+--- case 16 profile commonmark bytes 57
+<.modal>
+  <:header key={@value}>
+  </:header>
+</.modal>
+
+--- end
+--- case 17 profile commonmark bytes 33
+<.modal>
+  <:header />
+</.modal>
+
+--- end
+--- case 18 profile commonmark bytes 84
+<.form :let={f}>
+    <%= text_input f, :text %>
+    <%= submit "Submit" %>
+</.form>
+
+--- end
+--- case 19 profile commonmark bytes 64
+<.func>
+  <:slot :let={foo}>
+    <%= foo %>
+  </:slot>
+</.func>
+
+--- end
+--- case 20 profile commonmark bytes 63
+<.component :for={item <- @items}>
+  <%= item %>
+</.component>
+
+--- end
+--- case 21 profile commonmark bytes 36
+<.component :for={item <- @items}/>
+
+--- end
+--- case 22 profile commonmark bytes 86
+<.component>
+  <:slot :for={item <- @items}>
+    <%= item %>
+  </:slot>
+</.component>
+
+--- end
+--- case 23 profile commonmark bytes 61
+<.component>
+  <:slot :for={item <- @items} />
+</.component>
+
+--- end
+--- case 24 profile commonmark bytes 66
+<.component :if={@expression}>
+  <%= @expression %>
+</.component>
+
+--- end
+--- case 25 profile commonmark bytes 33
+<.component :if={@expression} />
+
+--- end
+--- case 26 profile commonmark bytes 89
+<.component>
+  <:slot :if={@expression}>
+    <%= @expression %>
+  </:slot>
+</.component>
+
+--- end
+--- case 27 profile commonmark bytes 57
+<.component>
+  <:slot :if={@expression} />
+</.component>
+
+--- end
+--- case 28 profile commonmark bytes 26
+<Root.render key=value />
+
+--- end
+--- case 29 profile commonmark bytes 23
+<Root.render hidden />
+
+--- end
+--- case 30 profile commonmark bytes 28
+<Root.render key='value' />
+
+--- end
+--- case 31 profile commonmark bytes 28
+<Root.render key="value" />
+
+--- end
+--- case 32 profile commonmark bytes 28
+<Root.render key={value} />
+
+--- end
+--- case 33 profile commonmark bytes 22
+<Root.render a="a" />
+
+--- end
+--- case 34 profile commonmark bytes 33
+# Contact Form
+
+<.form>
+</.form>
+
+--- end
+--- case 35 profile commonmark bytes 130
+# Contact Form
+
+<.form
+  for={@form}
+  phx-change="change_name"
+>
+  <.input field={@form[:email]} />
+</.form>
+
+## Footer
+
+Socials
+
+--- end
+--- case 36 profile commonmark bytes 64
+# Posts from {Date.utc_today().year}
+
+<.button>Submit</.button>
+
+--- end
+--- case 37 profile commonmark bytes 42
+Click <.button>here</.button> to continue
+
+--- end
+--- case 38 profile commonmark bytes 42
+<.component>first</.component> **second**
+
+--- end
+--- case 39 profile commonmark bytes 39
+<.outer><.inner>text</.inner></.outer>
+
+--- end
+--- case 40 profile commonmark bytes 49
+<.outer><.inner>text</.inner></.outer> **after**
+
+--- end
+--- case 41 profile commonmark bytes 31
+<.a>x</.a><.b>y</.b> **after**
+
+--- end
+--- case 42 profile commonmark bytes 32
+<.icon name="star" /> **label**
+
+--- end
+--- case 43 profile commonmark bytes 39
+<.link href="/">click</.link> **bold**
+
+--- end
+--- case 44 profile commonmark bytes 30
+<.spacer></.spacer> **after**
+
+--- end
+--- case 45 profile commonmark bytes 277
+# Hello World
+
+<.link href="/">Regular anchor link</.link>
+
+```elixir
+IO.puts("Hello")
+```
+
+<.link navigate="/?sort=asc" replace={false}>
+  Sort By Price
+</.link>
+
+```rust
+let result = ammonia::clean("<b><img src='' onerror=alert('attack')>I'm not trying to XSS you</b>");
+```
+
+--- end
+--- case 46 profile commonmark bytes 34
+Header: <:title>My Title</:title>
+
+--- end
+--- case 47 profile commonmark bytes 36
+The year is {Date.utc_today().year}
+
+--- end
+--- case 48 profile commonmark bytes 37
+# Posts from {Date.utc_today().year}
+
+--- end
+--- case 49 profile commonmark bytes 25
+Value: {%{key: "value"}}
+
+--- end
+--- case 50 profile commonmark bytes 23
+Count: {length(items)}
+
+--- end
+--- case 51 profile commonmark bytes 38
+User {user.name} has {user.age} items
+
+--- end
+--- case 52 profile commonmark bytes 24
+Text: {"hello {world}"}
+
+--- end
+--- case 53 profile commonmark bytes 40
+The year is <% Date.utc_today().year %>
+
+--- end
+--- case 54 profile commonmark bytes 41
+The year is <%= Date.utc_today().year %>
+
+--- end
+--- case 55 profile commonmark bytes 30
+Code: <%% IO.inspect(user) %>
+
+--- end
+--- case 56 profile commonmark bytes 31
+Code: <%%= IO.inspect(user) %>
+
+--- end
+--- case 57 profile commonmark bytes 30
+Text: <%= "hello %> world" %>
+
+--- end
+--- case 58 profile commonmark bytes 26
+# Posts from <%= @year %>
+
+--- end
+--- case 59 profile commonmark bytes 50
+User <%= @user.name %> has <%= @user.age %> years
+
+--- end
+--- case 60 profile commonmark bytes 48
+Result: <%=
+  user.name
+  |> String.upcase()
+%>
+
+--- end
+--- case 61 profile commonmark bytes 40
+Value: {user.name} or <%= @user.name %>
+
+--- end
+--- case 62 profile commonmark bytes 74
+<.form :let={f} for={@changeset}>
+  <.input field={f[:email]} />
+</.form>
+
+--- end
+--- case 63 profile commonmark bytes 155
+<.table rows={@users}>
+  <:col :let={user} label="Name">
+    {user.name}
+  </:col>
+  <:col :let={user} label="Email">
+    {user.email}
+  </:col>
+</.table>
+
+--- end
+--- case 64 profile commonmark bytes 22
+Value: {"\{escaped}"}
+
+--- end
+--- case 65 profile commonmark bytes 42
+<.input field={@form[:email]} required />
+
+--- end
+--- case 66 profile commonmark bytes 67
+<.component
+  class = {get_class()}
+  id= {@id}
+  data ={@data}
+/>
+
+--- end
+--- case 67 profile commonmark bytes 84
+<.component
+  value={user.name}
+  count={length(items)}
+  data={%{key: "value"}}
+/>
+
+--- end
+--- case 68 profile commonmark bytes 59
+<.form
+  for={@form}
+  phx-change="change_name"
+>
+</.form>
+
+--- end
+--- case 69 profile commonmark bytes 94
+<.form
+  for={@form}
+  phx-change="change_name"
+>
+  <.input field={@form[:email]} />
+</.form>
+
+--- end
+--- case 70 profile commonmark bytes 121
+<Component>
+  <:subtitle>
+    Subtitle content
+  </:subtitle>
+  <:actions>
+    Action buttons
+  </:actions>
+</Component>
+
+--- end
+--- case 71 profile commonmark bytes 30
+<.form>
+  <.input />
+</.form>
+
+--- end
+--- case 72 profile commonmark bytes 36
+> <.form>
+>   <.input />
+> </.form>
+
+--- end
+--- case 73 profile commonmark bytes 33
+<.header>
+  ```elixir
+</.header>
+
+--- end
+--- case 74 profile commonmark bytes 39
+> <.header>
+>   ```elixir
+> </.header>
+
+--- end
+--- case 75 profile commonmark bytes 40
+<.header>
+hello
+</.header>
+
+hello world
+
+--- end
+--- case 76 profile commonmark bytes 49
+> <.header>
+> hello
+> </.header>
+>
+> hello world
+
+--- end
+--- case 77 profile commonmark bytes 19
+Value: {user.name}
+
+--- end
+--- case 78 profile commonmark bytes 31
+> Here is a value: {user.name}
+
+--- end
+--- case 79 profile commonmark bytes 20
+Value: <%= @user %>
+
+--- end
+--- case 80 profile commonmark bytes 32
+> Here is a value: <%= @user %>
+
+--- end
+--- case 81 profile commonmark bytes 18
+<.foo>
+
+
+
+</.foo>
+
+--- end
+--- case 82 profile commonmark bytes 46
+<MyComponent>
+
+  Content here
+
+</MyComponent>
+
+--- end
+--- case 83 profile commonmark bytes 45
+<.outer>
+
+  <.inner>
+
+  </.inner>
+
+</.outer>
+
+--- end
+--- case 84 profile commonmark bytes 32
+<.form>
+Content
+</.form>
+
+After
+
+--- end
+--- case 85 profile commonmark bytes 15
+<Foo>
+
+
+</Foo>
+
+--- end
+--- case 86 profile commonmark bytes 16
+<.btn />
+
+After
+
+--- end
+--- case 87 profile commonmark bytes 28
+<Component.render />
+
+After
+
+--- end
+--- case 88 profile commonmark bytes 28
+<.form>
+content
+</
+</.form>
+
+--- end
+--- case 89 profile commonmark bytes 23
+<.form>
+</>  
+</.form>
+
+--- end
+--- case 90 profile commonmark bytes 6
+<. />
+
+--- end
+--- case 91 profile commonmark bytes 18
+<.form>
+  content
+
+--- end
+--- case 92 profile commonmark bytes 14
+<%= foo
+  bar
+
+--- end
+--- case 93 profile commonmark bytes 42
+<%# this is a comment
+  that never closes
+
+--- end
+--- case 94 profile commonmark bytes 29
+<.form>
+  content
+</.button>
+
+--- end
+--- case 95 profile commonmark bytes 39
+<MyApp.Form>
+  content
+</MyApp.Button>
+
+--- end
+--- case 96 profile commonmark bytes 27
+<.form>
+  content
+</.Form>
+
+--- end
+--- case 97 profile commonmark bytes 29
+<.form>
+  content
+</  .form>
+
+--- end
+--- case 98 profile commonmark bytes 175
+<MyApp.List.list>
+  <MyApp.List.li>
+    content
+    <MyApp.List.list>
+      <MyApp.List.li>nested</MyApp.List.li>
+    </MyApp.List.list>
+  </MyApp.List.li>
+</MyApp.List.list>
+
+--- end
+--- case 99 profile commonmark bytes 95
+<.list>
+  <.li>
+    content
+    <.list>
+      <.li>nested</.li>
+    </.list>
+  </.li>
+</.list>
+
+--- end
+--- case 100 profile commonmark bytes 59
+<MyApp.List.list>
+  <MyApp.List.list />
+</MyApp.List.list>
+
+--- end
+--- case 101 profile commonmark bytes 40
+<.list>
+  <.list>inner</.list>
+</.list>
+
+--- end
+--- case 102 profile commonmark bytes 67
+<.form>
+  <%= if true do %>
+    <%= @value %>
+  <% end %>
+</.form>
+
+--- end
+--- case 103 profile commonmark bytes 27
+<%= foo %> text <%= bar %>
+
+--- end
+--- case 104 profile commonmark bytes 21
+<%= foo %>text after
+
+--- end
+--- case 105 profile commonmark bytes 28
+<% foo %><% bar %><% baz %>
+
+--- end
+--- case 106 profile commonmark bytes 28
+text <%= foo
+  bar %> after
+
+--- end
+--- case 107 profile commonmark bytes 17
+<.form>
+</.form>
+
+--- end
+--- case 108 profile commonmark bytes 24
+<.form>
+   
+  
+</.form>
+
+--- end
+--- case 109 profile commonmark bytes 5
+<%%>
+
+--- end
+--- case 110 profile commonmark bytes 34
+- <.button>
+    text
+  </.button>
+
+--- end
+--- case 111 profile commonmark bytes 24
+<%= "100%% complete" %>
+
+--- end
+--- case 112 profile commonmark bytes 15
+<%= "<tag>" %>
+
+--- end
+--- case 113 profile commonmark bytes 38
+<.button data-key="<>&\"">
+</.button>
+
+--- end
+--- case 114 profile commonmark bytes 21
+{
+  "a"
+  <>
+  "b"
+}
+
+--- end

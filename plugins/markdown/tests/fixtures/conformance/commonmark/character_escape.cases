@@ -1,0 +1,105 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: character_escape
+count: 11
+
+--- case 1 options - label-bytes 40 input-bytes 64 expected-bytes 54
+should support escaped ascii punctuation
+--- input
+\!\"\#\$\%\&\'\(\)\*\+\,\-\.\/\:\;\<\=\>\?\@\[\\\]\^\_\`\{\|\}\~
+--- expected
+<p>!&quot;#$%&amp;'()*+,-./:;&lt;=&gt;?@[\]^_`{|}~</p>
+--- end
+--- case 2 options - label-bytes 53 input-bytes 18 expected-bytes 25
+should not support other characters after a backslash
+--- input
+\→\A\a\ \3\φ\«
+--- expected
+<p>\→\A\a\ \3\φ\«</p>
+--- end
+--- case 3 options - label-bytes 30 input-bytes 174 expected-bytes 192
+should escape other constructs
+--- input
+\*not emphasized*
+\<br/> not a tag
+\[not a link](/foo)
+\`not code`
+1\. not a list
+\* not a list
+\# not a heading
+\[foo]: /url "not a reference"
+\&ouml; not a character entity
+--- expected
+<p>*not emphasized*
+&lt;br/&gt; not a tag
+[not a link](/foo)
+`not code`
+1. not a list
+* not a list
+# not a heading
+[foo]: /url &quot;not a reference&quot;
+&amp;ouml; not a character entity</p>
+--- end
+--- case 4 options - label-bytes 26 input-bytes 8 expected-bytes 20
+should escape a line break
+--- input
+foo\
+bar
+--- expected
+<p>foo<br />
+bar</p>
+--- end
+--- case 5 options - label-bytes 30 input-bytes 10 expected-bytes 24
+should not escape in text code
+--- input
+`` \[\` ``
+--- expected
+<p><code>\[\`</code></p>
+--- end
+--- case 6 options - label-bytes 34 input-bytes 8 expected-bytes 29
+should not escape in indented code
+--- input
+    \[\]
+--- expected
+<pre><code>\[\]
+</code></pre>
+--- end
+--- case 7 options - label-bytes 29 input-bytes 28 expected-bytes 76
+should not escape in autolink
+--- input
+<http://example.com?find=\*>
+--- expected
+<p><a href="http://example.com?find=%5C*">http://example.com?find=\*</a></p>
+--- end
+--- case 8 options allow_dangerous_html,allow_dangerous_protocol label-bytes 30 input-bytes 18 expected-bytes 18
+should not escape in flow html
+--- input
+<a href="/bar\/)">
+--- expected
+<a href="/bar\/)">
+--- end
+--- case 9 options - label-bytes 35 input-bytes 23 expected-bytes 45
+should escape in resource and title
+--- input
+[foo](/bar\* "ti\*tle")
+--- expected
+<p><a href="/bar*" title="ti*tle">foo</a></p>
+--- end
+--- case 10 options - label-bytes 46 input-bytes 30 expected-bytes 45
+should escape in definition resource and title
+--- input
+[foo]: /bar\* "ti\*tle"
+
+[foo]
+--- expected
+<p><a href="/bar*" title="ti*tle">foo</a></p>
+--- end
+--- case 11 options - label-bytes 33 input-bytes 20 expected-bytes 53
+should escape in fenced code info
+--- input
+``` foo\+bar
+foo
+```
+--- expected
+<pre><code class="language-foo+bar">foo
+</code></pre>
+--- end

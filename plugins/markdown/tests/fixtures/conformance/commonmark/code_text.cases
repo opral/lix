@@ -1,0 +1,181 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: code_text
+count: 24
+
+--- case 1 options - label-bytes 19 input-bytes 5 expected-bytes 23
+should support code
+--- input
+`foo`
+--- expected
+<p><code>foo</code></p>
+--- end
+--- case 2 options - label-bytes 35 input-bytes 15 expected-bytes 29
+should support code w/ more accents
+--- input
+`` foo ` bar ``
+--- expected
+<p><code>foo ` bar</code></p>
+--- end
+--- case 3 options - label-bytes 49 input-bytes 6 expected-bytes 22
+should support code w/ fences inside, and padding
+--- input
+` `` `
+--- expected
+<p><code>``</code></p>
+--- end
+--- case 4 options - label-bytes 36 input-bytes 8 expected-bytes 24
+should support code w/ extra padding
+--- input
+`  ``  `
+--- expected
+<p><code> `` </code></p>
+--- end
+--- case 5 options - label-bytes 41 input-bytes 4 expected-bytes 22
+should support code w/ unbalanced padding
+--- input
+` a`
+--- expected
+<p><code> a</code></p>
+--- end
+--- case 6 options - label-bytes 45 input-bytes 7 expected-bytes 25
+should support code w/ non-padding whitespace
+--- input
+` b `
+--- expected
+<p><code> b </code></p>
+--- end
+--- case 7 options - label-bytes 28 input-bytes 8 expected-bytes 37
+should support code w/o data
+--- input
+` `
+`  `
+--- expected
+<p><code> </code>
+<code>  </code></p>
+--- end
+--- case 8 options - label-bytes 40 input-bytes 19 expected-bytes 33
+should support code w/o line endings (1)
+--- input
+``
+foo
+bar  
+baz
+``
+--- expected
+<p><code>foo bar   baz</code></p>
+--- end
+--- case 9 options - label-bytes 40 input-bytes 10 expected-bytes 24
+should support code w/o line endings (2)
+--- input
+``
+foo 
+``
+--- expected
+<p><code>foo </code></p>
+--- end
+--- case 10 options - label-bytes 40 input-bytes 16 expected-bytes 34
+should not support whitespace collapsing
+--- input
+`foo   bar 
+baz`
+--- expected
+<p><code>foo   bar  baz</code></p>
+--- end
+--- case 11 options - label-bytes 36 input-bytes 10 expected-bytes 28
+should not support character escapes
+--- input
+`foo\`bar`
+--- expected
+<p><code>foo\</code>bar`</p>
+--- end
+--- case 12 options - label-bytes 27 input-bytes 11 expected-bytes 27
+should support more accents
+--- input
+``foo`bar``
+--- expected
+<p><code>foo`bar</code></p>
+--- end
+--- case 13 options - label-bytes 27 input-bytes 14 expected-bytes 30
+should support less accents
+--- input
+` foo `` bar `
+--- expected
+<p><code>foo `` bar</code></p>
+--- end
+--- case 14 options - label-bytes 28 input-bytes 7 expected-bytes 25
+should precede over emphasis
+--- input
+*foo`*`
+--- expected
+<p>*foo<code>*</code></p>
+--- end
+--- case 15 options - label-bytes 25 input-bytes 20 expected-bytes 38
+should precede over links
+--- input
+[not a `link](/foo`)
+--- expected
+<p>[not a <code>link](/foo</code>)</p>
+--- end
+--- case 16 options - label-bytes 39 input-bytes 14 expected-bytes 48
+should have same precedence as HTML (1)
+--- input
+`<a href="`">`
+--- expected
+<p><code>&lt;a href=&quot;</code>&quot;&gt;`</p>
+--- end
+--- case 17 options allow_dangerous_html,allow_dangerous_protocol label-bytes 39 input-bytes 13 expected-bytes 20
+should have same precedence as HTML (2)
+--- input
+<a href="`">`
+--- expected
+<p><a href="`">`</p>
+--- end
+--- case 18 options - label-bytes 44 input-bytes 23 expected-bytes 47
+should have same precedence as autolinks (1)
+--- input
+`<http://foo.bar.`baz>`
+--- expected
+<p><code>&lt;http://foo.bar.</code>baz&gt;`</p>
+--- end
+--- case 19 options - label-bytes 44 input-bytes 22 expected-bytes 63
+should have same precedence as autolinks (2)
+--- input
+<http://foo.bar.`baz>`
+--- expected
+<p><a href="http://foo.bar.%60baz">http://foo.bar.`baz</a>`</p>
+--- end
+--- case 20 options - label-bytes 46 input-bytes 8 expected-bytes 15
+should not support more accents before a fence
+--- input
+```foo``
+--- expected
+<p>```foo``</p>
+--- end
+--- case 21 options - label-bytes 39 input-bytes 4 expected-bytes 11
+should not support no closing fence (1)
+--- input
+`foo
+--- expected
+<p>`foo</p>
+--- end
+--- case 22 options - label-bytes 39 input-bytes 11 expected-bytes 27
+should not support no closing fence (2)
+--- input
+`foo``bar``
+--- expected
+<p>`foo<code>bar</code></p>
+--- end
+--- case 23 options - label-bytes 27 input-bytes 10 expected-bytes 28
+should support tabs in code
+--- input
+`foo		bar`
+--- expected
+<p><code>foo		bar</code></p>
+--- end
+--- case 24 options - label-bytes 46 input-bytes 5 expected-bytes 22
+should support an escaped initial grave accent
+--- input
+\``x`
+--- expected
+<p>`<code>x</code></p>
+--- end

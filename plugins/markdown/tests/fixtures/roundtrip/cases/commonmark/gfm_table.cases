@@ -1,0 +1,767 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/gfm_table.rs
+role: upstream-input
+count: 62
+profiles: commonmark,gfm
+
+--- case 1 profile commonmark bytes 17
+| a |
+| - |
+| b |
+--- end
+--- case 2 profile gfm bytes 17
+| a |
+| - |
+| b |
+--- end
+--- case 3 profile gfm bytes 5
+| a |
+--- end
+--- case 4 profile gfm bytes 3
+| a
+--- end
+--- case 5 profile gfm bytes 3
+a |
+--- end
+--- case 6 profile gfm bytes 11
+| a |
+| - |
+--- end
+--- case 7 profile gfm bytes 7
+| a
+| -
+--- end
+--- case 8 profile gfm bytes 11
+| a
+| -
+| b
+--- end
+--- case 9 profile gfm bytes 11
+a|b
+-|-
+c|d
+--- end
+--- case 10 profile gfm bytes 21
+| a  
+| -	
+| b |     
+--- end
+--- case 11 profile gfm bytes 12
+| a | 
+| - |
+--- end
+--- case 12 profile gfm bytes 12
+| a |
+| - | 
+--- end
+--- case 13 profile gfm bytes 18
+| a |
+| - |
+| b | 
+--- end
+--- case 14 profile gfm bytes 10
+||a|
+|-|-|
+--- end
+--- case 15 profile gfm bytes 10
+|a||
+|-|-|
+--- end
+--- case 16 profile gfm bytes 10
+a||b
+-|-|-
+--- end
+--- case 17 profile gfm bytes 16
+|a|b|
+|-|-|
+||c|
+--- end
+--- case 18 profile gfm bytes 16
+|a|b|
+|-|-|
+|c||
+--- end
+--- case 19 profile gfm bytes 16
+a|b|c
+-|-|-
+d||e
+--- end
+--- case 20 profile gfm bytes 80
+:
+|-|
+|a|
+
+b
+|-|
+|c|
+
+|
+|-|
+|d|
+
+|
+|-|
+|e|
+
+|:
+|-|
+|f|
+
+||
+|-|
+|g|
+
+| |
+|-|
+|h|
+
+--- end
+--- case 21 profile gfm bytes 48
+a
+|-
+
+b
+||
+
+c
+|-|
+
+d
+|:|
+
+e
+| |
+
+f
+| -|
+
+g
+|- |
+
+--- end
+--- case 22 profile gfm bytes 3
+|
+|
+--- end
+--- case 23 profile gfm bytes 15
+| a |
+| - |
+- b
+--- end
+--- case 24 profile gfm bytes 13
+> | a |
+| - |
+--- end
+--- case 25 profile gfm bytes 13
+| a |
+> | - |
+--- end
+--- case 26 profile gfm bytes 21
+> | a |
+> | - |
+| b |
+--- end
+--- case 27 profile gfm bytes 25
+> a
+> | b |
+> | - |
+| c |
+--- end
+--- case 28 profile gfm bytes 29
+> | A |
+> | - |
+> | 1 |
+| 2 |
+--- end
+--- case 29 profile gfm bytes 14
+   - d
+    - e
+--- end
+--- case 30 profile commonmark bytes 14
+   - d
+    - e
+--- end
+--- case 31 profile gfm bytes 14
+| a |
+   | - |
+--- end
+--- case 32 profile gfm bytes 15
+| a |
+    | - |
+--- end
+--- case 33 profile gfm bytes 26
+| a |
+| - |
+> block quote?
+--- end
+--- case 34 profile gfm bytes 13
+| a |
+| - |
+>
+--- end
+--- case 35 profile gfm bytes 19
+| a |
+| - |
+- list?
+--- end
+--- case 36 profile gfm bytes 13
+| a |
+| - |
+-
+--- end
+--- case 37 profile gfm bytes 26
+| a |
+| - |
+<!-- HTML? -->
+--- end
+--- case 38 profile gfm bytes 18
+| a |
+| - |
+	code?
+--- end
+--- case 39 profile gfm bytes 23
+| a |
+| - |
+```js
+code?
+--- end
+--- case 40 profile gfm bytes 15
+| a |
+| - |
+***
+--- end
+--- case 41 profile gfm bytes 22
+| a |
+| - |
+# heading?
+--- end
+--- case 42 profile gfm bytes 21
+| a |
+| - |
+heading
+=
+--- end
+--- case 43 profile gfm bytes 23
+| a |
+| - |
+heading
+---
+--- end
+--- case 44 profile gfm bytes 21
+| a |
+| - |
+heading
+-
+--- end
+--- case 45 profile gfm bytes 6
+a
+b
+-:
+--- end
+--- case 46 profile gfm bytes 15
+> | a |
+> | - |
+--- end
+--- case 47 profile gfm bytes 21
+> | a |
+> | - |
+| c |
+--- end
+--- case 48 profile gfm bytes 21
+> | a |
+| - |
+> | c |
+--- end
+--- case 49 profile gfm bytes 11
+[
+a
+:-
+]: b
+--- end
+--- case 50 profile gfm bytes 26
+    | a |
+	| - |
+    | b |
+--- end
+--- case 51 profile gfm bytes 575
+# Align
+
+## An empty initial cell
+
+| | a|c|
+|--|:----:|:---|
+|a|b|c|
+|a|b|c|
+
+## Missing alignment characters
+
+| a | b | c |
+|   |---|---|
+| d | e | f |
+
+* * *
+
+| a | b | c |
+|---|---|   |
+| d | e | f |
+
+## Incorrect characters
+
+| a | b | c |
+|---|-*-|---|
+| d | e | f |
+
+## Two alignments
+
+|a|
+|::|
+
+|a|
+|:-:|
+
+## Two at the start or end
+
+|a|
+|::-|
+
+|a|
+|-::|
+
+## In the middle
+
+|a|
+|-:-|
+
+## A space in the middle
+
+|a|
+|- -|
+
+## No pipe
+
+a
+:-:
+
+a
+:-
+
+a
+-:
+
+## A single colon
+
+|a|
+|:|
+
+a
+:
+
+## Alignment on empty cells
+
+| a | b | c | d | e |
+| - | - | :- | -: | :-: |
+| f |
+
+--- end
+--- case 52 profile gfm bytes 127
+# Tables
+
+| a | b | c |
+| - | - | - |
+| d | e | f |
+
+## No body
+
+| a | b | c |
+| - | - | - |
+
+## One column
+
+| a |
+| - |
+| b |
+
+--- end
+--- case 53 profile gfm bytes 469
+# Tables in things
+
+## In lists
+
+*   Unordered:
+
+    | A | B |
+    | - | - |
+    | 1 | 2 |
+
+1.  Ordered:
+
+    | A | B |
+    | - | - |
+    | 1 | 2 |
+
+*   Lazy?
+    | A | B |
+    | - | - |
+   | 1 | 2 |
+  | 3 | 4 |
+ | 5 | 6 |
+| 7 | 8 |
+
+## In block quotes
+
+> W/ space:
+> | A | B |
+> | - | - |
+> | 1 | 2 |
+
+>W/o space:
+>| A | B |
+>| - | - |
+>| 1 | 2 |
+
+> Lazy?
+> | A | B |
+> | - | - |
+> | 1 | 2 |
+>| 3 | 4 |
+| 5 | 6 |
+
+### List interrupting delimiters
+
+a |
+- |
+
+a
+-|
+
+a
+|-
+
+--- end
+--- case 54 profile gfm bytes 24
+| a |
+| - |
+| - |
+| 1 |
+
+--- end
+--- case 55 profile gfm bytes 429
+# Examples from GFM
+
+## A
+
+| foo | bar |
+| --- | --- |
+| baz | bim |
+
+## B
+
+| abc | defghi |
+:-: | -----------:
+bar | baz
+
+## C
+
+| f\|oo  |
+| ------ |
+| b `\|` az |
+| b **\|** im |
+
+## D
+
+| abc | def |
+| --- | --- |
+| bar | baz |
+> bar
+
+## E
+
+| abc | def |
+| --- | --- |
+| bar | baz |
+bar
+
+bar
+
+## F
+
+| abc | def |
+| --- |
+| bar |
+
+## G
+
+| abc | def |
+| --- | --- |
+| bar |
+| bar | baz | boo |
+
+## H
+
+| abc | def |
+| --- | --- |
+
+--- end
+--- case 56 profile gfm bytes 431
+# Grave accents
+
+## Grave accent in cell
+
+| A            | B |
+|--------------|---|
+| <kbd>`</kbd> | C |
+
+## Escaped grave accent in “inline code” in cell
+
+| A   |
+|-----|
+| `\` |
+
+## “Empty” inline code
+
+| 1 | 2    | 3  |
+|---|------|----|
+| a |   `` |    |
+| b |   `` | `` |
+| c |    ` | `  |
+| d |     `|`   |
+| e | `\|` |    |
+| f |   \| |    |
+
+## Escaped pipes in code in cells
+
+| `\|\\` |
+| --- |
+| `\|\\` |
+
+`\|\\`
+
+--- end
+--- case 57 profile gfm bytes 112
+# Code
+
+## Indented delimiter row
+
+a
+   |-
+
+a
+    |-
+
+## Indented body
+
+| a |
+ | - |
+  | C |
+   | D |
+    | E |
+
+--- end
+--- case 58 profile gfm bytes 849
+## Blank line
+
+a
+:-
+b
+
+c
+
+## Block quote
+
+a
+:-
+b
+> c
+
+## Code (fenced)
+
+a
+:-
+b
+```
+c
+```
+
+## Code (indented)
+
+a
+:-
+b
+    c
+
+## Definition
+
+a
+:-
+b
+[c]: d
+
+## Heading (atx)
+
+a
+:-
+b
+# c
+
+
+## Heading (setext) (rank 1)
+
+a
+:-
+b
+==
+c
+
+## Heading (setext) (rank 2)
+
+a
+:-
+b
+--
+c
+
+## HTML (flow, kind 1: raw)
+
+a
+:-
+b
+<pre>
+  a
+</pre>
+
+## HTML (flow, kind 2: comment)
+
+a
+:-
+b
+<!-- c -->
+
+## HTML (flow, kind 3: instruction)
+
+a
+:-
+b
+<? c ?>
+
+## HTML (flow, kind 4: declaration)
+
+a
+:-
+b
+<!C>
+
+## HTML (flow, kind 5: cdata)
+
+a
+:-
+b
+<![CDATA[c]]>
+
+## HTML (flow, kind 6: basic)
+
+a
+:-
+b
+<div>
+
+## HTML (flow, kind 7: complete)
+
+a
+:-
+b
+<x>
+
+## List (ordered, 1)
+
+a
+:-
+b
+1. c
+
+## List (ordered, other)
+
+a
+:-
+b
+2. c
+
+## List (unordered)
+
+a
+:-
+b
+* c
+
+## List (unordered, blank)
+
+a
+:-
+b
+*
+c
+
+## List (unordered, blank start)
+
+a
+:-
+b
+*
+  c
+
+## Thematic break
+
+a
+:-
+b
+***
+
+--- end
+--- case 59 profile gfm bytes 164
+# Loose
+
+## Loose
+
+Header 1 | Header 2
+-------- | --------
+Cell 1   | Cell 2
+Cell 3   | Cell 4
+
+## One “column”, loose
+
+a
+-
+b
+
+## No pipe in first row
+
+a
+| - |
+
+--- end
+--- case 60 profile gfm bytes 290
+# Some more escapes
+
+| Head          |
+| ------------- |
+| A | Alpha     |
+| B \| Bravo    |
+| C \\| Charlie |
+| D \\\| Delta  |
+| E \\\\| Echo  |
+
+Note: GH has a bug where in case C and E, the escaped escape is treated as a
+normal escape: <https://github.com/github/cmark-gfm/issues/277>.
+
+--- end
+--- case 61 profile gfm bytes 82
+| none | left | right | center |
+| - | :- | -: | :-: |
+| a |
+| b | c | d | e | f |
+--- end
+--- case 62 profile gfm bytes 16
+| `a\|b` |
+| - |
+--- end

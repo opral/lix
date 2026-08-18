@@ -9,10 +9,41 @@ import {
 	changelogEntry,
 	loadChanges,
 	updateCargoToml,
+	updateCargoLockfiles,
 	updateChangelog,
 	updatePackageVersion,
 	validateCargoLockstepVersions,
 } from "./release.mjs";
+
+test("updateCargoLockfiles refreshes the root and tooling workspaces", () => {
+	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
+	mkdirSync(join(root, "tooling"));
+	writeFileSync(join(root, "Cargo.toml"), "[workspace]\n");
+	writeFileSync(join(root, "tooling", "Cargo.toml"), "[workspace]\n");
+	const calls = [];
+
+	updateCargoLockfiles(root, {
+		runCargo(command, args, options) {
+			calls.push({ command, args, options });
+		},
+	});
+
+	assert.deepEqual(
+		calls.map(({ command, args, options }) => ({ command, args, cwd: options.cwd })),
+		[
+			{
+				command: "cargo",
+				args: ["update", "--workspace", "--manifest-path", "Cargo.toml"],
+				cwd: root,
+			},
+			{
+				command: "cargo",
+				args: ["update", "--workspace", "--manifest-path", "tooling/Cargo.toml"],
+				cwd: root,
+			},
+		],
+	);
+});
 
 test("bumpVersion applies semver changes", () => {
 	assert.equal(bumpVersion("0.6.0", "patch"), "0.6.1");

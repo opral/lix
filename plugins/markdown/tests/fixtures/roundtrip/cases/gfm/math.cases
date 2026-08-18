@@ -1,0 +1,152 @@
+# markdown-syntax semantic input cases v2
+origin: gfm
+commit: d2da7a0
+source: upstream-tests/math.rs
+role: upstream-input
+count: 42
+profiles: math
+
+--- case 1 profile math bytes 5
+$2+2$
+--- end
+--- case 2 profile math bytes 15
+$\alpha$$\beta$
+--- end
+--- case 3 profile math bytes 10
+$2+2$$2+2$
+--- end
+--- case 4 profile math bytes 13
+$22 and $2+2$
+--- end
+--- case 5 profile math bytes 4
+$a!$
+--- end
+--- case 6 profile math bytes 3
+$x$
+--- end
+--- case 7 profile math bytes 7
+$1+2\$$
+--- end
+--- case 8 profile math bytes 7
+$1+\$2$
+--- end
+--- case 9 profile math bytes 7
+$1+\%2$
+--- end
+--- case 10 profile math bytes 21
+$22+1$ and $22 + a^2$
+--- end
+--- case 11 profile math bytes 30
+$2+2$ $22 and dollars$22 $2+2$
+--- end
+--- case 12 profile math bytes 29
+$1/2$ &lt;b&gt;test&lt;/b&gt;
+--- end
+--- case 13 profile math bytes 7
+$$2+2$$
+--- end
+--- case 14 profile math bytes 12
+$$   2+2  $$
+--- end
+--- case 15 profile math bytes 15
+$22 and $$2+2$$
+--- end
+--- case 16 profile math bytes 6
+$$a!$$
+--- end
+--- case 17 profile math bytes 5
+$$x$$
+--- end
+--- case 18 profile math bytes 21
+$$20,000 and $$30,000
+--- end
+--- case 19 profile math bytes 14
+test $$
+2+2
+$$
+--- end
+--- case 20 profile math bytes 25
+$$22+1$$ and $$22 + a^2$$
+--- end
+--- case 21 profile math bytes 34
+$$2+2$$ $22 and dollars$22 $$2+2$$
+--- end
+--- case 22 profile math bytes 34
+dollars$22 and $$a^2 + b^2 = c^2$$
+--- end
+--- case 23 profile math bytes 13
+$$
+2+2
+4+4
+$$
+--- end
+--- case 24 profile math bytes 7
+$`2+2`$
+--- end
+--- case 25 profile math bytes 15
+$22 and $`2+2`$
+--- end
+--- case 26 profile math bytes 9
+$`1+\$2`$
+--- end
+--- case 27 profile math bytes 25
+$`22+1`$ and $`22 + a^2`$
+--- end
+--- case 28 profile math bytes 34
+$`2+2`$ $22 and dollars$22 $`2+2`$
+--- end
+--- case 29 profile math bytes 19
+```math
+2+2
+4+4
+```
+--- end
+--- case 30 profile math bytes 5
+`2+2`
+--- end
+--- case 31 profile math bytes 16
+test `2+2`$ test
+--- end
+--- case 32 profile math bytes 19
+$20,000 and $30,000
+--- end
+--- case 33 profile math bytes 15
+$20,000 in $USD
+--- end
+--- case 34 profile math bytes 7
+$ a^2 $
+--- end
+--- case 35 profile math bytes 3
+$
+$
+--- end
+--- case 36 profile math bytes 3
+$$$
+--- end
+--- case 37 profile math bytes 7
+`$1+2$`
+--- end
+--- case 38 profile math bytes 9
+`$$1+2$$`
+--- end
+--- case 39 profile math bytes 10
+`$\$1+2$$`
+--- end
+--- case 40 profile math bytes 16
+test $`2+2` test
+--- end
+--- case 41 profile math bytes 3
+$`$
+--- end
+--- case 42 profile math bytes 58
+$x^2$ and $$y^2$$ and $`z^2`$
+
+$$
+a^2
+$$
+
+```math
+b^2
+```
+
+--- end

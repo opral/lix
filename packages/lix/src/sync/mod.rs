@@ -7315,8 +7315,8 @@ where
         JsonSlot::None => return Ok(None),
         JsonSlot::Inline(json) => json.as_bytes().to_vec(),
         JsonSlot::Ref(json_ref) => JsonStoreContext::new()
+            .reader(store)
             .load_bytes_many(
-                store,
                 JsonLoadRequestRef {
                     refs: std::slice::from_ref(json_ref),
                     scope: JsonReadScopeRef::OutOfBand,

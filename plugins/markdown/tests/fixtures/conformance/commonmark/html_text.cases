@@ -1,0 +1,500 @@
+# markdown-syntax AST->HTML conformance suite v1
+source: html_text
+count: 68
+
+--- case 1 options - label-bytes 39 input-bytes 7 expected-bytes 20
+should encode dangerous html by default
+--- input
+a <b> c
+--- expected
+<p>a &lt;b&gt; c</p>
+--- end
+--- case 2 options allow_dangerous_html,allow_dangerous_protocol label-bytes 27 input-bytes 13 expected-bytes 20
+should support opening tags
+--- input
+<a><bab><c2c>
+--- expected
+<p><a><bab><c2c></p>
+--- end
+--- case 3 options allow_dangerous_html,allow_dangerous_protocol label-bytes 32 input-bytes 9 expected-bytes 16
+should support self-closing tags
+--- input
+<a/><b2/>
+--- expected
+<p><a/><b2/></p>
+--- end
+--- case 4 options allow_dangerous_html,allow_dangerous_protocol label-bytes 33 input-bytes 22 expected-bytes 29
+should support whitespace in tags
+--- input
+<a  /><b2
+data="foo" >
+--- expected
+<p><a  /><b2
+data="foo" ></p>
+--- end
+--- case 5 options allow_dangerous_html,allow_dangerous_protocol label-bytes 33 input-bytes 63 expected-bytes 70
+should support attributes on tags
+--- input
+<a foo="bar" bam = 'baz <em>"</em>'
+_boolean zoop:33=zoop:33 />
+--- expected
+<p><a foo="bar" bam = 'baz <em>"</em>'
+_boolean zoop:33=zoop:33 /></p>
+--- end
+--- case 6 options allow_dangerous_html,allow_dangerous_protocol label-bytes 28 input-bytes 38 expected-bytes 45
+should support non-html tags
+--- input
+Foo <responsive-image src="foo.jpg" />
+--- expected
+<p>Foo <responsive-image src="foo.jpg" /></p>
+--- end
+--- case 7 options allow_dangerous_html,allow_dangerous_protocol label-bytes 42 input-bytes 9 expected-bytes 28
+should not support nonconforming tag names
+--- input
+<33> <__>
+--- expected
+<p>&lt;33&gt; &lt;__&gt;</p>
+--- end
+--- case 8 options allow_dangerous_html,allow_dangerous_protocol label-bytes 48 input-bytes 15 expected-bytes 38
+should not support nonconforming attribute names
+--- input
+<a h*#ref="hi">
+--- expected
+<p>&lt;a h*#ref=&quot;hi&quot;&gt;</p>
+--- end
+--- case 9 options allow_dangerous_html,allow_dangerous_protocol label-bytes 49 input-bytes 26 expected-bytes 50
+should not support nonconforming attribute values
+--- input
+<a href="hi'> <a href=hi'>
+--- expected
+<p>&lt;a href=&quot;hi'&gt; &lt;a href=hi'&gt;</p>
+--- end
+--- case 10 options allow_dangerous_html,allow_dangerous_protocol label-bytes 43 input-bytes 41 expected-bytes 72
+should not support nonconforming whitespace
+--- input
+< a><
+foo><bar/ >
+<foo bar=baz
+bim!bop />
+--- expected
+<p>&lt; a&gt;&lt;
+foo&gt;&lt;bar/ &gt;
+&lt;foo bar=baz
+bim!bop /&gt;</p>
+--- end
+--- case 11 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 25 expected-bytes 38
+should not support missing whitespace
+--- input
+<a href='bar'title=title>
+--- expected
+<p>&lt;a href='bar'title=title&gt;</p>
+--- end
+--- case 12 options allow_dangerous_html,allow_dangerous_protocol label-bytes 27 input-bytes 11 expected-bytes 18
+should support closing tags
+--- input
+</a></foo >
+--- expected
+<p></a></foo ></p>
+--- end
+--- case 13 options allow_dangerous_html,allow_dangerous_protocol label-bytes 45 input-bytes 15 expected-bytes 38
+should not support closing tags w/ attributes
+--- input
+</a href="foo">
+--- expected
+<p>&lt;/a href=&quot;foo&quot;&gt;</p>
+--- end
+--- case 14 options allow_dangerous_html,allow_dangerous_protocol label-bytes 23 input-bytes 44 expected-bytes 51
+should support comments
+--- input
+foo <!-- this is a
+comment - with hyphen -->
+--- expected
+<p>foo <!-- this is a
+comment - with hyphen --></p>
+--- end
+--- case 15 options allow_dangerous_html,allow_dangerous_protocol label-bytes 44 input-bytes 41 expected-bytes 48
+should support comments w/ two dashes inside
+--- input
+foo <!-- not a comment -- two hyphens -->
+--- expected
+<p>foo <!-- not a comment -- two hyphens --></p>
+--- end
+--- case 16 options allow_dangerous_html,allow_dangerous_protocol label-bytes 41 input-bytes 17 expected-bytes 27
+should support nonconforming comments (1)
+--- input
+foo <!--> foo -->
+--- expected
+<p>foo <!--> foo --&gt;</p>
+--- end
+--- case 17 options allow_dangerous_html,allow_dangerous_protocol label-bytes 41 input-bytes 16 expected-bytes 23
+should support nonconforming comments (2)
+--- input
+foo <!-- foo--->
+--- expected
+<p>foo <!-- foo---></p>
+--- end
+--- case 18 options allow_dangerous_html,allow_dangerous_protocol label-bytes 27 input-bytes 21 expected-bytes 28
+should support instructions
+--- input
+foo <?php echo $a; ?>
+--- expected
+<p>foo <?php echo $a; ?></p>
+--- end
+--- case 19 options allow_dangerous_html,allow_dangerous_protocol label-bytes 27 input-bytes 23 expected-bytes 30
+should support declarations
+--- input
+foo <!ELEMENT br EMPTY>
+--- expected
+<p>foo <!ELEMENT br EMPTY></p>
+--- end
+--- case 20 options allow_dangerous_html,allow_dangerous_protocol label-bytes 20 input-bytes 19 expected-bytes 26
+should support cdata
+--- input
+foo <![CDATA[>&<]]>
+--- expected
+<p>foo <![CDATA[>&<]]></p>
+--- end
+--- case 21 options allow_dangerous_html,allow_dangerous_protocol label-bytes 44 input-bytes 21 expected-bytes 28
+should support (ignore) character references
+--- input
+foo <a href="&ouml;">
+--- expected
+<p>foo <a href="&ouml;"></p>
+--- end
+--- case 22 options allow_dangerous_html,allow_dangerous_protocol label-bytes 40 input-bytes 17 expected-bytes 24
+should not support character escapes (1)
+--- input
+foo <a href="\*">
+--- expected
+<p>foo <a href="\*"></p>
+--- end
+--- case 23 options allow_dangerous_html,allow_dangerous_protocol label-bytes 40 input-bytes 13 expected-bytes 40
+should not support character escapes (2)
+--- input
+<a href="\"">
+--- expected
+<p>&lt;a href=&quot;&quot;&quot;&gt;</p>
+--- end
+--- case 24 options allow_dangerous_html,allow_dangerous_protocol label-bytes 68 input-bytes 8 expected-bytes 21
+should not support non-comment, non-cdata, and non-named declaration
+--- input
+foo <!1>
+--- expected
+<p>foo &lt;!1&gt;</p>
+--- end
+--- case 25 options allow_dangerous_html,allow_dangerous_protocol label-bytes 48 input-bytes 21 expected-bytes 34
+should not support comments w/ not enough dashes
+--- input
+foo <!-not enough!-->
+--- expected
+<p>foo &lt;!-not enough!--&gt;</p>
+--- end
+--- case 26 options allow_dangerous_html,allow_dangerous_protocol label-bytes 86 input-bytes 14 expected-bytes 21
+should support comments that start w/ a dash, if it’s not followed by a greater than
+--- input
+foo <!---ok-->
+--- expected
+<p>foo <!---ok--></p>
+--- end
+--- case 27 options allow_dangerous_html,allow_dangerous_protocol label-bytes 42 input-bytes 10 expected-bytes 17
+should support comments that start w/ `->`
+--- input
+foo <!--->
+--- expected
+<p>foo <!---></p>
+--- end
+--- case 28 options allow_dangerous_html,allow_dangerous_protocol label-bytes 32 input-bytes 15 expected-bytes 22
+should support `->` in a comment
+--- input
+foo <!-- -> -->
+--- expected
+<p>foo <!-- -> --></p>
+--- end
+--- case 29 options allow_dangerous_html,allow_dangerous_protocol label-bytes 39 input-bytes 8 expected-bytes 18
+should not support eof in a comment (1)
+--- input
+foo <!--
+--- expected
+<p>foo &lt;!--</p>
+--- end
+--- case 30 options allow_dangerous_html,allow_dangerous_protocol label-bytes 39 input-bytes 9 expected-bytes 19
+should not support eof in a comment (2)
+--- input
+foo <!--a
+--- expected
+<p>foo &lt;!--a</p>
+--- end
+--- case 31 options allow_dangerous_html,allow_dangerous_protocol label-bytes 39 input-bytes 10 expected-bytes 20
+should not support eof in a comment (3)
+--- input
+foo <!--a-
+--- expected
+<p>foo &lt;!--a-</p>
+--- end
+--- case 32 options allow_dangerous_html,allow_dangerous_protocol label-bytes 39 input-bytes 11 expected-bytes 21
+should not support eof in a comment (4)
+--- input
+foo <!--a--
+--- expected
+<p>foo &lt;!--a--</p>
+--- end
+--- case 33 options allow_dangerous_html,allow_dangerous_protocol label-bytes 40 input-bytes 16 expected-bytes 29
+should not support lowercase “cdata”
+--- input
+foo <![cdata[]]>
+--- expected
+<p>foo &lt;![cdata[]]&gt;</p>
+--- end
+--- case 34 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 12 expected-bytes 22
+should not support eof in a CDATA (1)
+--- input
+foo <![CDATA
+--- expected
+<p>foo &lt;![CDATA</p>
+--- end
+--- case 35 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 13 expected-bytes 23
+should not support eof in a CDATA (2)
+--- input
+foo <![CDATA[
+--- expected
+<p>foo &lt;![CDATA[</p>
+--- end
+--- case 36 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 14 expected-bytes 24
+should not support eof in a CDATA (3)
+--- input
+foo <![CDATA[]
+--- expected
+<p>foo &lt;![CDATA[]</p>
+--- end
+--- case 37 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 15 expected-bytes 25
+should not support eof in a CDATA (4)
+--- input
+foo <![CDATA[]]
+--- expected
+<p>foo &lt;![CDATA[]]</p>
+--- end
+--- case 38 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 16 expected-bytes 26
+should not support eof in a CDATA (5)
+--- input
+foo <![CDATA[asd
+--- expected
+<p>foo &lt;![CDATA[asd</p>
+--- end
+--- case 39 options allow_dangerous_html,allow_dangerous_protocol label-bytes 43 input-bytes 18 expected-bytes 25
+should support end-like constructs in CDATA
+--- input
+foo <![CDATA[]]]]>
+--- expected
+<p>foo <![CDATA[]]]]></p>
+--- end
+--- case 40 options allow_dangerous_html,allow_dangerous_protocol label-bytes 38 input-bytes 13 expected-bytes 23
+should not support eof in declarations
+--- input
+foo <!doctype
+--- expected
+<p>foo &lt;!doctype</p>
+--- end
+--- case 41 options allow_dangerous_html,allow_dangerous_protocol label-bytes 42 input-bytes 9 expected-bytes 19
+should not support eof in instructions (1)
+--- input
+foo <?php
+--- expected
+<p>foo &lt;?php</p>
+--- end
+--- case 42 options allow_dangerous_html,allow_dangerous_protocol label-bytes 42 input-bytes 10 expected-bytes 20
+should not support eof in instructions (2)
+--- input
+foo <?php?
+--- expected
+<p>foo &lt;?php?</p>
+--- end
+--- case 43 options allow_dangerous_html,allow_dangerous_protocol label-bytes 45 input-bytes 9 expected-bytes 16
+should support question marks in instructions
+--- input
+foo <???>
+--- expected
+<p>foo <???></p>
+--- end
+--- case 44 options allow_dangerous_html,allow_dangerous_protocol label-bytes 60 input-bytes 8 expected-bytes 21
+should not support closing tags that don’t start w/ alphas
+--- input
+foo </3>
+--- expected
+<p>foo &lt;/3&gt;</p>
+--- end
+--- case 45 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 9 expected-bytes 16
+should support dashes in closing tags
+--- input
+foo </a->
+--- expected
+<p>foo </a-></p>
+--- end
+--- case 46 options allow_dangerous_html,allow_dangerous_protocol label-bytes 49 input-bytes 11 expected-bytes 18
+should support whitespace after closing tag names
+--- input
+foo </a   >
+--- expected
+<p>foo </a   ></p>
+--- end
+--- case 47 options allow_dangerous_html,allow_dangerous_protocol label-bytes 59 input-bytes 9 expected-bytes 22
+should not support other characters after closing tag names
+--- input
+foo </a!>
+--- expected
+<p>foo &lt;/a!&gt;</p>
+--- end
+--- case 48 options allow_dangerous_html,allow_dangerous_protocol label-bytes 37 input-bytes 8 expected-bytes 15
+should support dashes in opening tags
+--- input
+foo <a->
+--- expected
+<p>foo <a-></p>
+--- end
+--- case 49 options allow_dangerous_html,allow_dangerous_protocol label-bytes 49 input-bytes 10 expected-bytes 17
+should support whitespace after opening tag names
+--- input
+foo <a   >
+--- expected
+<p>foo <a   ></p>
+--- end
+--- case 50 options allow_dangerous_html,allow_dangerous_protocol label-bytes 59 input-bytes 8 expected-bytes 21
+should not support other characters after opening tag names
+--- input
+foo <a!>
+--- expected
+<p>foo &lt;a!&gt;</p>
+--- end
+--- case 51 options allow_dangerous_html,allow_dangerous_protocol label-bytes 55 input-bytes 9 expected-bytes 22
+should not support other characters in opening tags (1)
+--- input
+foo <a !>
+--- expected
+<p>foo &lt;a !&gt;</p>
+--- end
+--- case 52 options allow_dangerous_html,allow_dangerous_protocol label-bytes 55 input-bytes 10 expected-bytes 23
+should not support other characters in opening tags (2)
+--- input
+foo <a b!>
+--- expected
+<p>foo &lt;a b!&gt;</p>
+--- end
+--- case 53 options allow_dangerous_html,allow_dangerous_protocol label-bytes 59 input-bytes 10 expected-bytes 17
+should support a self-closing slash after an attribute name
+--- input
+foo <a b/>
+--- expected
+<p>foo <a b/></p>
+--- end
+--- case 54 options allow_dangerous_html,allow_dangerous_protocol label-bytes 53 input-bytes 9 expected-bytes 16
+should support a greater than after an attribute name
+--- input
+foo <a b>
+--- expected
+<p>foo <a b></p>
+--- end
+--- case 55 options allow_dangerous_html,allow_dangerous_protocol label-bytes 65 input-bytes 11 expected-bytes 27
+should not support less than to start an unquoted attribute value
+--- input
+foo <a b=<>
+--- expected
+<p>foo &lt;a b=&lt;&gt;</p>
+--- end
+--- case 56 options allow_dangerous_html,allow_dangerous_protocol label-bytes 68 input-bytes 11 expected-bytes 27
+should not support greater than to start an unquoted attribute value
+--- input
+foo <a b=>>
+--- expected
+<p>foo &lt;a b=&gt;&gt;</p>
+--- end
+--- case 57 options allow_dangerous_html,allow_dangerous_protocol label-bytes 65 input-bytes 11 expected-bytes 24
+should not support equals to to start an unquoted attribute value
+--- input
+foo <a b==>
+--- expected
+<p>foo &lt;a b==&gt;</p>
+--- end
+--- case 58 options allow_dangerous_html,allow_dangerous_protocol label-bytes 68 input-bytes 11 expected-bytes 24
+should not support grave accent to start an unquoted attribute value
+--- input
+foo <a b=`>
+--- expected
+<p>foo &lt;a b=`&gt;</p>
+--- end
+--- case 59 options allow_dangerous_html,allow_dangerous_protocol label-bytes 55 input-bytes 13 expected-bytes 28
+should not support eof in double quoted attribute value
+--- input
+foo <a b="asd
+--- expected
+<p>foo &lt;a b=&quot;asd</p>
+--- end
+--- case 60 options allow_dangerous_html,allow_dangerous_protocol label-bytes 55 input-bytes 13 expected-bytes 23
+should not support eof in single quoted attribute value
+--- input
+foo <a b='asd
+--- expected
+<p>foo &lt;a b='asd</p>
+--- end
+--- case 61 options allow_dangerous_html,allow_dangerous_protocol label-bytes 50 input-bytes 12 expected-bytes 22
+should not support eof in unquoted attribute value
+--- input
+foo <a b=asd
+--- expected
+<p>foo &lt;a b=asd</p>
+--- end
+--- case 62 options allow_dangerous_html,allow_dangerous_protocol label-bytes 47 input-bytes 14 expected-bytes 21
+should support an eol before an attribute value
+--- input
+foo <a b=
+asd>
+--- expected
+<p>foo <a b=
+asd></p>
+--- end
+--- case 63 options allow_dangerous_html,allow_dangerous_protocol label-bytes 109 input-bytes 5 expected-bytes 12
+should support starting a line w/ a tag if followed by anything other than an eol (after optional space/tabs)
+--- input
+<x> a
+--- expected
+<p><x> a</p>
+--- end
+--- case 64 options allow_dangerous_html,allow_dangerous_protocol label-bytes 47 input-bytes 10 expected-bytes 20
+should support an EOF before an attribute value
+--- input
+<span foo=
+--- expected
+<p>&lt;span foo=</p>
+--- end
+--- case 65 options allow_dangerous_html,allow_dangerous_protocol label-bytes 38 input-bytes 8 expected-bytes 15
+should support an EOL in a declaration
+--- input
+a <!b
+c>
+--- expected
+<p>a <!b
+c></p>
+--- end
+--- case 66 options allow_dangerous_html,allow_dangerous_protocol label-bytes 30 input-bytes 15 expected-bytes 22
+should support an EOL in cdata
+--- input
+a <![CDATA[
+]]>
+--- expected
+<p>a <![CDATA[
+]]></p>
+--- end
+--- case 67 options allow_dangerous_html,allow_dangerous_protocol label-bytes 39 input-bytes 7 expected-bytes 14
+should support an EOL in an instruction
+--- input
+a <?
+?>
+--- expected
+<p>a <?
+?></p>
+--- end
+--- case 68 options - label-bytes 38 input-bytes 5 expected-bytes 18
+should support turning off html (text)
+--- input
+a <x>
+--- expected
+<p>a &lt;x&gt;</p>
+--- end

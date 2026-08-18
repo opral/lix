@@ -1,0 +1,424 @@
+# markdown-syntax semantic input cases v2
+origin: commonmark
+commit: 1506572
+source: upstream-tests/mdx_jsx_text.rs
+role: upstream-input
+count: 133
+profiles: mdx
+
+--- case 1 profile mdx bytes 7
+a <b> c
+--- end
+--- case 2 profile mdx bytes 9
+a <b/> c.
+--- end
+--- case 3 profile mdx bytes 12
+a <b></b> c.
+--- end
+--- case 4 profile mdx bytes 10
+a <></> c.
+--- end
+--- case 5 profile mdx bytes 15
+a <b>*b*</b> c.
+--- end
+--- case 6 profile mdx bytes 7
+{1}<a/>
+--- end
+--- case 7 profile mdx bytes 10
+<a>{1}</a>
+--- end
+--- case 8 profile mdx bytes 10
+a <b /> c.
+--- end
+--- case 9 profile mdx bytes 15
+a <b>*c*</b> d.
+--- end
+--- case 10 profile mdx bytes 8
+<a:b />.
+--- end
+--- case 11 profile mdx bytes 10
+<a.b.c />.
+--- end
+--- case 12 profile mdx bytes 13
+<a {...b} />.
+--- end
+--- case 13 profile mdx bytes 12
+<a b c:d />.
+--- end
+--- case 14 profile mdx bytes 24
+<a b='c' d="e" f={g} />.
+--- end
+--- case 15 profile mdx bytes 120
+<a b='&nbsp; &amp; &copy; &AElig; &Dcaron; &frac34; &HilbertSpace; &DifferentialD; &ClockwiseContourIntegral; &ngE;' />.
+--- end
+--- case 16 profile mdx bytes 63
+<a b='&#35; &#1234; &#992; &#0;' c='&#X22; &#XD06; &#xcab;' />.
+--- end
+--- case 17 profile mdx bytes 78
+<a b='&nbsp &x; &#; &#x; &#987654321; &#abcdef0; &ThisIsNotDefined; &hi?;' />.
+--- end
+--- case 18 profile mdx bytes 22
+<a　b 　c　 d　/>.
+--- end
+--- case 19 profile mdx bytes 14
+<a
+b 
+c
+ d
+/>.
+--- end
+--- case 20 profile mdx bytes 8
+a </b> c
+--- end
+--- case 21 profile mdx bytes 15
+a <b> c </b/> d
+--- end
+--- case 22 profile mdx bytes 16
+a <b> c </b d> e
+--- end
+--- case 23 profile mdx bytes 11
+a <>b</c> d
+--- end
+--- case 24 profile mdx bytes 11
+a <b>c</> d
+--- end
+--- case 25 profile mdx bytes 15
+*a <b>c* d</b>.
+--- end
+--- case 26 profile mdx bytes 15
+<a>b *c</a> d*.
+--- end
+--- case 27 profile mdx bytes 6
+a <b>.
+--- end
+--- case 28 profile mdx bytes 3
+<a>
+--- end
+--- case 29 profile mdx bytes 10
+<a><b></b>
+--- end
+--- case 30 profile mdx bytes 9
+a <b /> c
+--- end
+--- case 31 profile mdx bytes 14
+a <b> c </b> d
+--- end
+--- case 32 profile mdx bytes 17
+a <b {1 + 1} /> c
+--- end
+--- case 33 profile mdx bytes 19
+a <b c={1 + 1} /> d
+--- end
+--- case 34 profile mdx bytes 16
+a <b {...c} /> d
+--- end
+--- case 35 profile mdx bytes 44
+a <b {...{c: 1, d: Infinity, e: false}} /> f
+--- end
+--- case 36 profile mdx bytes 35
+a <b {...[1, Infinity, false]} /> d
+--- end
+--- case 37 profile mdx bytes 14
+a <b c={} /> d
+--- end
+--- case 38 profile mdx bytes 15
+a <b c={?} /> d
+--- end
+--- case 39 profile mdx bytes 13
+a <b {?} /> c
+--- end
+--- case 40 profile mdx bytes 16
+a <b{c=d}={}/> f
+--- end
+--- case 41 profile mdx bytes 27
+a <b c={(2)} d={<e />} /> f
+--- end
+--- case 42 profile mdx bytes 6
+a <> c
+--- end
+--- case 43 profile mdx bytes 10
+a < 	>b</>
+--- end
+--- case 44 profile mdx bytes 13
+a < 
+b	>b</b>
+--- end
+--- case 45 profile mdx bytes 7
+a <!> b
+--- end
+--- case 46 profile mdx bytes 9
+a </(> b.
+--- end
+--- case 47 profile mdx bytes 11
+a <π /> b.
+--- end
+--- case 48 profile mdx bytes 11
+a <© /> b.
+--- end
+--- case 49 profile mdx bytes 10
+a <!--b-->
+--- end
+--- case 50 profile mdx bytes 11
+a <// b
+c/>
+--- end
+--- case 51 profile mdx bytes 12
+a <b// c
+d/>
+--- end
+--- case 52 profile mdx bytes 10
+a </*b*/c>
+--- end
+--- case 53 profile mdx bytes 10
+a <b/*c*/>
+--- end
+--- case 54 profile mdx bytes 14
+a <a‌b /> b.
+--- end
+--- case 55 profile mdx bytes 12
+a <a¬ /> b.
+--- end
+--- case 56 profile mdx bytes 9
+a <b@c.d>
+--- end
+--- case 57 profile mdx bytes 15
+a <a-->b</a-->.
+--- end
+--- case 58 profile mdx bytes 9
+a <a?> c.
+--- end
+--- case 59 profile mdx bytes 35
+a <abc . def.ghi>b</abc.def . ghi>.
+--- end
+--- case 60 profile mdx bytes 11
+a <b.c@d.e>
+--- end
+--- case 61 profile mdx bytes 29
+a <svg: rect>b</  svg :rect>.
+--- end
+--- case 62 profile mdx bytes 10
+a <a:+> c.
+--- end
+--- case 63 profile mdx bytes 22
+a <http://example.com>
+--- end
+--- case 64 profile mdx bytes 10
+a <http: >
+--- end
+--- case 65 profile mdx bytes 11
+a <a:b|> c.
+--- end
+--- case 66 profile mdx bytes 10
+a <a..> c.
+--- end
+--- case 67 profile mdx bytes 11
+a <a.b,> c.
+--- end
+--- case 68 profile mdx bytes 12
+a <a:b .> c.
+--- end
+--- case 69 profile mdx bytes 12
+a <a.b :> c.
+--- end
+--- case 70 profile mdx bytes 10
+a <a => c.
+--- end
+--- case 71 profile mdx bytes 32
+a <b {...props} {...rest}>c</b>.
+--- end
+--- case 72 profile mdx bytes 27
+a <b {...{"a": "b"}}>c</b>.
+--- end
+--- case 73 profile mdx bytes 11
+<a{...b}/>.
+--- end
+--- case 74 profile mdx bytes 13
+<a.b{...c}/>.
+--- end
+--- case 75 profile mdx bytes 13
+<a:b{...c}/>.
+--- end
+--- case 76 profile mdx bytes 15
+a <b c{...d}/>.
+--- end
+--- case 77 profile mdx bytes 17
+a <b c:d{...e}/>.
+--- end
+--- case 78 profile mdx bytes 26
+a <b a {...props} b>c</b>.
+--- end
+--- case 79 profile mdx bytes 32
+a <b c     d="d"		efg="e">c</b>.
+--- end
+--- case 80 profile mdx bytes 19
+a <b {...p}~>c</b>.
+--- end
+--- case 81 profile mdx bytes 9
+a <b {...
+--- end
+--- case 82 profile mdx bytes 11
+a <a b@> c.
+--- end
+--- case 83 profile mdx bytes 40
+a <b xml :	lang
+= "de-CH" foo:bar>c</b>.
+--- end
+--- case 84 profile mdx bytes 29
+a <b a b : c d : e = "f" g/>.
+--- end
+--- case 85 profile mdx bytes 12
+a <a b 1> c.
+--- end
+--- case 86 profile mdx bytes 12
+a <a b:#> c.
+--- end
+--- case 87 profile mdx bytes 13
+a <a b:c%> c.
+--- end
+--- case 88 profile mdx bytes 14
+a <a b:c ^> c.
+--- end
+--- case 89 profile mdx bytes 21
+a <b c={1 + 1}>c</b>.
+--- end
+--- case 90 profile mdx bytes 30
+a <b c={1 + ({a: 1}).a}>c</b>.
+--- end
+--- case 91 profile mdx bytes 13
+a <a b=``> c.
+--- end
+--- case 92 profile mdx bytes 16
+a <a b=<c />> d.
+--- end
+--- case 93 profile mdx bytes 12
+a <a b="> c.
+--- end
+--- case 94 profile mdx bytes 12
+a <a b={> c.
+--- end
+--- case 95 profile mdx bytes 14
+a <a b=""*> c.
+--- end
+--- case 96 profile mdx bytes 11
+<a b=""c/>.
+--- end
+--- case 97 profile mdx bytes 12
+<a{...b}c/>.
+--- end
+--- case 98 profile mdx bytes 10
+a <a/b> c.
+--- end
+--- case 99 profile mdx bytes 7
+<a/ 	>.
+--- end
+--- case 100 profile mdx bytes 6
+a > c.
+--- end
+--- case 101 profile mdx bytes 13
+a <>`<`</> c.
+--- end
+--- case 102 profile mdx bytes 16
+a <>`` ``` ``</>
+--- end
+--- case 103 profile mdx bytes 8
+a </> c.
+--- end
+--- case 104 profile mdx bytes 8
+a <></b>
+--- end
+--- case 105 profile mdx bytes 8
+a <b></>
+--- end
+--- case 106 profile mdx bytes 11
+a <a.b></a>
+--- end
+--- case 107 profile mdx bytes 11
+a <a></a.b>
+--- end
+--- case 108 profile mdx bytes 13
+a <a.b></a.c>
+--- end
+--- case 109 profile mdx bytes 11
+a <a:b></a>
+--- end
+--- case 110 profile mdx bytes 11
+a <a></a:b>
+--- end
+--- case 111 profile mdx bytes 13
+a <a:b></a:c>
+--- end
+--- case 112 profile mdx bytes 13
+a <a:b></a.b>
+--- end
+--- case 113 profile mdx bytes 11
+a <a>b</a/>
+--- end
+--- case 114 profile mdx bytes 12
+a <a>b</a b>
+--- end
+--- case 115 profile mdx bytes 18
+a <>b <>c</> d</>.
+--- end
+--- case 116 profile mdx bytes 161
+<x y="Character references can be used: &quot;, &apos;, &lt;, &gt;, &#x7B;, and &#x7D;, they can be named, decimal, or hexadecimal: &copy; &#8800; &#x1D306;" />.
+--- end
+--- case 117 profile mdx bytes 158
+<x>Character references can be used: &quot;, &apos;, &lt;, &gt;, &#x7B;, and &#x7D;, they can be named, decimal, or hexadecimal: &copy; &#8800; &#x1D306;</x>.
+--- end
+--- case 118 profile mdx bytes 6
+<x />.
+--- end
+--- case 119 profile mdx bytes 7
+a <x />
+--- end
+--- case 120 profile mdx bytes 26
+a *open <b> close* </b> c.
+--- end
+--- case 121 profile mdx bytes 28
+a **open <b> close** </b> c.
+--- end
+--- case 122 profile mdx bytes 29
+a [open <b> close](c) </b> d.
+--- end
+--- case 123 profile mdx bytes 30
+a ![open <b> close](c) </b> d.
+--- end
+--- case 124 profile mdx bytes 19
+> a <b>
+> c </b> d.
+--- end
+--- case 125 profile mdx bytes 19
+> a <b c="d
+e" /> f
+--- end
+--- case 126 profile mdx bytes 19
+> a <b c={d
+e} /> f
+--- end
+--- case 127 profile mdx bytes 17
+> a <b {c
+d} /> e
+--- end
+--- case 128 profile mdx bytes 11
+> a <b
+/> c
+--- end
+--- case 129 profile mdx bytes 17
+> a <b c='
+d'/> e
+--- end
+--- case 130 profile mdx bytes 17
+> a <b c='d
+'/> e
+--- end
+--- case 131 profile mdx bytes 18
+> a <b c='d
+e'/> f
+--- end
+--- case 132 profile mdx bytes 18
+> a <b c={d
+e}/> f
+--- end
+--- case 133 profile mdx bytes 5
+1 < 3
+--- end
