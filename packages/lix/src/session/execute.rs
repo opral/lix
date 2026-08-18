@@ -1177,12 +1177,21 @@ where
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -1235,10 +1244,20 @@ where
                     self.file_views.apply_mutations(file_view_mutations);
                     return Ok(content);
                 }
-                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
-                    continue;
+                Err(error) => {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -1427,12 +1446,22 @@ where
             None
         };
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
+        let reads_already_quiesced = runtime_write_access.is_some();
         let (mut read_result, file_view_mutations, _provider_rows_examined) = loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        reads_already_quiesced,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(normalize_sql_surface_error(error, sql));
@@ -1468,7 +1497,15 @@ where
                 Ok(result) => break result,
                 Err(error) => {
                     let error = normalize_sql_surface_error(error, sql);
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        reads_already_quiesced,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -2163,12 +2200,21 @@ where
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -2247,10 +2293,20 @@ where
                     self.file_views.apply_mutations(file_view_mutations);
                     return Ok(results);
                 }
-                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
-                    continue;
+                Err(error) => {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -2325,22 +2381,28 @@ where
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let acknowledge_file_views = parsed
-            .iter()
-            .zip(statements)
-            .all(|(parsed, (_, params))| {
-                is_acknowledgeable_file_content_read(parsed, params)
-                    || late_materialized_lix_file_content_read(parsed).is_some()
-            });
+        let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, (_, params))| {
+            is_acknowledgeable_file_content_read(parsed, params)
+                || late_materialized_lix_file_content_read(parsed).is_some()
+        });
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -2454,10 +2516,20 @@ where
                     self.file_views.apply_mutations(file_view_mutations);
                     return Ok(batch);
                 }
-                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
-                    continue;
+                Err(error) => {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -5285,6 +5357,26 @@ fn consume_expired_read_retry(retries: &mut usize, error: &LixError) -> bool {
         return false;
     }
     *retries += 1;
+    true
+}
+
+/// A storage such as browser OPFS may preserve coherent reads by expiring a
+/// multi-call snapshot when a commit lands between calls. Retry once on the
+/// optimistic path, then hold the same collaboration gate used by every Lix
+/// writer so a busy sync bootstrap cannot invalidate all bounded retries.
+async fn retry_expired_read_with_write_quiescence(
+    retries: &mut usize,
+    error: &LixError,
+    write_gate: &Arc<tokio::sync::Mutex<()>>,
+    guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    already_quiesced: bool,
+) -> bool {
+    if !consume_expired_read_retry(retries, error) {
+        return false;
+    }
+    if !already_quiesced && guard.is_none() {
+        *guard = Some(Arc::clone(write_gate).lock_owned().await);
+    }
     true
 }
 
