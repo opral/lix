@@ -5,6 +5,72 @@ use serde_json::json;
 
 use super::assert_rows_eq;
 
+simulation_test!(lix_directory_exposes_public_timestamps, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+    let directory_id = "6469722d-7469-8d65-8374-616d70730000";
+
+    session
+        .execute(
+            &format!("INSERT INTO lix_directory (id, path) VALUES ('{directory_id}', '/before')"),
+            &[],
+        )
+        .await
+        .expect("directory insert should succeed");
+    let initial = session
+        .execute(
+            &format!(
+                "SELECT lixcol_created_at, lixcol_updated_at \
+                     FROM lix_directory WHERE id = '{directory_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("directory timestamps should be public");
+    let created_at = initial.rows()[0]
+        .get::<String>("lixcol_created_at")
+        .expect("created timestamp should be text");
+    let updated_at = initial.rows()[0]
+        .get::<String>("lixcol_updated_at")
+        .expect("updated timestamp should be text");
+
+    session
+        .execute(
+            &format!("UPDATE lix_directory SET path = '/after' WHERE id = '{directory_id}'"),
+            &[],
+        )
+        .await
+        .expect("directory rename should succeed");
+    let renamed = session
+        .execute(
+            &format!(
+                "SELECT lixcol_created_at, lixcol_updated_at \
+                     FROM lix_directory WHERE id = '{directory_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("renamed directory timestamps should be public");
+    assert_eq!(
+        renamed.rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created timestamp should be text"),
+        created_at,
+    );
+    assert_ne!(
+        renamed.rows()[0]
+            .get::<String>("lixcol_updated_at")
+            .expect("updated timestamp should be text"),
+        updated_at,
+    );
+});
+
 simulation_test!(
     lix_directory_path_insert_preserves_long_opaque_segments,
     |sim| async move {

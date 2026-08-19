@@ -1876,6 +1876,8 @@ mod tests {
                 "content",
                 "lixcol_global",
                 "lixcol_change_id",
+                "lixcol_created_at",
+                "lixcol_updated_at",
                 "lixcol_untracked",
                 "lixcol_metadata",
                 "deleted_path",

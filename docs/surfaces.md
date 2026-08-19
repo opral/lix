@@ -26,7 +26,9 @@ documents it together with the history functions.
 `lix_file` represents regular file contents only. Its public columns are `id`,
 `path`, `directory_id`, `name`, and `content`, plus the standard `lixcol_*`
 bookkeeping columns. `path` is an absolute, literal UTF-8 path and `content` is
-the file's bytes. Path characters such as spaces, `%`, `#`, `?`, and `@` are
+the file's bytes. `lixcol_created_at` and `lixcol_updated_at` are public,
+read-only timestamps on both `lix_file` and `lix_directory`. Path characters
+such as spaces, `%`, `#`, `?`, and `@` are
 not URL-encoded. Lix does not represent symbolic
 links, device nodes, sockets, or other non-regular filesystem entries as
 `lix_file` rows. Executable and
