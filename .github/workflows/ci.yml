@@ -300,12 +300,10 @@ jobs:
       - name: Install plugin build target
         run: rustup target add wasm32-wasip2
 
-      - name: Install browser WebAssembly build target
-        if: matrix.runtime == 'browser'
+      - name: Install WebAssembly build target
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install wasm-bindgen CLI
-        if: matrix.runtime == 'browser'
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.122
@@ -345,6 +343,7 @@ jobs:
         run: |
           npm run clean
           npm run build:native
+          npm run build:wasm:dev
           npm run build:ts
           npm run build:plugins
 

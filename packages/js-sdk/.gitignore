@@ -1,3 +1,5 @@
 *.node
 dist/
 native-packages/
+src/wasm
+src/wasm/

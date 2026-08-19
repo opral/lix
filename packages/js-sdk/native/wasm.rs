@@ -23,6 +23,9 @@ use wasm_bindgen_futures::JsFuture;
 use crate::browser_storage::BrowserStorage;
 use crate::js_storage::{JsStorage, JsStorageProvider};
 
+#[path = "wasm_remote.rs"]
+mod remote;
+
 type BrowserLix = RsLix<BrowserStorage>;
 type BrowserTransaction = RsLixTransaction<BrowserStorage>;
 type BrowserObserveEvents = RsObserveEvents<BrowserStorage>;
@@ -488,7 +491,7 @@ impl From<SqlScriptPlan> for SqlScriptPlanDto {
     }
 }
 
-fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, JsValue> {
+pub(super) fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, JsValue> {
     match options {
         Some(value) if !value.is_null() && !value.is_undefined() => {
             let options: ExecuteOptionsDto = from_js(value)?;
@@ -500,53 +503,53 @@ fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, J
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateBranchOptionsDto {
-    id: Option<String>,
-    name: String,
-    from_commit_id: Option<String>,
+pub(super) struct CreateBranchOptionsDto {
+    pub(super) id: Option<String>,
+    pub(super) name: String,
+    pub(super) from_commit_id: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateBranchReceiptDto {
-    id: String,
-    name: String,
-    hidden: bool,
-    commit_id: String,
+pub(super) struct CreateBranchReceiptDto {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) hidden: bool,
+    pub(super) commit_id: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateCheckpointReceiptDto {
-    commit_id: String,
+pub(super) struct CreateCheckpointReceiptDto {
+    pub(super) commit_id: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UndoReceiptDto {
-    branch_id: String,
-    target_commit_id: String,
-    inverse_commit_id: String,
+pub(super) struct UndoReceiptDto {
+    pub(super) branch_id: String,
+    pub(super) target_commit_id: String,
+    pub(super) inverse_commit_id: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RedoReceiptDto {
-    branch_id: String,
-    target_commit_id: String,
-    replay_commit_id: String,
+pub(super) struct RedoReceiptDto {
+    pub(super) branch_id: String,
+    pub(super) target_commit_id: String,
+    pub(super) replay_commit_id: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SwitchBranchOptionsDto {
-    branch_id: String,
+pub(super) struct SwitchBranchOptionsDto {
+    pub(super) branch_id: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SwitchBranchReceiptDto {
-    branch_id: String,
+pub(super) struct SwitchBranchReceiptDto {
+    pub(super) branch_id: String,
 }
 
 #[derive(Deserialize)]
@@ -694,7 +697,7 @@ struct LixValueDto {
     blob: Option<ByteBuf>,
 }
 
-fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
+pub(super) fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
     let values: Vec<LixValueDto> = from_js(value)?;
     values
         .into_iter()
@@ -703,7 +706,7 @@ fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
         .map_err(lix_error_to_js)
 }
 
-fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
+pub(super) fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
     if !Array::is_array(&value) {
         return Err(lix_error_to_js(invalid_param(
             "executeBatch statements must be an array",
@@ -828,7 +831,7 @@ impl TryFrom<&Value> for LixValueDto {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ExecuteResultDto {
+pub(super) struct ExecuteResultDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     statement_index: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -887,7 +890,7 @@ struct ObserveEventDto {
     rows: ExecuteResultDto,
 }
 
-fn execute_result_to_js(result: RsExecuteResult) -> Result<JsValue, JsValue> {
+pub(super) fn execute_result_to_js(result: RsExecuteResult) -> Result<JsValue, JsValue> {
     let result = ExecuteResultDto::try_from(result).map_err(lix_error_to_js)?;
     to_js(&result)
 }
@@ -919,7 +922,7 @@ fn transaction_closed_error() -> JsValue {
     ))
 }
 
-fn observe_next_in_flight_error() -> JsValue {
+pub(super) fn observe_next_in_flight_error() -> JsValue {
     lix_error_to_js(
         LixError::new(
             "LIX_OBSERVE_NEXT_IN_FLIGHT",
@@ -929,12 +932,12 @@ fn observe_next_in_flight_error() -> JsValue {
     )
 }
 
-fn from_js<T: DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {
+pub(super) fn from_js<T: DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {
     serde_wasm_bindgen::from_value(value)
         .map_err(|error| js_bridge_error(format!("invalid JavaScript value: {error}")))
 }
 
-fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+pub(super) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
     value
         .serialize(
             &serde_wasm_bindgen::Serializer::new()
@@ -948,7 +951,7 @@ fn js_bridge_error(message: impl AsRef<str>) -> JsValue {
     js_sys::Error::new(message.as_ref()).into()
 }
 
-fn lix_error_to_js(error: LixError) -> JsValue {
+pub(super) fn lix_error_to_js(error: LixError) -> JsValue {
     let js_error = js_sys::Error::new(&error.message);
     js_error.set_name("LixError");
     let object: &JsValue = js_error.as_ref();
@@ -964,10 +967,15 @@ fn lix_error_to_js(error: LixError) -> JsValue {
             &JsValue::from_str(&hint),
         );
     }
-    if let Some(details) = error.details
-        && let Ok(details) = to_js(&details)
-    {
-        let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
+    if let Some(details) = error.details {
+        if let Some(status) = details.get("httpStatus").and_then(|value| value.as_u64()) {
+            let status = JsValue::from_f64(status as f64);
+            let _ = Reflect::set(object, &JsValue::from_str("status"), &status);
+            let _ = Reflect::set(object, &JsValue::from_str("httpStatus"), &status);
+        }
+        if let Ok(details) = to_js(&details) {
+            let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
+        }
     }
     js_error.into()
 }
