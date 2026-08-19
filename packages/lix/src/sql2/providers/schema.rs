@@ -3706,10 +3706,7 @@ fn apply_row_batch_filters(
     // Public schema scans never expose tombstones. Some overlay paths retain
     // a deletion slot so later layers can reconcile it; compact those slots
     // before Arrow projection even when the SQL query has no predicate.
-    let rows = rows.filter(
-        |row| row.snapshot_content().is_some() || row.typed_snapshot().is_some(),
-        None,
-    );
+    let rows = rows.filter(|row| !row.deleted(), None);
     validate_typed_row_schema_bindings(spec, &rows)?;
     if filters.is_empty() {
         return Ok(FilteredRowBatch { rows });
@@ -4904,6 +4901,7 @@ mod tests {
         };
         let tombstone = MaterializedHotStateRow {
             snapshot_content: None,
+            deleted: true,
             ..live_row()
         };
         let filter = super::RowFilter::ColumnEq {

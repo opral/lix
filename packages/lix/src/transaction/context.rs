@@ -666,6 +666,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// staged later in this transaction affect validation but become visible
     /// to SQL planning only after commit opens a new transaction snapshot.
     sql_schema_snapshot: Arc<CatalogSnapshot>,
+    /// Plugin ownership pinned with the transaction's opening branch head.
+    opening_plugin_registry: PluginRegistry,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     prepared_mutation_program: Option<(
         Arc<str>,
@@ -1533,6 +1535,12 @@ where
             } else {
                 branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?
             };
+            let opening_plugin_registry = if let Some(head) = opening_active_branch_head {
+                let mut tracked = tracked_state.reader(&read);
+                load_plugin_registry_at_commit(&mut tracked, &head.to_string()).await?
+            } else {
+                PluginRegistry::empty()
+            };
             Ok::<_, LixError>((
                 active_branch_id,
                 runtime_functions,
@@ -1542,6 +1550,7 @@ where
                 opening_tracked_mutation_revision,
                 opening_active_branch_head,
                 opening_global_branch_head,
+                opening_plugin_registry,
                 runtime_boundary_result,
             ))
         }
@@ -1555,6 +1564,7 @@ where
             opening_tracked_mutation_revision,
             opening_active_branch_head,
             opening_global_branch_head,
+            opening_plugin_registry,
             runtime_boundary_result,
         ) = match setup_result {
             Ok(result) => result,
@@ -1586,6 +1596,7 @@ where
                     branch_ctx,
                     schema_resolver,
                     sql_schema_snapshot: sql_schema_catalog,
+                    opening_plugin_registry,
                     sql_planning_cache,
                     prepared_mutation_program: None,
                     prepared_mutation_membership: PreparedMutationMembership::Unprepared,
@@ -9411,6 +9422,10 @@ where
 
     fn schema_catalog_snapshot(&self) -> Option<Arc<CatalogSnapshot>> {
         Some(Arc::clone(&self.sql_schema_snapshot))
+    }
+
+    fn plugin_owns_schema(&self, schema_key: &str) -> bool {
+        self.opening_plugin_registry.owns_schema(schema_key)
     }
 
     fn plugin_host(&self) -> PluginRuntimeHost {

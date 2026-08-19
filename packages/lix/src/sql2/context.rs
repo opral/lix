@@ -179,6 +179,11 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     fn schema_catalog_snapshot(&self) -> Option<Arc<crate::catalog::CatalogSnapshot>> {
         None
     }
+    /// Whether the active plugin registry owns this schema's durable rows.
+    /// Engine schemas also have compiled plans but retain generic JSON rows.
+    fn plugin_owns_schema(&self, _schema_key: &str) -> bool {
+        false
+    }
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
     }

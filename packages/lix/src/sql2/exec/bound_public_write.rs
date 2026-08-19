@@ -128,10 +128,7 @@ fn use_typed_certified_insert(row_count: usize) -> bool {
 }
 
 fn schema_uses_native_sql_rows(ctx: &dyn SqlWriteExecutionContext, schema_key: &str) -> bool {
-    schema_key != "lix_registered_schema"
-        && ctx
-            .schema_catalog_snapshot()
-            .is_some_and(|catalog| catalog.plan_for_key(schema_key).is_some())
+    ctx.plugin_owns_schema(schema_key)
 }
 
 impl CertifiedRowInsertParameterBatch {
@@ -5357,7 +5354,7 @@ fn append_row_insert_row(
                 .plan_for_key(&layout.schema_key)
                 .map(|(_, plan)| plan)
         })
-        .filter(|_| layout.schema_key != "lix_registered_schema");
+        .filter(|_| ctx.plugin_owns_schema(&layout.schema_key));
     let mut snapshot = serde_json::Map::with_capacity(layout.snapshot_capacity);
     let mut typed_row = native_plan.map(|_| lix_schema::Row::with_capacity(spec.columns.len()));
     let mut row_pk = None;

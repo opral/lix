@@ -5551,7 +5551,13 @@ fn stage_commit_deltas_inner(
         segment_start = segment_end;
     }
     let mut final_change_ids = HashSet::with_capacity(entries.len());
-    for entry in &entries {
+    for ((entry, payload), &direct) in entries.iter().zip(&payloads).zip(&addressable) {
+        // Selected refs deliberately reuse their source ChangeId, including
+        // across several identity-specific tombstones. Only locally authored
+        // or newly direct-addressed rows claim a unique change identity here.
+        if !payload.authored && !direct {
+            continue;
+        }
         let change_id = decode_value(&entry.value)?.change_id;
         if !final_change_ids.insert(change_id) {
             return Err(LixError::new(
