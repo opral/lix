@@ -404,6 +404,10 @@ where
     /// transaction boundaries for each statement.
     /// While a transaction is active, call `execute()` on the transaction
     /// handle instead.
+    ///
+    /// `sql` must be a single statement. To run several statements atomically,
+    /// pass an array of statements to [`Self::execute_batch`]. Do not concatenate
+    /// statements into one script string.
     pub fn execute<'a>(
         &'a self,
         sql: &'a str,
@@ -523,6 +527,9 @@ where
     /// Executes statements sequentially against one atomic snapshot.
     /// Pure reads share one read snapshot; batches containing writes retain
     /// transactional read-after-write and rollback semantics.
+    ///
+    /// Each entry is one statement plus its own parameters. Callers assemble
+    /// the array; Lix does not parse a multi-statement script on their behalf.
     pub fn execute_batch<'a>(
         &'a self,
         statements: &'a [ExecuteBatchStatement],

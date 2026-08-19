@@ -38,6 +38,23 @@ test("SQLite is not part of the JavaScript SDK export surface", async () => {
 	expect("SQLite" in sdk).toBe(false);
 });
 
+test("parseSqlScript is not part of the JavaScript SDK export surface", async () => {
+	const sdk = await import("./index.js");
+	expect("parseSqlScript" in sdk).toBe(false);
+	expect("SqlScriptPlan" in sdk).toBe(false);
+	expect("SqlScriptStatement" in sdk).toBe(false);
+});
+
+test("execute rejects multi-statement scripts", async () => {
+	const lix = await openLix();
+	await expect(lix.execute("SELECT 1; SELECT 2")).rejects.toMatchObject({
+		name: "LixError",
+		code: "LIX_UNSUPPORTED_SQL",
+		message: "Lix SQL only supports one statement per execute() call",
+	});
+	await lix.close();
+});
+
 test("filesystem storage is owned by its adapter package", async () => {
 	const sdk = await import("./index.js");
 	expect("FilesystemStorage" in sdk).toBe(false);

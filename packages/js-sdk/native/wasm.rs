@@ -11,9 +11,8 @@ use lix::{
     CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
     ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
     Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, SqlScriptPlan,
+    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
     SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
-    parse_sql_script as parse_rs_sql_script,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -184,12 +183,6 @@ struct BrowserTelemetryDispatch(Function);
 )]
 unsafe impl Send for BrowserTelemetryDispatch {}
 unsafe impl Sync for BrowserTelemetryDispatch {}
-
-#[wasm_bindgen(js_name = parseSqlScript)]
-pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsValue, JsValue> {
-    let plan = parse_rs_sql_script(&sql, provided_param_count).map_err(lix_error_to_js)?;
-    to_js(&SqlScriptPlanDto::from(plan))
-}
 
 #[wasm_bindgen]
 impl WasmLix {
@@ -522,36 +515,6 @@ struct ExecuteOptionsDto {
 pub(super) struct OpenAnotherSessionOptionsDto {
     pub(super) branch_id: Option<String>,
     pub(super) account_id: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SqlScriptPlanDto {
-    statements: Vec<SqlScriptStatementDto>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SqlScriptStatementDto {
-    sql: String,
-    param_start: usize,
-    param_end: usize,
-}
-
-impl From<SqlScriptPlan> for SqlScriptPlanDto {
-    fn from(plan: SqlScriptPlan) -> Self {
-        Self {
-            statements: plan
-                .statements
-                .into_iter()
-                .map(|statement| SqlScriptStatementDto {
-                    sql: statement.sql,
-                    param_start: statement.params.start,
-                    param_end: statement.params.end,
-                })
-                .collect(),
-        }
-    }
 }
 
 pub(super) fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, JsValue> {

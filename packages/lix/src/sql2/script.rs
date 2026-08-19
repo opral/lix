@@ -8,7 +8,7 @@ use crate::LixError;
 
 /// One executable statement in a parsed SQL transaction script.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqlScriptStatement {
+pub(crate) struct SqlScriptStatement {
     /// Canonical SQL generated from the parsed statement.
     pub sql: String,
     /// The request-wide parameter range to bind to this statement.
@@ -17,7 +17,7 @@ pub struct SqlScriptStatement {
 
 /// Atomic execution plan produced by [`parse_sql_script`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqlScriptPlan {
+pub(crate) struct SqlScriptPlan {
     /// One or more statements that must execute atomically.
     pub statements: Vec<SqlScriptStatement>,
 }
@@ -48,7 +48,10 @@ struct ParsedStatement {
 /// modes, savepoints, rollback, nested controls, and empty transactions are
 /// rejected. PostgreSQL-style numbered placeholders retain their request-wide
 /// positions.
-pub fn parse_sql_script(sql: &str, provided_param_count: usize) -> Result<SqlScriptPlan, LixError> {
+pub(crate) fn parse_sql_script(
+    sql: &str,
+    provided_param_count: usize,
+) -> Result<SqlScriptPlan, LixError> {
     let statements = parse_statements(sql)?;
     if statements.is_empty() {
         return Err(LixError::new(

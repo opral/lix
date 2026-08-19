@@ -282,6 +282,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_multi_statement_scripts() {
+        let error = parse_statement("SELECT 1; SELECT 2")
+            .expect_err("execute parses one statement, not a script");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(
+            error.message,
+            "Lix SQL only supports one statement per execute() call"
+        );
+    }
+
+    #[test]
     fn rejects_hex_literals_before_read_or_write_planning() {
         for sql in [
             "SELECT X'4142'",

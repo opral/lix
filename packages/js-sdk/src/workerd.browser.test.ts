@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import initWasm, {
 	openMemoryFromSnapshot,
 } from "../dist/wasm/lix_js_sdk.js";
+import * as wasmBindings from "../dist/wasm/lix_js_sdk.js";
 
 const initialized = initWasm();
 const SNAPSHOT_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000441";
@@ -85,6 +86,10 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 	} finally {
 		await restored.close();
 	}
+});
+
+test("Workerd WASM bindings do not export parseSqlScript", () => {
+	expect("parseSqlScript" in wasmBindings).toBe(false);
 });
 
 test("Workerd snapshots reject malformed bytes", async () => {
