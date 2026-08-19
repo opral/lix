@@ -809,6 +809,7 @@ struct TypedStateTransition {
 struct TypedStateTransitionTarget {
     change_id: ChangeId,
     snapshot_content: Option<SharedStr>,
+    typed_snapshot: Option<Arc<WasmTypedRow>>,
     metadata: Option<SharedStr>,
 }
 
@@ -8064,6 +8065,7 @@ where
             let target = desired.map(|row| TypedStateTransitionTarget {
                 change_id: row.change_id(),
                 snapshot_content: row.snapshot_content().cloned(),
+                typed_snapshot: row.typed_snapshot().cloned(),
                 metadata: row.metadata().cloned(),
             });
             if expected_change_id != target.as_ref().map(|target| target.change_id) {
@@ -8099,34 +8101,56 @@ where
                     "typed tracked-state transition contains an unchanged row",
                 ));
             }
-            let (snapshot, metadata) = match transition.target {
+            let (snapshot, typed_snapshot, metadata) = match transition.target {
                 Some(target) => (
                     parse_materialized_diff_json(
                         target.snapshot_content,
                         "typed state transition target",
                     )?,
+                    target.typed_snapshot,
                     parse_materialized_diff_json(
                         target.metadata,
                         "typed state transition target metadata",
                     )?,
                 ),
-                None => (None, None),
+                None => (None, None, None),
             };
-            rows.push(TransactionWriteRow {
-                row_pk: Some(transition.identity.row_pk),
-                schema_key: transition.identity.schema_key.into(),
-                file_id: transition.identity.file_id.map(Into::into),
-                snapshot,
-                metadata,
-                origin: None,
-                created_at: None,
-                updated_at: None,
-                global: false,
-                change_id: None,
-                commit_id: None,
-                untracked: false,
-                branch_id: branch_id.clone().into(),
-            });
+            let row_pk = Some(transition.identity.row_pk);
+            let schema_key = transition.identity.schema_key.into();
+            let file_id = transition.identity.file_id.map(Into::into);
+            if let Some(typed_snapshot) = typed_snapshot {
+                rows.push_typed_parts(
+                    row_pk,
+                    schema_key,
+                    file_id,
+                    Some(typed_snapshot),
+                    metadata,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    branch_id.clone().into(),
+                );
+            } else {
+                rows.push(TransactionWriteRow {
+                    row_pk,
+                    schema_key,
+                    file_id,
+                    snapshot,
+                    metadata,
+                    origin: None,
+                    created_at: None,
+                    updated_at: None,
+                    global: false,
+                    change_id: None,
+                    commit_id: None,
+                    untracked: false,
+                    branch_id: branch_id.clone().into(),
+                });
+            }
         }
         self.stage_write(TransactionWrite::Rows {
             mode: TransactionWriteMode::Replace,
@@ -8300,27 +8324,46 @@ where
                         "materialized diff target is missing its identity",
                     )
                 })?;
-                rows.push(TransactionWriteRow {
-                    row_pk: Some(identity.row_pk),
-                    schema_key: identity.schema_key.into(),
-                    file_id: identity.file_id.map(Into::into),
-                    snapshot: parse_materialized_diff_json(
-                        payload.snapshot_content,
-                        "diff target",
-                    )?,
-                    metadata: parse_materialized_diff_json(
-                        payload.metadata,
-                        "diff target metadata",
-                    )?,
-                    origin: None,
-                    created_at: None,
-                    updated_at: None,
-                    global: false,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: false,
-                    branch_id: branch_id.clone().into(),
-                });
+                let snapshot =
+                    parse_materialized_diff_json(payload.snapshot_content, "diff target")?;
+                let metadata =
+                    parse_materialized_diff_json(payload.metadata, "diff target metadata")?;
+                let row_pk = Some(identity.row_pk);
+                let schema_key = identity.schema_key.into();
+                let file_id = identity.file_id.map(Into::into);
+                if let Some(typed_snapshot) = payload.typed_snapshot {
+                    rows.push_typed_parts(
+                        row_pk,
+                        schema_key,
+                        file_id,
+                        Some(typed_snapshot),
+                        metadata,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        branch_id.clone().into(),
+                    );
+                } else {
+                    rows.push(TransactionWriteRow {
+                        row_pk,
+                        schema_key,
+                        file_id,
+                        snapshot,
+                        metadata,
+                        origin: None,
+                        created_at: None,
+                        updated_at: None,
+                        global: false,
+                        change_id: None,
+                        commit_id: None,
+                        untracked: false,
+                        branch_id: branch_id.clone().into(),
+                    });
+                }
             }
         }
         if !rows.is_empty() {

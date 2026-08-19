@@ -16109,8 +16109,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn public_membership_dedupes_ids_but_payload_authority_rejects_conflicts() {
+    #[test]
+    fn authored_membership_rejects_duplicate_change_ids_before_publication() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("duplicate-change-id");
         let mut fixtures = packed_commit_delta_fixtures()
@@ -16120,30 +16120,15 @@ mod tests {
         fixtures[1].change_id = fixtures[0].change_id;
         let deltas = commit_delta_refs(commit_id, &fixtures);
         let mut writes = storage.new_write_set();
-        stage_commit_deltas(&mut writes, &deltas).expect("distinct identities should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("corrupt duplicate-id fixture should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        assert_eq!(
-            load_commit_delta_change_ids(&read, commit_id)
-                .await
-                .expect("public commit membership should load"),
-            vec![fixtures[0].change_id]
+        let error = stage_commit_deltas(&mut writes, &deltas)
+            .expect_err("authored duplicate ids must fail before publication");
+        assert!(
+            error
+                .message
+                .contains("colliding authored or generated ChangeIds")
         );
-        let error = scan_commit_delta_inventory(&read)
-            .await
-            .expect_err("global authority must reject duplicate change ids");
-        assert!(error.to_string().contains("contains duplicate change id"));
-        let error = scan_change_records_from_commit_deltas(&read)
-            .await
-            .expect_err("streaming authority must reject duplicate change ids");
-        assert!(error.to_string().contains("contains duplicate change id"));
+        assert_eq!(writes.stats().staged_puts, 0);
+        assert_eq!(writes.stats().staged_deletes, 0);
     }
 
     #[tokio::test]
