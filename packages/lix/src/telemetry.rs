@@ -9,6 +9,8 @@ pub enum TelemetrySpanKind {
     SqlQuery,
     SqlBatch,
     SqlCoherentReadBatch,
+    /// A client session bound to a Lix. Not engine construction or cache-admit.
+    LixOpened,
 }
 
 /// One vendor-neutral telemetry attribute.
@@ -147,8 +149,17 @@ impl TracingTelemetrySink {
 }
 
 impl TelemetrySink for TracingTelemetrySink {
-    fn enabled(&self, _kind: TelemetrySpanKind) -> bool {
-        tracing::enabled!(target: "lix_sql", tracing::Level::INFO)
+    fn enabled(&self, kind: TelemetrySpanKind) -> bool {
+        match kind {
+            TelemetrySpanKind::SqlQuery
+            | TelemetrySpanKind::SqlBatch
+            | TelemetrySpanKind::SqlCoherentReadBatch => {
+                tracing::enabled!(target: "lix_sql", tracing::Level::INFO)
+            }
+            TelemetrySpanKind::LixOpened => {
+                tracing::enabled!(target: "lix", tracing::Level::INFO)
+            }
+        }
     }
 
     fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
@@ -218,6 +229,13 @@ fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
             "lix.execution.kind" = tracing::field::Empty,
             "error.type" = tracing::field::Empty,
             "otel.status_code" = tracing::field::Empty,
+        ),
+        TelemetrySpanKind::LixOpened => tracing::info_span!(
+            target: "lix",
+            "lix.opened",
+            "lix.id" = tracing::field::Empty,
+            "lix.branch_id" = tracing::field::Empty,
+            "lix.account_id" = tracing::field::Empty,
         ),
     };
     for attribute in &start.attributes {
@@ -290,4 +308,166 @@ pub(crate) fn unix_time_ms() -> u64 {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// Records that a client session has bound to a Lix.
+///
+/// This is the only place that starts a [`TelemetrySpanKind::LixOpened`] span.
+/// Handshake session creation and in-process [`crate::open_lix`] call it.
+/// Protocol roots opened with [`crate::OpenLixBuilder::as_protocol_root`]
+/// skip it so a cached runtime can inherit a sink without emitting.
+/// Hosts that mint a session against an already-open runtime (MCP signed
+/// context, cache hit) should call the same helper instead of opening another
+/// engine.
+///
+/// No-op when `sink` is absent or `enabled(LixOpened)` is false. Those paths
+/// do not build attributes or timestamps.
+pub fn bind_session(
+    sink: Option<&Arc<dyn TelemetrySink>>,
+    lix_id: &str,
+    branch_id: &str,
+    account_id: Option<&str>,
+) {
+    let Some(sink) = sink else {
+        return;
+    };
+    if !sink.enabled(TelemetrySpanKind::LixOpened) {
+        return;
+    }
+    let mut attributes = vec![
+        TelemetryAttribute::string("lix.id", lix_id),
+        TelemetryAttribute::string("lix.branch_id", branch_id),
+    ];
+    if let Some(account_id) = account_id.filter(|id| !id.is_empty()) {
+        attributes.push(TelemetryAttribute::string("lix.account_id", account_id));
+    }
+    let span = ActiveTelemetrySpan::start(
+        sink,
+        TelemetrySpanStart {
+            kind: TelemetrySpanKind::LixOpened,
+            name: "lix.opened",
+            started_at_unix_ms: unix_time_ms(),
+            attributes,
+        },
+    );
+    span.finish(TelemetrySpanStatus::Ok, Vec::new());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct RecordingSink {
+        opened_enabled: bool,
+        sql_enabled: bool,
+        started: Mutex<Vec<TelemetrySpanStart>>,
+        enabled_kinds: Mutex<Vec<TelemetrySpanKind>>,
+    }
+
+    impl RecordingSink {
+        fn new(opened_enabled: bool) -> Self {
+            Self {
+                opened_enabled,
+                sql_enabled: true,
+                started: Mutex::new(Vec::new()),
+                enabled_kinds: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn into_sink(self: Arc<Self>) -> Arc<dyn TelemetrySink> {
+            self
+        }
+    }
+
+    impl TelemetrySink for RecordingSink {
+        fn enabled(&self, kind: TelemetrySpanKind) -> bool {
+            self.enabled_kinds.lock().expect("enabled kinds").push(kind);
+            match kind {
+                TelemetrySpanKind::LixOpened => self.opened_enabled,
+                TelemetrySpanKind::SqlQuery
+                | TelemetrySpanKind::SqlBatch
+                | TelemetrySpanKind::SqlCoherentReadBatch => self.sql_enabled,
+            }
+        }
+
+        fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
+            self.started.lock().expect("started spans").push(start);
+            Box::new(RecordingHandle)
+        }
+    }
+
+    struct RecordingHandle;
+
+    impl TelemetrySpanHandle for RecordingHandle {
+        fn enter(&self) -> Box<dyn TelemetrySpanEnterGuard + '_> {
+            Box::new(())
+        }
+
+        fn finish(self: Box<Self>, _end: TelemetrySpanEnd) {}
+    }
+
+    fn attribute_string<'a>(start: &'a TelemetrySpanStart, key: &str) -> Option<&'a str> {
+        start.attributes.iter().find_map(|attribute| {
+            if attribute.key == key {
+                match &attribute.value {
+                    TelemetryValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn absent_sink_does_no_opened_span_work() {
+        bind_session(None, "lix-id", "branch-id", Some("account-id"));
+    }
+
+    #[test]
+    fn disabled_opened_kind_does_not_start_a_span() {
+        let sink = Arc::new(RecordingSink::new(false));
+        let trait_sink = Arc::clone(&sink).into_sink();
+        bind_session(Some(&trait_sink), "lix-id", "branch-id", Some("account-id"));
+        assert_eq!(
+            *sink.enabled_kinds.lock().expect("enabled kinds"),
+            [TelemetrySpanKind::LixOpened]
+        );
+        assert!(sink.started.lock().expect("started spans").is_empty());
+    }
+
+    #[test]
+    fn bind_session_emits_vendor_neutral_opened_attributes() {
+        let sink = Arc::new(RecordingSink::new(true));
+        let trait_sink = Arc::clone(&sink).into_sink();
+        bind_session(Some(&trait_sink), "lix-id", "branch-id", Some("account-id"));
+        let started = sink.started.lock().expect("started spans").clone();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].kind, TelemetrySpanKind::LixOpened);
+        assert_eq!(started[0].name, "lix.opened");
+        assert_eq!(attribute_string(&started[0], "lix.id"), Some("lix-id"));
+        assert_eq!(
+            attribute_string(&started[0], "lix.branch_id"),
+            Some("branch-id")
+        );
+        assert_eq!(
+            attribute_string(&started[0], "lix.account_id"),
+            Some("account-id")
+        );
+        assert!(started[0]
+            .attributes
+            .iter()
+            .all(|attribute| attribute.key.starts_with("lix.")));
+    }
+
+    #[test]
+    fn bind_session_omits_account_when_absent() {
+        let sink = Arc::new(RecordingSink::new(true));
+        let trait_sink = Arc::clone(&sink).into_sink();
+        bind_session(Some(&trait_sink), "lix-id", "branch-id", None);
+        let started = sink.started.lock().expect("started spans").clone();
+        assert_eq!(started.len(), 1);
+        assert!(attribute_string(&started[0], "lix.account_id").is_none());
+    }
 }

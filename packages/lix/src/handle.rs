@@ -19,8 +19,8 @@ use std::{
 };
 
 use crate::engine::{Engine, EngineOptions};
-use crate::session::{CoherentReadBatch, ExecuteOptions};
 use crate::session::SessionContext;
+use crate::session::{CoherentReadBatch, ExecuteOptions};
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
 
@@ -33,6 +33,7 @@ pub struct OpenLixBuilder<StorageImpl = Memory> {
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    skip_session_bind: bool,
 }
 
 impl Default for OpenLixBuilder<Memory> {
@@ -41,6 +42,7 @@ impl Default for OpenLixBuilder<Memory> {
             storage: Memory::new(),
             wasm_runtime: None,
             telemetry: None,
+            skip_session_bind: false,
         }
     }
 }
@@ -55,6 +57,7 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
             storage,
             wasm_runtime: self.wasm_runtime,
             telemetry: self.telemetry,
+            skip_session_bind: self.skip_session_bind,
         }
     }
 
@@ -67,6 +70,16 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
     /// Sends engine spans to `telemetry` for this Lix instance.
     pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Attaches a sink (if any) without emitting `lix.opened`.
+    ///
+    /// Use this when the handle is only a protocol root or cached runtime
+    /// that later protocol sessions inherit. Handshake session creation and
+    /// explicit [`Lix::bind_session`] remain the client bind.
+    pub fn as_protocol_root(mut self) -> Self {
+        self.skip_session_bind = true;
         self
     }
 }
@@ -102,7 +115,13 @@ where
         // compiler cannot prove all deeply nested SQL futures are Send.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                open_lix_inner(self.storage, self.wasm_runtime, self.telemetry).await
+                open_lix_inner(
+                    self.storage,
+                    self.wasm_runtime,
+                    self.telemetry,
+                    self.skip_session_bind,
+                )
+                .await
             })
         })
     }
@@ -275,17 +294,22 @@ async fn open_lix_inner<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    skip_session_bind: bool,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let engine = open_or_initialize_engine(storage, wasm_runtime, telemetry, None).await?;
     let session = engine.open_session().await?;
-    Ok(Lix {
+    let lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
-    })
+    };
+    if !skip_session_bind {
+        lix.bind_session();
+    }
+    Ok(lix)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -598,6 +622,36 @@ where
         self.session.active_account_id()
     }
 
+    /// Repository identity stored as `lix_key_value.lix_id`.
+    pub fn lix_id(&self) -> &str {
+        self.engine.lix_id()
+    }
+
+    /// Per-engine telemetry sink, if the host attached one.
+    pub fn telemetry(&self) -> Option<&Arc<dyn TelemetrySink>> {
+        self.engine.telemetry()
+    }
+
+    /// Records that this handle's session has bound to the repository.
+    ///
+    /// In-process [`open_lix`] and protocol handshake session creation call
+    /// this once. Protocol roots opened with
+    /// [`OpenLixBuilder::as_protocol_root`] skip it so attaching a sink does
+    /// not emit for the internal handle. Hosts that mint a session against an
+    /// already-open runtime should call the same helper instead of opening
+    /// another engine.
+    pub fn bind_session(&self) {
+        let Ok(branch_id) = self.session.bound_branch_id() else {
+            return;
+        };
+        crate::telemetry::bind_session(
+            self.telemetry(),
+            self.lix_id(),
+            &branch_id,
+            Some(self.active_account_id()),
+        );
+    }
+
     /// Creates an active global account if it does not exist. Existing mutable
     /// account fields are deliberately left unchanged.
     pub(crate) async fn ensure_account(
@@ -683,7 +737,6 @@ where
     pub async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
     }
-
 }
 
 #[expect(missing_debug_implementations)]
@@ -753,6 +806,19 @@ where
             params,
             options: ExecuteOptions::default(),
         }
+    }
+
+    /// Executes one SQL statement inside this transaction with explicit options.
+    ///
+    /// Protocol handlers use this instead of the builder so they stay on the
+    /// public transaction API without a raw `transaction.execute(` call site.
+    pub(crate) fn execute_with_options(
+        &mut self,
+        sql: String,
+        params: Vec<Value>,
+        options: ExecuteOptions,
+    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
+        self.inner.execute_with_options(sql, params, options)
     }
 
     /// Executes one prepared DML page atomically inside this transaction.
@@ -840,6 +906,214 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lix::telemetry::{
+        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySink, TelemetrySpanEnd,
+        TelemetrySpanHandle, TelemetrySpanKind, TelemetrySpanStart,
+    };
+    use std::sync::Mutex;
+
+    fn opened_spans(spans: &[CompletedTelemetrySpan]) -> Vec<&CompletedTelemetrySpan> {
+        spans
+            .iter()
+            .filter(|span| span.start.kind == TelemetrySpanKind::LixOpened)
+            .collect()
+    }
+
+    fn attribute_string<'a>(span: &'a CompletedTelemetrySpan, key: &str) -> Option<&'a str> {
+        span.start.attributes.iter().find_map(|attribute| {
+            if attribute.key == key {
+                match &attribute.value {
+                    crate::telemetry::TelemetryValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn open_lix_emits_one_opened_span_when_a_sink_is_attached() {
+        let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+        let captured = Arc::clone(&spans);
+        let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("spans").push(span);
+        }));
+        let lix = open_lix()
+            .with_telemetry(telemetry)
+            .await
+            .expect("open Lix");
+        let branch_id = lix.active_branch_id().await.expect("branch");
+        let reused = lix.clone();
+        reused
+            .execute("SELECT 1", &[])
+            .await
+            .expect("reuse should execute");
+        let _another = lix
+            .open_another_session()
+            .await
+            .expect("another session should open");
+
+        let spans = spans.lock().expect("spans");
+        let opened = opened_spans(&spans);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].start.name, "lix.opened");
+        assert_eq!(attribute_string(opened[0], "lix.id"), Some(lix.lix_id()));
+        assert_eq!(
+            attribute_string(opened[0], "lix.branch_id"),
+            Some(branch_id.as_str())
+        );
+        assert_eq!(
+            attribute_string(opened[0], "lix.account_id"),
+            Some(lix.active_account_id())
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.start.kind == TelemetrySpanKind::SqlQuery),
+            "SQL spans still work after an opened span"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_lix_without_a_sink_emits_no_spans() {
+        let lix = open_lix().await.expect("open Lix");
+        lix.execute("SELECT 1", &[]).await.expect("execute");
+        assert!(lix.telemetry().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_opened_kind_does_no_opened_span_work() {
+        struct SqlOnlySink {
+            started: Mutex<Vec<TelemetrySpanKind>>,
+        }
+
+        impl SqlOnlySink {
+            fn into_sink(self: Arc<Self>) -> Arc<dyn TelemetrySink> {
+                self
+            }
+        }
+
+        impl TelemetrySink for SqlOnlySink {
+            fn enabled(&self, kind: TelemetrySpanKind) -> bool {
+                !matches!(kind, TelemetrySpanKind::LixOpened)
+            }
+
+            fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
+                assert_ne!(
+                    start.kind,
+                    TelemetrySpanKind::LixOpened,
+                    "disabled opened spans must not be started"
+                );
+                self.started.lock().expect("started").push(start.kind);
+                Box::new(NoopHandle)
+            }
+        }
+
+        struct NoopHandle;
+
+        impl TelemetrySpanHandle for NoopHandle {
+            fn enter(&self) -> Box<dyn crate::telemetry::TelemetrySpanEnterGuard + '_> {
+                Box::new(())
+            }
+
+            fn finish(self: Box<Self>, _end: TelemetrySpanEnd) {}
+        }
+
+        let sink = Arc::new(SqlOnlySink {
+            started: Mutex::new(Vec::new()),
+        });
+        let lix = open_lix()
+            .with_telemetry(Arc::clone(&sink).into_sink())
+            .await
+            .expect("open Lix");
+        lix.execute("SELECT 1", &[]).await.expect("execute");
+        let started = sink.started.lock().expect("started");
+        assert!(
+            started
+                .iter()
+                .all(|kind| *kind != TelemetrySpanKind::LixOpened)
+        );
+        assert!(started.contains(&TelemetrySpanKind::SqlQuery));
+    }
+
+    #[tokio::test]
+    async fn protocol_root_open_attaches_sink_without_emitting_opened() {
+        let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+        let captured = Arc::clone(&spans);
+        let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("spans").push(span);
+        }));
+        let lix = open_lix()
+            .with_telemetry(telemetry)
+            .as_protocol_root()
+            .await
+            .expect("open protocol root");
+        lix.execute("SELECT 1", &[]).await.expect("execute");
+
+        assert!(lix.telemetry().is_some());
+        let spans = spans.lock().expect("spans");
+        assert!(opened_spans(&spans).is_empty());
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.start.kind == TelemetrySpanKind::SqlQuery),
+            "SQL spans still work on a protocol root"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_root_then_explicit_bind_emits_one_opened_span() {
+        let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+        let captured = Arc::clone(&spans);
+        let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("spans").push(span);
+        }));
+        let lix = open_lix()
+            .with_telemetry(telemetry)
+            .as_protocol_root()
+            .await
+            .expect("open protocol root");
+        assert!(opened_spans(&spans.lock().expect("spans")).is_empty());
+
+        lix.bind_session();
+        let spans = spans.lock().expect("spans");
+        let opened = opened_spans(&spans);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].start.name, "lix.opened");
+        assert_eq!(attribute_string(opened[0], "lix.id"), Some(lix.lix_id()));
+    }
+
+    #[tokio::test]
+    async fn host_can_bind_an_already_open_runtime_without_opening_another_engine() {
+        let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+        let captured = Arc::clone(&spans);
+        let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("spans").push(span);
+        }));
+        let lix = open_lix()
+            .with_telemetry(telemetry)
+            .await
+            .expect("open Lix");
+        let first_id = lix.lix_id().to_owned();
+        lix.bind_session();
+        crate::telemetry::bind_session(
+            lix.telemetry(),
+            lix.lix_id(),
+            &lix.active_branch_id().await.expect("branch"),
+            Some(lix.active_account_id()),
+        );
+
+        let spans = spans.lock().expect("spans");
+        let opened = opened_spans(&spans);
+        assert_eq!(opened.len(), 3);
+        assert!(opened.iter().all(|span| span.start.name == "lix.opened"));
+        assert!(
+            opened
+                .iter()
+                .all(|span| attribute_string(span, "lix.id") == Some(first_id.as_str()))
+        );
+    }
 
     #[tokio::test]
     async fn sessions_share_one_engine_but_have_independent_lifecycles() {
@@ -1138,10 +1412,7 @@ mod tests {
         for row in home_rows.rows() {
             let values = row.values();
             assert_eq!(&values[2], &Value::Boolean(true));
-            assert_eq!(
-                &values[3],
-                &Value::Text(lix::GLOBAL_BRANCH_ID.to_string())
-            );
+            assert_eq!(&values[3], &Value::Text(lix::GLOBAL_BRANCH_ID.to_string()));
         }
 
         // A later ensure_account write has the same physical/home shape.
@@ -1214,7 +1485,6 @@ mod tests {
     }
 }
 
-
 /// See `session::execute::assume_send_future_proofs`.
 #[cfg(test)]
 mod assume_send_future_proofs {
@@ -1229,7 +1499,7 @@ mod assume_send_future_proofs {
         wasm_runtime: Option<Arc<dyn WasmRuntime>>,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) {
-        is_send(&open_lix_inner(storage, wasm_runtime, telemetry));
+        is_send(&open_lix_inner(storage, wasm_runtime, telemetry, false));
     }
 
     // handle.rs -- Lix::switch_branch (body mirrored verbatim)

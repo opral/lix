@@ -1,7 +1,7 @@
 {
 	"name": "@lix-js/storage-opfs",
 	"type": "module",
-	"version": "0.12.2",
+	"version": "0.12.3",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -20,7 +20,7 @@
 	],
 	"scripts": {
 		"build": "npm run clean && tsc -p tsconfig.json && esbuild js/client.ts --bundle --format=esm --platform=browser --target=es2022 --sourcemap --outfile=dist/provider.js && esbuild js/provider.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=dist/direct.js && esbuild js/owner.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=dist/owner.js",
-		"benchmark": "npm run build && vitest run --config vitest.browser.config.ts tests/storage-path.bench.browser.test.ts tests/opfs-scale.bench.browser.test.ts tests/lix-interaction.bench.browser.test.ts --reporter=verbose",
+		"benchmark": "npm run build && vitest run --config vitest.browser.config.ts --fileParallelism=false tests/storage-path.bench.browser.test.ts tests/opfs-scale.bench.browser.test.ts tests/lix-interaction.bench.browser.test.ts --reporter=verbose",
 		"benchmark:multi-tab": "LIX_OPFS_BENCHMARK=1 node ./scripts/test-packed-vite.js",
 		"clean": "node -e \"import('node:fs/promises').then(({ rm }) => rm('dist', { recursive: true, force: true }))\"",
 		"test:browser": "npm run build && npm run test:browser:built",
@@ -32,7 +32,7 @@
 		"@sqlite.org/sqlite-wasm": "3.53.0-build1"
 	},
 	"peerDependencies": {
-		"@lix-js/sdk": "0.12.2"
+		"@lix-js/sdk": "0.12.3"
 	},
 	"devDependencies": {
 		"@lix-js/sdk": "file:../js-sdk",

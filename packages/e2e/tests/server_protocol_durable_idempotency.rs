@@ -157,6 +157,7 @@ async fn open_server() -> (
     let lix = Arc::new(
         lix::open_lix()
             .with_storage(storage.clone())
+            .as_protocol_root()
             .await
             .expect("open Lix"),
     );
