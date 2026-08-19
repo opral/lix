@@ -2424,6 +2424,10 @@ where
         );
     }
     let mut change_watcher = lease.record.lix.sync_mode_state().change_watcher();
+    // A cursor-neutral wake asks us to re-read; it must not buy another full
+    // timeout. Otherwise ordinary repository activity can keep one HTTP
+    // request alive past the client's deadline and force needless reconnects.
+    let long_poll_deadline = tokio::time::Instant::now() + SYNC_LONG_POLL_TIMEOUT;
     let response = loop {
         // Subscribe before reading the cursor, closing the change-between-read-
         // and-wait race without a periodic poll.
@@ -2451,7 +2455,7 @@ where
                 }
                 break response;
             },
-            _ = tokio::time::sleep(SYNC_LONG_POLL_TIMEOUT) => break response,
+            _ = tokio::time::sleep_until(long_poll_deadline) => break response,
         }
     };
     bounded_sync_json_response(response, "sync pull", MAX_SYNC_PULL_RESPONSE_BYTES)

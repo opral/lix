@@ -39,6 +39,63 @@ struct HttpProbe {
     one_way_delay_millis: AtomicU64,
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_local_write_pushes_before_deferred_history_is_read() {
+    let authority = Arc::new(open_lix().await.expect("open authority"));
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/shared.md', CAST('Hello world' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("seed shared file");
+    put_value(&authority, "head", "visible").await;
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    replica
+        .execute(
+            "SELECT content FROM lix_file WHERE path = '/shared.md'",
+            &[],
+        )
+        .await
+        .expect("hydrate only the visible file");
+    replica
+        .execute(
+            "UPDATE lix_file SET content = CAST('Hello worlds' AS BYTEA) WHERE path = '/shared.md'",
+            &[],
+        )
+        .await
+        .expect("edit file before reading history");
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            let result = authority
+                .execute(
+                    "SELECT content FROM lix_file WHERE path = '/shared.md'",
+                    &[],
+                )
+                .await
+                .expect("read authority file");
+            if result.rows()[0]
+                .get::<Vec<u8>>("content")
+                .expect("file content decodes")
+                == b"Hello worlds"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("file edit reaches authority");
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+    authority.close().await.expect("close authority");
+}
+
 impl HttpProbe {
     fn drop_next_push_ack(&self) {
         self.drop_next_push_ack.store(true, Ordering::Release);
@@ -452,6 +509,21 @@ async fn file_observer_hydrates_lazy_chunks_after_a_remote_edit() {
             b"Hello world",
         );
         observers.push(events);
+    }
+    let mut writer_observers = Vec::with_capacity(OBSERVER_COUNT);
+    for _ in 0..OBSERVER_COUNT {
+        let mut events = bob
+            .observe(
+                "SELECT content FROM lix_file WHERE path = '/shared.md'",
+                &[],
+            )
+            .expect("observe Bob's shared file");
+        events
+            .next()
+            .await
+            .expect("Bob's initial observer evaluation succeeds")
+            .expect("Bob's initial observer event exists");
+        writer_observers.push(events);
     }
 
     let chunk_gets_before_remote_edit = probe.chunk_gets.load(Ordering::Acquire);
