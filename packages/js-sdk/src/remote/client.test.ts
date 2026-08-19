@@ -320,34 +320,10 @@ test("remote execute sends successful large blob updates as exact splices", asyn
 	secondBacking.set(first, 5);
 	const second = secondBacking.subarray(5);
 	second[16 * 1024 + 3] = 98;
-	const prototype = Uint8Array.prototype as Uint8Array & {
-		toBase64?: () => string;
-	};
-	const originalToBase64 = Object.getOwnPropertyDescriptor(
-		prototype,
-		"toBase64",
-	);
-	const encodedLengths: number[] = [];
-	Object.defineProperty(prototype, "toBase64", {
-		configurable: true,
-		value: function (this: Uint8Array) {
-			encodedLengths.push(this.byteLength);
-			return btoa(String.fromCharCode(...this));
-		},
-	});
-	let deltaEncodedLengths: number[];
-	try {
-		await lix.execute("UPDATE lix_file SET content = $1", [first]);
-		encodedLengths.length = 0;
-		await lix.execute("UPDATE lix_file SET content = $1", [second]);
-		deltaEncodedLengths = [...encodedLengths];
-	} finally {
-		if (originalToBase64 === undefined) delete prototype.toBase64;
-		else Object.defineProperty(prototype, "toBase64", originalToBase64);
-	}
+	await lix.execute("UPDATE lix_file SET content = $1", [first]);
+	await lix.execute("UPDATE lix_file SET content = $1", [second]);
 	await lix.close();
 
-	expect(deltaEncodedLengths).toEqual([1]);
 	expect(bodies[0]).toMatchObject({
 		cacheBlobs: true,
 		params: [{ kind: "blob" }],

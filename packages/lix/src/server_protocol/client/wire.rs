@@ -94,10 +94,18 @@ pub struct ExecuteResponseBody {
 
 impl ExecuteResponseBody {
     pub fn into_execute_result(self) -> Result<ExecuteResult, LixError> {
+        let column_count = self.columns.len();
         let rows = self
             .rows
             .into_iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(row_index, row)| {
+                if row.len() != column_count {
+                    return Err(protocol_error(format!(
+                        "execute result row {row_index} has {} values for {column_count} columns",
+                        row.len()
+                    )));
+                }
                 row.into_iter()
                     .map(WireValue::try_into_engine)
                     .collect::<Result<Vec<_>, _>>()
@@ -251,10 +259,7 @@ pub fn encode_engine_values(values: &[Value]) -> Result<Vec<RequestWireValue>, L
 }
 
 pub fn encode_engine_wire_values(values: &[Value]) -> Result<Vec<WireValue>, LixError> {
-    values
-        .iter()
-        .map(WireValue::try_from_engine)
-        .collect()
+    values.iter().map(WireValue::try_from_engine).collect()
 }
 
 pub fn is_recoverable_session_error(error: &LixError) -> bool {
@@ -263,9 +268,7 @@ pub fn is_recoverable_session_error(error: &LixError) -> bool {
 
 pub fn validate_session_id(session_id: &str) -> Result<(), LixError> {
     if (1..=256).contains(&session_id.len())
-        && session_id
-            .bytes()
-            .all(|byte| (0x21..=0x7e).contains(&byte))
+        && session_id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
     {
         Ok(())
     } else {

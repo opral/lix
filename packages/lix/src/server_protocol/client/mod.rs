@@ -726,7 +726,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     })
                 }
                 Err(error) => {
-                    if error_has_http_status(&error) && !is_definitive_client_error(&error) {
+                    if error_clears_cached_branch(&error) {
                         self.state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
@@ -832,7 +832,7 @@ impl<H: ProtocolHttp + Clone + 'static> ProtocolClient<H> {
         let result = self.core.switch_branch(branch_id).await;
         match &result {
             Ok(_) => self.observe.restart(),
-            Err(error) if !is_definitive_client_error(error) => self.observe.restart(),
+            Err(error) if error_clears_cached_branch(error) => self.observe.restart(),
             Err(_) => {}
         }
         result
@@ -1093,13 +1093,13 @@ fn error_http_status(error: &LixError) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
-fn error_has_http_status(error: &LixError) -> bool {
-    error_http_status(error).is_some()
-}
-
 fn is_definitive_client_error(error: &LixError) -> bool {
     let status = error_http_status(error).unwrap_or(0);
     (400..500).contains(&status) && status != 408 && status != 429
+}
+
+fn error_clears_cached_branch(error: &LixError) -> bool {
+    error.code != "LIX_REMOTE_CONFIGURATION_ERROR" && !is_definitive_client_error(error)
 }
 
 use wire::RequestWireValue;

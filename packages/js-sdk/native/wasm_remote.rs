@@ -1,11 +1,11 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::StreamExt;
-use js_sys::{Function, Promise, Reflect, Uint8Array};
+use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
 use lix::server_protocol::client::{
     ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolHttp, ProtocolHttpRequest,
     ProtocolHttpResponse, ProtocolHttpStream, ProtocolObserveEvents, ProtocolTransaction,
@@ -13,6 +13,7 @@ use lix::server_protocol::client::{
 };
 use lix::{CreateBranchOptions as RsCreateBranchOptions, LixError};
 use serde::Deserialize;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -36,6 +37,7 @@ pub struct WasmRemoteLixTransaction {
 pub struct WasmRemoteObserveEvents {
     inner: RefCell<Option<ProtocolObserveEvents<ClientCore<JsHttp>>>>,
     next_in_flight: RefCell<bool>,
+    pending_close: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -80,7 +82,7 @@ impl ProtocolHttp for JsHttp {
         js_sleep(duration).await;
     }
 
-    fn spawn(&self, fut: Pin<Box<dyn std::future::Future<Output = ()>>>) {
+    fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()>>>) {
         wasm_bindgen_futures::spawn_local(fut);
     }
 }
@@ -155,6 +157,7 @@ impl WasmRemoteLix {
         Ok(WasmRemoteObserveEvents {
             inner: RefCell::new(Some(inner)),
             next_in_flight: RefCell::new(false),
+            pending_close: Cell::new(false),
         })
     }
 
@@ -175,7 +178,10 @@ impl WasmRemoteLix {
 
     #[wasm_bindgen(js_name = activeAccountId)]
     pub async fn active_account_id(&self) -> Result<String, JsValue> {
-        self.inner.active_account_id().await.map_err(lix_error_to_js)
+        self.inner
+            .active_account_id()
+            .await
+            .map_err(lix_error_to_js)
     }
 
     #[wasm_bindgen(js_name = createBranch)]
@@ -245,12 +251,16 @@ impl WasmRemoteLix {
 
     #[wasm_bindgen(js_name = importFilesystemPaths)]
     pub async fn import_filesystem_paths(&self, _paths: JsValue) -> Result<(), JsValue> {
-        Err(lix_error_to_js(self.inner.unsupported("importFilesystemPaths")))
+        Err(lix_error_to_js(
+            self.inner.unsupported("importFilesystemPaths"),
+        ))
     }
 
     #[wasm_bindgen(js_name = mergeBranchPreview)]
     pub async fn merge_branch_preview(&self, _options: JsValue) -> Result<JsValue, JsValue> {
-        Err(lix_error_to_js(self.inner.unsupported("mergeBranchPreview")))
+        Err(lix_error_to_js(
+            self.inner.unsupported("mergeBranchPreview"),
+        ))
     }
 
     #[wasm_bindgen(js_name = mergeBranch)]
@@ -314,13 +324,16 @@ impl WasmRemoteObserveEvents {
         }
         *self.next_in_flight.borrow_mut() = true;
         let result = async {
-            let events = self
-                .inner
-                .borrow_mut()
-                .take()
-                .ok_or_else(|| JsValue::UNDEFINED)?;
+            let Some(events) = self.inner.borrow_mut().take() else {
+                return Ok(JsValue::UNDEFINED);
+            };
             let next = events.next().await;
             *self.inner.borrow_mut() = Some(events);
+            if self.pending_close.get()
+                && let Some(events) = self.inner.borrow().as_ref()
+            {
+                events.close();
+            }
             match next {
                 Ok(Some(event)) => observe_event_to_js(event),
                 Ok(None) => Ok(JsValue::UNDEFINED),
@@ -334,7 +347,8 @@ impl WasmRemoteObserveEvents {
 
     #[wasm_bindgen(js_name = close)]
     pub fn close(&self) {
-        if let Some(events) = self.inner.borrow_mut().take() {
+        self.pending_close.set(true);
+        if let Some(events) = self.inner.borrow().as_ref() {
             events.close();
         }
     }
@@ -366,7 +380,7 @@ fn observe_event_to_js(event: lix::ObserveEvent) -> Result<JsValue, JsValue> {
     let object = js_sys::Object::new();
     let set = |key: &str, value: JsValue| {
         Reflect::set(&object, &JsValue::from_str(key), &value)
-            .map_err(|_| js_sys::Error::new("could not encode observe event").into())
+            .map_err(|_| JsValue::from(js_sys::Error::new("could not encode observe event")))
     };
     set("sequence", JsValue::from_f64(event.sequence as f64))?;
     set(
@@ -394,6 +408,8 @@ async fn send_js_http_cancellable(
     let init = js_sys::Object::new();
     set_js(&init, "method", JsValue::from_str(&request.method))?;
     let headers = resolve_caller_headers(&http.headers).await?;
+    delete_header(&headers, "lix-session-id")?;
+    delete_header(&headers, "content-encoding")?;
     for (name, value) in &request.headers {
         if name.eq_ignore_ascii_case("lix-session-id") {
             continue;
@@ -409,10 +425,10 @@ async fn send_js_http_cancellable(
     if let Some(body) = &request.body {
         set_js(&init, "body", Uint8Array::from(body.as_ref()).into())?;
     }
-    let controller = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("AbortController"))
+    let controller = Reflect::get(&js_sys::global(), &JsValue::from_str("AbortController"))
         .ok()
         .and_then(|ctor| ctor.dyn_into::<Function>().ok())
-        .and_then(|ctor| ctor.construct0().ok());
+        .and_then(|ctor| Reflect::construct(&ctor, &Array::new()).ok());
     let cancel: Arc<dyn Fn()> = if let Some(controller) = controller.clone() {
         set_js(
             &init,
@@ -467,10 +483,8 @@ fn js_headers_ctor(init: Option<JsValue>) -> Result<JsValue, LixError> {
         .dyn_into::<Function>()
         .map_err(|_| protocol_bridge("Headers is not available"))?;
     match init {
-        Some(init) => ctor
-            .construct1(&init)
-            .map_err(|error| header_error(error)),
-        None => ctor.construct0().map_err(|error| header_error(error)),
+        Some(init) => Reflect::construct(&ctor, &Array::of1(&init)).map_err(header_error),
+        None => Reflect::construct(&ctor, &Array::new()).map_err(header_error),
     }
 }
 
@@ -480,12 +494,20 @@ fn append_header(headers: &JsValue, name: &str, value: &str) -> Result<(), LixEr
     let set = set
         .dyn_into::<Function>()
         .map_err(|_| protocol_bridge("Headers.set is not available"))?;
-    set.call2(
-        headers,
-        &JsValue::from_str(name),
-        &JsValue::from_str(value),
-    )
-    .map_err(|error| header_error(error))?;
+    set.call2(headers, &JsValue::from_str(name), &JsValue::from_str(value))
+        .map_err(|error| header_error(error))?;
+    Ok(())
+}
+
+fn delete_header(headers: &JsValue, name: &str) -> Result<(), LixError> {
+    let delete = Reflect::get(headers, &JsValue::from_str("delete"))
+        .map_err(|_| protocol_bridge("Headers.delete is not available"))?;
+    let delete = delete
+        .dyn_into::<Function>()
+        .map_err(|_| protocol_bridge("Headers.delete is not available"))?;
+    delete
+        .call1(headers, &JsValue::from_str(name))
+        .map_err(|error| header_error(error))?;
     Ok(())
 }
 
@@ -500,24 +522,45 @@ fn js_status(response: &JsValue) -> Result<u16, LixError> {
 fn js_headers(response: &JsValue) -> Result<Vec<(String, String)>, LixError> {
     let headers = Reflect::get(response, &JsValue::from_str("headers"))
         .map_err(|_| protocol_bridge("remote response headers are missing"))?;
-    let entries = Reflect::get(&headers, &JsValue::from_str("entries"))
+    if headers.is_null() || headers.is_undefined() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    if let Some(value) = js_header_get(&headers, "content-type") {
+        out.push(("content-type".to_owned(), value));
+    }
+    if let Some(value) = js_header_get(&headers, "content-encoding") {
+        out.push(("content-encoding".to_owned(), value));
+    }
+    let iterable = Reflect::get(&headers, &JsValue::from_str("entries"))
         .ok()
         .and_then(|value| value.dyn_into::<Function>().ok())
-        .and_then(|function| function.call0(&headers).ok());
-    let Some(entries) = entries else {
-        return Ok(Vec::new());
-    };
-    let array = js_sys::Array::from(&entries);
-    let mut out = Vec::new();
+        .and_then(|function| function.call0(&headers).ok())
+        .unwrap_or_else(|| headers.clone());
+    let array = Array::from(&iterable);
     for entry in array.iter() {
-        let pair = js_sys::Array::from(&entry);
-        if pair.length() >= 2 {
-            if let (Some(name), Some(value)) = (pair.get(0).as_string(), pair.get(1).as_string()) {
+        let pair = Array::from(&entry);
+        if pair.length() >= 2
+            && let (Some(name), Some(value)) = (pair.get(0).as_string(), pair.get(1).as_string())
+        {
+            if !out
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(&name))
+            {
                 out.push((name, value));
             }
         }
     }
     Ok(out)
+}
+
+fn js_header_get(headers: &JsValue, name: &str) -> Option<String> {
+    let get = Reflect::get(headers, &JsValue::from_str("get"))
+        .ok()
+        .and_then(|value| value.dyn_into::<Function>().ok())?;
+    get.call1(headers, &JsValue::from_str(name))
+        .ok()
+        .and_then(|value| value.as_string())
 }
 
 async fn js_array_buffer(response: &JsValue) -> Result<Bytes, LixError> {
@@ -597,11 +640,7 @@ async fn js_sleep(duration: Duration) {
         if let Ok(set_timeout) = Reflect::get(&global, &JsValue::from_str("setTimeout"))
             && let Ok(set_timeout) = set_timeout.dyn_into::<Function>()
         {
-            let _ = set_timeout.call2(
-                &global,
-                &resolve,
-                &JsValue::from_f64(millis.max(0) as f64),
-            );
+            let _ = set_timeout.call2(&global, &resolve, &JsValue::from_f64(millis.max(0) as f64));
         } else {
             let _ = resolve.call0(&JsValue::UNDEFINED);
         }
@@ -626,13 +665,7 @@ fn fetch_unavailable(error: JsValue) -> LixError {
 }
 
 fn header_error(error: JsValue) -> LixError {
-    LixError::new(
-        "LIX_REMOTE_CONFIGURATION_ERROR",
-        "Remote Lix observation headers could not be resolved",
-    )
-    .with_details(serde_json::json!({
-        "cause": js_error_message(error),
-    }))
+    LixError::new("LIX_REMOTE_CONFIGURATION_ERROR", js_error_message(error))
 }
 
 fn protocol_bridge(message: &str) -> LixError {
@@ -642,11 +675,7 @@ fn protocol_bridge(message: &str) -> LixError {
 fn js_error_message(value: JsValue) -> String {
     value
         .as_string()
-        .or_else(|| {
-            js_sys::Error::from(value.clone())
-                .message()
-                .as_string()
-        })
+        .or_else(|| js_sys::Error::from(value.clone()).message().as_string())
         .unwrap_or_else(|| format!("{value:?}"))
 }
 
@@ -656,5 +685,3 @@ fn transaction_closed_error() -> JsValue {
         "Lix transaction is closed",
     ))
 }
-
-use super::ExecuteResultDto;

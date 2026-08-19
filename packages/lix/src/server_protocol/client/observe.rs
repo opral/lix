@@ -70,26 +70,42 @@ struct SubscriptionState {
     events: Mutex<VecDeque<Result<Option<ObserveEvent>, LixError>>>,
     notify: Notify,
     closed: AtomicBool,
+    last_error: Mutex<Option<LixError>>,
     last_rows: Mutex<Option<ExecuteResult>>,
     last_sequence: Mutex<i64>,
 }
 
-#[derive(Debug)]
 struct HubState {
     closed: bool,
     next_id: u64,
     subscriptions: HashMap<String, Arc<SubscriptionState>>,
+    subscription_order: Vec<String>,
     retry_attempt: u32,
     server_retry_ms: Option<u64>,
     session_recovered: bool,
     generation: u64,
     driver_running: bool,
+    stream_active: bool,
+    current_cancel: Option<super::http::StreamCancel>,
+}
+
+impl std::fmt::Debug for HubState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubState")
+            .field("closed", &self.closed)
+            .field("subscription_count", &self.subscriptions.len())
+            .field("generation", &self.generation)
+            .field("driver_running", &self.driver_running)
+            .field("stream_active", &self.stream_active)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
 pub struct ObservationHub<T> {
     transport: T,
     state: Arc<Mutex<HubState>>,
+    interrupt: Arc<Notify>,
 }
 
 impl<T> std::fmt::Debug for ObservationHub<T> {
@@ -108,15 +124,19 @@ impl<T: ObserveTransport> ObservationHub<T> {
     pub fn new(transport: T) -> Self {
         Self {
             transport,
+            interrupt: Arc::new(Notify::new()),
             state: Arc::new(Mutex::new(HubState {
                 closed: false,
                 next_id: 0,
                 subscriptions: HashMap::new(),
+                subscription_order: Vec::new(),
                 retry_attempt: 0,
                 server_retry_ms: None,
                 session_recovered: false,
                 generation: 0,
                 driver_running: false,
+                stream_active: false,
+                current_cancel: None,
             })),
         }
     }
@@ -144,11 +164,14 @@ impl<T: ObserveTransport> ObservationHub<T> {
             events: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
             closed: AtomicBool::new(false),
+            last_error: Mutex::new(None),
             last_rows: Mutex::new(None),
             last_sequence: Mutex::new(-1),
         });
-        state.subscriptions.insert(id, subscription.clone());
+        state.subscriptions.insert(id.clone(), subscription.clone());
+        state.subscription_order.push(id);
         let should_start = !state.driver_running;
+        let should_restart = state.driver_running && state.stream_active;
         if should_start {
             state.driver_running = true;
             state.generation += 1;
@@ -156,7 +179,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
         drop(state);
         if should_start {
             self.start_driver();
-        } else {
+        } else if should_restart {
             self.restart();
         }
         Ok(ProtocolObserveEvents {
@@ -169,6 +192,9 @@ impl<T: ObserveTransport> ObservationHub<T> {
         let mut state = self.state.lock().await;
         state.closed = true;
         state.generation += 1;
+        abort_current_stream(&mut state);
+        self.interrupt.notify_waiters();
+        state.subscription_order.clear();
         let subscriptions = std::mem::take(&mut state.subscriptions);
         drop(state);
         for subscription in subscriptions.into_values() {
@@ -186,6 +212,8 @@ impl<T: ObserveTransport> ObservationHub<T> {
             state.generation += 1;
             state.retry_attempt = 0;
             state.server_retry_ms = None;
+            abort_current_stream(&mut state);
+            hub.interrupt.notify_waiters();
             if !state.driver_running && !state.subscriptions.is_empty() {
                 state.driver_running = true;
                 drop(state);
@@ -206,13 +234,15 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 let mut state = self.state.lock().await;
                 if state.closed || state.subscriptions.is_empty() {
                     state.driver_running = false;
+                    state.stream_active = false;
                     return;
                 }
                 (
                     state.generation,
                     state
-                        .subscriptions
-                        .values()
+                        .subscription_order
+                        .iter()
+                        .filter_map(|id| state.subscriptions.get(id))
                         .map(|subscription| MultiplexObserveSubscription {
                             id: subscription.id.clone(),
                             sql: subscription.sql.clone(),
@@ -225,12 +255,36 @@ impl<T: ObserveTransport> ObservationHub<T> {
 
             match self.open_stream_with_recovery(subscriptions).await {
                 Ok(mut stream) => {
+                    {
+                        let mut state = self.state.lock().await;
+                        if state.generation != generation
+                            || state.closed
+                            || state.subscriptions.is_empty()
+                        {
+                            (stream.cancel)();
+                            continue;
+                        }
+                        state.stream_active = true;
+                        state.current_cancel = Some(stream.cancel.clone());
+                    }
                     let consume = self.consume_stream(&mut stream, generation).await;
                     (stream.cancel)();
+                    {
+                        let mut state = self.state.lock().await;
+                        state.stream_active = false;
+                        state.current_cancel = None;
+                    }
                     match consume {
                         ConsumeResult::Continue => {}
                         ConsumeResult::Stop => {
                             let mut state = self.state.lock().await;
+                            if state.closed || state.subscriptions.is_empty() {
+                                state.driver_running = false;
+                                return;
+                            }
+                            if state.generation != generation {
+                                continue;
+                            }
                             state.driver_running = false;
                             return;
                         }
@@ -246,24 +300,29 @@ impl<T: ObserveTransport> ObservationHub<T> {
                     self.fail_all(error).await;
                     let mut state = self.state.lock().await;
                     state.driver_running = false;
+                    state.stream_active = false;
                     return;
                 }
             }
 
             let delay = {
                 let mut state = self.state.lock().await;
-                if state.closed || state.subscriptions.is_empty() || state.generation != generation
-                {
-                    if state.generation == generation {
-                        state.driver_running = false;
-                    }
+                if state.closed || state.subscriptions.is_empty() {
+                    state.driver_running = false;
                     return;
                 }
-                let delay = reconnect_delay(&state);
-                state.retry_attempt = state.retry_attempt.saturating_add(1);
-                delay
+                if state.generation != generation {
+                    None
+                } else {
+                    let delay = reconnect_delay(&state);
+                    state.retry_attempt = state.retry_attempt.saturating_add(1);
+                    Some(delay)
+                }
             };
-            self.transport.sleep(delay).await;
+            match delay {
+                None => continue,
+                Some(delay) => self.transport.sleep(delay).await,
+            }
         }
     }
 
@@ -361,14 +420,21 @@ impl<T: ObserveTransport> ObservationHub<T> {
             if !self.is_current(generation).await {
                 return ConsumeResult::Stop;
             }
-            match next_sse_event(
-                &mut stream.body,
-                &mut buffered,
-                &mut event_name,
-                &mut retry,
-                &mut data_lines,
-            )
-            .await
+            let interrupted = self.interrupt.notified();
+            if !self.is_current(generation).await {
+                return ConsumeResult::Stop;
+            }
+            let frame = tokio::select! {
+                _ = interrupted => return ConsumeResult::Stop,
+                frame = next_sse_event(
+                    &mut stream.body,
+                    &mut buffered,
+                    &mut event_name,
+                    &mut retry,
+                    &mut data_lines,
+                ) => frame,
+            };
+            match frame
             {
                 Ok(Some(frame)) => {
                     if let Some(server_retry) = frame.retry {
@@ -479,13 +545,18 @@ impl<T: ObserveTransport> ObservationHub<T> {
         }
         if let Some(subscription_id) = payload.subscription_id {
             let subscription = {
-                let mut state = self.state.lock().await;
-                state.subscriptions.remove(&subscription_id)
+                let state = self.state.lock().await;
+                state.subscriptions.get(&subscription_id).cloned()
             };
             if let Some(subscription) = subscription {
                 if payload.retryable == Some(true) {
                     recover_subscription(&subscription, error).await;
                     return ConsumeResult::Continue;
+                }
+                {
+                    let mut state = self.state.lock().await;
+                    state.subscription_order.retain(|id| id != &subscription_id);
+                    state.subscriptions.remove(&subscription_id);
                 }
                 close_subscription(&subscription, Some(error)).await;
             }
@@ -509,6 +580,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
     async fn fail_all(&self, error: LixError) {
         let subscriptions = {
             let mut state = self.state.lock().await;
+            state.subscription_order.clear();
             std::mem::take(&mut state.subscriptions)
         };
         for subscription in subscriptions.into_values() {
@@ -531,6 +603,9 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
                     return event;
                 }
                 if self.subscription.closed.load(Ordering::SeqCst) {
+                    if let Some(error) = self.subscription.last_error.lock().await.clone() {
+                        return Err(error);
+                    }
                     return Ok(None);
                 }
             }
@@ -541,6 +616,9 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
                     return event;
                 }
                 if self.subscription.closed.load(Ordering::SeqCst) {
+                    if let Some(error) = self.subscription.last_error.lock().await.clone() {
+                        return Err(error);
+                    }
                     return Ok(None);
                 }
             }
@@ -555,6 +633,7 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
             {
                 let mut state = hub.state.lock().await;
                 state.subscriptions.remove(&subscription.id);
+                state.subscription_order.retain(|id| id != &subscription.id);
                 state.generation += 1;
             }
             close_subscription(&subscription, None).await;
@@ -566,6 +645,12 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
 enum ConsumeResult {
     Continue,
     Stop,
+}
+
+fn abort_current_stream(state: &mut HubState) {
+    if let Some(cancel) = state.current_cancel.take() {
+        cancel();
+    }
 }
 
 async fn accept_event(
@@ -611,6 +696,9 @@ async fn recover_subscription(subscription: &SubscriptionState, error: LixError)
 
 async fn close_subscription(subscription: &SubscriptionState, error: Option<LixError>) {
     subscription.closed.store(true, Ordering::SeqCst);
+    if let Some(error) = &error {
+        *subscription.last_error.lock().await = Some(error.clone());
+    }
     let mut events = subscription.events.lock().await;
     if let Some(error) = error {
         events.push_back(Err(error));
@@ -853,7 +941,7 @@ where
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn spawn(&self, fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>) {
+    fn spawn(&self, fut: std::pin::Pin<Box<dyn Future<Output = ()>>>) {
         self.http.spawn(fut);
     }
 }

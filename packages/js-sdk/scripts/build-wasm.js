@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, symlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +11,7 @@ const profile = process.env.LIX_WASM_PROFILE ?? "release";
 const cargoProfile = profile === "release" ? "release" : "dev";
 const artifactProfile = cargoProfile === "release" ? "release" : "debug";
 const outDir = join(packageDir, "dist", "wasm");
+const sourceOutDir = join(packageDir, "src", "wasm");
 
 function run(command, args, options = {}) {
 	return new Promise((resolve, reject) => {
@@ -103,3 +104,6 @@ await run("wasm-bindgen", [
 	"--out-name",
 	"lix_js_sdk",
 ]);
+// Source imports (`../wasm/lix_js_sdk.js`) resolve here for Node vitest.
+await rm(sourceOutDir, { recursive: true, force: true });
+await symlink(outDir, sourceOutDir, "dir");
