@@ -4,8 +4,6 @@
 
 <h3 align="center">Embeddable repository for your product</h3>
 
-<p align="center">Files, SQL database, and version control in one.</p>
-
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
   <a href="https://discord.gg/gdMPPWy57R"><img src="https://img.shields.io/discord/897438559458430986?style=flat&logo=discord&labelColor=white" alt="Discord"></a>
@@ -13,7 +11,7 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is a repository you embed in your product. Everything inside is versioned data: file content, app tables, reviews, comments. There is no external control plane to sync. Agents read and write normal files. Your product queries SQL. You branch, diff, merge, and roll back all of it together:
+Files, SQL database, and version control in one. Everything inside is versioned data: file content, app tables, reviews, comments. There is no external control plane to sync. Agents read and write normal files. Your product queries SQL. You branch, diff, merge, and roll back all of it together:
 
 <img src="./website/public/assets/lix-repo.svg" alt="A Lix repo holds files, a SQL database, and version control in one system" width="760" />
 
