@@ -1,6 +1,7 @@
 import type { LixBinding } from "../binding-types.js";
 import type { RemoteLixServerOptions } from "../types.js";
-import { SERVER_PROTOCOL_PATH } from "./server-protocol.js";
+
+const SERVER_PROTOCOL_PATH = "/lix/v1/";
 
 // Generated WASM glue lives in dist/wasm; package imports keep src tests and
 // the compiled SDK on the same module.

@@ -2,7 +2,7 @@
 //!
 //! JavaScript supplies the repository URL, `fetch`, and auth headers. The
 //! protocol, session, recover-once, gzip, blob splices, and observe hub live
-//! in `lix::server_protocol::client`.
+//! in `lix::server_protocol`.
 
 #![allow(missing_debug_implementations)]
 
@@ -15,9 +15,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Function, Promise, Reflect, Uint8Array};
-use lix::server_protocol::client::{
+use lix::server_protocol::{
     OpenRemoteOptions, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse, ProtocolHttpStream,
-    ProtocolHttpStreamResponse, RemoteExecuteOptions, ServerProtocolClient,
+    ProtocolHttpStreamResponse, RemoteExecuteOptions, RemoteObserveEvents, RemoteTransaction,
+    ServerProtocolClient,
 };
 use lix::{
     CreateBranchOptions as RsCreateBranchOptions, LixError, SwitchBranchOptions as RsSwitchBranchOptions,
@@ -39,12 +40,12 @@ pub struct WasmRemoteLix {
 
 #[wasm_bindgen]
 pub struct WasmRemoteTransaction {
-    inner: Option<lix::server_protocol::client::RemoteTransaction<JsProtocolHttp>>,
+    inner: Option<RemoteTransaction<JsProtocolHttp>>,
 }
 
 #[wasm_bindgen]
 pub struct WasmRemoteObserveEvents {
-    inner: RefCell<Option<lix::server_protocol::client::RemoteObserveEvents>>,
+    inner: RefCell<Option<RemoteObserveEvents>>,
     closed: Cell<bool>,
     next_abort: RefCell<Option<AbortHandle>>,
 }
@@ -220,32 +221,22 @@ impl WasmRemoteLix {
 
     #[wasm_bindgen(js_name = importFilesystemPaths)]
     pub async fn import_filesystem_paths(&self, _paths: JsValue) -> Result<(), JsValue> {
-        Err(lix_error_to_js(
-            ServerProtocolClient::<JsProtocolHttp>::unsupported_local_operation(
-                "importFilesystemPaths",
-            ),
-        ))
+        Err(lix_error_to_js(unsupported_remote("importFilesystemPaths")))
     }
 
     #[wasm_bindgen(js_name = mergeBranchPreview)]
     pub async fn merge_branch_preview(&self, _options: JsValue) -> Result<JsValue, JsValue> {
-        Err(lix_error_to_js(
-            ServerProtocolClient::<JsProtocolHttp>::unsupported_local_operation("mergeBranchPreview"),
-        ))
+        Err(lix_error_to_js(unsupported_remote("mergeBranchPreview")))
     }
 
     #[wasm_bindgen(js_name = mergeBranch)]
     pub async fn merge_branch(&self, _options: JsValue) -> Result<JsValue, JsValue> {
-        Err(lix_error_to_js(
-            ServerProtocolClient::<JsProtocolHttp>::unsupported_local_operation("mergeBranch"),
-        ))
+        Err(lix_error_to_js(unsupported_remote("mergeBranch")))
     }
 
     #[wasm_bindgen(js_name = syncDiskToLix)]
     pub async fn sync_disk_to_lix(&self) -> Result<(), JsValue> {
-        Err(lix_error_to_js(
-            ServerProtocolClient::<JsProtocolHttp>::unsupported_local_operation("syncDiskToLix"),
-        ))
+        Err(lix_error_to_js(unsupported_remote("syncDiskToLix")))
     }
 
     #[wasm_bindgen(js_name = close)]
@@ -777,6 +768,14 @@ fn js_error_message(value: &JsValue) -> String {
         .ok()
         .and_then(|value| value.as_string())
         .unwrap_or_else(|| format!("{value:?}"))
+}
+
+fn unsupported_remote(operation: &str) -> LixError {
+    LixError::new(
+        "LIX_UNSUPPORTED_REMOTE_OPERATION",
+        format!("{operation} is not supported in remote mode"),
+    )
+    .with_details(serde_json::json!({ "operation": operation }))
 }
 
 fn transaction_closed_error() -> JsValue {

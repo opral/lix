@@ -21,9 +21,6 @@ pub use http::{
     ProtocolHttpStreamResponse,
 };
 pub use observe::RemoteObserveEvents;
-pub use wire::{
-    PROTOCOL_PATH, PROTOCOL_VERSION, SERVER_CLOSED, SESSION_GONE, SESSION_ID_HEADER,
-};
 
 use blobs::{PreparedRequestParams, RequestBlobCache, request_blob_slot};
 use observe::ObservationHub;
@@ -36,8 +33,9 @@ use wire::{
     BLOB_BASE_MISSING, BeginTransactionResponse, CreateBranchRequest, CreateBranchResponse,
     CreateCheckpointResponse, ErrorEnvelope, ExecuteBatchRequest, ExecuteBatchStatementRequest,
     ExecuteOptionsRequest, ExecuteRequest, ExecuteResponse, HandshakeResponse, PROTOCOL_ERROR,
-    RedoResponse, RequestWireValue, SwitchBranchRequest, SwitchBranchResponse,
-    TRANSACTION_ID_HEADER, UndoResponse, UNSUPPORTED_REMOTE_OPERATION,
+    PROTOCOL_VERSION, RedoResponse, RequestWireValue, SERVER_CLOSED, SESSION_GONE,
+    SESSION_ID_HEADER, SwitchBranchRequest, SwitchBranchResponse, TRANSACTION_ID_HEADER,
+    UndoResponse,
 };
 use crate::{
     CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
@@ -368,10 +366,6 @@ impl<H: ProtocolHttp + 'static> ServerProtocolClient<H> {
             }
         })
         .await
-    }
-
-    pub fn unsupported_local_operation(operation: &str) -> LixError {
-        unsupported(operation)
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
@@ -881,14 +875,6 @@ fn idempotency_key(provided: Option<&str>) -> Result<String, LixError> {
 
 pub(crate) fn protocol_error(message: impl Into<String>) -> LixError {
     LixError::new(PROTOCOL_ERROR, message)
-}
-
-pub(crate) fn unsupported(operation: &str) -> LixError {
-    LixError::new(
-        UNSUPPORTED_REMOTE_OPERATION,
-        format!("{operation} is not supported in remote mode"),
-    )
-    .with_details(serde_json::json!({ "operation": operation }))
 }
 
 pub(crate) fn with_status(mut error: LixError, status: u16) -> LixError {

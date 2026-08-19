@@ -16,10 +16,6 @@
 			"types": "./dist/workerd.d.ts",
 			"workerd": "./dist/workerd.js",
 			"default": "./dist/workerd.js"
-		},
-		"./server-protocol": {
-			"types": "./dist/remote/server-protocol.d.ts",
-			"default": "./dist/remote/server-protocol.js"
 		}
 	},
 	"imports": {

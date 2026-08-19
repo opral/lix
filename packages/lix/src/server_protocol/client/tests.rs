@@ -1,7 +1,7 @@
+use super::wire::{SERVER_CLOSED, SESSION_GONE, SESSION_ID_HEADER};
 use super::{
     OpenRemoteOptions, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse,
-    ProtocolHttpStream, ProtocolHttpStreamResponse, RemoteExecuteOptions, SERVER_CLOSED,
-    SESSION_GONE, SESSION_ID_HEADER, ServerProtocolClient,
+    ProtocolHttpStream, ProtocolHttpStreamResponse, RemoteExecuteOptions, ServerProtocolClient,
 };
 use crate::{LixError, Value};
 use async_trait::async_trait;

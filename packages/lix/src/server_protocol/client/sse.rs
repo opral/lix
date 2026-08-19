@@ -5,13 +5,13 @@ use crate::LixError;
 use super::wire::PROTOCOL_ERROR;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SseEvent {
+pub(crate) struct SseEvent {
     pub event: String,
     pub data: String,
     pub retry: Option<u64>,
 }
 
-pub struct SseReader {
+pub(crate) struct SseReader {
     stream: Box<dyn ProtocolHttpStream>,
     buffered: String,
     event_name: String,

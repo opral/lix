@@ -3,24 +3,21 @@
 use crate::{LixNotice, WireValue};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_PATH: &str = "/lix/v1";
-pub const PROTOCOL_VERSION: u32 = 2;
-pub const SESSION_ID_HEADER: &str = "lix-session-id";
-pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
-pub const TRANSACTION_ID_HEADER: &str = "lix-transaction-id";
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const SESSION_ID_HEADER: &str = "lix-session-id";
+pub(crate) const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+pub(crate) const TRANSACTION_ID_HEADER: &str = "lix-transaction-id";
 
-pub const SESSION_GONE: &str = "LIX_ERROR_PROTOCOL_SESSION_GONE";
-pub const SERVER_CLOSED: &str = "LIX_ERROR_PROTOCOL_SERVER_CLOSED";
-pub const BLOB_BASE_MISSING: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
-pub const PROTOCOL_ERROR: &str = "LIX_SERVER_PROTOCOL_ERROR";
-pub const REMOTE_UNAVAILABLE: &str = "LIX_REMOTE_UNAVAILABLE";
-pub const REMOTE_REQUEST_FAILED: &str = "LIX_REMOTE_REQUEST_FAILED";
-pub const REMOTE_CONFIGURATION_ERROR: &str = "LIX_REMOTE_CONFIGURATION_ERROR";
-pub const UNSUPPORTED_REMOTE_OPERATION: &str = "LIX_UNSUPPORTED_REMOTE_OPERATION";
+pub(crate) const SESSION_GONE: &str = "LIX_ERROR_PROTOCOL_SESSION_GONE";
+pub(crate) const SERVER_CLOSED: &str = "LIX_ERROR_PROTOCOL_SERVER_CLOSED";
+pub(crate) const BLOB_BASE_MISSING: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
+pub(crate) const PROTOCOL_ERROR: &str = "LIX_SERVER_PROTOCOL_ERROR";
+pub(crate) const REMOTE_UNAVAILABLE: &str = "LIX_REMOTE_UNAVAILABLE";
+pub(crate) const REMOTE_REQUEST_FAILED: &str = "LIX_REMOTE_REQUEST_FAILED";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HandshakeResponse {
+pub(crate) struct HandshakeResponse {
     pub protocol_version: u32,
     pub active_branch_id: String,
     pub active_account_id: String,
@@ -29,7 +26,7 @@ pub struct HandshakeResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExecuteRequest<'a> {
+pub(crate) struct ExecuteRequest<'a> {
     pub sql: &'a str,
     pub params: &'a [RequestWireValue],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,14 +37,14 @@ pub struct ExecuteRequest<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExecuteOptionsRequest {
+pub(crate) struct ExecuteOptionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExecuteBatchRequest<'a> {
+pub(crate) struct ExecuteBatchRequest<'a> {
     pub statements: &'a [ExecuteBatchStatementRequest],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<ExecuteOptionsRequest>,
@@ -56,7 +53,7 @@ pub struct ExecuteBatchRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ExecuteBatchStatementRequest {
+pub(crate) struct ExecuteBatchStatementRequest {
     pub sql: String,
     pub params: Vec<RequestWireValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,14 +62,14 @@ pub struct ExecuteBatchStatementRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub enum RequestWireValue {
+pub(crate) enum RequestWireValue {
     Value(WireValue),
     BlobSplice(RequestBlobSplice),
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RequestBlobSplice {
+pub(crate) struct RequestBlobSplice {
     pub kind: &'static str,
     pub base_sha256: String,
     pub result_sha256: String,
@@ -83,7 +80,7 @@ pub struct RequestBlobSplice {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExecuteResponse {
+pub(crate) struct ExecuteResponse {
     #[serde(default)]
     pub statement_index: Option<usize>,
     #[serde(default)]
@@ -97,13 +94,13 @@ pub struct ExecuteResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BeginTransactionResponse {
+pub(crate) struct BeginTransactionResponse {
     pub transaction_id: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateBranchRequest {
+pub(crate) struct CreateBranchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub name: String,
@@ -113,7 +110,7 @@ pub struct CreateBranchRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateBranchResponse {
+pub(crate) struct CreateBranchResponse {
     pub id: String,
     pub name: String,
     pub hidden: bool,
@@ -122,13 +119,13 @@ pub struct CreateBranchResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateCheckpointResponse {
+pub(crate) struct CreateCheckpointResponse {
     pub commit_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UndoResponse {
+pub(crate) struct UndoResponse {
     pub branch_id: String,
     pub target_commit_id: String,
     pub inverse_commit_id: String,
@@ -136,7 +133,7 @@ pub struct UndoResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RedoResponse {
+pub(crate) struct RedoResponse {
     pub branch_id: String,
     pub target_commit_id: String,
     pub replay_commit_id: String,
@@ -144,23 +141,23 @@ pub struct RedoResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SwitchBranchRequest<'a> {
+pub(crate) struct SwitchBranchRequest<'a> {
     pub branch_id: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SwitchBranchResponse {
+pub(crate) struct SwitchBranchResponse {
     pub branch_id: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct MultiplexObserveRequest {
+pub(crate) struct MultiplexObserveRequest {
     pub subscriptions: Vec<MultiplexObserveSubscription>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct MultiplexObserveSubscription {
+pub(crate) struct MultiplexObserveSubscription {
     pub id: String,
     pub sql: String,
     pub params: Vec<WireValue>,
@@ -168,7 +165,7 @@ pub struct MultiplexObserveSubscription {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MultiplexObserveEvent {
+pub(crate) struct MultiplexObserveEvent {
     pub subscription_id: String,
     pub sequence: u64,
     pub mutation_sequence: u64,
@@ -180,7 +177,7 @@ pub struct MultiplexObserveEvent {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum ObserveDelta {
+pub(crate) enum ObserveDelta {
     #[serde(rename = "single-blob-splice", rename_all = "camelCase")]
     SingleBlobSplice {
         base_sequence: u64,
@@ -199,7 +196,7 @@ pub enum ObserveDelta {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MultiplexObserveError {
+pub(crate) struct MultiplexObserveError {
     #[serde(default)]
     pub subscription_id: Option<String>,
     pub error: ErrorBody,
@@ -208,12 +205,12 @@ pub struct MultiplexObserveError {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ErrorEnvelope {
+pub(crate) struct ErrorEnvelope {
     pub error: ErrorBody,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ErrorBody {
+pub(crate) struct ErrorBody {
     #[serde(default)]
     pub code: Option<String>,
     #[serde(default)]
