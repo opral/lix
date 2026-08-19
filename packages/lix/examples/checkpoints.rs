@@ -17,7 +17,7 @@ async fn main() -> Result<(), LixError> {
     let working_diffs = lix
         .execute(
             "SELECT row_pk, schema_key, diff_type
-             FROM lix_working_diff
+             FROM lix_working_diff()
              ORDER BY schema_key, row_pk",
             &[],
         )
@@ -36,12 +36,12 @@ async fn main() -> Result<(), LixError> {
     println!("created checkpoint {}", checkpoint.commit_id);
 
     // `lix_checkpoint` holds the checkpoint rows and carries no ordering column.
-    // `lix_checkpoint_history()` exposes `lixcol_depth`, so ascending depth is
+    // `lix_history('lix_checkpoint')` exposes `lixcol_depth`, so ascending depth is
     // newest-first.
     let checkpoints = lix
         .execute(
             "SELECT commit_id, lixcol_depth
-             FROM lix_checkpoint_history()
+             FROM lix_history('lix_checkpoint')
              ORDER BY lixcol_depth",
             &[],
         )
@@ -58,7 +58,7 @@ async fn main() -> Result<(), LixError> {
     );
 
     let remaining = lix
-        .execute("SELECT COUNT(*) AS count FROM lix_working_diff", &[])
+        .execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
         .await?;
     let remaining_count = remaining.rows()[0].get::<i64>("count")?;
     assert_eq!(remaining_count, 0);

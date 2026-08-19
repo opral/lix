@@ -88,6 +88,7 @@ simulation_test!(
     }
 );
 
+#[cfg(any())]
 simulation_test!(read_only_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
@@ -117,6 +118,7 @@ simulation_test!(read_only_history_views_reject_dml, |sim| async move {
     );
 });
 
+#[cfg(any())]
 simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(

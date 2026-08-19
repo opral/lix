@@ -8,13 +8,11 @@ Lix exposes logical application data through typed SQL relations:
 
 | Data                            | Current session              | History / comparison                   |
 | :------------------------------ | :--------------------------- | :------------------------------------- |
-| Registered application row `X` | `<schema>`                   | `<schema>_history()`                   |
-| Files                           | `lix_file`                   | `lix_file_history()`                   |
-| Directories                     | `lix_directory`              | `lix_directory_history()`              |
-| Working diffs                   | `lix_working_diff`           | `lix_diff(from_commit, to_commit)`     |
-| File working diffs              | `lix_file_working_diff`      | —                                      |
-| Directory working diffs         | `lix_directory_working_diff` | —                                      |
-| Checkpoints                     | `lix_checkpoint`             | `lix_checkpoint_history()`             |
+| Registered application row `X` | `<schema>`                   | `lix_history('<schema>')`                   |
+| Files                           | `lix_file`                   | `lix_history('lix_file')`                   |
+| Directories                     | `lix_directory`              | `lix_history('lix_directory')`              |
+| Working diffs                   | `lix_working_diff()`         | `lix_diff(from_commit, to_commit)`     |
+| Checkpoints                     | `lix_checkpoint`             | `lix_history('lix_checkpoint')`             |
 
 The history functions read revisions reachable from a commit; `lix_diff`
 compares two arbitrary commits. `lix_registered_schema` and its history
@@ -41,11 +39,10 @@ other segment text is preserved exactly: the engine does not URL-decode,
 case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that
 the target host cannot represent.
 
-The checkpoint and diff relations are read-only. `lix_working_diff` and
+The checkpoint and diff relations are read-only. `lix_working_diff()` and
 `lix_diff()` expose a `diff_id` that can
 feed the `lix_revert`, `lix_apply`, and `lix_create_checkpoint` command sinks.
-`lix_checkpoint` and the file and directory working-diff relations do not
-carry a `diff_id`. See [Checkpoints](./checkpoints.md) and
+`lix_checkpoint` does not carry a `diff_id`. See [Checkpoints](./checkpoints.md) and
 [Diff commands](./diff-commands.md).
 
 ## The executable column contract
@@ -98,11 +95,11 @@ describe omission only; `is_nullable` still describes read values.
 
 Registering a Schema v1 document with `key: "acme_task"` produces:
 
-| Surface                      | Use for                                                   |
-| :--------------------------- | :-------------------------------------------------------- |
-| `acme_task`                  | Read and mutate tasks in the current session.              |
-| `acme_task_history()`        | Read task revisions reachable from the active head.       |
-| `acme_task_history($commit)` | Read task revisions reachable from an explicit commit.    |
+| Surface                              | Use for                                                |
+| :----------------------------------- | :----------------------------------------------------- |
+| `acme_task`                          | Read and mutate tasks in the current session.          |
+| `lix_history('acme_task')`           | Read revisions reachable from the active head.         |
+| `lix_history('acme_task', $commit)`  | Read revisions reachable from an explicit commit.      |
 
 User properties become ordinary typed columns:
 
@@ -115,8 +112,9 @@ WHERE done = false;
 Lix bookkeeping columns use the `lixcol_*` prefix. Relations are scoped to the
 session's active branch. Open another session to work on another branch.
 
-Every public history read calls its table-valued function with zero or one
-commit-id argument; there are no bare history table aliases.
+Every public history read calls `lix_history` with a relation-name text literal
+and an optional commit-id argument; there are no generated history functions or
+bare history table aliases.
 [History](./history.md) documents the history columns, depth ordering,
 composite-key lookups, and tombstones.
 
@@ -141,7 +139,7 @@ beginning with `lix_`; their base or generated SQL names occupy the namespace
 reserved for Lix bootstrap schemas. Use an owner-specific prefix such as
 `acme_task`.
 
-`lix_key_value` and `lix_key_value_history()` are public for shared repository
+`lix_key_value` and `lix_history('lix_key_value')` are public for shared repository
 settings and interoperability metadata.
 
 ## Files
@@ -151,7 +149,7 @@ settings and interoperability metadata.
 | Surface              | Use for                                 |
 | :------------------- | :-------------------------------------- |
 | `lix_file`           | Current files on the active branch.     |
-| `lix_file_history()` | File revisions reachable from a commit. |
+| `lix_history('lix_file')` | File revisions reachable from a commit. |
 
 User columns are `id`, `path`, `directory_id`, `name`, and `content`.
 
@@ -186,7 +184,7 @@ Directories use the same three scopes:
 | Surface                   | Use for                                      |
 | :------------------------ | :------------------------------------------- |
 | `lix_directory`           | Current directories on the active branch.    |
-| `lix_directory_history()` | Directory revisions reachable from a commit. |
+| `lix_history('lix_directory')` | Directory revisions reachable from a commit. |
 
 User columns are `id`, `path`, `parent_id`, and `name`. Directory and file
 paths share the same canonical syntax: non-root paths do not end with a slash.

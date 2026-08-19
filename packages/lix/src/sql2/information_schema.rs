@@ -15,7 +15,6 @@ use datafusion::prelude::SessionContext;
 
 use crate::LixError;
 
-use super::catalog::PublicSurfaceKind;
 use super::catalog::{PublicCatalog, PublicColumnInsertPolicy};
 use super::result_metadata::field_is_json;
 
@@ -165,6 +164,7 @@ impl LixInformationSchemaProvider {
         let mut function_catalog = Vec::new();
         let mut function_schema = Vec::new();
         let mut function_name = Vec::new();
+        let mut source_relation = Vec::new();
         let mut argument_signature = Vec::new();
         let mut result_column = Vec::new();
         let mut ordinal_position = Vec::new();
@@ -172,24 +172,17 @@ impl LixInformationSchemaProvider {
         let mut data_type = Vec::new();
         let mut lix_value_kind = Vec::new();
 
-        for surface in self.public_catalog.surfaces().filter(|surface| {
-            matches!(
-                surface.kind,
-                PublicSurfaceKind::SchemaHistory { .. }
-                    | PublicSurfaceKind::FileHistory
-                    | PublicSurfaceKind::DirectoryHistory
-            )
-        }) {
+        for history in self.public_catalog.history_relations() {
             let provider_schema = self
                 .public_catalog
-                .history_surface_schema(&surface.name)
+                .history_relation_schema(&history.relation_name)
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "history function '{}' is missing its result schema",
-                        surface.name
+                        "history relation '{}' is missing its result schema",
+                        history.relation_name
                     ))
                 })?;
-            for (position, column) in surface
+            for (position, column) in history
                 .columns
                 .iter()
                 .filter(|column| column.is_public())
@@ -198,11 +191,39 @@ impl LixInformationSchemaProvider {
                 let field = provider_schema.field_with_name(&column.name)?;
                 function_catalog.push(self.public_catalog_name.clone());
                 function_schema.push(self.public_schema_name.clone());
-                function_name.push(surface.name.clone());
-                argument_signature.push("() | (as_of TEXT)".to_string());
+                function_name.push("lix_history".to_string());
+                source_relation.push(Some(history.relation_name.clone()));
+                argument_signature
+                    .push("(relation TEXT) | (relation TEXT, as_of TEXT)".to_string());
                 result_column.push(column.name.clone());
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if column.read_nullable { "YES" } else { "NO" }.to_string());
+                data_type.push(public_sql_type(field.data_type()));
+                lix_value_kind.push(field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()));
+            }
+        }
+
+        for (name, signature, provider_schema) in [
+            (
+                "lix_working_diff",
+                "()",
+                super::providers::working_diff_schema(),
+            ),
+            (
+                "lix_diff",
+                "(from_commit_id TEXT, to_commit_id TEXT)",
+                super::providers::diff_schema(),
+            ),
+        ] {
+            for (position, field) in provider_schema.fields().iter().enumerate() {
+                function_catalog.push(self.public_catalog_name.clone());
+                function_schema.push(self.public_schema_name.clone());
+                function_name.push(name.to_string());
+                source_relation.push(None);
+                argument_signature.push(signature.to_string());
+                result_column.push(field.name().clone());
+                ordinal_position.push((position + 1) as u64);
+                is_nullable.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                 data_type.push(public_sql_type(field.data_type()));
                 lix_value_kind.push(field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()));
             }
@@ -214,6 +235,7 @@ impl LixInformationSchemaProvider {
                 Arc::new(StringArray::from(function_catalog)),
                 Arc::new(StringArray::from(function_schema)),
                 Arc::new(StringArray::from(function_name)),
+                Arc::new(StringArray::from(source_relation)),
                 Arc::new(StringArray::from(argument_signature)),
                 Arc::new(StringArray::from(result_column)),
                 Arc::new(UInt64Array::from(ordinal_position)),
@@ -268,6 +290,7 @@ fn table_functions_schema() -> SchemaRef {
         Field::new("function_catalog", DataType::Utf8, false),
         Field::new("function_schema", DataType::Utf8, false),
         Field::new("function_name", DataType::Utf8, false),
+        Field::new("source_relation", DataType::Utf8, true),
         Field::new("argument_signature", DataType::Utf8, false),
         Field::new("result_column", DataType::Utf8, false),
         Field::new("ordinal_position", DataType::UInt64, false),

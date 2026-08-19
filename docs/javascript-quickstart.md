@@ -38,7 +38,7 @@ Lix records both writes automatically. You do not need to create commits.
 ```ts
 const history = await lix.execute(
   `SELECT path, content, lixcol_depth
-     FROM lix_file_history()
+     FROM lix_history('lix_file')
     WHERE path = $1
     ORDER BY lixcol_depth`,
   ["/hello.txt"],

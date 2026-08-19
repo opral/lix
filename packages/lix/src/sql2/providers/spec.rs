@@ -562,14 +562,6 @@ pub(super) fn register_spec_table(
         )?;
     }
     let provider = Arc::new(SpecTableProvider::new(spec));
-    if let Some(anchor_column) = provider.history_anchor_column() {
-        return super::history_table_function::register_history_table_function(
-            session,
-            surface_name,
-            provider,
-            anchor_column,
-        );
-    }
     session
         .register_table(surface_name, provider)
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;

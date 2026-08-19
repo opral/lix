@@ -38,9 +38,7 @@ simulation_test!(create_branch_rejects_existing_id, |sim| async move {
 
     assert_eq!(error.code, "LIX_ERROR_UNIQUE");
     assert!(
-        error
-            .to_string()
-            .contains("INSERT would duplicate row_pk"),
+        error.to_string().contains("INSERT would duplicate row_pk"),
         "error should explain the duplicate branch id: {error:?}"
     );
     assert_branch_descriptor(&main, "01930000-0000-7000-8000-000000000001", "Draft").await;
@@ -882,7 +880,7 @@ simulation_test!(
         let working_diffs = main
             .execute(
                 "SELECT row_pk, diff_type \
-                 FROM lix_working_diff \
+                 FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY row_pk",
                 &[],
@@ -1261,12 +1259,11 @@ simulation_test!(
             commit_parent_edges(&main, &source_head).await,
             vec![(recovered_head, 0), (checkpoint, 1)]
         );
-        main
-            .merge_branch(MergeBranchOptions {
-                source_branch_id: "01930000-0000-7000-8000-000000000002".to_string(),
-            })
-            .await
-            .expect("same-identity changes use deterministic column LWW");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "01930000-0000-7000-8000-000000000002".to_string(),
+        })
+        .await
+        .expect("same-identity changes use deterministic column LWW");
         assert_key_value(&main, "checkpoint-bridge-conflict", Some("\"target\"")).await;
     }
 );
@@ -1324,7 +1321,7 @@ simulation_test!(
         let history = main
             .execute(
                 "SELECT value \
-	             FROM lix_key_value_history() \
+	             FROM lix_history('lix_key_value') \
 	               WHERE key = 'merge-select-change' \
 	             ORDER BY lixcol_depth",
                 &[],
@@ -1525,12 +1522,11 @@ simulation_test!(
             )
             .await
             .expect("draft update should succeed");
-        main
-            .merge_branch(MergeBranchOptions {
-                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
-            })
-            .await
-            .expect("delete/modify uses deterministic whole-row LWW");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("delete/modify uses deterministic whole-row LWW");
         assert_key_value(
             &main,
             "73686172-6564-8d62-8566-6f72652d6200",
@@ -1552,12 +1548,11 @@ simulation_test!(
         .await
         .expect("main update should succeed");
         delete_key_value(&draft, "73686172-6564-8d62-8566-6f72652d6200").await;
-        main
-            .merge_branch(MergeBranchOptions {
-                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
-            })
-            .await
-            .expect("modify/delete uses deterministic whole-row LWW");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("modify/delete uses deterministic whole-row LWW");
         assert_key_value(&main, "73686172-6564-8d62-8566-6f72652d6200", None).await;
     }
 );
@@ -1642,12 +1637,11 @@ simulation_test!(
             )
             .await
             .expect("draft insert should succeed");
-        main
-            .merge_branch(MergeBranchOptions {
-                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
-            })
-            .await
-            .expect("independent adds use deterministic whole-row LWW");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("independent adds use deterministic whole-row LWW");
         assert_key_value(&main, "merge-independent-add", Some("\"draft\"")).await;
     }
 );
@@ -2103,7 +2097,7 @@ simulation_test!(
         let rows = draft
             .execute(
                 "SELECT diff_type, before_change_id, after_change_id \
-                 FROM lix_working_diff \
+                 FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                    AND row_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
                 &[],
@@ -2161,7 +2155,7 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM lix_working_diff \
+                 SELECT diff_id FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                    AND row_pk = CAST('[\"branch-revert\"]' AS JSONB)",
                 &[],
@@ -2219,7 +2213,7 @@ simulation_test!(
         let rows = main
             .execute(
                 "SELECT diff_type, before_change_id \
-                 FROM lix_working_diff \
+                 FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                    AND row_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
                 &[],
@@ -2270,7 +2264,7 @@ simulation_test!(
 
         let narrow = draft
             .execute(
-                "SELECT diff_type, before_change_id FROM lix_working_diff \
+                "SELECT diff_type, before_change_id FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                    AND row_pk = CAST('[\"branch-delete\"]' AS JSONB)",
                 &[],
@@ -2291,7 +2285,7 @@ simulation_test!(
 
         let broad = draft
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff \
+                "SELECT row_pk, diff_type FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
                 &[],
             )
@@ -2369,7 +2363,7 @@ simulation_test!(
 
         let rows = draft
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff \
+                "SELECT row_pk, diff_type FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
                 &[],
             )
@@ -2449,7 +2443,7 @@ simulation_test!(
 
         let rows = draft
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff \
+                "SELECT row_pk, diff_type FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
                 &[],
             )
@@ -2509,7 +2503,7 @@ simulation_test!(
 
         let rows = main
             .execute(
-                "SELECT diff_type, before_change_id FROM lix_working_diff \
+                "SELECT diff_type, before_change_id FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                    AND row_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
                 &[],
@@ -2563,7 +2557,7 @@ simulation_test!(
         assert_key_value(&draft, "branch-checkpoint", Some("\"after\"")).await;
         let rows = draft
             .execute(
-                "SELECT row_pk FROM lix_working_diff WHERE schema_key = 'lix_key_value'",
+                "SELECT row_pk FROM lix_working_diff() WHERE schema_key = 'lix_key_value'",
                 &[],
             )
             .await

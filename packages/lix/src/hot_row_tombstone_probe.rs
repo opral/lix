@@ -205,7 +205,7 @@ async fn drop_all_tombstones(storage: &Memory) -> usize {
 async fn working_diff_rows(session: &SessionContext<Memory>, schema_key: &str) -> usize {
     session
         .execute(
-            "SELECT row_pk FROM lix_working_diff WHERE schema_key = $1",
+            "SELECT row_pk FROM lix_working_diff() WHERE schema_key = $1",
             &[crate::Value::Text(schema_key.to_string())],
         )
         .await
@@ -934,7 +934,10 @@ async fn undo_restores_a_row_whose_tombstone_was_removed() {
 
     assert_eq!(before, 3, "fixture should start with three rows");
     assert_eq!(after_delete, 2, "the delete should be visible");
-    assert_eq!(removed, 1, "the delete should have left exactly one tombstone");
+    assert_eq!(
+        removed, 1,
+        "the delete should have left exactly one tombstone"
+    );
     assert_eq!(
         after_drop, 2,
         "removing the tombstone must not resurrect the row"
@@ -967,10 +970,7 @@ async fn undo_restores_a_row_whose_tombstone_was_removed() {
 #[tokio::test]
 #[ignore = "measurement probe, not a gate"]
 async fn retention_fence_durability_across_supported_operations() {
-    async fn untracked_insert(
-        session: &SessionContext<Memory>,
-        table: &str,
-    ) -> Result<(), String> {
+    async fn untracked_insert(session: &SessionContext<Memory>, table: &str) -> Result<(), String> {
         session
             .execute(
                 &format!(
@@ -1278,7 +1278,10 @@ async fn recreated_identity_created_at_without_compaction() {
     register(&session, probe_schema("c8row")).await;
 
     session
-        .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
+        .execute(
+            "INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')",
+            &[],
+        )
         .await
         .expect("first insert should commit");
     // Mirrors the compacted arm's shape exactly, so the only difference
@@ -1337,7 +1340,10 @@ async fn recreated_identity_created_at_after_compaction() {
         .expect("active branch id reads");
 
     session
-        .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
+        .execute(
+            "INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')",
+            &[],
+        )
         .await
         .expect("first insert should commit");
     // The insert has to be checkpointed before the delete, or the two cancel
@@ -1519,9 +1525,8 @@ struct CompactionCounters {
 }
 
 fn compaction_counters() -> CompactionCounters {
-    let load = |counter: &std::sync::atomic::AtomicU64| {
-        counter.load(std::sync::atomic::Ordering::Relaxed)
-    };
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
     CompactionCounters {
         routes: load(&crate::hot_state::COMPACTED_TOMBSTONE_ROUTES),
         offered: load(&crate::hot_state::COMPACTED_TOMBSTONE_OFFERED),
@@ -1797,7 +1802,6 @@ async fn checkpoint_compaction_scan_cost() {
     }
 }
 
-
 /// PHASE 7 - how much of a scan's decode work is tombstones, counted at the
 /// per-entry decode loop.
 ///
@@ -1881,7 +1885,10 @@ async fn hot_row_tombstone_decode_census() {
             let census = row_census(&storage).await;
             let _ = timed_scan(&session, &scan_sql("c7upd"), 1, 1).await;
             reset();
-            let rows = session.execute(&scan_sql("c7upd"), &[]).await.expect("scan");
+            let rows = session
+                .execute(&scan_sql("c7upd"), &[])
+                .await
+                .expect("scan");
             let (decoded, matched, tombs) = read();
             let scan = timed_scan(&session, &scan_sql("c7upd"), 1, reps).await;
             println!(
@@ -1981,7 +1988,6 @@ async fn hot_row_tombstone_decode_census() {
         }
     }
 }
-
 
 /// PHASE 11 - does a churning workload accumulate tombstones without bound?
 ///
@@ -2104,10 +2110,7 @@ async fn hot_row_tombstone_churn_cycles() {
                 .collect::<Vec<_>>()
                 .join(",");
             session
-                .execute(
-                    &format!("DELETE FROM {table} WHERE id IN ({del})"),
-                    &[],
-                )
+                .execute(&format!("DELETE FROM {table} WHERE id IN ({del})"), &[])
                 .await
                 .expect("round delete should commit");
             let mut counters = CompactionCounters::default();
@@ -2140,7 +2143,6 @@ async fn hot_row_tombstone_churn_cycles() {
         }
     }
 }
-
 
 /// Removes only the tombstones of identities created and deleted inside the
 /// current checkpoint interval, identified by name prefix rather than by
@@ -2250,7 +2252,10 @@ async fn interval_local_tombstone_has_no_dependent_reader() {
             "phase12 | arm=local before: entries={} tombstones={} packed_bases={} root_bases={} working_diff_rows={diff_before} live={live_before}",
             census.entries, census.tombstones, census.packed_bases, census.root_bases
         );
-        assert_eq!(live_before, 1, "only the survivor is live before the removal");
+        assert_eq!(
+            live_before, 1,
+            "only the survivor is live before the removal"
+        );
 
         let removed = drop_tombstones_named(&storage, "ephem-").await;
         let session = reopen_session(&storage).await;
@@ -2270,10 +2275,14 @@ async fn interval_local_tombstone_has_no_dependent_reader() {
             .expect("point read")
             .len();
         println!(
-            "phase12 | arm=local after: removed={removed} entries={} tombstones={} working_diff_rows={diff_after} live={live_after} point_hits_for_deleted={point}"
-        , census.entries, census.tombstones);
+            "phase12 | arm=local after: removed={removed} entries={} tombstones={} working_diff_rows={diff_after} live={live_after} point_hits_for_deleted={point}",
+            census.entries, census.tombstones
+        );
 
-        assert_eq!(removed, N, "every interval-local tombstone should be removable");
+        assert_eq!(
+            removed, N,
+            "every interval-local tombstone should be removable"
+        );
         assert_eq!(live_after, 1, "removal must not resurrect an ephemeral row");
         assert_eq!(point, 0, "a point read must not resurrect an ephemeral row");
         assert_eq!(
@@ -2486,7 +2495,6 @@ async fn interval_local_tombstone_has_no_dependent_reader() {
         );
     }
 }
-
 
 /// Engagement for the interval-local elision route, read from inside it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -2743,7 +2751,11 @@ async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
         .execute("SELECT id FROM p13base", &[])
         .await
         .expect("collection scan should run");
-    assert_eq!(live.len(), N, "the based rows must survive, the ephemerals must not");
+    assert_eq!(
+        live.len(),
+        N,
+        "the based rows must survive, the ephemerals must not"
+    );
 }
 
 /// Named-row helpers, so an arm can create and delete a cohort without

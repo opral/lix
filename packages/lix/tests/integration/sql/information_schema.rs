@@ -29,7 +29,10 @@ simulation_test!(public_catalog_has_no_by_branch_surfaces, |sim| async move {
         )
         .await
         .expect("public table catalog should be readable");
-    assert!(tables.rows().is_empty(), "no explicit-branch tables may remain");
+    assert!(
+        tables.rows().is_empty(),
+        "no explicit-branch tables may remain"
+    );
 
     let columns = session
         .execute(
@@ -49,7 +52,9 @@ simulation_test!(public_catalog_has_no_by_branch_surfaces, |sim| async move {
         .await
         .expect_err("retired explicit-branch table names must fail closed");
     assert!(
-        error.message.contains("no_explicit_branch_surface_by_branch"),
+        error
+            .message
+            .contains("no_explicit_branch_surface_by_branch"),
         "the unknown-table error should identify the retired surface: {error:?}"
     );
 });
@@ -520,7 +525,8 @@ simulation_test!(
             .execute(
                 "SELECT result_column, is_nullable \
                  FROM information_schema.table_functions \
-                 WHERE function_name = 'engine_column_contract_history' \
+                 WHERE function_name = 'lix_history' \
+                   AND source_relation = 'engine_column_contract' \
                    AND result_column IN ('id', 'title') \
                  ORDER BY result_column",
                 &[],
@@ -1388,19 +1394,17 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    nullable_columns_are_optional_on_insert,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+simulation_test!(nullable_columns_are_optional_on_insert, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
-        session
+    session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
                  VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_required_nullable_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"payload\",\"type\":\"jsonb\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB))",
@@ -1409,66 +1413,65 @@ simulation_test!(
             .await
             .expect("required nullable schema should register");
 
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT is_nullable, lix_insert_policy \
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT is_nullable, lix_insert_policy \
                      FROM information_schema.columns \
                      WHERE table_name = 'engine_required_nullable_contract' \
                        AND column_name = 'payload'",
-                    &[],
-                )
-                .await
-                .expect("required nullable column should introspect"),
-            vec![vec![
-                Value::Text("YES".to_string()),
-                Value::Text("OPTIONAL".to_string()),
-            ]],
-        );
-        session
-            .execute(
-                "INSERT INTO engine_required_nullable_contract (id) VALUES ('omitted')",
                 &[],
             )
             .await
-            .expect("nullable column may be omitted");
+            .expect("required nullable column should introspect"),
+        vec![vec![
+            Value::Text("YES".to_string()),
+            Value::Text("OPTIONAL".to_string()),
+        ]],
+    );
+    session
+        .execute(
+            "INSERT INTO engine_required_nullable_contract (id) VALUES ('omitted')",
+            &[],
+        )
+        .await
+        .expect("nullable column may be omitted");
 
+    session
+        .execute(
+            "INSERT INTO engine_required_nullable_contract (id, payload) \
+                 VALUES ('explicit-null', CAST('null' AS JSONB))",
+            &[],
+        )
+        .await
+        .expect("required nullable column should accept explicit JSON null");
+    assert_rows_eq(
         session
             .execute(
-                "INSERT INTO engine_required_nullable_contract (id, payload) \
-                 VALUES ('explicit-null', CAST('null' AS JSONB))",
+                "SELECT payload FROM engine_required_nullable_contract \
+                     WHERE id = 'explicit-null'",
                 &[],
             )
             .await
-            .expect("required nullable column should accept explicit JSON null");
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT payload FROM engine_required_nullable_contract \
-                     WHERE id = 'explicit-null'",
-                    &[],
-                )
-                .await
-                .expect("typed JSON null should read as SQL NULL"),
-            vec![vec![Value::Null]],
-        );
-        assert_rows_eq(
-            session
-                .execute(
-                    "DELETE FROM engine_required_nullable_contract \
+            .expect("typed JSON null should read as SQL NULL"),
+        vec![vec![Value::Null]],
+    );
+    assert_rows_eq(
+        session
+            .execute(
+                "DELETE FROM engine_required_nullable_contract \
                      WHERE id = 'explicit-null' \
                      RETURNING payload, CAST('null' AS JSONB)",
-                    &[],
-                )
-                .await
-                .expect("DELETE RETURNING should match SELECT null semantics"),
-            vec![vec![
-                Value::Null,
-                Value::Jsonb(serde_json::Value::Null.into()),
-            ]],
-        );
-    }
-);
+                &[],
+            )
+            .await
+            .expect("DELETE RETURNING should match SELECT null semantics"),
+        vec![vec![
+            Value::Null,
+            Value::Jsonb(serde_json::Value::Null.into()),
+        ]],
+    );
+});
 
 simulation_test!(
     typed_bigint_projection_is_lossless_or_explicit,
@@ -1530,7 +1533,7 @@ simulation_test!(
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT count FROM engine_bigint_contract_history() \
+                    "SELECT count FROM lix_history('engine_bigint_contract') \
                        WHERE lixcol_row_pk = CAST('[\"integral-real\"]' AS JSONB)",
                     &[],
                 )

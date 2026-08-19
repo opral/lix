@@ -50,7 +50,7 @@ functions called without an explicit commit:
 
 ```sql
 SELECT lixcol_depth, title
-FROM acme_task_history()
+FROM lix_history('acme_task')
 WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```

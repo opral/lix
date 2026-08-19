@@ -35,7 +35,7 @@ simulation_test!(
 
         let working = select_rows(
             &session,
-            "SELECT diff_id, row_pk, diff_type FROM lix_working_diff \
+            "SELECT diff_id, row_pk, diff_type FROM lix_working_diff() \
          WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
         )
         .await;
@@ -133,7 +133,7 @@ simulation_test!(
         let checkpointed = session
             .execute(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
-             SELECT diff_id FROM lix_working_diff \
+             SELECT diff_id FROM lix_working_diff() \
              WHERE schema_key = $1 \
                AND row_pk = CAST($2 AS JSONB) \
              RETURNING commit_id",
@@ -176,7 +176,7 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT row_pk FROM lix_working_diff \
+                "SELECT row_pk FROM lix_working_diff() \
              WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
             )
             .await,
@@ -208,7 +208,7 @@ simulation_test!(
         let empty = session
             .execute(
                 "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM lix_working_diff WHERE 1 = 0 \
+                 SELECT diff_id FROM lix_working_diff() WHERE 1 = 0 \
                  RETURNING commit_id",
                 &[],
             )
@@ -257,7 +257,7 @@ simulation_test!(
             .expect("fresh insert should succeed");
         let fresh = select_rows(
             &session,
-            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
+            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff() \
              WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"fresh\"]' AS JSONB)",
         )
         .await;
@@ -285,7 +285,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
-                 SELECT diff_id FROM lix_working_diff",
+                 SELECT diff_id FROM lix_working_diff()",
                 &[],
             )
             .await
@@ -297,7 +297,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
-                 SELECT diff_id FROM lix_working_diff",
+                 SELECT diff_id FROM lix_working_diff()",
                 &[],
             )
             .await
@@ -312,7 +312,7 @@ simulation_test!(
 
         let recycled = select_rows(
             &session,
-            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
+            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff() \
              WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"recycled\"]' AS JSONB)",
         )
         .await;

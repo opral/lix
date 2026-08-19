@@ -389,7 +389,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
             },
             ExecuteBatchStatement {
                 label: None,
-                sql: "SELECT id FROM lix_file_history('one', 'two')".to_string(),
+                sql: "SELECT id FROM lix_history('lix_file', 'one', 'two')".to_string(),
                 params: Vec::new(),
             },
         ])

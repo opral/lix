@@ -236,7 +236,7 @@ fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<Strin
     }
 }
 
-fn diff_schema() -> SchemaRef {
+pub(crate) fn diff_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("diff_id", DataType::Utf8, false),
         json_field("row_pk", false),

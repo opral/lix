@@ -221,29 +221,20 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = vec![
             "lix_account",
-            "lix_account_history",
             "lix_apply",
             "lix_branch",
             "lix_branch_descriptor",
-            "lix_branch_descriptor_history",
             "lix_branch_ref",
-            "lix_branch_ref_history",
             "lix_change",
             "lix_checkpoint",
-            "lix_checkpoint_history",
             "lix_commit",
             "lix_commit_edge",
             "lix_create_checkpoint",
             "lix_directory",
-            "lix_directory_history",
-            "lix_directory_working_diff",
             "lix_file",
-            "lix_file_history",
-            "lix_file_working_diff",
+            "lix_history",
             "lix_key_value",
-            "lix_key_value_history",
             "lix_registered_schema",
-            "lix_registered_schema_history",
             "lix_revert",
             "lix_working_diff",
         ];
@@ -260,16 +251,20 @@ mod tests {
         let catalog = PublicCatalog::fixed_system();
         for surface_name in [
             "lix_key_value",
-            "lix_key_value_history",
             "lix_registered_schema",
-            "lix_registered_schema_history",
             "lix_checkpoint",
-            "lix_checkpoint_history",
+            "lix_history",
             "lix_working_diff",
         ] {
             assert!(
                 catalog.surface(surface_name).is_some(),
                 "{surface_name} should remain public"
+            );
+        }
+        for relation_name in ["lix_key_value", "lix_registered_schema", "lix_checkpoint"] {
+            assert!(
+                catalog.history_relation(relation_name).is_some(),
+                "{relation_name} should support lix_history"
             );
         }
         for surface_name in [
@@ -327,18 +322,22 @@ mod tests {
     #[test]
     fn dynamic_row_history_surface_uses_provider_history_column_names() {
         let catalog = catalog();
-        let table = bind_public_table(
-            &catalog,
-            &table_name("SELECT * FROM test_state_schema_history()"),
-        )
-        .expect("schema history surface should bind");
+        let history = catalog
+            .history_relation("test_state_schema")
+            .expect("schema history contract should exist");
 
-        assert!(matches!(
-            table.surface.kind,
-            PublicSurfaceKind::SchemaHistory { .. }
-        ));
-        assert!(require_public_column(&table, "lixcol_row_pk").is_ok());
-        assert!(require_public_column(&table, "lixcol_snapshot_content").is_err());
+        assert!(
+            history
+                .columns
+                .iter()
+                .any(|column| { column.name == "lixcol_row_pk" && column.is_public() })
+        );
+        assert!(
+            !history
+                .columns
+                .iter()
+                .any(|column| { column.name == "lixcol_snapshot_content" && column.is_public() })
+        );
     }
 
     #[test]

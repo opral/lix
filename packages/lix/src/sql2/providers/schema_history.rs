@@ -11,7 +11,6 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::prelude::SessionContext;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
@@ -21,7 +20,6 @@ use crate::serialize_row_metadata;
 use crate::sql2::change_materialization::MaterializedChange;
 
 use crate::sql2::SqlHistoryQuerySource;
-use crate::sql2::WriteAccess;
 use crate::sql2::catalog::{
     SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec, schema_surface_schema,
 };
@@ -39,30 +37,24 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::schema::{RowPrimaryKeyFilterAnalyzer, row_pks_from_primary_key_filters};
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
+use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
-pub(super) fn register_row_history_surface<S>(
-    session: &SessionContext,
-    surface_name: &str,
+pub(super) fn build_row_history_provider<S>(
+    relation_name: &str,
     spec: Arc<SchemaSurfaceSpec>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
-) -> Result<(), LixError>
+) -> Arc<dyn datafusion::catalog::TableProvider>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    register_spec_table(
-        session,
-        surface_name,
-        Arc::new(SchemaHistorySpec {
-            surface_name: surface_name.to_string(),
-            schema: schema_surface_schema(&spec, SchemaSurfaceShape::History),
-            spec,
-            commit_graph,
-            query_source,
-        }),
-        WriteAccess::read_only(),
-    )
+    Arc::new(SpecTableProvider::new(Arc::new(SchemaHistorySpec {
+        surface_name: relation_name.to_string(),
+        schema: schema_surface_schema(&spec, SchemaSurfaceShape::History),
+        spec,
+        commit_graph,
+        query_source,
+    })))
 }
 
 /// Schema-specific history surface backed directly by the commit graph.

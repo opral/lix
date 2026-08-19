@@ -41,7 +41,7 @@ async fn main() -> Result<(), lix::LixError> {
     let history = lix
         .execute(
             "SELECT path, lixcol_depth \
-             FROM lix_file_history() \
+             FROM lix_history('lix_file') \
              WHERE path = $1 \
              ORDER BY lixcol_depth",
             &[lix::Value::Text("/hello.txt".to_owned())],

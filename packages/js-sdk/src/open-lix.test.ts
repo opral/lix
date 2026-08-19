@@ -539,7 +539,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
 	const fileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history($2) WHERE id = $1 AND lixcol_depth = 0",
+			"SELECT lixcol_source_changes FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_depth = 0",
 			[fileId, insertedHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -568,7 +568,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(txStamped, "origin_key")).toBe("tx-origin");
 	const txFileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history($2) WHERE id = $1 AND lixcol_depth = 0",
+			"SELECT lixcol_source_changes FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_depth = 0",
 			[fileId, txHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -1228,7 +1228,7 @@ test("beginTransaction preserves handle after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT id FROM lix_file_history('one', 'two')",
+			"SELECT id FROM lix_history('lix_file', 'one', 'two')",
 		),
 	).rejects.toMatchObject({
 		code: "LIX_PARSE_ERROR",
@@ -1259,7 +1259,7 @@ test("beginTransaction can continue after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT id FROM lix_file_history('one', 'two')",
+			"SELECT id FROM lix_history('lix_file', 'one', 'two')",
 		),
 	).rejects.toMatchObject({
 		code: "LIX_PARSE_ERROR",
@@ -1394,7 +1394,7 @@ test("engine errors cross the native boundary", async () => {
 
 	try {
 		await lix.execute(
-			"SELECT id FROM lix_file_history('one', 'two')",
+			"SELECT id FROM lix_history('lix_file', 'one', 'two')",
 		);
 		throw new Error("expected history query to fail");
 	} catch (error) {
@@ -1840,7 +1840,7 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 
 	const result = await lix.execute(
 		"SELECT lixcol_source_changes \
-		 FROM lix_directory_history() \
+		 FROM lix_history('lix_directory') \
 		 WHERE id = $1 \
 		 ORDER BY lixcol_depth \
 		 LIMIT 1",

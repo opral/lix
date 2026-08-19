@@ -401,7 +401,9 @@ simulation_test!(
         assert_replay_gc_state(&session).await;
         let history = session
             .execute(
-                &format!("SELECT note FROM {REPLAY_GC_SCHEMA_KEY}_history() WHERE id = 'row-1'"),
+                &format!(
+                    "SELECT note FROM lix_history('{REPLAY_GC_SCHEMA_KEY}') WHERE id = 'row-1'"
+                ),
                 &[],
             )
             .await
@@ -422,7 +424,9 @@ simulation_test!(
         assert_replay_gc_state(&reopened).await;
         reopened
             .execute(
-                &format!("SELECT note FROM {REPLAY_GC_SCHEMA_KEY}_history() WHERE id = 'row-1'"),
+                &format!(
+                    "SELECT note FROM lix_history('{REPLAY_GC_SCHEMA_KEY}') WHERE id = 'row-1'"
+                ),
                 &[],
             )
             .await

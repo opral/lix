@@ -431,36 +431,42 @@ simulation_test!(
             })
             .collect::<std::collections::BTreeSet<_>>();
 
-        for surface_name in [
-            "lix_key_value",
-            "lix_registered_schema",
-            "lix_checkpoint",
-            "lix_working_diff",
-            "lix_file_working_diff",
-            "lix_directory_working_diff",
-        ] {
+        for surface_name in ["lix_key_value", "lix_registered_schema", "lix_checkpoint"] {
             assert!(
                 public_table_names.contains(surface_name),
                 "{surface_name} should remain public"
             );
         }
-        let history_functions = session
+        let table_functions = session
             .execute(
-                "SELECT function_name \
+                "SELECT function_name, source_relation \
                  FROM information_schema.table_functions \
-                 WHERE function_name IN ('lix_checkpoint_history', 'lix_key_value_history', 'lix_registered_schema_history') \
-                 GROUP BY function_name \
-                 ORDER BY function_name",
+                 WHERE (function_name = 'lix_history' \
+                        AND source_relation IN ('lix_checkpoint', 'lix_key_value', 'lix_registered_schema')) \
+                    OR function_name IN ('lix_working_diff', 'lix_diff') \
+                 GROUP BY function_name, source_relation \
+                 ORDER BY function_name, source_relation",
                 &[],
             )
             .await
-            .expect("history function metadata should load");
+            .expect("table function metadata should load");
         assert_rows_eq(
-            history_functions,
+            table_functions,
             vec![
-                vec![Value::Text("lix_checkpoint_history".to_string())],
-                vec![Value::Text("lix_key_value_history".to_string())],
-                vec![Value::Text("lix_registered_schema_history".to_string())],
+                vec![Value::Text("lix_diff".to_string()), Value::Null],
+                vec![
+                    Value::Text("lix_history".to_string()),
+                    Value::Text("lix_checkpoint".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_history".to_string()),
+                    Value::Text("lix_key_value".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_history".to_string()),
+                    Value::Text("lix_registered_schema".to_string()),
+                ],
+                vec![Value::Text("lix_working_diff".to_string()), Value::Null],
             ],
         );
         for surface_name in [
@@ -642,7 +648,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT value, lixcol_row_pk, lixcol_observed_commit_id, lixcol_depth \
-                     FROM lix_registered_schema_history('{second_commit_id}') \
+                     FROM lix_history('lix_registered_schema', '{second_commit_id}') \
                        WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB) \
                      ORDER BY lixcol_depth"
                 ),
@@ -739,7 +745,6 @@ simulation_test!(
     }
 );
 
-
 simulation_test!(
     registered_schema_identity_is_scoped_per_branch,
     |sim| async move {
@@ -832,7 +837,10 @@ simulation_test!(
             )
             .await
             .expect("target schema read should succeed");
-        assert_rows_eq(target_result, vec![vec![Value::Jsonb(target_schema.into())]]);
+        assert_rows_eq(
+            target_result,
+            vec![vec![Value::Jsonb(target_schema.into())]],
+        );
     }
 );
 
@@ -947,7 +955,6 @@ simulation_test!(
         assert_rows_eq(draft_result, vec![vec![Value::Jsonb(draft_schema.into())]]);
     }
 );
-
 
 simulation_test!(
     registered_row_insert_applies_defaulted_primary_key,
@@ -1069,7 +1076,6 @@ simulation_test!(
         );
     }
 );
-
 
 simulation_test!(
     global_row_insert_rejects_active_only_schema,
@@ -1565,19 +1571,17 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    typed_row_insert_rejects_unknown_column,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+simulation_test!(typed_row_insert_rejects_unknown_column, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
-        session
+    session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
@@ -1590,24 +1594,23 @@ simulation_test!(
             .await
             .expect("registered schema insert should succeed");
 
-        let error = session
-            .execute(
-                "INSERT INTO engine_unknown_insert_column_schema \
+    let error = session
+        .execute(
+            "INSERT INTO engine_unknown_insert_column_schema \
                  (id, name, missing_column, lixcol_global, lixcol_untracked) \
                  VALUES ('row-1', 'before', 'ignored-before-fix', false, false)",
-                &[],
-            )
-            .await
-            .expect_err("typed row insert should not ignore unknown columns");
-        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+            &[],
+        )
+        .await
+        .expect_err("typed row insert should not ignore unknown columns");
+    assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
-        let result = session
-            .execute("SELECT id FROM engine_unknown_insert_column_schema", &[])
-            .await
-            .expect("select should succeed");
-        assert_rows_eq(result, Vec::<Vec<Value>>::new());
-    }
-);
+    let result = session
+        .execute("SELECT id FROM engine_unknown_insert_column_schema", &[])
+        .await
+        .expect("select should succeed");
+    assert_rows_eq(result, Vec::<Vec<Value>>::new());
+});
 
 simulation_test!(
     typed_row_insert_rejects_duplicate_columns,
@@ -1747,18 +1750,12 @@ simulation_test!(
             &engine,
         );
         let result = draft
-            .execute(
-                "SELECT id FROM engine_base_branch_insert_schema",
-                &[],
-            )
+            .execute("SELECT id FROM engine_base_branch_insert_schema", &[])
             .await
             .expect("draft branch query should succeed");
         assert_rows_eq(result, Vec::<Vec<Value>>::new());
     }
 );
-
-
-
 
 simulation_test!(
     typed_row_update_rejects_duplicate_assignments,

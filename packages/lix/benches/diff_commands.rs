@@ -19,7 +19,7 @@ fn diff_command_benches(c: &mut Criterion) {
         b.iter_batched(
             || runtime.block_on(seeded_session(1_000)),
             |session| {
-                runtime.block_on(execute(&session, "SELECT COUNT(*) FROM lix_working_diff"));
+                runtime.block_on(execute(&session, "SELECT COUNT(*) FROM lix_working_diff()"));
             },
             BatchSize::LargeInput,
         );
@@ -93,7 +93,7 @@ async fn profile_sample(rows: usize, sample: usize) {
     let selected = (rows / 10).max(1);
 
     let scan = elapsed(async {
-        execute(&session, "SELECT COUNT(*) FROM lix_working_diff").await;
+        execute(&session, "SELECT COUNT(*) FROM lix_working_diff()").await;
     })
     .await;
     emit("working_diff", rows, rows, sample, scan);
@@ -103,7 +103,7 @@ async fn profile_sample(rows: usize, sample: usize) {
             &session,
             &format!(
                 "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM lix_working_diff \
+                 SELECT diff_id FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY row_pk LIMIT {selected}"
             ),
@@ -134,7 +134,7 @@ async fn profile_sample(rows: usize, sample: usize) {
             &session,
             &format!(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
-                 SELECT diff_id FROM lix_working_diff \
+                 SELECT diff_id FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY row_pk LIMIT {checkpoint_selected}"
             ),

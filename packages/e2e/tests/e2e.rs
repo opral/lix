@@ -290,7 +290,7 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
     let result = history_lix
         .execute(
             "SELECT content, lixcol_depth \
-             FROM lix_file_history($1) \
+             FROM lix_history('lix_file', $1) \
              WHERE id = $2 \
              ORDER BY lixcol_depth \
              LIMIT 2",
@@ -1353,7 +1353,7 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     );
     let historical = lix
         .execute(
-            "SELECT kind, payload_json FROM markdown_node_history() \
+            "SELECT kind, payload_json FROM lix_history('markdown_node') \
              WHERE lixcol_depth = 1 ORDER BY kind",
             &[],
         )
@@ -4375,7 +4375,7 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
 
     let historical = lix
         .execute(
-            "SELECT key, scalar_json FROM json_object_member_history() \
+            "SELECT key, scalar_json FROM lix_history('json_object_member') \
              WHERE lixcol_depth = 1 ORDER BY key",
             &[],
         )
@@ -5539,7 +5539,7 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
     );
     assert!(
         lix.execute(
-            "SELECT element_json FROM excalidraw_element_history() \
+            "SELECT element_json FROM lix_history('excalidraw_element') \
              WHERE id = 'a' AND lixcol_depth = 1",
             &[],
         )
