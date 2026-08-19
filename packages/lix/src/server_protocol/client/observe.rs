@@ -276,6 +276,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
                     }
                     match consume {
                         ConsumeResult::Continue => {}
+                        ConsumeResult::ReconnectNow => continue,
                         ConsumeResult::Stop => {
                             let mut state = self.state.lock().await;
                             if state.closed || state.subscriptions.is_empty() {
@@ -367,7 +368,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 }
             }
             let error = if let Ok(envelope) = serde_json::from_slice::<ErrorEnvelope>(&body) {
-                error_from_envelope(&envelope)
+                with_http_status(error_from_envelope(&envelope), stream.status)
             } else {
                 remote_error(
                     "LIX_REMOTE_REQUEST_FAILED",
@@ -377,7 +378,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
             };
             if is_recoverable_session_error(&error) {
                 return match self.recover_session_or_fail(&error).await {
-                    Ok(()) => ConsumeResult::Continue,
+                    Ok(()) => ConsumeResult::ReconnectNow,
                     Err(error) => {
                         self.fail_all(error).await;
                         ConsumeResult::Stop
@@ -536,7 +537,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
         let error = error_from_envelope(&payload);
         if is_recoverable_session_error(&error) {
             match self.recover_session_or_fail(&error).await {
-                Ok(()) => return ConsumeResult::Continue,
+                Ok(()) => return ConsumeResult::ReconnectNow,
                 Err(error) => {
                     self.fail_all(error).await;
                     return ConsumeResult::Stop;
@@ -644,6 +645,7 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
 
 enum ConsumeResult {
     Continue,
+    ReconnectNow,
     Stop,
 }
 
@@ -837,6 +839,22 @@ fn apply_observe_delta(
             ))
         }
     }
+}
+
+fn with_http_status(error: LixError, status: u16) -> LixError {
+    let mut details = error
+        .details
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("httpStatus".to_owned(), serde_json::json!(status));
+    } else {
+        details = serde_json::json!({
+            "httpStatus": status,
+            "body": details,
+        });
+    }
+    error.with_details(details)
 }
 
 fn error_from_envelope(payload: &ErrorEnvelope) -> LixError {

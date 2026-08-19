@@ -524,28 +524,15 @@ impl<H: ProtocolHttp> ClientCore<H> {
             if let Some(branch_id) = cached {
                 return Ok(branch_id);
             }
-            let handshake = self.handshake_resume().await?;
-            let current = self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .session_id
-                .clone();
-            if current.as_deref() != Some(handshake.session_id.as_str()) {
-                return Err(protocol_error(
-                    "Lix Server Protocol handshake changed sessionId",
-                ));
-            }
-            self.apply_handshake(handshake)?;
-            Ok(self
-                .state
+            self.resume_or_recover_handshake().await?;
+            self.state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .active_branch_id
                 .clone()
                 .ok_or_else(|| {
                     protocol_error("Lix Server Protocol handshake requires activeBranchId")
-                })?)
+                })
         })
         .await
     }
@@ -561,30 +548,40 @@ impl<H: ProtocolHttp> ClientCore<H> {
             if let Some(account_id) = cached {
                 return Ok(account_id);
             }
-            let handshake = self.handshake_resume().await?;
-            let current = self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .session_id
-                .clone();
-            if current.as_deref() != Some(handshake.session_id.as_str()) {
-                return Err(protocol_error(
-                    "Lix Server Protocol handshake changed sessionId",
-                ));
-            }
-            self.apply_handshake(handshake)?;
-            Ok(self
-                .state
+            self.resume_or_recover_handshake().await?;
+            self.state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .active_account_id
                 .clone()
                 .ok_or_else(|| {
                     protocol_error("Lix Server Protocol handshake requires activeAccountId")
-                })?)
+                })
         })
         .await
+    }
+
+    async fn resume_or_recover_handshake(&self) -> Result<(), LixError> {
+        match self.handshake_resume().await {
+            Ok(handshake) => {
+                let current = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .session_id
+                    .clone();
+                if current.as_deref() != Some(handshake.session_id.as_str()) {
+                    return Err(protocol_error(
+                        "Lix Server Protocol handshake changed sessionId",
+                    ));
+                }
+                self.apply_handshake(handshake)
+            }
+            Err(error) if is_recoverable_session_error(&error) => {
+                self.recover_session_once().await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn create_branch(
