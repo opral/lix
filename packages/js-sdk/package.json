@@ -27,6 +27,7 @@
 			"node": "./dist/binding.node.js",
 			"default": "./dist/binding.browser.js"
 		},
+		"#remote-wasm": "./dist/wasm/lix_js_sdk.js",
 		"#worker-factory": {
 			"node": "./dist/worker/factory.node.js",
 			"default": "./dist/worker/factory.browser.js"

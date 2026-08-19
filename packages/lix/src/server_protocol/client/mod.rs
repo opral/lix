@@ -359,7 +359,7 @@ impl<H: ProtocolHttp + 'static> ServerProtocolClient<H> {
                     })
                 }
                 Err(error) => {
-                    if !is_definitive_client_error(&error) {
+                    if request_was_attempted(&error) && !is_definitive_client_error(&error) {
                         inner.clear_cached_branch().await;
                         inner.hub.restart(Arc::clone(&inner));
                     }
@@ -918,6 +918,10 @@ pub(crate) fn is_recoverable_session_error(error: &LixError) -> bool {
 
 fn is_definitive_client_error(error: &LixError) -> bool {
     http_status(error).is_some_and(|status| (400..500).contains(&status) && status != 408 && status != 429)
+}
+
+fn request_was_attempted(error: &LixError) -> bool {
+    http_status(error).is_some() || error.code == wire::REMOTE_UNAVAILABLE
 }
 
 fn error_from_http(body: &[u8], status: u16) -> LixError {

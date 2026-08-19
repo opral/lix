@@ -384,10 +384,14 @@ impl ProtocolHttp for JsProtocolHttp {
         let reader = Function::from(get_reader)
             .call0(&body)
             .map_err(js_to_lix)?;
+        let abort_controller = Reflect::get(&response, &JsValue::from_str("__lixAbortController")).ok();
         Ok(ProtocolHttpStreamResponse {
             status,
             headers,
-            body: Box::new(JsByteStream { reader }),
+            body: Box::new(JsByteStream {
+                reader,
+                abort_controller: abort_controller.filter(|value| !value.is_undefined()),
+            }),
         })
     }
 
@@ -444,14 +448,35 @@ impl JsProtocolHttp {
             bytes.copy_from(body);
             Reflect::set(&init, &JsValue::from_str("body"), &bytes).map_err(js_to_lix)?;
         }
+        let abort_controller = if observe {
+            let ctor = Function::from(
+                Reflect::get(&js_sys::global(), &JsValue::from_str("AbortController"))
+                    .map_err(js_to_lix)?,
+            );
+            let controller = Reflect::construct(&ctor, &js_sys::Array::new()).map_err(js_to_lix)?;
+            let signal = Reflect::get(&controller, &JsValue::from_str("signal")).map_err(js_to_lix)?;
+            Reflect::set(&init, &JsValue::from_str("signal"), &signal).map_err(js_to_lix)?;
+            Some(controller)
+        } else {
+            None
+        };
         let called = self
             .fetch
             .call2(&JsValue::UNDEFINED, &url, &init)
             .map_err(|cause| transport_unavailable(observe, &js_error_message(&cause)))?;
         let promise = Promise::from(called);
-        SendJsFuture(JsFuture::from(promise))
+        let response = SendJsFuture(JsFuture::from(promise))
             .await
-            .map_err(|cause| transport_unavailable(observe, &js_error_message(&cause)))
+            .map_err(|cause| transport_unavailable(observe, &js_error_message(&cause)))?;
+        if let Some(controller) = abort_controller {
+            Reflect::set(
+                &response,
+                &JsValue::from_str("__lixAbortController"),
+                &controller,
+            )
+            .map_err(js_to_lix)?;
+        }
+        Ok(response)
     }
 
     fn request_url(&self, request: &ProtocolHttpRequest) -> Result<JsValue, LixError> {
@@ -480,11 +505,13 @@ impl JsProtocolHttp {
             Reflect::get(&js_sys::global(), &JsValue::from_str("Headers")).map_err(js_to_lix)?,
         );
         let init = if let Some(resolve) = &self.headers {
-            let resolved = resolve.call0(&JsValue::UNDEFINED).map_err(js_to_lix)?;
+            let resolved = resolve
+                .call0(&JsValue::UNDEFINED)
+                .map_err(js_header_error)?;
             if resolved.is_instance_of::<Promise>() {
                 SendJsFuture(JsFuture::from(Promise::from(resolved)))
                     .await
-                    .map_err(js_to_lix)?
+                    .map_err(js_header_error)?
             } else {
                 resolved
             }
@@ -501,6 +528,7 @@ impl JsProtocolHttp {
             Reflect::get(&headers, &JsValue::from_str("delete")).map_err(js_to_lix)?,
         );
         let _ = delete.call1(&headers, &JsValue::from_str("content-encoding"));
+        let _ = delete.call1(&headers, &JsValue::from_str("lix-session-id"));
         let set =
             Function::from(Reflect::get(&headers, &JsValue::from_str("set")).map_err(js_to_lix)?);
         for (name, value) in protocol_headers {
@@ -517,6 +545,17 @@ impl JsProtocolHttp {
 
 struct JsByteStream {
     reader: JsValue,
+    abort_controller: Option<JsValue>,
+}
+
+impl Drop for JsByteStream {
+    fn drop(&mut self) {
+        if let Some(controller) = self.abort_controller.take()
+            && let Ok(abort) = Reflect::get(&controller, &JsValue::from_str("abort"))
+        {
+            let _ = Function::from(abort).call0(&controller);
+        }
+    }
 }
 
 #[expect(
@@ -714,6 +753,13 @@ fn transport_unavailable(observe: bool, cause: &str) -> LixError {
         },
     )
     .with_details(serde_json::json!({ "cause": cause }))
+}
+
+fn js_header_error(error: JsValue) -> LixError {
+    LixError::new(
+        "LIX_SERVER_PROTOCOL_ERROR",
+        js_error_message(&error),
+    )
 }
 
 fn js_to_lix(error: JsValue) -> LixError {
