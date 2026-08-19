@@ -1,7 +1,7 @@
 //! RocksDB coverage for the public SQL file-read surface.
 
 use lix::storage::Storage;
-use lix::{Lix, Value, open_lix};
+use lix::{GLOBAL_BRANCH_ID, Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[tokio::test]
@@ -19,27 +19,29 @@ async fn public_file_read_works_with_rocksdb() {
 
     // Public reads retain active-branch precedence when a global file has an
     // active branch-local overlay at the same logical path.
-    let active_branch_id = lix.active_branch_id().await.expect("active branch");
+    let global = lix
+        .open_another_session()
+        .with_branch(GLOBAL_BRANCH_ID)
+        .await
+        .expect("open global session");
+    global
+        .execute(
+            "INSERT INTO lix_file (id, path, content, lixcol_global) \
+         VALUES ($1, $2, $3, true)",
+            &[
+                Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_owned()),
+                Value::Text("/native/overlap.bin".to_owned()),
+                Value::Blob(b"global".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("insert global overlap fixture");
     lix.execute(
-        "INSERT INTO lix_file_by_branch \
-         (id, path, content, lixcol_global, lixcol_branch_id) \
-         VALUES ($1, $2, $3, true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
-        &[
-            Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_owned()),
-            Value::Text("/native/overlap.bin".to_owned()),
-            Value::Blob(b"global".to_vec().into()),
-        ],
-    )
-    .await
-    .expect("insert global overlap fixture");
-    lix.execute(
-        "INSERT INTO lix_file_by_branch \
-         (id, path, content, lixcol_branch_id) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
         &[
             Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_owned()),
             Value::Text("/native/overlap.bin".to_owned()),
             Value::Blob(b"local".to_vec().into()),
-            Value::Text(active_branch_id),
         ],
     )
     .await

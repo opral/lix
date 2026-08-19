@@ -1,7 +1,7 @@
 //! RocksDB coverage for public SQL file writes and atomic batches.
 
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Lix, Value, open_lix};
+use lix::{ExecuteBatchStatement, GLOBAL_BRANCH_ID, Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[tokio::test]
@@ -51,27 +51,29 @@ async fn public_file_upsert_works_with_rocksdb() {
     assert_eq!(active_branch_commit_id(&lix).await, head_before_error);
 
     // SQL upserts target the active overlay while preserving the global row.
-    let active_branch_id = lix.active_branch_id().await.expect("active branch");
+    let global = lix
+        .open_another_session()
+        .with_branch(GLOBAL_BRANCH_ID)
+        .await
+        .expect("open global session");
+    global
+        .execute(
+            "INSERT INTO lix_file (id, path, content, lixcol_global) \
+         VALUES ($1, $2, $3, true)",
+            &[
+                Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_owned()),
+                Value::Text("/native/overlap.bin".to_owned()),
+                Value::Blob(b"g".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("insert global overlap fixture");
     lix.execute(
-        "INSERT INTO lix_file_by_branch \
-         (id, path, content, lixcol_global, lixcol_branch_id) \
-         VALUES ($1, $2, $3, true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
-        &[
-            Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_owned()),
-            Value::Text("/native/overlap.bin".to_owned()),
-            Value::Blob(b"g".to_vec().into()),
-        ],
-    )
-    .await
-    .expect("insert global overlap fixture");
-    lix.execute(
-        "INSERT INTO lix_file_by_branch \
-         (id, path, content, lixcol_branch_id) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
         &[
             Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_owned()),
             Value::Text("/native/overlap.bin".to_owned()),
             Value::Blob(b"l".to_vec().into()),
-            Value::Text(active_branch_id.clone()),
         ],
     )
     .await
@@ -85,20 +87,8 @@ async fn public_file_upsert_works_with_rocksdb() {
     )
     .await
     .expect("update active overlay through SQL batch");
-    assert_file_content_by_branch(
-        &lix,
-        "abc1de5c-4b72-748d-84df-8fc7b1beedda",
-        &active_branch_id,
-        b"updated",
-    )
-    .await;
-    assert_file_content_by_branch(
-        &lix,
-        "abc1de5c-4b72-748d-84df-8fc7b1beedda",
-        "ffffffff-ffff-7fff-bfff-ffffffffffff",
-        b"g",
-    )
-    .await;
+    assert_file_content_by_session(&lix, "abc1de5c-4b72-748d-84df-8fc7b1beedda", b"updated").await;
+    assert_file_content_by_session(&global, "abc1de5c-4b72-748d-84df-8fc7b1beedda", b"g").await;
 }
 
 const UPSERT_SQL: &str = "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
@@ -206,18 +196,14 @@ where
     );
 }
 
-async fn assert_file_content_by_branch<S>(lix: &Lix<S>, id: &str, branch_id: &str, expected: &[u8])
+async fn assert_file_content_by_session<S>(lix: &Lix<S>, id: &str, expected: &[u8])
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
         .execute(
-            "SELECT content FROM lix_file_by_branch \
-             WHERE id = $1 AND lixcol_branch_id = $2",
-            &[
-                Value::Text(id.to_owned()),
-                Value::Text(branch_id.to_owned()),
-            ],
+            "SELECT content FROM lix_file WHERE id = $1",
+            &[Value::Text(id.to_owned())],
         )
         .await
         .expect("read branch file");
