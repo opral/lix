@@ -140,28 +140,11 @@ simulation_test!(
         assert_eq!(no_op.columns(), ["id", "title"]);
         assert!(no_op.rows().is_empty());
 
-        let by_branch = session
-            .execute(
-                "INSERT INTO returning_task_by_branch (id, title, lixcol_branch_id) \
-                 VALUES ('01920000-0000-7000-8000-000000000002', 'By branch', $1) \
-                 RETURNING id, title, lixcol_branch_id",
-                &[Value::Text(sim.main_branch_id().to_string())],
-            )
-            .await
-            .expect("by-branch row INSERT RETURNING should succeed");
-        assert_rows_eq(
-            by_branch,
-            vec![vec![
-                Value::Text("01920000-0000-7000-8000-000000000002".to_string()),
-                Value::Text("By branch".to_string()),
-                Value::Text(sim.main_branch_id().to_string()),
-            ]],
-        );
     }
 );
 
 simulation_test!(
-    filesystem_and_branch_surfaces_return_postimages_for_insert_update_and_upsert,
+    filesystem_and_branch_catalog_surfaces_return_postimages_for_insert_update_and_upsert,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -329,129 +312,6 @@ simulation_test!(
             ]],
         );
 
-        let explicit_branch_id = sim.main_branch_id().to_string();
-        let inserted_file_by_branch = session
-            .execute(
-                "INSERT INTO lix_file_by_branch (path, content, lixcol_branch_id) \
-                 VALUES ('/returning-by-branch-file.txt', CAST('byte-01' AS BYTEA), $1) \
-                 RETURNING id, path, lixcol_branch_id",
-                &[Value::Text(explicit_branch_id.clone())],
-            )
-            .await
-            .expect("by-branch file INSERT RETURNING should succeed");
-        let [
-            Value::Text(file_by_branch_id),
-            Value::Text(file_by_branch_path),
-            Value::Text(returned_branch_id),
-        ] = inserted_file_by_branch.rows()[0].values()
-        else {
-            panic!("by-branch file INSERT RETURNING should expose its postimage")
-        };
-        assert_eq!(file_by_branch_path, "/returning-by-branch-file.txt");
-        assert_eq!(returned_branch_id, &explicit_branch_id);
-        let file_by_branch_id = file_by_branch_id.clone();
-
-        let upserted_file_by_branch = session
-            .execute(
-                "INSERT INTO lix_file_by_branch (path, content, lixcol_branch_id) \
-                 VALUES ('/returning-by-branch-file.txt', $2, $1) \
-                 ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET content = excluded.content \
-                 RETURNING id, content, lixcol_branch_id",
-                &[
-                    Value::Text(explicit_branch_id.clone()),
-                    Value::Blob(vec![2].into()),
-                ],
-            )
-            .await
-            .expect("by-branch file UPSERT RETURNING should expose its postimage");
-        assert_rows_eq(
-            upserted_file_by_branch,
-            vec![vec![
-                Value::Text(file_by_branch_id),
-                Value::Blob(vec![2].into()),
-                Value::Text(explicit_branch_id.clone()),
-            ]],
-        );
-
-        let global_file_id = "72657475-726e-896e-872d-676c6f62616c";
-        session
-            .execute(
-                "INSERT INTO lix_file_by_branch \
-                 (id, path, content, lixcol_global, lixcol_branch_id) \
-                 VALUES ($1, '/returning-global-file.txt', CAST('byte-01' AS BYTEA), true, \
-                         'ffffffff-ffff-7fff-bfff-ffffffffffff')",
-                &[Value::Text(global_file_id.to_string())],
-            )
-            .await
-            .expect("global file seed should succeed");
-
-        // A global file is rendered in an explicit branch with that consumer
-        // branch's id. RETURNING must preserve that readback identity rather
-        // than re-validate the rendered row as a new global write.
-        let updated_global_projection = session
-            .execute(
-                "UPDATE lix_file_by_branch SET content = CAST('byte-03' AS BYTEA) \
-                 WHERE id = $1 AND lixcol_branch_id = $2 \
-                 RETURNING id, path, lixcol_branch_id, lixcol_global",
-                &[
-                    Value::Text(global_file_id.to_string()),
-                    Value::Text(explicit_branch_id.clone()),
-                ],
-            )
-            .await
-            .expect("global file projection UPDATE RETURNING should succeed");
-        assert_rows_eq(
-            updated_global_projection,
-            vec![vec![
-                Value::Text(global_file_id.to_string()),
-                Value::Text("/returning-global-file.txt".to_string()),
-                Value::Text(explicit_branch_id.clone()),
-                Value::Boolean(true),
-            ]],
-        );
-
-        let inserted_directory_by_branch = session
-            .execute(
-                "INSERT INTO lix_directory_by_branch (path, lixcol_branch_id) \
-                 VALUES ('/returning-by-branch-directory', $1) \
-                 RETURNING id, path, lixcol_branch_id",
-                &[Value::Text(explicit_branch_id.clone())],
-            )
-            .await
-            .expect("by-branch directory INSERT RETURNING should succeed");
-        let [
-            Value::Text(directory_by_branch_id),
-            Value::Text(directory_by_branch_path),
-            Value::Text(returned_branch_id),
-        ] = inserted_directory_by_branch.rows()[0].values()
-        else {
-            panic!("by-branch directory INSERT RETURNING should expose its postimage")
-        };
-        assert_eq!(directory_by_branch_path, "/returning-by-branch-directory");
-        assert_eq!(returned_branch_id, &explicit_branch_id);
-        let directory_by_branch_id = directory_by_branch_id.clone();
-
-        let upserted_directory_by_branch = session
-            .execute(
-                "INSERT INTO lix_directory_by_branch (id, path, lixcol_branch_id) \
-                 VALUES ($1, '/returning-by-branch-directory-upserted', $2) \
-                 ON CONFLICT (id) DO UPDATE SET path = excluded.path \
-                 RETURNING id, path, lixcol_branch_id",
-                &[
-                    Value::Text(directory_by_branch_id.clone()),
-                    Value::Text(explicit_branch_id.clone()),
-                ],
-            )
-            .await
-            .expect("by-branch directory UPSERT RETURNING should expose its postimage");
-        assert_rows_eq(
-            upserted_directory_by_branch,
-            vec![vec![
-                Value::Text(directory_by_branch_id),
-                Value::Text("/returning-by-branch-directory-upserted".to_string()),
-                Value::Text(explicit_branch_id),
-            ]],
-        );
     }
 );
 

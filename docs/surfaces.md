@@ -6,19 +6,20 @@ description: "The application-oriented SQL surfaces in Lix: typed rows, files, d
 
 Lix exposes logical application data through typed SQL relations:
 
-| Data                              | Active branch                | Cross-branch                           | History / diff functions           |
-| :-------------------------------- | :--------------------------- | :------------------------------------- | :--------------------------------- |
-| Registered application row `X` | `<schema>`                   | `<schema>_by_branch`                   | `<schema>_history()`               |
-| Files                             | `lix_file`                   | `lix_file_by_branch`                   | `lix_file_history()`               |
-| Directories                       | `lix_directory`              | `lix_directory_by_branch`              | `lix_directory_history()`          |
-| Working diffs                     | `lix_working_diff`           | `lix_working_diff_by_branch`           | `lix_diff(from_commit, to_commit)` |
-| File working diffs                | `lix_file_working_diff`      | `lix_file_working_diff_by_branch`      | —                                  |
-| Directory working diffs           | `lix_directory_working_diff` | `lix_directory_working_diff_by_branch` | —                                  |
-| Checkpoints                       | `lix_checkpoint`             | —                                    | `lix_checkpoint_history()`         |
+| Data                            | Current session              | History / comparison                   |
+| :------------------------------ | :--------------------------- | :------------------------------------- |
+| Registered application row `X` | `<schema>`                   | `<schema>_history()`                   |
+| Files                           | `lix_file`                   | `lix_file_history()`                   |
+| Directories                     | `lix_directory`              | `lix_directory_history()`              |
+| Working diffs                   | `lix_working_diff`           | `lix_diff(from_commit, to_commit)`     |
+| File working diffs              | `lix_file_working_diff`      | —                                      |
+| Directory working diffs         | `lix_directory_working_diff` | —                                      |
+| Checkpoints                     | `lix_checkpoint`             | `lix_checkpoint_history()`             |
 
 The history functions read revisions reachable from a commit; `lix_diff`
-compares two arbitrary commits. `lix_registered_schema*` provides schema
-discovery and `lix_key_value*` provides shared repository metadata.
+compares two arbitrary commits. `lix_registered_schema` and its history
+function provide schema discovery; `lix_key_value` and its history function
+provide shared repository metadata.
 `lix_change` records repository-wide activity; [History](./history.md)
 documents it together with the history functions.
 
@@ -38,8 +39,8 @@ other segment text is preserved exactly: the engine does not URL-decode,
 case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that
 the target host cannot represent.
 
-The checkpoint and diff relations are read-only. `lix_working_diff`,
-`lix_working_diff_by_branch`, and `lix_diff()` expose a `diff_id` that can
+The checkpoint and diff relations are read-only. `lix_working_diff` and
+`lix_diff()` expose a `diff_id` that can
 feed the `lix_revert`, `lix_apply`, and `lix_create_checkpoint` command sinks.
 `lix_checkpoint` and the file and directory working-diff relations do not
 carry a `diff_id`. See [Checkpoints](./checkpoints.md) and
@@ -97,8 +98,7 @@ Registering a Schema v1 document with `key: "acme_task"` produces:
 
 | Surface                      | Use for                                                   |
 | :--------------------------- | :-------------------------------------------------------- |
-| `acme_task`                  | Read and mutate tasks on the active branch.               |
-| `acme_task_by_branch`        | Read or mutate tasks with an explicit `lixcol_branch_id`. |
+| `acme_task`                  | Read and mutate tasks in the current session.              |
 | `acme_task_history()`        | Read task revisions reachable from the active head.       |
 | `acme_task_history($commit)` | Read task revisions reachable from an explicit commit.    |
 
@@ -110,8 +110,8 @@ FROM acme_task
 WHERE done = false;
 ```
 
-Lix bookkeeping columns use the `lixcol_*` prefix. The base relation is scoped
-implicitly to the active branch; `_by_branch` adds `lixcol_branch_id`.
+Lix bookkeeping columns use the `lixcol_*` prefix. Relations are scoped to the
+session's active branch. Open another session to work on another branch.
 
 Every public history read calls its table-valued function with zero or one
 commit-id argument; there are no bare history table aliases.
@@ -139,8 +139,8 @@ beginning with `lix_`; their base or generated SQL names occupy the namespace
 reserved for Lix bootstrap schemas. Use an owner-specific prefix such as
 `acme_task`.
 
-`lix_key_value`, `lix_key_value_by_branch`, and `lix_key_value_history()` are
-public for shared repository settings and interoperability metadata.
+`lix_key_value` and `lix_key_value_history()` are public for shared repository
+settings and interoperability metadata.
 
 ## Files
 
@@ -149,7 +149,6 @@ public for shared repository settings and interoperability metadata.
 | Surface              | Use for                                 |
 | :------------------- | :-------------------------------------- |
 | `lix_file`           | Current files on the active branch.     |
-| `lix_file_by_branch` | Files with explicit branch scope.       |
 | `lix_file_history()` | File revisions reachable from a commit. |
 
 User columns are `id`, `path`, `directory_id`, `name`, and `content`.
@@ -185,7 +184,6 @@ Directories use the same three scopes:
 | Surface                   | Use for                                      |
 | :------------------------ | :------------------------------------------- |
 | `lix_directory`           | Current directories on the active branch.    |
-| `lix_directory_by_branch` | Directories with explicit branch scope.      |
 | `lix_directory_history()` | Directory revisions reachable from a commit. |
 
 User columns are `id`, `path`, `parent_id`, and `name`. Directory and file

@@ -35,7 +35,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 pub(super) async fn register_filesystem_working_diff_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    active_branch_id: Option<String>,
+    active_branch_id: String,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlChangelogQuerySource<S>,
@@ -48,7 +48,6 @@ where
         session,
         surface_name,
         Arc::new(FilesystemWorkingDiffSpec {
-            by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
             commit_graph: Arc::new(Mutex::new(commit_graph)),
@@ -66,8 +65,7 @@ pub(super) enum FilesystemWorkingDiffKind {
 }
 
 struct FilesystemWorkingDiffSpec<S> {
-    by_branch: bool,
-    active_branch_id: Option<String>,
+    active_branch_id: String,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     store: S,
@@ -80,16 +78,14 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn table_name(&self) -> &str {
-        match (self.kind, self.by_branch) {
-            (FilesystemWorkingDiffKind::File, false) => "lix_file_working_diff",
-            (FilesystemWorkingDiffKind::File, true) => "lix_file_working_diff_by_branch",
-            (FilesystemWorkingDiffKind::Directory, false) => "lix_directory_working_diff",
-            (FilesystemWorkingDiffKind::Directory, true) => "lix_directory_working_diff_by_branch",
+        match self.kind {
+            FilesystemWorkingDiffKind::File => "lix_file_working_diff",
+            FilesystemWorkingDiffKind::Directory => "lix_directory_working_diff",
         }
     }
 
     fn schema(&self) -> SchemaRef {
-        filesystem_working_diff_schema(self.by_branch)
+        filesystem_working_diff_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -100,7 +96,7 @@ where
         if filter
             .column_refs()
             .iter()
-            .any(|column| matches!(column.name.as_str(), "id" | "lixcol_branch_id"))
+            .any(|column| column.name == "id")
         {
             TableProviderFilterPushDown::Inexact
         } else {
@@ -139,8 +135,8 @@ where
                     }
                     let heads = selected_heads(
                         branch_ref.as_ref(),
-                        active_branch_id.as_deref(),
-                        &route.branch_ids,
+                        Some(active_branch_id.as_str()),
+                        &FileIdConstraint::All,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -158,7 +154,6 @@ where
                             &mut tracked,
                             &checkpoint_id.to_string(),
                             &head.commit_id.to_string(),
-                            &head.branch_id,
                             kind,
                         )
                         .await
@@ -183,7 +178,6 @@ where
 
 #[derive(Clone)]
 struct FilesystemWorkingDiffRoute {
-    branch_ids: FileIdConstraint,
     ids: FileIdConstraint,
     contradictory: bool,
 }
@@ -191,13 +185,9 @@ struct FilesystemWorkingDiffRoute {
 impl FilesystemWorkingDiffRoute {
     fn from_filters(filters: &[Expr]) -> Result<Self> {
         let conjuncts = filter_conjuncts(filters);
-        let branch_ids =
-            exact_string_column_constraint_from_filters(&conjuncts, "lixcol_branch_id")?;
         let ids = exact_string_column_constraint_from_filters(&conjuncts, "id")?;
-        let contradictory =
-            matches!(branch_ids, FileIdConstraint::None) || matches!(ids, FileIdConstraint::None);
+        let contradictory = matches!(ids, FileIdConstraint::None);
         Ok(Self {
-            branch_ids,
             ids,
             contradictory,
         })
@@ -228,7 +218,6 @@ async fn load_rows<S>(
     tracked: &mut TrackedStateStoreReader<S>,
     checkpoint_id: &str,
     head_id: &str,
-    branch_id: &str,
     kind: FilesystemWorkingDiffKind,
 ) -> Result<Vec<FilesystemWorkingDiffSqlRow>, LixError>
 where
@@ -310,7 +299,6 @@ where
             path,
             previous_path,
             change_kind,
-            branch_id: branch_id.to_string(),
         });
     }
     Ok(rows)
@@ -527,7 +515,6 @@ struct FilesystemWorkingDiffSqlRow {
     path: Option<String>,
     previous_path: Option<String>,
     change_kind: &'static str,
-    branch_id: String,
 }
 
 static FILESYSTEM_WORKING_DIFF_COLS: ColumnTable<FilesystemWorkingDiffSqlRow> = ColumnTable {
@@ -539,23 +526,16 @@ static FILESYSTEM_WORKING_DIFF_COLS: ColumnTable<FilesystemWorkingDiffSqlRow> = 
             Col::Utf8(|row| row.previous_path.as_deref()),
         ),
         ("change_kind", Col::Utf8(|row| Some(row.change_kind))),
-        (
-            "lixcol_branch_id",
-            Col::Utf8(|row| Some(row.branch_id.as_str())),
-        ),
     ],
 };
 
-pub(crate) fn filesystem_working_diff_schema(by_branch: bool) -> SchemaRef {
-    let mut fields = vec![
+pub(crate) fn filesystem_working_diff_schema() -> SchemaRef {
+    let fields = vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, true),
         Field::new("previous_path", DataType::Utf8, true),
         Field::new("change_kind", DataType::Utf8, false),
     ];
-    if by_branch {
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    }
     Arc::new(Schema::new(fields))
 }
 

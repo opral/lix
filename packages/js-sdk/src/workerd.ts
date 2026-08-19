@@ -20,6 +20,9 @@ export interface OpenMemoryLixOptions {
 }
 
 export interface WorkerdLixBinding extends LixBinding {
+	openAnotherSession(
+		options: import("./types.js").OpenAnotherSessionOptions,
+	): Promise<WorkerdLixBinding>;
 	exportSnapshot(): Promise<Uint8Array>;
 }
 

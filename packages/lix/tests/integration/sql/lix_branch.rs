@@ -493,12 +493,18 @@ simulation_test!(
              WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
         )
         .await;
-        session
+        let branch_session = sim.wrap_session(
+            engine
+                .open_session_at("73716c2d-6272-816e-8368-2d6c6f636100")
+                .await
+                .expect("branch session should open"),
+            &engine,
+        );
+        branch_session
             .execute(
-                "INSERT INTO lix_key_value_by_branch \
-                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'draft', \
-                         '73716c2d-6272-816e-8368-2d6c6f636100', false, true)",
+                "INSERT INTO lix_key_value \
+                 (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'draft', false, true)",
                 &[],
             )
             .await
@@ -593,22 +599,27 @@ simulation_test!(
             )
             .await
             .expect("branch insert should succeed");
-        session
+        let branch_session = sim.wrap_session(
+            engine
+                .open_session_at("73716c2d-6272-816e-8368-2d7265637201")
+                .await
+                .expect("branch session should open"),
+            &engine,
+        );
+        branch_session
             .execute(
-                "INSERT INTO lix_key_value_by_branch \
-                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'old', \
-                         '73716c2d-6272-816e-8368-2d7265637201', false, false)",
+                "INSERT INTO lix_key_value \
+                 (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'old', false, false)",
                 &[],
             )
             .await
             .expect("tracked branch-local row should insert");
         assert_eq!(
             count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_key_value_by_branch \
-                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201' \
-                   AND lixcol_branch_id = '73716c2d-6272-816e-8368-2d7265637201'",
+                &branch_session,
+                "SELECT COUNT(*) FROM lix_key_value \
+                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201'",
             )
             .await,
             1
@@ -632,10 +643,15 @@ simulation_test!(
 
         assert_eq!(
             count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_key_value_by_branch \
-                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201' \
-                   AND lixcol_branch_id = '73716c2d-6272-816e-8368-2d7265637201'",
+                &sim.wrap_session(
+                    engine
+                        .open_session_at("73716c2d-6272-816e-8368-2d7265637201")
+                        .await
+                        .expect("recreated branch session should open"),
+                    &engine,
+                ),
+                "SELECT COUNT(*) FROM lix_key_value \
+                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201'",
             )
             .await,
             0,

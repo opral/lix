@@ -100,6 +100,42 @@ test("openLix opens native storage without telemetry", async () => {
 	await lix.close();
 });
 
+test("openAnotherSession keeps branch and lifecycle independent", async () => {
+	const main = await openLix();
+	const mainBranchId = await main.activeBranchId();
+	const draft = await main.createBranch({ name: "Independent draft" });
+	const review = await main.openAnotherSession({ branchId: draft.id });
+
+	expect(await main.activeBranchId()).toBe(mainBranchId);
+	expect(await review.activeBranchId()).toBe(draft.id);
+	expect(await review.activeAccountId()).toBe(await main.activeAccountId());
+
+	await review.switchBranch({ branchId: mainBranchId });
+	expect(await main.activeBranchId()).toBe(mainBranchId);
+	expect(await review.activeBranchId()).toBe(mainBranchId);
+
+	await main.close();
+	await expect(review.execute("SELECT 1 AS value")).resolves.toBeDefined();
+	await expect(main.openAnotherSession()).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
+	await review.close();
+});
+
+test("openAnotherSession validates options and missing branches", async () => {
+	const lix = await openLix();
+	await expect(
+		lix.openAnotherSession({ branchId: "missing-branch" }),
+	).rejects.toMatchObject({ code: "LIX_BRANCH_NOT_FOUND" });
+	await expect(lix.openAnotherSession({ branchId: "" })).rejects.toBeInstanceOf(
+		TypeError,
+	);
+	await expect(lix.openAnotherSession(null as never)).rejects.toBeInstanceOf(
+		TypeError,
+	);
+	await lix.close();
+});
+
 test("openLix exposes the lix-sdk e2e flow", async () => {
 	const lix = await openLix();
 	const mainBranchId = await lix.activeBranchId();
@@ -730,6 +766,25 @@ test("fs storage binds to one open lix at a time", async () => {
 	const reopened = await openLix({ storage });
 	await storage.syncDiskToLix();
 	await reopened.close();
+});
+
+test("fs storage connector routes through a live child session", async () => {
+	const dir = tempFsDir();
+	mkdirSync(dir, { recursive: true });
+	const storage = new FilesystemStorage({ path: dir, syncAllFiles: false });
+	const primary = await openLix({ storage });
+	const child = await primary.openAnotherSession();
+
+	await primary.close();
+	writeFileSync(join(dir, "child.md"), "child");
+	await storage.importPaths(["child.md"]);
+	await storage.syncDiskToLix();
+	expect(
+		new TextDecoder().decode((await readFile(child, "/child.md"))!),
+	).toBe("child");
+
+	await child.close();
+	await expect(storage.syncDiskToLix()).rejects.toThrow("requires an open Lix");
 });
 
 test("fs storage defaults match FilesystemStorage::new(path)", () => {

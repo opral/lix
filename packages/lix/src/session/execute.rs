@@ -3507,21 +3507,6 @@ where
             }
         }
     }
-
-    #[cfg(test)]
-    pub(crate) async fn scan_hot_state_for_test(
-        &mut self,
-        request: &crate::hot_state::HotStateScanRequest,
-    ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
-        let _operation_guard = self.begin_session_operation()?;
-        let transaction = self.transaction_mut()?;
-        transaction.flush_prepared_mutations_for_read().await?;
-        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_hot_state_batch(
-            transaction,
-            request,
-        )
-        .await
-    }
 }
 
 async fn try_execute_transaction_parameter_batch<StorageImpl>(
@@ -3782,11 +3767,6 @@ fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params:
     match point_read.table_name.as_str() {
         "lix_file" => {
             equality_columns.len() == 1
-                && (equality_columns.contains("id") || equality_columns.contains("path"))
-        }
-        "lix_file_by_branch" => {
-            equality_columns.len() == 2
-                && equality_columns.contains("lixcol_branch_id")
                 && (equality_columns.contains("id") || equality_columns.contains("path"))
         }
         _ => false,
@@ -8246,7 +8226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_preserves_later_missing_branch_index() {
+    async fn execute_batch_preserves_later_bind_error_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -8264,40 +8244,30 @@ mod tests {
             )
             .await
             .unwrap();
-        let active_branch_id = session
-            .execute("SELECT lix_active_branch_id() AS id", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("id")
-            .unwrap();
-
-        let sql = "INSERT INTO parameter_insert_branch_probe_by_branch \
-                   (id, value, lixcol_branch_id) VALUES ($1, $2, $3)";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
                     label: None,
-                    sql: sql.to_string(),
+                    sql: "INSERT INTO parameter_insert_branch_probe (id, value) VALUES ($1, $2)"
+                        .to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
                         Value::Text("value-a".to_string()),
-                        Value::Text(active_branch_id),
                     ],
                 },
                 ExecuteBatchStatement {
                     label: None,
-                    sql: sql.to_string(),
+                    sql: "INSERT INTO parameter_insert_branch_probe (id, missing) VALUES ($1, $2)"
+                        .to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
                         Value::Text("value-b".to_string()),
-                        Value::Text("00000000-0000-7000-8000-000000000404".to_string()),
                     ],
                 },
             ])
             .await
-            .expect_err("the second row's missing branch must retain its statement index");
-        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+            .expect_err("the second statement's bind error must retain its statement index");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
 
         let rows = session

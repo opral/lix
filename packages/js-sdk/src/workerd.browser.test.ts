@@ -93,6 +93,21 @@ test("Workerd snapshots reject malformed bytes", async () => {
 	).rejects.toThrow(/invalid in-memory snapshot/);
 });
 
+test("raw Workerd sessions have independent idempotent lifecycles", async () => {
+	const primary = await openMemoryLix();
+	const child = await primary.openAnotherSession({});
+	const nested = await child.openAnotherSession({});
+
+	await primary.close();
+	await primary.close();
+	expect((await child.execute("SELECT 1", noParams)).rows).toHaveLength(1);
+
+	await nested.close();
+	expect((await child.execute("SELECT 1", noParams)).rows).toHaveLength(1);
+	await child.close();
+	await child.close();
+});
+
 test("Workerd executeBatch accepts nested statement parameters", async () => {
 	const lix = await openMemoryLix();
 	try {

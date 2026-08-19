@@ -660,21 +660,22 @@ where
         name: &str,
         kind: &str,
     ) -> Result<(), LixError> {
-        let branch_id = Box::pin(self.active_branch_id()).await?;
-        let system =
-            Box::pin(self.open_internal_session(branch_id, lix::SYSTEM_ACCOUNT_ID)).await?;
+        let system = Box::pin(self.open_internal_session(
+            lix::GLOBAL_BRANCH_ID.to_string(),
+            lix::SYSTEM_ACCOUNT_ID,
+        ))
+        .await?;
         system
             .execute(
-                "INSERT INTO lix_account_by_branch \
-                 (id, name, kind, status, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, $2, $3, 'active', $4, true, false) \
-                 ON CONFLICT (id, lixcol_branch_id) \
+                "INSERT INTO lix_account \
+                 (id, name, kind, status, lixcol_global, lixcol_untracked) \
+                 VALUES ($1, $2, $3, 'active', true, false) \
+                 ON CONFLICT (id) \
                  DO NOTHING",
                 &[
                     Value::Text(id.to_string()),
                     Value::Text(name.to_string()),
                     Value::Text(kind.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
                 ],
             )
             .await?;
@@ -1246,17 +1247,14 @@ mod tests {
 
         let system = root
             .open_another_session()
+            .with_branch(lix::GLOBAL_BRANCH_ID)
             .with_account(lix::SYSTEM_ACCOUNT_ID)
             .await
             .expect("open system session");
         system
             .execute(
-                "UPDATE lix_account_by_branch SET name = 'Ada Lovelace' \
-                 WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(AUTHOR_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "UPDATE lix_account SET name = 'Ada Lovelace' WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
             .expect("rename account");
@@ -1280,11 +1278,8 @@ mod tests {
 
         system
             .execute(
-                "DELETE FROM lix_account_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(UNUSED_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "DELETE FROM lix_account WHERE id = $1",
+                &[Value::Text(UNUSED_ID.to_string())],
             )
             .await
             .expect("delete unused account");
@@ -1298,11 +1293,8 @@ mod tests {
         assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
         let error = system
             .execute(
-                "DELETE FROM lix_account_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(AUTHOR_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "DELETE FROM lix_account WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
             .expect_err("authored changes must restrict account deletion");
@@ -1310,12 +1302,8 @@ mod tests {
 
         system
             .execute(
-                "UPDATE lix_account_by_branch SET status = 'disabled' \
-                 WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(AUTHOR_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
             .expect("disable author");
@@ -1330,12 +1318,8 @@ mod tests {
 
         let error = system
             .execute(
-                "UPDATE lix_account_by_branch SET status = 'disabled' \
-                 WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
+                &[Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string())],
             )
             .await
             .expect_err("built-in accounts must remain active");
@@ -1370,36 +1354,20 @@ mod tests {
             );
         }
 
-        // Physical copies materialize as `lixcol_global = false`. Unfiltered
-        // `*_by_branch` also *projects* inherited global rows onto every
-        // visible branch with `lixcol_global = true` — that is the same
-        // visibility overlay `ensure_account` uses, not a second seed write.
-        let local_copies = root
-            .execute(
-                "SELECT id, lixcol_branch_id FROM lix_account_by_branch \
-                 WHERE id IN ($1, $2) AND lixcol_global = false",
-                &[
-                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                ],
-            )
+        let global = root
+            .open_another_session()
+            .with_branch(lix::GLOBAL_BRANCH_ID)
             .await
-            .expect("query local account copies should succeed");
-        assert!(
-            local_copies.rows().is_empty(),
-            "built-in accounts must not have branch-local copies"
-        );
-
-        let home_rows = root
+            .expect("global session should open");
+        let home_rows = global
             .execute(
-                "SELECT id, name, lixcol_global, lixcol_branch_id \
-                 FROM lix_account_by_branch \
-                 WHERE id IN ($1, $2) AND lixcol_branch_id = $3 \
+                "SELECT id, name, lixcol_global \
+                 FROM lix_account \
+                 WHERE id IN ($1, $2) \
                  ORDER BY name",
                 &[
                     Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
                     Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
                 ],
             )
             .await
@@ -1412,25 +1380,21 @@ mod tests {
         for row in home_rows.rows() {
             let values = row.values();
             assert_eq!(&values[2], &Value::Boolean(true));
-            assert_eq!(&values[3], &Value::Text(lix::GLOBAL_BRANCH_ID.to_string()));
         }
 
         // A later ensure_account write has the same physical/home shape.
         root.ensure_account(AUTHOR_ID, "Ada", "human")
             .await
             .expect("provision author");
-        let author_copies = root
+        let author_rows = global
             .execute(
-                "SELECT id FROM lix_account_by_branch \
-                 WHERE id = $1 AND lixcol_global = false",
+                "SELECT id, lixcol_global FROM lix_account WHERE id = $1",
                 &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
-            .expect("query ensure_account copies should succeed");
-        assert!(
-            author_copies.rows().is_empty(),
-            "ensure_account must not create branch-local copies either"
-        );
+            .expect("query ensure_account row should succeed");
+        assert_eq!(author_rows.rows().len(), 1);
+        assert_eq!(author_rows.rows()[0].values()[1], Value::Boolean(true));
 
         let draft = root
             .create_branch(CreateBranchOptions {
@@ -1466,22 +1430,6 @@ mod tests {
             );
         }
 
-        let draft_local_copies = root
-            .execute(
-                "SELECT id FROM lix_account_by_branch \
-                 WHERE id IN ($1, $2, $3) AND lixcol_global = false",
-                &[
-                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                    Value::Text(AUTHOR_ID.to_string()),
-                ],
-            )
-            .await
-            .expect("query draft local copies should succeed");
-        assert!(
-            draft_local_copies.rows().is_empty(),
-            "creating a branch must not copy global accounts onto the new branch"
-        );
     }
 }
 

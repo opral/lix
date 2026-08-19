@@ -47,9 +47,9 @@ await lix.close();
 
 ## Diff sources
 
-`lix_working_diff` compares the active branch head with its latest checkpoint.
-`lix_working_diff_by_branch` adds `lixcol_branch_id` for cross-branch
-inspection. Their columns are listed in the
+`lix_working_diff` compares the current session's active branch head with its
+latest checkpoint. Open another session on another branch to inspect that
+branch's working diff. Its columns are listed in the
 [checkpoint SQL surfaces table](./checkpoints.md#sql-surfaces).
 
 `lix_diff` compares any two commits. Both commit arguments are required:

@@ -38,6 +38,7 @@ const opened = new Promise((resolve, reject) => {
 });
 connection.postMessage({
 	id: 1,
+	sessionId: 0,
 	operation: {
 		kind: "open",
 		storage: { kind: "memory" },

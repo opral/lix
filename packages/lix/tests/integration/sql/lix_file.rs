@@ -580,30 +580,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_file_by_branch_read_rejects_dynamic_branch_id_operand,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        let error = session
-            .execute(
-                "SELECT id FROM lix_file_by_branch WHERE lixcol_branch_id = lower('main')",
-                &[],
-            )
-            .await
-            .expect_err("public branch id predicate should only accept literal/param operands");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("public column 'lixcol_branch_id'"));
-    }
-);
 
 simulation_test!(
     lix_file_path_insert_preserves_long_opaque_segments,
@@ -1820,55 +1796,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_file_by_branch_insert_duplicate_id_reports_lix_file_by_branch,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-        let branch_id = sim.main_branch_id();
-
-        session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file_by_branch \
-                     (id, path, content, lixcol_branch_id) \
-                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', CAST('byte-01' AS BYTEA), '{branch_id}')"
-                ),
-                &[],
-            )
-            .await
-            .expect("first by-branch file insert should succeed");
-
-        let error = session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file_by_branch \
-                     (id, path, content, lixcol_branch_id) \
-                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', CAST('byte-02' AS BYTEA), '{branch_id}')"
-                ),
-                &[],
-            )
-            .await
-            .expect_err("duplicate by-branch file id insert should be rejected");
-
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert!(
-            error.message.contains("table 'lix_file_by_branch'")
-                && error
-                    .message
-                    .contains("id '73616d65-2d66-896c-8500-000000000000'")
-                && !error.message.contains("table 'lix_file':")
-                && !error.message.contains("lix_binary_blob_ref"),
-            "unexpected error: {error:?}"
-        );
-    }
-);
 
 simulation_test!(
     lix_file_path_insert_rejects_existing_directory_entry,
@@ -3079,55 +3006,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
-
-    session
-        .execute(
-            "INSERT INTO lix_file (id, path, content, lixcol_global, lixcol_untracked) \
-             VALUES ('66696c65-2d67-8c6f-8261-6c2d6f766500', '/global.txt', CAST('g' AS BYTEA), true, false)",
-            &[],
-        )
-        .await
-        .expect("global file insert should succeed");
-
-    let result = session
-        .execute(
-            "SELECT id, path, lixcol_branch_id, lixcol_global, lixcol_untracked \
-             FROM lix_file_by_branch \
-             WHERE id = '66696c65-2d67-8c6f-8261-6c2d6f766500' \
-             ORDER BY lixcol_branch_id",
-            &[],
-        )
-        .await
-        .expect("file by-branch read should succeed");
-    assert_rows_eq(
-        result,
-        vec![
-            vec![
-                Value::Text("66696c65-2d67-8c6f-8261-6c2d6f766500".to_string()),
-                Value::Text("/global.txt".to_string()),
-                Value::Text(sim.main_branch_id().to_string()),
-                Value::Boolean(true),
-                Value::Boolean(false),
-            ],
-            vec![
-                Value::Text("66696c65-2d67-8c6f-8261-6c2d6f766500".to_string()),
-                Value::Text("/global.txt".to_string()),
-                Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-                Value::Boolean(true),
-                Value::Boolean(false),
-            ],
-        ],
-    );
-});
 
 simulation_test!(
     lix_file_global_path_insert_reuses_existing_global_directory,
@@ -3539,94 +3417,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_file_by_branch_insert_on_conflict_path_branch_updates_existing,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-        let branch_id = sim.main_branch_id();
 
-        session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file_by_branch \
-                     (id, path, content, lixcol_branch_id) \
-                     VALUES ('66696c65-2d62-8261-8e63-682d70617400', '/docs/branch.md', CAST('old' AS BYTEA), '{branch_id}')"
-                ),
-                &[],
-            )
-            .await
-            .expect("seed by-branch insert should succeed");
-
-        let result = session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file_by_branch \
-                     (path, content, lixcol_branch_id) \
-                     VALUES ('/docs/branch.md', CAST('new' AS BYTEA), '{branch_id}') \
-                     ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET content = excluded.content"
-                ),
-                &[],
-            )
-            .await
-            .expect("by-branch path upsert should succeed");
-        assert_eq!(result.rows_affected(), 1);
-
-        let read = session
-            .execute(
-                "SELECT id, content FROM lix_file WHERE path = '/docs/branch.md'",
-                &[],
-            )
-            .await
-            .expect("file read should succeed");
-        assert_rows_eq(
-            read,
-            vec![vec![
-                Value::Text("66696c65-2d62-8261-8e63-682d70617400".to_string()),
-                Value::Blob(b"new".to_vec().into()),
-            ]],
-        );
-    }
-);
-
-simulation_test!(
-    lix_file_by_branch_insert_on_conflict_path_without_branch_target_rejects,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-        let branch_id = sim.main_branch_id();
-
-        let error = session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file_by_branch \
-                     (path, content, lixcol_branch_id) \
-                     VALUES ('/docs/reject.md', CAST('byte-00' AS BYTEA), '{branch_id}') \
-                     ON CONFLICT (path) DO UPDATE SET content = excluded.content"
-                ),
-                &[],
-            )
-            .await
-            .expect_err("by-branch path-only target should be rejected");
-        assert!(
-            error
-                .message
-                .contains("path identity columns (path, lixcol_branch_id)")
-        );
-    }
-);
 
 simulation_test!(
     lix_file_insert_on_conflict_path_rejects_missing_path,
@@ -3720,11 +3511,17 @@ simulation_test!(
             .expect("path upsert should update visible global file");
         assert_eq!(result.rows_affected(), 1);
 
-        let read = session
+        let global_session = sim.wrap_session(
+            engine
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let read = global_session
             .execute(
-                "SELECT id, content, lixcol_global, lixcol_branch_id \
-                 FROM lix_file_by_branch \
-                 WHERE id = '66696c65-2d67-8c6f-8261-6c2d70617400' AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+                "SELECT id, content, lixcol_global FROM lix_file \
+                 WHERE id = '66696c65-2d67-8c6f-8261-6c2d70617400'",
                 &[],
             )
             .await
@@ -3735,7 +3532,6 @@ simulation_test!(
                 Value::Text("66696c65-2d67-8c6f-8261-6c2d70617400".to_string()),
                 Value::Blob(b"new".to_vec().into()),
                 Value::Boolean(true),
-                Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             ]],
         );
     }
@@ -3924,24 +3720,19 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let branch_id = sim.main_branch_id();
-
         session
             .execute(
-                "INSERT INTO lix_file_by_branch \
-                 (id, path, content, lixcol_global, lixcol_branch_id) \
-                 VALUES ('6c616e65-2d66-896c-8500-000000000000', '/global.md', CAST('byte-01' AS BYTEA), true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
+                "INSERT INTO lix_file \
+                 (id, path, content, lixcol_global) \
+                 VALUES ('6c616e65-2d66-896c-8500-000000000000', '/global.md', CAST('byte-01' AS BYTEA), true)",
                 &[],
             )
             .await
             .expect("global lane file should insert");
         session
             .execute(
-                &format!(
-                    "INSERT INTO lix_file_by_branch \
-                     (id, path, content, lixcol_branch_id) \
-                     VALUES ('6c616e65-2d66-896c-8500-000000000000', '/branch.md', CAST('byte-02' AS BYTEA), '{branch_id}')"
-                ),
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('6c616e65-2d66-896c-8500-000000000000', '/branch.md', CAST('byte-02' AS BYTEA))",
                 &[],
             )
             .await
@@ -3977,10 +3768,8 @@ simulation_test!(
 
         let deleted = transaction
             .execute(
-                &format!(
-                    "DELETE FROM lix_file_by_branch \
-                     WHERE id = '6c616e65-2d66-896c-8500-000000000000' AND lixcol_branch_id = '{branch_id}'"
-                ),
+                "DELETE FROM lix_file \
+                 WHERE id = '6c616e65-2d66-896c-8500-000000000000'",
                 &[],
             )
             .await

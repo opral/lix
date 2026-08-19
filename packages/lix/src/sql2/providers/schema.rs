@@ -25,7 +25,6 @@ use serde_json::Value as JsonValue;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
-use crate::row_pk::RowPk;
 use crate::hot_state::MaterializedHotStateBatch;
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
@@ -33,16 +32,15 @@ use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
     HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
+use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
-    SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec, PublicCatalog, PublicSurfaceKind,
+    PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec,
     schema_surface_schema,
-};
-use crate::sql2::row_projection::{
-    RowProjectionDecoder, row_projection_error_to_datafusion_error,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_schema_surface;
+use crate::sql2::row_projection::{RowProjectionDecoder, row_projection_error_to_datafusion_error};
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
@@ -150,9 +148,10 @@ pub(crate) async fn execute_exact_schema_batch_read(
         let Some(row) = exact.row(slot) else {
             continue;
         };
-        rows.push(decoder.decode_public_values(
-            row.snapshot_content().map(|snapshot| snapshot.as_bytes()),
-        )?);
+        rows.push(
+            decoder
+                .decode_public_values(row.snapshot_content().map(|snapshot| snapshot.as_bytes()))?,
+        );
     }
     Ok(crate::SqlQueryResult {
         rows,
@@ -192,20 +191,6 @@ where
                         Arc::clone(&hot_state),
                         Arc::clone(&branch_ref),
                         active_branch_id.to_string(),
-                        row_snapshot_reader.clone(),
-                    )),
-                    WriteAccess::read_only(),
-                )?;
-            }
-            PublicSurfaceKind::SchemaByBranch { schema_key } if include_write_surfaces => {
-                let spec = catalog_schema_spec(catalog, schema_key)?;
-                register_spec_table(
-                    ctx,
-                    &surface.name,
-                    Arc::new(SchemaSpec::by_branch(
-                        spec,
-                        Arc::clone(&hot_state),
-                        Arc::clone(&branch_ref),
                         row_snapshot_reader.clone(),
                     )),
                     WriteAccess::read_only(),
@@ -267,19 +252,6 @@ pub(crate) async fn register_row_write_providers(
                     WriteAccess::write(write_ctx.clone()),
                 )?;
             }
-            PublicSurfaceKind::SchemaByBranch { schema_key } => {
-                let spec = catalog_schema_spec(catalog, schema_key)?;
-                register_spec_table(
-                    ctx,
-                    &surface.name,
-                    Arc::new(SchemaSpec::by_branch_with_write(
-                        spec,
-                        write_ctx.clone(),
-                        Arc::clone(&branch_ref),
-                    )),
-                    WriteAccess::write(write_ctx.clone()),
-                )?;
-            }
             _ => {}
         }
     }
@@ -305,7 +277,7 @@ fn catalog_schema_spec(
 
 /// One spec type covers every registered row schema: the runtime
 /// [`SchemaSurfaceSpec`] carries the per-schema column layout, and the
-/// surface name follows the catalog naming for the base/by-branch shapes.
+/// surface name follows the catalog naming for the active shape.
 #[derive(Clone)]
 struct SchemaSpec {
     surface_name: String,
@@ -346,32 +318,6 @@ impl SchemaSpec {
         Self::active(spec, hot_state, branch_ref, active_branch_id, None)
     }
 
-    fn by_branch(
-        spec: Arc<SchemaSurfaceSpec>,
-        hot_state: Arc<dyn HotStateReader>,
-        branch_ref: Arc<dyn BranchRefReader>,
-        row_snapshot_reader: Option<Arc<dyn RowSnapshotReader>>,
-    ) -> Self {
-        Self {
-            surface_name: format!("{}_by_branch", spec.schema_key),
-            schema: schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch),
-            spec,
-            hot_state,
-            row_snapshot_reader,
-            branch_ref,
-            branch_binding: BranchBinding::explicit(),
-        }
-    }
-
-    fn by_branch_with_write(
-        spec: Arc<SchemaSurfaceSpec>,
-        write_ctx: SqlWriteContext,
-        branch_ref: Arc<dyn BranchRefReader>,
-    ) -> Self {
-        let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx));
-        Self::by_branch(spec, hot_state, branch_ref, None)
-    }
-
     /// Plan-time scan derivation shared by `plan_scan` and the unit tests:
     /// the projected output schema, the live-state scan request (with branch
     /// routing resolved), and the residual snapshot row filters.
@@ -399,16 +345,6 @@ impl SchemaSpec {
             if row_filters.is_empty() { limit } else { None },
             !row_filters.is_empty(),
         );
-        let exact_branch_ids = exact_branch_ids_from_filters(filters)?;
-        // Preserve an exact by-branch selector before resolving an explicit
-        // provider scope. Resolving first would enumerate every branch even
-        // when the DELETE has an exact `lixcol_branch_id = ...` predicate,
-        // and write contexts intentionally only expose point branch-head
-        // lookups. Active surfaces retain their existing post-resolution
-        // filtering behavior so a branch overlay is still constructed first.
-        if matches!(&self.branch_binding, BranchBinding::Explicit) {
-            apply_exact_branch_id_filter(&mut request, exact_branch_ids.clone());
-        }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -416,7 +352,6 @@ impl SchemaSpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_row_pk_filters(&mut request, &self.spec, filters)?;
         apply_exact_file_id_filter(&mut request, exact_file_ids_from_filters(filters)?);
         if request.filter.row_pks.is_empty()
@@ -448,19 +383,8 @@ impl SchemaSpec {
                 "UPDATE schema surface RETURNING has invalid lixcol_row_pk: {error}"
             ))
         })?;
-        let branch_id = match self.branch_binding {
-            BranchBinding::Active { .. } => String::new(),
-            BranchBinding::Explicit => required_string_value(
-                batch,
-                row_index,
-                "lixcol_branch_id",
-                "UPDATE schema surface RETURNING",
-            )?,
-        };
-        Ok(RowReturningKey {
-            row_pk,
-            branch_id,
-        })
+        let branch_id = String::new();
+        Ok(RowReturningKey { row_pk, branch_id })
     }
 
     async fn returning_post_image(
@@ -484,14 +408,6 @@ impl SchemaSpec {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        if matches!(self.branch_binding, BranchBinding::Explicit) {
-            request.filter.branch_ids = keys
-                .iter()
-                .map(|key| key.branch_id.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-        }
         let rows = WriteContextHotStateReader::new(write_ctx.clone())
             .scan_batch(&request)
             .await
@@ -703,10 +619,7 @@ impl TableSpec for SchemaSpec {
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let primary_key_analyzer = RowPrimaryKeyFilterAnalyzer::new(&self.spec);
         let row_filter_analyzer = RowFilterAnalyzer::new(&self.spec);
-        if ExactBranchIdFilterAnalyzer.supports(filter)
-            || ExactFileIdFilterAnalyzer.supports(filter)
-            || primary_key_analyzer.supports(filter)
-        {
+        if ExactFileIdFilterAnalyzer.supports(filter) || primary_key_analyzer.supports(filter) {
             TableProviderFilterPushDown::Exact
         } else if row_filter_analyzer.supports(filter) {
             // Retain a DataFusion residual even when the row-shaped fallback
@@ -788,8 +701,7 @@ impl TableSpec for SchemaSpec {
                 .plan_row_columnar_scan(columnar_request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?
-            && let Some(projection) =
-                row_columnar_projection(&layout.manifest, &schema, &self.spec)
+            && let Some(projection) = row_columnar_projection(&layout.manifest, &schema, &self.spec)
         {
             let group_indices = row_columnar_group_indices(&layout.manifest, &row_filters);
             return Ok(PlannedScan {
@@ -1379,8 +1291,7 @@ fn row_columnar_coordinate_shadow_masks(
             // has no stale base member to suppress.
             continue;
         };
-        let owner =
-            crate::hot_state::row_group_set_id(coordinate.base_commit_id, &spec.schema_key);
+        let owner = crate::hot_state::row_group_set_id(coordinate.base_commit_id, &spec.schema_key);
         if owner != layout.id {
             return exec_err!(
                 "row overlay columnar coordinate belongs to a different immutable base"
@@ -1452,9 +1363,7 @@ fn row_columnar_overlay_batches(
             continue;
         }
         let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
-            DataFusionError::Execution(
-                "live row columnar overlay row has no snapshot".to_owned(),
-            )
+            DataFusionError::Execution("live row columnar overlay row has no snapshot".to_owned())
         })?;
         if !row_filters.is_empty() {
             let parsed = parse_snapshot_value(std::str::from_utf8(snapshot).map_err(|error| {
@@ -1599,31 +1508,13 @@ fn row_delete_stage_rows_from_batch(
             "DELETE FROM schema surface",
         )?
         .unwrap_or(false);
-        let source_branch_id = optional_string_value(
-            batch,
-            row_index,
-            "lixcol_branch_id",
-            "DELETE FROM schema surface",
-        )?;
-        if matches!(branch_binding, BranchBinding::Explicit)
-            && global
-            && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
-        {
-            return Err(DataFusionError::Execution(
-                "DELETE through a row by-branch surface cannot mutate a projected global row"
-                    .to_string(),
-            ));
-        }
         let branch_id = if global {
             GLOBAL_BRANCH_ID.to_string()
         } else {
-            source_branch_id
-                .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "DELETE FROM row by-branch requires lixcol_branch_id".to_string(),
-                    )
-                })?
+            branch_binding
+                .active_branch_id()
+                .expect("active row surface has an active branch")
+                .to_owned()
         };
         let row_pk = RowPk::from_json_array_text(&required_string_value(
             batch,
@@ -1697,31 +1588,13 @@ fn row_update_stage_rows_from_batch(
         let global =
             optional_bool_value(batch, row_index, "lixcol_global", "UPDATE schema surface")?
                 .unwrap_or(false);
-        let source_branch_id = optional_string_value(
-            batch,
-            row_index,
-            "lixcol_branch_id",
-            "UPDATE schema surface",
-        )?;
-        if matches!(branch_binding, BranchBinding::Explicit)
-            && global
-            && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
-        {
-            return Err(DataFusionError::Execution(
-                "UPDATE through a row by-branch surface cannot mutate a projected global row"
-                    .to_string(),
-            ));
-        }
         let branch_id = if global {
             GLOBAL_BRANCH_ID.to_string()
         } else {
-            source_branch_id
-                .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "UPDATE row by-branch requires lixcol_branch_id".to_string(),
-                    )
-                })?
+            branch_binding
+                .active_branch_id()
+                .expect("active row surface has an active branch")
+                .to_owned()
         };
         let row_pk = RowPk::from_json_array_text(&required_string_value(
             batch,
@@ -1836,12 +1709,7 @@ fn row_update_json_value(
         }
         SchemaColumnType::Integer => match value {
             ScalarValue::Int64(Some(value)) => Ok(JsonValue::from(value)),
-            other => Err(row_update_type_error(
-                spec,
-                column_name,
-                "BIGINT",
-                &other,
-            )),
+            other => Err(row_update_type_error(spec, column_name, "BIGINT", &other)),
         },
         SchemaColumnType::Number => match value {
             ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
@@ -1861,12 +1729,7 @@ fn row_update_json_value(
         },
         SchemaColumnType::Boolean => match value {
             ScalarValue::Boolean(Some(value)) => Ok(JsonValue::Bool(value)),
-            other => Err(row_update_type_error(
-                spec,
-                column_name,
-                "BOOLEAN",
-                &other,
-            )),
+            other => Err(row_update_type_error(spec, column_name, "BOOLEAN", &other)),
         },
         SchemaColumnType::Timestamptz => match value {
             ScalarValue::TimestampMicrosecond(Some(value), _) => {
@@ -2247,9 +2110,7 @@ fn row_filter_mentions_primary_key(filter: &RowFilter, primary_key_columns: &[&s
     match filter {
         RowFilter::ColumnEq { column, .. }
         | RowFilter::ColumnIn { column, .. }
-        | RowFilter::ColumnRange { column, .. } => {
-            primary_key_columns.contains(&column.as_str())
-        }
+        | RowFilter::ColumnRange { column, .. } => primary_key_columns.contains(&column.as_str()),
         RowFilter::And(left, right) | RowFilter::Or(left, right) => {
             row_filter_mentions_primary_key(left, primary_key_columns)
                 || row_filter_mentions_primary_key(right, primary_key_columns)
@@ -2272,33 +2133,6 @@ fn primary_key_filter_external_value(
             RowFilterValue::String(value),
         ) => Some(value.clone()),
         _ => None,
-    }
-}
-
-fn exact_branch_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
-    let analyzer = ExactBranchIdFilterAnalyzer;
-    let mut branch_ids: Option<BTreeSet<String>> = None;
-    for filter in filters {
-        let Some(filter_ids) = analyzer.analyze(filter)? else {
-            continue;
-        };
-        branch_ids = Some(match branch_ids {
-            Some(existing_ids) => existing_ids.intersection(&filter_ids).cloned().collect(),
-            None => filter_ids,
-        });
-    }
-    Ok(branch_ids.map(|ids| ids.into_iter().collect()))
-}
-
-fn apply_exact_branch_id_filter(
-    request: &mut HotStateScanRequest,
-    branch_ids: Option<Vec<String>>,
-) {
-    if let Some(branch_ids) = branch_ids {
-        if branch_ids.is_empty() {
-            request.filter.rows = HotStateRowFilter::None;
-        }
-        request.filter.branch_ids = branch_ids;
     }
 }
 
@@ -2329,7 +2163,10 @@ fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<ExactFileI
     Ok(file_ids.map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_file_id_filter(request: &mut HotStateScanRequest, file_ids: Option<Vec<ExactFileId>>) {
+fn apply_exact_file_id_filter(
+    request: &mut HotStateScanRequest,
+    file_ids: Option<Vec<ExactFileId>>,
+) {
     if let Some(file_ids) = file_ids {
         if file_ids.is_empty() {
             request.filter.rows = HotStateRowFilter::None;
@@ -2390,8 +2227,7 @@ impl ExactFileIdFilterAnalyzer {
                 let Expr::Column(column) = expression.as_ref() else {
                     return Ok(None);
                 };
-                Ok((column.name == "lixcol_file_id")
-                    .then(|| BTreeSet::from([ExactFileId::Null])))
+                Ok((column.name == "lixcol_file_id").then(|| BTreeSet::from([ExactFileId::Null])))
             }
             _ => Ok(None),
         }
@@ -2449,89 +2285,6 @@ struct RowFilterAnalyzer<'a> {
     spec: &'a SchemaSurfaceSpec,
 }
 
-struct ExactBranchIdFilterAnalyzer;
-
-impl ExactBranchIdFilterAnalyzer {
-    fn supports(&self, expr: &Expr) -> bool {
-        self.analyze(expr)
-            .is_ok_and(|constraint| constraint.is_some())
-    }
-
-    #[expect(clippy::self_only_used_in_recursion)]
-    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<String>>> {
-        match expr {
-            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-                let Some(left) = self.analyze(&binary_expr.left)? else {
-                    return Ok(None);
-                };
-                let Some(right) = self.analyze(&binary_expr.right)? else {
-                    return Ok(None);
-                };
-                Ok(Some(left.intersection(&right).cloned().collect()))
-            }
-            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-                let Some(mut left) = self.analyze(&binary_expr.left)? else {
-                    return Ok(None);
-                };
-                let Some(right) = self.analyze(&binary_expr.right)? else {
-                    return Ok(None);
-                };
-                left.extend(right);
-                Ok(Some(left))
-            }
-            Expr::BinaryExpr(binary_expr) => {
-                Ok(branch_id_from_binary_filter(binary_expr).map(|value| BTreeSet::from([value])))
-            }
-            Expr::InList(in_list) => {
-                Ok(branch_ids_from_in_list_filter(in_list)
-                    .map(|values| values.into_iter().collect()))
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-fn branch_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
-    if binary_expr.op != Operator::Eq {
-        return None;
-    }
-
-    branch_id_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
-        .or_else(|| branch_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
-}
-
-fn branch_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
-    if in_list.negated {
-        return None;
-    }
-    let Expr::Column(column) = in_list.expr.as_ref() else {
-        return None;
-    };
-    if column.name != "lixcol_branch_id" {
-        return None;
-    }
-
-    let values = in_list
-        .list
-        .iter()
-        .map(string_expr_literal)
-        .collect::<Option<Vec<_>>>()?;
-    if values.is_empty() {
-        return None;
-    }
-    Some(values)
-}
-
-fn branch_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr) -> Option<String> {
-    let Expr::Column(column) = column_expr else {
-        return None;
-    };
-    if column.name != "lixcol_branch_id" {
-        return None;
-    }
-    string_expr_literal(literal_expr)
-}
-
 impl<'a> RowPrimaryKeyFilterAnalyzer<'a> {
     pub(super) fn new(spec: &'a SchemaSurfaceSpec) -> Self {
         Self {
@@ -2557,10 +2310,7 @@ impl<'a> RowPrimaryKeyFilterAnalyzer<'a> {
         let Some(constraint) = self.analyze_constraint(expr)? else {
             return Ok(None);
         };
-        Ok(
-            constraint
-                .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types),
-        )
+        Ok(constraint.into_row_pks(&self.primary_key_columns, &self.primary_key_component_types))
     }
 
     /// Extracts identity constraints that are guaranteed conjuncts while
@@ -2605,8 +2355,8 @@ impl<'a> RowPrimaryKeyFilterAnalyzer<'a> {
                 let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
                     return Ok(None);
                 };
-                let Some(left_ids) = left
-                    .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
+                let Some(left_ids) =
+                    left.into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
                 else {
                     return Ok(None);
                 };
@@ -2704,12 +2454,10 @@ impl<'a> RowFilterAnalyzer<'a> {
             Expr::Column(column) => {
                 let column_name = self.filterable_column_name(&column.name)?;
                 let column = self.spec.visible_column(column_name)?;
-                (column.column_type == SchemaColumnType::Boolean).then(|| {
-                    RowFilter::ColumnEq {
-                        column: column_name.to_string(),
-                        column_type: SchemaColumnType::Boolean,
-                        value: RowFilterValue::Boolean(true),
-                    }
+                (column.column_type == SchemaColumnType::Boolean).then(|| RowFilter::ColumnEq {
+                    column: column_name.to_string(),
+                    column_type: SchemaColumnType::Boolean,
+                    value: RowFilterValue::Boolean(true),
                 })
             }
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
@@ -2819,11 +2567,7 @@ impl<'a> RowFilterAnalyzer<'a> {
         })
     }
 
-    fn analyze_column_literal(
-        &self,
-        column_expr: &Expr,
-        literal_expr: &Expr,
-    ) -> Option<RowFilter> {
+    fn analyze_column_literal(&self, column_expr: &Expr, literal_expr: &Expr) -> Option<RowFilter> {
         let Expr::Column(column) = column_expr else {
             return None;
         };
@@ -3013,12 +2757,7 @@ impl RowFilter {
                     .fields
                     .iter()
                     .position(|field| field.name == *column)?;
-                row_filter_range_in_statistics(
-                    *op,
-                    value,
-                    &group.columns[index],
-                    group.row_count,
-                )
+                row_filter_range_in_statistics(*op, value, &group.columns[index], group.row_count)
             }
             Self::And(left, right) => match (
                 left.may_match_group(manifest, group),
@@ -3171,9 +2910,7 @@ fn row_scalar_value_cmp(
 ) -> Option<std::cmp::Ordering> {
     use crate::columnar_row_group::RowGroupScalar;
     match (scalar, value) {
-        (RowGroupScalar::Int64(scalar), RowFilterValue::Integer(value)) => {
-            Some(scalar.cmp(value))
-        }
+        (RowGroupScalar::Int64(scalar), RowFilterValue::Integer(value)) => Some(scalar.cmp(value)),
         (RowGroupScalar::String(scalar), RowFilterValue::String(value)) => {
             Some(scalar.as_str().cmp(value.as_str()))
         }
@@ -3201,10 +2938,7 @@ fn row_filter_value_cmp(
     }
 }
 
-fn row_filter_value_literal(
-    expr: &Expr,
-    column_type: SchemaColumnType,
-) -> Option<RowFilterValue> {
+fn row_filter_value_literal(expr: &Expr, column_type: SchemaColumnType) -> Option<RowFilterValue> {
     let Expr::Literal(literal, _) = expr else {
         return None;
     };
@@ -3217,9 +2951,7 @@ fn row_filter_value_literal(
         ScalarValue::UInt8(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
         ScalarValue::UInt16(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
         ScalarValue::UInt32(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
-        ScalarValue::UInt64(Some(value)) => {
-            i64::try_from(*value).ok().map(RowFilterValue::Integer)
-        }
+        ScalarValue::UInt64(Some(value)) => i64::try_from(*value).ok().map(RowFilterValue::Integer),
         ScalarValue::Float32(Some(value)) => Some(RowFilterValue::Number(f64::from(*value))),
         ScalarValue::Float64(Some(value)) => Some(RowFilterValue::Number(*value)),
         ScalarValue::Utf8(Some(value))
@@ -3230,10 +2962,7 @@ fn row_filter_value_literal(
     match (&value, column_type) {
         (RowFilterValue::Boolean(_), SchemaColumnType::Boolean)
         | (RowFilterValue::Integer(_), SchemaColumnType::Integer)
-        | (
-            RowFilterValue::Integer(_) | RowFilterValue::Number(_),
-            SchemaColumnType::Number,
-        )
+        | (RowFilterValue::Integer(_) | RowFilterValue::Number(_), SchemaColumnType::Number)
         | (RowFilterValue::String(_), SchemaColumnType::String) => Some(value),
         _ => None,
     }
@@ -3490,10 +3219,7 @@ fn identity_matches_parts(
 }
 
 #[cfg(test)]
-fn apply_row_filters(
-    rows: &mut Vec<MaterializedHotStateRow>,
-    filters: &[RowFilter],
-) -> Result<()> {
+fn apply_row_filters(rows: &mut Vec<MaterializedHotStateRow>, filters: &[RowFilter]) -> Result<()> {
     if filters.is_empty() {
         return Ok(());
     }
@@ -3761,9 +3487,7 @@ fn row_record_batch(
     }
 
     match projection {
-        RowBatchProjection::ParsedSnapshots => {
-            row_record_batch_from_snapshots(spec, schema, rows)
-        }
+        RowBatchProjection::ParsedSnapshots => row_record_batch_from_snapshots(spec, schema, rows),
         RowBatchProjection::RawTrackedProjection if rows.iter().all(|row| !row.untracked()) => {
             row_record_batch_from_raw_projection(spec, schema, rows)
         }
@@ -4257,19 +3981,19 @@ mod tests {
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk as TestRowPk;
     use crate::hot_state::{
         HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
         MaterializedHotStateBatch, MaterializedHotStateRow,
     };
+    use crate::row_pk::RowPk as TestRowPk;
     use crate::sql2::catalog::{
         SchemaColumnType, SchemaSurfaceShape, derive_schema_surface_spec_from_schema,
-        schema_surface_schema, schema_exposed_as_history_surface,
-        schema_exposed_as_schema_surface,
+        schema_exposed_as_history_surface, schema_exposed_as_schema_surface, schema_surface_schema,
     };
 
     struct EmptyHotStateReader;
     struct EmptyBranchRefReader;
+    struct ActiveBranchRefReader;
 
     #[derive(Default)]
     struct TestCachingRowSnapshotReader {
@@ -4336,8 +4060,29 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl BranchRefReader for ActiveBranchRefReader {
+        async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+            Ok((branch_id == "branch-a").then(|| BranchHead {
+                branch_id: branch_id.to_string(),
+                commit_id: CommitId::for_test_label("branch-a-head"),
+            }))
+        }
+
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
+            Ok(vec![BranchHead {
+                branch_id: "branch-a".to_string(),
+                commit_id: CommitId::for_test_label("branch-a-head"),
+            }])
+        }
+    }
+
     fn empty_branch_ref() -> Arc<dyn BranchRefReader> {
         Arc::new(EmptyBranchRefReader)
+    }
+
+    fn active_branch_ref() -> Arc<dyn BranchRefReader> {
+        Arc::new(ActiveBranchRefReader)
     }
 
     #[derive(Default)]
@@ -4955,24 +4700,6 @@ mod tests {
     }
 
     #[test]
-    fn by_branch_schema_includes_branch_system_column() {
-        let spec = derive_schema_surface_spec_from_schema(&json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "project_message",
-            "columns": [
-                { "name": "body", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["body"],
-        }))
-        .expect("schema should derive schema surface spec");
-
-        let schema = schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch);
-        assert!(schema.field_with_name("body").is_ok());
-        assert!(schema.field_with_name("lixcol_row_pk").is_ok());
-        assert!(schema.field_with_name("lixcol_branch_id").is_ok());
-    }
-
-    #[test]
     fn active_schema_excludes_branch_system_column() {
         let spec = derive_schema_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -5038,7 +4765,7 @@ mod tests {
             }))
             .expect("schema should derive schema surface spec"),
         );
-        let schema = schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch);
+        let schema = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
 
         let batch = row_record_batch(
             &spec,
@@ -5088,16 +4815,6 @@ mod tests {
                 .expect("row pk is string")
                 .value(0),
             "[\"row-1\"]"
-        );
-        assert_eq!(
-            batch
-                .column_by_name("lixcol_branch_id")
-                .expect("branch id column")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("branch id is string")
-                .value(0),
-            "01920000-0000-7000-8000-0000000000a1"
         );
     }
 
@@ -5265,7 +4982,7 @@ mod tests {
             ..live_row()
         };
         let rows = live_batch(vec![branch_row, global_row]);
-        let schema = schema_surface_schema(&spec, SchemaSurfaceShape::ByBranch);
+        let schema = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
         let parsed = row_record_batch(
             &spec,
             Arc::clone(&schema),
@@ -5285,7 +5002,6 @@ mod tests {
             "lixcol_metadata",
             "lixcol_row_pk",
             "lixcol_file_id",
-            "lixcol_branch_id",
             "lixcol_global",
             "lixcol_untracked",
         ] {
@@ -5407,7 +5123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_registers_as_table_provider() {
+    async fn active_provider_registers_without_branch_system_column() {
         let spec = Arc::new(
             derive_schema_surface_spec_from_schema(&json!({
                 "$schema": "https://lix.dev/schema-v1.json",
@@ -5419,10 +5135,11 @@ mod tests {
             }))
             .expect("schema should derive schema surface spec"),
         );
-        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::by_branch(
+        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
             spec,
             Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
-            empty_branch_ref(),
+            active_branch_ref(),
+            "branch-a".to_string(),
             None,
         )));
 
@@ -5430,7 +5147,7 @@ mod tests {
             provider
                 .schema()
                 .field_with_name("lixcol_branch_id")
-                .is_ok()
+                .is_err()
         );
     }
 
@@ -5450,10 +5167,7 @@ mod tests {
             .expect("primary-key filters should analyze")
             .expect("primary-key filters should produce a constraint");
 
-        assert_eq!(
-            row_pks,
-            vec![crate::row_pk::RowPk::single("row-a")]
-        );
+        assert_eq!(row_pks, vec![crate::row_pk::RowPk::single("row-a")]);
     }
 
     #[tokio::test]
@@ -5470,10 +5184,11 @@ mod tests {
             }))
             .expect("file-scoped schema should derive"),
         );
-        let provider = super::SchemaSpec::by_branch(
+        let provider = super::SchemaSpec::active(
             Arc::clone(&spec),
             Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
-            empty_branch_ref(),
+            active_branch_ref(),
+            "branch-a".to_string(),
             None,
         );
 
@@ -5547,7 +5262,10 @@ mod tests {
             .plan_scan_parts(None, &[null_file_owner], None)
             .await
             .expect("NULL file-owner scan should plan");
-        assert_eq!(request.filter.file_ids, vec![crate::NullableKeyFilter::Null]);
+        assert_eq!(
+            request.filter.file_ids,
+            vec![crate::NullableKeyFilter::Null]
+        );
         assert!(row_filters.is_empty());
 
         // Shapes the seek cannot represent stay unsupported so DataFusion keeps
@@ -5592,10 +5310,11 @@ mod tests {
             &spec.primary_key_component_types,
         )
         .expect("integer identity should encode");
-        let provider = super::SchemaSpec::by_branch(
+        let provider = super::SchemaSpec::active(
             Arc::clone(&spec),
             Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
-            empty_branch_ref(),
+            active_branch_ref(),
+            "branch-a".to_string(),
             None,
         );
 
@@ -5691,8 +5410,8 @@ mod tests {
             },
         ];
 
-        let (lower, upper) = super::primary_key_range(&spec, &filters)
-            .expect("contiguous typed range should route");
+        let (lower, upper) =
+            super::primary_key_range(&spec, &filters).expect("contiguous typed range should route");
         let lower = lower.expect("lower bound");
         let upper = upper.expect("upper bound");
         assert_eq!(lower.row_pk.clone().into_parts(), vec!["41"]);
@@ -5732,9 +5451,8 @@ mod tests {
         };
 
         assert!(super::primary_key_range(&spec, &[prefix.clone(), lower.clone()]).is_none());
-        let (actual_lower, actual_upper) =
-            super::primary_key_range(&spec, &[prefix, lower, upper])
-                .expect("bounded final component with exact prefix should route");
+        let (actual_lower, actual_upper) = super::primary_key_range(&spec, &[prefix, lower, upper])
+            .expect("bounded final component with exact prefix should route");
         assert_eq!(
             actual_lower.expect("lower").row_pk.into_parts(),
             vec!["docs", "10"]
@@ -5841,10 +5559,11 @@ mod tests {
     #[tokio::test]
     async fn payload_filter_scan_forces_snapshot_and_removes_pushed_limit() {
         let spec = filter_pushdown_spec();
-        let provider = super::SchemaSpec::by_branch(
+        let provider = super::SchemaSpec::active(
             Arc::clone(&spec),
             Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
-            empty_branch_ref(),
+            active_branch_ref(),
+            "branch-a".to_string(),
             None,
         );
         let row_pk_index = provider
@@ -5881,10 +5600,11 @@ mod tests {
     #[tokio::test]
     async fn unsupported_payload_filter_keeps_limit_and_no_snapshot_projection() {
         let spec = filter_pushdown_spec();
-        let provider = super::SchemaSpec::by_branch(
+        let provider = super::SchemaSpec::active(
             Arc::clone(&spec),
             Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
-            empty_branch_ref(),
+            active_branch_ref(),
+            "branch-a".to_string(),
             None,
         );
         let row_pk_index = provider
@@ -5919,10 +5639,11 @@ mod tests {
     #[tokio::test]
     async fn integer_filter_does_not_claim_exact_pushdown_for_real_literal() {
         let spec = filter_pushdown_spec();
-        let provider = super::SchemaSpec::by_branch(
+        let provider = super::SchemaSpec::active(
             Arc::clone(&spec),
             Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
-            empty_branch_ref(),
+            active_branch_ref(),
+            "branch-a".to_string(),
             None,
         );
         let row_pk_index = provider
@@ -6199,10 +5920,8 @@ mod tests {
             column_type: SchemaColumnType::Boolean,
             value: super::RowFilterValue::Boolean(true),
         };
-        let selected = super::row_columnar_group_indices(
-            &encoded.manifest,
-            std::slice::from_ref(&row_filter),
-        );
+        let selected =
+            super::row_columnar_group_indices(&encoded.manifest, std::slice::from_ref(&row_filter));
         let flag_index = encoded
             .manifest
             .fields
@@ -6220,10 +5939,11 @@ mod tests {
             )
         }));
 
-        let provider = super::SchemaSpec::by_branch(
+        let provider = super::SchemaSpec::active(
             Arc::new(spec),
             Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
-            empty_branch_ref(),
+            active_branch_ref(),
+            "branch-a".to_string(),
             None,
         );
         let expression = Expr::BinaryExpr(BinaryExpr::new(

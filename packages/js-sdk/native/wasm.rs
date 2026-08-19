@@ -1,6 +1,7 @@
 #![allow(missing_debug_implementations)]
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::future::{AbortHandle, Abortable};
@@ -91,6 +92,8 @@ pub async fn benchmark_storage_bridge(
 pub struct WasmLix {
     inner: BrowserLix,
     storage: BrowserStorage,
+    storage_sessions: Rc<Cell<usize>>,
+    closed: Cell<bool>,
 }
 
 #[wasm_bindgen]
@@ -165,7 +168,12 @@ async fn open_browser_storage(
         None => open_lix().with_storage(storage.clone()).await,
     }
     .map_err(lix_error_to_js)?;
-    Ok(WasmLix { inner, storage })
+    Ok(WasmLix {
+        inner,
+        storage,
+        storage_sessions: Rc::new(Cell::new(1)),
+        closed: Cell::new(false),
+    })
 }
 
 struct BrowserTelemetryDispatch(Function);
@@ -185,6 +193,27 @@ pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsVa
 
 #[wasm_bindgen]
 impl WasmLix {
+    #[wasm_bindgen(js_name = openAnotherSession)]
+    pub async fn open_another_session(&self, options: JsValue) -> Result<WasmLix, JsValue> {
+        let options: OpenAnotherSessionOptionsDto = from_js(options)?;
+        let mut builder = self.inner.open_another_session();
+        if let Some(branch_id) = options.branch_id {
+            builder = builder.with_branch(branch_id);
+        }
+        if let Some(account_id) = options.account_id {
+            builder = builder.with_account(account_id);
+        }
+        let inner = builder.await.map_err(lix_error_to_js)?;
+        self.storage_sessions
+            .set(self.storage_sessions.get().saturating_add(1));
+        Ok(WasmLix {
+            inner,
+            storage: self.storage.clone(),
+            storage_sessions: self.storage_sessions.clone(),
+            closed: Cell::new(false),
+        })
+    }
+
     #[wasm_bindgen(js_name = exportSnapshot)]
     pub async fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
         match &self.storage {
@@ -383,11 +412,22 @@ impl WasmLix {
 
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) -> Result<(), JsValue> {
-        self.inner.close().await.map_err(lix_error_to_js)?;
-        self.storage
-            .close()
-            .await
-            .map_err(|error| lix_error_to_js(error.into()))
+        if self.closed.replace(true) {
+            return Ok(());
+        }
+        if let Err(error) = self.inner.close().await {
+            self.closed.set(false);
+            return Err(lix_error_to_js(error));
+        }
+        let remaining = self.storage_sessions.get().saturating_sub(1);
+        self.storage_sessions.set(remaining);
+        if remaining == 0 {
+            self.storage
+                .close()
+                .await
+                .map_err(|error| lix_error_to_js(error.into()))?;
+        }
+        Ok(())
     }
 }
 
@@ -475,6 +515,13 @@ impl WasmObserveEvents {
 #[serde(rename_all = "camelCase")]
 struct ExecuteOptionsDto {
     origin_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct OpenAnotherSessionOptionsDto {
+    pub(super) branch_id: Option<String>,
+    pub(super) account_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -722,7 +769,9 @@ pub(super) fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
         .map_err(lix_error_to_js)
 }
 
-pub(super) fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
+pub(super) fn batch_statements_from_js(
+    value: JsValue,
+) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
     if !Array::is_array(&value) {
         return Err(lix_error_to_js(invalid_param(
             "executeBatch statements must be an array",

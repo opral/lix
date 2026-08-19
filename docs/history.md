@@ -42,10 +42,9 @@ For the full surface grid, insert policies, and the
 
 ## Typed row history
 
-A registered application schema such as `acme_task` has two typed relations
-and one history function:
-`acme_task` for the active branch, `acme_task_by_branch` for explicit branch
-scope, and `acme_task_history()` for branch-reachable history.
+A registered application schema such as `acme_task` has one typed current-state
+relation and one history function: `acme_task` for the current session and
+`acme_task_history()` for branch-reachable revision history.
 
 History starts at the active branch head. The user columns are the same typed
 columns exposed by the base relation. Row history adds these system

@@ -2,6 +2,58 @@ use lix::{LixError, Value};
 
 use super::assert_rows_eq;
 
+simulation_test!(public_catalog_has_no_by_branch_surfaces, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"no_explicit_branch_surface\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB), false, false)",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+    let tables = session
+        .execute(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name LIKE '%\\_by\\_branch' ESCAPE '\\'",
+            &[],
+        )
+        .await
+        .expect("public table catalog should be readable");
+    assert!(tables.rows().is_empty(), "no explicit-branch tables may remain");
+
+    let columns = session
+        .execute(
+            "SELECT table_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND column_name = 'lixcol_branch_id'",
+            &[],
+        )
+        .await
+        .expect("public column catalog should be readable");
+    assert!(
+        columns.rows().is_empty(),
+        "no public data relation may expose lixcol_branch_id"
+    );
+
+    let error = session
+        .execute("SELECT * FROM no_explicit_branch_surface_by_branch", &[])
+        .await
+        .expect_err("retired explicit-branch table names must fail closed");
+    assert!(
+        error.message.contains("no_explicit_branch_surface_by_branch"),
+        "the unknown-table error should identify the retired surface: {error:?}"
+    );
+});
+
 simulation_test!(
     information_schema_never_exposes_raw_snapshot_content,
     |sim| async move {
@@ -321,26 +373,7 @@ simulation_test!(
             )
             .await
             .expect("by-branch contract query should succeed");
-        assert_rows_eq(
-            by_branch_contract,
-            vec![
-                vec![
-                    Value::Text("engine_column_contract_by_branch".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("REQUIRED".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_directory_by_branch".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("REQUIRED".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_file_by_branch".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("REQUIRED".to_string()),
-                ],
-            ],
-        );
+        assert_rows_eq(by_branch_contract, vec![]);
 
         let identity_contract = session
             .execute(

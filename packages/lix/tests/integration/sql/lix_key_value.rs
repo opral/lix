@@ -343,51 +343,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_key_value_by_branch_on_conflict_upserts_global_row,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_key_value_by_branch \
-             (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-             VALUES ('kv-upsert-global', 'first', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true, true) \
-             ON CONFLICT(key, lixcol_branch_id) DO UPDATE SET value = excluded.value",
-                &[],
-            )
-            .await
-            .expect("initial global upsert should insert");
-
-        session
-            .execute(
-                "INSERT INTO lix_key_value_by_branch \
-             (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-             VALUES ('kv-upsert-global', 'second', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true, true) \
-             ON CONFLICT(key, lixcol_branch_id) DO UPDATE SET value = excluded.value",
-                &[],
-            )
-            .await
-            .expect("second global upsert should update");
-
-        let result = session
-            .execute(
-                "SELECT value FROM lix_key_value_by_branch \
-             WHERE key = 'kv-upsert-global' AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
-                &[],
-            )
-            .await
-            .expect("select should succeed");
-        assert_single_text(result, "\"second\"");
-    }
-);
 
 fn assert_single_text(result: ExecuteResult, expected: &str) {
     let row_set = result;

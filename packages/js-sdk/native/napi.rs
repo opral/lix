@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
 use tokio::runtime::{Builder, Runtime};
@@ -48,7 +48,11 @@ pub struct NativeLix {
 
 enum NativeLixInner {
     Memory(RsLix<Memory>),
-    FilesystemStorage(RsLix<FilesystemStorage>, FilesystemStorage),
+    FilesystemStorage(
+        RsLix<FilesystemStorage>,
+        FilesystemStorage,
+        Arc<AtomicUsize>,
+    ),
 }
 
 enum NativeLixTransactionInner {
@@ -66,6 +70,15 @@ enum NativeObserveEventsInner {
 pub struct NativeExecuteOptions {
     #[napi(js_name = "originKey")]
     pub origin_key: Option<String>,
+}
+
+#[napi(object)]
+#[derive(Debug)]
+pub struct NativeOpenAnotherSessionOptions {
+    #[napi(js_name = "branchId")]
+    pub branch_id: Option<String>,
+    #[napi(js_name = "accountId")]
+    pub account_id: Option<String>,
 }
 
 #[napi(object)]
@@ -95,6 +108,7 @@ type NativeDeferred<T> = JsDeferred<T, NativeResolver<T>>;
 type NativeExecuteDeferred = NativeDeferred<ExecuteResult>;
 type NativeExecuteBatchDeferred = NativeDeferred<Vec<ExecuteResult>>;
 type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
+type NativeLixDeferred = NativeDeferred<NativeLix>;
 type NativeStringDeferred = NativeDeferred<String>;
 type NativeCreateBranchDeferred = NativeDeferred<CreateBranchReceiptDto>;
 type NativeCreateCheckpointDeferred = NativeDeferred<CreateCheckpointReceiptDto>;
@@ -106,6 +120,10 @@ type NativeMergeReceiptDeferred = NativeDeferred<MergeBranchReceiptDto>;
 type NativeUnitDeferred = NativeDeferred<()>;
 
 enum LixCommand {
+    OpenAnotherSession {
+        options: NativeOpenAnotherSessionOptions,
+        deferred: NativeLixDeferred,
+    },
     Execute {
         sql: String,
         params: Vec<Value>,
@@ -291,6 +309,9 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
     while let Ok(command) = receiver.recv() {
         match command {
             LixCommand::Execute { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::OpenAnotherSession { deferred, .. } => {
+                deferred.reject(to_napi_error(&error))
+            }
             LixCommand::ExecuteBatch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
@@ -327,6 +348,13 @@ fn handle_lix_command(
     command: LixCommand,
 ) -> bool {
     match command {
+        LixCommand::OpenAnotherSession { options, deferred } => {
+            let result = rt
+                .block_on(state.lix.open_another_session(options))
+                .and_then(NativeLix::new);
+            settle_deferred(deferred, result);
+            false
+        }
         LixCommand::Execute {
             sql,
             params,
@@ -506,6 +534,9 @@ fn handle_lix_command(
 fn settle_command_after_close(command: LixCommand) {
     match command {
         LixCommand::Close(deferred) => settle_deferred(deferred, Ok(())),
+        LixCommand::OpenAnotherSession { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::Execute { deferred, .. } | LixCommand::TransactionExecute { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -575,7 +606,7 @@ impl NativeLixInner {
                     None => execution.await,
                 }
             }
-            Self::FilesystemStorage(lix, _) => {
+            Self::FilesystemStorage(lix, _, _) => {
                 let execution = lix.execute(sql, params);
                 match options {
                     Some(origin_key) => execution.with_origin_key(origin_key).await,
@@ -598,7 +629,7 @@ impl NativeLixInner {
                     None => execution.await,
                 }
             }
-            Self::FilesystemStorage(lix, _) => {
+            Self::FilesystemStorage(lix, _, _) => {
                 let execution = lix.execute_batch(statements);
                 match options {
                     Some(origin_key) => execution.with_origin_key(origin_key).await,
@@ -613,7 +644,7 @@ impl NativeLixInner {
             Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(
                 lix.begin_transaction().await?,
             )),
-            Self::FilesystemStorage(lix, _) => Ok(NativeLixTransactionInner::FilesystemStorage(
+            Self::FilesystemStorage(lix, _, _) => Ok(NativeLixTransactionInner::FilesystemStorage(
                 lix.begin_transaction().await?,
             )),
         }
@@ -626,7 +657,7 @@ impl NativeLixInner {
     ) -> std::result::Result<NativeObserveEventsInner, LixError> {
         match self {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
-            Self::FilesystemStorage(lix, _) => Ok(NativeObserveEventsInner::FilesystemStorage(
+            Self::FilesystemStorage(lix, _, _) => Ok(NativeObserveEventsInner::FilesystemStorage(
                 lix.observe(sql, params)?,
             )),
         }
@@ -635,14 +666,14 @@ impl NativeLixInner {
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
         match self {
             Self::Memory(lix) => lix.active_branch_id().await,
-            Self::FilesystemStorage(lix, _) => lix.active_branch_id().await,
+            Self::FilesystemStorage(lix, _, _) => lix.active_branch_id().await,
         }
     }
 
     fn active_account_id(&self) -> &str {
         match self {
             Self::Memory(lix) => lix.active_account_id(),
-            Self::FilesystemStorage(lix, _) => lix.active_account_id(),
+            Self::FilesystemStorage(lix, _, _) => lix.active_account_id(),
         }
     }
 
@@ -652,28 +683,28 @@ impl NativeLixInner {
     ) -> std::result::Result<CreateBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
-            Self::FilesystemStorage(lix, _) => lix.create_branch(options).await,
+            Self::FilesystemStorage(lix, _, _) => lix.create_branch(options).await,
         }
     }
 
     async fn create_checkpoint(&self) -> std::result::Result<CreateCheckpointReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_checkpoint().await,
-            Self::FilesystemStorage(lix, _) => lix.create_checkpoint().await,
+            Self::FilesystemStorage(lix, _, _) => lix.create_checkpoint().await,
         }
     }
 
     async fn undo(&self) -> std::result::Result<UndoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.undo().await,
-            Self::FilesystemStorage(lix, _) => lix.undo().await,
+            Self::FilesystemStorage(lix, _, _) => lix.undo().await,
         }
     }
 
     async fn redo(&self) -> std::result::Result<RedoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.redo().await,
-            Self::FilesystemStorage(lix, _) => lix.redo().await,
+            Self::FilesystemStorage(lix, _, _) => lix.redo().await,
         }
     }
 
@@ -683,7 +714,7 @@ impl NativeLixInner {
     ) -> std::result::Result<SwitchBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.switch_branch(options).await,
-            Self::FilesystemStorage(lix, _) => lix.switch_branch(options).await,
+            Self::FilesystemStorage(lix, _, _) => lix.switch_branch(options).await,
         }
     }
 
@@ -692,7 +723,7 @@ impl NativeLixInner {
         paths: Vec<String>,
     ) -> std::result::Result<(), LixError> {
         match self {
-            Self::FilesystemStorage(_, storage) => storage.import_paths(paths).await,
+            Self::FilesystemStorage(_, storage, _) => storage.import_paths(paths).await,
             Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "importFilesystemPaths requires a filesystem storage",
@@ -706,7 +737,7 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchPreview, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
-            Self::FilesystemStorage(lix, _) => lix.merge_branch_preview(options).await,
+            Self::FilesystemStorage(lix, _, _) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -716,13 +747,13 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch(options).await,
-            Self::FilesystemStorage(lix, _) => lix.merge_branch(options).await,
+            Self::FilesystemStorage(lix, _, _) => lix.merge_branch(options).await,
         }
     }
 
     async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
         match self {
-            Self::FilesystemStorage(_, storage) => storage.sync_disk_to_lix().await,
+            Self::FilesystemStorage(_, storage, _) => storage.sync_disk_to_lix().await,
             Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "syncDiskToLix requires a filesystem storage",
@@ -733,9 +764,45 @@ impl NativeLixInner {
     async fn close(&self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(lix) => lix.close().await,
-            Self::FilesystemStorage(lix, storage) => {
-                storage.stop_sync().await?;
+            Self::FilesystemStorage(lix, storage, sessions) => {
+                if sessions.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    storage.stop_sync().await?;
+                }
                 lix.close().await
+            }
+        }
+    }
+
+    async fn open_another_session(
+        &self,
+        options: NativeOpenAnotherSessionOptions,
+    ) -> std::result::Result<Self, LixError> {
+        match self {
+            Self::Memory(lix) => {
+                let mut builder = lix.open_another_session();
+                if let Some(branch_id) = options.branch_id {
+                    builder = builder.with_branch(branch_id);
+                }
+                if let Some(account_id) = options.account_id {
+                    builder = builder.with_account(account_id);
+                }
+                Ok(Self::Memory(builder.await?))
+            }
+            Self::FilesystemStorage(lix, storage, sessions) => {
+                let mut builder = lix.open_another_session();
+                if let Some(branch_id) = options.branch_id {
+                    builder = builder.with_branch(branch_id);
+                }
+                if let Some(account_id) = options.account_id {
+                    builder = builder.with_account(account_id);
+                }
+                let opened = builder.await?;
+                sessions.fetch_add(1, Ordering::SeqCst);
+                Ok(Self::FilesystemStorage(
+                    opened,
+                    storage.clone(),
+                    sessions.clone(),
+                ))
             }
         }
     }
@@ -885,7 +952,11 @@ fn open_filesystem_storage_native(
         None => rt.block_on(async { open_lix().with_storage(storage.clone()).await })?,
     };
     rt.block_on(storage.start_sync(&lix))?;
-    NativeLix::new(NativeLixInner::FilesystemStorage(lix, storage))
+    NativeLix::new(NativeLixInner::FilesystemStorage(
+        lix,
+        storage,
+        Arc::new(AtomicUsize::new(1)),
+    ))
 }
 
 #[napi]
@@ -910,6 +981,24 @@ impl NativeLix {
             sync_all_files,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
         }))
+    }
+
+    #[napi(js_name = "openAnotherSession")]
+    pub fn open_another_session<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeOpenAnotherSessionOptions>,
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeLixDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::OpenAnotherSession {
+                options: options.unwrap_or(NativeOpenAnotherSessionOptions {
+                    branch_id: None,
+                    account_id: None,
+                }),
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi]
