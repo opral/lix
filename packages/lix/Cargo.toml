@@ -26,7 +26,11 @@ storage-benches = []
 # `storage-benches` so timing A/B runs never pay for the inline `Instant::now()`.
 root-replay-trace = ["storage-benches"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# WASM-safe protocol client. Hosts supply HTTP (fetch/headers) via ProtocolHttp.
+server-protocol-client = ["dep:flate2", "tokio/macros"]
+# Canonical server plus the shared client.
 server-protocol = [
+  "server-protocol-client",
   "dep:async-stream",
   "dep:futures-core",
   "dep:getrandom",
@@ -143,7 +147,8 @@ uuid = { version = "1", features = ["v5", "v7", "std", "js", "fast-rng"] }
 web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-lite = "2"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+flate2 = { version = "1", optional = true }
 tracing = "0.1"
 blake3 = "1"
 fastcdc = "3"

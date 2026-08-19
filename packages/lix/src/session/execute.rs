@@ -244,6 +244,20 @@ impl ExecuteResult {
         Self::from_query_parts(columns, rows, rows_affected, notices)
     }
 
+    pub(crate) fn from_protocol_response(
+        statement_index: Option<usize>,
+        label: Option<String>,
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        rows_affected: u64,
+        notices: Vec<LixNotice>,
+    ) -> Self {
+        let mut result = Self::from_query_parts(columns, rows, rows_affected, notices);
+        result.statement_index = statement_index;
+        result.statement_label = label;
+        result
+    }
+
     fn from_query_parts(
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
