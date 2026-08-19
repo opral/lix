@@ -227,6 +227,56 @@ pub(crate) async fn demand_sync_for_error(
     Ok(true)
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SyncDemandRetry {
+    seen: BTreeSet<String>,
+    rounds: usize,
+}
+
+impl SyncDemandRetry {
+    pub(crate) async fn hydrate_for_retry(
+        &mut self,
+        demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
+        error: LixError,
+    ) -> Result<(), LixError> {
+        let demand_identity = match error.code.as_str() {
+            "LIX_SYNC_HISTORY_REQUIRED" | "LIX_SYNC_CHUNKS_REQUIRED" => Some(format!(
+                "{}:{}",
+                error.code,
+                serde_json::to_string(&error.details).unwrap_or_default()
+            )),
+            _ => None,
+        };
+        let Some(identity) = demand_identity else {
+            return Err(error);
+        };
+        let Some(demand_tx) = demand_tx else {
+            return Err(error);
+        };
+        if !self.seen.insert(identity) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync demand hydration did not make progress",
+            ));
+        }
+        if self.rounds >= super::MAX_SYNC_REQUEST_ITEMS {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "sync demand hydration exceeded {} rounds",
+                    super::MAX_SYNC_REQUEST_ITEMS
+                ),
+            ));
+        }
+        self.rounds += 1;
+        if demand_sync_for_error(demand_tx, &error).await? {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
 impl Drop for SyncRuntime {
     fn drop(&mut self) {
         self.stop();
@@ -455,8 +505,7 @@ where
     // work. This prevents an engine's synthetic initialization commit from
     // being mistaken for user-authored repository history.
     if lix.load_sync_repository_cursor(remote_id).await?.is_none() {
-        let (snapshot, _lix_id, _default_branch_id) =
-            fetch_repository_snapshot(transport).await?;
+        let (snapshot, _lix_id, _default_branch_id) = fetch_repository_snapshot(transport).await?;
         register_commit_blob_manifests(lix, transport, &snapshot.commits).await?;
         register_snapshot_row_blob_manifests(lix, transport, &snapshot.rows).await?;
         lix.apply_sync_repository_snapshot(

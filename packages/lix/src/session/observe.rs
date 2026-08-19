@@ -55,6 +55,7 @@ where
     sequence: u64,
     last_rows: Option<ExecuteResult>,
     last_shared_content: Option<ObserveSharedContent>,
+    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     closed: bool,
 }
 
@@ -62,6 +63,14 @@ impl<StorageImpl> ObserveEvents<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn with_sync_demand_sender(
+        mut self,
+        sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    ) -> Self {
+        self.sync_demand_tx = sync_demand_tx;
+        self
+    }
+
     pub fn next(
         &mut self,
     ) -> impl Future<Output = Result<Option<ObserveEvent>, LixError>> + Send + '_ {
@@ -175,8 +184,21 @@ where
                 .ensure_external_watcher(self.session.storage.clone())
                 .await?;
             let before = self.invalidation_generation()?;
-            let rows = Box::pin(self.execute_or_share(before)).await;
             drop(operation_guard);
+            // Keep shared-query leadership across demand hydration, while the
+            // query helper releases its own session guard before the sync
+            // worker writes the requested history or chunks.
+            let rows = Box::pin(self.execute_or_share(before)).await;
+            // A follower can wait on another session's shared leader. Recheck
+            // this session after that wait so an explicit transaction cannot
+            // consume the shared cached result.
+            let operation_guard = match self.session.begin_waitable_session_operation().await {
+                Err(error) if error.code == LixError::CODE_CLOSED => {
+                    self.close();
+                    return Ok(None);
+                }
+                result => result?,
+            };
             // Closing transitions the shared session to `Closing` before it
             // waits for active operations. Do not publish a snapshot that
             // completed concurrently with that lifecycle boundary.
@@ -196,6 +218,7 @@ where
             if before == after {
                 return Ok(Some((after, rows)));
             }
+            drop(operation_guard);
         }
     }
 
@@ -211,9 +234,11 @@ where
             self.last_shared_content = None;
         }
         let Some(shared_state) = &self.query.shared_state else {
-            return Box::pin(
-                self.session
-                    .execute_for_observe(&self.query.sql, &self.query.params),
+            return Self::execute_with_sync_demands(
+                &self.session,
+                &self.query.sql,
+                &self.query.params,
+                self.sync_demand_tx.as_ref(),
             )
             .await
             .map(ObserveQueryEvaluation::unshared);
@@ -221,15 +246,32 @@ where
 
         shared_state
             .evaluate(generation, Arc::strong_count(shared_state) > 1, || {
-                Box::pin(async {
-                    Box::pin(
-                        self.session
-                            .execute_for_observe(&self.query.sql, &self.query.params),
-                    )
-                    .await
-                })
+                Self::execute_with_sync_demands(
+                    &self.session,
+                    &self.query.sql,
+                    &self.query.params,
+                    self.sync_demand_tx.as_ref(),
+                )
             })
             .await
+    }
+
+    async fn execute_with_sync_demands(
+        session: &SessionContext<StorageImpl>,
+        sql: &str,
+        params: &[Value],
+        sync_demand_tx: Option<&tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    ) -> Result<ExecuteResult, LixError> {
+        let mut retry = crate::sync::SyncDemandRetry::default();
+        loop {
+            let operation_guard = session.begin_waitable_session_operation().await?;
+            let rows = Box::pin(session.execute_for_observe(sql, params)).await;
+            drop(operation_guard);
+            match rows {
+                Err(error) => retry.hydrate_for_retry(sync_demand_tx, error).await?,
+                result => return result,
+            }
+        }
     }
 }
 
@@ -282,6 +324,7 @@ where
             sequence: 0,
             last_rows: None,
             last_shared_content: None,
+            sync_demand_tx: None,
             closed: false,
         })
     }

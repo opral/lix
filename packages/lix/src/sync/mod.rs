@@ -38,14 +38,13 @@ pub(crate) use protocol::{
     SyncEvent, SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
     SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
-pub(crate) use runtime::{
-    PreparedSync, SyncDemand, SyncRuntime, activate_sync_mode, demand_sync_for_error,
-    prepare_sync_mode,
-};
 pub(crate) use repository::{
     SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
     has_any_sync_replica_state, load_sync_replica_account, stage_repository_transaction_event,
     validate_repository_transaction_event_transfer,
+};
+pub(crate) use runtime::{
+    PreparedSync, SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode, prepare_sync_mode,
 };
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;

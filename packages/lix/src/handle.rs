@@ -13,7 +13,6 @@ use lix::{
     SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::{
-    collections::BTreeSet,
     future::{Future, IntoFuture},
     pin::Pin,
     sync::Arc,
@@ -378,11 +377,7 @@ where
             let read = adapter
                 .begin_read(crate::storage_adapter::StorageReadOptions::default())
                 .await?;
-            crate::sync::load_sync_replica_account(
-                &read,
-                server.url.trim_end_matches('/'),
-            )
-            .await?
+            crate::sync::load_sync_replica_account(&read, server.url.trim_end_matches('/')).await?
         } else {
             None
         }
@@ -461,13 +456,6 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    async fn hydrate_sync_demand_for_error(&self, error: &LixError) -> Result<bool, LixError> {
-        let Some(demand_tx) = self.sync_demand_tx.as_ref() else {
-            return Ok(false);
-        };
-        crate::sync::demand_sync_for_error(demand_tx, error).await
-    }
-
     async fn retry_sync_demands<T, Operation, OperationFuture>(
         &self,
         mut operation: Operation,
@@ -476,39 +464,17 @@ where
         Operation: FnMut() -> OperationFuture,
         OperationFuture: Future<Output = Result<T, LixError>>,
     {
-        const MAX_DEMAND_ROUNDS: usize = crate::sync::MAX_SYNC_REQUEST_ITEMS;
-        let mut seen = BTreeSet::new();
-        for _ in 0..MAX_DEMAND_ROUNDS {
+        let mut retry = crate::sync::SyncDemandRetry::default();
+        loop {
             match operation().await {
                 Err(error) => {
-                    let demand_identity = match error.code.as_str() {
-                        "LIX_SYNC_HISTORY_REQUIRED" | "LIX_SYNC_CHUNKS_REQUIRED" => Some(format!(
-                            "{}:{}",
-                            error.code,
-                            serde_json::to_string(&error.details).unwrap_or_default()
-                        )),
-                        _ => None,
-                    };
-                    if let Some(identity) = demand_identity
-                        && !seen.insert(identity)
-                    {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "sync demand hydration did not make progress",
-                        ));
-                    }
-                    if self.hydrate_sync_demand_for_error(&error).await? {
-                        continue;
-                    }
-                    return Err(error);
+                    retry
+                        .hydrate_for_retry(self.sync_demand_tx.as_ref(), error)
+                        .await?;
                 }
                 result => return result,
             }
         }
-        Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("sync demand hydration exceeded {MAX_DEMAND_ROUNDS} rounds"),
-        ))
     }
 
     pub(crate) fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
@@ -849,7 +815,9 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ObserveEvents<StorageImpl>, LixError> {
-        self.session.observe(sql, params)
+        self.session
+            .observe(sql, params)
+            .map(|events| events.with_sync_demand_sender(self.sync_demand_tx.clone()))
     }
 
     pub async fn begin_transaction(&self) -> Result<LixTransaction<StorageImpl>, LixError> {
