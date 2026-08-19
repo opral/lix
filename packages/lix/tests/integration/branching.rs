@@ -72,76 +72,6 @@ simulation_test!(create_branch_rejects_duplicate_name, |sim| async move {
 });
 
 simulation_test!(
-    branch_descriptor_delete_via_schema_surface_is_rejected_when_ref_exists,
-    |sim| async move {
-        let (engine, main, _draft) = create_draft_from_main(&sim).await;
-
-        let error = main
-            .execute(
-                "DELETE FROM lix_branch_descriptor WHERE id = '01930000-0000-7000-8000-000000000001'",
-                &[],
-            )
-            .await
-            .expect_err("descriptor delete through schema surface should fail");
-        assert_branch_pair_delete_restricted(&error);
-
-        assert_eq!(
-            count_branch_descriptors(&main, "01930000-0000-7000-8000-000000000001").await,
-            1
-        );
-        assert_eq!(
-            count_branch_refs(&main, "01930000-0000-7000-8000-000000000001").await,
-            1
-        );
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id("01930000-0000-7000-8000-000000000001")
-                .await
-                .expect("branch ref head should still load"),
-            Some(sim.initial_commit_id().to_string())
-        );
-
-        drop(main);
-        drop(engine);
-    }
-);
-
-simulation_test!(
-    branch_ref_delete_via_schema_surface_is_rejected_when_descriptor_exists,
-    |sim| async move {
-        let (engine, main, _draft) = create_draft_from_main(&sim).await;
-
-        let error = main
-            .execute(
-                "DELETE FROM lix_branch_ref WHERE id = '01930000-0000-7000-8000-000000000001'",
-                &[],
-            )
-            .await
-            .expect_err("ref delete through schema surface should fail");
-        assert_branch_pair_delete_restricted(&error);
-
-        assert_eq!(
-            count_branch_descriptors(&main, "01930000-0000-7000-8000-000000000001").await,
-            1
-        );
-        assert_eq!(
-            count_branch_refs(&main, "01930000-0000-7000-8000-000000000001").await,
-            1
-        );
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id("01930000-0000-7000-8000-000000000001")
-                .await
-                .expect("branch ref head should still load"),
-            Some(sim.initial_commit_id().to_string())
-        );
-
-        drop(main);
-        drop(engine);
-    }
-);
-
-simulation_test!(
     create_branch_can_start_from_explicit_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -1932,43 +1862,6 @@ async fn assert_branch_descriptor(
             Value::Text(branch_id.to_string()),
             Value::Text(expected_name.to_string()),
         ]
-    );
-}
-
-async fn count_branch_descriptors(
-    session: &support::simulation_test::engine::SimSession,
-    branch_id: &str,
-) -> i64 {
-    select_single_integer(
-        session,
-        &format!("SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = '{branch_id}'"),
-    )
-    .await
-}
-
-async fn count_branch_refs(
-    session: &support::simulation_test::engine::SimSession,
-    branch_id: &str,
-) -> i64 {
-    select_single_integer(
-        session,
-        &format!("SELECT COUNT(*) FROM lix_branch_ref WHERE id = '{branch_id}'"),
-    )
-    .await
-}
-
-fn assert_branch_pair_delete_restricted(error: &LixError) {
-    assert_eq!(error.code, LixError::CODE_READ_ONLY);
-    assert!(
-        error.to_string().contains("lix_branch"),
-        "error should explain the branch pair restriction: {error:?}"
-    );
-    assert!(
-        error
-            .hint
-            .as_deref()
-            .is_some_and(|hint| hint.contains("lix_branch")),
-        "error should guide callers to the lix_branch surface: {error:?}"
     );
 }
 

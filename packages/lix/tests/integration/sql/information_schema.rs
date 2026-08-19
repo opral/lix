@@ -2,7 +2,7 @@ use lix::{LixError, Value};
 
 use super::assert_rows_eq;
 
-simulation_test!(public_catalog_has_no_by_branch_surfaces, |sim| async move {
+simulation_test!(public_catalog_hides_internal_branch_surfaces, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -32,6 +32,36 @@ simulation_test!(public_catalog_has_no_by_branch_surfaces, |sim| async move {
     assert!(
         tables.rows().is_empty(),
         "no explicit-branch tables may remain"
+    );
+
+    let branch_component_tables = session
+        .execute(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'public' \
+               AND table_name IN ('lix_branch_descriptor', 'lix_branch_ref')",
+            &[],
+        )
+        .await
+        .expect("public table catalog should be readable");
+    assert!(
+        branch_component_tables.rows().is_empty(),
+        "internal branch component tables must not be advertised"
+    );
+
+    let branch_component_history = session
+        .execute(
+            "SELECT function_name FROM information_schema.table_functions \
+             WHERE function_schema = 'public' \
+               AND function_name IN (\
+                 'lix_branch_descriptor_history', 'lix_branch_ref_history'\
+               )",
+            &[],
+        )
+        .await
+        .expect("public table-function catalog should be readable");
+    assert!(
+        branch_component_history.rows().is_empty(),
+        "internal branch history functions must not be advertised"
     );
 
     let columns = session

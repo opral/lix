@@ -2266,33 +2266,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_row_fast_path_keeps_synthesized_branch_refs_generic() {
-        let storage = Memory::new();
-        let receipt = Engine::initialize(storage.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("initialized engine should open");
-        let session = engine.open_session().await.expect("session should open");
-
-        let rows = session
-            .execute("SELECT id, commit_id FROM lix_branch_ref ORDER BY id", &[])
-            .await
-            .expect("synthesized branch refs should read through the generic path");
-        assert!(
-            rows.rows().iter().any(|row| {
-                row.get::<String>("id")
-                    .is_ok_and(|id| id == receipt.main_branch_id)
-                    && row
-                        .get::<String>("commit_id")
-                        .is_ok_and(|commit_id| commit_id == receipt.initial_commit_id)
-            }),
-            "the normal branch-ref SQL surface must retain its synthesized control row"
-        );
-    }
-
-    #[tokio::test]
     async fn predecessor_protocol_is_rejected_before_old_head_bytes_are_decoded() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())

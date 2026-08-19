@@ -9,6 +9,9 @@
   JavaScript SDKs. Hosts pass an array of statements to `executeBatch`;
   `execute` remains one statement. Do not parse a script string into statements
   on the host.
+- Removed the public `lix_branch_descriptor`, `lix_branch_ref`, and matching
+  history SQL relations. Use the writable `lix_branch` relation for branch
+  creation, metadata, and current head access.
 - Removed every public `*_by_branch` SQL relation and the public
   `lixcol_branch_id` row-routing column. SQL relations now always use the
   current session's active branch. Open another session to work with another
