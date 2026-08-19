@@ -6,7 +6,7 @@
 //! decide whether a reached commit contributed anything a history query asked
 //! for, the reader used to load that commit's replay-state authority (header +
 //! mutation inventory) — one extra point-read pair per reached commit, which
-//! made `lix_file_history(...) WHERE path = ?` grow with history depth even
+//! made `lix_history('lix_file', ...) WHERE path = ?` grow with history depth even
 //! when the answer did not.
 //!
 //! Git does not pay this because a commit's tree hash *is already* the answer:

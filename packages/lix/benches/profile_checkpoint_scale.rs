@@ -18,8 +18,8 @@
 //!   run rocksdb /tmp/checkpoint-rocks-run 1000 10 5
 
 use async_trait::async_trait;
-use lix_storage_rocksdb::RocksDB;
 use lix::{ExecuteBatchStatement, Lix, Storage, Value, open_lix};
+use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -295,7 +295,8 @@ where
 {
     assert!(file_count > 0, "file count must be positive");
     let storage = S::open_for_benchmark(path);
-    let lix = open_lix().with_storage(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("open checkpoint profile lix");
 
@@ -315,7 +316,7 @@ where
         file_count
     );
     assert_eq!(
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff").await,
+        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff()").await,
         0
     );
     lix.close().await.expect("close checkpoint setup lix");
@@ -425,7 +426,8 @@ async fn run_workload<S>(
     );
 
     let storage = S::open_for_benchmark(path);
-    let lix = open_lix().with_storage(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("open checkpoint run lix");
     let file_count = scalar_count(&lix, "SELECT count(*) AS count FROM lix_file").await;
@@ -553,7 +555,7 @@ async fn run_workload<S>(
     );
     let working_diff_query_start = Instant::now();
     let remaining_working_diffs =
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff").await;
+        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff()").await;
     let working_diff_query_elapsed = working_diff_query_start.elapsed();
     assert_eq!(
         remaining_working_diffs, 0,
@@ -578,7 +580,8 @@ async fn run_workload<S>(
     peak_sampled_storage_bytes = peak_sampled_storage_bytes.max(after_close.storage_bytes);
     let reopen_start = Instant::now();
     let reopened_storage = S::open_for_benchmark(path);
-    let reopened = open_lix().with_storage(reopened_storage.clone())
+    let reopened = open_lix()
+        .with_storage(reopened_storage.clone())
         .await
         .expect("reopen checkpoint run lix");
     let reopened_checkpoint_count =
@@ -903,13 +906,15 @@ where
     assert!(path.exists(), "fixture {} does not exist", path.display());
     let storage = S::open_for_benchmark(path);
     let open_start = Instant::now();
-    let lix = open_lix().with_storage(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("open checkpoint surface lix");
     let open_elapsed = open_start.elapsed();
 
     let working_start = Instant::now();
-    let working_count = scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff").await;
+    let working_count =
+        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff()").await;
     let working_elapsed = working_start.elapsed();
     let limited_sql = "SELECT commit_id FROM lix_checkpoint LIMIT 20";
     let medium_sql = "SELECT commit_id FROM lix_checkpoint LIMIT 128";

@@ -6493,7 +6493,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{}') \
+                     FROM lix_history('rootless_ordered_insert_probe', '{}') \
                      WHERE lixcol_is_deleted = false",
                     head.commit_id
                 ),
@@ -6764,7 +6764,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(DISTINCT id) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     FROM lix_history('rootless_ordered_insert_probe', '{rooted_fence}') \
                      WHERE id IN ('00000', '00001', '00002', '32767') \
                        AND lixcol_is_deleted = false"
                 ),
@@ -6777,7 +6777,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     FROM lix_history('rootless_ordered_insert_probe', '{rooted_fence}') \
                      WHERE (id = '00001' AND value = 'draft') \
                         OR (id = '32767' AND value = 'main')"
                 ),
@@ -7079,7 +7079,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
-                     FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                     FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
                      WHERE lixcol_is_deleted = false"
                 ),
                 &[],
@@ -7106,7 +7106,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(DISTINCT id) AS entries \
-                     FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                     FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
                      WHERE id IN ('02047', '02048', '65535', '65536') \
                        AND lixcol_is_deleted = false"
                 ),
@@ -7245,7 +7245,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT value, lixcol_depth \
-                     FROM columnar_lifecycle_probe_history('{merged_head}') \
+                     FROM lix_history('columnar_lifecycle_probe', '{merged_head}') \
                      WHERE id = '00000' ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -7306,7 +7306,7 @@ mod tests {
             reopened_session
                 .execute(
                     &format!(
-                        "SELECT value FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                        "SELECT value FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
                          WHERE id = '65536'"
                     ),
                     &[],
@@ -7406,7 +7406,7 @@ mod tests {
         );
         let working_diff = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff WHERE schema_key = 'ordered_packed_update_probe' AND diff_type = 'added'",
+                "SELECT COUNT(*) AS entries FROM lix_working_diff() WHERE schema_key = 'ordered_packed_update_probe' AND diff_type = 'added'",
                 &[],
             )
             .await
@@ -7456,7 +7456,7 @@ mod tests {
             .await
             .expect("replaced packed current base should remain checkpointable");
         let working_diff = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff()", &[])
             .await
             .unwrap();
         assert_eq!(
@@ -9307,7 +9307,7 @@ mod tests {
         let merged_history = session
             .execute(
                 &format!(
-                    "SELECT value FROM packed_replacement_probe_history('{merged_commit_id}') \
+                    "SELECT value FROM lix_history('packed_replacement_probe', '{merged_commit_id}') \
                      WHERE path = '/00000' ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -10389,7 +10389,7 @@ mod tests {
             ),
             (
                 "SELECT lixcol_depth \
-                 FROM lix_key_value_history() \
+                 FROM lix_history('lix_key_value') \
                  WHERE key = 'batch-read'",
                 &[],
             ),
@@ -10501,7 +10501,10 @@ mod tests {
         );
 
         session
-            .execute("SELECT COUNT(*) AS rows FROM lix_key_value_history()", &[])
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_history('lix_key_value')",
+                &[],
+            )
             .await
             .expect("fixed history surface should execute");
         assert_eq!(

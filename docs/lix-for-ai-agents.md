@@ -69,7 +69,7 @@ const rows = await reviewLix.execute(
 await reviewLix.close();
 ```
 
-`<schema>_history()` is revision history anchored to a commit; it is not a
+`lix_history('<schema>')` is revision history anchored to a commit; it is not a
 current-state snapshot replacement. Use the branch-scoped session for current
 rows and `lix_diff()` for a commit-to-commit change set.
 

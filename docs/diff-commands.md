@@ -20,7 +20,7 @@ const lix = await openLix();
 
 // Inspect what would be reverted.
 const diffs = await lix.execute(
-  "SELECT diff_id, diff_type FROM lix_working_diff WHERE file_id = $1",
+  "SELECT diff_id, diff_type FROM lix_working_diff() WHERE file_id = $1",
   ["file_1"],
 );
 
@@ -31,7 +31,7 @@ for (const row of diffs.rows) {
 // Revert them in one atomic statement.
 const reverted = await lix.execute(
   `INSERT INTO lix_revert (diff_id)
-   SELECT diff_id FROM lix_working_diff WHERE file_id = $1
+   SELECT diff_id FROM lix_working_diff() WHERE file_id = $1
    RETURNING commit_id`,
   ["file_1"],
 );
@@ -47,7 +47,7 @@ await lix.close();
 
 ## Diff sources
 
-`lix_working_diff` compares the current session's active branch head with its
+`lix_working_diff()` compares the current session's active branch head with its
 latest checkpoint. Open another session on another branch to inspect that
 branch's working diff. Its columns are listed in the
 [checkpoint SQL surfaces table](./checkpoints.md#sql-surfaces).
@@ -68,7 +68,7 @@ Three insert-only command sinks consume a one-column query of `diff_id` rows:
 -- Revert selected changes from their after side to their before side.
 INSERT INTO lix_revert (diff_id)
 SELECT diff_id
-FROM lix_working_diff
+FROM lix_working_diff()
 WHERE file_id = $1;
 
 -- Apply selected changes from their before side to their after side.
@@ -80,7 +80,7 @@ WHERE schema_key = 'acme_task';
 -- Move only the selected working diffs behind a new checkpoint.
 INSERT INTO lix_create_checkpoint (diff_id)
 SELECT diff_id
-FROM lix_working_diff
+FROM lix_working_diff()
 WHERE file_id <> $1;
 ```
 

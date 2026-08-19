@@ -2676,7 +2676,7 @@ mod tests {
             .expect("replay Lix should reopen without Git");
         let marker_rows = db::block_on(lix.execute(
             "SELECT value, lixcol_observed_commit_id \
-             FROM lix_key_value_history() \
+             FROM lix_history('lix_key_value') \
              WHERE key = $1 AND NOT lixcol_is_deleted",
             &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
         ))
@@ -2709,7 +2709,7 @@ mod tests {
                 .get(git_sha)
                 .unwrap_or_else(|| panic!("missing Lix commit for Git version {version_index}"));
             let historical = db::block_on(lix.execute(
-                "SELECT content FROM lix_file_history($1) \
+                "SELECT content FROM lix_history('lix_file', $1) \
                  WHERE path = '/asset.bin' AND lixcol_depth = 0 AND NOT lixcol_is_deleted",
                 &[Value::Text(lix_commit.clone())],
             ))

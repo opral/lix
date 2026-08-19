@@ -39,8 +39,8 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, TableFactor, Value as SqlValue, Visit, VisitMut,
-    Visitor, VisitorMut,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart, TableFactor,
+    Value as SqlValue, Visit, VisitMut, Visitor, VisitorMut,
 };
 #[cfg(any(feature = "storage-benches", test))]
 use futures_util::TryStreamExt;
@@ -617,10 +617,18 @@ pub(crate) fn statement_has_table_function(statement: &DataFusionStatement) -> b
         }
     }
 
-    let mut visitor = TableFunctionVisitor(false);
-    if let DataFusionStatement::Statement(statement) = statement {
-        let _ = statement.visit(&mut visitor);
+    fn visit(statement: &DataFusionStatement, visitor: &mut TableFunctionVisitor) {
+        match statement {
+            DataFusionStatement::Statement(statement) => {
+                let _ = statement.visit(visitor);
+            }
+            DataFusionStatement::Explain(explain) => visit(explain.statement.as_ref(), visitor),
+            _ => {}
+        }
     }
+
+    let mut visitor = TableFunctionVisitor(false);
+    visit(statement, &mut visitor);
     visitor.0
 }
 
@@ -2106,7 +2114,10 @@ fn write_provider_selection(plan: &LogicalWritePlan, target_table_name: &str) ->
     match (&plan.bound.op, &plan.bound.input) {
         (BoundWriteOp::Insert, BoundWriteInput::Values(_))
         | (BoundWriteOp::Update | BoundWriteOp::Delete, BoundWriteInput::None) => {
-            ProviderSelection::Only(BTreeSet::from([target_table_name.to_string()]))
+            ProviderSelection::Only {
+                names: BTreeSet::from([target_table_name.to_string()]),
+                history_relations: BTreeSet::new(),
+            }
         }
         _ => ProviderSelection::All,
     }
@@ -2486,12 +2497,14 @@ fn datafusion_filter_expr_from_bound_expr(
                 if let ScalarValue::Utf8(Some(raw)) = &value {
                     return Ok(Expr::Literal(
                         ScalarValue::Utf8(Some(
-                            crate::sql2::udfs::common::canonical_jsonb_text(raw).map_err(|error| {
-                                LixError::new(
-                                    LixError::CODE_TYPE_MISMATCH,
-                                    format!("JSON comparison value is not valid JSON: {error}"),
-                                )
-                            })?,
+                            crate::sql2::udfs::common::canonical_jsonb_text(raw).map_err(
+                                |error| {
+                                    LixError::new(
+                                        LixError::CODE_TYPE_MISMATCH,
+                                        format!("JSON comparison value is not valid JSON: {error}"),
+                                    )
+                                },
+                            )?,
                         )),
                         Some(json_field_metadata()),
                     ));
@@ -2631,10 +2644,9 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
 
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
-        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base {
-            schema_key,
-        }) if bound_predicate_contains_like(&plan.bound.predicate)
-            || bound_update_contains_binary(plan) =>
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base { schema_key })
+            if bound_predicate_contains_like(&plan.bound.predicate)
+                || bound_update_contains_binary(plan) =>
         {
             Ok(schema_key.clone())
         }
@@ -2756,7 +2768,9 @@ fn validate_json_predicate_params(
                 LixError::CODE_TYPE_MISMATCH,
                 "JSON columns can only be compared with JSON expressions",
             )
-            .with_hint("Use CAST(... AS JSONB) or pass a JSON parameter value instead of bare text."));
+            .with_hint(
+                "Use CAST(... AS JSONB) or pass a JSON parameter value instead of bare text.",
+            ));
         }
     }
     Ok(())
@@ -2851,12 +2865,37 @@ fn bind_table_function_parameters(
             table_factor: &mut TableFactor,
         ) -> ControlFlow<Self::Break> {
             let TableFactor::Table {
+                name,
                 args: Some(arguments),
                 ..
             } = table_factor
             else {
                 return ControlFlow::Continue(());
             };
+            let public_function_name = ["lix_history", "lix_working_diff", "lix_diff"]
+                .into_iter()
+                .find(|candidate| {
+                    crate::sql2::parse::object_name_is_public_function(name, candidate)
+                });
+            let is_history = public_function_name == Some("lix_history");
+            if let Some(function_name) = public_function_name {
+                // DataFusion's table-function registry is case-sensitive and
+                // global rather than schema-scoped. Normalize the public SQL
+                // spelling after preserving quoted-identifier semantics.
+                *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(function_name))]);
+            }
+            if is_history
+                && !matches!(
+                    arguments.args.first(),
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))))
+                        if matches!(value.value, SqlValue::SingleQuotedString(_))
+                )
+            {
+                return ControlFlow::Break(Box::new(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "lix_history relation argument must be a non-null text literal known at plan time",
+                )));
+            }
             for argument in &mut arguments.args {
                 let FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) = argument else {
                     continue;
@@ -3009,11 +3048,9 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
-        Value::Timestamptz(value) => ScalarValue::TimestampMicrosecond(
-            Some(*value),
-            Some("UTC".into()),
-        )
-        .into(),
+        Value::Timestamptz(value) => {
+            ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())).into()
+        }
         Value::Blob(value) => ScalarValue::LargeBinary(Some(value.to_vec())).into(),
     }
 }
@@ -3377,7 +3414,7 @@ mod tests {
     use crate::hot_state::{HotStateReader, HotStateScanRequest, MaterializedHotStateRow};
     use crate::json_store::JsonStoreContext;
     use crate::sql2::{
-        ChangelogQuerySource, RowSnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
+        ChangelogQuerySource, HistoryQuerySource, RowSnapshotReader, SqlChangelogQuerySource,
         SqlHistoryQuerySource,
     };
     use crate::sql2::{
@@ -4100,9 +4137,10 @@ mod tests {
 
             assert_eq!(
                 selection,
-                crate::sql2::providers::ProviderSelection::Only(BTreeSet::from([
-                    "lix_file".to_string()
-                ])),
+                crate::sql2::providers::ProviderSelection::Only {
+                    names: BTreeSet::from(["lix_file".to_string()]),
+                    history_relations: BTreeSet::new(),
+                },
                 "{sql}"
             );
 
@@ -4479,9 +4517,7 @@ mod tests {
             row_pk: crate::row_pk::RowPk::single(row_pk),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
-            snapshot_content: Some(
-                format!("{{\"id\":\"{row_pk}\",\"value\":\"{value}\"}}").into(),
-            ),
+            snapshot_content: Some(format!("{{\"id\":\"{row_pk}\",\"value\":\"{value}\"}}").into()),
             metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
@@ -4501,11 +4537,7 @@ mod tests {
         untracked: bool,
     ) -> MaterializedHotStateRow {
         let mut row = live_row(row_pk, branch_id, value);
-        row.snapshot_content = Some(
-            json!({ "id": row_pk, "value": value })
-                .to_string()
-                .into(),
-        );
+        row.snapshot_content = Some(json!({ "id": row_pk, "value": value }).to_string().into());
         row.untracked = untracked;
         row
     }
@@ -4574,11 +4606,7 @@ mod tests {
         }
     }
 
-    fn live_blob_ref_row(
-        row_pk: &str,
-        branch_id: &str,
-        bytes: &[u8],
-    ) -> MaterializedHotStateRow {
+    fn live_blob_ref_row(row_pk: &str, branch_id: &str, bytes: &[u8]) -> MaterializedHotStateRow {
         MaterializedHotStateRow {
             row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture blob-ref ID should be a UUID"),
@@ -4596,12 +4624,8 @@ mod tests {
             metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!(
-                "change-{row_pk}-blob"
-            ))),
-            commit_id: Some(CommitId::for_test_label(&format!(
-                "commit-{row_pk}-blob"
-            ))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}-blob"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}-blob"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -4743,11 +4767,9 @@ mod tests {
     async fn integer_primary_key_read_pushes_exact_identity_to_hot_state() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
         let component_types = [crate::row_pk::RowPkComponentType::Integer];
-        let row_pk = crate::row_pk::RowPk::from_external_parts(
-            vec!["42".to_string()],
-            &component_types,
-        )
-        .expect("integer fixture identity should encode");
+        let row_pk =
+            crate::row_pk::RowPk::from_external_parts(vec!["42".to_string()], &component_types)
+                .expect("integer fixture identity should encode");
         let mut row = live_row("42", branch_id, "answer");
         row.row_pk = row_pk.clone();
         row.schema_key = "integer_state_schema".to_string();
@@ -5792,7 +5814,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT value, count, lixcol_row_pk, lixcol_depth \
-	             FROM test_state_schema_history('{head_commit_id}') \
+	             FROM lix_history('test_state_schema', '{head_commit_id}') \
 	             WHERE lixcol_row_pk = CAST('[\"row-history\"]' AS JSONB)"
                 ),
                 &[],
@@ -5821,7 +5843,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT id, parent_id, name, path, lixcol_depth \
-             FROM lix_directory_history('{head_commit_id}') \
+             FROM lix_history('lix_directory', '{head_commit_id}') \
              WHERE id = '01920000-0000-7000-8000-0000000000d3'"
                 ),
                 &[],
@@ -5852,7 +5874,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT id \
-             FROM lix_directory_history('{head_commit_id}') \
+             FROM lix_history('lix_directory', '{head_commit_id}') \
              WHERE name = 'docs'"
                 ),
                 &[],
@@ -5874,7 +5896,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT id, path, content, lixcol_depth \
-             FROM lix_file_history('{head_commit_id}') \
+             FROM lix_history('lix_file', '{head_commit_id}') \
              WHERE id = '01920000-0000-7000-8000-0000000000a2' \
                AND content IS NOT NULL \
              ORDER BY lixcol_depth",
@@ -5903,7 +5925,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT id \
-             FROM lix_file_history('{head_commit_id}') \
+             FROM lix_history('lix_file', '{head_commit_id}') \
              WHERE path = '/docs/readme.md'"
                 ),
                 &[],
@@ -5970,7 +5992,7 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, lixcol_depth FROM lix_file_history('{head_commit_id}') \
+                    "SELECT id, path, lixcol_depth FROM lix_history('lix_file', '{head_commit_id}') \
                      WHERE path = '/docs/readme.md' ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -6121,7 +6143,7 @@ mod tests {
 
         let projection = format!(
             "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
-             FROM lix_file_history('{head_commit_id}')"
+             FROM lix_history('lix_file', '{head_commit_id}')"
         );
         let key = |row: &Vec<Value>| format!("{:?}", row);
         let unfiltered = rows_from_execute_result(
@@ -6142,14 +6164,8 @@ mod tests {
                 // The minted file's last path before it was deleted.
                 "/docs/renamed.md",
             ),
-            (
-                "01920000-0000-7000-8000-0000000000c4",
-                "/docs/minted.md",
-            ),
-            (
-                "01920000-0000-7000-8000-0000000000a2",
-                "/docs/readme.md",
-            ),
+            ("01920000-0000-7000-8000-0000000000c4", "/docs/minted.md"),
+            ("01920000-0000-7000-8000-0000000000a2", "/docs/readme.md"),
         ] {
             let expected_by_id: BTreeSet<String> = unfiltered
                 .iter()
@@ -6264,7 +6280,7 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, lixcol_depth FROM lix_file_history('{head_commit_id}') \
+                    "SELECT id, path, lixcol_depth FROM lix_history('lix_file', '{head_commit_id}') \
                      WHERE path = '/docs/readme.md' ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -6285,8 +6301,7 @@ mod tests {
             panic!("by-path history should traverse {projection}: {by_projection:?}")
         });
         assert!(
-            buckets.get("pruned").copied().unwrap_or(0)
-                >= DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS,
+            buckets.get("pruned").copied().unwrap_or(0) >= DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS,
             "{projection} must prune every content commit that belongs to another \
              file; without a pinned file_id the membership test answers \
              LoadedPresent for all of them: {by_projection:?}"
@@ -6370,7 +6385,7 @@ mod tests {
 
         let projection = format!(
             "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
-             FROM lix_file_history('{head_commit_id}')"
+             FROM lix_history('lix_file', '{head_commit_id}')"
         );
         let key = |row: &Vec<Value>| format!("{row:?}");
         let unfiltered = rows_from_execute_result(
@@ -6498,7 +6513,14 @@ mod tests {
 
         // Plain ASCII first, then the shapes whose JSON encoding may differ
         // from their source text.
-        let names = ["plain.md", "with space.md", "quo\"te.md", "back\\slash.md", "ünïcode.md", "emoji-🙂.md"];
+        let names = [
+            "plain.md",
+            "with space.md",
+            "quo\"te.md",
+            "back\\slash.md",
+            "ünïcode.md",
+            "emoji-🙂.md",
+        ];
         for (index, name) in names.iter().enumerate() {
             let statement = format!(
                 "INSERT INTO lix_file (path, content) VALUES ('/docs/{name}', CAST('c{index}' AS BYTEA))"
@@ -6532,7 +6554,7 @@ mod tests {
 
         let projection = format!(
             "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
-             FROM lix_file_history('{head_commit_id}')"
+             FROM lix_history('lix_file', '{head_commit_id}')"
         );
         let key = |row: &Vec<Value>| format!("{row:?}");
         let unfiltered = rows_from_execute_result(
@@ -6561,7 +6583,9 @@ mod tests {
                         &[Value::Text(path.clone())],
                     )
                     .await
-                    .unwrap_or_else(|error| panic!("path history for {path} should execute: {error}")),
+                    .unwrap_or_else(|error| {
+                        panic!("path history for {path} should execute: {error}")
+                    }),
             )
             .1
             .iter()
@@ -6612,7 +6636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_rejects_writes_to_history_views_before_planning() {
+    async fn execute_sql_rejects_writes_to_removed_history_suffixes_before_planning() {
         for sql in [
             "DELETE FROM test_state_schema_history",
             "DELETE FROM TEST_STATE_SCHEMA_HISTORY",
@@ -6638,12 +6662,12 @@ mod tests {
 
             let error = execute_write_sql(&mut ctx, sql, &[])
                 .await
-                .expect_err("history views are read-only");
+                .expect_err("history suffix surfaces should not exist");
 
-            assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
-            assert_eq!(
-                error.message, "DML cannot write read-only SQL table 'test_state_schema_history'",
-                "{sql}"
+            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
+            assert!(
+                error.message.contains("unknown SQL table"),
+                "{sql}: {error:?}"
             );
         }
     }
@@ -6676,10 +6700,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-000000000312\"]"
-        );
+        assert_eq!(rows[0].row_pk, "[\"01920000-0000-7000-8000-000000000312\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
     }
 
@@ -6928,10 +6949,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let filter = &requests[0].filter;
         assert_eq!(filter.schema_keys, vec!["test_state_schema"]);
-        assert_eq!(
-            filter.row_pks,
-            vec![crate::row_pk::RowPk::single("target")]
-        );
+        assert_eq!(filter.row_pks, vec![crate::row_pk::RowPk::single("target")]);
         assert_eq!(
             filter.branch_ids,
             vec!["01920000-0000-7000-8000-0000000000b1"]
@@ -6961,11 +6979,9 @@ mod tests {
     async fn integer_primary_key_update_and_delete_narrow_candidate_scans() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
         let component_types = [crate::row_pk::RowPkComponentType::Integer];
-        let row_pk = crate::row_pk::RowPk::from_external_parts(
-            vec!["42".to_string()],
-            &component_types,
-        )
-        .expect("integer fixture identity should encode");
+        let row_pk =
+            crate::row_pk::RowPk::from_external_parts(vec!["42".to_string()], &component_types)
+                .expect("integer fixture identity should encode");
 
         for (sql, params) in [
             (
@@ -7211,10 +7227,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-0000000000d3\"]"
-        );
+        assert_eq!(rows[0].row_pk, "[\"01920000-0000-7000-8000-0000000000d3\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -7268,10 +7281,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-0000000000d3\"]"
-        );
+        assert_eq!(rows[0].row_pk, "[\"01920000-0000-7000-8000-0000000000d3\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -7323,10 +7333,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-0000000000d3\"]"
-        );
+        assert_eq!(rows[0].row_pk, "[\"01920000-0000-7000-8000-0000000000d3\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -7368,10 +7375,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-0000000000d2\"]"
-        );
+        assert_eq!(rows[0].row_pk, "[\"01920000-0000-7000-8000-0000000000d2\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -8164,10 +8168,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-0000000000d2\"]"
-        );
+        assert_eq!(rows[0].row_pk, "[\"01920000-0000-7000-8000-0000000000d2\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
@@ -9043,70 +9044,70 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_row_view_from_active_branch() {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
+        let ctx = setup_sql2_state_fixture()
+            .await
+            .expect("fixture should initialize");
 
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT value, lixcol_row_pk \
+        let result = execute_sql(
+            &ctx,
+            "SELECT value, lixcol_row_pk \
                      FROM test_state_schema",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read row view");
+            &[],
+        )
+        .await
+        .expect("sql2 execute should read row view");
 
-                assert_eq!(result.columns, vec!["value", "lixcol_row_pk"]);
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-                assert_eq!(result.rows[0][1], Value::Jsonb(json!(["row-a"]).into()));
+        assert_eq!(result.columns, vec!["value", "lixcol_row_pk"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
+        assert_eq!(result.rows[0][1], Value::Jsonb(json!(["row-a"]).into()));
     }
 
     #[tokio::test]
     async fn execute_sql_reads_lix_directory_from_active_branch() {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
+        let ctx = setup_sql2_state_fixture()
+            .await
+            .expect("fixture should initialize");
 
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT path, name \
+        let result = execute_sql(
+            &ctx,
+            "SELECT path, name \
                      FROM lix_directory \
                      WHERE id = '01920000-0000-7000-8000-0000000000d3'",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read lix_directory");
+            &[],
+        )
+        .await
+        .expect("sql2 execute should read lix_directory");
 
-                assert_eq!(result.columns, vec!["path", "name"]);
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
-                assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
+        assert_eq!(result.columns, vec!["path", "name"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
+        assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
     }
 
     #[tokio::test]
     async fn execute_sql_reads_lix_file_from_active_branch() {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
+        let ctx = setup_sql2_state_fixture()
+            .await
+            .expect("fixture should initialize");
 
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT path, name, content \
+        let result = execute_sql(
+            &ctx,
+            "SELECT path, name, content \
                      FROM lix_file \
                      WHERE id = '01920000-0000-7000-8000-0000000000a2'",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read lix_file");
+            &[],
+        )
+        .await
+        .expect("sql2 execute should read lix_file");
 
-                assert_eq!(result.columns, vec!["path", "name", "content"]);
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(
-                    result.rows[0][0],
-                    Value::Text("/docs/readme.md".to_string())
-                );
-                assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
-                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42].into()));
+        assert_eq!(result.columns, vec!["path", "name", "content"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0][0],
+            Value::Text("/docs/readme.md".to_string())
+        );
+        assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
+        assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42].into()));
     }
 }

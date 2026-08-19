@@ -2786,13 +2786,13 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "PublicSurfaceKind::Branch",
             "PublicSurfaceKind::Change",
             "PublicSurfaceKind::File",
-            "PublicSurfaceKind::FileHistory",
             "PublicSurfaceKind::Directory",
-            "PublicSurfaceKind::DirectoryHistory",
+            "PublicSurfaceKind::HistoryFunction",
             "branch::register_lix_branch_read_provider",
             "change::register_lix_change_read_provider",
-            "file_history::register_lix_file_history_surface",
-            "directory_history::register_lix_directory_history_surface",
+            "file_history::build_lix_file_history_provider",
+            "directory_history::build_lix_directory_history_provider",
+            "history_table_function::register_history_table_function",
             "directory::register_lix_directory_active_provider",
             "file::register_lix_file_active_provider",
             "schema::register_row_providers",
@@ -2922,19 +2922,12 @@ fn sql2_row_provider_registration_is_catalog_driven() {
     assert_source_contains_all(
         relative,
         read_registration,
-        &[
-            "catalog.surfaces()",
-            "PublicSurfaceKind::SchemaBase",
-            "PublicSurfaceKind::SchemaHistory",
-        ],
+        &["catalog.surfaces()", "PublicSurfaceKind::SchemaBase"],
     );
     assert_source_contains_all(
         relative,
         write_registration,
-        &[
-            "catalog.surfaces()",
-            "PublicSurfaceKind::SchemaBase",
-        ],
+        &["catalog.surfaces()", "PublicSurfaceKind::SchemaBase"],
     );
     assert_source_contains_none(
         relative,

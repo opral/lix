@@ -55,7 +55,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT row_pk, schema_key, diff_type \
-                 FROM lix_working_diff ORDER BY schema_key, row_pk",
+                 FROM lix_working_diff() ORDER BY schema_key, row_pk",
             )
             .await,
             vec![vec![
@@ -68,7 +68,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT row_pk, schema_key, diff_type \
-                 FROM lix_working_diff \
+                 FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                    AND row_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
             )
@@ -83,7 +83,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT row_pk \
-                 FROM lix_working_diff \
+                 FROM lix_working_diff() \
                  WHERE schema_key = 'other_schema'",
             )
             .await
@@ -105,7 +105,7 @@ simulation_test!(
         );
 
         assert_eq!(
-            select_rows(&session, "SELECT COUNT(*) FROM lix_working_diff").await,
+            select_rows(&session, "SELECT COUNT(*) FROM lix_working_diff()").await,
             vec![vec![Value::Integer(0)]]
         );
         assert_eq!(
@@ -155,7 +155,7 @@ simulation_test!(
         let checkpoint_history = select_rows(
             &session,
             "SELECT commit_id, lixcol_change_id \
-             FROM lix_checkpoint_history() \
+             FROM lix_history('lix_checkpoint') \
              ORDER BY lixcol_depth",
         )
         .await;
@@ -255,9 +255,6 @@ simulation_test!(
             "INSERT INTO lix_checkpoint (id, commit_id) \
              VALUES ('01930000-0000-7000-8000-000000000001', 'fake')",
             "UPDATE lix_checkpoint SET commit_id = 'fake'",
-            "DELETE FROM lix_working_diff",
-            "DELETE FROM lix_file_working_diff",
-            "UPDATE lix_directory_working_diff SET change_kind = 'fake'",
         ] {
             let error = session
                 .execute(sql, &[])
@@ -268,6 +265,8 @@ simulation_test!(
 
         for sql in [
             "SELECT * FROM lix_working_diff_by_branch",
+            "SELECT * FROM lix_file_working_diff",
+            "SELECT * FROM lix_directory_working_diff",
             "SELECT * FROM lix_directory_working_diff_by_branch",
         ] {
             let error = session
@@ -318,7 +317,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT row_pk, diff_type \
-                 FROM lix_working_diff \
+                 FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY row_pk",
             )
@@ -339,7 +338,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT diff_type \
-                 FROM lix_working_diff \
+                 FROM lix_working_diff() \
                  WHERE schema_key = 'lix_key_value' \
                    AND row_pk = CAST('[\"working-removed\"]' AS JSONB)",
             )
@@ -350,6 +349,7 @@ simulation_test!(
     }
 );
 
+#[cfg(any())]
 simulation_test!(
     file_working_diff_reports_root_file_changes_without_directory_changes,
     |sim| async move {
@@ -482,6 +482,7 @@ simulation_test!(
     }
 );
 
+#[cfg(any())]
 simulation_test!(
     filesystem_working_diff_surfaces_compose_paths_and_directory_moves,
     |sim| async move {

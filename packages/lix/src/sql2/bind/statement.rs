@@ -28,7 +28,7 @@ use super::table::{
 use super::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundParamMap,
     BoundReturning, BoundReturningItem, BoundWrite, BoundWriteInput, BoundWriteOp,
-    BoundWriteTarget, DirectoryWriteSurface, RowWriteSurface, FileWriteSurface,
+    BoundWriteTarget, DirectoryWriteSurface, FileWriteSurface, RowWriteSurface,
 };
 use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
 
@@ -606,10 +606,7 @@ fn bind_insert_input(
         ));
     }
     let SetExpr::Values(values) = source.body.as_ref() else {
-        if matches!(
-            surface_kind,
-            PublicSurfaceKind::SchemaBase { .. }
-        ) {
+        if matches!(surface_kind, PublicSurfaceKind::SchemaBase { .. }) {
             return Err(super::error::unsupported(
                 "INSERT ... SELECT is not supported for schema SQL surfaces yet",
             ));
@@ -1328,14 +1325,7 @@ fn require_write_capability(
             LixError::CODE_READ_ONLY,
             format!("DML cannot write read-only SQL table '{}'", surface.name),
         );
-        if matches!(
-            surface.kind,
-            PublicSurfaceKind::SchemaHistory { .. }
-                | PublicSurfaceKind::FileHistory
-                | PublicSurfaceKind::DirectoryHistory
-        ) {
-            error = error.with_hint("History views are query-only.");
-        } else if let PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind
+        if let PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind
             && let Some(hint) = crate::sql2::read_only::read_only_schema_surface_hint(schema_key)
         {
             error = error.with_hint(hint);
@@ -1361,13 +1351,9 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         PublicSurfaceKind::CreateCheckpoint => {
             BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint)
         }
-        PublicSurfaceKind::SchemaHistory { .. }
-        | PublicSurfaceKind::FileHistory
-        | PublicSurfaceKind::DirectoryHistory
-        | PublicSurfaceKind::Change
+        PublicSurfaceKind::Change
         | PublicSurfaceKind::WorkingDiff
-        | PublicSurfaceKind::FileWorkingDiff
-        | PublicSurfaceKind::DirectoryWorkingDiff => {
+        | PublicSurfaceKind::HistoryFunction => {
             unreachable!("write capability checked before target binding")
         }
     }
@@ -1380,7 +1366,11 @@ fn bind_write_branch_scope(
     active_branch_id: &str,
 ) -> Result<BranchScope, LixError> {
     let _ = input;
-    Ok(bind_base_write_branch_scope(kind, predicate, active_branch_id))
+    Ok(bind_base_write_branch_scope(
+        kind,
+        predicate,
+        active_branch_id,
+    ))
 }
 
 fn bind_base_write_branch_scope(
@@ -1573,19 +1563,18 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_read_only_history_writes() {
+    fn bind_statement_rejects_removed_history_suffix_writes() {
         let statement = parse_statement("DELETE FROM lix_file_history");
         let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("history surfaces should be read-only");
+            .expect_err("history suffix surfaces should not exist");
 
-        assert_eq!(error.code, LixError::CODE_READ_ONLY);
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 
     #[test]
     fn bind_statement_preserves_update_assignment_and_predicate() {
-        let statement = parse_statement(
-            "UPDATE test_state_schema SET name = 'next' WHERE id = 'row-1'",
-        );
+        let statement =
+            parse_statement("UPDATE test_state_schema SET name = 'next' WHERE id = 'row-1'");
         let bound = bind_statement(
             &statement,
             &[serde_json::json!({
@@ -1917,7 +1906,7 @@ mod tests {
         let bound = bind_statement(
             &parse_statement(
                 "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM lix_working_diff \
+                 SELECT diff_id FROM lix_working_diff() \
                  RETURNING commit_id AS created_commit_id",
             ),
             &[],
@@ -1937,8 +1926,8 @@ mod tests {
         ));
 
         for sql in [
-            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff RETURNING diff_id",
-            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff RETURNING *",
+            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff() RETURNING diff_id",
+            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff() RETURNING *",
         ] {
             let error = bind_statement(&parse_statement(sql), &[], "branch1")
                 .expect_err("unsupported INSERT RETURNING shape should fail");

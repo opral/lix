@@ -63,7 +63,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT id, count, active, meta, lixcol_row_pk, lixcol_observed_commit_id, lixcol_is_deleted, lixcol_depth \
-                     FROM engine_history_schema_history('{second_commit_id}') \
+                     FROM lix_history('engine_history_schema', '{second_commit_id}') \
                      WHERE lixcol_row_pk = CAST('[\"history-row\"]' AS JSONB) \
                      ORDER BY lixcol_depth"
                 ),
@@ -135,7 +135,7 @@ simulation_test!(row_history_defaults_to_active_head, |sim| async move {
     let result = session
         .execute(
             "SELECT id, lixcol_depth \
-                 FROM engine_history_error_schema_history() \
+                 FROM lix_history('engine_history_error_schema') \
                  WHERE id = 'history-default'",
             &[],
         )
@@ -151,19 +151,17 @@ simulation_test!(row_history_defaults_to_active_head, |sim| async move {
     );
 });
 
-simulation_test!(
-    row_history_rejects_retired_anchor_names,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+simulation_test!(row_history_rejects_retired_anchor_names, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
-        session
+    session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
@@ -176,24 +174,23 @@ simulation_test!(
             .await
             .expect("registered schema insert should succeed");
 
-        for retired in ["start_commit_id", "lixcol_start_commit_id"] {
-            let error = session
-                .execute(
-                    &format!(
-                        "SELECT id \
-                         FROM engine_history_bare_error_schema_history() \
+    for retired in ["start_commit_id", "lixcol_start_commit_id"] {
+        let error = session
+            .execute(
+                &format!(
+                    "SELECT id \
+                         FROM lix_history('engine_history_bare_error_schema') \
                          WHERE {retired} = lix_active_branch_commit_id()"
-                    ),
-                    &[],
-                )
-                .await
-                .expect_err("retired history anchor must fail");
+                ),
+                &[],
+            )
+            .await
+            .expect_err("retired history anchor must fail");
 
-            assert_eq!(error.code, lix::LixError::CODE_COLUMN_NOT_FOUND);
-            assert!(
-                error.to_string().contains(retired),
-                "unexpected error: {error}"
-            );
-        }
+        assert_eq!(error.code, lix::LixError::CODE_COLUMN_NOT_FOUND);
+        assert!(
+            error.to_string().contains(retired),
+            "unexpected error: {error}"
+        );
     }
-);
+});

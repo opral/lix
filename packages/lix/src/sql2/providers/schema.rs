@@ -23,7 +23,6 @@ use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
-use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
 use crate::hot_state::MaterializedHotStateBatch;
 #[cfg(test)]
@@ -45,16 +44,12 @@ use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
-use crate::sql2::{
-    RowSnapshotReader, SqlHistoryQuerySource, SqlWriteContext, WriteAccess,
-    WriteContextHotStateReader,
-};
+use crate::sql2::{RowSnapshotReader, SqlWriteContext, WriteAccess, WriteContextHotStateReader};
 use crate::transaction_types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 
 use super::ProviderSelection;
-use super::schema_history::register_row_history_surface;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ExecutionPlan, Statistics};
 use futures_util::stream;
@@ -67,7 +62,6 @@ use super::spec::{
 use super::values::{
     optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
 };
-use crate::storage_adapter::StorageAdapterRead;
 
 /// Executes the already-proved unique registered-schema point shape without
 /// constructing a DataFusion plan or Arrow batch. The retained snapshot
@@ -160,22 +154,16 @@ pub(crate) async fn execute_exact_schema_batch_read(
     })
 }
 
-pub(crate) async fn register_row_providers<S>(
+pub(crate) async fn register_row_providers(
     ctx: &SessionContext,
     active_branch_id: &str,
     hot_state: Arc<dyn HotStateReader>,
     row_snapshot_reader: Option<Arc<dyn RowSnapshotReader>>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Option<Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>>,
-    query_source: Option<SqlHistoryQuerySource<S>>,
-    checkpoint_history_query_source: Option<SqlHistoryQuerySource<S>>,
     catalog: &PublicCatalog,
     include_write_surfaces: bool,
     selection: &ProviderSelection,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync + 'static,
-{
+) -> Result<(), LixError> {
     for surface in catalog.surfaces() {
         if !selection.includes(surface) {
             continue;
@@ -194,30 +182,6 @@ where
                         row_snapshot_reader.clone(),
                     )),
                     WriteAccess::read_only(),
-                )?;
-            }
-            PublicSurfaceKind::SchemaHistory { schema_key } => {
-                let selected_query_source =
-                    if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY {
-                        checkpoint_history_query_source.as_ref()
-                    } else {
-                        query_source.as_ref()
-                    };
-                let (Some(commit_graph), Some(query_source)) =
-                    (commit_graph.as_ref(), selected_query_source)
-                else {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "selected row history provider is missing its history context",
-                    ));
-                };
-                let spec = catalog_schema_spec(catalog, schema_key)?;
-                register_row_history_surface(
-                    ctx,
-                    &surface.name,
-                    spec,
-                    Arc::clone(commit_graph),
-                    query_source.clone(),
                 )?;
             }
             _ => {}
@@ -259,7 +223,7 @@ pub(crate) async fn register_row_write_providers(
     Ok(())
 }
 
-fn catalog_schema_spec(
+pub(super) fn catalog_schema_spec(
     catalog: &PublicCatalog,
     schema_key: &str,
 ) -> Result<Arc<SchemaSurfaceSpec>, LixError> {

@@ -335,7 +335,7 @@ async fn assert_history_file<StorageImpl>(
 {
     let result = lix
         .execute(
-            "SELECT content FROM lix_file_history($1) \
+            "SELECT content FROM lix_history('lix_file', $1) \
              WHERE id = $2 \
              ORDER BY lixcol_depth",
             &[

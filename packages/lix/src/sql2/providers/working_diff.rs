@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
@@ -13,8 +14,8 @@ use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head};
 use crate::commit_graph::CommitGraphReader;
 use crate::hot_state::TrackedHeadContext;
 use crate::row_pk::RowPk;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateFilter,
@@ -24,7 +25,7 @@ use crate::{LixError, NullableKeyFilter};
 use super::branch_selection::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
+use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 use crate::sql2::error::lix_error_to_datafusion_error;
 
 pub(super) async fn register_working_diff_provider<S>(
@@ -38,17 +39,47 @@ pub(super) async fn register_working_diff_provider<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    register_spec_table(
-        session,
-        surface_name,
-        Arc::new(WorkingDiffSpec {
+    let provider: Arc<dyn TableProvider> =
+        Arc::new(SpecTableProvider::new(Arc::new(WorkingDiffSpec {
             active_branch_id,
             branch_ref,
             commit_graph: Arc::new(Mutex::new(commit_graph)),
             store: query_source.store,
+        })));
+    session.register_udtf(
+        surface_name,
+        Arc::new(ZeroArgumentTableFunction {
+            name: surface_name.to_string(),
+            provider,
         }),
-        WriteAccess::read_only(),
-    )
+    );
+    Ok(())
+}
+
+struct ZeroArgumentTableFunction {
+    name: String,
+    provider: Arc<dyn TableProvider>,
+}
+
+impl std::fmt::Debug for ZeroArgumentTableFunction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ZeroArgumentTableFunction")
+            .field(&self.name)
+            .finish()
+    }
+}
+
+impl datafusion::catalog::TableFunctionImpl for ZeroArgumentTableFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if !args.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "{} expects no arguments",
+                self.name
+            )));
+        }
+        Ok(Arc::clone(&self.provider))
+    }
 }
 
 struct WorkingDiffSpec<S> {
@@ -76,12 +107,11 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if filter.column_refs().iter().any(|column| {
-            matches!(
-                column.name.as_str(),
-                "row_pk" | "schema_key" | "file_id"
-            )
-        }) {
+        if filter
+            .column_refs()
+            .iter()
+            .any(|column| matches!(column.name.as_str(), "row_pk" | "schema_key" | "file_id"))
+        {
             TableProviderFilterPushDown::Inexact
         } else {
             TableProviderFilterPushDown::Unsupported
@@ -269,7 +299,7 @@ fn string_constraint_values(constraint: FileIdConstraint) -> Option<Vec<String>>
     }
 }
 
-pub(super) fn working_diff_schema() -> SchemaRef {
+pub(crate) fn working_diff_schema() -> SchemaRef {
     let fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
         json_field("row_pk", false),

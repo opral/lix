@@ -7,7 +7,10 @@ use serde_json::Value as JsonValue;
 
 use crate::LixError;
 
-use super::{PublicColumn, PublicSurfaceContract, PublicSurfaceKind, SurfaceCapabilities};
+use super::{
+    PublicColumn, PublicHistoryContract, PublicHistoryKind, PublicSurfaceContract,
+    PublicSurfaceKind, SurfaceCapabilities,
+};
 use crate::sql2::catalog::schema_surface_schema;
 use crate::sql2::catalog::{
     SchemaSurfaceShape, SchemaSurfaceSpec, derive_schema_surface_spec_from_schema,
@@ -15,17 +18,16 @@ use crate::sql2::catalog::{
 };
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ROW_PK, HISTORY_COL_FILE_ID,
-    HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_FILE_ID, HISTORY_COL_IS_DELETED,
+    HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
+    HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
-#[cfg(test)]
-use crate::sql2::providers::filesystem_working_diff_schema;
 use crate::sql2::result_metadata::json_field;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicCatalog {
     surfaces: BTreeMap<String, PublicSurfaceContract>,
+    history: BTreeMap<String, PublicHistoryContract>,
     schema_specs: BTreeMap<String, SchemaSurfaceSpec>,
 }
 
@@ -92,11 +94,18 @@ impl PublicCatalog {
         self.surfaces.values()
     }
 
+    pub(crate) fn history_relations(&self) -> impl Iterator<Item = &PublicHistoryContract> {
+        self.history.values()
+    }
+
+    pub(crate) fn history_relation(&self, relation_name: &str) -> Option<&PublicHistoryContract> {
+        self.history.get(relation_name)
+    }
+
     pub(crate) fn schema_spec(&self, schema_key: &str) -> Option<&SchemaSurfaceSpec> {
         self.schema_specs.get(schema_key)
     }
 
-    #[cfg(test)]
     pub(crate) fn surface_schema(&self, table_name: &str) -> Option<SchemaRef> {
         let surface = self.surface(table_name)?;
         Some(match &surface.kind {
@@ -109,6 +118,7 @@ impl PublicCatalog {
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
             PublicSurfaceKind::WorkingDiff => working_diff_schema(),
+            PublicSurfaceKind::HistoryFunction => return None,
             PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![Field::new(
@@ -116,9 +126,6 @@ impl PublicCatalog {
                 DataType::Utf8,
                 false,
             )])),
-            PublicSurfaceKind::FileWorkingDiff | PublicSurfaceKind::DirectoryWorkingDiff => {
-                filesystem_working_diff_schema()
-            }
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("account_id", DataType::Utf8, false),
@@ -130,28 +137,42 @@ impl PublicCatalog {
                 Field::new("origin_key", DataType::Utf8, true),
                 json_field("snapshot_content", true),
             ])),
-            PublicSurfaceKind::FileHistory => history_filesystem_schema(true),
-            PublicSurfaceKind::DirectoryHistory => history_filesystem_schema(false),
             PublicSurfaceKind::SchemaBase { schema_key } => {
                 schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::Active)
-            }
-            PublicSurfaceKind::SchemaHistory { schema_key } => {
-                schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::History)
             }
         })
     }
 
-    pub(crate) fn history_surface_schema(&self, table_name: &str) -> Option<SchemaRef> {
-        let surface = self.surface(table_name)?;
-        match &surface.kind {
-            PublicSurfaceKind::FileHistory => Some(history_filesystem_schema(true)),
-            PublicSurfaceKind::DirectoryHistory => Some(history_filesystem_schema(false)),
-            PublicSurfaceKind::SchemaHistory { schema_key } => Some(schema_surface_schema(
+    pub(crate) fn history_relation_schema(&self, relation_name: &str) -> Option<SchemaRef> {
+        let history = self.history_relation(relation_name)?;
+        match &history.kind {
+            PublicHistoryKind::File => Some(history_filesystem_schema(true)),
+            PublicHistoryKind::Directory => Some(history_filesystem_schema(false)),
+            PublicHistoryKind::Schema { schema_key } => Some(schema_surface_schema(
                 self.schema_spec(schema_key)?,
                 SchemaSurfaceShape::History,
             )),
-            _ => None,
         }
+    }
+
+    fn insert_history(&mut self, mut history: PublicHistoryContract) -> Result<(), LixError> {
+        if self.history.contains_key(&history.relation_name) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "duplicate public SQL history relation '{}'",
+                    history.relation_name
+                ),
+            ));
+        }
+        history.columns = history
+            .columns
+            .into_iter()
+            .enumerate()
+            .map(|(id, column)| column.with_id(id))
+            .collect();
+        self.history.insert(history.relation_name.clone(), history);
+        Ok(())
     }
 
     pub(crate) fn require_surface(
@@ -221,6 +242,12 @@ impl PublicCatalog {
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
+        self.insert(surface(
+            "lix_history",
+            PublicSurfaceKind::HistoryFunction,
+            Vec::new(),
+            SurfaceCapabilities::read_only(),
+        ))?;
         for (name, kind) in [
             ("lix_revert", PublicSurfaceKind::Revert),
             ("lix_apply", PublicSurfaceKind::Apply),
@@ -240,44 +267,16 @@ impl PublicCatalog {
                 },
             ))?;
         }
-        for (name, kind) in [
-            (
-                "lix_file_working_diff",
-                PublicSurfaceKind::FileWorkingDiff,
-            ),
-            (
-                "lix_directory_working_diff",
-                PublicSurfaceKind::DirectoryWorkingDiff,
-            ),
-        ] {
-            let columns = vec![
-                ("id", false),
-                ("path", true),
-                ("previous_path", true),
-                ("change_kind", false),
-            ];
-            self.insert(surface(
-                name,
-                kind,
-                columns
-                    .into_iter()
-                    .map(|(name, nullable)| PublicColumn::public(name, nullable))
-                    .collect(),
-                SurfaceCapabilities::read_only(),
-            ))?;
-        }
-        self.insert(surface(
-            "lix_file_history",
-            PublicSurfaceKind::FileHistory,
-            file_history_columns(),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
-            "lix_directory_history",
-            PublicSurfaceKind::DirectoryHistory,
-            directory_history_columns(),
-            SurfaceCapabilities::read_only(),
-        ))?;
+        self.insert_history(PublicHistoryContract {
+            relation_name: "lix_file".to_string(),
+            kind: PublicHistoryKind::File,
+            columns: file_history_columns(),
+        })?;
+        self.insert_history(PublicHistoryContract {
+            relation_name: "lix_directory".to_string(),
+            kind: PublicHistoryKind::Directory,
+            columns: directory_history_columns(),
+        })?;
         Ok(())
     }
 
@@ -336,14 +335,13 @@ impl PublicCatalog {
                 .collect::<Vec<_>>();
             history_columns.extend(row_history_system_columns());
 
-            self.insert(surface(
-                format!("{}_history", spec.schema_key),
-                PublicSurfaceKind::SchemaHistory {
+            self.insert_history(PublicHistoryContract {
+                relation_name: spec.schema_key.clone(),
+                kind: PublicHistoryKind::Schema {
                     schema_key: spec.schema_key.clone(),
                 },
-                history_columns,
-                SurfaceCapabilities::read_only(),
-            ))?;
+                columns: history_columns,
+            })?;
         }
 
         self.schema_specs.insert(spec.schema_key.clone(), spec);
@@ -351,7 +349,6 @@ impl PublicCatalog {
     }
 }
 
-#[cfg(test)]
 fn working_diff_schema() -> SchemaRef {
     let fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
@@ -365,7 +362,6 @@ fn working_diff_schema() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-#[cfg(test)]
 fn filesystem_schema(include_data: bool) -> SchemaRef {
     let mut fields = if include_data {
         vec![
@@ -526,10 +522,7 @@ fn filesystem_system_columns() -> Vec<PublicColumn> {
     ]
 }
 
-fn row_system_columns(
-    spec: &SchemaSurfaceSpec,
-    variant: SchemaSurfaceShape,
-) -> Vec<PublicColumn> {
+fn row_system_columns(spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) -> Vec<PublicColumn> {
     debug_assert_ne!(variant, SchemaSurfaceShape::History);
     let row_pk = PublicColumn::public_insert_only("lixcol_row_pk", false);
     let row_pk = if spec.primary_key_paths.is_empty() {

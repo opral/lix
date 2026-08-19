@@ -458,13 +458,13 @@ simulation_test!(
 
         session
             .execute(
-                    "UPDATE lix_key_value \
+                "UPDATE lix_key_value \
                      SET lixcol_metadata = CAST(NULL AS JSONB) \
                      WHERE key = 'metadata-row-update'",
-                    &[],
-                )
-                .await
-                .expect("CAST(NULL AS JSONB) is SQL NULL metadata on UPDATE");
+                &[],
+            )
+            .await
+            .expect("CAST(NULL AS JSONB) is SQL NULL metadata on UPDATE");
 
         session
             .execute(
@@ -570,7 +570,7 @@ simulation_test!(
                 .execute(
                     &format!(
                         "SELECT lixcol_metadata \
-                         FROM lix_key_value_history('{commit_id}') \
+                         FROM lix_history('lix_key_value', '{commit_id}') \
                            WHERE key = 'metadata-valid-object'"
                     ),
                     &[],

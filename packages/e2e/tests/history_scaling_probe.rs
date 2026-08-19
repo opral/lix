@@ -1,4 +1,4 @@
-//! The standard scaling instrument for `lix_file_history()`.
+//! The standard scaling instrument for `lix_history('lix_file')`.
 //!
 //! **Use this rather than writing a fresh history probe, and keep the two
 //! sweeps separate.** History cost has two independent terms - the number of
@@ -209,11 +209,11 @@ async fn history_files_at_fixed_commits() {
             .expect("id text");
 
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_file_history($1) WHERE path = $2 \
+            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
         let by_id = format!(
-            "SELECT lixcol_depth FROM lix_file_history($1) WHERE id = $2 \
+            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
 
@@ -277,11 +277,11 @@ async fn history_member_scan_census() {
             .expect("id text");
 
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_file_history($1) WHERE path = $2 \
+            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
         let by_id = format!(
-            "SELECT lixcol_depth FROM lix_file_history($1) WHERE id = $2 \
+            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
 
@@ -338,7 +338,7 @@ async fn history_path_resolver_census() {
         seed(&lix, files, file_bytes, files, edits, &probe_path).await;
         let head = active_commit(&lix).await;
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_file_history($1) WHERE path = $2 \
+            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
         let params = [Value::Text(head.clone()), Value::Text(probe_path.clone())];
@@ -416,16 +416,16 @@ async fn history_commits_at_fixed_files() {
             .expect("id text");
 
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_file_history($1) WHERE path = $2 \
+            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
         let by_id = format!(
-            "SELECT lixcol_depth FROM lix_file_history($1) WHERE id = $2 \
+            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
         // A depth-bounded shape: the bounded-history-traversal work should make
         // this cheap regardless of how many commits exist.
-        let by_path_depth0 = "SELECT lixcol_depth FROM lix_file_history($1) \
+        let by_path_depth0 = "SELECT lixcol_depth FROM lix_history('lix_file', $1) \
                               WHERE path = $2 AND lixcol_depth = 0"
             .to_string();
         // Null control. This walks the same commit graph over the same fixture
@@ -434,7 +434,7 @@ async fn history_commits_at_fixed_files() {
         // cannot reach `lix_file_history`'s descriptor/blob route at all. Any
         // arm-to-arm movement it shows is this harness's noise floor: a
         // `lix_file_history` delta smaller than it is unresolvable.
-        let null_control_kv = "SELECT lixcol_depth FROM lix_key_value_history($1) \
+        let null_control_kv = "SELECT lixcol_depth FROM lix_history('lix_key_value', $1) \
                                ORDER BY lixcol_depth DESC"
             .to_string();
 
@@ -471,7 +471,7 @@ async fn history_commits_at_fixed_files() {
 
         if std::env::var("LIX_HISTORY_SCALE_VERIFY").is_ok() {
             let projection = "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
-                              FROM lix_file_history($1)";
+                              FROM lix_history('lix_file', $1)";
             let all = lix
                 .execute(projection, &[Value::Text(head.clone())])
                 .await

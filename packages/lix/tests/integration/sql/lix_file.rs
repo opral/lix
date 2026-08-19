@@ -248,7 +248,7 @@ simulation_test!(
                 &session,
                 &format!(
                     "SELECT schema_key, file_id \
-                     FROM lix_working_diff \
+                     FROM lix_working_diff() \
                      WHERE file_id = '{file_id}' \
                        AND schema_key = 'lix_file_descriptor'"
                 ),
@@ -579,7 +579,6 @@ simulation_test!(
         );
     }
 );
-
 
 simulation_test!(
     lix_file_path_insert_preserves_long_opaque_segments,
@@ -1796,7 +1795,6 @@ simulation_test!(
     }
 );
 
-
 simulation_test!(
     lix_file_path_insert_rejects_existing_directory_entry,
     |sim| async move {
@@ -2935,7 +2933,7 @@ async fn file_descriptor_event_count(
     let result = session
         .execute(
             &format!(
-                "SELECT lixcol_source_changes FROM lix_file_history('{commit_id}') \
+                "SELECT lixcol_source_changes FROM lix_history('lix_file', '{commit_id}') \
                    WHERE lixcol_depth = 0 \
                    AND id = '{file_id}'"
             ),
@@ -3005,7 +3003,6 @@ simulation_test!(
         assert_eq!(blob_ref_changes.len(), 0);
     }
 );
-
 
 simulation_test!(
     lix_file_global_path_insert_reuses_existing_global_directory,
@@ -3416,8 +3413,6 @@ simulation_test!(
         assert_eq!(files.len(), 1);
     }
 );
-
-
 
 simulation_test!(
     lix_file_insert_on_conflict_path_rejects_missing_path,
