@@ -52,6 +52,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
     schema_catalog: &mut TransactionCatalog,
     functions: FunctionProviderHandle,
     default_timestamp: &mut Option<crate::common::LixTimestamp>,
+    allow_reserved_builtin_registration: bool,
 ) -> Result<NormalizedRowFacts, LixError> {
     populate_registered_schema_snapshot(rows, row_index)?;
     let row = rows.row(row_index);
@@ -218,6 +219,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
             normalized_snapshot.as_ref().map(TransactionJson::value),
             schema_domain,
             schema_catalog,
+            allow_reserved_builtin_registration,
         )?;
     }
 
@@ -486,6 +488,7 @@ pub(crate) fn remember_pending_registered_schema(
     snapshot: Option<&JsonValue>,
     domain: Domain,
     schema_catalog: &mut TransactionCatalog,
+    allow_reserved_builtin_registration: bool,
 ) -> Result<(), LixError> {
     let Some(snapshot) = snapshot else {
         return Err(LixError::new(
@@ -509,10 +512,27 @@ pub(crate) fn remember_pending_registered_schema(
         validate_lix_schema(registered_schema_definition, snapshot)?;
     }
     let (key, schema) = schema_from_registered_snapshot(snapshot)?;
-    reject_reserved_schema_namespace(&key)?;
+    if allow_reserved_builtin_registration {
+        validate_reserved_builtin_registration(&key, &schema)?;
+    } else {
+        reject_reserved_schema_namespace(&key)?;
+    }
     validate_lix_schema_definition(&schema)?;
     schema_catalog.insert_schema_for_domain(domain, key, schema)?;
     Ok(())
+}
+
+fn validate_reserved_builtin_registration(
+    key: &SchemaKey,
+    schema: &JsonValue,
+) -> Result<(), LixError> {
+    if !PublicCatalog::runtime_schema_key_uses_reserved_namespace(&key.schema_key) {
+        return Ok(());
+    }
+    if crate::schema::seed_schema_definition(&key.schema_key) == Some(schema) {
+        return Ok(());
+    }
+    reject_reserved_schema_namespace(key)
 }
 
 pub(crate) fn reject_reserved_schema_namespace(key: &SchemaKey) -> Result<(), LixError> {
@@ -903,6 +923,39 @@ mod tests {
     }
 
     #[test]
+    fn normalization_allows_the_system_to_register_an_exact_built_in_schema() {
+        let mut catalog = catalog_with(vec![
+            seed_schema_definition(REGISTERED_SCHEMA_KEY)
+                .expect("registered schema builtin")
+                .clone(),
+        ]);
+        let schema = seed_schema_definition("lix_permission_grant")
+            .expect("permission grant builtin")
+            .clone();
+        let registered = TransactionWriteRow {
+            row_pk: None,
+            schema_key: REGISTERED_SCHEMA_KEY.into(),
+            snapshot: Some(transaction_json(json!({ "value": schema }))),
+            ..base_stage_row()
+        };
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push(registered);
+        let mut default_timestamp = None;
+
+        normalize_raw_write_row_in_place(
+            &mut rows,
+            0,
+            &mut catalog,
+            functions(),
+            &mut default_timestamp,
+            true,
+        )
+        .expect("the system may register the shipped built-in definition verbatim");
+
+        assert!(catalog.snapshot().contains("lix_permission_grant"));
+    }
+
+    #[test]
     fn normalization_allows_application_owned_schema_key() {
         let mut catalog = catalog_with(vec![
             seed_schema_definition(REGISTERED_SCHEMA_KEY)
@@ -1118,6 +1171,7 @@ mod tests {
             catalog,
             functions,
             &mut default_timestamp,
+            false,
         )?;
         Ok(rows.into_rows().pop().expect("single normalized test row"))
     }

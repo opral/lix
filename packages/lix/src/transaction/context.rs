@@ -6399,6 +6399,7 @@ where
                     catalog,
                     functions.clone(),
                     &mut default_timestamp,
+                    self.active_account_id == crate::SYSTEM_ACCOUNT_ID,
                 )?;
                 scalar_facts.push(plan_prepared_row_scalars(
                     rows.row(index),
@@ -6481,6 +6482,7 @@ where
                     row.snapshot.map(TransactionJson::value),
                     Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked),
                     catalog,
+                    self.active_account_id == crate::SYSTEM_ACCOUNT_ID,
                 )?;
             }
             for &index in &row_indices {
@@ -6490,6 +6492,7 @@ where
                     catalog,
                     functions.clone(),
                     &mut default_timestamp,
+                    self.active_account_id == crate::SYSTEM_ACCOUNT_ID,
                 )?);
             }
             // Preserve the historical domain-by-domain provider/error order:
