@@ -5,9 +5,11 @@ use bytes::Bytes;
 use crate::init::{
     REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE, REPOSITORY_PROTOCOL_VALUE,
 };
-use crate::storage::{
-    Key, KeyRange, Precondition, PutBatch, PutEntry, Storage, StorageSpace, StorageWrite,
-    StoredValue, ValueIntegrity, ValueSemantics, WriteOptions,
+use crate::storage_adapter::{
+    MigrationReplaceToken, PutBatch, PutEntry, Storage, StorageKey as Key,
+    StorageError, StorageKeyRange as KeyRange, StoragePrecondition as Precondition, StorageSpace,
+    StorageValue as StoredValue, StorageWrite, StorageWriteOptions as WriteOptions, ValueIntegrity,
+    ValueSemantics,
 };
 use crate::LixError;
 
@@ -158,7 +160,7 @@ where
         .await
         .map_err(storage_error)?;
 
-    let stage_result: Result<(), crate::storage::StorageError> = async {
+    let stage_result: Result<(), StorageError> = async {
         for space in plan.cleared_spaces {
             write.delete_range(
                 space,
@@ -171,7 +173,7 @@ where
         }
         for (space, entries) in plan.replacements {
             write.replace_many_for_migration(
-                &crate::storage::MigrationReplaceToken::issue(),
+                &MigrationReplaceToken::issue(),
                 space,
                 entries,
             )
@@ -203,7 +205,7 @@ pub(super) async fn preflight_backend<S: Storage>(storage: &S) -> Result<(), Lix
         .map_err(storage_error)?;
     let result = write
         .replace_many_for_migration(
-            &crate::storage::MigrationReplaceToken::issue(),
+            &MigrationReplaceToken::issue(),
             crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
             PutBatch { entries: Vec::new() },
         )
@@ -235,17 +237,19 @@ fn plan_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
 }
 
-fn storage_error(error: crate::storage::StorageError) -> LixError {
+fn storage_error(error: StorageError) -> LixError {
     let code = match &error {
-        crate::storage::StorageError::CommitOutcomeUnknown(_) => {
+        StorageError::CommitOutcomeUnknown(_) => {
             "LIX_ERROR_MIGRATION_COMMIT_OUTCOME_UNKNOWN"
         }
-        crate::storage::StorageError::Unsupported(crate::storage::Capability::MigrationReplace) => {
+        StorageError::Unsupported(
+            crate::storage_adapter::StorageCapability::MigrationReplace,
+        ) => {
             "LIX_ERROR_MIGRATION_UNSUPPORTED_BACKEND"
         }
-        crate::storage::StorageError::PreconditionFailed(_)
-        | crate::storage::StorageError::WriteConflict
-        | crate::storage::StorageError::Fenced => "LIX_ERROR_MIGRATION_CONCURRENT_MUTATION",
+        StorageError::PreconditionFailed(_) | StorageError::WriteConflict | StorageError::Fenced => {
+            "LIX_ERROR_MIGRATION_CONCURRENT_MUTATION"
+        }
         _ => LixError::CODE_INTERNAL_ERROR,
     };
     LixError::new(code, format!("repository migration storage error: {error}"))

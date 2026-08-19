@@ -53,7 +53,11 @@ pub(crate) use merge::{
     merge_payload_fallback_ids, plan_merge,
 };
 pub(crate) use mutation_directory::{
-    MUTATION_DIRECTORY_NODE_SPACE, collect_mutation_directory_node_ids,
+    LAYOUT_BOUNDED_DIRECT, LAYOUT_BOUNDED_INDIRECT, LAYOUT_COMPACT_REPLACEMENT,
+    LAYOUT_DIRECT_ROWS_ONLY, MUTATION_DIRECTORY_NODE_SPACE, MutationDirectoryEntry,
+    MutationDirectoryFullTraversalContext, MutationDirectoryReadSelection, MutationDirectoryRoot,
+    collect_mutation_directory_node_ids, load_mutation_part_read_plan,
+    validate_mutation_directory_root,
 };
 pub(crate) use replacement_part::{
     EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
@@ -67,7 +71,7 @@ pub(crate) use row_materialization::{
 #[cfg(test)]
 pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
-pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
+pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, ScopedRangeRoot, validate_scoped_range_trees};
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;

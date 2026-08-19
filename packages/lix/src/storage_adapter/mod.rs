@@ -39,6 +39,9 @@ pub use crate::storage::{
     ValueSemantics, WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{PutBatch, PutEntry};
+pub(crate) use crate::storage::{
+    Capability as StorageCapability, MigrationReplaceToken, StorageWrite,
+};
 
 pub use context::StorageAdapter;
 pub(crate) use context::stage_mutation_revision;

@@ -8,14 +8,12 @@ use crate::storage_adapter::{
     StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
     StorageProjectedValue, exact_get_many,
 };
-use crate::tracked_state::mutation_directory::{
+use crate::tracked_state::{
     LAYOUT_BOUNDED_DIRECT, LAYOUT_BOUNDED_INDIRECT, LAYOUT_COMPACT_REPLACEMENT,
     LAYOUT_DIRECT_ROWS_ONLY, MutationDirectoryEntry, MutationDirectoryFullTraversalContext,
     MutationDirectoryReadSelection, MutationDirectoryRoot, load_mutation_part_read_plan,
     validate_mutation_directory_root,
-};
-use crate::tracked_state::scoped_range::ScopedRangeRoot;
-use crate::tracked_state::{
+    ScopedRangeRoot,
     COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH, ColumnarMutationPartSet,
     CommitDeltaLifecycleSummary, CommitDeltaReplacementScope, CommitStateManifest,
     CommitStateReplayDebt, TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,

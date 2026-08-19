@@ -4,9 +4,10 @@ use crate::init::{
     CURRENT_FORMAT_VERSION, REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE,
     RepositoryProtocolStatus, parse_repository_protocol,
 };
-use crate::storage::{
-    CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, ReadOptions, Storage,
-    StorageRead,
+use crate::storage_adapter::{
+    Storage, StorageCoreProjection as CoreProjection, StorageGetManyRequest as GetManyRequest,
+    StorageGetOptions as GetOptions, StorageKey as Key, StorageProjectedValue as ProjectedValue,
+    StorageError, StorageRead, StorageReadOptions as ReadOptions,
 };
 use crate::LixError;
 
@@ -199,7 +200,7 @@ where
     })
 }
 
-fn storage_error(error: crate::storage::StorageError) -> LixError {
+fn storage_error(error: StorageError) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!("repository migration storage error: {error}"),

@@ -149,6 +149,14 @@ pub(crate) const RETIRED_STORAGE_SPACE_IDS: &[StorageSpaceId] = &[
     StorageSpaceId(0x0002_0002),
     // live_state.index.branch_root.v1
     StorageSpaceId(0x0004_0005),
+    // hot_state.certified_row_batch.v1
+    StorageSpaceId(0x0004_001f),
+    // hot_state.certified_row_batch_manifest.v2
+    StorageSpaceId(0x0004_0021),
+    // hot_state.certified_row_batch_page.v1
+    StorageSpaceId(0x0004_0022),
+    // plugin.current_checkpoint.v2
+    StorageSpaceId(0x0004_0026),
     // gc.reachability_delta.v1
     StorageSpaceId(0x0008_0003),
     // gc.reachability_queue.v1
