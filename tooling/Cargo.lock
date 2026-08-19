@@ -3036,6 +3036,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wasm-bindgen-futures",
  "wasmparser 0.247.0",
  "wasmtime",
  "wasmtime-wasi",
