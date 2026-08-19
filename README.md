@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Files, a SQL database, and version control in one repository</h3>
+<h3 align="center">Embeddable repository backend</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,7 +11,7 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is a repository you embed in your product. Agents read and write normal files. Your product queries SQL. Lix versions everything both write: branch, diff, merge, roll back. One system provides all three:
+Lix is a repository you embed in your product. Everything inside is versioned data: file content, app tables, reviews, comments. There is no external control plane to sync. Agents read and write normal files. Your product queries SQL. You branch, diff, merge, and roll back all of it together:
 
 <img src="./website/public/assets/lix-repo.svg" alt="A Lix repo holds files, a SQL database, and version control in one system" width="760" />
 
@@ -64,11 +64,9 @@ const lix = await openLix({
 
 ## Try a demo
 
-LixRay is Lix, hosted. One repo your team and your agents share. Create one for free:
+Try out [lixray.com](https://lixray.com):
 
-<a href="https://lixray.com"><img src="./website/public/assets/lixray-banner.svg" alt="LixRay: one repo your team and your agents share. Any file type, every change tracked." width="760" /></a>
-
-See the [Hosting guide](./docs/hosting.md) for LixRay and for running your own host.
+<a href="https://lixray.com"><img src="./website/public/assets/lixray-og.png" alt="LixRay: a repository for your entire company. Works with Claude, OpenAI, and Gemini." width="760" /></a>
 
 ## Prime use cases
 
