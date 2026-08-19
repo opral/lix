@@ -1408,6 +1408,10 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     /// Creates a protocol server with the default session limits.
+    ///
+    /// Open `root` with [`lix::OpenLixBuilder::as_protocol_root`] so attaching
+    /// a sink does not emit `lix.opened` for the internal handle. Handshake
+    /// session creation remains the client bind.
     pub fn new(root: Arc<Lix<S>>) -> Self {
         Self::with_options(root, ServerProtocolOptions::default())
             .expect("default protocol server options must be valid")
@@ -5127,6 +5131,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5168,6 +5173,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5201,6 +5207,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5238,6 +5245,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5429,6 +5437,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5482,6 +5491,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5565,6 +5575,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5655,6 +5666,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5734,7 +5746,7 @@ mod tests {
     }
 
     async fn app_with_options(options: ServerProtocolOptions) -> TestApp {
-        let lix = Arc::new(open_lix().await.expect("open lix"));
+        let lix = Arc::new(open_lix().as_protocol_root().await.expect("open lix"));
         let server = LixServerProtocol::with_options(lix, options).expect("protocol server");
         let router = handler(server.clone());
         TestApp { server, router }
@@ -5744,7 +5756,13 @@ mod tests {
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
-        let lix = Arc::new(open_lix().with_storage(storage).await.expect("open Lix"));
+        let lix = Arc::new(
+            open_lix()
+                .with_storage(storage)
+                .as_protocol_root()
+                .await
+                .expect("open Lix"),
+        );
         handler(LixServerProtocol::new(lix))
     }
 
@@ -5894,6 +5912,7 @@ mod tests {
         let lix = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5948,6 +5967,7 @@ mod tests {
         let lix = Arc::new(
             open_lix()
                 .with_telemetry(Arc::new(TracingTelemetrySink::new()))
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -6388,6 +6408,7 @@ mod tests {
                 .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
                     captured.lock().expect("spans").push(span);
                 })))
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -6400,7 +6421,7 @@ mod tests {
     async fn handshake_that_creates_a_session_emits_one_opened_span() {
         let spans = Arc::new(Mutex::new(Vec::new()));
         let app = app_with_callback_telemetry(Arc::clone(&spans)).await;
-        spans.lock().expect("spans").clear();
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 0);
 
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 1);
@@ -9511,6 +9532,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -9763,6 +9785,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -9833,6 +9856,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -9877,6 +9901,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -9928,6 +9953,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -10007,6 +10033,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -10192,6 +10219,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -10295,7 +10323,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_capacity_is_rejected() {
-        let lix = open_lix().await.expect("open lix");
+        let lix = open_lix().as_protocol_root().await.expect("open lix");
         let result = LixServerProtocol::with_options(
             Arc::new(lix),
             ServerProtocolOptions {
@@ -10310,7 +10338,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = LixServerProtocol::with_options(
-            Arc::new(open_lix().await.expect("open second lix")),
+            Arc::new(open_lix().as_protocol_root().await.expect("open second lix")),
             ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ServerProtocolOptions::default()

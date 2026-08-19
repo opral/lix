@@ -339,6 +339,14 @@ impl WasmLix {
         })
     }
 
+    #[wasm_bindgen(js_name = importFilesystemPaths)]
+    pub async fn import_filesystem_paths(&self, _paths: JsValue) -> Result<(), JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            "LIX_UNSUPPORTED_STORAGE",
+            "importFilesystemPaths requires a filesystem storage",
+        )))
+    }
+
     #[wasm_bindgen(js_name = mergeBranchPreview)]
     pub async fn merge_branch_preview(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: MergeBranchOptionsDto = from_js(options)?;
@@ -363,6 +371,14 @@ impl WasmLix {
             .await
             .map_err(lix_error_to_js)?;
         to_js(&MergeBranchReceiptDto::from(receipt))
+    }
+
+    #[wasm_bindgen(js_name = syncDiskToLix)]
+    pub async fn sync_disk_to_lix(&self) -> Result<(), JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            "LIX_UNSUPPORTED_STORAGE",
+            "syncDiskToLix requires a filesystem storage",
+        )))
     }
 
     #[wasm_bindgen(js_name = close)]

@@ -1,7 +1,7 @@
 {
 	"name": "@lix-js/storage-opfs",
 	"type": "module",
-	"version": "0.12.2",
+	"version": "0.12.3",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -32,7 +32,7 @@
 		"@sqlite.org/sqlite-wasm": "3.53.0-build1"
 	},
 	"peerDependencies": {
-		"@lix-js/sdk": "0.12.2"
+		"@lix-js/sdk": "0.12.3"
 	},
 	"devDependencies": {
 		"@lix-js/sdk": "file:../js-sdk",
