@@ -4,10 +4,10 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 
 # JavaScript API Reference
 
-`@lix-js/sdk` exports `openLix()`, `IndexedDbStorage`, `Row`, `Value`, and
-`bundledPluginArchives`. `@lix-js/storage-filesystem` provides filesystem
-storage. `openLix()` returns a `Lix` instance connected to a local or remote
-repository.
+`@lix-js/sdk` exports `openLix()`, the generic JavaScript storage protocol,
+`Row`, `Value`, and `bundledPluginArchives`. `@lix-js/storage-opfs` and
+`@lix-js/storage-filesystem` provide concrete storage implementations.
+`openLix()` returns a `Lix` instance connected to a local or remote repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -25,7 +25,7 @@ Options:
 
 | Option      | Type                                  | Description                                                                         |
 | ----------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
-| `storage`   | `LixStorage \| IndexedDbStorage`      | Local storage. `FilesystemStorage` and any adapter implementing `LixStorage` qualify. Omit it for memory. |
+| `storage`   | `LixStorage`                          | Local storage selected by a provider package. Omit it for memory. |
 | `server`    | `RemoteLixServerOptions`              | Connect to a remote Lix server. Remote mode does not accept local storage. |
 | `telemetry` | `LixTelemetryOptions`                 | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only.    |
 
@@ -43,13 +43,14 @@ const lix = await openLix({
 
 Remote file content, SQL rows, and branches live on the server. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
-Use `IndexedDbStorage` to persist a complete local browser Lix across reloads:
+Use `OpfsStorage` to persist a complete local browser Lix across reloads:
 
 ```ts
-import { IndexedDbStorage, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { OpfsStorage } from "@lix-js/storage-opfs";
 
 const lix = await openLix({
-  storage: new IndexedDbStorage({ name: "atelier" }),
+  storage: new OpfsStorage({ name: "atelier" }),
 });
 ```
 

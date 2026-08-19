@@ -43,6 +43,7 @@
 		"build:wasm:dev": "LIX_WASM_PROFILE=dev node ./scripts/build-wasm.js",
 		"build:plugins": "node ./scripts/build-bundled-plugins.js",
 		"benchmark:plugin-reopen": "node ./scripts/benchmark-plugin-reopen.mjs",
+		"benchmark:storage-boundary": "LIX_WASM_STORAGE_BENCH=1 npm run build:browser && LIX_WASM_STORAGE_BENCH=1 vitest run --config vitest.browser.config.ts src/storage-bridge.bench.browser.test.ts",
 		"clean": "node ./scripts/clean.js",
 		"prepare:native-package": "node ./scripts/prepare-native-package.js",
 		"build:ts": "tsc -p tsconfig.json",

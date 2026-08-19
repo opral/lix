@@ -65,17 +65,21 @@ if (cargoProfile === "release") {
 	cargoEnv.CARGO_PROFILE_RELEASE_OPT_LEVEL ??= "s";
 	cargoEnv.CARGO_PROFILE_RELEASE_STRIP ??= "symbols";
 }
+const cargoArgs = [
+	"build",
+	"-p",
+	"lix_js_sdk",
+	"--target",
+	"wasm32-unknown-unknown",
+	"--profile",
+	cargoProfile,
+];
+if (process.env.LIX_WASM_STORAGE_BENCH === "1") {
+	cargoArgs.push("--features", "storage-bridge-bench");
+}
 await run(
 	"cargo",
-	[
-		"build",
-		"-p",
-		"lix_js_sdk",
-		"--target",
-		"wasm32-unknown-unknown",
-		"--profile",
-		cargoProfile,
-	],
+	cargoArgs,
 	{
 		cwd: repoRoot,
 		env: cargoEnv,

@@ -5,7 +5,7 @@ use tracing::Instrument as _;
 
 use crate::storage::{
     CommitResult, KeyRange, Memory, Precondition, Prefix, PutBatch, PutEntry, ReadOptions, Storage,
-    StorageError, StorageWrite, StoredValue, WriteOptions,
+    StorageChangeWatch, StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{
     StorageAdapterRead, StorageAdapterReadScope, StorageSpace, StorageWriteSet,
@@ -47,6 +47,10 @@ where
             .begin_read(opts)
             .await
             .map(StorageAdapterReadScope::new)
+    }
+
+    pub(crate) async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
+        self.storage.watch_for_changes().await
     }
 
     pub fn new_write_set(&self) -> StorageWriteSet {

@@ -17,12 +17,72 @@ use lix::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
 use wasm_bindgen::prelude::*;
+#[cfg(feature = "storage-bridge-bench")]
+use wasm_bindgen_futures::JsFuture;
 
-use crate::indexeddb::{BrowserStorage, IndexedDb, IndexedDbBackend};
+use crate::browser_storage::BrowserStorage;
+use crate::js_storage::{JsStorage, JsStorageProvider};
 
 type BrowserLix = RsLix<BrowserStorage>;
 type BrowserTransaction = RsLixTransaction<BrowserStorage>;
 type BrowserObserveEvents = RsObserveEvents<BrowserStorage>;
+
+#[cfg(feature = "storage-bridge-bench")]
+#[wasm_bindgen]
+extern "C" {
+    /// Benchmark-only shape matching the asynchronous Rust -> JavaScript
+    /// storage calls used by the browser SQLite adapter.
+    pub type StorageBridgeBenchmarkBackend;
+
+    #[wasm_bindgen(method, js_name = roundTrip)]
+    fn round_trip(this: &StorageBridgeBenchmarkBackend, payload: JsValue) -> js_sys::Promise;
+}
+
+#[cfg(feature = "storage-bridge-bench")]
+#[derive(Serialize, Deserialize)]
+struct StorageBridgeBenchmarkEntry {
+    #[serde(with = "serde_bytes")]
+    key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    value: Vec<u8>,
+}
+
+/// Measures the actual wasm-bindgen + Promise + serde bridge used by browser
+/// storage without mixing provider I/O into the result. `calls` controls
+/// boundary crossings and `items_per_call` controls batching.
+#[cfg(feature = "storage-bridge-bench")]
+#[wasm_bindgen(js_name = benchmarkStorageBridge)]
+pub async fn benchmark_storage_bridge(
+    backend: StorageBridgeBenchmarkBackend,
+    calls: usize,
+    items_per_call: usize,
+    value_bytes: usize,
+) -> Result<u32, JsValue> {
+    let mut checksum = 0_u32;
+    for call in 0..calls {
+        let entries = (0..items_per_call)
+            .map(|item| StorageBridgeBenchmarkEntry {
+                key: (call.wrapping_mul(items_per_call).wrapping_add(item))
+                    .to_le_bytes()
+                    .to_vec(),
+                value: vec![u8::try_from(item & 0xff).unwrap_or_default(); value_bytes],
+            })
+            .collect::<Vec<_>>();
+        let payload = to_js(&entries)?;
+        let response = JsFuture::from(backend.round_trip(payload)).await?;
+        let response: Vec<StorageBridgeBenchmarkEntry> = from_js(response)?;
+        checksum = checksum.wrapping_add(
+            response
+                .iter()
+                .map(|entry| {
+                    u32::try_from(entry.key.len().wrapping_add(entry.value.len()))
+                        .unwrap_or(u32::MAX)
+                })
+                .sum::<u32>(),
+        );
+    }
+    Ok(checksum)
+}
 
 #[wasm_bindgen]
 pub struct WasmLix {
@@ -61,15 +121,13 @@ pub async fn open_memory_from_snapshot(
     open_browser_storage(BrowserStorage::Memory(storage), telemetry_dispatch).await
 }
 
-#[wasm_bindgen(js_name = openIndexedDb)]
-pub async fn open_indexed_db(
-    backend: IndexedDbBackend,
+#[wasm_bindgen(js_name = openJsStorage)]
+pub async fn open_js_storage(
+    provider: JsStorageProvider,
     telemetry_dispatch: Option<Function>,
 ) -> Result<WasmLix, JsValue> {
-    let storage = IndexedDb::open(backend)
-        .await
-        .map_err(|error| lix_error_to_js(error.into()))?;
-    let browser_storage = BrowserStorage::IndexedDb(storage);
+    let storage = JsStorage::new(provider);
+    let browser_storage = BrowserStorage::Js(storage);
     match open_browser_storage(browser_storage.clone(), telemetry_dispatch).await {
         Ok(lix) => Ok(lix),
         Err(error) => {
@@ -130,7 +188,7 @@ impl WasmLix {
             BrowserStorage::Memory(storage) => storage
                 .export_snapshot()
                 .map_err(|error| lix_error_to_js(error.into())),
-            BrowserStorage::IndexedDb(_) => Err(JsValue::from_str(
+            BrowserStorage::Js(_) => Err(JsValue::from_str(
                 "snapshot export is only available for memory storage",
             )),
         }

@@ -19,7 +19,7 @@ Lix is a repository you embed in your product. Agents read and write normal file
 - 🗄️ **SQL database.** File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.
 - 🔀 **Version control.** Diffs name the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
-- 🧩 **Pluggable storage.** Local filesystem, IndexedDB in the browser, or S3 behind a Lix server.
+- 🧩 **Pluggable storage.** Local filesystem, SQLite on browser OPFS, or S3 behind a Lix server.
 - 🔒 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
 
 ## Getting started

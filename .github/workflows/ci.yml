@@ -318,6 +318,7 @@ jobs:
           cache-dependency-path: |
             packages/js-sdk/package-lock.json
             packages/storage-filesystem/package-lock.json
+            packages/storage-opfs/package-lock.json
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
@@ -327,6 +328,11 @@ jobs:
         if: matrix.runtime == 'native'
         working-directory: packages/storage-filesystem
         run: npm ci --legacy-peer-deps
+
+      - name: Install OPFS storage dependencies
+        if: matrix.runtime == 'browser'
+        working-directory: packages/storage-opfs
+        run: npm ci
 
       - name: Install Chromium
         if: matrix.runtime == 'browser'
@@ -365,9 +371,26 @@ jobs:
         working-directory: packages/js-sdk
         run: npm run build:browser
 
+      - name: Build and check OPFS storage package
+        if: matrix.runtime == 'browser'
+        working-directory: packages/storage-opfs
+        run: |
+          npm run build
+          npm run typecheck
+          npm pack --dry-run --ignore-scripts
+
       - name: Run browser JS SDK tests
         if: matrix.runtime == 'browser'
         working-directory: packages/js-sdk
         run: |
           npm run test:browser:built
           node ./scripts/test-packed-vite.js
+
+      - name: Run OPFS storage browser tests
+        if: matrix.runtime == 'browser'
+        working-directory: packages/storage-opfs
+        run: |
+          npm run test:browser:built
+          npm run test:browser:production
+          npm run benchmark
+          npm run benchmark:multi-tab

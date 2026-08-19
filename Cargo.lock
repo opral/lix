@@ -2915,6 +2915,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wasm-bindgen-futures",
  "wasm-encoder 0.248.0",
  "wasmparser 0.247.0",
  "wasmtime",

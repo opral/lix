@@ -143,12 +143,16 @@ try {
 ## Notes
 
 - `openLix()` opens a fresh in-memory Lix. Install `@lix-js/storage-filesystem` and pass `new FilesystemStorage({ path })` for a filesystem repository directory backed by `<path>/.lix/.internal/rocksdb`.
-- In browsers, pass `new IndexedDbStorage({ name })` to persist a complete local Lix across reloads.
-- Only one Lix handle may open an IndexedDB storage name at a time, including across browser tabs.
+- In browsers, install a storage provider such as `@lix-js/storage-opfs` and pass its
+  storage registration to `openLix()`.
+- JavaScript storage packages register a worker-loadable module URL. That module exports
+  `createLixStorageProvider(options)` and returns the SDK's Rust-shaped `LixStorageProvider`:
+  `beginRead`, `beginWrite`, read/scan handles, write mutation methods, `commit`, and `rollback`.
+  The provider module is loaded beside the Lix Wasm engine in its dedicated worker; it does not
+  bundle or select a Lix engine version.
 - Pass `syncAllFiles: false` to start filesystem sync with no regular repository files, then call `storage.importPaths(["notes/today.md"])` on the `FilesystemStorage` instance to sync selected files. Imported paths are exact repository-relative file paths, not directories or globs.
-- In browsers, local mode and remote mode with IndexedDB storage load the Rust
-  engine as WebAssembly. In remote mode, the local engine contains only client
-  state.
+- Browser-local storage loads the Rust engine as WebAssembly. Remote mode does
+  not open a local storage provider.
 - `FilesystemStorage` is Node.js-only. Constructing it is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.

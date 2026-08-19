@@ -1,23 +1,15 @@
 import type { LixBinding } from "./binding-types.js";
 import { Lix } from "./lix.js";
-import { isLixStorage, type LixStorage } from "./storage-adapter.js";
-import type { IndexedDbStorageOptions, OpenLixOptions } from "./types.js";
+import {
+	isJsProviderLixStorage,
+	isLixStorage,
+	type LixStorage,
+} from "./storage-adapter.js";
+import type { OpenLixOptions } from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
 const openStorages = new WeakSet<LixStorage>();
-const openIndexedDbStorageNames = new Set<string>();
-
-export class IndexedDbStorage {
-	readonly name: string;
-
-	constructor(options: IndexedDbStorageOptions) {
-		if (!options || typeof options.name !== "string" || options.name.length === 0) {
-			throw new TypeError("IndexedDbStorage requires a non-empty name");
-		}
-		this.name = options.name;
-	}
-}
 
 export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	if (!options || typeof options !== "object") {
@@ -52,6 +44,9 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			),
 		);
 	}
+	if (isJsProviderLixStorage(options.storage)) {
+		return openJsProviderStorage(options.storage, options.telemetry);
+	}
 	if (isLixStorage(options.storage)) {
 		const storage = options.storage;
 		if (openStorages.has(storage)) {
@@ -81,30 +76,40 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			throw error;
 		}
 	}
-	if (options.storage instanceof IndexedDbStorage) {
-		const storage = options.storage;
-		const databaseName = storage.name;
-		if (openIndexedDbStorageNames.has(databaseName)) {
-			throw new Error("IndexedDbStorage is already open");
-		}
-		openIndexedDbStorageNames.add(databaseName);
-		let binding: LixBinding | undefined;
-		try {
-			binding = await openLixWorkerBinding(
-				{ kind: "indexedDb", name: databaseName },
-				() => openIndexedDbStorageNames.delete(databaseName),
-				options.telemetry,
-			);
-			return new Lix(binding);
-		} catch (error) {
-			openIndexedDbStorageNames.delete(databaseName);
-			await binding?.close().catch(() => undefined);
-			throw error;
-		}
+	throw new TypeError("openLix() requires a Lix storage adapter");
+}
+
+async function openJsProviderStorage(
+	storage: LixStorage & {
+		readonly lixStorage: {
+			readonly version: 2;
+			readonly moduleUrl: string;
+			readonly options: unknown;
+		};
+	},
+	telemetry: OpenLixOptions["telemetry"],
+): Promise<Lix> {
+	const { openLixWorkerBinding } = await import("./worker/client.js");
+	if (openStorages.has(storage)) throw storageAlreadyOpen();
+	openStorages.add(storage);
+	let binding: LixBinding | undefined;
+	try {
+		const opened = await openLixWorkerBinding(
+			{
+				kind: "jsStorage",
+				moduleUrl: storage.lixStorage.moduleUrl,
+				options: storage.lixStorage.options,
+			},
+			() => openStorages.delete(storage),
+			telemetry,
+		);
+		binding = opened;
+		return new Lix(opened);
+	} catch (error) {
+		openStorages.delete(storage);
+		await binding?.close().catch(() => undefined);
+		throw error;
 	}
-	throw new TypeError(
-		"openLix() requires a Lix storage adapter or IndexedDbStorage",
-	);
 }
 
 function storageAlreadyOpen(): Error & { code: string } {

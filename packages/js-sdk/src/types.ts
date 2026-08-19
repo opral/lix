@@ -1,11 +1,3 @@
-export type IndexedDbStorageOptions = {
-	/**
-	 * Identifies one persistent Lix database within the current origin.
-	 * A database name can be opened by only one Lix handle at a time.
-	 */
-	name: string;
-};
-
 export type RemoteLixFetch = (
 	input: RequestInfo | URL,
 	init?: RequestInit,
@@ -33,9 +25,7 @@ export type LixTelemetryOptions = {
 
 export type OpenLixOptions =
 	| {
-			storage?:
-				| import("./storage-adapter.js").LixStorage
-				| import("./open-lix.js").IndexedDbStorage;
+			storage?: import("./storage-adapter.js").LixStorage;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
 	  }

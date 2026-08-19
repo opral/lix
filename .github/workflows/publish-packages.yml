@@ -187,6 +187,7 @@ jobs:
           cache-dependency-path: |
             packages/js-sdk/package-lock.json
             packages/storage-filesystem/package-lock.json
+            packages/storage-opfs/package-lock.json
           registry-url: https://registry.npmjs.org
 
       - name: Install JS SDK dependencies
@@ -197,12 +198,20 @@ jobs:
         working-directory: packages/storage-filesystem
         run: npm ci --legacy-peer-deps
 
+      - name: Install OPFS storage dependencies
+        working-directory: packages/storage-opfs
+        run: npm ci
+
       - name: Build JS SDK package
         working-directory: packages/js-sdk
         run: npm run build
 
       - name: Build filesystem storage package
         working-directory: packages/storage-filesystem
+        run: npm run build
+
+      - name: Build OPFS storage package
+        working-directory: packages/storage-opfs
         run: npm run build
 
       - name: Upload JS SDK package build
@@ -219,6 +228,13 @@ jobs:
         with:
           name: storage-filesystem-package-build
           path: packages/storage-filesystem/dist
+          if-no-files-found: error
+
+      - name: Upload OPFS storage package build
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-opfs-package-build
+          path: packages/storage-opfs/dist
           if-no-files-found: error
 
   test-js-sdk:
@@ -242,6 +258,7 @@ jobs:
           cache-dependency-path: |
             packages/js-sdk/package-lock.json
             packages/storage-filesystem/package-lock.json
+            packages/storage-opfs/package-lock.json
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
@@ -250,6 +267,10 @@ jobs:
       - name: Install filesystem storage dependencies
         working-directory: packages/storage-filesystem
         run: npm ci --legacy-peer-deps
+
+      - name: Install OPFS storage dependencies
+        working-directory: packages/storage-opfs
+        run: npm ci
 
       - name: Download JS SDK package build
         uses: actions/download-artifact@v4
@@ -263,6 +284,12 @@ jobs:
           name: storage-filesystem-package-build
           path: packages/storage-filesystem/dist
 
+      - name: Download OPFS storage package build
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-opfs-package-build
+          path: packages/storage-opfs/dist
+
       - name: Test JS SDK package
         working-directory: packages/js-sdk
         run: |
@@ -274,6 +301,12 @@ jobs:
         run: |
           npm run typecheck
           npm test
+          npm pack --dry-run --ignore-scripts
+
+      - name: Test OPFS storage package
+        working-directory: packages/storage-opfs
+        run: |
+          npm run typecheck
           npm pack --dry-run --ignore-scripts
 
   publish-rust-crates:
@@ -382,6 +415,12 @@ jobs:
           name: storage-filesystem-package-build
           path: packages/storage-filesystem/dist
 
+      - name: Download OPFS storage package build
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-opfs-package-build
+          path: packages/storage-opfs/dist
+
       - name: Publish JS SDK packages
         env:
           EXPECTED_VERSION: ${{ needs.release-version.outputs.version }}
@@ -454,6 +493,7 @@ jobs:
 
           publish_package "$GITHUB_WORKSPACE/packages/js-sdk" "$EXPECTED_VERSION"
           publish_package "$GITHUB_WORKSPACE/packages/storage-filesystem" "$EXPECTED_VERSION"
+          publish_package "$GITHUB_WORKSPACE/packages/storage-opfs" "$EXPECTED_VERSION"
 
   create-github-release:
     name: Create GitHub release

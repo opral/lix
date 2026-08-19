@@ -5,7 +5,9 @@
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(target_family = "wasm")]
-mod indexeddb;
+mod browser_storage;
+#[cfg(target_family = "wasm")]
+mod js_storage;
 #[cfg(not(target_family = "wasm"))]
 mod napi;
 mod telemetry;

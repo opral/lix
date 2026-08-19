@@ -41,7 +41,6 @@ try {
 		throw new Error(`npm pack did not report a tarball: ${packOutput}`);
 	}
 	const tarballPath = join(tempRoot, tarballName);
-
 	await run(
 		"npm",
 		[

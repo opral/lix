@@ -38,7 +38,7 @@ pub use crate::storage::{
     Storage, StorageError, StorageRead, StorageSpace, StoredValue as StorageValue, ValueIntegrity,
     ValueSemantics, WriteOptions as StorageWriteOptions,
 };
-pub(crate) use crate::storage::{PutBatch, PutEntry};
+pub(crate) use crate::storage::{Capability as StorageCapability, PutBatch, PutEntry};
 
 pub use context::StorageAdapter;
 pub(crate) use point::exact_get_many;
