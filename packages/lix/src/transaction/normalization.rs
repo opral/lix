@@ -522,7 +522,7 @@ pub(crate) fn remember_pending_registered_schema(
     Ok(())
 }
 
-fn validate_reserved_builtin_registration(
+pub(crate) fn validate_reserved_builtin_registration(
     key: &SchemaKey,
     schema: &JsonValue,
 ) -> Result<(), LixError> {

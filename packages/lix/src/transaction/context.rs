@@ -6625,6 +6625,10 @@ where
                     &hot_state,
                 )
                 .with_staged_commit_ids(staged_commit_ids.clone());
+                if self.active_account_id == crate::SYSTEM_ACCOUNT_ID {
+                    validation_input =
+                        validation_input.with_reserved_builtin_registration();
+                }
                 if self.trust_filesystem_planner {
                     validation_input = validation_input.with_trusted_filesystem_planner();
                 }

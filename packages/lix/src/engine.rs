@@ -1053,6 +1053,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_session_can_reassert_an_exact_built_in_schema() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_session_at_with_account(GLOBAL_BRANCH_ID, crate::SYSTEM_ACCOUNT_ID)
+            .await
+            .expect("global system session should open");
+        let schema = crate::schema::seed_schema_definition("lix_permission_grant")
+            .expect("permission grant builtin");
+
+        session
+            .execute(
+                "UPDATE lix_registered_schema \
+                 SET value = CAST($1 AS JSONB) \
+                 WHERE schema_key = 'lix_permission_grant'",
+                &[crate::Value::Text(
+                    serde_json::to_string(schema).expect("encode schema"),
+                )],
+            )
+            .await
+            .expect("system should be allowed to reassert an exact built-in schema");
+    }
+
+    #[tokio::test]
     async fn tracked_row_fast_path_serves_broad_sql_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())

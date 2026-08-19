@@ -38,7 +38,9 @@ use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definiti
 use crate::schema::{
     format_lix_schema_validation_errors, schema_from_registered_snapshot, validate_schema_amendment,
 };
-use crate::transaction::normalization::reject_reserved_schema_namespace;
+use crate::transaction::normalization::{
+    reject_reserved_schema_namespace, validate_reserved_builtin_registration,
+};
 use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{
     PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
@@ -67,6 +69,7 @@ pub(crate) struct TransactionValidationInput<'a> {
     hot_state: &'a dyn HotStateReader,
     staged_commit_ids: BTreeSet<CommitId>,
     trust_filesystem_planner: bool,
+    allow_reserved_builtin_registration: bool,
 }
 
 impl<'a> TransactionValidationInput<'a> {
@@ -81,6 +84,7 @@ impl<'a> TransactionValidationInput<'a> {
             hot_state,
             staged_commit_ids: BTreeSet::new(),
             trust_filesystem_planner: false,
+            allow_reserved_builtin_registration: false,
         }
     }
 
@@ -94,6 +98,11 @@ impl<'a> TransactionValidationInput<'a> {
     /// validation because their planner snapshot can become stale.
     pub(crate) fn with_trusted_filesystem_planner(mut self) -> Self {
         self.trust_filesystem_planner = true;
+        self
+    }
+
+    pub(crate) fn with_reserved_builtin_registration(mut self) -> Self {
+        self.allow_reserved_builtin_registration = true;
         self
     }
 
@@ -858,8 +867,12 @@ async fn validate_registered_schema_identity_is_canonical(
         let pending_snapshot = pending_row
             .snapshot_json()
             .expect("pending registered schema row has snapshot_content");
-        let (key, _) = schema_from_registered_snapshot(pending_snapshot)?;
-        reject_reserved_schema_namespace(&key)?;
+        let (key, schema) = schema_from_registered_snapshot(pending_snapshot)?;
+        if input.allow_reserved_builtin_registration {
+            validate_reserved_builtin_registration(&key, &schema)?;
+        } else {
+            reject_reserved_schema_namespace(&key)?;
+        }
 
         let committed_rows = load_committed_constraint_rows(
             input.hot_state,
