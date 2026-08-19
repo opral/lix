@@ -65,22 +65,18 @@ A runnable Rust version lives at
 
 ## SQL surfaces
 
-Checkpointing has eight read-only SQL surfaces:
+Checkpointing has five read-only SQL surfaces:
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
 | `lix_working_diff` | Active branch | `diff_id`, `row_pk`, `schema_key`, `file_id`, `diff_type`, `before_change_id`, `after_change_id` |
-| `lix_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_file_working_diff` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
-| `lix_file_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_directory_working_diff` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
-| `lix_directory_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_checkpoint` | Repository-global | `id`, `commit_id`, plus the standard `lixcol_*` row columns |
 | `lix_checkpoint_history()` | Revisions reachable from a commit | `id`, `commit_id`, plus the standard history `lixcol_*` columns including `lixcol_depth` |
 
-Use the unqualified surfaces for the common active-branch workflow. Use their
-`_by_branch` counterparts to inspect multiple branches in one query;
-`lixcol_branch_id` identifies the branch represented by each row.
+Working-diff relations are scoped to the current session. Open another session
+on another branch to inspect that branch without switching the primary session.
 
 `diff_type` is `added`, `modified`, or `removed`. Working diffs compare the
 current branch head with that branch's newest checkpoint. Creating a checkpoint

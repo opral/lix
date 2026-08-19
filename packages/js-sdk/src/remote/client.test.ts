@@ -41,6 +41,81 @@ test("Lix Server Protocol handshake requests a restored initial active branch", 
 	await binding.close();
 });
 
+test("openAnotherSession creates an independent remote protocol session", async () => {
+	const accountId = "01920000-0000-7000-8000-000000000601";
+	const handshakes: Request[] = [];
+	let nextSession = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "DELETE")
+					return new Response(null, { status: 204 });
+				handshakes.push(request);
+				return Response.json({
+					protocolVersion: 2,
+					activeBranchId:
+						new URL(request.url).searchParams.get("activeBranchId") ??
+						"main-id",
+					activeAccountId: accountId,
+					sessionId: `session-${++nextSession}`,
+				});
+			},
+		},
+	});
+
+	const inherited = await lix.openAnotherSession();
+	const draft = await lix.openAnotherSession({ branchId: "draft-id" });
+	expect(await inherited.activeBranchId()).toBe("main-id");
+	expect(await draft.activeBranchId()).toBe("draft-id");
+	expect(
+		handshakes.map((request) =>
+			new URL(request.url).searchParams.get("activeBranchId"),
+		),
+	).toEqual([null, "main-id", "draft-id"]);
+	await expect(
+		lix.openAnotherSession({ accountId: "another-account" }),
+	).rejects.toMatchObject({ code: "LIX_INVALID_PARAM" });
+
+	await lix.close();
+	expect(await draft.activeBranchId()).toBe("draft-id");
+	await Promise.all([inherited.close(), draft.close()]);
+});
+
+test("openAnotherSession rejects and closes a remote identity mismatch", async () => {
+	const requests: Request[] = [];
+	let handshake = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request);
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				handshake += 1;
+				return Response.json({
+					protocolVersion: 2,
+					activeBranchId: "main-id",
+					activeAccountId: handshake === 1 ? "account-a" : "account-b",
+					sessionId: `session-${handshake}`,
+				});
+			},
+		},
+	});
+
+	await expect(lix.openAnotherSession()).rejects.toMatchObject({
+		code: "LIX_INVALID_PARAM",
+	});
+	expect(requests[2]?.method).toBe("DELETE");
+	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-2");
+	await lix.close();
+});
+
 async function requestJson(request: Request): Promise<unknown> {
 	const bytes = new Uint8Array(await request.arrayBuffer());
 	const decoded =

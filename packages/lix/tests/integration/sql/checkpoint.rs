@@ -256,15 +256,25 @@ simulation_test!(
              VALUES ('01930000-0000-7000-8000-000000000001', 'fake')",
             "UPDATE lix_checkpoint SET commit_id = 'fake'",
             "DELETE FROM lix_working_diff",
-            "UPDATE lix_working_diff_by_branch SET diff_type = 'fake'",
             "DELETE FROM lix_file_working_diff",
-            "UPDATE lix_directory_working_diff_by_branch SET change_kind = 'fake'",
+            "UPDATE lix_directory_working_diff SET change_kind = 'fake'",
         ] {
             let error = session
                 .execute(sql, &[])
                 .await
                 .expect_err("checkpoint SQL surface should be read-only");
             assert_eq!(error.code, LixError::CODE_READ_ONLY);
+        }
+
+        for sql in [
+            "SELECT * FROM lix_working_diff_by_branch",
+            "SELECT * FROM lix_directory_working_diff_by_branch",
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("retired by-branch surfaces must fail closed");
+            assert_eq!(error.code, LixError::CODE_TABLE_NOT_FOUND);
         }
     }
 );

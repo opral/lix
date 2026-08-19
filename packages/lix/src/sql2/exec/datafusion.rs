@@ -2012,7 +2012,7 @@ fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Resu
 
     if !matches!(
         plan.bound.target,
-        BoundWriteTarget::File(FileWriteSurface::Base | FileWriteSurface::ByBranch)
+        BoundWriteTarget::File(FileWriteSurface::Base)
     ) {
         return Ok(());
     }
@@ -2307,13 +2307,10 @@ fn datafusion_write_filters(
     let mut filters =
         datafusion_filters_from_predicate(session, schema, &plan.bound.predicate, params)?;
     if plan.bound.branch_scope == BranchScope::Global {
-        let branch_column = if schema.field_with_name("branch_id").is_ok() {
-            Some("branch_id")
-        } else if schema.field_with_name("lixcol_branch_id").is_ok() {
-            Some("lixcol_branch_id")
-        } else {
-            None
-        };
+        let branch_column = schema
+            .field_with_name("branch_id")
+            .is_ok()
+            .then_some("branch_id");
         let Some(branch_column) = branch_column else {
             let df_schema =
                 DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?;
@@ -2641,19 +2638,8 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         {
             Ok(schema_key.clone())
         }
-        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::ByBranch {
-            schema_key,
-        }) if bound_predicate_contains_like(&plan.bound.predicate)
-            || bound_update_contains_binary(plan) =>
-        {
-            Ok(format!("{schema_key}_by_branch"))
-        }
         BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file".to_string()),
-        BoundWriteTarget::File(FileWriteSurface::ByBranch) => Ok("lix_file_by_branch".to_string()),
         BoundWriteTarget::Directory(DirectoryWriteSurface::Base) => Ok("lix_directory".to_string()),
-        BoundWriteTarget::Directory(DirectoryWriteSurface::ByBranch) => {
-            Ok("lix_directory_by_branch".to_string())
-        }
         BoundWriteTarget::Branch => Ok("lix_branch".to_string()),
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert) => {
             Ok("lix_revert".to_string())
@@ -4181,9 +4167,7 @@ mod tests {
                 "lix_branch",
                 "lix_create_checkpoint",
                 "lix_directory",
-                "lix_directory_by_branch",
                 "lix_file",
-                "lix_file_by_branch",
                 "lix_revert",
             ]
         );
@@ -6700,102 +6684,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_row_by_branch_stages_write() {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let hot_state = Arc::new(DummyHotStateReader);
-        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader,
-            hot_state,
-            staged_writes: Arc::clone(&staged_writes),
-            schema_definitions: vec![json!({
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": "test_state_schema",
-                "columns": [
-                    { "name": "id", "type": "text", "nullable": false },
-                    { "name": "value", "type": "text", "nullable": false },
-                ],
-                "primary_key": ["id"],
-            })],
-        };
-
-        let result = execute_write_sql(
-            &mut ctx,
-            "INSERT INTO test_state_schema_by_branch (\
-	     lixcol_row_pk, lixcol_branch_id, id, value\
-	     ) VALUES (CAST('[\"row-c\"]' AS JSONB), '01920000-0000-7000-8000-0000000000b1', 'row-c', 'C')",
-            &[],
-        )
-        .await
-        .expect("INSERT INTO row by-branch surface should stage write");
-
-        assert_eq!(result.columns, vec!["count"]);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        assert_eq!(staged_writes.deltas.len(), 1);
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_semantic_rows(false, "test_state_schema");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-        assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
-        assert_eq!(
-            rows[0].snapshot_content.as_deref(),
-            Some("{\"id\":\"row-c\",\"value\":\"C\"}")
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_sql_insert_into_row_by_branch_accepts_parameterized_branch_id() {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let hot_state = Arc::new(DummyHotStateReader);
-        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader,
-            hot_state,
-            staged_writes: Arc::clone(&staged_writes),
-            schema_definitions: vec![json!({
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": "test_state_schema",
-                "columns": [
-                    { "name": "id", "type": "text", "nullable": false },
-                    { "name": "value", "type": "text", "nullable": false },
-                ],
-                "primary_key": ["id"],
-            })],
-        };
-
-        let result = execute_write_sql(
-            &mut ctx,
-            "INSERT INTO test_state_schema_by_branch (\
-             lixcol_row_pk, lixcol_branch_id, id, value\
-             ) VALUES (CAST('[\"row-c\"]' AS JSONB), $1, 'row-c', 'C')",
-            &[Value::Text(
-                "01920000-0000-7000-8000-0000000000b1".to_string(),
-            )],
-        )
-        .await
-        .expect("parameterized by-branch row insert should stage write");
-
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_semantic_rows(false, "test_state_schema");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-    }
-
-    #[tokio::test]
     async fn execute_sql_insert_into_active_row_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
@@ -7008,7 +6896,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
+            active_branch_id: "01920000-0000-7000-8000-0000000000b1",
             blob_reader,
             hot_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -7025,10 +6913,9 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO test_state_schema_by_branch \
-             (id, value, lixcol_branch_id, lixcol_untracked) \
-             VALUES ('target', 'new', '01920000-0000-7000-8000-0000000000b1', true) \
-             ON CONFLICT(id, lixcol_branch_id) DO UPDATE SET value = excluded.value",
+            "INSERT INTO test_state_schema \
+             (id, value, lixcol_untracked) VALUES ('target', 'new', true) \
+             ON CONFLICT(id) DO UPDATE SET value = excluded.value",
             &[],
             WriteExecutorMode::Auto,
         )
@@ -7293,54 +7180,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_directory_by_branch_stages_write() {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let hot_state = Arc::new(DummyHotStateReader);
-        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader,
-            hot_state,
-            staged_writes: Arc::clone(&staged_writes),
-            schema_definitions: vec![],
-        };
-
-        let result = execute_write_sql(
-            &mut ctx,
-            "INSERT INTO lix_directory_by_branch (\
-             id, parent_id, name, lixcol_branch_id\
-             ) VALUES ('01920000-0000-7000-8000-0000000000d3', NULL, 'docs', '01920000-0000-7000-8000-0000000000b1')",
-            &[],
-        )
-        .await
-        .expect("INSERT INTO lix_directory_by_branch should stage write");
-
-        assert_eq!(result.columns, vec!["count"]);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        assert_eq!(staged_writes.deltas.len(), 1);
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-0000000000d3\"]"
-        );
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-        assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
-        assert_eq!(
-            rows[0].snapshot_content.as_deref(),
-            Some(
-                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"docs\",\"parent_id\":null}"
-            )
-        );
-    }
-
-    #[tokio::test]
     async fn execute_sql_insert_into_active_directory_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
@@ -7498,113 +7337,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_directory_by_branch_stages_tombstone() {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let hot_state = Arc::new(RowsHotStateReader {
-            rows: vec![
-                live_directory_row(
-                    "01920000-0000-7000-8000-0000000000d3",
-                    "01920000-0000-7000-8000-0000000000a1",
-                    None,
-                    "docs",
-                ),
-                live_directory_row(
-                    "01920000-0000-7000-8000-000000000313",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    Some("01920000-0000-7000-8000-0000000000d3"),
-                    "guides",
-                ),
-            ],
-        });
-        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader,
-            hot_state,
-            staged_writes: Arc::clone(&staged_writes),
-            schema_definitions: vec![],
-        };
-
-        let result = execute_write_sql(
-            &mut ctx,
-            "DELETE FROM lix_directory_by_branch \
-             WHERE id = '01920000-0000-7000-8000-000000000313' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000b1'",
-            &[],
-        )
-        .await
-        .expect("DELETE lix_directory_by_branch should stage tombstone");
-
-        assert_eq!(result.columns, vec!["count"]);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        assert_eq!(staged_writes.deltas.len(), 1);
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_all_semantic_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-000000000313\"]"
-        );
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-        assert!(rows[0].tombstone);
-        assert_eq!(rows[0].snapshot_content, None);
-    }
-
-    #[tokio::test]
-    async fn execute_sql_insert_into_file_by_branch_stages_descriptor_write() {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let hot_state = Arc::new(DummyHotStateReader);
-        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader,
-            hot_state,
-            staged_writes: Arc::clone(&staged_writes),
-            schema_definitions: vec![],
-        };
-
-        let result = execute_write_sql(
-            &mut ctx,
-            "INSERT INTO lix_file_by_branch (\
-             id, directory_id, name, lixcol_branch_id\
-             ) VALUES ('01920000-0000-7000-8000-0000000000d2', '01920000-0000-7000-8000-0000000000d3', 'readme.md', '01920000-0000-7000-8000-0000000000b1')",
-            &[],
-        )
-        .await
-        .expect("INSERT INTO lix_file_by_branch should stage descriptor write");
-
-        assert_eq!(result.columns, vec!["count"]);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        assert_eq!(staged_writes.deltas.len(), 1);
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-0000000000d2\"]"
-        );
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-        assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
-        let snapshot: JsonValue =
-            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
-                .expect("descriptor snapshot JSON");
-        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
-        assert_eq!(
-            snapshot["directory_id"],
-            "01920000-0000-7000-8000-0000000000d3"
-        );
-        assert_eq!(snapshot["name"], "readme.md");
-    }
-
-    #[tokio::test]
     async fn execute_sql_insert_into_active_file_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(DummyHotStateReader);
@@ -7651,7 +7383,7 @@ mod tests {
         let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
-                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000a1",
                 None,
                 "docs",
             )],
@@ -7667,13 +7399,13 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_file_by_branch (\
-             id, directory_id, name, content, lixcol_branch_id\
-             ) VALUES ('01920000-0000-7000-8000-0000000000d2', '01920000-0000-7000-8000-0000000000d3', 'readme.md', CAST('AB' AS BYTEA), '01920000-0000-7000-8000-0000000000b1')",
+            "INSERT INTO lix_file (\
+             id, directory_id, name, content\
+             ) VALUES ('01920000-0000-7000-8000-0000000000d2', '01920000-0000-7000-8000-0000000000d3', 'readme.md', CAST('AB' AS BYTEA))",
             &[],
         )
         .await
-        .expect("INSERT INTO lix_file_by_branch should stage descriptor and content writes");
+        .expect("INSERT INTO lix_file should stage descriptor and content writes");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -7701,7 +7433,7 @@ mod tests {
         );
         assert_eq!(
             blob_ref_rows[0].branch_id,
-            "01920000-0000-7000-8000-0000000000b1"
+            "01920000-0000-7000-8000-0000000000a1"
         );
         let snapshot: JsonValue =
             serde_json::from_str(blob_ref_rows[0].snapshot_content.as_deref().unwrap())
@@ -8956,7 +8688,6 @@ mod tests {
             "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE path = '/readme.md'",
             "UPDATE lix_file SET content = CAST('A' AS BYTEA), name = 'renamed.md' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             "UPDATE lix_file SET content = content WHERE id = '01920000-0000-7000-8000-0000000000d2'",
-            "UPDATE lix_file_by_branch SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
         ] {
             let plan = create_write_logical_plan(&mut ctx, sql)
                 .await
@@ -9090,74 +8821,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_file_by_branch_stages_descriptor_tombstone() {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let hot_state = Arc::new(RowsHotStateReader {
-            rows: vec![
-                live_directory_row(
-                    "01920000-0000-7000-8000-0000000000d3",
-                    "01920000-0000-7000-8000-0000000000a1",
-                    None,
-                    "docs",
-                ),
-                live_directory_row(
-                    "01920000-0000-7000-8000-0000000000d3",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    None,
-                    "docs",
-                ),
-                live_file_row(
-                    "01920000-0000-7000-8000-0000000000d2",
-                    "01920000-0000-7000-8000-0000000000a1",
-                    Some("01920000-0000-7000-8000-0000000000d3"),
-                    "readme.md",
-                ),
-                live_file_row(
-                    "01920000-0000-7000-8000-000000000332",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    Some("01920000-0000-7000-8000-0000000000d3"),
-                    "guide.md",
-                ),
-            ],
-        });
-        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader,
-            hot_state,
-            staged_writes: Arc::clone(&staged_writes),
-            schema_definitions: vec![],
-        };
-
-        let result = execute_write_sql(
-            &mut ctx,
-            "DELETE FROM lix_file_by_branch \
-             WHERE id = '01920000-0000-7000-8000-000000000332' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000b1'",
-            &[],
-        )
-        .await
-        .expect("DELETE lix_file_by_branch should stage descriptor tombstone");
-
-        assert_eq!(result.columns, vec!["count"]);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        assert_eq!(staged_writes.deltas.len(), 1);
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_all_semantic_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].row_pk,
-            "[\"01920000-0000-7000-8000-000000000332\"]"
-        );
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-        assert!(rows[0].tombstone);
-        assert_eq!(rows[0].snapshot_content, None);
-    }
-
-    #[tokio::test]
     async fn execute_sql_update_schema_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let hot_state = Arc::new(RowsHotStateReader {
@@ -9213,104 +8876,6 @@ mod tests {
             rows[0].metadata.as_deref(),
             Some("{\"source\":\"row-update\"}")
         );
-    }
-
-    #[tokio::test]
-    async fn execute_sql_delete_row_by_branch_stages_tombstone() {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let hot_state = Arc::new(RowsHotStateReader {
-            rows: vec![
-                live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-                live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "B"),
-            ],
-        });
-        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader,
-            hot_state,
-            staged_writes: Arc::clone(&staged_writes),
-            schema_definitions: vec![json!({
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": "test_state_schema",
-                "columns": [
-                    { "name": "id", "type": "text", "nullable": false },
-                    { "name": "value", "type": "text", "nullable": false },
-                ],
-                "primary_key": ["id"],
-            })],
-        };
-
-        let result = execute_write_sql(
-            &mut ctx,
-            "DELETE FROM test_state_schema_by_branch \
-             WHERE lixcol_branch_id = $1",
-            &[Value::Text(
-                "01920000-0000-7000-8000-0000000000b1".to_string(),
-            )],
-        )
-        .await
-        .expect("parameterized DELETE row by-branch surface should stage tombstone");
-
-        assert_eq!(result.columns, vec!["count"]);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        assert_eq!(staged_writes.deltas.len(), 1);
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_all_semantic_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].row_pk, "[\"row-b\"]");
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-        assert!(rows[0].tombstone);
-        assert_eq!(rows[0].snapshot_content, None);
-    }
-
-    #[tokio::test]
-    async fn execute_sql_delete_row_by_branch_like_uses_datafusion_and_stages_tombstone() {
-        let (mut ctx, staged_writes, scans) = counting_write_context(vec![
-            live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-            live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "Before"),
-            live_row("row-c", "01920000-0000-7000-8000-0000000000b1", "After"),
-        ]);
-        ctx.schema_definitions = vec![json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-                "key": "test_state_schema",
-                "columns": [
-                    { "name": "id", "type": "text", "nullable": false },
-                    { "name": "value", "type": "text", "nullable": false },
-                ],
-                "primary_key": ["id"],
-        })];
-
-        let (result, path) = execute_write_sql_trace(
-            &mut ctx,
-            "DELETE FROM test_state_schema_by_branch \
-             WHERE lixcol_branch_id = $1 AND value LIKE $2",
-            &[
-                Value::Text("01920000-0000-7000-8000-0000000000b1".to_string()),
-                Value::Text("Before%".to_string()),
-            ],
-            WriteExecutorMode::Auto,
-        )
-        .await
-        .expect("DELETE LIKE on a schema surface should stage a tombstone");
-
-        assert_eq!(path, WriteExecutorPath::DataFusion);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-        assert_eq!(scans.load(Ordering::SeqCst), 1);
-
-        let staged_writes = staged_writes.lock().expect("staged writes lock");
-        let overlay = staged_writes.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_all_semantic_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].row_pk, "[\"row-b\"]");
-        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
-        assert!(rows[0].tombstone);
     }
 
     #[tokio::test]
@@ -9498,57 +9063,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_reads_row_by_branch_view() {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
-
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT value, lixcol_branch_id \
-                     FROM test_state_schema_by_branch \
-                     WHERE lixcol_branch_id = '01920000-0000-7000-8000-0000000000b1'",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read row by-branch view");
-
-                assert_eq!(result.columns, vec!["value", "lixcol_branch_id"]);
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Text("B".to_string()));
-                assert_eq!(
-                    result.rows[0][1],
-                    Value::Text("01920000-0000-7000-8000-0000000000b1".to_string())
-                );
-    }
-
-    #[tokio::test]
-    async fn execute_sql_reads_lix_directory_by_branch_view() {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
-
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT path, name, lixcol_branch_id \
-                     FROM lix_directory_by_branch \
-                     WHERE id = '01920000-0000-7000-8000-0000000000d3' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read lix_directory_by_branch");
-
-                assert_eq!(result.columns, vec!["path", "name", "lixcol_branch_id"]);
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
-                assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
-                assert_eq!(
-                    result.rows[0][2],
-                    Value::Text("01920000-0000-7000-8000-0000000000a1".to_string())
-                );
-    }
-
-    #[tokio::test]
     async fn execute_sql_reads_lix_directory_from_active_branch() {
                 let ctx = setup_sql2_state_fixture()
                     .await
@@ -9568,39 +9082,6 @@ mod tests {
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
-    }
-
-    #[tokio::test]
-    async fn execute_sql_reads_lix_file_by_branch_view() {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
-
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT path, name, content, lixcol_branch_id \
-                     FROM lix_file_by_branch \
-                     WHERE id = '01920000-0000-7000-8000-0000000000a2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read lix_file_by_branch");
-
-                assert_eq!(
-                    result.columns,
-                    vec!["path", "name", "content", "lixcol_branch_id"]
-                );
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(
-                    result.rows[0][0],
-                    Value::Text("/docs/readme.md".to_string())
-                );
-                assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
-                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42].into()));
-                assert_eq!(
-                    result.rows[0][3],
-                    Value::Text("01920000-0000-7000-8000-0000000000a1".to_string())
-                );
     }
 
     #[tokio::test]

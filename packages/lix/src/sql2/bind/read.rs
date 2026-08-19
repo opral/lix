@@ -28,10 +28,9 @@ pub(crate) fn bind_statement_route(
 }
 
 pub(crate) fn bind_read_statement(
-    sql: &str,
+    _sql: &str,
     statement: &DataFusionStatement,
 ) -> Result<(), LixError> {
-    validate_public_read_sql_surface(sql)?;
     if super::classify::classify_datafusion_statement(statement)
         == super::classify::SqlStatementKind::Write
     {
@@ -42,18 +41,5 @@ pub(crate) fn bind_read_statement(
     }
     super::classify::validate_supported_datafusion_statement_ast(statement)?;
     super::public_udf::validate_public_udf_calls_in_datafusion_statement(statement)?;
-    Ok(())
-}
-
-fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
-    let normalized = sql.to_ascii_lowercase();
-    if normalized.contains("lixcol_branch_id")
-        && (normalized.contains("= lower(") || normalized.contains(" in (lower("))
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "public column 'lixcol_branch_id' must be compared directly to a literal or parameter",
-        ));
-    }
     Ok(())
 }

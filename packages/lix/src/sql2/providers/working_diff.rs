@@ -30,7 +30,7 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 pub(super) async fn register_working_diff_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    active_branch_id: Option<String>,
+    active_branch_id: String,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlChangelogQuerySource<S>,
@@ -42,7 +42,6 @@ where
         session,
         surface_name,
         Arc::new(WorkingDiffSpec {
-            by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
             commit_graph: Arc::new(Mutex::new(commit_graph)),
@@ -53,8 +52,7 @@ where
 }
 
 struct WorkingDiffSpec<S> {
-    by_branch: bool,
-    active_branch_id: Option<String>,
+    active_branch_id: String,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     store: S,
@@ -66,15 +64,11 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn table_name(&self) -> &str {
-        if self.by_branch {
-            "lix_working_diff_by_branch"
-        } else {
-            "lix_working_diff"
-        }
+        "lix_working_diff"
     }
 
     fn schema(&self) -> SchemaRef {
-        working_diff_schema(self.by_branch)
+        working_diff_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -85,7 +79,7 @@ where
         if filter.column_refs().iter().any(|column| {
             matches!(
                 column.name.as_str(),
-                "row_pk" | "schema_key" | "file_id" | "lixcol_branch_id"
+                "row_pk" | "schema_key" | "file_id"
             )
         }) {
             TableProviderFilterPushDown::Inexact
@@ -124,8 +118,8 @@ where
                     }
                     let heads = selected_heads(
                         branch_ref.as_ref(),
-                        active_branch_id.as_deref(),
-                        &route.branch_ids,
+                        Some(active_branch_id.as_str()),
+                        &FileIdConstraint::All,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -200,7 +194,6 @@ where
                                 },
                                 before_change_id: entry.before.map(|row| row.change_id.to_string()),
                                 after_change_id: entry.after.map(|row| row.change_id.to_string()),
-                                branch_id: head.branch_id.clone(),
                             });
                             if limit.is_some_and(|limit| rows.len() >= limit) {
                                 break;
@@ -218,7 +211,6 @@ where
 
 #[derive(Clone, Debug)]
 struct WorkingDiffRoute {
-    branch_ids: FileIdConstraint,
     diff_request: TrackedStateDiffRequest,
     contradictory: bool,
 }
@@ -226,8 +218,6 @@ struct WorkingDiffRoute {
 impl WorkingDiffRoute {
     fn from_filters(filters: &[Expr]) -> Result<Self> {
         let conjuncts = filter_conjuncts(filters);
-        let branch_ids =
-            exact_string_column_constraint_from_filters(&conjuncts, "lixcol_branch_id")?;
         let schema_keys = string_constraint_values(exact_string_column_constraint_from_filters(
             &conjuncts,
             "schema_key",
@@ -239,8 +229,7 @@ impl WorkingDiffRoute {
             &conjuncts, "file_id",
         )?);
 
-        let mut contradictory = matches!(branch_ids, FileIdConstraint::None)
-            || schema_keys.as_ref().is_some_and(Vec::is_empty)
+        let mut contradictory = schema_keys.as_ref().is_some_and(Vec::is_empty)
             || row_pk_values.as_ref().is_some_and(Vec::is_empty)
             || file_ids.as_ref().is_some_and(Vec::is_empty);
         let row_pk_filter_is_explicit = row_pk_values.is_some();
@@ -252,7 +241,6 @@ impl WorkingDiffRoute {
         contradictory |= row_pk_filter_is_explicit && row_pks.is_empty();
 
         Ok(Self {
-            branch_ids,
             diff_request: TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
                     schema_keys: schema_keys.unwrap_or_default(),
@@ -281,8 +269,8 @@ fn string_constraint_values(constraint: FileIdConstraint) -> Option<Vec<String>>
     }
 }
 
-pub(super) fn working_diff_schema(by_branch: bool) -> SchemaRef {
-    let mut fields = vec![
+pub(super) fn working_diff_schema() -> SchemaRef {
+    let fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
         json_field("row_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
@@ -291,9 +279,6 @@ pub(super) fn working_diff_schema(by_branch: bool) -> SchemaRef {
         Field::new("before_change_id", DataType::Utf8, true),
         Field::new("after_change_id", DataType::Utf8, true),
     ];
-    if by_branch {
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    }
     Arc::new(Schema::new(fields))
 }
 
@@ -305,7 +290,6 @@ struct WorkingDiffSqlRow {
     diff_type: &'static str,
     before_change_id: Option<String>,
     after_change_id: Option<String>,
-    branch_id: String,
 }
 
 static WORKING_DIFF_COLS: ColumnTable<WorkingDiffSqlRow> = ColumnTable {
@@ -329,7 +313,6 @@ static WORKING_DIFF_COLS: ColumnTable<WorkingDiffSqlRow> = ColumnTable {
             "after_change_id",
             Col::Utf8(|row| row.after_change_id.as_deref()),
         ),
-        ("lixcol_branch_id", Col::Utf8(|row| Some(&row.branch_id))),
     ],
 };
 
@@ -351,22 +334,17 @@ mod tests {
 
     use crate::NullableKeyFilter;
 
-    use super::{FileIdConstraint, WorkingDiffRoute};
+    use super::WorkingDiffRoute;
 
     #[test]
-    fn routes_exact_branch_and_tracked_identity_filters() {
+    fn routes_exact_tracked_identity_filters() {
         let route = WorkingDiffRoute::from_filters(&[
-            col("lixcol_branch_id").eq(lit("01920000-0000-7000-8000-0000000000a1")),
             col("schema_key").eq(lit("acme_task")),
             col("row_pk").eq(lit("[\"task-a\"]")),
             col("file_id").eq(lit("01920000-0000-7000-8000-0000000000a2")),
         ])
         .expect("exact working-diff filters should route");
 
-        assert_eq!(
-            route.branch_ids,
-            FileIdConstraint::Ids(["01920000-0000-7000-8000-0000000000a1".to_string()].into())
-        );
         assert_eq!(
             route.diff_request.filter.schema_keys,
             vec!["acme_task".to_string()]

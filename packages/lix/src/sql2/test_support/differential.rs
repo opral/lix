@@ -2,15 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::serialize_row_metadata;
-    use crate::row_pk::RowPk;
-    use crate::hot_state::{
-        HotStateFilter, HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateRowRef,
-    };
     use crate::session::CreateBranchOptions;
     use crate::sql2::test_support::generators::{
-        ACTIVE_BRANCH_PROBE_ID, DifferentialExpectation, DifferentialParam, DifferentialProbe,
-        DifferentialSqlCase, ExpectedExecution, deterministic_repro_cases, generated_dml_cases,
+        DifferentialExpectation, DifferentialParam, DifferentialProbe, DifferentialSqlCase,
+        ExpectedExecution, deterministic_repro_cases, generated_dml_cases,
     };
     use crate::sql2::{WriteExecutorMode, WriteExecutorPath};
     use crate::storage_adapter::Memory;
@@ -48,7 +43,6 @@ mod tests {
         name: String,
         sql: String,
         params: Vec<Value>,
-        branch_column_indexes: &'static [usize],
     }
 
     #[tokio::test]
@@ -357,11 +351,11 @@ mod tests {
     async fn probe_session_state(
         session: &crate::session::SessionContext,
         probes: &[DifferentialProbe],
-        active_branch_id: &str,
+        _active_branch_id: &str,
     ) -> Vec<ProbeSnapshot> {
         let mut snapshots = Vec::with_capacity(probes.len());
         for probe in probes {
-            let query = probe_query(probe, active_branch_id);
+            let query = probe_query(probe);
             snapshots.push(ProbeSnapshot {
                 name: query.name,
                 rows: session
@@ -375,13 +369,7 @@ mod tests {
                     })
                     .rows()
                     .iter()
-                    .map(|row| {
-                        canonical_probe_values(
-                            row.values(),
-                            active_branch_id,
-                            query.branch_column_indexes,
-                        )
-                    })
+                    .map(|row| row.values().to_vec())
                     .collect(),
             });
         }
@@ -391,17 +379,11 @@ mod tests {
     async fn probe_transaction_state(
         transaction: &mut crate::session::SessionTransaction,
         probes: &[DifferentialProbe],
-        active_branch_id: &str,
+        _active_branch_id: &str,
     ) -> Vec<ProbeSnapshot> {
         let mut snapshots = Vec::with_capacity(probes.len());
         for probe in probes {
-            if let Some(snapshot) =
-                synthetic_staged_by_branch_probe(transaction, probe, active_branch_id).await
-            {
-                snapshots.push(snapshot);
-                continue;
-            }
-            let query = probe_query(probe, active_branch_id);
+            let query = probe_query(probe);
             snapshots.push(ProbeSnapshot {
                 name: query.name,
                 rows: transaction
@@ -415,20 +397,14 @@ mod tests {
                     })
                     .rows()
                     .iter()
-                    .map(|row| {
-                        canonical_probe_values(
-                            row.values(),
-                            active_branch_id,
-                            query.branch_column_indexes,
-                        )
-                    })
+                    .map(|row| row.values().to_vec())
                     .collect(),
             });
         }
         snapshots
     }
 
-    fn probe_query(probe: &DifferentialProbe, active_branch_id: &str) -> ProbeQuery {
+    fn probe_query(probe: &DifferentialProbe) -> ProbeQuery {
         match probe {
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
                 name: "lix_registered_schema".to_string(),
@@ -437,34 +413,7 @@ mod tests {
                  ORDER BY lixcol_row_pk"
                     .to_string(),
                 params: Vec::new(),
-                branch_column_indexes: &[],
             },
-            DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
-                let mut params = Vec::with_capacity(branch_ids.len());
-                let placeholders = branch_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(index, branch_id)| {
-                        params.push(Value::Text(resolve_probe_branch_id(
-                            branch_id,
-                            active_branch_id,
-                        )));
-                        format!("${}", index + 1)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ProbeQuery {
-                    name: format!("lix_registered_schema_by_branch:{branch_ids:?}"),
-                    sql: format!(
-                        "SELECT lixcol_row_pk, value, lixcol_branch_id, lixcol_metadata, lixcol_global, lixcol_untracked \
-                         FROM lix_registered_schema_by_branch \
-                         WHERE lixcol_branch_id IN ({placeholders}) \
-                         ORDER BY lixcol_row_pk, lixcol_branch_id"
-                    ),
-                    params,
-                    branch_column_indexes: &[2],
-                }
-            }
             DifferentialProbe::LixFileActive { paths } => {
                 let mut params = Vec::with_capacity(paths.len());
                 let placeholders = paths
@@ -485,144 +434,9 @@ mod tests {
                          ORDER BY path"
                     ),
                     params,
-                    branch_column_indexes: &[],
                 }
             }
         }
     }
 
-    async fn synthetic_staged_by_branch_probe(
-        transaction: &mut crate::session::SessionTransaction,
-        probe: &DifferentialProbe,
-        active_branch_id: &str,
-    ) -> Option<ProbeSnapshot> {
-        match probe {
-            DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
-                let rows = scan_transaction_hot_state(
-                    transaction,
-                    "lix_registered_schema",
-                    &[],
-                    branch_ids,
-                    active_branch_id,
-                )
-                .await;
-                Some(ProbeSnapshot {
-                    name: format!("lix_registered_schema_by_branch_staged:{branch_ids:?}"),
-                    rows: registered_schema_by_branch_rows(rows, active_branch_id),
-                })
-            }
-            _ => None,
-        }
-    }
-
-    async fn scan_transaction_hot_state(
-        transaction: &mut crate::session::SessionTransaction,
-        schema_key: &str,
-        row_pks: &[&str],
-        branch_ids: &[&str],
-        active_branch_id: &str,
-    ) -> MaterializedHotStateBatch {
-        transaction
-        .scan_hot_state_for_test(&HotStateScanRequest {
-            filter: HotStateFilter {
-                schema_keys: vec![schema_key.to_string()],
-                row_pks: row_pks
-                    .iter()
-                    .map(|row_pk| RowPk::single(*row_pk))
-                    .collect(),
-                branch_ids: branch_ids
-                    .iter()
-                    .map(|branch_id| resolve_probe_branch_id(branch_id, active_branch_id))
-                    .collect(),
-                ..HotStateFilter::default()
-            },
-            ..HotStateScanRequest::default()
-        })
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "staged live-state differential probe failed for schema '{schema_key}': {error:?}"
-            )
-        })
-    }
-
-    fn registered_schema_by_branch_rows(
-        rows: MaterializedHotStateBatch,
-        active_branch_id: &str,
-    ) -> Vec<Vec<Value>> {
-        let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
-        ordinals.sort_by(|left, right| {
-            let left = rows.row(*left);
-            let right = rows.row(*right);
-            left.row_pk()
-                .cmp(right.row_pk())
-                .then_with(|| left.branch_id().cmp(right.branch_id()))
-        });
-        ordinals
-            .into_iter()
-            .map(|ordinal| {
-                let row = rows.row(ordinal);
-                let value = row
-                    .snapshot_content()
-                    .map(|snapshot| snapshot.as_str())
-                    .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
-                    .and_then(|snapshot| snapshot.get("value").cloned())
-                    .map(|value| {
-                        Value::Text(serde_json::to_string(&value).expect("JSON serializes"))
-                    })
-                    .unwrap_or(Value::Null);
-                canonical_probe_values(
-                    &[
-                        row_pk_value(row),
-                        value,
-                        Value::Text(row.branch_id().to_string()),
-                        row.metadata()
-                            .map(|metadata| metadata.as_str())
-                            .map(serialize_row_metadata)
-                            .map(Value::Text)
-                            .unwrap_or(Value::Null),
-                        Value::Boolean(row.global()),
-                        Value::Boolean(row.untracked()),
-                    ],
-                    active_branch_id,
-                    &[2],
-                )
-            })
-            .collect()
-    }
-
-    fn row_pk_value(row: MaterializedHotStateRowRef<'_>) -> Value {
-        Value::Text(
-            row.row_pk()
-                .as_json_array_text()
-                .expect("materialized row pk should encode"),
-        )
-    }
-
-    fn resolve_probe_branch_id(branch_id: &str, active_branch_id: &str) -> String {
-        if branch_id == ACTIVE_BRANCH_PROBE_ID {
-            active_branch_id.to_string()
-        } else {
-            branch_id.to_string()
-        }
-    }
-
-    fn canonical_probe_values(
-        values: &[Value],
-        active_branch_id: &str,
-        branch_column_indexes: &[usize],
-    ) -> Vec<Value> {
-        values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| match value {
-                Value::Text(text)
-                    if text == active_branch_id && branch_column_indexes.contains(&index) =>
-                {
-                    Value::Text(ACTIVE_BRANCH_PROBE_ID.to_string())
-                }
-                other => other.clone(),
-            })
-            .collect()
-    }
 }

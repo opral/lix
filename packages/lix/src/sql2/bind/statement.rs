@@ -137,12 +137,9 @@ pub(super) fn bind_insert_bound(
         if !matches!(
             table.surface.kind,
             PublicSurfaceKind::SchemaBase { .. }
-                | PublicSurfaceKind::SchemaByBranch { .. }
                 | PublicSurfaceKind::Branch
                 | PublicSurfaceKind::File
-                | PublicSurfaceKind::FileByBranch
                 | PublicSurfaceKind::Directory
-                | PublicSurfaceKind::DirectoryByBranch
         ) {
             return Err(super::error::unsupported(
                 "INSERT ON CONFLICT is not supported for this SQL surface yet",
@@ -611,7 +608,7 @@ fn bind_insert_input(
     let SetExpr::Values(values) = source.body.as_ref() else {
         if matches!(
             surface_kind,
-            PublicSurfaceKind::SchemaBase { .. } | PublicSurfaceKind::SchemaByBranch { .. }
+            PublicSurfaceKind::SchemaBase { .. }
         ) {
             return Err(super::error::unsupported(
                 "INSERT ... SELECT is not supported for schema SQL surfaces yet",
@@ -1338,8 +1335,7 @@ fn require_write_capability(
                 | PublicSurfaceKind::DirectoryHistory
         ) {
             error = error.with_hint("History views are query-only.");
-        } else if let PublicSurfaceKind::SchemaBase { schema_key }
-        | PublicSurfaceKind::SchemaByBranch { schema_key } = &surface.kind
+        } else if let PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind
             && let Some(hint) = crate::sql2::read_only::read_only_schema_surface_hint(schema_key)
         {
             error = error.with_hint(hint);
@@ -1355,17 +1351,8 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
                 schema_key: schema_key.clone(),
             })
         }
-        PublicSurfaceKind::SchemaByBranch { schema_key } => {
-            BoundWriteTarget::Row(RowWriteSurface::ByBranch {
-                schema_key: schema_key.clone(),
-            })
-        }
         PublicSurfaceKind::File => BoundWriteTarget::File(FileWriteSurface::Base),
-        PublicSurfaceKind::FileByBranch => BoundWriteTarget::File(FileWriteSurface::ByBranch),
         PublicSurfaceKind::Directory => BoundWriteTarget::Directory(DirectoryWriteSurface::Base),
-        PublicSurfaceKind::DirectoryByBranch => {
-            BoundWriteTarget::Directory(DirectoryWriteSurface::ByBranch)
-        }
         PublicSurfaceKind::Branch => BoundWriteTarget::Branch,
         PublicSurfaceKind::Revert => {
             BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert)
@@ -1379,11 +1366,8 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         | PublicSurfaceKind::DirectoryHistory
         | PublicSurfaceKind::Change
         | PublicSurfaceKind::WorkingDiff
-        | PublicSurfaceKind::WorkingDiffByBranch
         | PublicSurfaceKind::FileWorkingDiff
-        | PublicSurfaceKind::FileWorkingDiffByBranch
-        | PublicSurfaceKind::DirectoryWorkingDiff
-        | PublicSurfaceKind::DirectoryWorkingDiffByBranch => {
+        | PublicSurfaceKind::DirectoryWorkingDiff => {
             unreachable!("write capability checked before target binding")
         }
     }
@@ -1395,75 +1379,8 @@ fn bind_write_branch_scope(
     predicate: &BoundPredicate,
     active_branch_id: &str,
 ) -> Result<BranchScope, LixError> {
-    let Some(branch_column) = by_branch_column_name(kind) else {
-        return Ok(bind_base_write_branch_scope(
-            kind,
-            predicate,
-            active_branch_id,
-        ));
-    };
-    let branch_selector = match input {
-        BoundWriteInput::Values(values) => {
-            let mut selector = BranchSelector::Missing;
-            if let Some(column_index) = values.column_index(branch_column) {
-                for row in &values.rows {
-                    let value = &row[column_index];
-                    selector = selector.union(value_branch_selector(value)?);
-                }
-            }
-            selector
-        }
-        BoundWriteInput::None => predicate_branch_selector(predicate, branch_column)?,
-        BoundWriteInput::Query { .. } => Err(super::error::unsupported(
-            "INSERT ... SELECT by-branch writes are not supported",
-        ))?,
-    };
-    by_branch_scope(input, branch_column, branch_selector)
-}
-
-fn by_branch_scope(
-    input: &BoundWriteInput,
-    branch_column: &str,
-    selector: BranchSelector,
-) -> Result<BranchScope, LixError> {
-    match (input, selector) {
-        (_, selector) if selector.is_empty() => Ok(BranchScope::Empty),
-        (BoundWriteInput::Values(_), BranchSelector::Missing) => Err(super::error::unsupported(
-            format!("INSERT into by-branch SQL table requires explicit '{branch_column}'"),
-        )),
-        (BoundWriteInput::Values(_), BranchSelector::Static(branch_ids)) => {
-            Ok(BranchScope::Explicit { branch_ids })
-        }
-        (
-            BoundWriteInput::Values(_),
-            BranchSelector::Dynamic {
-                branch_ids,
-                param_indexes,
-            },
-        ) => Ok(BranchScope::ExplicitDynamic {
-            branch_ids,
-            param_indexes,
-        }),
-        (BoundWriteInput::None, BranchSelector::Missing) => Err(super::error::unsupported(
-            format!("by-branch SQL writes require an explicit '{branch_column}' predicate"),
-        )),
-        (BoundWriteInput::None, BranchSelector::Static(branch_ids)) => {
-            Ok(BranchScope::ExplicitRequired { branch_ids })
-        }
-        (
-            BoundWriteInput::None,
-            BranchSelector::Dynamic {
-                branch_ids,
-                param_indexes,
-            },
-        ) => Ok(BranchScope::ExplicitRequiredDynamic {
-            branch_ids,
-            param_indexes,
-        }),
-        (BoundWriteInput::Query { .. }, _) => Err(super::error::unsupported(
-            "INSERT ... SELECT by-branch writes are not supported",
-        )),
-    }
+    let _ = input;
+    Ok(bind_base_write_branch_scope(kind, predicate, active_branch_id))
 }
 
 fn bind_base_write_branch_scope(
@@ -1478,209 +1395,6 @@ fn bind_base_write_branch_scope(
         return BranchScope::Global;
     }
     active_branch_scope(active_branch_id)
-}
-
-fn by_branch_column_name(kind: &PublicSurfaceKind) -> Option<&'static str> {
-    match kind {
-        PublicSurfaceKind::SchemaByBranch { .. }
-        | PublicSurfaceKind::FileByBranch
-        | PublicSurfaceKind::DirectoryByBranch => Some("lixcol_branch_id"),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum BranchSelector {
-    Missing,
-    Static(BTreeSet<String>),
-    Dynamic {
-        branch_ids: BTreeSet<String>,
-        param_indexes: BTreeSet<usize>,
-    },
-}
-
-impl BranchSelector {
-    fn is_empty(&self) -> bool {
-        matches!(self, Self::Static(branch_ids) if branch_ids.is_empty())
-    }
-
-    fn intersect(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
-            (Self::Static(branch_ids), Self::Dynamic { param_indexes, .. })
-            | (Self::Dynamic { param_indexes, .. }, Self::Static(branch_ids))
-                if branch_ids.is_empty() || param_indexes.is_empty() =>
-            {
-                Self::Static(BTreeSet::new())
-            }
-            (Self::Static(left), Self::Static(right)) => {
-                Self::Static(left.intersection(&right).cloned().collect())
-            }
-            (
-                Self::Dynamic {
-                    mut branch_ids,
-                    mut param_indexes,
-                },
-                Self::Dynamic {
-                    branch_ids: right_branches,
-                    param_indexes: right_params,
-                },
-            ) => {
-                branch_ids.extend(right_branches);
-                param_indexes.extend(right_params);
-                Self::Dynamic {
-                    branch_ids,
-                    param_indexes,
-                }
-            }
-            (
-                Self::Static(mut branch_ids),
-                Self::Dynamic {
-                    branch_ids: right_branches,
-                    param_indexes,
-                },
-            )
-            | (
-                Self::Dynamic {
-                    branch_ids: right_branches,
-                    param_indexes,
-                },
-                Self::Static(mut branch_ids),
-            ) => {
-                branch_ids.extend(right_branches);
-                Self::Dynamic {
-                    branch_ids,
-                    param_indexes,
-                }
-            }
-        }
-    }
-
-    fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
-            (Self::Static(mut left), Self::Static(right)) => {
-                left.extend(right);
-                Self::Static(left)
-            }
-            (
-                Self::Dynamic {
-                    mut branch_ids,
-                    mut param_indexes,
-                },
-                Self::Dynamic {
-                    branch_ids: right_branches,
-                    param_indexes: right_params,
-                },
-            ) => {
-                branch_ids.extend(right_branches);
-                param_indexes.extend(right_params);
-                Self::Dynamic {
-                    branch_ids,
-                    param_indexes,
-                }
-            }
-            (
-                Self::Static(mut branch_ids),
-                Self::Dynamic {
-                    branch_ids: right_branches,
-                    param_indexes,
-                },
-            )
-            | (
-                Self::Dynamic {
-                    branch_ids: right_branches,
-                    param_indexes,
-                },
-                Self::Static(mut branch_ids),
-            ) => {
-                branch_ids.extend(right_branches);
-                Self::Dynamic {
-                    branch_ids,
-                    param_indexes,
-                }
-            }
-        }
-    }
-}
-
-fn predicate_branch_selector(
-    predicate: &BoundPredicate,
-    branch_column: &str,
-) -> Result<BranchSelector, LixError> {
-    match predicate {
-        BoundPredicate::True
-        | BoundPredicate::Like { .. }
-        | BoundPredicate::IsNull(_)
-        | BoundPredicate::IsNotNull(_) => Ok(BranchSelector::Missing),
-        BoundPredicate::False => Ok(BranchSelector::Static(BTreeSet::new())),
-        BoundPredicate::And(predicates) => {
-            let mut result = BranchSelector::Missing;
-            for predicate in predicates {
-                result = result.intersect(predicate_branch_selector(predicate, branch_column)?);
-            }
-            Ok(result)
-        }
-        BoundPredicate::Or(predicates) => {
-            let mut result = BranchSelector::Static(BTreeSet::new());
-            for predicate in predicates {
-                let selector = predicate_branch_selector(predicate, branch_column)?;
-                if selector == BranchSelector::Missing {
-                    return Ok(BranchSelector::Missing);
-                }
-                result = result.union(selector);
-            }
-            Ok(result)
-        }
-        BoundPredicate::Eq(left, right) => {
-            branch_selector_from_binary_exprs(left, right, branch_column)
-                .or_else(|| branch_selector_from_binary_exprs(right, left, branch_column))
-                .transpose()
-                .map(|selector| selector.unwrap_or(BranchSelector::Missing))
-        }
-        BoundPredicate::In { expr, values } => {
-            let BoundExpr::Column(column) = expr else {
-                return Ok(BranchSelector::Missing);
-            };
-            if column.name != branch_column {
-                return Ok(BranchSelector::Missing);
-            }
-            let mut selector = BranchSelector::Missing;
-            for value in values {
-                selector = selector.union(value_branch_selector(value)?);
-            }
-            Ok(selector)
-        }
-    }
-}
-
-fn branch_selector_from_binary_exprs(
-    column_expr: &BoundExpr,
-    value_expr: &BoundExpr,
-    branch_column: &str,
-) -> Option<Result<BranchSelector, LixError>> {
-    let BoundExpr::Column(column) = column_expr else {
-        return None;
-    };
-    if column.name != branch_column {
-        return None;
-    }
-    Some(value_branch_selector(value_expr))
-}
-
-fn value_branch_selector(expr: &BoundExpr) -> Result<BranchSelector, LixError> {
-    match expr {
-        BoundExpr::Literal(BoundLiteral::Text(branch_id)) => {
-            Ok(BranchSelector::Static(BTreeSet::from([branch_id.clone()])))
-        }
-        BoundExpr::Param(param) => Ok(BranchSelector::Dynamic {
-            branch_ids: BTreeSet::new(),
-            param_indexes: BTreeSet::from([param.index]),
-        }),
-        _ => Err(super::error::unsupported(
-            "by-branch SQL write predicates require string branch ids",
-        )),
-    }
 }
 
 fn active_branch_scope(active_branch_id: &str) -> BranchScope {
@@ -1870,7 +1584,7 @@ mod tests {
     #[test]
     fn bind_statement_preserves_update_assignment_and_predicate() {
         let statement = parse_statement(
-            "UPDATE test_state_schema_by_branch SET name = 'next' WHERE lixcol_branch_id = 'branch2'",
+            "UPDATE test_state_schema SET name = 'next' WHERE id = 'row-1'",
         );
         let bound = bind_statement(
             &statement,
@@ -1890,7 +1604,7 @@ mod tests {
         let write = bound;
         assert!(matches!(
             write.target,
-            BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
+            BoundWriteTarget::Row(RowWriteSurface::Base { .. })
         ));
         assert_eq!(write.op, BoundWriteOp::Update);
         assert_eq!(write.assignments.len(), 1);
@@ -1904,12 +1618,11 @@ mod tests {
             BoundPredicate::Eq(
                 BoundExpr::Column(ref column),
                 BoundExpr::Literal(BoundLiteral::Text(ref value)),
-            ) if column.name == "lixcol_branch_id" && value == "branch2"
+            ) if column.name == "id" && value == "row-1"
         ));
         assert!(matches!(
             write.branch_scope,
-            BranchScope::ExplicitRequired { ref branch_ids }
-                if branch_ids == &BTreeSet::from(["branch2".to_string()])
+            BranchScope::Active { ref branch_id } if branch_id == "branch1"
         ));
     }
 
@@ -2041,76 +1754,6 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_binds_by_branch_insert_scope_from_branch_column() {
-        let statement = parse_statement(
-            "INSERT INTO lix_file_by_branch (id, name, lixcol_branch_id) VALUES ('file1', 'a', 'branch2')",
-        );
-        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
-
-        let write = bound;
-        assert!(matches!(
-            write.branch_scope,
-            BranchScope::Explicit { ref branch_ids }
-                if branch_ids == &BTreeSet::from(["branch2".to_string()])
-        ));
-    }
-
-    #[test]
-    fn bind_statement_preserves_parameterized_by_branch_scope_selectors() {
-        let update = bind_statement(
-            &parse_statement(
-                "UPDATE lix_file_by_branch SET name = 'renamed.txt' WHERE id = 'file1' AND lixcol_branch_id = $1",
-            ),
-            &[],
-            "branch1",
-        )
-        .expect("parameterized update branch scope should bind");
-        assert_eq!(
-            update.branch_scope,
-            BranchScope::ExplicitRequiredDynamic {
-                branch_ids: BTreeSet::new(),
-                param_indexes: BTreeSet::from([1])
-            }
-        );
-
-        let insert = bind_statement(
-            &parse_statement(
-                "INSERT INTO lix_file_by_branch (id, name, lixcol_branch_id) VALUES ('file1', 'a', $1)",
-            ),
-            &[],
-            "branch1",
-        )
-        .expect("parameterized insert branch scope should bind");
-        assert_eq!(
-            insert.branch_scope,
-            BranchScope::ExplicitDynamic {
-                branch_ids: BTreeSet::new(),
-                param_indexes: BTreeSet::from([1])
-            }
-        );
-    }
-
-    #[test]
-    fn bind_statement_binds_contradictory_by_branch_selectors_as_empty() {
-        let statement = parse_statement(
-            "DELETE FROM lix_file_by_branch WHERE lixcol_branch_id IN ('v1') AND lixcol_branch_id IN ('v2')",
-        );
-        let bound = bind_statement(&statement, &[], "branch1").expect("delete should bind");
-
-        let write = bound;
-        assert_eq!(write.branch_scope, BranchScope::Empty);
-    }
-
-    #[test]
-    fn bind_statement_binds_false_by_branch_predicate_as_empty() {
-        let statement = parse_statement("DELETE FROM lix_file_by_branch WHERE false");
-        let bound = bind_statement(&statement, &[], "branch1").expect("no-match delete binds");
-
-        let write = bound;
-        assert_eq!(write.branch_scope, BranchScope::Empty);
-    }
-
-    #[test]
     fn bind_statement_binds_false_base_predicates_as_empty() {
         for sql in [
             "DELETE FROM lix_file WHERE false",
@@ -2191,18 +1834,6 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_by_branch_writes_without_branch_selector() {
-        let statement = parse_statement(
-            "UPDATE lix_file_by_branch SET name = 'renamed.txt' WHERE id = 'file1'",
-        );
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("by-branch writes should require explicit branch predicate");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("require an explicit"));
-    }
-
-    #[test]
     fn bind_statement_binds_delete_like_predicate_and_parameter() {
         let statement = parse_statement("DELETE FROM lix_file WHERE path NOT LIKE $1");
         let bound = bind_statement(&statement, &[], "branch1").expect("DELETE LIKE should bind");
@@ -2221,17 +1852,6 @@ mod tests {
             bound.params.params.keys().copied().collect::<Vec<_>>(),
             vec![1]
         );
-    }
-
-    #[test]
-    fn bind_statement_keeps_like_out_of_by_branch_scope_selection() {
-        let statement =
-            parse_statement("DELETE FROM lix_file_by_branch WHERE lixcol_branch_id LIKE 'draft%'");
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("LIKE must not grant a by-branch write scope");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("require an explicit"));
     }
 
     #[test]
@@ -2423,17 +2043,6 @@ mod tests {
                 .message
                 .contains("unsupported SQL parameter placeholder")
         );
-    }
-
-    #[test]
-    fn bind_statement_rejects_read_only_by_branch_columns_as_write_targets() {
-        let statement =
-            parse_statement("UPDATE lix_file_by_branch SET lixcol_branch_id = 'branch2'");
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("by-branch branch columns are filter-only");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("is not writable"));
     }
 
     #[test]

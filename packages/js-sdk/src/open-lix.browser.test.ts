@@ -75,6 +75,22 @@ test("loads and executes the engine outside the browser main thread", async () =
 	}
 });
 
+test("keeps browser worker sessions independent", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const main = await openLix();
+	const mainBranchId = await main.activeBranchId();
+	const draft = await main.createBranch({ name: "Browser draft" });
+	const review = await main.openAnotherSession({ branchId: draft.id });
+
+	expect(await main.activeBranchId()).toBe(mainBranchId);
+	expect(await review.activeBranchId()).toBe(draft.id);
+	await main.close();
+	expect(
+		(await review.execute("SELECT 1 AS value")).rows[0]?.get("value"),
+	).toBe(1);
+	await review.close();
+});
+
 test("createCheckpoint returns the new active head through browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	const lix = await openLix();

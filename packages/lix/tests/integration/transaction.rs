@@ -679,13 +679,16 @@ async fn existing_session_ignores_later_default_branch_corruption() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine.open_session().await.expect("session should open");
+    let global_session = engine
+        .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+        .await
+        .expect("global session should open");
 
-    session
+    global_session
         .execute(
-            "UPDATE lix_key_value_by_branch \
+            "UPDATE lix_key_value \
              SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_default_branch_id' \
-               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+             WHERE key = 'lix_default_branch_id'",
             &[],
         )
         .await
@@ -759,13 +762,16 @@ async fn existing_session_writes_to_its_selected_branch() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine.open_session().await.expect("session should open");
+    let global_session = engine
+        .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+        .await
+        .expect("global session should open");
 
-    session
+    global_session
         .execute(
-            "UPDATE lix_key_value_by_branch \
+            "UPDATE lix_key_value \
              SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_default_branch_id' \
-               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+             WHERE key = 'lix_default_branch_id'",
             &[],
         )
         .await

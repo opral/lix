@@ -45,19 +45,16 @@ pub(crate) enum BoundWriteTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RowWriteSurface {
     Base { schema_key: String },
-    ByBranch { schema_key: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FileWriteSurface {
     Base,
-    ByBranch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DirectoryWriteSurface {
     Base,
-    ByBranch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

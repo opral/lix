@@ -65,8 +65,6 @@ mod tests {
     use crate::sql2::bind::bind_statement;
     use crate::sql2::parse_statement;
     use crate::sql2::plan::branch_scope::BranchScope;
-    use std::collections::BTreeSet;
-
     #[test]
     fn plan_write_contradiction_does_not_drop_bound_params() {
         let plan = plan_sql(
@@ -87,19 +85,6 @@ mod tests {
             plan.bound.branch_scope,
             BranchScope::Active {
                 branch_id: "branch1".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn plan_write_keeps_explicit_required_scope_for_by_branch_writes() {
-        let plan =
-            plan_sql("DELETE FROM lix_file_by_branch WHERE lixcol_branch_id IN ('v1', 'v2')");
-
-        assert_eq!(
-            plan.bound.branch_scope,
-            BranchScope::ExplicitRequired {
-                branch_ids: BTreeSet::from(["v1".to_string(), "v2".to_string()])
             }
         );
     }

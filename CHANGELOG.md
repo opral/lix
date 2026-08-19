@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- Removed every public `*_by_branch` SQL relation and the public
+  `lixcol_branch_id` row-routing column. SQL relations now always use the
+  current session's active branch. Open another session to work with another
+  branch, use that session's `lix_working_diff` for uncheckpointed work, and
+  use `lix_diff(from_commit, to_commit)` for commit-to-commit comparison.
+  `lixcol_global` and the global branch remain supported.
+
 ## 0.12.3 - 2026-08-18
 
 ### Patch

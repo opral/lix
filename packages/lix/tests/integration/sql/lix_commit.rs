@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lix::{CreateBranchOptions, Value};
+use lix::{CreateBranchOptions, LixError, Value};
 
 use super::select_rows;
 
@@ -15,12 +15,6 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-
-        let initial_head = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("branch head should load")
-            .expect("branch head should exist");
 
         session
             .execute(
@@ -84,84 +78,13 @@ simulation_test!(
             ]]
         );
 
-        let by_branch_rows = select_rows(
-            &session,
-            &format!(
-                "SELECT id, lixcol_branch_id, lixcol_global, lixcol_untracked \
-                 FROM lix_commit_by_branch \
-                 WHERE id IN ('{initial_head}', '{first_head}', '{second_head}') \
-                 ORDER BY id, lixcol_branch_id"
-            ),
-        )
-        .await;
-        assert!(by_branch_rows.contains(&vec![
-            Value::Text(initial_head.clone()),
-            Value::Text(sim.main_branch_id().to_string()),
-            Value::Boolean(true),
-            Value::Boolean(false),
-        ]));
-        assert!(by_branch_rows.contains(&vec![
-            Value::Text(initial_head),
-            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-            Value::Boolean(true),
-            Value::Boolean(false),
-        ]));
-        assert!(by_branch_rows.contains(&vec![
-            Value::Text(first_head.clone()),
-            Value::Text(sim.main_branch_id().to_string()),
-            Value::Boolean(true),
-            Value::Boolean(false),
-        ]));
-        assert!(by_branch_rows.contains(&vec![
-            Value::Text(first_head.clone()),
-            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-            Value::Boolean(true),
-            Value::Boolean(false),
-        ]));
-        assert!(by_branch_rows.contains(&vec![
-            Value::Text(second_head.clone()),
-            Value::Text(sim.main_branch_id().to_string()),
-            Value::Boolean(true),
-            Value::Boolean(false),
-        ]));
-        assert!(by_branch_rows.contains(&vec![
-            Value::Text(second_head.clone()),
-            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-            Value::Boolean(true),
-            Value::Boolean(false),
-        ]));
-
-        let edge_by_branch_rows = select_rows(
-            &session,
-            &format!(
-                "SELECT parent_id, child_id, parent_order, lixcol_branch_id, lixcol_global, lixcol_untracked \
-                 FROM lix_commit_edge_by_branch \
-                 WHERE child_id = '{second_head}' \
-                 ORDER BY lixcol_branch_id"
-            ),
-        )
-        .await;
-        assert_eq!(
-            edge_by_branch_rows,
-            vec![
-                vec![
-                    Value::Text(first_head.clone()),
-                    Value::Text(second_head.clone()),
-                    Value::Integer(0),
-                    Value::Text(sim.main_branch_id().to_string()),
-                    Value::Boolean(true),
-                    Value::Boolean(false),
-                ],
-                vec![
-                    Value::Text(first_head),
-                    Value::Text(second_head),
-                    Value::Integer(0),
-                    Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-                    Value::Boolean(true),
-                    Value::Boolean(false),
-                ],
-            ]
-        );
+        for table in ["lix_commit_by_branch", "lix_commit_edge_by_branch"] {
+            let error = session
+                .execute(&format!("SELECT * FROM {table}"), &[])
+                .await
+                .expect_err("retired by-branch commit surfaces must fail closed");
+            assert_eq!(error.code, LixError::CODE_TABLE_NOT_FOUND);
+        }
     }
 );
 
@@ -250,85 +173,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_commit_derived_by_branch_surfaces_match_commit_row_projection,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let main = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        main.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('main-edge-probe', 'main')",
-            &[],
-        )
-        .await
-        .expect("main write should succeed");
-
-        main.create_branch(CreateBranchOptions {
-            id: Some("01930000-0000-7000-8000-000000000007".to_string()),
-            name: "Edge Probe A".to_string(),
-            from_commit_id: Some(sim.initial_commit_id().to_string()),
-        })
-        .await
-        .expect("01930000-0000-7000-8000-000000000007 should be created from the initial commit");
-        main.create_branch(CreateBranchOptions {
-            id: Some("01930000-0000-7000-8000-000000000008".to_string()),
-            name: "Edge Probe B".to_string(),
-            from_commit_id: Some(sim.initial_commit_id().to_string()),
-        })
-        .await
-        .expect("01930000-0000-7000-8000-000000000008 should be created from the initial commit");
-
-        let branch_a = sim.wrap_session(
-            engine
-                .open_session_at("01930000-0000-7000-8000-000000000007")
-                .await
-                .expect("01930000-0000-7000-8000-000000000007 session should open"),
-            &engine,
-        );
-        branch_a
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('edge-probe-a-only', 'a')",
-                &[],
-            )
-            .await
-            .expect("01930000-0000-7000-8000-000000000007 write should succeed");
-
-        let branch_b = sim.wrap_session(
-            engine
-                .open_session_at("01930000-0000-7000-8000-000000000008")
-                .await
-                .expect("01930000-0000-7000-8000-000000000008 session should open"),
-            &engine,
-        );
-        branch_b
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('edge-probe-b-only', 'b')",
-                &[],
-            )
-            .await
-            .expect("01930000-0000-7000-8000-000000000008 write should succeed");
-
-        let global_edges =
-            commit_edges_by_branch(&main, "ffffffff-ffff-7fff-bfff-ffffffffffff").await;
-        for branch_id in [
-            sim.main_branch_id(),
-            "01930000-0000-7000-8000-000000000007",
-            "01930000-0000-7000-8000-000000000008",
-        ] {
-            let actual_edges = commit_edges_by_branch(&main, branch_id).await;
-            assert_eq!(
-                actual_edges, global_edges,
-                "lix_commit_edge_by_branch should project derived global edges for {branch_id}"
-            );
-        }
-    }
-);
 
 simulation_test!(
     lix_commit_surfaces_match_canonical_schema_definitions,
@@ -343,11 +187,8 @@ simulation_test!(
         );
 
         for (schema_key, tables) in [
-            ("lix_commit", vec!["lix_commit", "lix_commit_by_branch"]),
-            (
-                "lix_commit_edge",
-                vec!["lix_commit_edge", "lix_commit_edge_by_branch"],
-            ),
+            ("lix_commit", vec!["lix_commit"]),
+            ("lix_commit_edge", vec!["lix_commit_edge"]),
         ] {
             let schema_properties = builtin_schema_property_names(schema_key);
             for table in tables {
@@ -375,9 +216,7 @@ simulation_test!(
 
         for table in [
             "lix_commit",
-            "lix_commit_by_branch",
             "lix_commit_edge",
-            "lix_commit_edge_by_branch",
         ] {
             let rows = select_rows(&session, &format!("SELECT count(*) FROM {table}")).await;
             assert_single_count(rows, table);
@@ -402,24 +241,6 @@ fn text_value(value: &Value) -> String {
         panic!("expected text value, got {value:?}");
     };
     value.clone()
-}
-
-async fn commit_edges_by_branch(
-    session: &crate::support::simulation_test::engine::SimSession,
-    branch_id: &str,
-) -> BTreeSet<(String, String)> {
-    select_rows(
-        session,
-        &format!(
-            "SELECT parent_id, child_id \
-             FROM lix_commit_edge_by_branch \
-             WHERE lixcol_branch_id = '{branch_id}'"
-        ),
-    )
-    .await
-    .into_iter()
-    .map(|row| (text_value(&row[0]), text_value(&row[1])))
-    .collect()
 }
 
 fn builtin_schema_property_names(schema_key: &str) -> BTreeSet<String> {

@@ -10,15 +10,18 @@ import type {
 	MergeBranchOptions,
 	SwitchBranchOptions,
 	LixTelemetrySpan,
+	OpenAnotherSessionOptions,
 } from "../types.js";
 
 export type WorkerRequest = {
 	id: number;
+	sessionId: number;
 	operation: WorkerOperation;
 };
 
 export type WorkerOperation =
 	| { kind: "open"; storage: LixStorageConfig; telemetryEnabled: boolean }
+	| { kind: "openAnotherSession"; options: OpenAnotherSessionOptions }
 	| {
 			kind: "execute";
 			sql: string;

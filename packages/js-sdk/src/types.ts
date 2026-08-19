@@ -35,6 +35,14 @@ export type OpenLixOptions =
 			telemetry?: never;
 	  };
 
+/** Selects the initial context for an additional independent session. */
+export type OpenAnotherSessionOptions = {
+	/** Defaults to the current branch of the session opening it. */
+	branchId?: string;
+	/** Defaults to the current account. Remote sessions cannot override identity. */
+	accountId?: string;
+};
+
 export type LixValue =
 	| { kind: "null"; value: null }
 	| { kind: "boolean"; value: boolean }

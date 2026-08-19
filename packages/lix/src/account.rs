@@ -184,17 +184,14 @@ mod tests {
 
         let system = lix
             .open_another_session()
+            .with_branch(crate::GLOBAL_BRANCH_ID)
             .with_account(crate::SYSTEM_ACCOUNT_ID)
             .await
             .expect("system session should open");
         system
             .execute(
-                "UPDATE lix_account_by_branch SET status = 'disabled' \
-                 WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(AUTHOR_ID.to_string()),
-                    Value::Text(crate::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
             .expect("disable author");

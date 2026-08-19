@@ -433,16 +433,11 @@ simulation_test!(
 
         for surface_name in [
             "lix_key_value",
-            "lix_key_value_by_branch",
             "lix_registered_schema",
-            "lix_registered_schema_by_branch",
             "lix_checkpoint",
             "lix_working_diff",
-            "lix_working_diff_by_branch",
             "lix_file_working_diff",
-            "lix_file_working_diff_by_branch",
             "lix_directory_working_diff",
-            "lix_directory_working_diff_by_branch",
         ] {
             assert!(
                 public_table_names.contains(surface_name),
@@ -469,6 +464,11 @@ simulation_test!(
             ],
         );
         for surface_name in [
+            "lix_key_value_by_branch",
+            "lix_registered_schema_by_branch",
+            "lix_working_diff_by_branch",
+            "lix_file_working_diff_by_branch",
+            "lix_directory_working_diff_by_branch",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",
@@ -739,55 +739,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    row_by_branch_insert_rejects_target_branch_without_schema,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let main = sim.wrap_session(
-            engine
-                .open_session_at(sim.main_branch_id())
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        main.create_branch(CreateBranchOptions {
-            id: Some("01930000-0000-7000-8000-000000000015".to_string()),
-            name: "Schemaless Target".to_string(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("target branch should be created before schema registration");
-
-        main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_poison_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("schema should be visible on active main");
-
-        let error = main
-            .execute(
-                "INSERT INTO engine_poison_schema_by_branch \
-                 (id, name, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('poison-1', 'Poisoned', '01930000-0000-7000-8000-000000000015', true)",
-                &[],
-            )
-            .await
-            .expect_err("_by_branch write must use the target branch schema catalog");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error.message.contains("engine_poison_schema"),
-            "unexpected error: {error:?}"
-        );
-    }
-);
 
 simulation_test!(
     registered_schema_identity_is_scoped_per_branch,
@@ -997,86 +948,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    row_by_branch_insert_rejects_fk_graph_when_target_branch_lacks_schemas,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let main = sim.wrap_session(
-            engine
-                .open_session_at(sim.main_branch_id())
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        main.create_branch(CreateBranchOptions {
-            id: Some("01930000-0000-7000-8000-000000000013".to_string()),
-            name: "FK Schemaless Target".to_string(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("target branch should be created before FK schemas");
-
-        main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_fk_parent_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("parent schema should register on active main");
-
-        main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_fk_child_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"parent_id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"],\"foreign_keys\":[{\"columns\":[\"parent_id\"],\"references\":{\"schema_key\":\"engine_fk_parent_schema\",\"columns\":[\"id\"]}}]}' AS JSONB),\
-             false,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("child schema should register on active main");
-
-        let parent_result = main
-            .execute(
-                "INSERT INTO engine_fk_parent_schema_by_branch \
-                 (id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('parent-1', '01930000-0000-7000-8000-000000000013', true)",
-                &[],
-            )
-            .await;
-
-        if let Err(error) = parent_result {
-            assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-            assert!(
-                error.message.contains("engine_fk_parent_schema"),
-                "unexpected error: {error:?}"
-            );
-            return;
-        }
-
-        let error = main
-            .execute(
-                "INSERT INTO engine_fk_child_schema_by_branch \
-                 (id, parent_id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('child-1', 'parent-1', '01930000-0000-7000-8000-000000000013', true)",
-                &[],
-            )
-            .await
-            .expect_err("FK-valid active graph must not be insertable into a schemaless target");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error.message.contains("engine_fk_child_schema")
-                || error.message.contains("engine_fk_parent_schema"),
-            "unexpected error: {error:?}"
-        );
-    }
-);
 
 simulation_test!(
     registered_row_insert_applies_defaulted_primary_key,
@@ -1199,89 +1070,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(row_by_branch_expands_global_rows, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let global_session = sim.wrap_session(
-        engine
-            .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
-            .await
-            .expect("global session should open"),
-        &engine,
-    );
-    let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
-
-    global_session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_overlay_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             true,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("global registered schema insert should succeed");
-
-    session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_overlay_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("registered schema insert should succeed");
-
-    session
-        .execute(
-            "INSERT INTO engine_overlay_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-global-overlay', 'Global Row', true, false)",
-            &[],
-        )
-        .await
-        .expect("global row insert should succeed");
-
-    let result = session
-        .execute(
-            "SELECT id, name, lixcol_branch_id, lixcol_global, lixcol_untracked \
-                 FROM engine_overlay_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-global-overlay\"]' AS JSONB) \
-                 ORDER BY lixcol_branch_id",
-            &[],
-        )
-        .await
-        .expect("row by-branch read should succeed");
-    assert_rows_eq(
-        result,
-        vec![
-            vec![
-                Value::Text("row-global-overlay".to_string()),
-                Value::Text("Global Row".to_string()),
-                Value::Text(sim.main_branch_id().to_string()),
-                Value::Boolean(true),
-                Value::Boolean(false),
-            ],
-            vec![
-                Value::Text("row-global-overlay".to_string()),
-                Value::Text("Global Row".to_string()),
-                Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-                Value::Boolean(true),
-                Value::Boolean(false),
-            ],
-        ],
-    );
-});
 
 simulation_test!(
     global_row_insert_rejects_active_only_schema,
@@ -1703,16 +1491,14 @@ simulation_test!(
             .expect_err("base row table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
-        let result = main
+        let result = draft
             .execute(
-                "SELECT name \
-                 FROM engine_base_branch_filter_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
-                   AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
+                "SELECT name FROM engine_base_branch_filter_schema \
+                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB)",
                 &[],
             )
             .await
-            .expect("by-branch query should succeed");
+            .expect("draft branch query should succeed");
         assert_rows_eq(result, vec![vec![Value::Text("draft".to_string())]]);
     }
 );
@@ -1760,16 +1546,21 @@ simulation_test!(
             .expect_err("base row table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
-        let result = main
+        let draft = sim.wrap_session(
+            engine
+                .open_session_at("01930000-0000-7000-8000-00000000000e")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+        let result = draft
             .execute(
-                "SELECT name \
-                 FROM engine_base_insert_branch_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
-                   AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000e'",
+                "SELECT name FROM engine_base_insert_branch_schema \
+                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB)",
                 &[],
             )
             .await
-            .expect("by-branch query should succeed");
+            .expect("draft branch query should succeed");
         assert_rows_eq(result, vec![]);
     }
 );
@@ -1948,322 +1739,26 @@ simulation_test!(
             .expect_err("base row table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
-        let result = main
+        let draft = sim.wrap_session(
+            engine
+                .open_session_at("01930000-0000-7000-8000-00000000000e")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+        let result = draft
             .execute(
-                "SELECT id \
-                 FROM engine_base_branch_insert_schema_by_branch \
-                 WHERE lixcol_branch_id = '01930000-0000-7000-8000-00000000000e'",
+                "SELECT id FROM engine_base_branch_insert_schema",
                 &[],
             )
             .await
-            .expect("by-branch query should succeed");
+            .expect("draft branch query should succeed");
         assert_rows_eq(result, Vec::<Vec<Value>>::new());
     }
 );
 
-simulation_test!(
-    typed_row_by_branch_delete_requires_explicit_branch_filter,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let main = sim.wrap_session(
-            engine
-                .open_session_at(sim.main_branch_id())
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
 
-        main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_delete_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("registered schema insert should succeed");
 
-        main.create_branch(CreateBranchOptions {
-            id: Some("01930000-0000-7000-8000-000000000010".to_string()),
-            name: "By-branch Delete Draft".to_string(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("draft branch should be created after schema registration");
-
-        main.execute(
-            "INSERT INTO engine_by_branch_delete_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
-            &[],
-        )
-        .await
-        .expect("main row insert should succeed");
-
-        let draft = sim.wrap_session(
-            engine
-                .open_session_at("01930000-0000-7000-8000-000000000010")
-                .await
-                .expect("draft session should open"),
-            &engine,
-        );
-        draft
-            .execute(
-                "INSERT INTO engine_by_branch_delete_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
-                &[],
-            )
-            .await
-            .expect("draft row insert should succeed");
-
-        main.execute(
-            "DELETE FROM engine_by_branch_delete_scope_schema_by_branch \
-             WHERE lixcol_row_pk = '[\"row-1\"]'",
-            &[],
-        )
-        .await
-        .expect_err("_by_branch delete should not delete all branches without a branch filter");
-
-        let result = main
-            .execute(
-                &format!(
-                    "SELECT name, lixcol_branch_id \
-                 FROM engine_by_branch_delete_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
-                   AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000010') \
-                 ORDER BY name",
-                    sim.main_branch_id()
-                ),
-                &[],
-            )
-            .await
-            .expect("by-branch query should succeed");
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Text("draft".to_string()),
-                    Value::Text("01930000-0000-7000-8000-000000000010".to_string()),
-                ],
-                vec![
-                    Value::Text("main".to_string()),
-                    Value::Text(sim.main_branch_id().to_string()),
-                ],
-            ],
-        );
-    }
-);
-
-simulation_test!(
-    typed_row_by_branch_update_requires_explicit_branch_filter,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let main = sim.wrap_session(
-            engine
-                .open_session_at(sim.main_branch_id())
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_update_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("registered schema insert should succeed");
-
-        main.create_branch(CreateBranchOptions {
-            id: Some("01930000-0000-7000-8000-000000000011".to_string()),
-            name: "By-branch Update Draft".to_string(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("draft branch should be created after schema registration");
-
-        main.execute(
-            "INSERT INTO engine_by_branch_update_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
-            &[],
-        )
-        .await
-        .expect("main row insert should succeed");
-
-        let draft = sim.wrap_session(
-            engine
-                .open_session_at("01930000-0000-7000-8000-000000000011")
-                .await
-                .expect("draft session should open"),
-            &engine,
-        );
-        draft
-            .execute(
-                "INSERT INTO engine_by_branch_update_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
-                &[],
-            )
-            .await
-            .expect("draft row insert should succeed");
-
-        main.execute(
-            "UPDATE engine_by_branch_update_scope_schema_by_branch \
-             SET name = 'updated-all' \
-             WHERE lixcol_row_pk = '[\"row-1\"]'",
-            &[],
-        )
-        .await
-        .expect_err("_by_branch update should not update all branches without a branch filter");
-
-        let result = main
-            .execute(
-                &format!(
-                    "SELECT name, lixcol_branch_id \
-                 FROM engine_by_branch_update_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
-                   AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000011') \
-                 ORDER BY name",
-                    sim.main_branch_id()
-                ),
-                &[],
-            )
-            .await
-            .expect("by-branch query should succeed");
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Text("draft".to_string()),
-                    Value::Text("01930000-0000-7000-8000-000000000011".to_string()),
-                ],
-                vec![
-                    Value::Text("main".to_string()),
-                    Value::Text(sim.main_branch_id().to_string()),
-                ],
-            ],
-        );
-    }
-);
-
-simulation_test!(
-    typed_row_by_branch_dml_rejects_branch_id_alias,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let main = sim.wrap_session(
-            engine
-                .open_session_at(sim.main_branch_id())
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_alias_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
-             false\
-             )",
-            &[],
-        )
-        .await
-        .expect("registered schema insert should succeed");
-
-        main.create_branch(CreateBranchOptions {
-            id: Some("01930000-0000-7000-8000-00000000000f".to_string()),
-            name: "By-branch Alias Draft".to_string(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("draft branch should be created after schema registration");
-
-        main.execute(
-            "INSERT INTO engine_by_branch_alias_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
-            &[],
-        )
-        .await
-        .expect("main row insert should succeed");
-
-        let draft = sim.wrap_session(
-            engine
-                .open_session_at("01930000-0000-7000-8000-00000000000f")
-                .await
-                .expect("draft session should open"),
-            &engine,
-        );
-        draft
-            .execute(
-                "INSERT INTO engine_by_branch_alias_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
-                &[],
-            )
-            .await
-            .expect("draft row insert should succeed");
-
-        let update_error = main
-            .execute(
-                "UPDATE engine_by_branch_alias_scope_schema_by_branch \
-                 SET name = 'updated-via-alias' \
-                 WHERE lixcol_row_pk = '[\"row-1\"]' \
-                   AND branch_id = '01930000-0000-7000-8000-00000000000f'",
-                &[],
-            )
-            .await
-            .expect_err("_by_branch update should not accept branch_id alias");
-        assert_eq!(update_error.code, LixError::CODE_COLUMN_NOT_FOUND);
-
-        let delete_error = main
-            .execute(
-                "DELETE FROM engine_by_branch_alias_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = '[\"row-1\"]' \
-                   AND branch_id = '01930000-0000-7000-8000-00000000000f'",
-                &[],
-            )
-            .await
-            .expect_err("_by_branch delete should not accept branch_id alias");
-        assert_eq!(delete_error.code, LixError::CODE_COLUMN_NOT_FOUND);
-
-        let result = main
-            .execute(
-                &format!(
-                    "SELECT name, lixcol_branch_id \
-                 FROM engine_by_branch_alias_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
-                   AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-00000000000f') \
-                 ORDER BY name",
-                    sim.main_branch_id()
-                ),
-                &[],
-            )
-            .await
-            .expect("by-branch query should succeed");
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Text("draft".to_string()),
-                    Value::Text("01930000-0000-7000-8000-00000000000f".to_string()),
-                ],
-                vec![
-                    Value::Text("main".to_string()),
-                    Value::Text(sim.main_branch_id().to_string()),
-                ],
-            ],
-        );
-    }
-);
 
 simulation_test!(
     typed_row_update_rejects_duplicate_assignments,

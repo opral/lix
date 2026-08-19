@@ -319,18 +319,7 @@ where
                 working_diff::register_working_diff_provider(
                     session,
                     &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::WorkingDiffByBranch => {
-                working_diff::register_working_diff_provider(
-                    session,
-                    &surface.name,
-                    None,
+                    ctx.active_branch_id().to_string(),
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
@@ -341,19 +330,7 @@ where
                 filesystem_working_diff::register_filesystem_working_diff_provider(
                     session,
                     &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                    filesystem_working_diff::FilesystemWorkingDiffKind::File,
-                )
-                .await?;
-            }
-            PublicSurfaceKind::FileWorkingDiffByBranch => {
-                filesystem_working_diff::register_filesystem_working_diff_provider(
-                    session,
-                    &surface.name,
-                    None,
+                    ctx.active_branch_id().to_string(),
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
@@ -365,19 +342,7 @@ where
                 filesystem_working_diff::register_filesystem_working_diff_provider(
                     session,
                     &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                    filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryWorkingDiffByBranch => {
-                filesystem_working_diff::register_filesystem_working_diff_provider(
-                    session,
-                    &surface.name,
-                    None,
+                    ctx.active_branch_id().to_string(),
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
@@ -398,20 +363,6 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.hot_state(),
-                    ctx.filesystem_path_index(),
-                    Arc::clone(&branch_ref),
-                    ctx.blob_reader(),
-                    ctx.plugin_host(),
-                    ctx.functions(),
-                    ctx.session_file_views(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::FileByBranch => {
-                file::register_lix_file_by_branch_provider(
-                    session,
-                    &surface.name,
                     ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
@@ -445,17 +396,6 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::DirectoryByBranch => {
-                directory::register_lix_directory_by_branch_provider(
-                    session,
-                    &surface.name,
-                    ctx.hot_state(),
-                    ctx.filesystem_path_index(),
-                    Arc::clone(&branch_ref),
-                    ctx.functions(),
-                )
-                .await?;
-            }
             PublicSurfaceKind::DirectoryHistory => {
                 directory_history::register_lix_directory_history_surface(
                     session,
@@ -465,9 +405,7 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::SchemaBase { .. }
-            | PublicSurfaceKind::SchemaByBranch { .. }
-            | PublicSurfaceKind::SchemaHistory { .. }
+            PublicSurfaceKind::SchemaBase { .. } | PublicSurfaceKind::SchemaHistory { .. }
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => {}
@@ -580,27 +518,8 @@ async fn register_write_from_catalog(
                 )
                 .await?;
             }
-            PublicSurfaceKind::FileByBranch => {
-                file::register_by_branch_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                    Arc::clone(&branch_ref),
-                    options.clone(),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Directory => {
                 directory::register_active_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                    Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryByBranch => {
-                directory::register_by_branch_write_provider(
                     session,
                     &surface.name,
                     write_ctx.clone(),
@@ -637,16 +556,11 @@ async fn register_write_from_catalog(
             }
             PublicSurfaceKind::Change
             | PublicSurfaceKind::WorkingDiff
-            | PublicSurfaceKind::WorkingDiffByBranch
             | PublicSurfaceKind::FileWorkingDiff
-            | PublicSurfaceKind::FileWorkingDiffByBranch
             | PublicSurfaceKind::DirectoryWorkingDiff
-            | PublicSurfaceKind::DirectoryWorkingDiffByBranch
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
-            PublicSurfaceKind::SchemaBase { .. }
-            | PublicSurfaceKind::SchemaByBranch { .. }
-            | PublicSurfaceKind::SchemaHistory { .. } => {}
+            PublicSurfaceKind::SchemaBase { .. } | PublicSurfaceKind::SchemaHistory { .. } => {}
         }
     }
     schema::register_row_write_providers(session, write_ctx, branch_ref, catalog, selection)
@@ -847,12 +761,9 @@ mod tests {
                 "lix_change",
                 "lix_directory_history",
                 "lix_directory_working_diff",
-                "lix_directory_working_diff_by_branch",
                 "lix_file_history",
                 "lix_file_working_diff",
-                "lix_file_working_diff_by_branch",
                 "lix_working_diff",
-                "lix_working_diff_by_branch",
                 "phase8_row_history",
             ]
         );
@@ -863,19 +774,16 @@ mod tests {
                 "lix_branch",
                 "lix_create_checkpoint",
                 "lix_directory",
-                "lix_directory_by_branch",
                 "lix_file",
-                "lix_file_by_branch",
                 "lix_revert",
                 "phase8_row",
-                "phase8_row_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 30, "previous construction count");
+        assert_eq!(all_read + writable.len(), 21, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            20,
+            14,
             "new construction count"
         );
     }
@@ -894,7 +802,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 8, "previous standalone write count");
+        assert_eq!(all_writable, 6, "previous standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 
@@ -910,37 +818,17 @@ mod tests {
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_file_working_diff",
-            filesystem_working_diff::filesystem_working_diff_schema(false),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_file_working_diff_by_branch",
-            filesystem_working_diff::filesystem_working_diff_schema(true),
+            filesystem_working_diff::filesystem_working_diff_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_directory_working_diff",
-            filesystem_working_diff::filesystem_working_diff_schema(false),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_directory_working_diff_by_branch",
-            filesystem_working_diff::filesystem_working_diff_schema(true),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_file_by_branch",
-            file::lix_file_by_branch_schema(),
+            filesystem_working_diff::filesystem_working_diff_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_directory",
             directory::lix_directory_schema(),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_directory_by_branch",
-            directory::lix_directory_by_branch_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
@@ -955,12 +843,7 @@ mod tests {
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_working_diff",
-            working_diff::working_diff_schema(false),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_working_diff_by_branch",
-            working_diff::working_diff_schema(true),
+            working_diff::working_diff_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
@@ -978,7 +861,7 @@ mod tests {
     fn file_content_surfaces_use_large_binary() {
         let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
 
-        for surface_name in ["lix_file", "lix_file_by_branch", "lix_file_history"] {
+        for surface_name in ["lix_file", "lix_file_history"] {
             let schema = catalog
                 .surface_schema(surface_name)
                 .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
@@ -1029,12 +912,6 @@ mod tests {
         .expect("row providers should register");
 
         assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row").await;
-        assert_registered_table_schema_matches_catalog(
-            &session,
-            &catalog,
-            "phase8_row_by_branch",
-        )
-        .await;
         assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row_history")
             .await;
     }

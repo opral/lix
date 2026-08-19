@@ -37,11 +37,14 @@ export async function openLixWorker(
 	client ??= new LixWorkerClient();
 	client.beginLease(onDisposed, telemetry);
 	try {
-		await client.request({
-			kind: "open",
-			storage,
-			telemetryEnabled: telemetry !== undefined,
-		});
+		await client.request(
+			{
+				kind: "open",
+				storage,
+				telemetryEnabled: telemetry !== undefined,
+			},
+			0,
+		);
 		return client;
 	} catch (error) {
 		await client.terminate();
@@ -68,42 +71,93 @@ export async function openLixWorkerBinding(
 		const binding = await openDirectLixBinding(storage, telemetryDispatch);
 		if (binding) {
 			if (!onDisposed) return binding;
-			let disposed = false;
-			return new Proxy(binding, {
-				get(target, property, receiver) {
-					if (property === "close") {
-						return async () => {
-							try {
-								await target.close();
-							} finally {
-								if (!disposed) {
-									disposed = true;
-									onDisposed();
-								}
-							}
-						};
-					}
-					const value = Reflect.get(target, property, receiver) as unknown;
-					return typeof value === "function" ? value.bind(target) : value;
-				}
-			});
+			return wrapDirectBinding(binding, new DirectBindingLease(onDisposed));
 		}
 	}
 	const client = await openLixWorker(storage, onDisposed, telemetry);
-	return workerBinding(client);
+	return workerBinding(client, new SharedWorkerLease(client), 0);
 }
 
-function workerBinding(client: LixWorkerClient): LixBinding {
+class DirectBindingLease {
+	private references = 1;
+	constructor(private readonly onDisposed: () => void) {}
+	retain(): void {
+		this.references += 1;
+	}
+	release(): void {
+		this.references -= 1;
+		if (this.references === 0) this.onDisposed();
+	}
+}
+
+function wrapDirectBinding(
+	binding: LixBinding,
+	lease: DirectBindingLease,
+): LixBinding {
+	let closed = false;
+	return new Proxy(binding, {
+		get(target, property, receiver) {
+			if (property === "openAnotherSession") {
+				return async (
+					options: Parameters<LixBinding["openAnotherSession"]>[0],
+				) => {
+					const opened = await target.openAnotherSession(options);
+					lease.retain();
+					return wrapDirectBinding(opened, lease);
+				};
+			}
+			if (property === "close") {
+				return async () => {
+					if (closed) return;
+					try {
+						await target.close();
+					} finally {
+						closed = true;
+						lease.release();
+					}
+				};
+			}
+			const value = Reflect.get(target, property, receiver) as unknown;
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+class SharedWorkerLease {
+	private references = 1;
+	constructor(readonly client: LixWorkerClient) {}
+	retain(): void {
+		this.references += 1;
+	}
+	async release(): Promise<void> {
+		this.references -= 1;
+		if (this.references === 0) await releaseWorker(this.client);
+	}
+}
+
+function workerBinding(
+	client: LixWorkerClient,
+	lease: SharedWorkerLease,
+	sessionId: number,
+): LixBinding {
 	let closed = false;
 	const request: RequestWorker = (operation) => {
 		if (closed) return Promise.reject(workerClosedError());
-		return client.request(operation);
+		return client.request(operation, sessionId);
 	};
 	const notify: NotifyWorker = (notification) => {
 		if (!closed) client.notify(notification);
 	};
 
 	return {
+		openAnotherSession: async (options) => {
+			const openedSessionId = await request<number>({
+				kind: "openAnotherSession",
+				options,
+			});
+			lease.retain();
+			return workerBinding(client, lease, openedSessionId);
+		},
 		execute: (sql, params, options) =>
 			request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>
@@ -139,7 +193,7 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 			if (closed) return;
 			await request({ kind: "close" });
 			closed = true;
-			await releaseWorker(client);
+			await lease.release();
 		},
 	};
 }
@@ -217,7 +271,7 @@ export class LixWorkerClient {
 		onDisposed?.();
 	}
 
-	request<T>(operation: WorkerOperation): Promise<T> {
+	request<T>(operation: WorkerOperation, sessionId = 0): Promise<T> {
 		if (this.disposed || !this.leased) {
 			return Promise.reject(workerClosedError());
 		}
@@ -229,7 +283,7 @@ export class LixWorkerClient {
 				reject,
 			});
 			try {
-				this.connection.postMessage({ id, operation });
+				this.connection.postMessage({ id, sessionId, operation });
 			} catch (error) {
 				this.pending.delete(id);
 				if (this.pending.size === 0) this.connection.unref();

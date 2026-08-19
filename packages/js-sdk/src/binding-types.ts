@@ -12,6 +12,7 @@ import type {
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	LixTelemetrySpan,
+	OpenAnotherSessionOptions,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
 import type { LixStorageProvider } from "./storage-adapter.js";
@@ -44,6 +45,7 @@ export type BindingBatchStatement = {
 };
 
 export type LixBinding = {
+	openAnotherSession(options: OpenAnotherSessionOptions): Promise<LixBinding>;
 	execute(
 		sql: string,
 		params: BindingParam[],

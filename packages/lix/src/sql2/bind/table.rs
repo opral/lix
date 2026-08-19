@@ -157,25 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn by_branch_row_exposes_lixcol_branch_id_without_branch_id_alias() {
-        let catalog = catalog();
-        let table = bind_public_table(
-            &catalog,
-            &table_name("SELECT * FROM test_state_schema_by_branch"),
-        )
-        .expect("by-branch row table should bind");
-
-        assert!(matches!(
-            table.surface.kind,
-            PublicSurfaceKind::SchemaByBranch { .. }
-        ));
-        assert!(require_public_column(&table, "lixcol_branch_id").is_ok());
-        let error = require_public_column(&table, "branch_id")
-            .expect_err("by-branch schema surface should not alias branch_id");
-        assert!(error.message.contains("does not exist"));
-    }
-
-    #[test]
     fn quoted_table_names_are_case_sensitive() {
         let catalog = catalog();
 
@@ -236,46 +217,38 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = vec![
             "lix_account",
-            "lix_account_by_branch",
             "lix_account_history",
             "lix_apply",
             "lix_branch",
             "lix_branch_descriptor",
-            "lix_branch_descriptor_by_branch",
             "lix_branch_descriptor_history",
             "lix_branch_ref",
-            "lix_branch_ref_by_branch",
             "lix_branch_ref_history",
             "lix_change",
             "lix_checkpoint",
             "lix_checkpoint_history",
             "lix_commit",
-            "lix_commit_by_branch",
             "lix_commit_edge",
-            "lix_commit_edge_by_branch",
             "lix_create_checkpoint",
             "lix_directory",
-            "lix_directory_by_branch",
             "lix_directory_history",
             "lix_directory_working_diff",
-            "lix_directory_working_diff_by_branch",
             "lix_file",
-            "lix_file_by_branch",
             "lix_file_history",
             "lix_file_working_diff",
-            "lix_file_working_diff_by_branch",
             "lix_key_value",
-            "lix_key_value_by_branch",
             "lix_key_value_history",
             "lix_registered_schema",
-            "lix_registered_schema_by_branch",
             "lix_registered_schema_history",
             "lix_revert",
             "lix_working_diff",
-            "lix_working_diff_by_branch",
         ];
 
         assert_eq!(actual, expected);
+        assert!(
+            actual.iter().all(|name| !name.ends_with("_by_branch")),
+            "the public catalog must not expose explicit-branch table variants"
+        );
     }
 
     #[test]
@@ -283,15 +256,12 @@ mod tests {
         let catalog = PublicCatalog::fixed_system();
         for surface_name in [
             "lix_key_value",
-            "lix_key_value_by_branch",
             "lix_key_value_history",
             "lix_registered_schema",
-            "lix_registered_schema_by_branch",
             "lix_registered_schema_history",
             "lix_checkpoint",
             "lix_checkpoint_history",
             "lix_working_diff",
-            "lix_working_diff_by_branch",
         ] {
             assert!(
                 catalog.surface(surface_name).is_some(),
@@ -299,6 +269,9 @@ mod tests {
             );
         }
         for surface_name in [
+            "lix_key_value_by_branch",
+            "lix_registered_schema_by_branch",
+            "lix_working_diff_by_branch",
             "lix_state",
             "lix_state_by_branch",
             "lix_state_history",

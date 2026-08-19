@@ -64,12 +64,13 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				disconnect,
 				options.telemetry,
 			);
+			const routed = routeStorageBinding(binding);
 			storage.lixStorage.connect({
 				importFilesystemPaths: (paths) =>
-					binding!.importFilesystemPaths(paths),
-				syncDiskToLix: () => binding!.syncDiskToLix(),
+					routed.current().importFilesystemPaths(paths),
+				syncDiskToLix: () => routed.current().syncDiskToLix(),
 			});
-			return new Lix(binding);
+			return new Lix(routed.binding);
 		} catch (error) {
 			disconnect();
 			await binding?.close().catch(() => undefined);
@@ -77,6 +78,43 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		}
 	}
 	throw new TypeError("openLix() requires a Lix storage adapter");
+}
+
+function routeStorageBinding(root: LixBinding): {
+	binding: LixBinding;
+	current(): LixBinding;
+} {
+	const live = new Set<LixBinding>();
+	const wrap = (binding: LixBinding): LixBinding => {
+		live.add(binding);
+		return new Proxy(binding, {
+			get(target, property, receiver) {
+				if (property === "openAnotherSession") {
+					return async (
+						options: Parameters<LixBinding["openAnotherSession"]>[0],
+					) => wrap(await target.openAnotherSession(options));
+				}
+				if (property === "close") {
+					return async () => {
+						try {
+							await target.close();
+						} finally {
+							live.delete(target);
+						}
+					};
+				}
+				const value = Reflect.get(target, property, receiver) as unknown;
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+	};
+	return {
+		binding: wrap(root),
+		current: () => {
+			const bindings = [...live];
+			return bindings[bindings.length - 1] ?? root;
+		},
+	};
 }
 
 async function openJsProviderStorage(

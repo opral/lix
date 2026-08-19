@@ -25,23 +25,17 @@ impl PublicSurfaceContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicSurfaceKind {
     SchemaBase { schema_key: String },
-    SchemaByBranch { schema_key: String },
     SchemaHistory { schema_key: String },
     File,
-    FileByBranch,
     FileHistory,
     Directory,
-    DirectoryByBranch,
     DirectoryHistory,
     Branch,
     WorkingDiff,
-    WorkingDiffByBranch,
     Revert,
     Apply,
     CreateCheckpoint,
     FileWorkingDiff,
-    FileWorkingDiffByBranch,
     DirectoryWorkingDiff,
-    DirectoryWorkingDiffByBranch,
     Change,
 }

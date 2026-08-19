@@ -1953,11 +1953,7 @@ async fn execute_row_write(
     surface: &RowWriteSurface,
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
-    let schema_key = match surface {
-        RowWriteSurface::Base { schema_key } | RowWriteSurface::ByBranch { schema_key } => {
-            schema_key
-        }
-    };
+    let RowWriteSurface::Base { schema_key } = surface;
     reject_read_only_schema_surface(schema_key, row_action(&plan.bound.op))
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
 
@@ -2808,11 +2804,7 @@ pub(crate) fn prepare_path_value_replacement_program_from_logical(
     let BoundWriteTarget::Row(surface) = &plan.bound.target else {
         return None;
     };
-    let schema_key = match surface {
-        RowWriteSurface::Base { schema_key } | RowWriteSurface::ByBranch { schema_key } => {
-            schema_key
-        }
-    };
+    let RowWriteSurface::Base { schema_key } = surface;
     let catalog = ctx.public_catalog().ok()?;
     let spec = catalog.schema_spec(schema_key)?;
     prepare_path_value_replacement_program(ctx, plan, spec)
@@ -3295,7 +3287,6 @@ fn append_row_update_row<'a>(
     )? {
         return Ok(false);
     }
-    reject_projected_global_write(plan, candidate, "UPDATE")?;
     let mut updated = snapshot.clone();
     let mut visible_assignments = Vec::new();
     for assignment in &plan.bound.assignments {
@@ -3369,7 +3360,6 @@ async fn row_delete(
             params,
             active_branch_commit_id,
         )? {
-            reject_projected_global_write(plan, candidate, "DELETE")?;
             if let (Some(returning), Some(rows)) =
                 (plan.bound.returning.as_ref(), returning_rows.as_mut())
             {
@@ -3606,7 +3596,7 @@ async fn stage_rows(
 }
 
 fn validate_insert_conflict_target(
-    plan: &LogicalWritePlan,
+    _plan: &LogicalWritePlan,
     spec: &SchemaSurfaceSpec,
     conflict: &BoundInsertConflict,
 ) -> Result<(), LixError> {
@@ -3617,7 +3607,7 @@ fn validate_insert_conflict_target(
         ));
     }
 
-    let mut expected = spec
+    let expected = spec
         .primary_key_paths
         .iter()
         .map(|path| {
@@ -3630,13 +3620,6 @@ fn validate_insert_conflict_target(
             Ok(path[0].clone())
         })
         .collect::<Result<std::collections::BTreeSet<_>, LixError>>()?;
-    if matches!(
-        plan.bound.target,
-        BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
-    ) {
-        expected.insert("lixcol_branch_id".to_string());
-    }
-
     let actual = conflict
         .target_columns
         .iter()
@@ -4067,7 +4050,6 @@ enum InsertColumnTarget {
     Metadata,
     Global,
     Untracked,
-    BranchId,
 }
 
 impl InsertRowLayout {
@@ -4098,7 +4080,6 @@ impl InsertRowLayout {
                     "lixcol_metadata" => InsertColumnTarget::Metadata,
                     "lixcol_global" => InsertColumnTarget::Global,
                     "lixcol_untracked" => InsertColumnTarget::Untracked,
-                    "lixcol_branch_id" => InsertColumnTarget::BranchId,
                     _ => {
                         return Err(LixError::new(
                             LixError::CODE_UNSUPPORTED_SQL,
@@ -5081,7 +5062,6 @@ fn certified_row_insert_rows<'a>(
             let mut metadata = None;
             let mut global = None;
             let mut untracked = None;
-            let mut explicit_branch_id = None;
             for (index, (expr, target)) in row.iter().zip(layout.columns.iter()).enumerate() {
                 if let InsertColumnTarget::Visible { column_type, .. } = target {
                     reject_direct_blob_json_value(expr, *column_type, params)?;
@@ -5158,9 +5138,6 @@ fn certified_row_insert_rows<'a>(
                     }
                     InsertColumnTarget::Untracked => {
                         untracked = bool_value(value, "lixcol_untracked")?;
-                    }
-                    InsertColumnTarget::BranchId => {
-                        explicit_branch_id = text_value(value, "lixcol_branch_id")?;
                     }
                 }
             }
@@ -5254,7 +5231,7 @@ fn certified_row_insert_rows<'a>(
                 metadata,
                 global,
                 untracked: untracked.unwrap_or(false),
-                branch_id: row_branch_id(plan, explicit_branch_id, global)?.into(),
+                branch_id: row_branch_id(plan, global)?.into(),
             };
             if !unique_identities.insert((
                 certified.row_pk.clone(),
@@ -5335,7 +5312,6 @@ fn append_row_insert_row(
     let mut metadata = None;
     let mut global = None;
     let mut untracked = None;
-    let mut explicit_branch_id = None;
     let context = RowEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
 
     for (expr, target) in row.iter().zip(layout.columns.iter()) {
@@ -5408,9 +5384,6 @@ fn append_row_insert_row(
             InsertColumnTarget::Untracked => {
                 untracked = bool_value(value, "lixcol_untracked")?;
             }
-            InsertColumnTarget::BranchId => {
-                explicit_branch_id = text_value(value, "lixcol_branch_id")?;
-            }
         }
     }
 
@@ -5453,7 +5426,7 @@ fn append_row_insert_row(
         row_pk = Some(derived_row_pk);
     }
     let global = global.unwrap_or(false);
-    let branch_id = row_branch_id(plan, explicit_branch_id, global)?;
+    let branch_id = row_branch_id(plan, global)?;
     rows.push_parts(
         row_pk,
         layout.schema_key.as_str().into(),
@@ -5496,27 +5469,6 @@ fn populate_registered_schema_key(
             )
         })?;
     snapshot.insert("schema_key".into(), JsonValue::String(key));
-    Ok(())
-}
-
-fn reject_projected_global_write<'a>(
-    plan: &LogicalWritePlan,
-    row: impl Into<RowLiveRowRef<'a>>,
-    action: &str,
-) -> Result<(), LixError> {
-    let row = row.into();
-    let target_is_by_branch = matches!(
-        &plan.bound.target,
-        BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
-    );
-    if target_is_by_branch && row.global() && row.branch_id() != crate::GLOBAL_BRANCH_ID {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            format!(
-                "{action} through a row by-branch surface cannot mutate a projected global row"
-            ),
-        ));
-    }
     Ok(())
 }
 
@@ -5674,12 +5626,6 @@ impl<'a> RowEvalRowRef<'a> {
         }
     }
 
-    fn branch_id(self) -> &'a str {
-        match self {
-            Self::Live(row) => row.branch_id(),
-            Self::Staged(row) => row.branch_id.as_str(),
-        }
-    }
 }
 
 impl<'a> RowEvalContext<'a> {
@@ -6950,9 +6896,6 @@ fn column_eval_value(
             .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_global" => Ok(RowEvalValue::Json(JsonValue::Bool(row.global()))),
         "lixcol_untracked" => Ok(RowEvalValue::Json(JsonValue::Bool(row.untracked()))),
-        "lixcol_branch_id" => Ok(RowEvalValue::Json(JsonValue::String(
-            row.branch_id().to_string(),
-        ))),
         _ => Ok(RowEvalValue::SqlNull),
     }
 }
@@ -6999,9 +6942,6 @@ fn excluded_column_eval_value(
             .map(|metadata| metadata.unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_global" => Ok(RowEvalValue::Json(JsonValue::Bool(row.global))),
         "lixcol_untracked" => Ok(RowEvalValue::Json(JsonValue::Bool(row.untracked))),
-        "lixcol_branch_id" => Ok(RowEvalValue::Json(JsonValue::String(
-            row.branch_id.to_string(),
-        ))),
         _ => Ok(RowEvalValue::SqlNull),
     }
 }
@@ -7021,15 +6961,6 @@ fn visible_column_eval_value(
 fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
     Ok(match scope {
         BranchScope::Active { branch_id } => vec![branch_id.clone()],
-        BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids } => {
-            branch_ids.iter().cloned().collect()
-        }
-        BranchScope::ExplicitDynamic { .. } | BranchScope::ExplicitRequiredDynamic { .. } => {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "parameterized branch scope was not resolved before write execution",
-            ));
-        }
         BranchScope::Global => vec![crate::GLOBAL_BRANCH_ID.to_string()],
         BranchScope::Empty => Vec::new(),
     })
@@ -7037,105 +6968,14 @@ fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
 
 fn row_branch_id(
     plan: &LogicalWritePlan,
-    explicit_branch_id: Option<String>,
     global: bool,
 ) -> Result<String, LixError> {
     if global {
-        let target_branch_ids = insert_target_branch_ids(&plan.bound.branch_scope);
-        let target_is_by_branch = matches!(
-            &plan.bound.target,
-            BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
-        );
-        if explicit_branch_id
-            .as_deref()
-            .is_some_and(|branch_id| branch_id != crate::GLOBAL_BRANCH_ID)
-        {
-            return Err(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                "row INSERT cannot combine lixcol_global = true with a non-global lixcol_branch_id",
-            ));
-        }
-        if target_is_by_branch
-            && target_branch_ids.iter().any(|branch_ids| {
-                !branch_ids
-                    .iter()
-                    .any(|branch_id| branch_id == crate::GLOBAL_BRANCH_ID)
-            })
-        {
-            return Err(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                "row INSERT cannot combine lixcol_global = true with a non-global target branch",
-            ));
-        }
         return Ok(crate::GLOBAL_BRANCH_ID.to_string());
-    }
-    if explicit_branch_id.as_deref() == Some(crate::GLOBAL_BRANCH_ID) {
-        return Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            "row INSERT with lixcol_branch_id = 'global' must also set lixcol_global = true",
-        ));
-    }
-    let target_is_by_branch = matches!(
-        &plan.bound.target,
-        BoundWriteTarget::Row(RowWriteSurface::ByBranch { .. })
-    );
-    if target_is_by_branch && matches!(plan.bound.branch_scope, BranchScope::Global) {
-        return Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            "row INSERT into the global scope must set lixcol_global = true",
-        ));
-    }
-    if let Some(branch_id) = explicit_branch_id {
-        if target_is_by_branch {
-            let target_branch_ids = insert_target_branch_ids(&plan.bound.branch_scope);
-            if let Some(target_branch_ids) = &target_branch_ids {
-                if !target_branch_ids.contains(&branch_id) {
-                    return Err(LixError::new(
-                        LixError::CODE_TYPE_MISMATCH,
-                        format!(
-                            "row INSERT lixcol_branch_id '{branch_id}' does not match the target branch scope"
-                        ),
-                    ));
-                }
-            } else {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "row INSERT has no target branch scope",
-                ));
-            }
-        }
-        return Ok(branch_id);
     }
     match &plan.bound.branch_scope {
         BranchScope::Active { branch_id } => Ok(branch_id.clone()),
-        BranchScope::ExplicitRequired { branch_ids } | BranchScope::Explicit { branch_ids }
-            if branch_ids.len() == 1 =>
-        {
-            Ok(branch_ids.iter().next().expect("len checked").clone())
-        }
-        BranchScope::ExplicitDynamic { .. } | BranchScope::ExplicitRequiredDynamic { .. } => {
-            Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "parameterized branch scope was not resolved before write execution",
-            ))
-        }
         BranchScope::Global | BranchScope::Empty => Ok(crate::GLOBAL_BRANCH_ID.to_string()),
-        _ => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "row write requires exactly one target branch",
-        )),
-    }
-}
-
-fn insert_target_branch_ids(scope: &BranchScope) -> Option<Vec<String>> {
-    match scope {
-        BranchScope::Active { branch_id } => Some(vec![branch_id.clone()]),
-        BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids } => {
-            Some(branch_ids.iter().cloned().collect())
-        }
-        BranchScope::ExplicitDynamic { .. } | BranchScope::ExplicitRequiredDynamic { .. } => None,
-        BranchScope::Global => Some(vec![crate::GLOBAL_BRANCH_ID.to_string()]),
-        BranchScope::Empty => Some(Vec::new()),
     }
 }
 

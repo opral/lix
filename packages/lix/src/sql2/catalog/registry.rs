@@ -100,18 +100,15 @@ impl PublicCatalog {
     pub(crate) fn surface_schema(&self, table_name: &str) -> Option<SchemaRef> {
         let surface = self.surface(table_name)?;
         Some(match &surface.kind {
-            PublicSurfaceKind::File => filesystem_schema(false, true),
-            PublicSurfaceKind::FileByBranch => filesystem_schema(true, true),
-            PublicSurfaceKind::Directory => filesystem_schema(false, false),
-            PublicSurfaceKind::DirectoryByBranch => filesystem_schema(true, false),
+            PublicSurfaceKind::File => filesystem_schema(true),
+            PublicSurfaceKind::Directory => filesystem_schema(false),
             PublicSurfaceKind::Branch => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("name", DataType::Utf8, false),
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
-            PublicSurfaceKind::WorkingDiff => working_diff_schema(false),
-            PublicSurfaceKind::WorkingDiffByBranch => working_diff_schema(true),
+            PublicSurfaceKind::WorkingDiff => working_diff_schema(),
             PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![Field::new(
@@ -120,11 +117,7 @@ impl PublicCatalog {
                 false,
             )])),
             PublicSurfaceKind::FileWorkingDiff | PublicSurfaceKind::DirectoryWorkingDiff => {
-                filesystem_working_diff_schema(false)
-            }
-            PublicSurfaceKind::FileWorkingDiffByBranch
-            | PublicSurfaceKind::DirectoryWorkingDiffByBranch => {
-                filesystem_working_diff_schema(true)
+                filesystem_working_diff_schema()
             }
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -141,9 +134,6 @@ impl PublicCatalog {
             PublicSurfaceKind::DirectoryHistory => history_filesystem_schema(false),
             PublicSurfaceKind::SchemaBase { schema_key } => {
                 schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::Active)
-            }
-            PublicSurfaceKind::SchemaByBranch { schema_key } => {
-                schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::ByBranch)
             }
             PublicSurfaceKind::SchemaHistory { schema_key } => {
                 schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::History)
@@ -180,25 +170,13 @@ impl PublicCatalog {
         self.insert(surface(
             "lix_file",
             PublicSurfaceKind::File,
-            filesystem_columns(false),
-            SurfaceCapabilities::read_write(),
-        ))?;
-        self.insert(surface(
-            "lix_file_by_branch",
-            PublicSurfaceKind::FileByBranch,
-            filesystem_columns(true),
+            filesystem_columns(),
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
             "lix_directory",
             PublicSurfaceKind::Directory,
-            directory_columns(false),
-            SurfaceCapabilities::read_write(),
-        ))?;
-        self.insert(surface(
-            "lix_directory_by_branch",
-            PublicSurfaceKind::DirectoryByBranch,
-            directory_columns(true),
+            directory_columns(),
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
@@ -243,21 +221,6 @@ impl PublicCatalog {
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
-        self.insert(surface(
-            "lix_working_diff_by_branch",
-            PublicSurfaceKind::WorkingDiffByBranch,
-            public_columns([
-                ("diff_id", false),
-                ("row_pk", false),
-                ("schema_key", false),
-                ("file_id", true),
-                ("diff_type", false),
-                ("before_change_id", true),
-                ("after_change_id", true),
-                ("lixcol_branch_id", false),
-            ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
         for (name, kind) in [
             ("lix_revert", PublicSurfaceKind::Revert),
             ("lix_apply", PublicSurfaceKind::Apply),
@@ -277,37 +240,22 @@ impl PublicCatalog {
                 },
             ))?;
         }
-        for (name, kind, by_branch) in [
+        for (name, kind) in [
             (
                 "lix_file_working_diff",
                 PublicSurfaceKind::FileWorkingDiff,
-                false,
-            ),
-            (
-                "lix_file_working_diff_by_branch",
-                PublicSurfaceKind::FileWorkingDiffByBranch,
-                true,
             ),
             (
                 "lix_directory_working_diff",
                 PublicSurfaceKind::DirectoryWorkingDiff,
-                false,
-            ),
-            (
-                "lix_directory_working_diff_by_branch",
-                PublicSurfaceKind::DirectoryWorkingDiffByBranch,
-                true,
             ),
         ] {
-            let mut columns = vec![
+            let columns = vec![
                 ("id", false),
                 ("path", true),
                 ("previous_path", true),
                 ("change_kind", false),
             ];
-            if by_branch {
-                columns.push(("lixcol_branch_id", false));
-            }
             self.insert(surface(
                 name,
                 kind,
@@ -357,7 +305,7 @@ impl PublicCatalog {
         }
 
         let mut columns = row_columns(&spec);
-        columns.extend(row_hidden_columns(&spec, false));
+        columns.extend(row_hidden_columns(&spec));
         let capabilities = if crate::sql2::read_only::is_read_only_schema_surface(&spec.schema_key)
         {
             SurfaceCapabilities::read_only()
@@ -373,20 +321,6 @@ impl PublicCatalog {
             columns,
             capabilities.clone(),
         ))?;
-
-        if spec.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY {
-            let mut by_branch_columns = row_columns(&spec);
-            by_branch_columns.extend(row_hidden_columns(&spec, true));
-
-            self.insert(surface(
-                format!("{}_by_branch", spec.schema_key),
-                PublicSurfaceKind::SchemaByBranch {
-                    schema_key: spec.schema_key.clone(),
-                },
-                by_branch_columns,
-                capabilities,
-            ))?;
-        }
 
         if schema_exposed_as_history_surface(&spec.schema_key) {
             let history_identity_roots = primary_key_roots(&spec);
@@ -418,8 +352,8 @@ impl PublicCatalog {
 }
 
 #[cfg(test)]
-fn working_diff_schema(by_branch: bool) -> SchemaRef {
-    let mut fields = vec![
+fn working_diff_schema() -> SchemaRef {
+    let fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
         json_field("row_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
@@ -428,14 +362,11 @@ fn working_diff_schema(by_branch: bool) -> SchemaRef {
         Field::new("before_change_id", DataType::Utf8, true),
         Field::new("after_change_id", DataType::Utf8, true),
     ];
-    if by_branch {
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    }
     Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
-fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
+fn filesystem_schema(include_data: bool) -> SchemaRef {
     let mut fields = if include_data {
         vec![
             Field::new("id", DataType::Utf8, true),
@@ -464,9 +395,6 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
         Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]);
-    if by_branch {
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    }
     Arc::new(Schema::new(fields))
 }
 
@@ -556,7 +484,7 @@ fn row_columns(spec: &SchemaSurfaceSpec) -> Vec<PublicColumn> {
         .collect()
 }
 
-fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
+fn filesystem_columns() -> Vec<PublicColumn> {
     let mut columns = vec![
         PublicColumn::public_insert_only("id", false).with_default("uuidv7()"),
         PublicColumn::public("path", false).conditional_on_insert(),
@@ -564,34 +492,27 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::public("name", false).conditional_on_insert(),
         PublicColumn::public("content", false).with_default("CAST('' AS BYTEA)"),
     ];
-    columns.extend(filesystem_hidden_columns(by_branch));
+    columns.extend(filesystem_hidden_columns());
     columns
 }
 
-fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
+fn directory_columns() -> Vec<PublicColumn> {
     let mut columns = vec![
         PublicColumn::public_insert_only("id", false).with_default("uuidv7()"),
         PublicColumn::public("path", true).conditional_on_insert(),
         PublicColumn::public("parent_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
     ];
-    columns.extend(filesystem_hidden_columns(by_branch));
+    columns.extend(filesystem_hidden_columns());
     columns
 }
 
-fn row_hidden_columns(spec: &SchemaSurfaceSpec, by_branch: bool) -> Vec<PublicColumn> {
-    row_system_columns(
-        spec,
-        if by_branch {
-            SchemaSurfaceShape::ByBranch
-        } else {
-            SchemaSurfaceShape::Active
-        },
-    )
+fn row_hidden_columns(spec: &SchemaSurfaceSpec) -> Vec<PublicColumn> {
+    row_system_columns(spec, SchemaSurfaceShape::Active)
 }
 
-fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
-    let mut columns = vec![
+fn filesystem_hidden_columns() -> Vec<PublicColumn> {
+    vec![
         PublicColumn::hidden("lixcol_row_pk", false),
         PublicColumn::hidden("lixcol_schema_key", false),
         PublicColumn::hidden("lixcol_file_id", true),
@@ -602,11 +523,7 @@ fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::hidden("lixcol_commit_id", true),
         PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
-    ];
-    if by_branch {
-        columns.push(PublicColumn::public_insert_only("lixcol_branch_id", false));
-    }
-    columns
+    ]
 }
 
 fn row_system_columns(
@@ -620,7 +537,7 @@ fn row_system_columns(
     } else {
         row_pk.conditional_on_insert()
     };
-    let mut columns = vec![
+    vec![
         row_pk,
         PublicColumn::public_read_only("lixcol_schema_key", false),
         PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
@@ -631,11 +548,7 @@ fn row_system_columns(
         PublicColumn::public_read_only("lixcol_change_id", true),
         PublicColumn::public_read_only("lixcol_commit_id", true),
         PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
-    ];
-    if variant == SchemaSurfaceShape::ByBranch {
-        columns.push(PublicColumn::public_insert_only("lixcol_branch_id", false));
-    }
-    columns
+    ]
 }
 
 fn row_history_system_columns() -> Vec<PublicColumn> {

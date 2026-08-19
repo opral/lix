@@ -65,6 +65,22 @@ let bob = alice
     .await?;
 ```
 
+JavaScript applications use the equivalent `openAnotherSession()` method:
+
+```ts
+const main = await openLix();
+const review = await main.openAnotherSession({
+  branchId: reviewBranchId,
+  accountId: reviewerAccountId,
+});
+```
+
+The returned `Lix` has its own active branch, account, transactions,
+observations, and close lifecycle while sharing the repository storage. Closing
+either handle does not close the other. Remote sessions always use the server's
+authenticated account; `accountId` may only restate that identity in remote
+mode.
+
 ## Live editing and branches
 
 Use the same branch when collaborators should see each other's accepted writes
@@ -84,4 +100,3 @@ Branches and observations solve different problems:
 Lix synchronizes repository data. Cursor positions, selections, typing status,
 and user avatars are temporary presence data. Lix does not provide them. Send
 them through your application's real-time presence service.
-
