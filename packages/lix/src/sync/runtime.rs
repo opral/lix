@@ -6,9 +6,6 @@ use std::time::Duration;
 
 use futures_util::{FutureExt, select_biased};
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
-
 use crate::storage_adapter::Storage;
 use crate::{Lix, LixError};
 
@@ -461,7 +458,6 @@ async fn run_sync_worker<StorageImpl>(
                 retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
             }
             Err(error) => {
-                report_browser_sync_error("iteration", &error);
                 if is_terminal_sync_error(&error) {
                     tracing::error!(error = ?error, "sync repository cannot make progress");
                     break;
@@ -479,25 +475,6 @@ async fn run_sync_worker<StorageImpl>(
         }
     }
 }
-
-#[cfg(target_arch = "wasm32")]
-fn report_browser_sync_error(stage: &str, error: &LixError) {
-    let global = js_sys::global();
-    let Ok(console) = js_sys::Reflect::get(&global, &"console".into()) else {
-        return;
-    };
-    let Ok(warn) = js_sys::Reflect::get(&console, &"warn".into()) else {
-        return;
-    };
-    let Ok(warn) = warn.dyn_into::<js_sys::Function>() else {
-        return;
-    };
-    let message = format!("Lix sync {stage} failed: {error:?}");
-    let _ = warn.call1(&console, &message.into());
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn report_browser_sync_error(_stage: &str, _error: &LixError) {}
 
 #[derive(Debug)]
 enum IterationResult {
