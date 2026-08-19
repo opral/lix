@@ -174,6 +174,10 @@ mod tests {
         let table = bind_public_table(&catalog, &table_name("SELECT * FROM lix_file"))
             .expect("lix_file should bind");
 
+        require_public_column(&table, "lixcol_created_at")
+            .expect("filesystem created timestamp should be public");
+        require_public_column(&table, "lixcol_updated_at")
+            .expect("filesystem updated timestamp should be public");
         let error = require_public_column(&table, "lixcol_schema_key")
             .expect_err("hidden column should not bind");
         assert!(error.message.contains("not part of public SQL surface"));

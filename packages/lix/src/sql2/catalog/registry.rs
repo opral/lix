@@ -492,7 +492,7 @@ fn filesystem_columns() -> Vec<PublicColumn> {
         PublicColumn::public("name", false).conditional_on_insert(),
         PublicColumn::public("content", false).with_default("CAST('' AS BYTEA)"),
     ];
-    columns.extend(filesystem_hidden_columns());
+    columns.extend(filesystem_system_columns());
     columns
 }
 
@@ -503,7 +503,7 @@ fn directory_columns() -> Vec<PublicColumn> {
         PublicColumn::public("parent_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
     ];
-    columns.extend(filesystem_hidden_columns());
+    columns.extend(filesystem_system_columns());
     columns
 }
 
@@ -511,15 +511,15 @@ fn row_hidden_columns(spec: &SchemaSurfaceSpec) -> Vec<PublicColumn> {
     row_system_columns(spec, SchemaSurfaceShape::Active)
 }
 
-fn filesystem_hidden_columns() -> Vec<PublicColumn> {
+fn filesystem_system_columns() -> Vec<PublicColumn> {
     vec![
         PublicColumn::hidden("lixcol_row_pk", false),
         PublicColumn::hidden("lixcol_schema_key", false),
         PublicColumn::hidden("lixcol_file_id", true),
         PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
         PublicColumn::public_read_only("lixcol_change_id", true),
-        PublicColumn::hidden("lixcol_created_at", false),
-        PublicColumn::hidden("lixcol_updated_at", false),
+        PublicColumn::public_read_only("lixcol_created_at", false),
+        PublicColumn::public_read_only("lixcol_updated_at", false),
         PublicColumn::hidden("lixcol_commit_id", true),
         PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
