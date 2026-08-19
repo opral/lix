@@ -537,11 +537,10 @@ pub(crate) fn row_pk_satisfies_bounds(
     lower: Option<&RowPkRangeBound>,
     upper: Option<&RowPkRangeBound>,
 ) -> bool {
-    lower.is_none_or(|bound| {
-        row_pk > &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
-    }) && upper.is_none_or(|bound| {
-        row_pk < &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
-    })
+    lower.is_none_or(|bound| row_pk > &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk))
+        && upper.is_none_or(|bound| {
+            row_pk < &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
+        })
 }
 
 /// Requested property set for a tracked-state scan.

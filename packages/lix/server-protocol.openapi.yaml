@@ -79,59 +79,138 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ExecuteResponse" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/sync/admit:
+  /lix/v1/sync/push:
     post:
-      operationId: syncAdmit
-      description: Durably admits one row-first transaction pack into the session branch.
+      operationId: syncPush
+      description: Atomically stores at most 512 total immutable commits plus compare-and-swap branch-ref updates. Commit identity makes retries idempotent; oversized batches must be split on dependency-complete boundaries.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
-        - $ref: "#/components/parameters/RequiredIdempotencyKey"
       requestBody:
         required: true
         content:
-          application/json: { schema: { $ref: "#/components/schemas/SyncTransactionPack" } }
+          application/json: { schema: { $ref: "#/components/schemas/SyncPushRequest" } }
       responses:
         "200":
-          description: The pack was admitted, or its durable receipt was replayed.
-          content:
-            application/json: { schema: { $ref: "#/components/schemas/SyncAdmitResponse" } }
+          description: The commit and branch advancement are durable.
+          content: { application/json: { schema: { $ref: "#/components/schemas/SyncPushResponse" } } }
+        "409":
+          description: The branch no longer has the expected head, or an immutable identity names different content.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/sync/pull:
     get:
       operationId: syncPull
-      description: Pulls canonical row-first transaction packs after a durable branch cursor. Event-bearing pulls are mandatory long-polls: they block until the branch head advances or the server heartbeat expires. A limit=0 request is metadata-only and returns the current head without an event page.
+      description: Returns a hot-state snapshot when after is omitted. Otherwise long-polls complete repository commit/ref events after a repository cursor.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - name: after
           in: query
-          schema: { type: integer, minimum: 0, default: 0 }
+          schema: { type: integer, minimum: 0 }
         - name: limit
           in: query
-          schema: { type: integer, minimum: 0, maximum: 512, default: 128 }
-        - name: schemas
+          schema: { type: integer, minimum: 1, maximum: 512, default: 128 }
+        - name: snapshotBranchId
           in: query
-          description: Comma-separated semantic schema keys to hydrate. Omit for an unscoped topology pull; use limit=0 only for a metadata-only head probe.
-          schema: { type: string, maxLength: 16384 }
+          schema: { type: string, minLength: 1 }
+          description: With snapshotHeadCommitId, requests a stateless hot-row page pinned to this branch.
+        - name: snapshotHeadCommitId
+          in: query
+          schema: { type: string, minLength: 1 }
+          description: Immutable branch head used to serve a stable snapshot row page.
+        - name: snapshotAfter
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 4096 }
+          description: Opaque continuation returned by the preceding row page.
       responses:
         "200":
-          description: The next ordered page and the current authoritative head.
-          content:
-            application/json: { schema: { $ref: "#/components/schemas/SyncPullResponse" } }
-        default: { $ref: "#/components/responses/Error" }
-  /lix/v1/sync/branches:
-    get:
-      operationId: syncBranches
-      description: Lists the authoritative branch catalog for the repository.
-      parameters:
-        - $ref: "#/components/parameters/RequiredSessionId"
-      responses:
-        "200":
-          description: Branch IDs, names, heads, and visibility flags.
+          description: Pinned hot metadata, one immutable row page, or the next ordered repository event page.
           content:
             application/json:
               schema:
-                type: array
-                items: { $ref: "#/components/schemas/SyncBranch" }
+                oneOf:
+                  - { $ref: "#/components/schemas/SyncPullResponse" }
+                  - { $ref: "#/components/schemas/SyncSnapshotRowPage" }
+        "413":
+          description: The encoded response exceeds the 64 MiB protocol limit.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/sync/history:
+    get:
+      operationId: syncHistory
+      description: Fetches exact immutable historical commits without changing live sync state.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - name: commitId
+          in: query
+          required: true
+          schema: { type: array, minItems: 1, maxItems: 128, items: { type: string, minLength: 1, maxLength: 255 } }
+          style: form
+          explode: true
+      responses:
+        "200":
+          description: The requested commits that exist and the identities that are absent.
+          content: { application/json: { schema: { $ref: "#/components/schemas/SyncHistoryResponse" } } }
+        "413":
+          description: The encoded response exceeds the 64 MiB protocol limit.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/sync/blob:
+    get:
+      operationId: syncGetBlob
+      description: Loads one canonical FastCDC manifest by its BLAKE3-derived blob identity.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/BlobId"
+      responses:
+        "200":
+          description: Canonical flat manifest for the registered blob.
+          content: { application/json: { schema: { $ref: "#/components/schemas/SyncBlobManifest" } } }
+        "404": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      operationId: syncRegisterBlob
+      description: Reports missing chunks, or atomically registers a complete verified manifest.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/SyncBlobManifest" } }
+      responses:
+        "200":
+          description: Missing chunks to upload, or confirmation that the blob is complete.
+          content: { application/json: { schema: { $ref: "#/components/schemas/SyncBlobRegistration" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/sync/chunk:
+    get:
+      operationId: syncGetChunk
+      description: Loads one authenticated raw BLAKE3-addressed chunk.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/ChunkId"
+      responses:
+        "200":
+          description: Exact raw chunk bytes.
+          headers:
+            Cache-Control: { schema: { type: string } }
+          content:
+            application/octet-stream:
+              schema: { type: string, contentEncoding: binary, minLength: 1, maxLength: 4194304 }
+        "404": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+    put:
+      operationId: syncPutChunk
+      description: Stores raw bytes only when their BLAKE3 digest equals chunkId.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/ChunkId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, contentEncoding: binary, minLength: 1, maxLength: 4194304 }
+      responses:
+        "204": { description: Chunk is durably present. }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/transaction/begin:
     post:
@@ -351,6 +430,16 @@ components:
       in: query
       required: true
       schema: { type: string, minLength: 1 }
+    BlobId:
+      name: blobId
+      in: query
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+    ChunkId:
+      name: chunkId
+      in: query
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
   responses:
     Execute:
       description: SQL result.
@@ -382,13 +471,16 @@ components:
         sessionId: { type: string }
         capabilities:
           type: object
-          required: [binaryFileUpsert, binaryFileUpsertBatch, binaryFileRead, syncAdmission, syncPull]
+          required: [binaryFileUpsert, binaryFileUpsertBatch, binaryFileRead, syncPush, syncPull, syncHistory, syncBlob, syncChunk]
           properties:
             binaryFileUpsert: { type: boolean }
             binaryFileUpsertBatch: { type: boolean }
             binaryFileRead: { type: boolean }
-            syncAdmission: { type: boolean }
+            syncPush: { type: boolean }
             syncPull: { type: boolean }
+            syncHistory: { type: boolean }
+            syncBlob: { type: boolean }
+            syncChunk: { type: boolean }
     ExecuteOptions:
       type: object
       properties: { originKey: { type: string } }
@@ -415,86 +507,188 @@ components:
         rows: { type: array, items: { type: array, items: {} } }
         rowsAffected: { type: integer, minimum: 0 }
         notices: { type: array, items: { type: object } }
-    SyncRowMutation:
+    SyncRowPkPart:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, value]
+          properties:
+            type: { const: uuid }
+            value: { type: string, format: uuid }
+        - type: object
+          additionalProperties: false
+          required: [type, value]
+          properties:
+            type: { const: integer }
+            value: { type: integer }
+        - type: object
+          additionalProperties: false
+          required: [type, value]
+          properties:
+            type: { const: string }
+            value: { type: string }
+        - type: object
+          additionalProperties: false
+          required: [type, value]
+          properties:
+            type: { const: bytes }
+            value: { type: string, contentEncoding: base64 }
+    SyncRowPk:
+      type: array
+      minItems: 1
+      items: { $ref: "#/components/schemas/SyncRowPkPart" }
+      description: Lossless typed primary-key components in declared primary-key order.
+    SyncCommitMember:
       type: object
-      required: [schemaKey, rowPk]
+      required: [changeId, authored, schemaKey, rowPk, deleted, rowCreatedAt, rowUpdatedAt, changeAccountId, changeCreatedAt]
       properties:
+        changeId: { type: string, minLength: 1 }
+        authored: { type: boolean }
         schemaKey: { type: string, minLength: 1, maxLength: 255 }
         fileId: { type: [string, "null"], maxLength: 255 }
-        rowPk: {}
+        rowPk: { $ref: "#/components/schemas/SyncRowPk" }
+        deleted: { type: boolean }
         snapshot: {}
         metadata: {}
-    SyncFileMutation:
+        rowCreatedAt: { type: string, minLength: 1 }
+        rowUpdatedAt: { type: string, minLength: 1 }
+        changeAccountId: { type: string, minLength: 1 }
+        changeCreatedAt: { type: string, minLength: 1 }
+        originKey: { type: [string, "null"] }
+    SyncCommit:
       type: object
-      required: [fileId, path, global, untracked, content]
+      required: [commitId, parentCommitIds, accountId, createdAt, selectedSourceCommitId, members]
       properties:
-        fileId: { type: string, minLength: 1, maxLength: 255 }
-        path: { type: string, minLength: 1, maxLength: 4096 }
-        filename: { type: [string, "null"], maxLength: 4096 }
-        global: { type: boolean }
-        untracked: { type: boolean }
-        content:
-          type: string
-          contentEncoding: base64
-    SyncTransactionPack:
+        commitId: { type: string, minLength: 1 }
+        parentCommitIds: { type: array, items: { type: string, minLength: 1 } }
+        accountId: { type: string, minLength: 1 }
+        createdAt: { type: string, minLength: 1 }
+        selectedSourceCommitId:
+          type: [string, "null"]
+          description: Exactly parentCommitIds[1] for a merge with selected members; null otherwise, including self-contained non-merge checkpoints. Physical storage aliases are not exposed.
+        members: { type: array, items: { $ref: "#/components/schemas/SyncCommitMember" } }
+    SyncRefUpdate:
       type: object
-      required: [operationId, branchId, baseServerCommitId, localCommitId]
-      description: At least one row or file mutation is required by the server.
-      anyOf:
-        - required: [rows]
-          properties:
-            rows: { type: array, minItems: 1 }
-        - required: [files]
-          properties:
-            files: { type: array, minItems: 1 }
+      required: [branchId, expectedHeadCommitId, headCommitId]
       properties:
-        operationId: { type: string, minLength: 1, maxLength: 255 }
-        branchId: { type: string, minLength: 1, maxLength: 255 }
-        baseServerCommitId: { type: string, minLength: 1, maxLength: 255 }
-        localCommitId: { type: string, minLength: 1, maxLength: 255 }
-        rows:
-          type: array
-          maxItems: 8192
-          items: { $ref: "#/components/schemas/SyncRowMutation" }
-        files:
-          type: array
-          maxItems: 1024
-          items: { $ref: "#/components/schemas/SyncFileMutation" }
-    SyncAdmitResponse:
+        branchId: { type: string, minLength: 1 }
+        expectedHeadCommitId: { type: [string, "null"] }
+        headCommitId: { type: [string, "null"] }
+    SyncPushRequest:
       type: object
-      required: [operationId, branchId, canonicalCommitId, cursor]
+      required: [commits, refUpdates]
       properties:
-        operationId: { type: string }
-        branchId: { type: string }
-        canonicalCommitId: { type: string }
-        cursor: { type: integer, minimum: 1 }
-    SyncCanonicalEvent:
+        commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
+        refUpdates: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
+    SyncPushResponse:
       type: object
-      required: [cursor, canonicalCommitId, pack]
+      required: [cursor]
       properties:
-        cursor: { type: integer, minimum: 1 }
-        canonicalCommitId: { type: string }
-        packFingerprint: { type: string, minLength: 64, maxLength: 64 }
-        pack: { $ref: "#/components/schemas/SyncTransactionPack" }
-    SyncPullResponse:
+        cursor: { type: integer, minimum: 0 }
+    SyncCommitHeader:
       type: object
-      required: [branchId, events, nextCursor, headCursor, headCommitId]
+      required: [commitId, parentCommitIds, accountId, createdAt, generation, firstParentJumpCommitId, firstParentJumpSpan]
       properties:
-        branchId: { type: string }
-        events:
-          type: array
-          items: { $ref: "#/components/schemas/SyncCanonicalEvent" }
-        nextCursor: { type: integer, minimum: 0 }
-        headCursor: { type: integer, minimum: 0 }
-        headCommitId: { type: string }
-    SyncBranch:
-      type: object
-      required: [id, name, commitId, hidden]
-      properties:
-        id: { type: string }
-        name: { type: string }
         commitId: { type: string }
-        hidden: { type: boolean }
+        parentCommitIds: { type: array, items: { type: string } }
+        accountId: { type: string }
+        createdAt: { type: string }
+        generation: { type: integer, minimum: 0 }
+        firstParentJumpCommitId: { type: [string, "null"] }
+        firstParentJumpSpan: { type: [integer, "null"], minimum: 1 }
+        stateRootId:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Canonical state-root certificate. Required for every direct first parent of a snapshot head.
+    SyncSnapshotRow:
+      type: object
+      required: [branchId, schemaKey, rowPk, changeId, commitId, createdAt, updatedAt, changeAccountId, changeCreatedAt]
+      properties:
+        branchId: { type: string }
+        schemaKey: { type: string }
+        fileId: { type: [string, "null"] }
+        rowPk: { $ref: "#/components/schemas/SyncRowPk" }
+        snapshot: {}
+        metadata: {}
+        changeId: { type: string }
+        commitId: { type: string }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+        changeAccountId: { type: string, minLength: 1 }
+        changeCreatedAt: { type: string, minLength: 1 }
+        originKey: { type: [string, "null"] }
+    SyncBranchHead:
+      type: object
+      required: [branchId, headCommitId, hotStateRootId]
+      properties:
+        branchId: { type: string }
+        headCommitId: { type: [string, "null"] }
+        hotStateRootId:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: BLAKE3 root of the live tombstone-filtered snapshot rows at this immutable head.
+    SyncSnapshotRowPage:
+      type: object
+      required: [branchId, headCommitId, rows, continuation]
+      properties:
+        branchId: { type: string, minLength: 1 }
+        headCommitId: { type: string, minLength: 1 }
+        rows: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncSnapshotRow" } }
+        continuation: { type: [string, "null"], maxLength: 4096 }
+    SyncEvent:
+      type: object
+      required: [cursor, commits, refUpdates]
+      properties:
+        cursor: { type: integer, minimum: 1 }
+        commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
+        refUpdates: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
+    SyncPullResponse:
+      oneOf:
+        - type: object
+          required: [kind, cursor, defaultBranchId, branches]
+          properties:
+            kind: { type: string, const: snapshot }
+            cursor: { type: integer, minimum: 0 }
+            defaultBranchId: { type: string, minLength: 1 }
+            branches: { type: array, items: { $ref: "#/components/schemas/SyncBranchHead" } }
+        - type: object
+          required: [kind, cursor, events]
+          properties:
+            kind: { type: string, const: delta }
+            cursor: { type: integer, minimum: 0 }
+            events: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncEvent" } }
+    SyncHistoryResponse:
+      type: object
+      required: [commits, commitHeaders, missingCommitIds]
+      properties:
+        commits: { type: array, maxItems: 128, items: { $ref: "#/components/schemas/SyncCommit" } }
+        commitHeaders: { type: array, items: { $ref: "#/components/schemas/SyncCommitHeader" } }
+        missingCommitIds: { type: array, maxItems: 128, items: { type: string } }
+    SyncBlobChunk:
+      type: object
+      required: [chunkId, sizeBytes]
+      properties:
+        chunkId: { type: string, pattern: "^[0-9a-f]{64}$" }
+        sizeBytes: { type: integer, minimum: 1, maximum: 4194304 }
+    SyncBlobManifest:
+      type: object
+      required: [blobId, sizeBytes, chunks]
+      properties:
+        blobId: { type: string, pattern: "^[0-9a-f]{64}$" }
+        sizeBytes: { type: integer, minimum: 0 }
+        chunks:
+          type: array
+          maxItems: 16384
+          items: { $ref: "#/components/schemas/SyncBlobChunk" }
+    SyncBlobRegistration:
+      type: object
+      required: [missingChunkIds, complete]
+      properties:
+        missingChunkIds:
+          type: array
+          maxItems: 16384
+          items: { type: string, pattern: "^[0-9a-f]{64}$" }
+        complete: { type: boolean }
     ErrorEnvelope:
       type: object
       required: [error]

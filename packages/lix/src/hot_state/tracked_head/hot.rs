@@ -12647,6 +12647,17 @@ pub(super) fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn encode_hot_row_key_for_test(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    row_pk: &RowPk,
+    file_id: Option<&str>,
+) -> Vec<u8> {
+    encode_hot_row_key_parts(branch_id, generation, schema_key, row_pk, file_id)
+}
+
 fn encode_hot_row_key_parts(
     branch_id: &str,
     generation: CommitId,

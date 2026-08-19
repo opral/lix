@@ -6,11 +6,15 @@ import type {
 } from "../binding-types.js";
 import type { LixTelemetrySpan } from "../types.js";
 import {
+	deserializeWorkerError,
 	serializeWorkerError,
 	type WorkerHostEndpoint,
 	type WorkerInput,
 	type WorkerOperation,
 	type WorkerRequest,
+	type WorkerSyncFetchRequest,
+	type WorkerSyncFetchResponse,
+	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
 export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
@@ -19,6 +23,15 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	let nextObserveId = 1;
 	const transactions = new Map<number, LixTransactionBinding>();
 	const observations = new Map<number, ObserveEventsBinding>();
+	let nextSyncRequestId = 1;
+	const pendingSyncHeaders = new Map<
+		number,
+		{ resolve(headers: [string, string][]): void; reject(error: unknown): void }
+	>();
+	const pendingSyncFetch = new Map<
+		number,
+		{ resolve(response: WorkerSyncFetchResponse): void; reject(error: unknown): void }
+	>();
 	let finiteQueue = Promise.resolve();
 
 	endpoint.onMessage((message: WorkerInput) => {
@@ -43,7 +56,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	function handleNotification(
 		message: Exclude<WorkerInput, WorkerRequest>,
 	): void {
-		switch (message.kind) {
+			switch (message.kind) {
 			case "observe.close": {
 				const events = observations.get(message.observeId);
 				observations.delete(message.observeId);
@@ -57,6 +70,22 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 					if (transaction) await transaction.rollback().catch(() => undefined);
 				});
 				break;
+			case "sync.headers.result": {
+				const pending = pendingSyncHeaders.get(message.requestId);
+				pendingSyncHeaders.delete(message.requestId);
+				if (!pending) break;
+				if (message.result.ok) pending.resolve(message.result.headers);
+				else pending.reject(deserializeWorkerError(message.result.error));
+				break;
+			}
+			case "sync.fetch.result": {
+				const pending = pendingSyncFetch.get(message.requestId);
+				pendingSyncFetch.delete(message.requestId);
+				if (!pending) break;
+				if (message.result.ok) pending.resolve(message.result.response);
+				else pending.reject(deserializeWorkerError(message.result.error));
+				break;
+			}
 		}
 	}
 
@@ -88,7 +117,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 						? (span: LixTelemetrySpan) =>
 							endpoint.postMessage({ kind: "telemetry", span })
 						: undefined,
-					operation.server,
+					createSyncServerBridge(operation.server),
 				);
 				return undefined;
 			case "execute":
@@ -174,6 +203,73 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		}
 	}
 
+	function createSyncServerBridge(
+		server: WorkerSyncServerOptions | undefined,
+	):
+		| {
+				url: string;
+				headers: [string, string][];
+				headerProvider?: () => Promise<[string, string][]>;
+				fetch?: typeof fetch;
+		  }
+		| undefined {
+		if (!server) return undefined;
+		return {
+			url: server.url,
+			headers: server.headers ?? [],
+			headerProvider: server.dynamicHeaders
+				? () => {
+						const requestId = nextSyncRequestId++;
+						return new Promise((resolve, reject) => {
+							pendingSyncHeaders.set(requestId, { resolve, reject });
+							endpoint.postMessage({ kind: "sync.headers", requestId });
+						});
+					}
+				: undefined,
+			fetch: server.customFetch ? bridgeFetch : undefined,
+		};
+	}
+
+	async function bridgeFetch(
+		input: RequestInfo | URL,
+		init?: RequestInit,
+	): Promise<Response> {
+		const requestId = nextSyncRequestId++;
+		const request: WorkerSyncFetchRequest = {
+			url:
+				typeof input === "string"
+					? input
+					: input instanceof URL
+						? input.toString()
+						: input.url,
+			method: init?.method ?? "GET",
+			headers: headerEntries(init?.headers),
+			body: serializableBody(init?.body),
+			credentials: init?.credentials,
+		};
+		const response = new Promise<WorkerSyncFetchResponse>((resolve, reject) => {
+			pendingSyncFetch.set(requestId, { resolve, reject });
+			endpoint.postMessage({ kind: "sync.fetch", requestId, request });
+		});
+		const abort = () => {
+			const pending = pendingSyncFetch.get(requestId);
+			pendingSyncFetch.delete(requestId);
+			if (pending) {
+				pending.reject(new DOMException("The operation was aborted", "AbortError"));
+				endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
+			}
+		};
+		if (init?.signal?.aborted) abort();
+		else init?.signal?.addEventListener("abort", abort, { once: true });
+		try {
+			const resolved = await response;
+			return responseFromSyncFetch(resolved);
+		} finally {
+			init?.signal?.removeEventListener("abort", abort);
+			pendingSyncFetch.delete(requestId);
+		}
+	}
+
 	async function handleObserveNext(observeId: number): Promise<unknown> {
 		const events = observations.get(observeId);
 		if (!events) return undefined;
@@ -196,9 +292,42 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	}
 }
 
+export function responseFromSyncFetch(
+	resolved: WorkerSyncFetchResponse,
+): Response {
+	const body =
+		resolved.status === 204 ||
+		resolved.status === 205 ||
+		resolved.status === 304
+			? null
+			: resolved.body.slice().buffer;
+	return new Response(body, {
+		status: resolved.status,
+		statusText: resolved.statusText,
+		headers: resolved.headers,
+	});
+}
+
 function workerStateError(message: string): Error & { code?: string } {
 	const error = new Error(message) as Error & { code?: string };
 	error.name = "LixError";
 	error.code = "LIX_ERROR_CLOSED";
 	return error;
+}
+
+function headerEntries(headers: HeadersInit | undefined): [string, string][] {
+	const entries: [string, string][] = [];
+	new Headers(headers).forEach((value, name) => entries.push([name, value]));
+	return entries;
+}
+
+function serializableBody(body: BodyInit | null | undefined): string | Uint8Array | undefined {
+	if (body === undefined || body === null) return undefined;
+	if (typeof body === "string") return body;
+	if (body instanceof Uint8Array) return body;
+	if (body instanceof ArrayBuffer) return new Uint8Array(body);
+	if (ArrayBuffer.isView(body)) {
+		return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+	}
+	throw new TypeError("Browser sync fetch body is not structured-cloneable");
 }

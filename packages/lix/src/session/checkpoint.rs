@@ -279,13 +279,12 @@ fn push_selected_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        RECLAIM_MIN_INVENTORY, RECLAIM_YIELD_DENOMINATOR, checkpoint_gc_due,
-        push_selected_change,
+        RECLAIM_MIN_INVENTORY, RECLAIM_YIELD_DENOMINATOR, checkpoint_gc_due, push_selected_change,
     };
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
     use crate::gc::CheckpointGcState;
+    use crate::row_pk::RowPk;
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateDiffRow, TrackedStateKey,
     };
@@ -396,9 +395,15 @@ mod tests {
             yield_per_interval_estimate: 1,
             consecutive_reclaim_failures: 0,
         };
-        assert!(!checkpoint_gc_due(just_under).expect("valid"), "just under must refuse");
+        assert!(
+            !checkpoint_gc_due(just_under).expect("valid"),
+            "just under must refuse"
+        );
         just_under.collectible_interval_count = at_boundary;
-        assert!(checkpoint_gc_due(just_under).expect("valid"), "at the boundary must fire");
+        assert!(
+            checkpoint_gc_due(just_under).expect("valid"),
+            "at the boundary must fire"
+        );
     }
 
     /// A repository smaller than the inventory floor must not sweep on every

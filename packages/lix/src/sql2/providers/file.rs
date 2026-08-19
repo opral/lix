@@ -503,7 +503,6 @@ impl LixFileSpec {
                     &table_schema,
                     &blob_reader,
                     plugin_render.clone(),
-                    session_file_views.clone(),
                     options.needs_data,
                     prepared,
                 )
@@ -705,7 +704,6 @@ pub(crate) async fn execute_exact_lix_file_read(
         &schema,
         &blob_reader,
         plugin_render,
-        session_file_views.clone(),
         load_data,
         prepared,
     )
@@ -848,7 +846,6 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let rows = exact_path_data_rows_from_prepared(
         &blob_reader,
         plugin_render,
-        session_file_views,
         prepared,
         data_range.as_ref(),
     )
@@ -935,7 +932,6 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
         &schema,
         &blob_reader,
         plugin_render,
-        session_file_views.clone(),
         true,
         prepared,
     )
@@ -1233,7 +1229,6 @@ impl TableSpec for LixFileSpec {
                         &batch_schema,
                         &blob_reader,
                         plugin_render,
-                        session_file_views.clone(),
                         needs_data,
                         prepared,
                     )
@@ -1937,7 +1932,6 @@ impl UpsertSupport for LixFileSpec {
             &self.schema,
             &self.blob_reader,
             plugin_render,
-            None,
             true,
             prepared,
         )
@@ -4455,7 +4449,6 @@ async fn lix_file_record_batch(
         schema,
         blob_reader,
         plugin_render,
-        None,
         load_data,
         prepared,
     )
@@ -4991,7 +4984,6 @@ async fn lix_file_record_batch_from_prepared(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_render: Option<PluginRenderContext>,
-    session_file_views: Option<SessionFileViews>,
     load_data: bool,
     prepared: PreparedLixFileRows,
 ) -> Result<RecordBatch, LixError> {
@@ -5040,23 +5032,12 @@ async fn lix_file_record_batch_from_prepared(
             .remove(&key)
             .expect("prepared lix_file descriptor should have a path");
         let blob_key = file.blob_ref_key(&live_rows);
-        let sync_file_content = session_file_views.as_ref().and_then(|views| {
-            views
-                .sync_file_content(&SessionFileViewKey::new(
-                    live_rows.row(file.live).branch_id(),
-                    &file.id,
-                ))
-                .map(|(_, content)| content)
-        });
         let data = if needs_data {
-            match sync_file_content {
-                Some(content) => Some(content),
-                None => match blob_bytes.take(&blob_key).flatten() {
+            match blob_bytes.take(&blob_key).flatten() {
+                Some(data) => Some(data),
+                None => match rendered_plugin_bytes.remove(&key) {
                     Some(data) => Some(data),
-                    None => match rendered_plugin_bytes.remove(&key) {
-                        Some(data) => Some(data),
-                        None => Some(Vec::new()),
-                    },
+                    None => Some(Vec::new()),
                 },
             }
         } else {
@@ -5101,7 +5082,6 @@ async fn lix_file_record_batch_from_prepared(
 async fn exact_path_data_rows_from_prepared(
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_render: Option<PluginRenderContext>,
-    session_file_views: Option<SessionFileViews>,
     prepared: PreparedLixFileRows,
     data_range: Option<&Range<u64>>,
 ) -> Result<Vec<Vec<Value>>, LixError> {
@@ -5156,23 +5136,10 @@ async fn exact_path_data_rows_from_prepared(
             .remove(&key)
             .expect("prepared lix_file descriptor should have a path");
         let blob_key = file.blob_ref_key(&live_rows);
-        let sync_file_content = session_file_views.as_ref().and_then(|views| {
-            views
-                .sync_file_content(&SessionFileViewKey::new(
-                    live_rows.row(file.live).branch_id(),
-                    &file.id,
-                ))
-                .map(|(_, content)| content)
-        });
         if let Some(range) = data_range {
-            let content_identity = sync_file_content
-                .as_ref()
-                .map(|content| BlobId::from_content(content).to_hex())
-                .or_else(|| {
-                    blob_rows
-                        .get(&blob_key)
-                        .map(|blob_ref| blob_ref.blob_hash.clone())
-                })
+            let content_identity = blob_rows
+                .get(&blob_key)
+                .map(|blob_ref| blob_ref.blob_hash.clone())
                 .or_else(|| {
                     live_rows
                         .row(file.live)
@@ -5180,26 +5147,12 @@ async fn exact_path_data_rows_from_prepared(
                         .map(|change_id| change_id.to_string())
                 })
                 .unwrap_or_else(|| file.id.clone());
-            let selected = match sync_file_content {
-                Some(content) => Some(materialize_vec_range(content, range.clone())?),
-                None => match blob_ranges.take(&blob_key).flatten() {
-                    Some(data) => Some(data),
-                    None => match rendered_plugin_bytes.remove(&key) {
-                        Some(data) => Some(materialize_vec_range(data, range.clone())?),
-                        None => Some(materialize_vec_range(Vec::new(), range.clone())?),
-                    },
+            let selected = match blob_ranges.take(&blob_key).flatten() {
+                Some(data) => data,
+                None => match rendered_plugin_bytes.remove(&key) {
+                    Some(data) => materialize_vec_range(data, range.clone())?,
+                    None => materialize_vec_range(Vec::new(), range.clone())?,
                 },
-            };
-            let Some(selected) = selected else {
-                rows.push(vec![
-                    Value::Text(path),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                ]);
-                continue;
             };
             rows.push(vec![
                 Value::Text(path),
@@ -5216,13 +5169,13 @@ async fn exact_path_data_rows_from_prepared(
                 Value::Text(content_identity),
             ]);
         } else {
-            let data = sync_file_content.or_else(|| match blob_bytes.take(&blob_key).flatten() {
+            let data = match blob_bytes.take(&blob_key).flatten() {
                 Some(data) => Some(data),
                 None => match rendered_plugin_bytes.remove(&key) {
                     Some(data) => Some(data),
                     None => Some(Vec::new()),
                 },
-            });
+            };
             rows.push(vec![
                 Value::Text(path),
                 data.map_or(Value::Null, |data| Value::Blob(data.into())),
@@ -5438,25 +5391,6 @@ async fn render_plugin_files_for_sql(
         let blob_key = file.blob_ref_key(live_rows);
         let blob = blob_rows.get(&blob_key);
         if !branch.catalog.matches_plugin(owner.plugin_key(), path) {
-            continue;
-        }
-        // A late sync projection is the freshest source available to this
-        // replica. Do not acknowledge a derived plugin actor before the file
-        // row has had a chance to consume those bytes: the acknowledgement
-        // would evict the raw sync view from SessionFileViews and the query
-        // would incorrectly fall back to an empty blob.
-        let has_sync_overlay = plugin_render
-            .session_file_views
-            .as_ref()
-            .is_some_and(|views| {
-                views
-                    .sync_file_content(&SessionFileViewKey::new(
-                        key.branch_id(),
-                        key.descriptor_id(),
-                    ))
-                    .is_some()
-            });
-        if has_sync_overlay {
             continue;
         }
         match blob {
@@ -8141,7 +8075,6 @@ mod tests {
             &projected_schema,
             &blob_reader,
             None,
-            None,
             false,
             prepared,
         )
@@ -8412,7 +8345,6 @@ mod tests {
         let batch = super::lix_file_record_batch_from_prepared(
             &projected_schema,
             &blob_reader,
-            None,
             None,
             false,
             prepared,
@@ -9901,7 +9833,6 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
-            None,
             true,
             prepared,
         )
@@ -10285,7 +10216,6 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             Some(context),
-            None,
             true,
             prepared,
         )

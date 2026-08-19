@@ -143,6 +143,12 @@ pub use handle::{
     ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction, OpenAnotherSessionBuilder,
     OpenLixBuilder, ServerMode, ServerOptions, TransactionExecuteBuilder, open_lix,
 };
+#[cfg(target_family = "wasm")]
+#[doc(hidden)]
+pub use sync::{
+    BROWSER_TRANSPORT_CONFIG_HEADER, register_browser_sync_transport,
+    unregister_browser_sync_transport,
+};
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,

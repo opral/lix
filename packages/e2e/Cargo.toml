@@ -501,11 +501,6 @@ path = "tests/semantic_merge.rs"
 required-features = ["sdk-tests"]
 
 [[test]]
-name = "sync_prototype"
-path = "tests/sync_prototype.rs"
-required-features = ["sdk-tests", "server-protocol"]
-
-[[test]]
 name = "sync_mode"
 path = "tests/sync_mode.rs"
 required-features = ["sdk-tests", "server-protocol"]

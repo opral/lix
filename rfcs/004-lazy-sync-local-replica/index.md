@@ -1,139 +1,116 @@
-# RFC 004: Lazy local replica for `mode: sync`
+# RFC 004: Repository sync for `mode: sync`
 
 ## Goal
 
-Make `openLix({ server: { mode: "sync" } })` a transparent, lazy local
-replica of `mode: "remote"`. The existing Lix APIs and repository semantics
-remain unchanged; synchronization is an internal implementation detail.
+`openLix({ storage, server: { mode: "sync" } })` is a durable local replica.
+Normal reads and writes use only local storage. Synchronization exchanges the
+repository facts Lix already owns instead of maintaining a second projection
+model.
 
-The local replica must support the same SQL and API surfaces, including
-`execute`, `observe`, branches, commits, diff, working diff, merge, plugins,
-and files. Cached reads execute against local storage with zero network calls.
-Synchronization runs in the background, and data that is not materialized is
-hydrated lazily when first requested.
+## Protocol
 
-## Consistency contract
+The repository URL scopes every endpoint to one repository. The protocol has
+one ordered live cursor:
 
-Local reads return a transactionally consistent, monotonic local snapshot plus
-pending local writes. Local writes are durable and immediately readable.
-Remote changes may be briefly in transit, but replicas converge while
-connected. A successful cached read does not prove the server has no newer
-commit; globally linearizable reads would put the network back in the hot path.
+- `POST /lix/v1/sync/push` atomically publishes complete commits and
+  compare-and-swap branch ref updates.
+- `GET /lix/v1/sync/pull` returns pinned branch metadata when query parameters
+  are omitted, returns bounded current-row pages pinned to an immutable branch
+  head when given `snapshotBranchId` and `snapshotHeadCommitId`, and otherwise
+  long-polls commit/ref events after `after`.
+- `GET /lix/v1/sync/history?commitId=...` fetches exact immutable commit bodies
+  plus bounded topology certificates and never changes the live cursor.
+- `GET|POST /lix/v1/sync/blob` negotiates one canonical BLAKE3/FastCDC
+  manifest.
+- `GET|PUT /lix/v1/sync/chunk` transfers authenticated raw chunks.
 
-If a query requires an unmaterialized scope, sync may hydrate it before the
-query completes. If the required scope is cached, the query must not perform a
-network request. When offline, cached scopes remain readable; an uncached scope
-fails clearly instead of returning an incomplete result.
+There are no per-branch cursors, query scopes, row packs, file projections,
+admission receipts, compatibility versions, or polling intervals.
 
-No conflict object, conflict API, or sync-specific application API is exposed.
+## Data model
 
-## Internal architecture
+A live event contains complete immutable commits plus branch ref moves. A
+commit contains its semantic header, exact identity-ordered row membership,
+authored change facts, and the core commit-level selected-source identity used
+by merges. Physical columnar pages, jump indexes, and current-state roots are
+derived locally.
+
+Files remain rows. `lix_binary_blob_ref` rows name BLAKE3-addressed content;
+the manifest/chunk endpoints move those bytes without embedding them in commit
+JSON or exposing the CAS storage layout.
+
+## Bootstrap and history
+
+A fresh replica performs one handshake and one metadata request. The metadata
+pins the durable default branch, every branch head, and the repository cursor.
+The worker then concurrently fetches the distinct head commit bodies and their
+bounded topology certificates through `sync/history`, and bounded current-row
+pages through `sync/pull`, each row scan pinned to its immutable branch head.
+Each branch's `hotStateRootId` verifies the assembled live, tombstone-filtered
+row stream independently of the physical state-root certificates used for
+commit topology. The complete pinned result chooses the local default branch
+and initializes the replica atomically. Reopening a durable replica does no
+network work on the open path.
+
+Historical row membership is not part of bootstrap. It is fetched as complete
+immutable commits through `sync/history` when a history operation needs it.
+Blob manifests and chunks use their independent content-addressed lane.
+
+## Runtime
 
 ```text
-existing Lix API
-      |
-      +--> infer required scope
-      |        |
-      |        +--> cached: execute locally
-      |        +--> missing: hydrate once, then execute locally
-      |
-      +--> observe local state and background-applied remote changes
+shared repository state machine
+├── first bootstrap and reconnect
+├── durable local-head outbox discovery
+├── BLAKE3 manifest/chunk transfer
+├── push and long-pull orchestration
+├── branch reconciliation
+└── retry and shutdown policy
 
-background pull/stream --> atomic apply --> replay pending local writes
+platform adapter
+├── native: Tokio + reqwest
+└── browser: spawn_local + fetch + AbortController
 ```
 
-The private materialization manifest tracks coverage and cursors for:
+The immutable local commits and refs are the outbox. A separate serialized
+transaction queue is unnecessary. Replica state stores only the last applied
+authority cursor and authoritative branch heads. Retry is safe because commit
+identity is immutable and ref movement is compare-and-swap.
 
-- the global branch catalog, branch refs, schemas, and plugin metadata;
-- row and commit scopes for active queries;
-- commit topology, including merge parents;
-- file/blob projections, which remain lazy.
+When a remote ref advances while local commits are pending, reconciliation
+preserves both heads and creates an ordinary deterministic Lix merge before
+retrying the ref move. No conflict object or sync-specific application API is
+exposed.
 
-Branch creation, deletion, switching, refs, and listings are replicated as
-repository metadata. Merge commits replicate their parents and resulting row
-state so history, diff, working diff, undo/redo, and merge behavior remain
-equivalent across replicas. Plugin rows are canonical synchronization data;
-files are projections loaded only when requested. For a fresh plugin row
-scope, a certified event that combines a source-file mutation with its rows
-currently retains that one plugin-owned source payload so the local runtime
-can establish ownership and regenerate the rows; ordinary row-only events
-remain byte-free. A future ownership/CAS lane can remove this bootstrap
-exception.
+## Consistency
 
-The current prototype has one deliberate topology constraint: live polling
-pulls canonical events unfiltered so a commit is materialized as one graph
-node with all parents. Cold scope hydration is filtered at event granularity
-(unrelated commits transfer only their cursor identity; a matching commit is
-kept atomically). A future commit-skeleton/row-pack split is required before
-live polling can be filtered without risking a missing parent or a divergent
-local graph.
+Local reads return a transactionally consistent local snapshot plus completed
+local commits. Local writes are durable and immediately readable. Remote
+changes may be in transit, but connected replicas converge in repository
+cursor order. A cached read does not imply that the server has no newer event.
 
-Internal branch-catalog reconciliation runs in a sync-suppressed worker
-session, so catalog maintenance cannot echo a remote branch back into the
-outbox. After a successful flush it removes local non-default, non-active
-branches absent from an explicitly authoritative catalog; the pre-flush pass
-leaves offline local branches intact long enough to be admitted. Embedded or
-custom transports that cannot enumerate branches never trigger destructive
-pruning.
+Normal SQL never waits for the network. A history request may fetch immutable
+history that is not local yet. Missing uncached data while offline fails
+clearly rather than appearing as an empty result.
 
 ## Acceptance criteria
 
-- Cached `execute()` performs zero network requests and stays within 10% of
-  ordinary local Lix latency.
-- SQL queries infer, hydrate, and retain their required scopes automatically.
-- `observe()` emits local changes and changes applied by background sync.
-- Local writes survive restart and provide read-your-writes while offline.
-- Remote writes converge without exposing conflicts.
-- A branch created by one client appears through the normal branch APIs of
-  another client; switching and branch history work without manual setup.
-- Diff, working diff, commit history, undo/redo, and merge preserve the same
-  graph and row results on every synchronized client.
-- Plugin-backed rows synchronize canonically; files and blobs are lazy.
-- Retry, lost acknowledgement, restart, reconnect, offline, and overlapping
-  writes are covered by deterministic tests.
-- Benchmarks report cached-read p50/p95, cold-hydration latency, replication
-  lag, bytes transferred, retained storage, and scope hit rate.
-- Correctness, durability, security, and performance receive independent
-  sub-agent review before the implementation is considered production-ready.
-
-## Prototype measurements
-
-The checked-in `sync_lazy_profile` benchmark measures the protocol's JSON
-framing and scope projection, not database throughput. On the seeded mixed
-trace, scoped payload bytes were reduced by 86.2% (16×64 events/rows), 88.5%
-(128×64), and 89.2% (512×128). The strategy scorecard likewise reports
-convergence, duplicate-admission safety, offline replay, branch isolation, and
-wire/storage counters for transaction-admission/event-pull versus commit-pack
-variants. Those numbers are deterministic simulator evidence; production
-gates still require real FilesystemStorage/RocksDB runs measuring cached-read
-latency, cold hydration p50/p95, replication lag, and retained bytes.
-
-## Remaining production work
-
-The 90% path is implemented and covered by Rust unit tests, 20 protocol tests,
-and a 13-test two-replica/filesystem/plugin matrix. The following are explicit
-follow-ups rather than hidden semantics:
-
-- replace unfiltered live pulls with a topology skeleton plus independently
-  hydrated row/blob packs;
-- make pending-overlay replay idempotent without repeatedly generating local
-  projection commits;
-- provide a certified bootstrap for a fresh replica whose server already has
-  history (the current safe behavior rejects an uncertified divergent start);
-- make ambiguous durable-receipt recovery work with RocksDB-backed
-  FilesystemStorage after a server restart;
-- paginate branch catalogs and broaden SQL/API scope inference for every
-  history/system surface, including prepared-DML and more complex query
-  shapes;
-- audit `observe()` binding for every plugin/query shape and extend the
-  branch-control barrier to any API that resolves a remote source branch;
-- make branch deletion safe when the deleted ref is currently selected;
-- run real backend benchmarks and independent security/performance review
-  before calling the protocol production-ready.
+- Warm reads and writes perform no network requests.
+- Fresh bootstrap, immediate file creation, and checkpointing never produce a
+  missing checkpoint cursor.
+- Offline commits survive restart and publish after reconnect.
+- Lost acknowledgements and duplicate delivery are idempotent.
+- Two replicas converge for different-row and same-row concurrent writes.
+- Branch creation, deletion, switching, merge topology, and refs converge.
+- Binary files retain exact bytes through BLAKE3 manifest/chunk transfer.
+- Browser sync uses long polling and has no fixed-interval poll loop.
+- Native and browser runtimes execute the same policy state machine.
+- Snapshot size, cached-read latency, local-write latency, replication lag,
+  reconnect behavior, and retained storage have explicit measured gates.
 
 ## Non-goals
 
-- A new public `sync(shape)` or conflict-resolution API.
-- Synchronous server validation on every local read.
-- Downloading the complete repository before the local client can start.
-- Treating uncached offline data as an empty or partial result.
+- Backward compatibility with the unshipped prototype protocol.
+- A public sync, conflict-resolution, or query-scope API.
+- Server validation on the local interaction path.
+- Encoding Lix's physical storage layout on the wire.

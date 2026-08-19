@@ -13,8 +13,8 @@ use tracing::Instrument;
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
-use crate::row_pk::{RowPk, RowPkComponent};
 use crate::hot_state::{HotStateRowFilter, HotStateScanRequest, MaterializedHotStateRow};
+use crate::row_pk::{RowPk, RowPkComponent};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
@@ -78,7 +78,6 @@ where
     store: &'a S,
     commit_graph: &'a CommitGraphContext,
     all_nodes: Option<Vec<CommitGraphNode>>,
-    hidden_commits: Option<BTreeSet<CommitId>>,
 }
 
 impl<'a, S> DerivedReadContext<'a, S>
@@ -90,7 +89,6 @@ where
             store,
             commit_graph,
             all_nodes: None,
-            hidden_commits: None,
         }
     }
 
@@ -102,16 +100,6 @@ where
             .all_nodes
             .as_deref()
             .expect("derived commit scan cache was initialized"))
-    }
-
-    async fn hidden_commits(&mut self) -> Result<&BTreeSet<CommitId>, LixError> {
-        if self.hidden_commits.is_none() {
-            self.hidden_commits = Some(crate::sync::load_sync_hidden_commit_ids(self.store).await?);
-        }
-        Ok(self
-            .hidden_commits
-            .as_ref()
-            .expect("hidden sync commit cache was initialized"))
     }
 }
 
@@ -164,14 +152,10 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
-        let hidden = reads.hidden_commits().await?.clone();
         let commits = reads.all_nodes().await?;
         let mut rows = Vec::with_capacity(commits.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
             for commit in commits {
-                if hidden.contains(&commit.commit_id) {
-                    continue;
-                }
                 rows.push(commit_row(
                     commit.commit_id,
                     commit.change_id,
@@ -209,16 +193,12 @@ where
             .reader(reads.store)
             .load_nodes(&commit_ids)
             .await?;
-        let hidden = reads.hidden_commits().await?;
         let mut rows = Vec::with_capacity(records.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
             for (requested_commit_id, record) in records.iter() {
                 let Some(record) = record else {
                     continue;
                 };
-                if hidden.contains(&record.commit_id) {
-                    continue;
-                }
                 validate_commit_point_identity(*requested_commit_id, record)?;
                 rows.push(commit_row(
                     record.commit_id,
@@ -248,15 +228,8 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
-        let hidden = reads.hidden_commits().await?.clone();
         let commits = reads.all_nodes().await?;
-        let edges = commit_edges(commits)
-            .into_iter()
-            .filter(|edge| {
-                !hidden.contains(&edge.child_commit_id)
-                    && !hidden.contains(&edge.parent_commit_id)
-            })
-            .collect::<Vec<_>>();
+        let edges = commit_edges(commits);
         let mut rows = Vec::with_capacity(edges.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
             for edge in &edges {
@@ -296,7 +269,6 @@ where
             .into_iter()
             .filter_map(|(commit_id, node)| node.map(|node| (*commit_id, node)))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let hidden = reads.hidden_commits().await?;
         let mut edges = Vec::with_capacity(edge_ids.len());
         for (child_commit_id, parent_order) in edge_ids {
             let Some(node) = nodes_by_id.get(&child_commit_id) else {
@@ -305,9 +277,6 @@ where
             let Some(parent_commit_id) = node.parent_commit_ids.get(parent_order as usize) else {
                 continue;
             };
-            if hidden.contains(&child_commit_id) || hidden.contains(parent_commit_id) {
-                continue;
-            }
             edges.push(CommitGraphEdge {
                 parent_commit_id: *parent_commit_id,
                 child_commit_id,

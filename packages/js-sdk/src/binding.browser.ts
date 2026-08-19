@@ -2,6 +2,7 @@ import type {
 	LixStorageConfig,
 	LixBinding,
 	LixStorageProviderModule,
+	SyncServerBindingOptions,
 	TelemetryDispatch,
 } from "./binding-types.js";
 
@@ -18,7 +19,7 @@ function initializeWasm(): Promise<unknown> {
 export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
-	server?: { url: string; headers: [string, string][] },
+	server?: SyncServerBindingOptions,
 ): Promise<LixBinding> {
 	await initializeWasm();
 	switch (storage.kind) {

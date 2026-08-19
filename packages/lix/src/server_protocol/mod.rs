@@ -6,9 +6,8 @@ use crate::session::ExecuteOptions;
 #[cfg(test)]
 use crate::session::media_upload::FILE_UPLOAD_PART_BYTES;
 use crate::sync::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_SCOPE_KEY_BYTES, MAX_SYNC_SCOPE_KEYS,
-    SYNC_LONG_POLL_TIMEOUT, SyncAdmission, SyncBranch, SyncPullResponse, SyncTransactionPack,
-    validate_sync_transaction_pack,
+    MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_REQUEST_ITEMS, SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest,
+    SyncBlobRegistration, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -44,6 +43,9 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
+
+const MAX_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SYNC_BLOB_MANIFEST_CHUNKS: usize = 16_384;
 
 /// Request accepted by the canonical protocol handler.
 pub type ServerProtocolRequest = Request<ServerProtocolBody>;
@@ -284,9 +286,13 @@ pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("DELETE", "/lix/v1/session"),
     ("POST", "/lix/v1/execute"),
     ("POST", "/lix/v1/execute-batch"),
-    ("POST", "/lix/v1/sync/admit"),
+    ("POST", "/lix/v1/sync/push"),
     ("GET", "/lix/v1/sync/pull"),
-    ("GET", "/lix/v1/sync/branches"),
+    ("GET", "/lix/v1/sync/history"),
+    ("GET", "/lix/v1/sync/blob"),
+    ("POST", "/lix/v1/sync/blob"),
+    ("GET", "/lix/v1/sync/chunk"),
+    ("PUT", "/lix/v1/sync/chunk"),
     ("POST", "/lix/v1/transaction/begin"),
     ("POST", "/lix/v1/transaction/execute"),
     ("POST", "/lix/v1/transaction/commit"),
@@ -469,7 +475,7 @@ where
     options: ServerProtocolOptions,
     registry: AsyncMutex<SessionRegistry<S>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
-    sync_admission_gate: Arc<AsyncMutex<()>>,
+    sync_push_gate: Arc<AsyncMutex<()>>,
     session_open_gate: Arc<SessionOpenGate>,
     close_started: Once,
     close_result: watch::Sender<Option<Result<(), LixError>>>,
@@ -1464,7 +1470,7 @@ where
                 request_blob_budget: Arc::new(RequestBlobCacheBudget::new(
                     options.max_request_blob_cache_bytes,
                 )),
-                sync_admission_gate: Arc::new(AsyncMutex::new(())),
+                sync_push_gate: Arc::new(AsyncMutex::new(())),
                 session_open_gate: Arc::new(SessionOpenGate::default()),
                 close_started: Once::new(),
                 close_result,
@@ -1546,7 +1552,8 @@ where
             (&method, path.as_str()),
             (&Method::POST, "/lix/v1/execute")
                 | (&Method::POST, "/lix/v1/execute-batch")
-                | (&Method::POST, "/lix/v1/sync/admit")
+                | (&Method::POST, "/lix/v1/sync/push")
+                | (&Method::POST, "/lix/v1/sync/blob")
                 | (&Method::POST, "/lix/v1/transaction/execute")
                 | (&Method::POST, "/lix/v1/branch/create")
                 | (&Method::POST, "/lix/v1/branch/switch")
@@ -1556,17 +1563,30 @@ where
         if consumes_json && let Err(error) = require_json_content_type(&parts.headers) {
             return error.into_response();
         }
+        if matches!(
+            (&method, path.as_str()),
+            (&Method::PUT, "/lix/v1/sync/chunk")
+        ) && let Err(error) = require_octet_stream_content_type(&parts.headers)
+        {
+            return error.into_response();
+        }
         let consumes_body = consumes_json
             || matches!(
                 (&method, path.as_str()),
                 (&Method::POST, "/lix/v1/file/upsert")
                     | (&Method::POST, "/lix/v1/file/upsert-batch")
+                    | (&Method::PUT, "/lix/v1/sync/chunk")
             );
         let body = if consumes_body {
-            match body
-                .into_bytes(self.inner.options.max_request_body_bytes)
-                .await
-            {
+            let body_limit = if matches!(
+                (&method, path.as_str()),
+                (&Method::PUT, "/lix/v1/sync/chunk")
+            ) {
+                MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
+            } else {
+                self.inner.options.max_request_body_bytes
+            };
+            match body.into_bytes(body_limit).await {
                 Ok(body) => body,
                 Err(error) => return error.into_response(),
             }
@@ -1599,15 +1619,8 @@ where
                 )
                 .await,
             ),
-            (&Method::POST, "/lix/v1/sync/admit") => result_response(
-                sync_admit(
-                    self.clone(),
-                    lease,
-                    scope,
-                    parts.headers,
-                    json_request!(SyncTransactionPack),
-                )
-                .await,
+            (&Method::POST, "/lix/v1/sync/push") => result_response(
+                sync_push(self.clone(), lease, json_request!(SyncPushRequest)).await,
             ),
             (&Method::GET, "/lix/v1/sync/pull") => {
                 let query = match decode_query::<SyncPullRequest>(parts.uri.query()) {
@@ -1616,7 +1629,43 @@ where
                 };
                 result_response(sync_pull(lease, query).await)
             }
-            (&Method::GET, "/lix/v1/sync/branches") => result_response(sync_branches(lease).await),
+            (&Method::GET, "/lix/v1/sync/history") => {
+                let commit_ids = match decode_sync_history_query(parts.uri.query()) {
+                    Ok(commit_ids) => commit_ids,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(sync_history(lease, commit_ids).await)
+            }
+            (&Method::GET, "/lix/v1/sync/blob") => {
+                let query = match decode_query::<SyncBlobQuery>(parts.uri.query()) {
+                    Ok(query) => query,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(sync_get_blob(lease, query).await)
+            }
+            (&Method::POST, "/lix/v1/sync/blob") => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "sync blob registration does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(sync_register_blob(lease, json_request!(SyncBlobManifest)).await)
+            }
+            (&Method::GET, "/lix/v1/sync/chunk") => {
+                let query = match decode_query::<SyncChunkQuery>(parts.uri.query()) {
+                    Ok(query) => query,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(sync_get_chunk(lease, query).await)
+            }
+            (&Method::PUT, "/lix/v1/sync/chunk") => {
+                let query = match decode_query::<SyncChunkQuery>(parts.uri.query()) {
+                    Ok(query) => query,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(sync_put_chunk(lease, query, body).await)
+            }
             (&Method::POST, "/lix/v1/transaction/begin") => {
                 result_response(begin_transaction(lease).await)
             }
@@ -2109,8 +2158,11 @@ where
                 binary_file_upsert: true,
                 binary_file_upsert_batch: true,
                 binary_file_read: true,
-                sync_admission: true,
+                sync_push: true,
                 sync_pull: true,
+                sync_history: true,
+                sync_blob: true,
+                sync_chunk: true,
             },
         }),
     ))
@@ -2249,172 +2301,174 @@ where
     ))
 }
 
-async fn sync_admit<S>(
+async fn sync_push<S>(
     server: LixServerProtocol<S>,
     lease: SessionLease<S>,
-    scope: Option<String>,
-    headers: HeaderMap,
-    Json(pack): Json<SyncTransactionPack>,
-) -> Result<Json<SyncAdmission>, ApiError>
+    Json(request): Json<SyncPushRequest>,
+) -> Result<Json<SyncPushResponse>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let key = optional_idempotency_key(&headers)?
-        .ok_or_else(|| ApiError::bad_request("sync admission requires Idempotency-Key"))?;
-    if key != pack.operation_id {
+    if request.commits.is_empty() && request.ref_updates.is_empty() {
         return Err(ApiError::bad_request(
-            "Idempotency-Key must equal sync pack operationId",
+            "sync push requires at least one commit or ref update",
         ));
     }
-    if pack.rows.is_empty() && pack.files.is_empty() {
-        return Err(ApiError::bad_request(
-            "sync admission requires at least one row or file mutation",
-        ));
+    if request
+        .commits
+        .len()
+        .saturating_add(request.ref_updates.len())
+        > MAX_SYNC_REQUEST_ITEMS
+    {
+        return Err(ApiError::bad_request(format!(
+            "sync push accepts at most {MAX_SYNC_REQUEST_ITEMS} total commits and ref updates",
+        )));
     }
-    validate_sync_transaction_pack(&pack)?;
-    let fingerprint = idempotency_fingerprint("sync-admit", &pack)?;
-    let idempotency = ExecuteIdempotency::new(scope.clone(), key.clone(), fingerprint)
-        .with_branch(pack.branch_id.clone());
-    let admission_gate = Arc::clone(&server.inner.sync_admission_gate);
-    let admission = lease
-        .run_durable(move |session| {
-            let admission_gate = Arc::clone(&admission_gate);
+    let active_account_id = lease
+        .run_cancellable_read(|lix| async move { Ok(lix.active_account_id().to_string()) })
+        .await?;
+    if request
+        .commits
+        .iter()
+        .any(|commit| commit.account_id != active_account_id)
+    {
+        return Err(ApiError::account_mismatch());
+    }
+    ensure_sync_push_event_fits(&request, MAX_SYNC_PULL_RESPONSE_BYTES)?;
+    let push_gate = Arc::clone(&server.inner.sync_push_gate);
+    let response = lease
+        .run_durable(move |lix| {
+            let push_gate = Arc::clone(&push_gate);
             async move {
-                // The gate lives inside detached durable work. Cancelling the
-                // HTTP future cannot release authoritative ordering while the
-                // admission transaction is still staging or committing.
-                let _admission_guard = admission_gate.lock().await;
-                let session_branch_id = session.active_branch_id().await?;
-                require_sync_identity("session branch", &pack.branch_id, &session_branch_id)?;
-                let target = session
-                    .open_another_session()
-                    .with_branch(&pack.branch_id)
-                    .await?;
-                // Branch selection is mutable on the protocol session. Recheck
-                // after opening the target so a concurrent switch cannot turn
-                // the initial identity check into a stale admission request.
-                let session_branch_id = session.active_branch_id().await?;
-                require_sync_identity("session branch", &pack.branch_id, &session_branch_id)?;
-                let admission = admit_sync_pack_on_target(&target, &pack, idempotency).await;
-                let close = target.close().await;
-                match admission {
-                    Ok(admission) => {
-                        close?;
-                        Ok(admission)
-                    }
-                    Err(error) => {
-                        let _ = close;
-                        Err(error)
-                    }
-                }
+                // Cancellation cannot release repository ordering while the
+                // immutable objects, refs, and event cursor are committing.
+                let _guard = push_gate.lock().await;
+                lix.push_sync_repository(&request).await
             }
         })
         .await?;
-    Ok(Json(admission))
+    Ok(Json(response))
 }
 
-async fn admit_sync_pack_on_target<S>(
-    target: &Lix<S>,
-    pack: &SyncTransactionPack,
-    idempotency: ExecuteIdempotency,
-) -> Result<SyncAdmission, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    if let Some(result) = target
-        .replay_execute_idempotency_result(&idempotency)
-        .await?
-    {
-        return sync_admission_from_idempotency_result(
-            &result,
-            &pack.operation_id,
-            &pack.branch_id,
-        );
+fn ensure_sync_push_event_fits(
+    request: &SyncPushRequest,
+    max_bytes: usize,
+) -> Result<(), ApiError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AdmissionEvent<'a> {
+        cursor: u64,
+        commits: &'a [crate::sync::SyncCommit],
+        ref_updates: &'a [crate::sync::SyncRefUpdate],
     }
-    for _attempt in 0..8 {
-        match target.admit_sync_transaction_pack(pack, &idempotency).await {
-            Ok(admission) => return Ok(admission),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    LixError::CODE_TRANSACTION_CONFLICT
-                        | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-                ) =>
-            {
-                match target.replay_execute_idempotency_result(&idempotency).await {
-                    Ok(Some(result)) => {
-                        return sync_admission_from_idempotency_result(
-                            &result,
-                            &pack.operation_id,
-                            &pack.branch_id,
-                        );
-                    }
-                    Ok(None) if error.code == LixError::CODE_TRANSACTION_CONFLICT => continue,
-                    Ok(None) => return Err(error),
-                    Err(recovery_error) => return Err(recovery_error),
-                }
-            }
-            Err(error) => return Err(error),
-        }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AdmissionDelta<'a> {
+        kind: &'static str,
+        cursor: u64,
+        events: [AdmissionEvent<'a>; 1],
     }
-    Err(LixError::new(
-        LixError::CODE_TRANSACTION_CONFLICT,
-        "sync target branch kept changing during admission",
-    ))
-}
-
-fn sync_admission_from_idempotency_result(
-    result: &ExecuteResult,
-    operation_id: &str,
-    branch_id: &str,
-) -> Result<SyncAdmission, LixError> {
-    if result.rows().len() != 1 {
-        return Err(LixError::new(
+    let event = AdmissionDelta {
+        kind: "delta",
+        cursor: u64::MAX,
+        events: [AdmissionEvent {
+            cursor: u64::MAX,
+            commits: &request.commits,
+            ref_updates: &request.ref_updates,
+        }],
+    };
+    let encoded = serde_json::to_vec(&event).map_err(|error| {
+        ApiError::from(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "sync admission receipt has an invalid row count",
-        ));
+            format!("encode sync push event admission: {error}"),
+        ))
+    })?;
+    if encoded.len() > max_bytes {
+        return Err(ApiError::sync_push_event_too_large(max_bytes));
     }
-    let row = &result.rows()[0];
-    let cursor = row.get::<i64>("cursor")?;
-    Ok(SyncAdmission {
-        operation_id: operation_id.to_string(),
-        branch_id: branch_id.to_string(),
-        canonical_commit_id: row.get::<String>("canonical_commit_id")?,
-        cursor: u64::try_from(cursor).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync admission receipt has an invalid cursor",
-            )
-        })?,
-    })
+    Ok(())
 }
 
 async fn sync_pull<S>(
     lease: SessionLease<S>,
     request: SyncPullRequest,
-) -> Result<Json<SyncPullResponse>, ApiError>
+) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    // The change stream belongs to the repository engine rather than one
-    // pinned session. Every server session therefore wakes when any canonical
-    // write commits, including direct Lix writes made by an embedded host.
+    if request.limit == 0 || request.limit > MAX_SYNC_REQUEST_ITEMS {
+        return Err(ApiError::bad_request(format!(
+            "sync pull limit must be between 1 and {MAX_SYNC_REQUEST_ITEMS}",
+        )));
+    }
+    let snapshot_page_requested = request.snapshot_branch_id.is_some()
+        || request.snapshot_head_commit_id.is_some()
+        || request.snapshot_after.is_some();
+    if snapshot_page_requested {
+        if request.after.is_some()
+            || request
+                .snapshot_branch_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || request
+                .snapshot_head_commit_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || request
+                .snapshot_after
+                .as_ref()
+                .is_some_and(|continuation| continuation.is_empty() || continuation.len() > 4096)
+        {
+            return Err(ApiError::bad_request(
+                "snapshot row paging requires snapshotBranchId and snapshotHeadCommitId, an optional bounded snapshotAfter, and no after cursor",
+            ));
+        }
+        let branch_id = request
+            .snapshot_branch_id
+            .expect("validated snapshot branch id");
+        let head_commit_id = request
+            .snapshot_head_commit_id
+            .expect("validated snapshot head commit id");
+        let continuation = request.snapshot_after;
+        let limit = request.limit;
+        let response = lease
+            .run_cancellable_read(move |lix| async move {
+                lix.pull_sync_snapshot_rows(
+                    &branch_id,
+                    &head_commit_id,
+                    continuation.as_deref(),
+                    limit,
+                )
+                .await
+            })
+            .await?;
+        return bounded_sync_json_response(
+            response,
+            "sync snapshot rows",
+            MAX_SYNC_PULL_RESPONSE_BYTES,
+        );
+    }
     let mut change_watcher = lease.record.lix.sync_mode_state().change_watcher();
-    let long_poll = request.limit != 0;
     let response = loop {
-        // Subscribe before reading the head. The level-triggered watch closes
-        // the classic long-poll race where a commit lands between the read
-        // and registration of the waiter.
-        let response = pull_sync_once(&lease, request.clone()).await?;
-        let at_head = response.events.is_empty() && response.head_cursor <= request.after;
-        if !long_poll || !at_head {
+        // Subscribe before reading the cursor, closing the change-between-read-
+        // and-wait race without a periodic poll.
+        let after = request.after;
+        let limit = request.limit;
+        let response = lease
+            .run_cancellable_read(
+                move |lix| async move { lix.pull_sync_repository(after, limit).await },
+            )
+            .await?;
+        let at_head = matches!(
+            &response,
+            SyncRepositoryPullResponse::Delta { cursor, events }
+                if events.is_empty() && request.after.is_some_and(|after| *cursor <= after)
+        );
+        // Omitting `after` is a finite hot-state snapshot. A delta request is
+        // the mandatory long-poll form.
+        if request.after.is_none() || !at_head {
             break response;
         }
-        // `watch` is level-triggered, so a commit that lands during the
-        // storage read is observed by `changed()` even if it happened before
-        // the wait future was registered. The receiver was subscribed before
-        // the read, which closes the classic long-poll race without polling
-        // `has_changed()` (that method does not consume the notification).
         tokio::select! {
             result = change_watcher.changed() => {
                 if result.is_ok() {
@@ -2425,162 +2479,187 @@ where
             _ = tokio::time::sleep(SYNC_LONG_POLL_TIMEOUT) => break response,
         }
     };
-    let encoded = serde_json::to_vec(&response).map_err(|error| {
+    bounded_sync_json_response(response, "sync pull", MAX_SYNC_PULL_RESPONSE_BYTES)
+}
+
+async fn sync_history<S>(
+    lease: SessionLease<S>,
+    commit_ids: Vec<String>,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let response = lease
+        .run_cancellable_read(move |lix| async move { lix.sync_history(&commit_ids).await })
+        .await?;
+    bounded_sync_json_response(response, "sync history", MAX_SYNC_PULL_RESPONSE_BYTES)
+}
+
+fn bounded_sync_json_response<T>(
+    value: T,
+    operation: &'static str,
+    max_bytes: usize,
+) -> Result<Response, ApiError>
+where
+    T: Serialize,
+{
+    let encoded = serde_json::to_vec(&value).map_err(|error| {
         ApiError::from(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!("encode sync pull response: {error}"),
+            format!("encode {operation} response: {error}"),
         ))
     })?;
-    if encoded.len() > MAX_SYNC_PULL_RESPONSE_BYTES {
-        return Err(ApiError::payload_too_large(MAX_SYNC_PULL_RESPONSE_BYTES));
+    if encoded.len() > max_bytes {
+        return Err(ApiError::sync_response_too_large(operation, max_bytes));
     }
-    Ok(Json(response))
+    Ok(HttpResponse::builder()
+        .header(CONTENT_TYPE, "application/json")
+        .body(ServerProtocolBody::full(encoded))
+        .expect("static sync response headers are valid"))
 }
 
-async fn pull_sync_once<S>(
-    lease: &SessionLease<S>,
-    request: SyncPullRequest,
-) -> Result<SyncPullResponse, LixError>
+async fn sync_get_blob<S>(
+    lease: SessionLease<S>,
+    request: SyncBlobQuery,
+) -> Result<Json<SyncBlobManifest>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lease
+    let blob_id = required_sync_cas_id(request.blob_id, "blobId")?;
+    let requested_blob_id = blob_id.clone();
+    let manifest = lease
         .run_cancellable_read(move |lix| async move {
-            let session_branch_id = lix.active_branch_id().await?;
-            let branch_id = request.branch.clone().unwrap_or(session_branch_id.clone());
-            let target = if branch_id == session_branch_id {
-                None
-            } else {
-                Some(
-                    lix.open_internal_session(
-                        branch_id.clone(),
-                        lix.active_account_id().to_owned(),
-                    )
-                    .await?,
-                )
-            };
-            if request.schemas.as_deref().is_some_and(|schemas| {
-                schemas.len() > MAX_SYNC_SCOPE_KEYS * (MAX_SYNC_SCOPE_KEY_BYTES + 1)
-            }) {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync pull schema scope is too large",
-                ));
-            }
-            let schema_keys = request.schemas.as_deref().map(parse_sync_scope);
-            if let Some(schema_keys) = schema_keys.as_deref() {
-                validate_sync_scope(schema_keys)?;
-            }
-            let result = match target.as_ref() {
-                Some(target) => {
-                    target
-                        .pull_sync_events(
-                            &branch_id,
-                            request.after,
-                            request.limit,
-                            schema_keys.as_deref(),
-                        )
-                        .await
-                }
-                None => {
-                    lix.pull_sync_events(
-                        &branch_id,
-                        request.after,
-                        request.limit,
-                        schema_keys.as_deref(),
-                    )
-                    .await
-                }
-            };
-            if let Some(target) = target {
-                target.close().await?;
-            }
-            result
+            lix.get_sync_blob_manifest(&requested_blob_id).await
         })
-        .await
+        .await?
+        .ok_or_else(|| sync_cas_not_found("blob", &blob_id))?;
+    Ok(Json(manifest))
 }
 
-/// Returns the global branch catalog for a lazy local replica. This control
-/// plane is deliberately read-only and carries no row payloads; branch data
-/// is materialized locally through the existing branch API.
-async fn sync_branches<S>(lease: SessionLease<S>) -> Result<Json<Vec<SyncBranch>>, ApiError>
+async fn sync_register_blob<S>(
+    lease: SessionLease<S>,
+    Json(manifest): Json<SyncBlobManifest>,
+) -> Result<Json<SyncBlobRegistration>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let branches = lease
-        .run_cancellable_read(|lix| async move {
-            // The authenticated lease is pinned to the caller's application
-            // branch. Its branch-head/SQL caches can legitimately lag a
-            // concurrent control write made through another server session
-            // (for example a new branch created by the authority itself).
-            // Read the catalog through a fresh suppressed global session so
-            // every sync client sees the authoritative global control lane.
-            let global = lix
-                .open_internal_session_suppressed(
-                    lix::GLOBAL_BRANCH_ID.to_owned(),
-                    lix.active_account_id().to_owned(),
-                )
-                .await?;
-            let branches_result = async {
-                let result = global
-                    .execute(
-                        "SELECT id, name, hidden, commit_id FROM lix_branch ORDER BY id",
-                        &[],
-                    )
-                    .await?;
-                result
-                    .rows()
-                    .iter()
-                    .map(|row| {
-                        Ok(SyncBranch {
-                            id: row.get::<String>("id")?,
-                            name: row.get::<String>("name")?,
-                            hidden: row.get::<bool>("hidden")?,
-                            commit_id: row.get::<String>("commit_id")?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, LixError>>()
-            }
-            .await;
-            let close_result = global.close().await;
-            match (branches_result, close_result) {
-                (Err(error), _) => Err(error),
-                (Ok(_), Err(error)) => Err(error),
-                (Ok(branches), Ok(())) => Ok(branches),
-            }
-        })
+    validate_sync_blob_manifest(&manifest)?;
+    let registration = lease
+        .run_durable(move |lix| async move { lix.register_sync_blob_manifest(&manifest).await })
         .await?;
-    Ok(Json(branches))
+    Ok(Json(registration))
 }
 
-fn validate_sync_scope(schema_keys: &[String]) -> Result<(), LixError> {
-    if schema_keys.len() > MAX_SYNC_SCOPE_KEYS {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            format!("sync pull requests too many schemas (maximum {MAX_SYNC_SCOPE_KEYS})"),
+async fn sync_get_chunk<S>(
+    lease: SessionLease<S>,
+    request: SyncChunkQuery,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let chunk_id = required_sync_cas_id(request.chunk_id, "chunkId")?;
+    let requested_chunk_id = chunk_id.clone();
+    let bytes = lease
+        .run_cancellable_read(
+            move |lix| async move { lix.get_sync_chunk(&requested_chunk_id).await },
+        )
+        .await?
+        .ok_or_else(|| sync_cas_not_found("chunk", &chunk_id))?;
+    if bytes.is_empty() || bytes.len() > MAX_SYNC_CHUNK_BYTES {
+        return Err(ApiError::from(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "stored sync chunk violates the protocol size bound",
+        )));
+    }
+    let content_length = bytes.len();
+    let mut response = Response::new(ServerProtocolBody::from(Bytes::from(bytes)));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        http::HeaderValue::from_str(&content_length.to_string()).map_err(|_| {
+            ApiError::from(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync chunk response length cannot be encoded",
+            ))
+        })?,
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        http::HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    Ok(response)
+}
+
+async fn sync_put_chunk<S>(
+    lease: SessionLease<S>,
+    request: SyncChunkQuery,
+    bytes: Bytes,
+) -> Result<StatusCode, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let chunk_id = required_sync_cas_id(request.chunk_id, "chunkId")?;
+    if bytes.is_empty() {
+        return Err(ApiError::bad_request(
+            "sync chunks must contain at least one byte",
         ));
     }
-    if schema_keys
-        .iter()
-        .any(|schema| schema.is_empty() || schema.len() > MAX_SYNC_SCOPE_KEY_BYTES)
+    lease
+        .run_durable(move |lix| async move { lix.put_sync_chunk(&chunk_id, &bytes).await })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn required_sync_cas_id(value: Option<String>, field: &str) -> Result<String, ApiError> {
+    let value = value.ok_or_else(|| ApiError::bad_request(format!("{field} is required")))?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            format!("sync schema keys must contain 1 to {MAX_SYNC_SCOPE_KEY_BYTES} bytes"),
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a 64-character lowercase BLAKE3 hex digest",
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_sync_blob_manifest(manifest: &SyncBlobManifest) -> Result<(), ApiError> {
+    required_sync_cas_id(Some(manifest.blob_id.clone()), "blobId")?;
+    if manifest.chunks.len() > MAX_SYNC_BLOB_MANIFEST_CHUNKS {
+        return Err(ApiError::bad_request(format!(
+            "sync blob manifests accept at most {MAX_SYNC_BLOB_MANIFEST_CHUNKS} chunks",
+        )));
+    }
+    let mut declared_size = 0_u64;
+    for chunk in &manifest.chunks {
+        required_sync_cas_id(Some(chunk.chunk_id.clone()), "chunks[].chunkId")?;
+        if chunk.size_bytes == 0 || chunk.size_bytes > MAX_SYNC_CHUNK_BYTES as u64 {
+            return Err(ApiError::bad_request(format!(
+                "sync blob chunk sizes must be between 1 and {MAX_SYNC_CHUNK_BYTES} bytes",
+            )));
+        }
+        declared_size = declared_size.checked_add(chunk.size_bytes).ok_or_else(|| {
+            ApiError::bad_request("sync blob manifest size overflows an unsigned 64-bit integer")
+        })?;
+    }
+    if declared_size != manifest.size_bytes {
+        return Err(ApiError::bad_request(
+            "sync blob manifest sizeBytes must equal the sum of its chunk sizes",
         ));
     }
     Ok(())
 }
 
-fn require_sync_identity(label: &str, expected: &str, actual: &str) -> Result<(), LixError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            format!("sync {label} mismatch: expected '{expected}', received '{actual}'"),
-        ))
-    }
+fn sync_cas_not_found(kind: &str, id: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "LIX_ERROR_SYNC_CAS_NOT_FOUND",
+        format!("sync {kind} '{id}' does not exist"),
+    )
 }
 
 async fn begin_transaction<S>(
@@ -3683,6 +3762,22 @@ impl ApiError {
         )
     }
 
+    fn sync_response_too_large(operation: &str, limit: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE",
+            format!("{operation} response exceeds the {limit}-byte protocol limit"),
+        )
+    }
+
+    fn sync_push_event_too_large(limit: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "LIX_ERROR_REQUEST_BODY_TOO_LARGE",
+            format!("sync push would create an event above the {limit}-byte pull response limit"),
+        )
+    }
+
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -3981,7 +4076,9 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         LixError::CODE_CLOSED | LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED => {
             StatusCode::CONFLICT
         }
-        LixError::CODE_IDEMPOTENCY_KEY_REUSED => StatusCode::CONFLICT,
+        LixError::CODE_IDEMPOTENCY_KEY_REUSED | LixError::CODE_TRANSACTION_CONFLICT => {
+            StatusCode::CONFLICT
+        }
         LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
         | LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         LixError::CODE_IDEMPOTENCY_RESPONSE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
@@ -4013,33 +4110,72 @@ struct BeginTransactionResponse {
     transaction_id: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncPullRequest {
     #[serde(default)]
-    after: u64,
+    after: Option<u64>,
     #[serde(default = "default_sync_pull_limit")]
     limit: usize,
-    /// Comma-separated semantic schema keys requested by a lazy replica.
-    /// Event-bearing requests are always long-polled. An empty scope is an
-    /// unscoped/topology pull; only `limit=0` is the internal metadata-only
-    /// head probe and never returns an event page.
     #[serde(default)]
-    schemas: Option<String>,
-    /// Internal topology pulls may read another branch without mutating the
-    /// authenticated session's branch selector. Ordinary clients send their
-    /// pinned branch as well, so the server can validate the request identity.
+    snapshot_branch_id: Option<String>,
     #[serde(default)]
-    branch: Option<String>,
+    snapshot_head_commit_id: Option<String>,
+    #[serde(default)]
+    snapshot_after: Option<String>,
 }
 
-fn parse_sync_scope(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|schema| !schema.is_empty())
-        .map(str::to_owned)
-        .collect()
+impl Default for SyncPullRequest {
+    fn default() -> Self {
+        Self {
+            after: None,
+            limit: default_sync_pull_limit(),
+            snapshot_branch_id: None,
+            snapshot_head_commit_id: None,
+            snapshot_after: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncBlobQuery {
+    blob_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncChunkQuery {
+    chunk_id: Option<String>,
+}
+
+fn decode_sync_history_query(query: Option<&str>) -> Result<Vec<String>, ApiError> {
+    let pairs = serde_urlencoded::from_str::<Vec<(String, String)>>(query.unwrap_or_default())
+        .map_err(|error| ApiError::bad_request(format!("invalid sync history query: {error}")))?;
+    if pairs.iter().any(|(key, _)| key != "commitId") {
+        return Err(ApiError::bad_request(
+            "sync history accepts only repeated commitId parameters",
+        ));
+    }
+    let commit_ids = pairs
+        .into_iter()
+        .map(|(_, commit_id)| commit_id)
+        .collect::<Vec<_>>();
+    if commit_ids.is_empty() || commit_ids.len() > crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS {
+        return Err(ApiError::bad_request(format!(
+            "sync history requires between 1 and {} commitId parameters",
+            crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS,
+        )));
+    }
+    if commit_ids
+        .iter()
+        .any(|commit_id| commit_id.is_empty() || commit_id.len() > 255)
+    {
+        return Err(ApiError::bad_request(
+            "sync history commitId parameters must be between 1 and 255 bytes",
+        ));
+    }
+    Ok(commit_ids)
 }
 
 const fn default_sync_pull_limit() -> usize {
@@ -4055,8 +4191,11 @@ struct ProtocolCapabilities {
     binary_file_upsert: bool,
     binary_file_upsert_batch: bool,
     binary_file_read: bool,
-    sync_admission: bool,
+    sync_push: bool,
     sync_pull: bool,
+    sync_history: bool,
+    sync_blob: bool,
+    sync_chunk: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4218,6 +4357,24 @@ fn require_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "LIX_ERROR_UNSUPPORTED_CONTENT_TYPE",
             "JSON protocol requests require Content-Type application/json",
+        ))
+    }
+}
+
+fn require_octet_stream_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let media_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+    if media_type.eq_ignore_ascii_case("application/octet-stream") {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "LIX_ERROR_UNSUPPORTED_CONTENT_TYPE",
+            "raw sync chunk requests require Content-Type application/octet-stream",
         ))
     }
 }
@@ -4822,9 +4979,13 @@ mod tests {
                 ("DELETE", "/lix/v1/session") => "deleteSession",
                 ("POST", "/lix/v1/execute") => "execute",
                 ("POST", "/lix/v1/execute-batch") => "executeBatch",
-                ("POST", "/lix/v1/sync/admit") => "syncAdmit",
+                ("POST", "/lix/v1/sync/push") => "syncPush",
                 ("GET", "/lix/v1/sync/pull") => "syncPull",
-                ("GET", "/lix/v1/sync/branches") => "syncBranches",
+                ("GET", "/lix/v1/sync/history") => "syncHistory",
+                ("GET", "/lix/v1/sync/blob") => "syncGetBlob",
+                ("POST", "/lix/v1/sync/blob") => "syncRegisterBlob",
+                ("GET", "/lix/v1/sync/chunk") => "syncGetChunk",
+                ("PUT", "/lix/v1/sync/chunk") => "syncPutChunk",
                 ("POST", "/lix/v1/transaction/begin") => "beginTransaction",
                 ("POST", "/lix/v1/transaction/execute") => "transactionExecute",
                 ("POST", "/lix/v1/transaction/commit") => "commitTransaction",
@@ -4846,6 +5007,73 @@ mod tests {
                 "OpenAPI is missing {method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn openapi_sync_wire_tracks_the_exact_snapshot_and_merge_dtos() {
+        let openapi = include_str!("../../server-protocol.openapi.yaml");
+        assert!(openapi.contains("required: [kind, cursor, defaultBranchId, branches]"));
+        assert!(openapi.contains("required: [branchId, headCommitId, hotStateRootId]"));
+        assert!(openapi.contains("required: [branchId, headCommitId, rows, continuation]"));
+        assert!(openapi.contains("required: [commits, commitHeaders, missingCommitIds]"));
+        assert!(!openapi.contains("headCommits:"));
+        assert!(openapi.contains(
+            "required: [commitId, parentCommitIds, accountId, createdAt, selectedSourceCommitId, members]"
+        ));
+        assert!(openapi.contains("changeAccountId: { type: string, minLength: 1 }"));
+        assert!(openapi.contains("changeCreatedAt: { type: string, minLength: 1 }"));
+        assert_eq!(
+            openapi
+                .matches("rowPk: { $ref: \"#/components/schemas/SyncRowPk\" }")
+                .count(),
+            2,
+            "commit members and snapshot rows must share the lossless typed rowPk schema",
+        );
+        for row_pk_type in ["uuid", "integer", "string", "bytes"] {
+            assert!(openapi.contains(&format!("type: {{ const: {row_pk_type} }}")));
+        }
+        assert!(!openapi.contains("rowPk: {}"));
+        assert!(!openapi.contains("sourceCommitId:"));
+    }
+
+    #[test]
+    fn bounded_sync_json_response_rejects_oversized_encoded_bodies() {
+        let error = bounded_sync_json_response(
+            json!({ "payload": "larger than the test limit" }),
+            "sync history",
+            8,
+        )
+        .expect_err("encoded response should exceed the test limit");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.body.error.code, "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE");
+        assert!(error.body.error.message.contains("sync history response"));
+
+        let response = bounded_sync_json_response(json!({ "ok": true }), "sync pull", 64)
+            .expect("small response should fit");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("application/json"))
+        );
+    }
+
+    #[test]
+    fn sync_push_admission_rejects_an_event_that_cannot_be_pulled() {
+        let request = SyncPushRequest {
+            commits: Vec::new(),
+            ref_updates: vec![crate::sync::SyncRefUpdate {
+                branch_id: uuid::Uuid::now_v7().to_string(),
+                expected_head_commit_id: None,
+                head_commit_id: None,
+            }],
+        };
+        ensure_sync_push_event_fits(&request, 1024)
+            .expect("the small synthetic event should fit a normal envelope");
+        let error = ensure_sync_push_event_fits(&request, 1)
+            .expect_err("the authority must reject an unpullable event before committing it");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.body.error.code, "LIX_ERROR_REQUEST_BODY_TOO_LARGE");
+        assert!(error.body.error.message.contains("pull response limit"));
     }
 
     #[test]
@@ -6575,28 +6803,6 @@ mod tests {
             .expect("active commit id")
     }
 
-    fn sync_pack_json(
-        operation_id: &str,
-        branch_id: &str,
-        base_commit_id: &str,
-        row_id: &str,
-        value: &str,
-    ) -> JsonValue {
-        json!({
-            "operationId": operation_id,
-            "branchId": branch_id,
-            "baseServerCommitId": base_commit_id,
-            "localCommitId": format!("local-{operation_id}"),
-            "rows": [{
-                "schemaKey": "server_sync_test_row",
-                "fileId": null,
-                "rowPk": [row_id],
-                "snapshot": { "row_id": row_id, "value": value },
-                "metadata": null
-            }]
-        })
-    }
-
     fn wire_blob_json(bytes: &[u8]) -> JsonValue {
         let value = WireValue::try_from_engine(&Value::Blob(bytes.to_vec().into()))
             .expect("blob should encode");
@@ -6901,8 +7107,11 @@ mod tests {
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
         assert_eq!(first["capabilities"]["binaryFileUpsertBatch"], true);
         assert_eq!(first["capabilities"]["binaryFileRead"], true);
-        assert_eq!(first["capabilities"]["syncAdmission"], true);
+        assert_eq!(first["capabilities"]["syncPush"], true);
         assert_eq!(first["capabilities"]["syncPull"], true);
+        assert_eq!(first["capabilities"]["syncHistory"], true);
+        assert_eq!(first["capabilities"]["syncBlob"], true);
+        assert_eq!(first["capabilities"]["syncChunk"], true);
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
         assert!(
             session_id
@@ -6917,649 +7126,519 @@ mod tests {
         assert_eq!(resumed["activeBranchId"], first["activeBranchId"]);
     }
 
-    #[tokio::test]
-    async fn sync_admission_requires_matching_idempotency_identity() {
-        let app = app().await;
-        let (session_id, handshake) = new_session(&app.router).await;
-        let branch_id = handshake["activeBranchId"].as_str().expect("branch id");
-        let base = active_commit_id(&app.lix).await;
-        let pack = sync_pack_json("sync-identity", branch_id, &base, "one", "value");
-
-        let missing = request_with_headers(
-            &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&session_id),
-            &[],
-            Some(pack.clone()),
-        )
-        .await;
-        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
-
-        let mismatched = request_with_headers(
-            &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "another-operation")],
-            Some(pack),
-        )
-        .await;
-        assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
-
-        let empty = json!({
-            "operationId": "sync-empty",
-            "branchId": branch_id,
-            "baseServerCommitId": base,
-            "localCommitId": "local-empty",
-            "rows": []
-        });
-        let empty = request_with_headers(
-            &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-empty")],
-            Some(empty),
-        )
-        .await;
-        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn sync_admission_accepts_file_only_packs_and_bounds_scope_requests() {
-        let app = app().await;
-        let (session_id, handshake) = new_session(&app.router).await;
-        let branch_id = handshake["activeBranchId"].as_str().expect("branch id");
-        let base = active_commit_id(&app.lix).await;
-        let file_pack = json!({
-            "operationId": "sync-file-only",
-            "branchId": branch_id,
-            "baseServerCommitId": base,
-            "localCommitId": "local-file-only",
-            "files": [{
-                "fileId": "file-only",
-                "path": "/sync-file-only.bin",
-                "filename": null,
-                "global": false,
-                "untracked": false,
-                "content": "AAEC"
-            }]
-        });
-        let admitted = request_with_headers(
-            &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-file-only")],
-            Some(file_pack),
-        )
-        .await;
+    #[test]
+    fn sync_history_query_is_only_a_bounded_repeated_commit_id_list() {
         assert_eq!(
-            admitted.status(),
-            StatusCode::OK,
-            "{:?}",
-            response_json(admitted).await
+            decode_sync_history_query(Some("commitId=one&commitId=two"))
+                .expect("repeated commit ids"),
+            ["one", "two"]
         );
-
-        let schemas = (0..=MAX_SYNC_SCOPE_KEYS)
-            .map(|index| format!("schema_{index}"))
+        assert!(decode_sync_history_query(None).is_err());
+        assert!(decode_sync_history_query(Some("commitId=")).is_err());
+        assert!(decode_sync_history_query(Some("head=legacy")).is_err());
+        let too_many = (0..=crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS)
+            .map(|index| format!("commitId={index}"))
             .collect::<Vec<_>>()
-            .join(",");
-        let rejected = request_with_headers(
-            &app.router,
-            "GET",
-            &format!("/lix/v1/sync/pull?after=0&limit=1&schemas={schemas}"),
-            Some(&session_id),
-            &[],
-            None,
-        )
-        .await;
-        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            .join("&");
+        assert!(decode_sync_history_query(Some(&too_many)).is_err());
     }
 
-    #[tokio::test]
-    async fn sync_admission_requests_a_durable_storage_commit() {
-        let storage = PostCommitUnknownStorage::new();
-        let lix = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .await
-                .expect("open durability probe lix"),
+    #[test]
+    fn sync_ref_compare_and_swap_conflicts_are_http_conflicts() {
+        let error = LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "sync ref compare-and-swap failed",
         );
-        lix.execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-            &[Value::Text(SYNC_TEST_SCHEMA.to_owned())],
-        )
-        .await
-        .expect("register sync schema");
-        let base = active_commit_id(&lix).await;
-        let router = handler(LixServerProtocol::new(lix));
-        let (session_id, handshake) = new_session(&router).await;
-        let branch_id = handshake["activeBranchId"].as_str().expect("branch id");
-        storage.clear_last_write_await_durable();
-
-        let admitted = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-durable")],
-            Some(sync_pack_json(
-                "sync-durable",
-                branch_id,
-                &base,
-                "durable",
-                "yes",
-            )),
-        )
-        .await;
-        assert_eq!(admitted.status(), StatusCode::OK);
-        assert!(storage.last_write_await_durable());
+        assert_eq!(status_for_lix_error(&error), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
-    async fn sync_pull_is_a_mandatory_long_poll_and_wakes_after_canonical_admission() {
+    async fn sync_surface_is_a_hard_cut_to_push_pull_and_history() {
         let app = app().await;
-        app.lix
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-                &[Value::Text(SYNC_TEST_SCHEMA.to_owned())],
-            )
-            .await
-            .expect("register sync schema");
-        let (session_id, handshake) = new_session(&app.router).await;
-        let branch_id = handshake["activeBranchId"]
-            .as_str()
-            .expect("branch id")
-            .to_owned();
-        let base = active_commit_id(&app.lix).await;
+        let (session_id, _) = new_session(&app.router).await;
 
-        let first = request_with_headers(
+        for path in ["/lix/v1/sync/admit", "/lix/v1/sync/branches"] {
+            let response = request(&app.router, "GET", path, Some(&session_id), None).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        let empty_push = request(
             &app.router,
             "POST",
-            "/lix/v1/sync/admit",
+            "/lix/v1/sync/push",
             Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "long-poll-first")],
-            Some(sync_pack_json(
-                "long-poll-first",
-                &branch_id,
-                &base,
-                "long-poll",
-                "first",
-            )),
+            Some(json!({ "commits": [], "refUpdates": [] })),
         )
         .await;
-        assert_eq!(first.status(), StatusCode::OK);
-        let first = response_json(first).await;
-        let first_commit = first["canonicalCommitId"]
-            .as_str()
-            .expect("first canonical commit")
-            .to_owned();
-        let first_cursor = first["cursor"].as_u64().expect("first cursor");
+        assert_eq!(empty_push.status(), StatusCode::BAD_REQUEST);
 
-        // Unknown query controls are rejected. Long-polling is the server
-        // contract, not an opt-in `waitMs` request mode.
-        let unsupported = request_with_headers(
+        for path in [
+            "/lix/v1/sync/pull?limit=0",
+            "/lix/v1/sync/pull?schemas=legacy",
+            "/lix/v1/sync/pull?snapshotBranchId=branch",
+            "/lix/v1/sync/pull?snapshotBranchId=branch&snapshotHeadCommitId=head&after=1",
+            "/lix/v1/sync/history",
+            "/lix/v1/sync/history?head=legacy",
+        ] {
+            let response = request(&app.router, "GET", path, Some(&session_id), None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_snapshot_wire_is_metadata_only_and_rows_are_paged_by_immutable_head() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = request(
             &app.router,
             "GET",
-            &format!("/lix/v1/sync/pull?after={first_cursor}&limit=1&waitMs=1"),
+            "/lix/v1/sync/pull",
             Some(&session_id),
-            &[],
             None,
         )
         .await;
-        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+        let status = response.status();
+        let snapshot = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{snapshot}");
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert!(snapshot.get("headCommits").is_none());
+        assert!(snapshot.get("commitHeaders").is_none());
+        assert!(snapshot.get("rows").is_none());
 
-        let pending_router = app.router.clone();
-        let pending_session_id = session_id.clone();
-        let mut pending = tokio::spawn(async move {
-            request_with_headers(
-                &pending_router,
-                "GET",
-                &format!("/lix/v1/sync/pull?after={first_cursor}&limit=1"),
-                Some(&pending_session_id),
-                &[],
-                None,
-            )
-            .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut pending)
-                .await
-                .is_err(),
-            "an event pull at the current head should stay open"
-        );
+        let branches = snapshot["branches"]
+            .as_array()
+            .expect("snapshot branches should be an array");
+        let mut row_count = 0usize;
+        for branch in branches {
+            let Some(head_commit_id) = branch["headCommitId"].as_str() else {
+                continue;
+            };
+            let branch_id = branch["branchId"].as_str().expect("branch id");
+            let mut continuation = None;
+            loop {
+                let suffix = continuation
+                    .as_ref()
+                    .map(|continuation: &String| format!("&snapshotAfter={continuation}"))
+                    .unwrap_or_default();
+                let page = request(
+                    &app.router,
+                    "GET",
+                    &format!(
+                        "/lix/v1/sync/pull?snapshotBranchId={branch_id}&snapshotHeadCommitId={head_commit_id}&limit=1{suffix}"
+                    ),
+                    Some(&session_id),
+                    None,
+                )
+                .await;
+                let status = page.status();
+                let page = response_json(page).await;
+                assert_eq!(status, StatusCode::OK, "{page}");
+                assert_eq!(page["branchId"], branch_id);
+                assert_eq!(page["headCommitId"], head_commit_id);
+                let rows = page["rows"].as_array().expect("row page rows");
+                assert!(rows.len() <= 1);
+                assert!(rows.iter().all(|row| row["branchId"] == branch_id));
+                row_count += rows.len();
+                continuation = page["continuation"].as_str().map(str::to_owned);
+                if continuation.is_none() {
+                    break;
+                }
+            }
+        }
+        assert!(row_count > 0, "bootstrap fixture should expose hot rows");
+    }
 
-        let second = request_with_headers(
-            &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "long-poll-second")],
-            Some(sync_pack_json(
-                "long-poll-second",
-                &branch_id,
-                &first_commit,
-                "long-poll",
-                "second",
-            )),
-        )
-        .await;
-        assert_eq!(second.status(), StatusCode::OK);
-        let second = response_json(second).await;
-        let second_cursor = second["cursor"].as_u64().expect("second cursor");
-
-        let response = tokio::time::timeout(Duration::from_secs(1), pending)
-            .await
-            .expect("canonical admission should wake the long poll")
-            .expect("long-poll task should finish");
-        assert_eq!(response.status(), StatusCode::OK);
-        let response = response_json(response).await;
-        assert_eq!(response["events"].as_array().unwrap().len(), 1);
-        assert_eq!(response["events"][0]["cursor"], second_cursor);
-        assert_eq!(
-            response["events"][0]["pack"]["operationId"],
-            "long-poll-second"
-        );
-
-        // Ordinary authoritative Lix writes use the same canonical event
-        // lane. They must wake a waiter too; admission is not a special push
-        // path that would leave embedded/server-side writes invisible.
-        let pending_router = app.router.clone();
-        let pending_session_id = session_id.clone();
-        let mut pending = tokio::spawn(async move {
-            request_with_headers(
-                &pending_router,
-                "GET",
-                &format!("/lix/v1/sync/pull?after={second_cursor}&limit=1"),
-                Some(&pending_session_id),
-                &[],
-                None,
-            )
-            .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut pending)
-                .await
-                .is_err(),
-            "the second event pull should also wait at the current head"
-        );
-
-        // A repository-wide invalidation must not turn every branch's
-        // long-poll into an empty response. The waiter is pinned to the
-        // authenticated branch; unrelated branch activity should be ignored
-        // until that branch advances, otherwise N clients multiply every
-        // other branch's commit into an avoidable reconnect storm.
-        let foreign_branch_id = "0198a000-0000-7000-8000-0000000000f1";
-        app.lix
+    #[tokio::test]
+    async fn sync_history_and_push_roundtrip_commit_scoped_merge_provenance() {
+        let app = app().await;
+        let source_branch = app
+            .lix
             .create_branch(CreateBranchOptions {
-                id: Some(foreign_branch_id.to_owned()),
-                name: "long-poll-foreign".to_owned(),
+                id: Some("01920000-0000-7000-8000-000000001501".to_owned()),
+                name: "sync selected source".to_owned(),
                 from_commit_id: None,
             })
             .await
-            .expect("create unrelated branch");
-        let foreign = app
+            .expect("source branch should be created");
+        let source = app
             .lix
             .open_another_session()
-            .with_branch(foreign_branch_id)
             .await
-            .expect("open unrelated branch session");
-        foreign
+            .expect("source session should open");
+        source
+            .switch_branch(SwitchBranchOptions {
+                branch_id: source_branch.id.clone(),
+            })
+            .await
+            .expect("source session should switch branches");
+        source
             .execute(
-                "UPDATE server_sync_test_row SET value = 'foreign' WHERE row_id = 'long-poll'",
+                "INSERT INTO lix_key_value (key, value) VALUES ('sync-source', 'selected')",
                 &[],
             )
             .await
-            .expect("write unrelated branch event");
-        foreign.close().await.expect("close unrelated branch session");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut pending)
-                .await
-                .is_err(),
-            "unrelated branch activity must not complete the main-branch long poll"
-        );
-
+            .expect("source branch should diverge");
+        source
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('sync-source-older', 'selected')",
+                &[],
+            )
+            .await
+            .expect("source branch should span more than one commit");
         app.lix
             .execute(
-                "UPDATE server_sync_test_row SET value = 'direct' WHERE row_id = 'long-poll'",
+                "INSERT INTO lix_key_value (key, value) VALUES ('sync-target', 'authored')",
                 &[],
             )
             .await
-            .expect("direct authoritative write");
-        let response = tokio::time::timeout(Duration::from_secs(1), pending)
+            .expect("target branch should diverge");
+        let merge = app
+            .lix
+            .merge_branch(lix::MergeBranchOptions {
+                source_branch_id: source_branch.id,
+            })
             .await
-            .expect("direct canonical write should wake the long poll")
-            .expect("long-poll task should finish");
-        assert_eq!(response.status(), StatusCode::OK);
-        let response = response_json(response).await;
-        assert_eq!(response["events"].as_array().unwrap().len(), 1);
-        assert!(
-            response["events"][0]["pack"]["operationId"]
-                .as_str()
-                .is_some_and(|operation| operation.starts_with("server:"))
+            .expect("disjoint branches should merge");
+        let merge_commit_id = merge
+            .created_merge_commit_id
+            .expect("diverged branches should create a merge commit");
+
+        let (session_id, _) = new_session(&app.router).await;
+        let history_path = format!("/lix/v1/sync/history?commitId={merge_commit_id}");
+        let history = request(&app.router, "GET", &history_path, Some(&session_id), None).await;
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = response_json(history).await;
+        let merge_commit = history["commits"]
+            .as_array()
+            .expect("history commits should be an array")
+            .iter()
+            .find(|commit| commit["commitId"] == merge_commit_id)
+            .expect("history should include the requested merge commit")
+            .clone();
+        assert_eq!(
+            merge_commit["selectedSourceCommitId"],
+            merge.source_head_before_commit_id
         );
+        let members = merge_commit["members"]
+            .as_array()
+            .expect("merge members should be an array");
+        assert!(!members.is_empty());
+        assert!(members.iter().any(|member| member["authored"] == false));
+        assert!(
+            members
+                .iter()
+                .all(|member| member.get("sourceCommitId").is_none())
+        );
+
+        let mut pending = vec![merge_commit_id.clone()];
+        let mut imported = std::collections::BTreeMap::<String, JsonValue>::new();
+        while let Some(commit_id) = pending.pop() {
+            if imported.contains_key(&commit_id) {
+                continue;
+            }
+            let response = app
+                .lix
+                .sync_history(std::slice::from_ref(&commit_id))
+                .await
+                .expect("source history closure should load");
+            for commit in response.commits {
+                for dependency in &commit.parent_commit_ids {
+                    if !imported.contains_key(dependency) {
+                        pending.push(dependency.clone());
+                    }
+                }
+                imported.insert(
+                    commit.commit_id.clone(),
+                    serde_json::to_value(commit).expect("history commit should encode"),
+                );
+            }
+        }
+
+        let mut forged_commits = imported.values().cloned().collect::<Vec<_>>();
+        let forged_merge = forged_commits
+            .iter_mut()
+            .find(|commit| commit["commitId"] == merge_commit_id)
+            .expect("forged graph contains merge");
+        let forged_selected = forged_merge["members"]
+            .as_array_mut()
+            .expect("merge members array")
+            .iter_mut()
+            .find(|member| member["authored"] == false)
+            .expect("merge has a selected member");
+        forged_selected["snapshot"] = json!({"key": "forged", "value": "forged"});
+        let forged_target = self::app().await;
+        let forged_request: SyncPushRequest = serde_json::from_value(json!({
+            "commits": forged_commits,
+            "refUpdates": [{
+                "branchId": "01920000-0000-7000-8000-000000001503",
+                "expectedHeadCommitId": null,
+                "headCommitId": merge_commit_id,
+            }]
+        }))
+        .expect("forged request should decode");
+        let forged = forged_target
+            .lix
+            .push_sync_repository(&forged_request)
+            .await
+            .expect_err("forged selected payload must fail authority validation");
+        assert_eq!(forged.code, LixError::CODE_INVALID_PARAM);
+
+        let target = self::app().await;
+        let replay_request: SyncPushRequest = serde_json::from_value(json!({
+            "commits": imported.into_values().collect::<Vec<_>>(),
+            "refUpdates": [{
+                "branchId": "01920000-0000-7000-8000-000000001502",
+                "expectedHeadCommitId": null,
+                "headCommitId": merge_commit_id,
+            }]
+        }))
+        .expect("roundtrip request should decode");
+        target
+            .lix
+            .push_sync_repository(&replay_request)
+            .await
+            .expect("valid full graph should import");
+        let (target_session_id, _) = new_session(&target.router).await;
+
+        let roundtrip = request(
+            &target.router,
+            "GET",
+            &history_path,
+            Some(&target_session_id),
+            None,
+        )
+        .await;
+        assert_eq!(roundtrip.status(), StatusCode::OK);
+        let mut roundtrip = response_json(roundtrip).await;
+        assert_eq!(roundtrip["commits"], history["commits"]);
+        assert_eq!(roundtrip["missingCommitIds"], history["missingCommitIds"]);
+        let mut expected_headers = history["commitHeaders"].clone();
+        for headers in [&mut roundtrip["commitHeaders"], &mut expected_headers] {
+            for header in headers.as_array_mut().expect("commit headers array") {
+                header
+                    .as_object_mut()
+                    .expect("commit header object")
+                    .remove("stateRootId");
+            }
+        }
+        assert_eq!(roundtrip["commitHeaders"], expected_headers);
     }
 
     #[tokio::test]
-    async fn sync_admission_replays_receipt_and_orders_overlapping_row_packs() {
-        let lix = Arc::new(
-            open_lix()
-                .with_storage(DurableMemory::new())
-                .await
-                .expect("open durable test lix"),
-        );
-        let router = handler(LixServerProtocol::new(lix.clone()));
-        lix.execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-            &[Value::Text(SYNC_TEST_SCHEMA.to_owned())],
+    async fn sync_cas_rejects_aliases_invalid_media_and_chunk_bounds() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let digest = "0".repeat(64);
+
+        for path in [
+            "/lix/v1/sync/blob?sha256=legacy",
+            "/lix/v1/sync/blob?blobId=ABC",
+            "/lix/v1/sync/chunk?chunkId=ABC",
+        ] {
+            let response = request(&app.router, "GET", path, Some(&session_id), None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        let legacy_registration = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/blob?sha256=legacy",
+            Some(&session_id),
+            Some(json!({ "blobId": digest, "sizeBytes": 0, "chunks": [] })),
         )
-        .await
-        .expect("register sync schema");
-        let base = active_commit_id(&lix).await;
-        let branches_before = lix
-            .execute("SELECT COUNT(*) AS branch_count FROM lix_branch", &[])
+        .await;
+        assert_eq!(legacy_registration.status(), StatusCode::BAD_REQUEST);
+        let dynamic_path = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/chunk/{digest}"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(dynamic_path.status(), StatusCode::NOT_FOUND);
+        for path in [
+            format!("/lix/v1/sync/blob?blobId={digest}"),
+            format!("/lix/v1/sync/chunk?chunkId={digest}"),
+        ] {
+            let response = request(&app.router, "GET", &path, Some(&session_id), None).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(error_code(response).await, "LIX_ERROR_SYNC_CAS_NOT_FOUND");
+        }
+
+        let wrong_blob_media = Request::builder()
+            .method("POST")
+            .uri("/lix/v1/sync/blob")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(CONTENT_TYPE, "text/plain")
+            .body(Body::from("{}"))
+            .expect("wrong manifest media request");
+        let response = app
+            .router
+            .clone()
+            .oneshot(wrong_blob_media)
             .await
-            .expect("count branches before admission")
-            .rows()[0]
-            .get::<i64>("branch_count")
-            .unwrap();
-        let (session_id, handshake) = new_session(&router).await;
-        let branch_id = handshake["activeBranchId"]
-            .as_str()
-            .expect("branch id")
-            .to_owned();
-        let first_pack = sync_pack_json("sync-first", &branch_id, &base, "shared", "first");
+            .expect("wrong manifest media response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
-        let first = request_with_headers(
-            &router,
+        let wrong_chunk_media = Request::builder()
+            .method("PUT")
+            .uri(format!("/lix/v1/sync/chunk?chunkId={digest}"))
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("x"))
+            .expect("wrong chunk media request");
+        let response = app
+            .router
+            .clone()
+            .oneshot(wrong_chunk_media)
+            .await
+            .expect("wrong chunk media response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let empty_chunk = Request::builder()
+            .method("PUT")
+            .uri(format!("/lix/v1/sync/chunk?chunkId={digest}"))
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::empty())
+            .expect("empty chunk request");
+        let response = app
+            .router
+            .clone()
+            .oneshot(empty_chunk)
+            .await
+            .expect("empty chunk response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let oversized_chunk = Request::builder()
+            .method("PUT")
+            .uri(format!("/lix/v1/sync/chunk?chunkId={digest}"))
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(vec![0; MAX_SYNC_CHUNK_BYTES + 1]))
+            .expect("oversized chunk request");
+        let response = app
+            .router
+            .clone()
+            .oneshot(oversized_chunk)
+            .await
+            .expect("oversized chunk response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let invalid_manifest = request(
+            &app.router,
             "POST",
-            "/lix/v1/sync/admit",
+            "/lix/v1/sync/blob",
             Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-first")],
-            Some(first_pack.clone()),
+            Some(json!({
+                "blobId": digest,
+                "sizeBytes": MAX_SYNC_CHUNK_BYTES as u64 + 1,
+                "chunks": [{
+                    "chunkId": "0".repeat(64),
+                    "sizeBytes": MAX_SYNC_CHUNK_BYTES as u64 + 1
+                }]
+            })),
         )
         .await;
-        assert_eq!(first.status(), StatusCode::OK);
-        let first = response_json(first).await;
-        let first_commit = first["canonicalCommitId"]
-            .as_str()
-            .expect("first canonical commit")
-            .to_owned();
+        assert_eq!(invalid_manifest.status(), StatusCode::BAD_REQUEST);
+    }
 
-        let replay = request_with_headers(
-            &router,
+    #[tokio::test]
+    async fn sync_cas_roundtrips_one_chunk_without_a_presence_route() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let bytes = b"one canonical sync chunk";
+        let chunk_id = blake3::hash(bytes).to_hex().to_string();
+        let manifest = json!({
+            "blobId": chunk_id,
+            "sizeBytes": bytes.len(),
+            "chunks": [{ "chunkId": chunk_id, "sizeBytes": bytes.len() }]
+        });
+
+        let missing = request(
+            &app.router,
             "POST",
-            "/lix/v1/sync/admit",
+            "/lix/v1/sync/blob",
             Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-first")],
-            Some(first_pack.clone()),
+            Some(manifest.clone()),
         )
         .await;
-        assert_eq!(replay.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(replay).await["canonicalCommitId"],
-            first_commit
-        );
-        assert_eq!(active_commit_id(&lix).await, first_commit);
+        assert_eq!(missing.status(), StatusCode::OK);
+        let missing = response_json(missing).await;
+        assert_eq!(missing["complete"], false);
+        assert_eq!(missing["missingChunkIds"], json!([chunk_id]));
 
-        let changed_payload = sync_pack_json(
-            "sync-first",
-            &branch_id,
-            &base,
-            "shared",
-            "not-the-first-payload",
-        );
-        let conflict = request_with_headers(
-            &router,
+        let put = Request::builder()
+            .method("PUT")
+            .uri(format!("/lix/v1/sync/chunk?chunkId={chunk_id}"))
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(bytes.to_vec()))
+            .expect("put chunk request");
+        let put = app
+            .router
+            .clone()
+            .oneshot(put)
+            .await
+            .expect("put chunk response");
+        assert_eq!(put.status(), StatusCode::NO_CONTENT);
+
+        let registration = request(
+            &app.router,
             "POST",
-            "/lix/v1/sync/admit",
+            "/lix/v1/sync/blob",
             Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-first")],
-            Some(changed_payload),
+            Some(manifest.clone()),
         )
         .await;
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-
-        let second_pack = sync_pack_json("sync-second", &branch_id, &base, "shared", "second");
-        let second = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-second")],
-            Some(second_pack),
-        )
-        .await;
-        assert_eq!(second.status(), StatusCode::OK);
-        let second_commit = response_json(second).await["canonicalCommitId"]
-            .as_str()
-            .expect("second canonical commit")
-            .to_owned();
-        assert_ne!(second_commit, first_commit);
-        // A pre-sync repository now publishes its reachable commit DAG as
-        // oldest-first bootstrap events before admitting the first live pack.
-        // Locate the live operation by identity instead of assuming that the
-        // bootstrap occupies exactly one cursor slot.
-        let first_page = request_with_headers(
-            &router,
-            "GET",
-            "/lix/v1/sync/pull?after=1&limit=32",
-            Some(&session_id),
-            &[],
-            None,
-        )
-        .await;
-        assert_eq!(first_page.status(), StatusCode::OK);
-        let first_page = response_json(first_page).await;
-        let events = first_page["events"].as_array().unwrap();
-        let first_event = events
-            .iter()
-            .find(|event| event["pack"] == first_pack)
-            .expect("first admitted pack appears after bootstrap history");
-        let first_cursor = first_event["cursor"]
-            .as_u64()
-            .expect("first admitted cursor");
-        let second_event = events
-            .iter()
-            .find(|event| event["canonicalCommitId"] == second_commit)
-            .expect("second admitted pack appears after the first");
-        let second_cursor = second_event["cursor"]
-            .as_u64()
-            .expect("second admitted cursor");
-        assert!(first_cursor < second_cursor);
-        assert_eq!(second_event["pack"]["operationId"], "sync-second");
-        let head_cursor = first_page["headCursor"]
-            .as_u64()
-            .expect("bootstrap/live head cursor");
-        assert!(head_cursor >= second_cursor);
-
-        let second_page = request_with_headers(
-            &router,
-            "GET",
-            &format!("/lix/v1/sync/pull?after={first_cursor}&limit=1"),
-            Some(&session_id),
-            &[],
-            None,
-        )
-        .await;
-        assert_eq!(second_page.status(), StatusCode::OK);
-        let second_page = response_json(second_page).await;
-        assert_eq!(second_page["events"].as_array().unwrap().len(), 1);
-        assert_eq!(second_page["events"][0]["cursor"], second_cursor);
-        assert_eq!(second_page["events"][0]["canonicalCommitId"], second_commit);
-        assert_eq!(second_page["nextCursor"], second_cursor);
-        assert_eq!(second_page["headCursor"], head_cursor);
-        let head_only = request_with_headers(
-            &router,
-            "GET",
-            &format!("/lix/v1/sync/pull?after={head_cursor}&limit=0"),
-            Some(&session_id),
-            &[],
-            None,
-        )
-        .await;
-        assert_eq!(head_only.status(), StatusCode::OK);
-        let head_only = response_json(head_only).await;
-        assert!(head_only["events"].as_array().unwrap().is_empty());
-        assert_eq!(head_only["nextCursor"], head_cursor);
-        assert_eq!(head_only["headCursor"], head_cursor);
-
-        let filtered_page = request_with_headers(
-            &router,
-            "GET",
-            "/lix/v1/sync/pull?after=1&limit=1&schemas=unrelated_schema",
-            Some(&session_id),
-            &[],
-            None,
-        )
-        .await;
-        assert_eq!(filtered_page.status(), StatusCode::OK);
-        let filtered_page = response_json(filtered_page).await;
-        assert_eq!(filtered_page["events"].as_array().unwrap().len(), 1);
+        assert_eq!(registration.status(), StatusCode::OK);
+        let registration = response_json(registration).await;
+        assert_eq!(registration["complete"], true);
         assert!(
-            filtered_page["events"][0]["pack"]["rows"]
+            registration["missingChunkIds"]
                 .as_array()
                 .unwrap()
                 .is_empty()
         );
-        let row = lix
-            .execute(
-                "SELECT value FROM server_sync_test_row WHERE row_id = 'shared'",
-                &[],
-            )
-            .await
-            .expect("read admitted row");
-        assert_eq!(row.rows()[0].get::<String>("value").unwrap(), "second");
-        let branches = lix
-            .execute("SELECT COUNT(*) AS branch_count FROM lix_branch", &[])
-            .await
-            .expect("count branches");
-        assert_eq!(
-            branches.rows()[0].get::<i64>("branch_count").unwrap(),
-            branches_before
-        );
-    }
 
-    #[tokio::test]
-    async fn concurrent_sync_admissions_form_one_history_and_preserve_disjoint_rows() {
-        let app = app().await;
-        app.lix
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-                &[Value::Text(SYNC_TEST_SCHEMA.to_owned())],
-            )
-            .await
-            .expect("register sync schema");
-        let base = active_commit_id(&app.lix).await;
-        let (alice_session, alice_handshake) = new_session(&app.router).await;
-        let (bob_session, _) = new_session(&app.router).await;
-        let branch_id = alice_handshake["activeBranchId"]
-            .as_str()
-            .expect("branch id");
-        let alice_pack = sync_pack_json("sync-concurrent-alice", branch_id, &base, "a", "alice");
-        let bob_pack = sync_pack_json("sync-concurrent-bob", branch_id, &base, "b", "bob");
-
-        let alice = request_with_headers(
+        let blob = request(
             &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&alice_session),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-concurrent-alice")],
-            Some(alice_pack),
-        );
-        let bob = request_with_headers(
-            &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
-            Some(&bob_session),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-concurrent-bob")],
-            Some(bob_pack),
-        );
-        let (alice, bob) = tokio::join!(alice, bob);
-        assert_eq!(alice.status(), StatusCode::OK);
-        assert_eq!(bob.status(), StatusCode::OK);
-
-        let rows = app
-            .lix
-            .execute(
-                "SELECT row_id, value FROM server_sync_test_row ORDER BY row_id",
-                &[],
-            )
-            .await
-            .expect("read admitted rows");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "alice");
-        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "bob");
-        let forks = app
-            .lix
-            .execute(
-                "SELECT parent_id, COUNT(*) AS children FROM lix_commit_edge \
-                 GROUP BY parent_id HAVING COUNT(*) > 1",
-                &[],
-            )
-            .await
-            .expect("query history forks");
-        assert_eq!(forks.len(), 0, "sync admissions must not fork history");
-    }
-
-    #[tokio::test]
-    async fn sync_admission_rejects_a_base_from_another_branch() {
-        let app = app().await;
-        app.lix
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-                &[Value::Text(SYNC_TEST_SCHEMA.to_owned())],
-            )
-            .await
-            .expect("register sync schema");
-        let target_branch_id = app.lix.active_branch_id().await.expect("target branch id");
-        let target_head_before = active_commit_id(&app.lix).await;
-        let foreign_branch_id = "0198a000-0000-7000-8000-000000000001";
-        app.lix
-            .create_branch(CreateBranchOptions {
-                id: Some(foreign_branch_id.to_owned()),
-                name: "foreign sync base".to_owned(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("create foreign branch");
-        let foreign = app
-            .lix
-            .open_another_session()
-            .with_branch(foreign_branch_id)
-            .await
-            .expect("open foreign branch");
-        foreign
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('foreign-only', 'yes')",
-                &[],
-            )
-            .await
-            .expect("advance foreign branch");
-        let foreign_head = active_commit_id(&foreign).await;
-        foreign.close().await.expect("close foreign branch");
-
-        let (session_id, _) = new_session(&app.router).await;
-        let pack = sync_pack_json(
-            "sync-foreign-base",
-            &target_branch_id,
-            &foreign_head,
-            "foreign",
-            "rejected",
-        );
-        let rejected = request_with_headers(
-            &app.router,
-            "POST",
-            "/lix/v1/sync/admit",
+            "GET",
+            &format!("/lix/v1/sync/blob?blobId={chunk_id}"),
             Some(&session_id),
-            &[(IDEMPOTENCY_KEY_HEADER, "sync-foreign-base")],
-            Some(pack),
+            None,
         )
         .await;
-        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(active_commit_id(&app.lix).await, target_head_before);
+        assert_eq!(blob.status(), StatusCode::OK);
+        assert_eq!(response_json(blob).await, manifest);
+
+        let chunk = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/chunk?chunkId={chunk_id}"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(chunk.status(), StatusCode::OK);
+        assert_eq!(
+            chunk.headers().get(CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("application/octet-stream"))
+        );
+        assert_eq!(
+            chunk.into_body().collect().await.unwrap().to_bytes(),
+            &bytes[..]
+        );
+
+        let presence = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/presence?chunkId={chunk_id}"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(presence.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -7635,6 +7714,71 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sync_push_rejects_a_commit_authored_by_another_account() {
+        let app = app().await;
+        let principal = ServerProtocolPrincipal::Authenticated {
+            account_id: lix::SYSTEM_ACCOUNT_ID.to_string(),
+            idempotency_scope: "sync-account-binding".to_string(),
+        };
+        let handshake = Request::builder()
+            .uri("/lix/v1")
+            .body(Body::empty())
+            .expect("trusted handshake request");
+        let response = app
+            .server
+            .handle(
+                handshake,
+                ServerProtocolContext {
+                    principal: principal.clone(),
+                    durable_terminal_storage_notifier: None,
+                },
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response_json(response).await["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+
+        let foreign_commit = json!({
+            "commitId": crate::changelog::CommitId::for_test_label("foreign-sync-author").to_string(),
+            "parentCommitIds": [],
+            "accountId": lix::ANONYMOUS_ACCOUNT_ID,
+            "createdAt": "2026-08-19T00:00:00Z",
+            "selectedSourceCommitId": null,
+            "members": [],
+        });
+        let push = Request::builder()
+            .method(Method::POST)
+            .uri("/lix/v1/sync/push")
+            .header(SESSION_ID_HEADER, session_id)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "commits": [foreign_commit],
+                    "refUpdates": [],
+                }))
+                .expect("encode sync push"),
+            ))
+            .expect("foreign account push request");
+        let response = app
+            .server
+            .handle(
+                push,
+                ServerProtocolContext {
+                    principal,
+                    durable_terminal_storage_notifier: None,
+                },
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            error_code(response).await,
+            "LIX_ERROR_PROTOCOL_ACCOUNT_MISMATCH"
+        );
     }
 
     #[tokio::test]

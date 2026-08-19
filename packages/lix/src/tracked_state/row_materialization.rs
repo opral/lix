@@ -893,8 +893,7 @@ mod tests {
         let metadata = SharedStr::from_static(r#"{"impact":"format"}"#);
         let mut builder = MaterializedTrackedStateBatchBuilder::with_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
-            let row_pk =
-                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk = integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             builder.push_ref(
                 TrackedStateKeyRef {
                     schema_key: "shared_schema",
@@ -952,8 +951,7 @@ mod tests {
         let mut builder =
             MaterializedTrackedStateBatchBuilder::with_capacities(ROW_COUNT, ROW_COUNT * 2, 0);
         for index in 0..ROW_COUNT {
-            let row_pk =
-                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk = integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             let file_id = format!("file-{index:05}");
             builder.push_ref(
                 TrackedStateKeyRef {

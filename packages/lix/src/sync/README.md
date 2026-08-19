@@ -1,21 +1,20 @@
-# Sync module boundary
+# Repository sync
 
-The synchronization subsystem has three layers:
+Lix synchronizes its native repository facts rather than maintaining a second
+row protocol:
 
-- `mod.rs` contains the shared durable sync engine: wire/state models,
-  outbox/canonical application, lazy hydration, and branch reconciliation.
-- `runtime.rs` is the single lifecycle state machine for bootstrap, reconnect,
-  long-poll orchestration, outbox admission, retry/backoff, and shutdown.
-- `platform.rs` and `platform/` are the only target-dependent layer. Native
-  uses Tokio and reqwest. Browser WASM uses `spawn_local`, browser timers,
-  fetch, and `AbortController`.
+- complete immutable commits, with merge provenance in the second parent and
+  self-contained checkpoint members;
+- compare-and-swap branch ref updates on one ordered repository cursor;
+- BLAKE3/FastCDC blob manifests and chunks.
 
-`contract.rs` is the platform-neutral transport interface between the shared
-engine and the platform HTTP adapters. Target `cfg`, HTTP libraries, and task
-spawning must not leak into `mod.rs` or `runtime.rs`; a compile-time source
-boundary test in `platform.rs` enforces that rule.
+`repository.rs` exports, imports, and persists those facts. `runtime.rs` is the
+one bootstrap, outbox, long-poll, reconciliation, and retry state machine.
+`contract.rs` is its transport interface. `platform.rs` and `platform/` contain
+the only native/browser divergence: tasks, timers, HTTP, and cancellation.
 
-Lifecycle sync always uses the server's cancellable event long poll. The
-interval-based `SyncClient::run_polling_until` API remains only as a backwards-
-compatible helper for explicit/manual clients and is not used by server sync
-mode.
+An initial pull pins the cursor, default branch, and branch heads. The runtime
+then fetches distinct head commit bodies with bounded topology certificates and
+immutable head-pinned current-row pages concurrently. Live events transfer
+complete commits and ref moves. Older commit bodies and binary chunks load
+separately on demand and never advance the live cursor.

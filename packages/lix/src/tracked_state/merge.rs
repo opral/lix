@@ -938,10 +938,7 @@ mod tests {
         assert_eq!(plan.picks.row_capacity(), 0);
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts.row_capacity(), 1);
-        assert_eq!(
-            plan.conflicts[0].identity.row_pk(),
-            &integer_row_pk(-1)
-        );
+        assert_eq!(plan.conflicts[0].identity.row_pk(), &integer_row_pk(-1));
     }
 
     #[test]
@@ -1233,18 +1230,16 @@ mod tests {
     }
 
     fn integer_row_pk(value: i64) -> RowPk {
-        RowPk::from_components(smallvec::smallvec![
-            crate::row_pk::RowPkComponent::Integer(value)
-        ])
+        RowPk::from_components(smallvec::smallvec![crate::row_pk::RowPkComponent::Integer(
+            value
+        )])
         .expect("one integer is a valid row primary key")
     }
 
     fn integer_identity_batch(first: i64, row_count: usize) -> Vec<TrackedStateDiffIdentity> {
         let row_pks = (0..row_count)
             .map(|offset| {
-                integer_row_pk(
-                    first + i64::try_from(offset).expect("test row count fits an i64"),
-                )
+                integer_row_pk(first + i64::try_from(offset).expect("test row count fits an i64"))
             })
             .collect::<Vec<_>>();
         TrackedStateDiffIdentity::from_key_refs(row_count, |index| {

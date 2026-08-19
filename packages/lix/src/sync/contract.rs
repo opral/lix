@@ -1,49 +1,71 @@
 //! Platform-neutral transport contract consumed by the shared sync engine.
 //!
-//! HTTP, task, timer, and cancellation mechanics live under [`super::platform`].
-//! Admission, pull ordering, reconciliation, retry, and persistence policy do
-//! not belong in a transport implementation.
+//! The repository URL already selects one Lix repository. Accordingly the
+//! live protocol has one cursor and no branch, schema, projection, or session
+//! topology side channels. HTTP, task, timer, and cancellation mechanics live
+//! under [`super::platform`].
 
 use super::{
-    SyncAdmission, SyncBranch, SyncPullResponse, SyncTransactionPack, SyncTransportBounds,
-    SyncTransportFuture,
+    SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
+    SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransportBounds, SyncTransportFuture,
 };
 
-/// The operations required from a remote sync authority.
+/// Operations required from a remote repository authority.
 ///
-/// The Server Protocol is one transport for this interface. Keeping the core
-/// state machine transport-neutral also lets embedded hosts and tests connect
-/// two Lix repositories without making the database depend on an HTTP client.
+/// Commits and ref updates use one ordered repository cursor. Binary payloads
+/// use their independent BLAKE3/FastCDC CAS and are transferred only when a
+/// commit references content absent on the receiving side.
 pub trait SyncTransport: SyncTransportBounds {
     /// Stable identity of the remote repository (normally its canonical URL).
     fn remote_id(&self) -> &str;
 
-    fn admit<'a>(&'a self, pack: &'a SyncTransactionPack)
-    -> SyncTransportFuture<'a, SyncAdmission>;
+    /// Account authenticated by the authority handshake for this session.
+    fn active_account_id(&self) -> &str;
 
-    fn pull<'a>(
+    /// Atomically publishes immutable commits and compare-and-swap ref moves.
+    fn push<'a>(
+        &'a self,
+        request: &'a SyncPushRequest,
+    ) -> SyncTransportFuture<'a, SyncPushResponse>;
+
+    /// Loads hot state when `after` is `None`, otherwise long-polls the single
+    /// ordered repository event stream after that cursor.
+    fn pull(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> SyncTransportFuture<'_, SyncRepositoryPullResponse>;
+
+    /// Loads one bounded hot-row page at an immutable branch head.
+    fn snapshot_rows<'a>(
         &'a self,
         branch_id: &'a str,
-        after_cursor: u64,
+        head_commit_id: &'a str,
+        continuation: Option<&'a str>,
         limit: usize,
-        // Empty means an unscoped/head-only request; non-empty requests only
-        // materialize row/file payloads for these schema keys.
-        schema_keys: &'a [String],
-    ) -> SyncTransportFuture<'a, SyncPullResponse>;
+    ) -> SyncTransportFuture<'a, SyncSnapshotRowPage>;
 
-    /// Returns the current global branch catalog. Transports that do not
-    /// expose control-plane enumeration can leave this empty; row sync remains
-    /// fully functional and the runtime retries topology after reconnect.
-    fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
+    /// Loads exact immutable commits without changing live sync state.
+    fn history<'a>(
+        &'a self,
+        commit_ids: &'a [String],
+    ) -> SyncTransportFuture<'a, SyncHistoryResponse>;
 
-    /// Whether [`list_branches`](Self::list_branches) is an authoritative
-    /// catalog for this transport. The default is deliberately false: an
-    /// empty result from an embedded or test transport must not be interpreted
-    /// as proof that every local branch was deleted. Only an explicit catalog
-    /// implementation may drive destructive branch pruning.
-    fn has_authoritative_branch_catalog(&self) -> bool {
-        false
-    }
+    /// Loads one canonical flat blob manifest, if it is registered.
+    fn get_blob<'a>(
+        &'a self,
+        blob_id: &'a str,
+    ) -> SyncTransportFuture<'a, Option<SyncBlobManifest>>;
+
+    /// Negotiates missing chunks and atomically registers a verified manifest.
+    fn register_blob<'a>(
+        &'a self,
+        manifest: &'a SyncBlobManifest,
+    ) -> SyncTransportFuture<'a, SyncBlobRegistration>;
+
+    /// Loads one raw BLAKE3-addressed chunk, if present.
+    fn get_chunk<'a>(&'a self, chunk_id: &'a str) -> SyncTransportFuture<'a, Option<Vec<u8>>>;
+
+    /// Stores one raw chunk after the authority verifies its BLAKE3 identity.
+    fn put_chunk<'a>(&'a self, chunk_id: &'a str, bytes: &'a [u8]) -> SyncTransportFuture<'a, ()>;
 }

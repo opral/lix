@@ -5,7 +5,7 @@ import {
 	isLixStorage,
 	type LixStorage,
 } from "./storage-adapter.js";
-import type { OpenLixOptions } from "./types.js";
+import type { OpenLixOptions, SyncLixServerOptions } from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
@@ -40,9 +40,17 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		options.server?.mode === "sync"
 			? {
 					url: new URL(options.server.url).toString(),
-					headers: resolveHeaders(options.server.headers),
+					headers: options.server.headers,
+					fetch: options.server.fetch,
 				}
 			: undefined;
+	if (syncServer?.fetch !== undefined && typeof syncServer.fetch !== "function") {
+		throw new TypeError("openLix() sync server fetch must be a function");
+	}
+	if (syncServer?.headers !== undefined && typeof syncServer.headers !== "function") {
+		// Validate static headers before opening a worker/native runtime.
+		new Headers(syncServer.headers);
+	}
 	if (options.server !== undefined && syncServer === undefined) {
 		throw new TypeError("openLix() server mode must be 'remote' or 'sync'");
 	}
@@ -106,7 +114,7 @@ async function openJsProviderStorage(
 		};
 	},
 	telemetry: OpenLixOptions["telemetry"],
-	syncServer: { url: string; headers: [string, string][] } | undefined,
+	syncServer: Omit<SyncLixServerOptions, "mode"> | undefined,
 ): Promise<Lix> {
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (openStorages.has(storage)) throw storageAlreadyOpen();
@@ -130,12 +138,6 @@ async function openJsProviderStorage(
 		await binding?.close().catch(() => undefined);
 		throw error;
 	}
-}
-
-function resolveHeaders(headers: HeadersInit | undefined): [string, string][] {
-	const entries: [string, string][] = [];
-	new Headers(headers).forEach((value, name) => entries.push([name, value]));
-	return entries;
 }
 
 function storageAlreadyOpen(): Error & { code: string } {

@@ -137,7 +137,7 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ),
     (
         "sync",
-        "optional row-first synchronization coordinator spanning sessions and server admission",
+        "optional repository sync coordinator over complete commits and refs",
     ),
     ("session", "cyclic with `transaction` and with `gc`"),
     (

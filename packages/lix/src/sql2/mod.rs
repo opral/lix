@@ -85,7 +85,6 @@ pub(crate) use exec::{
 };
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
-    SessionSyncFileView,
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;

@@ -134,14 +134,10 @@ impl TrackedStateTree {
     ) -> Result<Vec<String>, LixError> {
         let mut schema_keys = Vec::new();
         let mut lower = Vec::new();
-        while let Some(encoded_key) = self
-            .first_key_at_or_after(store, root_id, &lower)
-            .await?
-        {
+        while let Some(encoded_key) = self.first_key_at_or_after(store, root_id, &lower).await? {
             let key = decode_key(&encoded_key)?;
             let schema_key = key.schema_key;
-            let Some(next_lower) =
-                lexicographic_successor(&encode_schema_key_prefix(&schema_key))
+            let Some(next_lower) = lexicographic_successor(&encode_schema_key_prefix(&schema_key))
             else {
                 schema_keys.push(schema_key);
                 break;
@@ -318,6 +314,20 @@ impl TrackedStateTree {
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        self.scan_after(store, root_id, request, None).await
+    }
+
+    /// Scans strictly after one complete canonical row identity.
+    ///
+    /// The encoded lower bound is intersected with ordinary filter ranges so
+    /// internal subtrees at or before the continuation are never loaded.
+    pub(crate) async fn scan_after(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        request: &TrackedStateTreeScanRequest,
+        exclusive_after: Option<&TrackedStateKey>,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
         if request.limit == Some(0) {
             return Ok(Vec::new());
         }
@@ -333,7 +343,32 @@ impl TrackedStateTree {
             return Ok(Vec::new());
         }
 
-        let ranges = scan_ranges(request);
+        let mut ranges = scan_ranges(request);
+        if let Some(after) = exclusive_after {
+            let encoded = encode_key(after);
+            let Some(start) = lexicographic_successor(&encoded) else {
+                return Ok(Vec::new());
+            };
+            if ranges.is_empty() {
+                ranges.push(EncodedScanRange { start, end: None });
+            } else {
+                ranges = ranges
+                    .into_iter()
+                    .filter_map(|range| {
+                        if range.end.as_ref().is_some_and(|end| end <= &start) {
+                            return None;
+                        }
+                        Some(EncodedScanRange {
+                            start: range.start.max(start.clone()),
+                            end: range.end,
+                        })
+                    })
+                    .collect();
+                if ranges.is_empty() {
+                    return Ok(Vec::new());
+                }
+            }
+        }
         let key_decode_hint = scan_key_decode_hint(request, &ranges);
         let row_capacity = if request.include_tombstones
             && request.schema_keys.is_empty()
@@ -3103,6 +3138,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exclusive_after_page_prunes_preceding_subtrees_and_honors_limit() {
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        let builder = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 256,
+            min_chunk_bytes: 128,
+            max_chunk_bytes: 512,
+        });
+        let mutations = (0..1_000)
+            .map(|index| {
+                mutation_owned(
+                    key("schema", None, &format!("row-{index:04}")),
+                    value(&format!("change-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let built = apply_mutations_for_test(&builder, &storage, None, mutations, None)
+            .await
+            .expect("paged scan fixture should build");
+        assert!(built.tree_height > 1, "fixture must have internal nodes");
+
+        let paged_reads = Arc::new(AtomicUsize::new(0));
+        let read = memory
+            .begin_read(crate::storage::ReadOptions::default())
+            .await
+            .expect("paged read should open");
+        let store = StorageAdapterReadScope::new(CountingStorageRead {
+            read,
+            tree_chunk_reads: Arc::clone(&paged_reads),
+        });
+        let page = TrackedStateTree::new()
+            .scan_after(
+                &store,
+                &built.root_id,
+                &TrackedStateTreeScanRequest {
+                    include_tombstones: false,
+                    limit: Some(5),
+                    ..TrackedStateTreeScanRequest::default()
+                },
+                Some(&key("schema", None, "row-0899")),
+            )
+            .await
+            .expect("second page should scan");
+        assert_eq!(page.len(), 5, "only the requested page is materialized");
+        assert_eq!(page[0].0.row_pk, RowPk::single("row-0900"));
+
+        let full_reads = Arc::new(AtomicUsize::new(0));
+        let read = memory
+            .begin_read(crate::storage::ReadOptions::default())
+            .await
+            .expect("full read should open");
+        let store = StorageAdapterReadScope::new(CountingStorageRead {
+            read,
+            tree_chunk_reads: Arc::clone(&full_reads),
+        });
+        let full = TrackedStateTree::new()
+            .scan(
+                &store,
+                &built.root_id,
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .expect("full scan should run");
+        assert_eq!(full.len(), 1_000);
+        assert!(
+            paged_reads.load(Ordering::Relaxed) * 10 < full_reads.load(Ordering::Relaxed),
+            "page 2 should prune earlier subtrees: paged={} full={}",
+            paged_reads.load(Ordering::Relaxed),
+            full_reads.load(Ordering::Relaxed),
+        );
+    }
+
+    #[tokio::test]
     async fn exact_candidates_outside_primary_key_bounds_do_zero_tree_reads() {
         let bytes = encode_leaf_node(&[]);
         let hash = hash_bytes(&bytes);
@@ -3406,11 +3514,7 @@ mod tests {
             "selected boundary key must exist in the base"
         );
         changed_rows.insert(
-            key(
-                "schema",
-                None,
-                &format!("row-{boundary_insert_number:05}"),
-            ),
+            key("schema", None, &format!("row-{boundary_insert_number:05}")),
             value("boundary-insert", Some("{}")),
         );
         changed_rows.insert(
@@ -3629,10 +3733,7 @@ mod tests {
                 let row_pk = if index % 2 == 0 {
                     RowPk::single(format!("row-{index:03}"))
                 } else {
-                    RowPk::from_parts_unchecked(vec![
-                        format!("row-{index:03}"),
-                        "尾-".to_string(),
-                    ])
+                    RowPk::from_parts_unchecked(vec![format!("row-{index:03}"), "尾-".to_string()])
                 };
                 let key = TrackedStateKey {
                     schema_key: schema_key.to_string(),
@@ -3850,11 +3951,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0.schema_key, "schema-a");
         assert_eq!(
-            rows[0]
-                .0
-                .row_pk
-                .as_single_string_owned()
-                .expect("identity"),
+            rows[0].0.row_pk.as_single_string_owned().expect("identity"),
             "row-a"
         );
         assert_eq!(
@@ -4022,24 +4119,26 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("range read should open");
-        let request = |lower: (&str, bool), upper: (&str, bool)| {
-            TrackedStateTreeScanRequest {
-                schema_keys: vec!["schema-a".to_owned()],
-                file_ids: vec![NullableKeyFilter::Value(file_id.to_owned())],
-                row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
-                    row_pk: RowPk::single(lower.0),
-                    inclusive: lower.1,
-                }),
-                row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
-                    row_pk: RowPk::single(upper.0),
-                    inclusive: upper.1,
-                }),
-                ..Default::default()
-            }
+        let request = |lower: (&str, bool), upper: (&str, bool)| TrackedStateTreeScanRequest {
+            schema_keys: vec!["schema-a".to_owned()],
+            file_ids: vec![NullableKeyFilter::Value(file_id.to_owned())],
+            row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single(lower.0),
+                inclusive: lower.1,
+            }),
+            row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single(upper.0),
+                inclusive: upper.1,
+            }),
+            ..Default::default()
         };
 
         let rows = tree
-            .scan(&store, &result.root_id, &request(("row-a", false), ("row-d", false)))
+            .scan(
+                &store,
+                &result.root_id,
+                &request(("row-a", false), ("row-d", false)),
+            )
             .await
             .expect("open range should scan");
         assert_eq!(
@@ -4050,7 +4149,11 @@ mod tests {
         );
 
         let rows = tree
-            .scan(&store, &result.root_id, &request(("row-b", true), ("row-c", true)))
+            .scan(
+                &store,
+                &result.root_id,
+                &request(("row-b", true), ("row-c", true)),
+            )
             .await
             .expect("closed range should scan");
         assert_eq!(
@@ -4061,10 +4164,14 @@ mod tests {
         );
 
         assert!(
-            tree.scan(&store, &result.root_id, &request(("row-d", true), ("row-a", true)))
-                .await
-                .expect("empty inverted range should not fail")
-                .is_empty()
+            tree.scan(
+                &store,
+                &result.root_id,
+                &request(("row-d", true), ("row-a", true))
+            )
+            .await
+            .expect("empty inverted range should not fail")
+            .is_empty()
         );
     }
 

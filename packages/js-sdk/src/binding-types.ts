@@ -16,6 +16,13 @@ import type {
 import type { NativeLixValue } from "./value.js";
 import type { LixStorageProvider } from "./storage-adapter.js";
 
+export type SyncServerBindingOptions = {
+	url: string;
+	headers: [string, string][];
+	headerProvider?: () => Promise<[string, string][]>;
+	fetch?: typeof fetch;
+};
+
 export type BindingExecuteResult = {
 	statementIndex?: number;
 	label?: string;

@@ -50,6 +50,7 @@ pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
 pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
+pub(crate) const BINARY_CAS_CHUNK_DEMAND_NAMESPACE: &str = "binary_cas.chunk_demand.v1";
 pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0005_0001),
     BINARY_CAS_MANIFEST_NAMESPACE,
@@ -88,6 +89,11 @@ pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace = StorageSpace::declare_co
 pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
+    ValueSemantics::Mutable,
+);
+pub(crate) const BINARY_CAS_CHUNK_DEMAND_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0005_0005),
+    BINARY_CAS_CHUNK_DEMAND_NAMESPACE,
     ValueSemantics::Mutable,
 );
 fn fresh_revision_token() -> StorageValue {
@@ -234,7 +240,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     // mutation. The caller commits one atomic write set, but keeping a failed
     // plan empty also prevents accidental reuse of partially staged sweep
     // work after corruption is reported.
-    verify_live_chunk_presence(store, &live_chunks).await?;
+    let live_demand_chunks = verify_live_chunk_presence(store, &live_chunks).await?;
 
     let mut manifest_cursor = store
         .begin_scan(
@@ -388,6 +394,42 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 })?);
             if !live_chunks.contains_key(&chunk_hash) {
                 writes.delete(BINARY_CAS_CHUNK_PRESENCE_SPACE, entry.key);
+            }
+        }
+        if !page_has_more {
+            break;
+        }
+    }
+
+    let mut demand_cursor = store
+        .begin_scan(
+            BINARY_CAS_CHUNK_DEMAND_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    loop {
+        let (page, page_has_more) = demand_cursor
+            .next_page(CAS_RECLAIM_PAGE_ROWS)
+            .await?
+            .into_parts();
+        for entry in page {
+            let chunk_hash =
+                ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "binary CAS chunk-demand key is not a 32-byte chunk hash",
+                    )
+                })?);
+            if !live_demand_chunks.contains(&chunk_hash) {
+                writes.delete(BINARY_CAS_CHUNK_DEMAND_SPACE, entry.key);
+                result.reclaimed_demand_marker_rows += 1;
             }
         }
         if !page_has_more {
@@ -657,7 +699,8 @@ fn decode_manifest_chunk_key(key: &StorageKey) -> Result<(BlobId, u64), LixError
 async fn verify_live_chunk_presence(
     store: &(impl StorageAdapterRead + ?Sized),
     live_chunks: &BTreeMap<ChunkHash, u64>,
-) -> Result<(), LixError> {
+) -> Result<BTreeSet<ChunkHash>, LixError> {
+    let mut demand_chunks = BTreeSet::new();
     for (hash, expected_size) in live_chunks {
         let key = StorageKey(Bytes::copy_from_slice(hash.as_bytes()));
         let payload_result = PointReadPlan::new(BINARY_CAS_CHUNK_SPACE, std::slice::from_ref(&key))
@@ -668,23 +711,6 @@ async fn verify_live_chunk_presence(
                 },
             )
             .await?;
-        let Some(Some(StorageProjectedValue::FullValue(bytes))) = payload_result.value.first()
-        else {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                format!(
-                    "live binary CAS chunk '{}' is missing its payload row",
-                    hash.to_hex()
-                ),
-            ));
-        };
-        decode_and_verify_chunk(
-            bytes,
-            persisted_size_to_usize(*expected_size, "live binary CAS chunk")?,
-            BlobId::from_bytes(hash.into_bytes()),
-            *hash,
-        )?;
-
         let presence_result =
             PointReadPlan::new(BINARY_CAS_CHUNK_PRESENCE_SPACE, std::slice::from_ref(&key))
                 .materialize(
@@ -694,17 +720,66 @@ async fn verify_live_chunk_presence(
                     },
                 )
                 .await?;
-        if presence_result.value.first().is_none_or(Option::is_none) {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                format!(
-                    "live binary CAS chunk '{}' is missing its presence row",
-                    hash.to_hex()
-                ),
-            ));
+        let demand_result =
+            PointReadPlan::new(BINARY_CAS_CHUNK_DEMAND_SPACE, std::slice::from_ref(&key))
+                .materialize(
+                    store,
+                    StorageGetOptions {
+                        projection: StorageCoreProjection::KeyOnly,
+                    },
+                )
+                .await?;
+        let payload = payload_result.value.first().and_then(Option::as_ref);
+        let present = presence_result.value.first().is_some_and(Option::is_some);
+        let demanded = demand_result.value.first().is_some_and(Option::is_some);
+        match (payload, present, demanded) {
+            (Some(StorageProjectedValue::FullValue(bytes)), true, _) => {
+                decode_and_verify_chunk(
+                    bytes,
+                    persisted_size_to_usize(*expected_size, "live binary CAS chunk")?,
+                    BlobId::from_bytes(hash.into_bytes()),
+                    *hash,
+                )?;
+            }
+            (None, false, true) => {
+                demand_chunks.insert(*hash);
+            }
+            (None, false, false) => {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "live binary CAS chunk '{}' is missing without a demand marker",
+                        hash.to_hex()
+                    ),
+                ));
+            }
+            (None, true, _) => {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "live binary CAS chunk '{}' has a presence row but no payload row",
+                        hash.to_hex()
+                    ),
+                ));
+            }
+            (Some(StorageProjectedValue::FullValue(_)), false, _) => {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "live binary CAS chunk '{}' is missing its presence row",
+                        hash.to_hex()
+                    ),
+                ));
+            }
+            (Some(_), _, _) => {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS payload read omitted its full value",
+                ));
+            }
         }
     }
-    Ok(())
+    Ok(demand_chunks)
 }
 
 #[cfg(test)]
@@ -865,6 +940,25 @@ pub(crate) fn stage_chunk(
         key(chunk_key(chunk_hash)),
         value(encode_binary_cas_chunk(codec, uncompressed_len, payload)),
     );
+    writes.delete(BINARY_CAS_CHUNK_DEMAND_SPACE, key(chunk_key(chunk_hash)));
+}
+
+pub(in crate::binary_cas) fn stage_chunk_demand(
+    writes: &mut StorageWriteSet,
+    chunk_hash: ChunkHash,
+) {
+    writes.put(
+        BINARY_CAS_CHUNK_DEMAND_SPACE,
+        key(chunk_key(chunk_hash)),
+        value(Vec::new()),
+    );
+}
+
+pub(in crate::binary_cas) fn stage_chunk_available(
+    writes: &mut StorageWriteSet,
+    chunk_hash: ChunkHash,
+) {
+    writes.delete(BINARY_CAS_CHUNK_DEMAND_SPACE, key(chunk_key(chunk_hash)));
 }
 
 fn stage_content_chunk(
@@ -1798,12 +1892,51 @@ async fn load_chunk_rows(
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
-    point_values(
+    let rows = point_values(
         store,
         BINARY_CAS_CHUNK_SPACE,
         hashes.iter().map(|hash| chunk_key(*hash)).collect(),
     )
-    .await
+    .await?;
+    let missing = hashes
+        .iter()
+        .copied()
+        .zip(&rows)
+        .filter_map(|(hash, row)| row.is_none().then_some(hash))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(rows);
+    }
+    let demand = point_values(
+        store,
+        BINARY_CAS_CHUNK_DEMAND_SPACE,
+        missing.iter().map(|hash| chunk_key(*hash)).collect(),
+    )
+    .await?;
+    if let Some(unmarked) = missing
+        .iter()
+        .zip(&demand)
+        .find_map(|(hash, marker)| marker.is_none().then_some(*hash))
+    {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!(
+                "binary CAS chunk '{}' is missing without a demand marker",
+                unmarked.to_hex()
+            ),
+        ));
+    }
+    let chunk_ids = missing
+        .into_iter()
+        .map(ChunkHash::to_hex)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Err(LixError::new(
+        "LIX_SYNC_CHUNKS_REQUIRED",
+        "binary CAS chunks require demand hydration",
+    )
+    .with_details(serde_json::json!({ "chunkIds": chunk_ids })))
 }
 
 async fn point_values(
@@ -2913,8 +3046,7 @@ mod tests {
             .collect::<Vec<_>>()
     }
 
-    use crate::binary_cas::BinaryCasContext;
-    use crate::binary_cas::BlobPayload;
+    use crate::binary_cas::{BinaryCasContext, BlobChunkReceipt, BlobPayload};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{
         Memory, StorageError, StorageGetManyResult, StorageKeyRange, StorageReadOptions,
@@ -3406,6 +3538,181 @@ mod tests {
                 .expect("orphan chunk read should succeed")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn reclamation_retains_live_demand_and_sweeps_orphan_and_redundant_markers() {
+        let storage = StorageAdapter::new(Memory::new());
+        let missing = b"lazy missing chunk";
+        let hydrated = b"already hydrated chunk";
+        let missing_hash = ChunkHash::from_content(missing);
+        let hydrated_hash = ChunkHash::from_content(hydrated);
+        let orphan_hash = ChunkHash::from_content(b"orphan demand marker");
+        let receipts = [
+            BlobChunkReceipt {
+                hash: missing_hash,
+                size_bytes: missing.len() as u64,
+            },
+            BlobChunkReceipt {
+                hash: hydrated_hash,
+                size_bytes: hydrated.len() as u64,
+            },
+        ];
+
+        let mut initial = storage.new_write_set();
+        let live_blob = stage_upload_manifest(&mut initial, &receipts)
+            .expect("manifest should stage")
+            .hash;
+        stage_chunk_demand(&mut initial, missing_hash);
+        stage_chunk(
+            &mut initial,
+            hydrated_hash,
+            BinaryChunkCodec::Raw,
+            hydrated.len() as u64,
+            hydrated,
+        );
+        stage_chunk_demand(&mut initial, orphan_hash);
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("lazy CAS fixture should commit");
+
+        // Simulate stale state left by an interrupted older hydrator. GC must
+        // remove this marker because the authenticated payload is available.
+        let mut stale = storage.new_write_set();
+        stage_chunk_demand(&mut stale, hydrated_hash);
+        storage
+            .commit_write_set(stale, StorageWriteOptions::default())
+            .await
+            .expect("redundant marker should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("GC read should open");
+        let mut writes = storage.new_write_set();
+        let result = stage_reclaim_unreachable_binary_cas(
+            &read,
+            &mut writes,
+            &BTreeSet::from([live_blob]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("marked live missing chunks should be sweepable");
+        assert_eq!(result.reclaimed_demand_marker_rows, 2);
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("GC writes should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        assert!(
+            get_one(
+                &read,
+                BINARY_CAS_CHUNK_DEMAND_SPACE,
+                chunk_key(missing_hash)
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            get_one(
+                &read,
+                BINARY_CAS_CHUNK_DEMAND_SPACE,
+                chunk_key(hydrated_hash)
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            get_one(&read, BINARY_CAS_CHUNK_DEMAND_SPACE, chunk_key(orphan_hash))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reclamation_rejects_unmarked_live_missing_chunks() {
+        let storage = StorageAdapter::new(Memory::new());
+        let missing = b"unmarked live chunk";
+        let missing_hash = ChunkHash::from_content(missing);
+        let mut initial = storage.new_write_set();
+        let live_blob = stage_upload_manifest(
+            &mut initial,
+            &[BlobChunkReceipt {
+                hash: missing_hash,
+                size_bytes: missing.len() as u64,
+            }],
+        )
+        .expect("manifest should stage")
+        .hash;
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("unmarked fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("GC read should open");
+        let mut writes = storage.new_write_set();
+        let error = stage_reclaim_unreachable_binary_cas(
+            &read,
+            &mut writes,
+            &BTreeSet::from([live_blob]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("unmarked missing chunks remain corruption");
+        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
+        assert!(error.message.contains("missing without a demand marker"));
+        assert!(writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn staging_a_chunk_clears_its_durable_demand_marker() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"hydrate this demanded chunk";
+        let hash = ChunkHash::from_content(payload);
+
+        let mut initial = storage.new_write_set();
+        stage_chunk_demand(&mut initial, hash);
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("demand marker should commit");
+
+        let mut hydration = storage.new_write_set();
+        stage_chunk(
+            &mut hydration,
+            hash,
+            BinaryChunkCodec::Raw,
+            payload.len() as u64,
+            payload,
+        );
+        storage
+            .commit_write_set(hydration, StorageWriteOptions::default())
+            .await
+            .expect("chunk hydration should commit atomically");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        assert!(
+            get_one(&read, BINARY_CAS_CHUNK_DEMAND_SPACE, chunk_key(hash))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_chunk(&read, hash).await.unwrap().is_some());
     }
 
     #[tokio::test]

@@ -243,10 +243,24 @@ where
         // the Sync session; storage handles are Send by the Storage contract.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                self.lix
+                let first = self
+                    .lix
                     .session
-                    .execute_with_options(&self.sql, &self.params, self.options)
-                    .await
+                    .execute_with_options(&self.sql, &self.params, self.options.clone())
+                    .await;
+                match first {
+                    Err(error) => {
+                        if self.lix.hydrate_sync_demand_for_error(&error).await? {
+                            self.lix
+                                .session
+                                .execute_with_options(&self.sql, &self.params, self.options)
+                                .await
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    result => result,
+                }
             })
         })
     }
@@ -286,10 +300,24 @@ where
         // only the Sync session across suspension.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                self.lix
+                let first = self
+                    .lix
                     .session
-                    .execute_batch_with_options(&self.statements, self.options)
-                    .await
+                    .execute_batch_with_options(&self.statements, self.options.clone())
+                    .await;
+                match first {
+                    Err(error) => {
+                        if self.lix.hydrate_sync_demand_for_error(&error).await? {
+                            self.lix
+                                .session
+                                .execute_batch_with_options(&self.statements, self.options)
+                                .await
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    result => result,
+                }
             })
         })
     }
@@ -313,6 +341,7 @@ where
     session: Arc<SessionContext<StorageImpl>>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     sync_runtime: Option<Arc<crate::sync::SyncRuntime>>,
+    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
 }
 
 async fn open_lix_inner<StorageImpl>(
@@ -324,29 +353,48 @@ async fn open_lix_inner<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    // A fresh sync store can adopt the server's branch identity at genesis.
-    // Probe only when the local protocol marker is absent; initialized stores
-    // must reopen from durable local state without putting the network in the
-    // read/open hot path.
-    let initial_sync_branch_id: Option<String> = {
-        {
-            if let Some(server) = server.as_ref() {
-                let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
-                let read = adapter
-                    .begin_read(crate::storage_adapter::StorageReadOptions::default())
-                    .await?;
-                if matches!(
-                    crate::init::repository_protocol_status(&read).await?,
-                    crate::init::RepositoryProtocolStatus::Missing
-                ) {
-                    Some(crate::sync::probe_sync_branch_id(server).await?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+    // Fresh sync initialization uses one handshake and one snapshot. The same
+    // snapshot chooses the local default branch and is then applied verbatim;
+    // reopened repositories do no network work on their open path.
+    let mut prepared_sync: Option<crate::sync::PreparedSync> = if let Some(server) = server.as_ref()
+    {
+        let missing = {
+            let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+            let read = adapter
+                .begin_read(crate::storage_adapter::StorageReadOptions::default())
+                .await?;
+            matches!(
+                crate::init::repository_protocol_status(&read).await?,
+                crate::init::RepositoryProtocolStatus::Missing
+            )
+        };
+        if missing {
+            Some(crate::sync::prepare_sync_mode(server).await?)
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    let initial_sync_branch_id = prepared_sync
+        .as_ref()
+        .map(|prepared| prepared.default_branch_id().to_owned());
+    let reopened_sync_account_id = if prepared_sync.is_none() {
+        if let Some(server) = server.as_ref() {
+            let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+            let read = adapter
+                .begin_read(crate::storage_adapter::StorageReadOptions::default())
+                .await?;
+            crate::sync::repository::load_sync_replica_account(
+                &read,
+                server.url.trim_end_matches('/'),
+            )
+            .await?
+        } else {
+            None
+        }
+    } else {
+        None
     };
     let engine = open_or_initialize_engine(
         storage,
@@ -356,17 +404,25 @@ where
         initial_sync_branch_id.as_deref(),
     )
     .await?;
-    let session = engine.open_session().await?;
+    let session = match reopened_sync_account_id {
+        Some(account_id) => engine.open_session_with_account(account_id).await?,
+        None => engine.open_session().await?,
+    };
     let mut lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
         sync_runtime: None,
+        sync_demand_tx: None,
     };
     if let Some(server) = server {
         match server.mode {
             ServerMode::Sync => {
-                lix.sync_runtime = Some(crate::sync::activate_sync_mode(&lix, &server).await?);
+                let runtime =
+                    crate::sync::activate_sync_mode(&mut lix, &server, prepared_sync.take())
+                        .await?;
+                lix.sync_demand_tx = Some(runtime.demand_sender());
+                lix.sync_runtime = Some(runtime);
             }
         }
     }
@@ -377,6 +433,13 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    async fn hydrate_sync_demand_for_error(&self, error: &LixError) -> Result<bool, LixError> {
+        let Some(demand_tx) = self.sync_demand_tx.as_ref() else {
+            return Ok(false);
+        };
+        crate::sync::demand_sync_for_error(demand_tx, error).await
+    }
+
     pub(crate) fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
         self.engine.storage()
     }
@@ -385,27 +448,11 @@ where
         self.engine.sync_mode()
     }
 
-    pub(crate) fn active_branch_id_for_sync_worker(&self) -> Result<String, LixError> {
-        self.session.active_branch_id_for_sync_worker()
-    }
-
-    /// API-level operations that inspect commit/branch state use the same
-    /// lazy readiness barrier as SQL. Local writes still run immediately; the
-    /// barrier is only entered when an operation cannot be answered from the
-    /// currently materialized repository.
-    async fn ensure_sync_api_scope(&self, sql_shape: &str) -> Result<(), LixError> {
-        if self.session.sync_scope_suppressed() {
-            return Ok(());
-        }
-        let sync_mode = self.engine.sync_mode();
-        if matches!(sync_mode.role()?, crate::sync::SyncRole::Replica { .. }) {
-            let branch_id = self.active_branch_id().await?;
-            let requested_scopes = sync_mode.register_sql_scope_for_branch(sql_shape, &branch_id);
-            sync_mode
-                .wait_for_scope_hydration_for_branch(&requested_scopes, &branch_id)
-                .await?;
-        }
-        Ok(())
+    pub(crate) async fn repository_default_branch_id_for_sync(
+        &self,
+        read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    ) -> Result<String, LixError> {
+        self.engine.load_repository_default_branch_id(read).await
     }
 
     /// Starts configuring another independent session for this repository.
@@ -448,65 +495,8 @@ where
             None => self.active_branch_id().await?,
         };
         let active_account_id = account_id.unwrap_or_else(|| self.active_account_id().to_owned());
-        let retry_branch_id = active_branch_id.clone();
-        let retry_account_id = active_account_id.clone();
-        match self
-            .open_internal_session(active_branch_id, active_account_id)
+        self.open_internal_session(active_branch_id, active_account_id)
             .await
-        {
-            Ok(session) => Ok(session),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    LixError::CODE_BRANCH_NOT_FOUND | LixError::CODE_COMMIT_NOT_FOUND
-                ) =>
-            {
-                // A branch supplied explicitly by the caller may exist on the
-                // server while its descriptor/head is still outside this
-                // lazy replica's local catalog. Match switch_branch's retry
-                // contract: demand the control-plane scope, then retry the
-                // ordinary local session open without adding a sync API.
-                //
-                // The catalog pass runs on a background worker and can finish
-                // one iteration after the readiness marker is published. A
-                // small bounded retry closes that scheduling race without
-                // putting normal reads on a network path or exposing sync
-                // machinery through the public session API.
-                let mut last_error = error;
-                for attempt in 0..3 {
-                    let current_branch_id = self.active_branch_id().await?;
-                    self.engine.sync_mode().invalidate_scopes_for_branch(
-                        &current_branch_id,
-                        &[crate::sync::CONTROL_SYNC_SCOPE],
-                    );
-                    self.ensure_sync_api_scope("SELECT * FROM lix_branch")
-                        .await?;
-                    match self
-                        .open_internal_session(retry_branch_id.clone(), retry_account_id.clone())
-                        .await
-                    {
-                        Ok(session) => return Ok(session),
-                        Err(next_error)
-                            if matches!(
-                                next_error.code.as_str(),
-                                LixError::CODE_BRANCH_NOT_FOUND | LixError::CODE_COMMIT_NOT_FOUND
-                            ) =>
-                        {
-                            last_error = next_error;
-                            if attempt < 2 {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    25 * (attempt + 1) as u64,
-                                ))
-                                .await;
-                            }
-                        }
-                        Err(next_error) => return Err(next_error),
-                    }
-                }
-                Err(last_error)
-            }
-            Err(error) => Err(error),
-        }
     }
 
     pub(crate) async fn open_internal_session(
@@ -558,23 +548,12 @@ where
             .await?;
         let mut session = session;
         session.set_sync_outbox_suppressed(suppress_sync_outbox);
-        session.set_sync_scope_suppressed(suppress_sync_outbox);
-        // Suppressed sessions are short-lived background sync workers. They
-        // never serve application file reads, so restoring the complete
-        // durable projection index on every polling iteration only adds a
-        // storage scan to the read hot path. Application/internal sessions
-        // retain the restore so restart and branch-local reads see cached
-        // file bytes immediately.
-        if !suppress_sync_outbox
-            && let crate::sync::SyncRole::Replica { remote_id } = self.engine.sync_mode().role()?
-        {
-            session.restore_sync_file_projections(&remote_id).await?;
-        }
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
             primary_switch_gate: None,
             sync_runtime: None,
+            sync_demand_tx: self.sync_demand_tx.clone(),
         })
     }
 
@@ -671,7 +650,21 @@ where
         path: impl Into<String>,
         range: Option<std::ops::Range<u64>>,
     ) -> Result<Option<lix::FileRead>, LixError> {
-        self.session.read_file_content(path.into(), range).await
+        let path = path.into();
+        match self
+            .session
+            .read_file_content(path.clone(), range.clone())
+            .await
+        {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session.read_file_content(path, range).await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
     }
 
     pub(crate) async fn execute_with_options_and_metadata(
@@ -681,9 +674,22 @@ where
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
     ) -> Result<ExecuteResult, LixError> {
-        self.session
-            .execute_with_options_and_metadata(sql, params, options, metadata)
+        match self
+            .session
+            .execute_with_options_and_metadata(sql, params, options.clone(), metadata.clone())
             .await
+        {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session
+                        .execute_with_options_and_metadata(sql, params, options, metadata)
+                        .await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
     }
 
     pub(crate) fn execute_with_idempotency_and_options_and_metadata(
@@ -761,9 +767,30 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.session
-            .execute_batch_with_options_and_metadata(statements, options, statement_metadata)
+        match self
+            .session
+            .execute_batch_with_options_and_metadata(
+                statements,
+                options.clone(),
+                statement_metadata.clone(),
+            )
             .await
+        {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session
+                        .execute_batch_with_options_and_metadata(
+                            statements,
+                            options,
+                            statement_metadata,
+                        )
+                        .await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
     }
 
     pub(crate) fn execute_batch_with_idempotency_and_options_and_metadata(
@@ -838,65 +865,48 @@ where
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
-        let retry_options = options.clone();
-        let result = match self.session.create_branch(options).await {
-            Ok(receipt) => Ok(receipt),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    LixError::CODE_COMMIT_NOT_FOUND | LixError::CODE_BRANCH_NOT_FOUND
-                ) =>
-            {
-                let current_branch_id = self.active_branch_id().await?;
-                self.engine.sync_mode().invalidate_scopes_for_branch(
-                    &current_branch_id,
-                    &[
-                        crate::sync::CONTROL_SYNC_SCOPE,
-                        crate::sync::FULL_SYNC_SCOPE,
-                    ],
-                );
-                self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-                    .await?;
-                self.session.create_branch(retry_options).await
+        match self.session.create_branch(options.clone()).await {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session.create_branch(options).await
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
-        };
-        // Branch creation is a global control write. On a sync replica the
-        // local transaction is optimistic, but callers expect the ordinary
-        // branch API to return once the authoritative ref has been admitted
-        // (or the local optimistic value is known to be the same). Invalidate
-        // the control readiness mark so the worker performs one catalog pass;
-        // it deliberately withholds that mark while this branch's outbox is
-        // pending, then publishes it after canonical admission/reconciliation.
-        if result.is_ok() && self.engine.sync_mode().is_replica() {
-            let current_branch_id = self.active_branch_id().await?;
-            self.engine.sync_mode().invalidate_scopes_for_branch(
-                &current_branch_id,
-                &[crate::sync::CONTROL_SYNC_SCOPE],
-            );
-            self.ensure_sync_api_scope("SELECT * FROM lix_branch").await?;
+            result => result,
         }
-        result
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
-        self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-            .await?;
         self.session.create_checkpoint().await
     }
 
     /// Reverses the latest undoable tracked commit on this handle's active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-            .await?;
-        self.session.undo().await
+        match self.session.undo().await {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session.undo().await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
     }
 
     /// Replays the latest tracked commit abandoned by undo on this handle's active branch.
     pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-            .await?;
-        self.session.redo().await
+        match self.session.redo().await {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session.redo().await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
     }
 
     pub fn switch_branch(
@@ -912,55 +922,7 @@ where
                     Some(gate) => Some(gate.lock().await),
                     None => None,
                 };
-                let retry_options = options.clone();
-                let receipt = match self.session.switch_branch(options).await {
-                    Ok(receipt) => receipt,
-                    Err(error)
-                        if matches!(
-                            error.code.as_str(),
-                            LixError::CODE_BRANCH_NOT_FOUND | LixError::CODE_COMMIT_NOT_FOUND
-                        ) =>
-                    {
-                        let current_branch_id = self.active_branch_id().await?;
-                        self.engine.sync_mode().invalidate_scopes_for_branch(
-                            &current_branch_id,
-                            &[crate::sync::CONTROL_SYNC_SCOPE],
-                        );
-                        self.ensure_sync_api_scope("SELECT * FROM lix_branch")
-                            .await?;
-                        self.session.switch_branch(retry_options).await?
-                    }
-                    Err(error) => return Err(error),
-                };
-                // Keep the selected branch durable even when the process goes
-                // offline immediately after switching. The sync worker also
-                // persists this mapping after a successful re-handshake, but
-                // doing it at the session boundary closes the short
-                // switch-then-close window.
-                #[cfg(not(target_family = "wasm"))]
-                // Only the primary handle owns the process sync worker and
-                // its durable branch binding. Secondary sessions have their
-                // own branch selector; letting one of them rewrite this
-                // mapping would make the worker reconnect to the wrong
-                // branch. Clones of the primary retain this gate.
-                if let crate::sync::SyncRole::Replica { remote_id } =
-                    self.engine.sync_mode().role()?
-                {
-                    if self.primary_switch_gate.is_some() {
-                        self.persist_sync_replica_config(&remote_id, &receipt.branch_id)
-                            .await?;
-                        // Scope hydration is branch-specific. Clear the
-                        // process-local readiness marks so the sync worker must
-                        // hydrate the selected branch before reads resume.
-                        self.engine.sync_mode().reset_scope_hydration();
-                    }
-                    // The selected branch may already have durable lazy-file
-                    // projections from an earlier session. Restore those
-                    // bytes immediately so an offline branch switch keeps
-                    // cached reads on the local hot path.
-                    self.restore_sync_file_projections(&remote_id).await?;
-                }
-                Ok(receipt)
+                self.session.switch_branch(options).await
             })
         }
     }
@@ -969,34 +931,15 @@ where
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
-        let retry_options = options.clone();
-        self.ensure_sync_api_scope("SELECT * FROM lix_branch")
-            .await?;
-        self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-            .await?;
-        match self.session.merge_branch(options).await {
-            Ok(receipt) => Ok(receipt),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    LixError::CODE_BRANCH_NOT_FOUND | LixError::CODE_COMMIT_NOT_FOUND
-                ) =>
-            {
-                let current_branch_id = self.active_branch_id().await?;
-                self.engine.sync_mode().invalidate_scopes_for_branch(
-                    &current_branch_id,
-                    &[
-                        crate::sync::CONTROL_SYNC_SCOPE,
-                        crate::sync::FULL_SYNC_SCOPE,
-                    ],
-                );
-                self.ensure_sync_api_scope("SELECT * FROM lix_branch")
-                    .await?;
-                self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-                    .await?;
-                self.session.merge_branch(retry_options).await
+        match self.session.merge_branch(options.clone()).await {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session.merge_branch(options).await
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
+            result => result,
         }
     }
 
@@ -1013,34 +956,15 @@ where
         &self,
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
-        let retry_options = options.clone();
-        self.ensure_sync_api_scope("SELECT * FROM lix_branch")
-            .await?;
-        self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-            .await?;
-        match self.session.merge_branch_preview(options).await {
-            Ok(preview) => Ok(preview),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    LixError::CODE_BRANCH_NOT_FOUND | LixError::CODE_COMMIT_NOT_FOUND
-                ) =>
-            {
-                let current_branch_id = self.active_branch_id().await?;
-                self.engine.sync_mode().invalidate_scopes_for_branch(
-                    &current_branch_id,
-                    &[
-                        crate::sync::CONTROL_SYNC_SCOPE,
-                        crate::sync::FULL_SYNC_SCOPE,
-                    ],
-                );
-                self.ensure_sync_api_scope("SELECT * FROM lix_branch")
-                    .await?;
-                self.ensure_sync_api_scope("SELECT * FROM lix_commit")
-                    .await?;
-                self.session.merge_branch_preview(retry_options).await
+        match self.session.merge_branch_preview(options.clone()).await {
+            Err(error) => {
+                if self.hydrate_sync_demand_for_error(&error).await? {
+                    self.session.merge_branch_preview(options).await
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
+            result => result,
         }
     }
 
@@ -1065,17 +989,55 @@ where
         self.engine.sync_mode().set_role(role)
     }
 
-    pub(crate) async fn restore_sync_file_projections(
-        &self,
-        remote_id: &str,
+    pub(crate) async fn align_primary_account_for_sync(
+        &mut self,
+        active_account_id: &str,
     ) -> Result<(), LixError> {
-        self.session.restore_sync_file_projections(remote_id).await
+        if self.active_account_id() == active_account_id {
+            return Ok(());
+        }
+        let replacement = self
+            .engine
+            .open_session_with_account(active_account_id.to_owned())
+            .await?;
+        let previous = std::mem::replace(&mut self.session, Arc::new(replacement));
+        previous.close().await
     }
 
     pub(crate) async fn lock_collaboration_writes(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.engine.collaboration_write_gate().lock_owned().await
     }
 
+    pub(crate) async fn reconcile_sync_branch(
+        &self,
+        branch_id: &str,
+        authority_head_commit_id: &str,
+    ) -> Result<(), LixError> {
+        let authority_head =
+            crate::changelog::CommitId::parse_lix(authority_head_commit_id, "sync authority head")?;
+        // Reconciliation must not change the application's session-local
+        // branch selection. A short-lived session targets the affected ref and
+        // shares the engine's ordinary transaction/commit machinery.
+        let session = self
+            .engine
+            .open_session_with_account(self.active_account_id().to_owned())
+            .await?;
+        let result: Result<(), LixError> = async {
+            session
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: branch_id.to_owned(),
+                })
+                .await?;
+            session
+                .merge_sync_commit_into_active_branch(authority_head)
+                .await?;
+            Ok(())
+        }
+        .await;
+        let close_result = session.close().await;
+        result?;
+        close_result
+    }
 }
 
 #[expect(missing_debug_implementations)]
@@ -1165,245 +1127,6 @@ where
         row: TransactionWriteRow,
     ) -> Result<(), LixError> {
         self.inner.stage_test_row(row).await
-    }
-
-    pub(crate) async fn stage_sync_rows(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-    ) -> Result<(), LixError> {
-        self.inner.stage_sync_rows(rows).await
-    }
-
-    pub(crate) async fn stage_sync_pack(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-        files: Vec<crate::sync::SyncFileMutation>,
-    ) -> Result<(), LixError> {
-        self.stage_sync_pack_with_commit_id(rows, files, None).await
-    }
-
-    pub(crate) async fn stage_sync_pack_with_commit_id(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-        files: Vec<crate::sync::SyncFileMutation>,
-        canonical_commit_id: Option<&str>,
-    ) -> Result<(), LixError> {
-        self.stage_sync_pack_with_commit_and_parents(rows, files, canonical_commit_id, None)
-            .await
-    }
-
-    pub(crate) async fn stage_sync_pack_with_commit_and_parents(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-        files: Vec<crate::sync::SyncFileMutation>,
-        canonical_commit_id: Option<&str>,
-        parent_commit_ids: Option<&[String]>,
-    ) -> Result<(), LixError> {
-        self.stage_sync_pack_with_commit_and_parents_mode(
-            rows,
-            files,
-            canonical_commit_id,
-            parent_commit_ids,
-            false,
-            false,
-            false,
-        )
-        .await
-    }
-
-    pub(crate) fn stage_sync_topology_commit(
-        &mut self,
-        canonical_commit_id: &str,
-        parent_commit_ids: &[String],
-    ) -> Result<(), LixError> {
-        self.inner
-            .stage_sync_topology_commit(canonical_commit_id, parent_commit_ids)
-    }
-
-    /// Materializes a late file-view demand without creating a second commit
-    /// when the canonical graph node was already replayed by another scope.
-    /// The payload is staged through the internal durable projection lane and
-    /// exposed through the session file-view overlay; canonical descriptor/blob
-    /// rows remain the durable source of identity and branch topology.
-    pub(crate) async fn stage_sync_file_projection(
-        &mut self,
-        remote_id: &str,
-        files: Vec<crate::sync::SyncFileMutation>,
-    ) -> Result<(), LixError> {
-        self.inner
-            .stage_sync_file_projection(remote_id, files)
-            .await
-            .map(|_| ())
-    }
-
-    /// Stages certified canonical rows without assigning another canonical
-    /// commit identity. This is used when a topology-only replay already
-    /// installed the graph node but a later file scope still needs to add
-    /// its durable descriptor/blob identities alongside the byte projection.
-    pub(crate) async fn stage_sync_canonical_rows(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-    ) -> Result<(), LixError> {
-        self.inner.stage_sync_canonical_rows(rows).await
-    }
-
-    /// Applies a server-authored canonical pack through the local plugin
-    /// renderer before the trusted row fallback is considered.
-    pub(crate) async fn stage_sync_canonical_renderer_pack_with_commit_and_parents(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-        files: Vec<crate::sync::SyncFileMutation>,
-        canonical_commit_id: Option<&str>,
-        parent_commit_ids: Option<&[String]>,
-    ) -> Result<(), LixError> {
-        self.stage_sync_pack_with_commit_and_parents_mode(
-            rows,
-            files,
-            canonical_commit_id,
-            parent_commit_ids,
-            false,
-            true,
-            false,
-        )
-        .await
-    }
-
-    /// Applies a server-authored canonical pack on a replica. The normal sync
-    /// admission path remains renderer-backed; this trusted variant is only
-    /// selected by canonical pull fallback when the local replica lacks the
-    /// source bytes needed by a plugin renderer.
-    pub(crate) async fn stage_sync_canonical_pack_with_commit_and_parents(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-        files: Vec<crate::sync::SyncFileMutation>,
-        canonical_commit_id: Option<&str>,
-        parent_commit_ids: Option<&[String]>,
-    ) -> Result<(), LixError> {
-        self.stage_sync_pack_with_commit_and_parents_mode(
-            rows,
-            files,
-            canonical_commit_id,
-            parent_commit_ids,
-            true,
-            false,
-            false,
-        )
-        .await
-    }
-
-    async fn stage_sync_pack_with_commit_and_parents_mode(
-        &mut self,
-        rows: crate::transaction_types::RawWriteBatch,
-        files: Vec<crate::sync::SyncFileMutation>,
-        canonical_commit_id: Option<&str>,
-        parent_commit_ids: Option<&[String]>,
-        trusted_canonical_rows: bool,
-        canonical_renderer_rows: bool,
-        untracked_file_projection: bool,
-    ) -> Result<(), LixError> {
-        self.inner.suppress_ordinary_sync_event()?;
-        if untracked_file_projection {
-            if !rows.is_empty() {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "late sync file projection unexpectedly carries semantic rows",
-                ));
-            }
-            let remote_id = self.inner.sync_remote_id()?.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "late sync file projection requires replica mode",
-                )
-            })?;
-            self.inner
-                .stage_sync_file_projection(&remote_id, files)
-                .await?;
-        } else {
-            for file in files {
-                self.inner.clear_sync_file_projection(&file.file_id)?;
-                let path = file.path.ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync file mutation is missing its logical path",
-                    )
-                })?;
-                // File IDs are part of the canonical row identity. Keeping them
-                // stable across replicas is what lets a later descriptor-only
-                // rename find the existing blob reference instead of creating a
-                // second empty projection row.
-                // The canonical file identity wins even when another replica
-                // created a different ID for the same path while offline. Remove
-                // the path occupant first, then upsert by ID so later descriptor
-                // or delete events cannot target an orphaned local identity.
-                // A file-only proposal with a legacy/non-UUID identity is a
-                // transport-level compatibility shape used before descriptor
-                // rows were materialized. Preserve its historical path
-                // upsert behavior. Canonical UUID identities still take the
-                // stable-ID path even when no semantic rows accompany the
-                // bytes, which is what makes rename/delete convergence work.
-                let legacy_file_identity =
-                    crate::storage_codec::id_string::uuid_bytes_from_canonical(&file.file_id)
-                        .is_none();
-                if legacy_file_identity {
-                    self.execute(
-                        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
-                         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                        &[Value::Text(path), Value::Blob(file.content.into())],
-                    )
-                    .await?;
-                } else {
-                    self.execute(
-                        "DELETE FROM lix_file WHERE path = $1",
-                        &[Value::Text(path.clone())],
-                    )
-                    .await?;
-                    self.execute(
-                        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3) \
-                         ON CONFLICT (id) DO UPDATE SET path = excluded.path, content = excluded.content",
-                        &[
-                            Value::Text(file.file_id),
-                            Value::Text(path),
-                            Value::Blob(file.content.into()),
-                        ],
-                    )
-                    .await?;
-                }
-            }
-        }
-        if !rows.is_empty() {
-            if trusted_canonical_rows {
-                self.inner.stage_sync_canonical_rows(rows).await?;
-            } else if canonical_renderer_rows {
-                self.inner.stage_sync_canonical_renderer_rows(rows).await?;
-            } else {
-                self.stage_sync_rows(rows).await?;
-            }
-        }
-        if !untracked_file_projection && let Some(parent_commit_ids) = parent_commit_ids {
-            self.inner.stage_sync_commit_parents(parent_commit_ids)?;
-        }
-        if !untracked_file_projection && let Some(canonical_commit_id) = canonical_commit_id {
-            self.inner.relabel_sync_commit(canonical_commit_id)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn stage_sync_admission_receipt(
-        &mut self,
-        idempotency: &ExecuteIdempotency,
-        pack: &crate::sync::SyncTransactionPack,
-        plan: crate::sync::SyncAdmissionPlan,
-    ) -> Result<crate::sync::SyncAdmission, LixError> {
-        self.inner
-            .stage_sync_admission_receipt(idempotency, pack, plan)
-            .await
-    }
-
-    pub(crate) fn stage_sync_applied_event_markers(
-        &mut self,
-        markers: &[(crate::sync::SyncAppliedEventMarker, Option<Vec<u8>>)],
-    ) -> Result<(), LixError> {
-        self.inner.stage_sync_applied_event_markers(markers)
     }
 
     pub(crate) fn active_branch_id(&self) -> Result<&str, LixError> {
@@ -1774,10 +1497,7 @@ mod tests {
         for row in home_rows.rows() {
             let values = row.values();
             assert_eq!(&values[2], &Value::Boolean(true));
-            assert_eq!(
-                &values[3],
-                &Value::Text(lix::GLOBAL_BRANCH_ID.to_string())
-            );
+            assert_eq!(&values[3], &Value::Text(lix::GLOBAL_BRANCH_ID.to_string()));
         }
 
         // A later ensure_account write has the same physical/home shape.

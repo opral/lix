@@ -2,17 +2,20 @@
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Reflect};
 use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
 use lix::{
-    CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, ServerOptions, SqlScriptPlan,
+    BROWSER_TRANSPORT_CONFIG_HEADER, CreateBranchOptions as RsCreateBranchOptions,
+    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
+    Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
+    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
+    ObserveEvents as RsObserveEvents, ServerOptions, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
-    parse_sql_script as parse_rs_sql_script,
+    parse_sql_script as parse_rs_sql_script, register_browser_sync_transport,
+    unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -88,6 +91,7 @@ pub async fn benchmark_storage_bridge(
 pub struct WasmLix {
     inner: BrowserLix,
     storage: BrowserStorage,
+    browser_sync_transport_id: RefCell<Option<String>>,
 }
 
 #[wasm_bindgen]
@@ -167,10 +171,29 @@ async fn open_browser_storage(
         url: String,
         headers: Vec<(String, String)>,
     }
-    let server = server
-        .map(serde_wasm_bindgen::from_value::<BrowserSyncServerOptions>)
-        .transpose()?
-        .map(|server| ServerOptions::sync(server.url).with_headers(server.headers));
+    static NEXT_BROWSER_SYNC_TRANSPORT_ID: AtomicU64 = AtomicU64::new(1);
+    let mut browser_sync_transport_id = None;
+    let server = match server {
+        Some(value) => {
+            let mut parsed =
+                serde_wasm_bindgen::from_value::<BrowserSyncServerOptions>(value.clone())?;
+            let header_provider = optional_function_property(&value, "headerProvider")?;
+            let fetch = optional_function_property(&value, "fetch")?;
+            if header_provider.is_some() || fetch.is_some() {
+                let id = format!(
+                    "browser-{}",
+                    NEXT_BROWSER_SYNC_TRANSPORT_ID.fetch_add(1, Ordering::Relaxed)
+                );
+                register_browser_sync_transport(id.clone(), header_provider, fetch);
+                parsed
+                    .headers
+                    .push((BROWSER_TRANSPORT_CONFIG_HEADER.to_owned(), id.clone()));
+                browser_sync_transport_id = Some(id);
+            }
+            Some(ServerOptions::sync(parsed.url).with_headers(parsed.headers))
+        }
+        None => None,
+    };
     let inner = match telemetry {
         Some(telemetry) => {
             let builder = open_lix()
@@ -189,8 +212,28 @@ async fn open_browser_storage(
             }
         }
     }
-    .map_err(lix_error_to_js)?;
-    Ok(WasmLix { inner, storage })
+    .map_err(|error| {
+        if let Some(id) = browser_sync_transport_id.as_deref() {
+            unregister_browser_sync_transport(id);
+        }
+        lix_error_to_js(error)
+    })?;
+    Ok(WasmLix {
+        inner,
+        storage,
+        browser_sync_transport_id: RefCell::new(browser_sync_transport_id),
+    })
+}
+
+fn optional_function_property(value: &JsValue, name: &str) -> Result<Option<Function>, JsValue> {
+    let property = Reflect::get(value, &name.into())?;
+    if property.is_null() || property.is_undefined() {
+        return Ok(None);
+    }
+    property
+        .dyn_into::<Function>()
+        .map(Some)
+        .map_err(Into::into)
 }
 
 struct BrowserTelemetryDispatch(Function);
@@ -393,6 +436,9 @@ impl WasmLix {
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) -> Result<(), JsValue> {
         self.inner.close().await.map_err(lix_error_to_js)?;
+        if let Some(id) = self.browser_sync_transport_id.borrow_mut().take() {
+            unregister_browser_sync_transport(&id);
+        }
         self.storage
             .close()
             .await
@@ -402,6 +448,14 @@ impl WasmLix {
     #[wasm_bindgen(js_name = beginClose)]
     pub fn begin_close(&self) {
         self.inner.begin_close();
+    }
+}
+
+impl Drop for WasmLix {
+    fn drop(&mut self) {
+        if let Some(id) = self.browser_sync_transport_id.get_mut().take() {
+            unregister_browser_sync_transport(&id);
+        }
     }
 }
 

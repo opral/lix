@@ -1,6 +1,5 @@
 #![allow(clippy::match_wild_err_arm, clippy::option_if_let_else)]
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
@@ -40,7 +39,6 @@ use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
 
-use super::MAX_EXPIRED_READ_RETRIES;
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 use crate::transaction::CommitCoordinator;
 
@@ -172,20 +170,9 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
     pub(super) sync_mode: SyncModeState,
-    /// Query-shape fast path for a replica session. Once a query's inferred
-    /// scopes are hydrated, its repeated cached reads do not need to reacquire
-    /// the process-wide scope registry on every call. The branch is part of
-    /// the key so a session-local branch switch cannot reuse readiness from a
-    /// different projection.
-    pub(super) sync_ready_query_cache: Arc<RwLock<BTreeMap<String, BTreeSet<String>>>>,
     /// Internal sync sessions apply canonical rows and must not enqueue those
     /// maintenance writes as new client proposals.
     pub(super) sync_outbox_suppressed: bool,
-    /// Internal sync sessions also issue catalog reads while the worker is
-    /// hydrating. Scope registration/readiness is session-local suppression;
-    /// using the process-wide sync state for this would race application
-    /// queries in another session.
-    pub(super) sync_scope_suppressed: bool,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
@@ -360,9 +347,7 @@ where
             observe_coordinator,
             observe_invalidation,
             sync_mode,
-            sync_ready_query_cache: Arc::new(RwLock::new(BTreeMap::new())),
             sync_outbox_suppressed: false,
-            sync_scope_suppressed: false,
             plugin_host,
             telemetry,
             transaction_manager,
@@ -377,188 +362,12 @@ where
         Ok(())
     }
 
-    /// Restores raw file bytes that were fetched by a lazy sync scope. The
-    /// projection is local durable cache state, not a new Lix row/commit; it
-    /// therefore belongs in the session file-view overlay on every new
-    /// session opened for the same replica branch.
-    pub(crate) async fn restore_sync_file_projections(
-        &self,
-        remote_id: &str,
-    ) -> Result<(), LixError> {
-        let branch_id = self
-            .branch
-            .get()
-            .expect("session branch selector should be readable");
-        let mut expired_read_retries = 0;
-        let mut read_quiescence_guard = None;
-        loop {
-            let attempt = async {
-                let read = self
-                    .storage
-                    .begin_read(StorageReadOptions::default())
-                    .await?;
-                let read = SharedStorageAdapterRead::new(read);
-                crate::sync::load_sync_file_projections(&read, remote_id, &branch_id).await
-            }
-            .await;
-            match attempt {
-                Ok(projections) => {
-                    for projection in projections {
-                        self.file_views.remember_sync_file_view(
-                            crate::sql2::SessionFileViewKey::new(
-                                branch_id.clone(),
-                                projection.file_id,
-                            ),
-                            projection.path,
-                            projection.content,
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(error)
-                    if error.code == LixError::CODE_STORAGE_READ_EXPIRED
-                        && expired_read_retries < MAX_EXPIRED_READ_RETRIES =>
-                {
-                    expired_read_retries += 1;
-                    if read_quiescence_guard.is_none() {
-                        read_quiescence_guard = Some(
-                            Arc::clone(&self.collaboration_write_gate)
-                                .lock_owned()
-                                .await,
-                        );
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     pub fn is_closed(&self) -> bool {
         self.transaction_manager.is_closed()
     }
 
     pub(crate) fn set_sync_outbox_suppressed(&mut self, suppressed: bool) {
         self.sync_outbox_suppressed = suppressed;
-    }
-
-    pub(crate) fn set_sync_scope_suppressed(&mut self, suppressed: bool) {
-        self.sync_scope_suppressed = suppressed;
-    }
-
-    pub(crate) fn sync_scope_suppressed(&self) -> bool {
-        self.sync_scope_suppressed
-    }
-
-    pub(super) fn register_sync_sql_scope(&self, sql: &str) -> Vec<String> {
-        if self.sync_scope_suppressed {
-            Vec::new()
-        } else {
-            let branch_id = self
-                .branch
-                .get()
-                .expect("session branch selector should be readable");
-            if self
-                .sync_ready_query_cache
-                .read()
-                .ok()
-                .is_some_and(|branches| {
-                    branches
-                        .get(&branch_id)
-                        .is_some_and(|queries| queries.contains(sql))
-                })
-            {
-                return Vec::new();
-            }
-            let scopes = self
-                .sync_mode
-                .register_sql_scope_for_branch(sql, &branch_id);
-            if scopes.is_empty()
-                && self.sync_mode.is_replica()
-                && let Ok(mut queries) = self.sync_ready_query_cache.write()
-            {
-                let total_queries = queries.values().map(BTreeSet::len).sum::<usize>();
-                if total_queries >= 512 {
-                    queries.clear();
-                }
-                queries.entry(branch_id).or_default().insert(sql.to_owned());
-            }
-            scopes
-        }
-    }
-
-    /// Returns the synchronization barrier a write needs before opening its
-    /// local transaction. Inserts only need the registered-schema catalog to
-    /// resolve an uncached application table; targeted updates/deletes need
-    /// that relation's rows so a partial replica cannot turn the mutation
-    /// into a silent no-op. Engine-owned writes stay local. The control-plane
-    /// marker is deliberately excluded here: topology reconciliation runs in
-    /// the background worker and must not put ordinary writes on a network
-    /// barrier.
-    pub(super) fn sync_write_wait_scopes(
-        &self,
-        sql: &str,
-        route: crate::sql2::BoundStatementRoute,
-        requested_scopes: &[String],
-    ) -> Vec<String> {
-        if route != crate::sql2::BoundStatementRoute::Write {
-            return requested_scopes.to_vec();
-        }
-        if requested_scopes.iter().any(|scope| scope.starts_with('\0')) {
-            return requested_scopes
-                .iter()
-                .filter(|scope| !crate::sync::is_sync_control_scope(scope))
-                .cloned()
-                .collect();
-        }
-        if requested_scopes
-            .iter()
-            .any(|scope| !scope.starts_with("lix_"))
-        {
-            let is_insert = sql
-                .trim_start()
-                .get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("INSERT"));
-            let lower_sql = sql.to_ascii_lowercase();
-            let insert_requires_rows = lower_sql.contains("on conflict")
-                || lower_sql.contains(" select ")
-                || lower_sql.contains("select\n")
-                || lower_sql.contains("select\t");
-            if is_insert && !insert_requires_rows {
-                return self.register_sync_sql_scope("SELECT * FROM lix_registered_schema");
-            }
-            return requested_scopes.to_vec();
-        }
-        Vec::new()
-    }
-
-    pub(super) async fn wait_for_sync_scope_hydration(
-        &self,
-        requested_scopes: &[String],
-    ) -> Result<(), LixError> {
-        if self.sync_scope_suppressed {
-            Ok(())
-        } else {
-            let branch_id = self
-                .branch
-                .get()
-                .expect("session branch selector should be readable");
-            self.sync_mode
-                .wait_for_scope_hydration_for_branch(requested_scopes, &branch_id)
-                .await?;
-            // File bytes are a late, durable projection applied by the
-            // background worker's suppressed session. Scope readiness is
-            // intentionally published before the worker returns so row
-            // readers can proceed, therefore refresh this application's
-            // in-memory file overlay after the barrier and before planning
-            // the query. The restore is local storage-only and closes the
-            // wake-up race without putting the network on the read path.
-            if requested_scopes.iter().any(|scope| scope == "lix_file")
-                && let crate::sync::SyncRole::Replica { remote_id } = self.sync_mode.role()?
-            {
-                self.restore_sync_file_projections(&remote_id).await?;
-            }
-            Ok(())
-        }
     }
 
     /// Returns the immutable account that authors every change from this session.
@@ -675,16 +484,6 @@ where
         // The selector is session-local state, not repository storage. Opening
         // a coherent storage read here made this metadata-only operation race
         // browser OPFS commits performed by sync bootstrap for no reason.
-        self.ensure_open()?;
-        self.branch.get()
-    }
-
-    /// Reads the session's branch selector without waiting for the session
-    /// operation lease. The sync worker uses this while the application may
-    /// hold an explicit transaction; that transaction cannot change the
-    /// selector, and blocking the worker here would prevent lazy hydration
-    /// from making progress for the transaction's first read.
-    pub(crate) fn active_branch_id_for_sync_worker(&self) -> Result<String, LixError> {
         self.ensure_open()?;
         self.branch.get()
     }

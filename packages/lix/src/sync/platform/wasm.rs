@@ -59,13 +59,3 @@ pub(in crate::sync) async fn sleep(duration: Duration) -> Result<(), LixError> {
     })?;
     Ok(())
 }
-
-pub(in crate::sync) fn deadline(
-    duration: Duration,
-) -> impl Future<Output = Result<(), LixError>> + Send {
-    // Browser timers carry JavaScript Promise state and therefore are not
-    // marked `Send`. Browser WASM is single-threaded, while the shared Lix
-    // session surface intentionally retains its native `Send` future shape.
-    // Keep that target-specific proof at the adapter boundary.
-    unsafe { crate::session::AssumeSendFuture::new(sleep(duration)) }
-}

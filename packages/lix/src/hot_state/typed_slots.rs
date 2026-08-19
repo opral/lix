@@ -83,7 +83,6 @@ const TAG_F64: u8 = 6;
 const TAG_STR: u8 = 7;
 const TAG_JSONB: u8 = 8;
 
-
 // Counted at every point on the decode path that hands bytes to a JSON
 // tokenizer, so a test can assert that reading columns out of a typed record
 // tokenized nothing rather than inspecting the code and believing it. Only a
@@ -176,9 +175,7 @@ pub(crate) struct TypedSlotLayout {
 }
 
 impl TypedSlotLayout {
-    pub(crate) fn new(
-        columns: impl IntoIterator<Item = (String, DeclaredType)>,
-    ) -> Result<Self> {
+    pub(crate) fn new(columns: impl IntoIterator<Item = (String, DeclaredType)>) -> Result<Self> {
         let columns: Vec<(String, DeclaredType)> = columns.into_iter().collect();
         if columns.len() > usize::from(u16::MAX) {
             return Err(TypedSlotError::new(format!(
@@ -482,7 +479,8 @@ impl<'a> TypedSlotsRef<'a> {
             )));
         }
         let (tag, offset, length) = self.directory_entry(index);
-        let payload = &self.bytes[self.payload_start + offset..self.payload_start + offset + length];
+        let payload =
+            &self.bytes[self.payload_start + offset..self.payload_start + offset + length];
         Ok(match tag {
             TAG_NULL => TypedSlot::Null,
             TAG_ABSENT => TypedSlot::Absent,
@@ -723,8 +721,9 @@ mod tests {
     #[test]
     fn only_a_json_declared_column_reaches_a_parser_and_only_when_wanted() {
         let layout = layout();
-        let snapshot =
-            object(r#"{"count":1,"enabled":false,"id":"row","label":"x","payload":{"deep":[1]},"ratio":0.5}"#);
+        let snapshot = object(
+            r#"{"count":1,"enabled":false,"id":"row","label":"x","payload":{"deep":[1]},"ratio":0.5}"#,
+        );
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 
@@ -751,8 +750,7 @@ mod tests {
     #[test]
     fn an_undeclared_predicate_column_projects_to_nothing() {
         let layout = layout();
-        let bytes =
-            encode_typed_slots(&layout, &object(r#"{"id":"row"}"#)).expect("encode");
+        let bytes = encode_typed_slots(&layout, &object(r#"{"id":"row"}"#)).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
         let wanted: BTreeSet<&str> = ["not_a_column"].into_iter().collect();
         let projected = record.filter_columns(&layout, &wanted).expect("project");
@@ -764,8 +762,9 @@ mod tests {
         // Every field carries a distinct value on purpose: a round trip with
         // colliding values cannot detect a permuted slot order.
         let layout = layout();
-        let snapshot =
-            object(r#"{"count":7,"enabled":true,"id":"row-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#);
+        let snapshot = object(
+            r#"{"count":7,"enabled":true,"id":"row-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#,
+        );
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 

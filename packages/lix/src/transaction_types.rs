@@ -816,28 +816,6 @@ pub(crate) struct RawWriteRowRef<'a> {
 }
 
 impl RawWriteRowRef<'_> {
-    /// Copies this borrowed ingress row into the owned shape used by the
-    /// trusted sync-owner lane. Sync admission keeps owner metadata out of
-    /// the public row-write path, but it still uses the compact raw batch
-    /// representation shared by ordinary writes.
-    pub(crate) fn to_owned_row(self) -> TransactionWriteRow {
-        TransactionWriteRow {
-            row_pk: self.row_pk.cloned(),
-            schema_key: self.schema_key.clone(),
-            file_id: self.file_id.cloned(),
-            snapshot: self.snapshot.cloned(),
-            metadata: self.metadata.cloned(),
-            origin: self.origin.cloned(),
-            created_at: self.created_at.map(ToString::to_string),
-            updated_at: self.updated_at.map(ToString::to_string),
-            global: self.global,
-            change_id: self.change_id.map(ToString::to_string),
-            commit_id: self.commit_id.map(ToString::to_string),
-            untracked: self.untracked,
-            branch_id: self.branch_id.clone(),
-        }
-    }
-
     pub(crate) fn schema_scope_branch_id(&self) -> &str {
         if self.global {
             crate::GLOBAL_BRANCH_ID
@@ -3117,28 +3095,6 @@ impl PreparedStateBatch {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Rebinds the commit identity assigned by the local staging path to a
-    /// canonical identity supplied by the sync protocol. This is deliberately
-    /// private to transaction materialization: ordinary SQL writes continue
-    /// to allocate their own commit IDs, while a replicated event can retain
-    /// the server identity that other replicas observe.
-    pub(crate) fn replace_commit_id(&mut self, from: CommitId, to: CommitId) {
-        if from == to {
-            return;
-        }
-        if let Some(dense) = self.dense_certified_parameter.as_mut() {
-            if dense.commit_id == Some(from) {
-                dense.commit_id = Some(to);
-            }
-            return;
-        }
-        for slot in &mut self.slots {
-            if slot.commit_id == Some(from) {
-                slot.commit_id = Some(to);
-            }
-        }
     }
 
     pub(crate) fn certified_tracked_keys_strictly_ordered(&self) -> bool {

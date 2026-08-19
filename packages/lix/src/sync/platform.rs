@@ -17,13 +17,18 @@ mod wasm;
 mod wasm_http;
 
 #[cfg(not(target_family = "wasm"))]
-pub(super) use native::{SyncTask, deadline, sleep, spawn_sync_task};
+pub(super) use native::{SyncTask, sleep, spawn_sync_task};
 #[cfg(not(target_family = "wasm"))]
 pub(super) use native_http::HttpSyncTransport;
 #[cfg(target_family = "wasm")]
-pub(super) use wasm::{SyncTask, deadline, sleep, spawn_sync_task};
+pub(super) use wasm::{SyncTask, sleep, spawn_sync_task};
 #[cfg(target_family = "wasm")]
 pub(super) use wasm_http::HttpSyncTransport;
+#[cfg(target_family = "wasm")]
+pub use wasm_http::{
+    BROWSER_TRANSPORT_CONFIG_HEADER, register_browser_sync_transport,
+    unregister_browser_sync_transport,
+};
 
 /// Target-appropriate future returned by a synchronization transport.
 ///
@@ -56,8 +61,11 @@ mod tests {
     #[test]
     fn shared_sync_modules_have_no_target_specific_policy() {
         for (name, source) in [
-            ("mod.rs", include_str!("mod.rs")),
+            ("blob.rs", include_str!("blob.rs")),
+            ("commit.rs", include_str!("commit.rs")),
             ("contract.rs", include_str!("contract.rs")),
+            ("protocol.rs", include_str!("protocol.rs")),
+            ("repository.rs", include_str!("repository.rs")),
             ("runtime.rs", include_str!("runtime.rs")),
         ] {
             assert!(
@@ -77,6 +85,20 @@ mod tests {
         assert!(!runtime.contains("from_millis(250)"));
         assert!(!runtime.contains("SYNC_POLL_INTERVAL"));
         assert!(!runtime.contains("run_polling"));
+        assert!(!runtime.contains("SYNC_TOPOLOGY_INTERVAL"));
+        assert!(!runtime.contains("inactive_branch"));
+        assert!(!runtime.contains("hydrated_scope"));
+    }
+
+    #[test]
+    fn transport_is_repository_scoped() {
+        let contract = include_str!("contract.rs");
+        assert!(contract.contains("fn push"));
+        assert!(contract.contains("fn pull"));
+        assert!(contract.contains("fn history"));
+        assert!(!contract.contains("fn admit"));
+        assert!(!contract.contains("list_branches"));
+        assert!(!contract.contains("schema_keys"));
     }
 
     #[test]
@@ -91,6 +113,10 @@ mod tests {
             assert!(!source.contains("reconcile_sync_branches"), "{name}");
             assert!(!source.contains("retry_backoff"), "{name}");
             assert!(!source.contains("sync_lifecycle"), "{name}");
+            if name.ends_with("_http.rs") {
+                assert!(!source.contains("activeBranchId"), "{name}");
+                assert!(!source.contains("list_branches"), "{name}");
+            }
         }
         assert!(include_str!("platform/native.rs").contains("tokio::runtime"));
         assert!(include_str!("platform/native_http.rs").contains("reqwest::"));

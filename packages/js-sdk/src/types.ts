@@ -18,8 +18,10 @@ export type RemoteLixServerOptions = {
 export type SyncLixServerOptions = {
 	mode: "sync";
 	url: string | URL;
-	/** Headers copied into each browser sync request, such as Authorization. */
-	headers?: HeadersInit;
+	/** Resolved for every browser sync request, including reconnect handshakes. */
+	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+	/** Browser fetch override. Functions cross the worker boundary through RPC. */
+	fetch?: RemoteLixFetch;
 };
 
 export type LixTelemetrySpan = {

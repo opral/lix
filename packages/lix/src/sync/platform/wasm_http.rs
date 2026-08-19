@@ -1,22 +1,61 @@
-use js_sys::{Array, Function, Object, Promise, Reflect};
+//! Browser fetch mechanics for the repository-scoped sync protocol.
+
+use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use crate::LixError;
 use crate::sync::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, SyncAdmission, SyncBranch, SyncPullResponse, SyncTransactionPack,
-    SyncTransport, SyncTransportFuture, validate_sync_branch_id, validate_sync_remote_id,
+    MAX_SYNC_HISTORY_COMMIT_IDS, MAX_SYNC_PULL_RESPONSE_BYTES, SyncBlobManifest,
+    SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
+    SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportFuture,
+    validate_blake3_id, validate_sync_remote_id,
 };
 
 const SESSION_HEADER: &str = "lix-session-id";
-const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+pub const BROWSER_TRANSPORT_CONFIG_HEADER: &str = "x-lix-internal-browser-transport";
+
+#[derive(Clone)]
+struct BrowserTransportConfig {
+    header_provider: Option<Function>,
+    fetch: Option<Function>,
+}
+
+thread_local! {
+    static BROWSER_TRANSPORT_CONFIGS: RefCell<HashMap<String, BrowserTransportConfig>> =
+        RefCell::new(HashMap::new());
+}
+
+pub fn register_browser_sync_transport(
+    id: String,
+    header_provider: Option<Function>,
+    fetch: Option<Function>,
+) {
+    BROWSER_TRANSPORT_CONFIGS.with(|configs| {
+        configs.borrow_mut().insert(
+            id,
+            BrowserTransportConfig {
+                header_provider,
+                fetch,
+            },
+        );
+    });
+}
+
+pub fn unregister_browser_sync_transport(id: &str) {
+    BROWSER_TRANSPORT_CONFIGS.with(|configs| {
+        configs.borrow_mut().remove(id);
+    });
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HandshakeResponse {
-    active_branch_id: String,
     session_id: String,
+    active_account_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,67 +76,88 @@ pub(crate) struct HttpSyncTransport {
     repository_url: String,
     protocol_url: String,
     headers: Vec<(String, String)>,
+    header_provider: Option<Function>,
+    fetch: Option<Function>,
     session_id: String,
-    branch_id: String,
+    active_account_id: String,
 }
 
 impl HttpSyncTransport {
     pub(crate) async fn connect(
         repository_url: &str,
         headers: &[(String, String)],
-        active_branch_id: Option<&str>,
     ) -> Result<Self, LixError> {
         let repository_url = repository_url.trim_end_matches('/').to_owned();
         validate_sync_remote_id(&repository_url)?;
+        let config_id = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(BROWSER_TRANSPORT_CONFIG_HEADER))
+            .map(|(_, value)| value.clone());
+        let config = config_id.as_deref().and_then(|id| {
+            BROWSER_TRANSPORT_CONFIGS.with(|configs| configs.borrow().get(id).cloned())
+        });
+        if config_id.is_some() && config.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "browser sync transport callbacks are no longer registered",
+            ));
+        }
+        let headers = headers
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case(BROWSER_TRANSPORT_CONFIG_HEADER))
+            .cloned()
+            .collect::<Vec<_>>();
         let protocol_url = format!("{repository_url}/lix/v1");
-        let handshake_url = match active_branch_id {
-            Some(branch_id) => format!(
-                "{protocol_url}?activeBranchId={}",
-                js_sys::encode_uri_component(branch_id)
-            ),
-            None => protocol_url.clone(),
-        };
-        let response = fetch(&handshake_url, "GET", headers, None).await?;
+        let resolved_headers = resolve_request_headers(
+            &headers,
+            config
+                .as_ref()
+                .and_then(|value| value.header_provider.as_ref()),
+        )
+        .await?;
+        let response = fetch(
+            &protocol_url,
+            "GET",
+            &resolved_headers,
+            None,
+            config.as_ref().and_then(|value| value.fetch.as_ref()),
+        )
+        .await?;
         let handshake: HandshakeResponse = decode_response(response, "open sync session")?;
-        validate_sync_branch_id(&handshake.active_branch_id)?;
         if handshake.session_id.is_empty() || handshake.session_id.len() > 4096 {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "sync handshake returned an invalid session identity",
             ));
         }
+        crate::row_pk::RowPk::uuid_from_canonical(&handshake.active_account_id).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync handshake returned an invalid active account identity",
+            )
+        })?;
         Ok(Self {
             repository_url,
             protocol_url,
-            headers: headers.to_vec(),
+            headers,
+            header_provider: config
+                .as_ref()
+                .and_then(|value| value.header_provider.clone()),
+            fetch: config.and_then(|value| value.fetch),
             session_id: handshake.session_id,
-            branch_id: handshake.active_branch_id,
+            active_account_id: handshake.active_account_id,
         })
     }
 
-    pub(crate) fn branch_id(&self) -> &str {
-        &self.branch_id
+    pub(crate) fn active_account_id(&self) -> &str {
+        &self.active_account_id
     }
 
-    pub(crate) async fn close(self) -> Result<(), LixError> {
-        let headers = self.session_headers(None);
-        let response = fetch(
-            &format!("{}/session", self.protocol_url),
-            "DELETE",
-            &headers,
-            None,
-        )
-        .await?;
-        ensure_success(response, "close sync session")
-    }
-
-    fn session_headers(&self, idempotency_key: Option<&str>) -> Vec<(String, String)> {
-        let mut headers = self.headers.clone();
+    async fn session_headers(&self) -> Result<Vec<(String, String)>, LixError> {
+        let mut headers =
+            resolve_request_headers(&self.headers, self.header_provider.as_ref()).await?;
         headers.push((SESSION_HEADER.to_owned(), self.session_id.clone()));
-        if let Some(key) = idempotency_key {
-            headers.push((IDEMPOTENCY_HEADER.to_owned(), key.to_owned()));
-        }
-        headers
+        Ok(headers)
     }
 }
 
@@ -106,82 +166,258 @@ impl SyncTransport for HttpSyncTransport {
         &self.repository_url
     }
 
-    fn admit<'a>(
+    fn active_account_id(&self) -> &str {
+        &self.active_account_id
+    }
+
+    fn push<'a>(
         &'a self,
-        pack: &'a SyncTransactionPack,
-    ) -> SyncTransportFuture<'a, SyncAdmission> {
+        request: &'a SyncPushRequest,
+    ) -> SyncTransportFuture<'a, SyncPushResponse> {
         Box::pin(async move {
-            let body = serde_json::to_string(pack).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("encode sync transaction: {error}"),
-                )
-            })?;
-            let mut headers = self.session_headers(Some(&pack.operation_id));
+            let body = json_body(request, "encode sync push")?;
+            let mut headers = self.session_headers().await?;
             headers.push(("content-type".to_owned(), "application/json".to_owned()));
             let response = fetch(
-                &format!("{}/sync/admit", self.protocol_url),
+                &format!("{}/sync/push", self.protocol_url),
                 "POST",
                 &headers,
-                Some(&body),
+                Some(body),
+                self.fetch.as_ref(),
             )
             .await?;
-            decode_response(response, "admit sync transaction")
+            decode_response(response, "push sync commits")
         })
     }
 
-    fn pull<'a>(
+    fn pull(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> SyncTransportFuture<'_, SyncRepositoryPullResponse> {
+        Box::pin(async move {
+            let url = match after {
+                Some(after) => format!(
+                    "{}/sync/pull?after={after}&limit={limit}",
+                    self.protocol_url
+                ),
+                None => format!("{}/sync/pull?limit={limit}", self.protocol_url),
+            };
+            let headers = self.session_headers().await?;
+            let response = fetch(&url, "GET", &headers, None, self.fetch.as_ref()).await?;
+            decode_response(response, "pull sync repository")
+        })
+    }
+
+    fn snapshot_rows<'a>(
         &'a self,
         branch_id: &'a str,
-        after_cursor: u64,
+        head_commit_id: &'a str,
+        continuation: Option<&'a str>,
         limit: usize,
-        schema_keys: &'a [String],
-    ) -> SyncTransportFuture<'a, SyncPullResponse> {
+    ) -> SyncTransportFuture<'a, SyncSnapshotRowPage> {
         Box::pin(async move {
             let mut url = format!(
-                "{}/sync/pull?after={after_cursor}&limit={limit}&branch={}",
+                "{}/sync/pull?snapshotBranchId={}&snapshotHeadCommitId={}&limit={limit}",
                 self.protocol_url,
-                js_sys::encode_uri_component(branch_id)
+                encode_query(branch_id),
+                encode_query(head_commit_id),
             );
-            if !schema_keys.is_empty() {
-                url.push_str("&schemas=");
-                let schemas = js_sys::encode_uri_component(&schema_keys.join(","));
-                url.push_str(&String::from(schemas));
+            if let Some(continuation) = continuation {
+                url.push_str("&snapshotAfter=");
+                url.push_str(&encode_query(continuation));
             }
-            let response = fetch(&url, "GET", &self.session_headers(None), None).await?;
-            decode_response(response, "pull sync transactions")
-        })
-    }
-
-    fn list_branches<'a>(&'a self) -> SyncTransportFuture<'a, Vec<SyncBranch>> {
-        Box::pin(async move {
             let response = fetch(
-                &format!("{}/sync/branches", self.protocol_url),
+                &url,
                 "GET",
-                &self.session_headers(None),
+                &self.session_headers().await?,
                 None,
+                self.fetch.as_ref(),
             )
             .await?;
-            decode_response(response, "list sync branches")
+            decode_response(response, "load sync snapshot rows")
         })
     }
 
-    fn has_authoritative_branch_catalog(&self) -> bool {
-        true
+    fn history<'a>(
+        &'a self,
+        commit_ids: &'a [String],
+    ) -> SyncTransportFuture<'a, SyncHistoryResponse> {
+        Box::pin(async move {
+            if commit_ids.is_empty() || commit_ids.len() > MAX_SYNC_HISTORY_COMMIT_IDS {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync history requires 1 through {MAX_SYNC_HISTORY_COMMIT_IDS} commit IDs"
+                    ),
+                ));
+            }
+            let query = commit_ids
+                .iter()
+                .map(|commit_id| format!("commitId={}", encode_query(commit_id)))
+                .collect::<Vec<_>>()
+                .join("&");
+            let response = fetch(
+                &format!("{}/sync/history?{query}", self.protocol_url),
+                "GET",
+                &self.session_headers().await?,
+                None,
+                self.fetch.as_ref(),
+            )
+            .await?;
+            decode_response(response, "load sync history")
+        })
+    }
+
+    fn get_blob<'a>(
+        &'a self,
+        blob_id: &'a str,
+    ) -> SyncTransportFuture<'a, Option<SyncBlobManifest>> {
+        Box::pin(async move {
+            validate_blake3_id(blob_id, "blob ID")?;
+            let response = fetch(
+                &format!(
+                    "{}/sync/blob?blobId={}",
+                    self.protocol_url,
+                    encode_query(blob_id)
+                ),
+                "GET",
+                &self.session_headers().await?,
+                None,
+                self.fetch.as_ref(),
+            )
+            .await?;
+            decode_optional_response(response, "load sync blob manifest")
+        })
+    }
+
+    fn register_blob<'a>(
+        &'a self,
+        manifest: &'a SyncBlobManifest,
+    ) -> SyncTransportFuture<'a, SyncBlobRegistration> {
+        Box::pin(async move {
+            validate_blake3_id(&manifest.blob_id, "blob ID")?;
+            let body = json_body(manifest, "encode sync blob manifest")?;
+            let mut headers = self.session_headers().await?;
+            headers.push(("content-type".to_owned(), "application/json".to_owned()));
+            let response = fetch(
+                &format!("{}/sync/blob", self.protocol_url),
+                "POST",
+                &headers,
+                Some(body),
+                self.fetch.as_ref(),
+            )
+            .await?;
+            decode_response(response, "register sync blob manifest")
+        })
+    }
+
+    fn get_chunk<'a>(&'a self, chunk_id: &'a str) -> SyncTransportFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            validate_blake3_id(chunk_id, "chunk ID")?;
+            let response = fetch(
+                &format!(
+                    "{}/sync/chunk?chunkId={}",
+                    self.protocol_url,
+                    encode_query(chunk_id)
+                ),
+                "GET",
+                &self.session_headers().await?,
+                None,
+                self.fetch.as_ref(),
+            )
+            .await?;
+            if response.status == 404 {
+                return Ok(None);
+            }
+            ensure_success_ref(&response, "load sync chunk")?;
+            Ok(Some(response.body))
+        })
+    }
+
+    fn put_chunk<'a>(&'a self, chunk_id: &'a str, bytes: &'a [u8]) -> SyncTransportFuture<'a, ()> {
+        Box::pin(async move {
+            validate_blake3_id(chunk_id, "chunk ID")?;
+            let mut headers = self.session_headers().await?;
+            headers.push((
+                "content-type".to_owned(),
+                "application/octet-stream".to_owned(),
+            ));
+            let body: JsValue = Uint8Array::from(bytes).into();
+            let response = fetch(
+                &format!(
+                    "{}/sync/chunk?chunkId={}",
+                    self.protocol_url,
+                    encode_query(chunk_id)
+                ),
+                "PUT",
+                &headers,
+                Some(body),
+                self.fetch.as_ref(),
+            )
+            .await?;
+            ensure_success(response, "store sync chunk")
+        })
     }
 }
 
 struct FetchResponse {
     status: u16,
     status_text: String,
-    body: String,
+    body: Vec<u8>,
+}
+
+async fn resolve_request_headers(
+    static_headers: &[(String, String)],
+    provider: Option<&Function>,
+) -> Result<Vec<(String, String)>, LixError> {
+    let Some(provider) = provider else {
+        return Ok(static_headers.to_vec());
+    };
+    let value = provider
+        .call0(&JsValue::UNDEFINED)
+        .map_err(js_transport_error)?;
+    let value = JsFuture::from(Promise::resolve(&value))
+        .await
+        .map_err(js_transport_error)?;
+    if !Array::is_array(&value) {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "browser sync header provider must return [name, value] pairs",
+        ));
+    }
+    let dynamic = Array::from(&value)
+        .iter()
+        .map(|pair| {
+            if !Array::is_array(&pair) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "browser sync header provider must return [name, value] pairs",
+                ));
+            }
+            let pair = Array::from(&pair);
+            let name = pair.get(0).as_string();
+            let value = pair.get(1).as_string();
+            match (pair.length(), name, value) {
+                (2, Some(name), Some(value)) => Ok((name, value)),
+                _ => Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "browser sync header provider must return [name, value] pairs",
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut headers = static_headers.to_vec();
+    headers.extend(dynamic);
+    Ok(headers)
 }
 
 async fn fetch(
     url: &str,
     method: &str,
     headers: &[(String, String)],
-    body: Option<&str>,
+    body: Option<JsValue>,
+    fetch_override: Option<&Function>,
 ) -> Result<FetchResponse, LixError> {
     let init = Object::new();
     let global = js_sys::global();
@@ -193,10 +429,9 @@ async fn fetch(
         Reflect::construct(&controller_constructor, &Array::new()).map_err(js_transport_error)?;
     let signal = Reflect::get(&controller, &"signal".into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"signal".into(), &signal).map_err(js_transport_error)?;
-    // Dropping the Rust future is how the shared runtime interrupts a held
-    // long poll for a local write or shutdown. A JavaScript Promise keeps the
-    // underlying request alive after its JsFuture is dropped, so tie that
-    // cancellation boundary to AbortController explicitly.
+    // Dropping the shared pull future must stop the browser request too. A
+    // dropped `JsFuture` does not cancel its Promise, so cancellation lives at
+    // this adapter boundary through AbortController.
     let mut abort_on_drop = AbortOnDrop {
         controller: controller.into(),
         armed: true,
@@ -212,15 +447,23 @@ async fn fetch(
     }
     Reflect::set(&init, &"headers".into(), &header_pairs).map_err(js_transport_error)?;
     if let Some(body) = body {
-        Reflect::set(&init, &"body".into(), &body.into()).map_err(js_transport_error)?;
+        Reflect::set(&init, &"body".into(), &body).map_err(js_transport_error)?;
     }
 
-    let fetch = Reflect::get(&global, &"fetch".into())
-        .map_err(js_transport_error)?
-        .dyn_into::<Function>()
-        .map_err(js_transport_error)?;
+    let fetch = match fetch_override {
+        Some(fetch) => fetch.clone(),
+        None => Reflect::get(&global, &"fetch".into())
+            .map_err(js_transport_error)?
+            .dyn_into::<Function>()
+            .map_err(js_transport_error)?,
+    };
+    let this = if fetch_override.is_some() {
+        JsValue::UNDEFINED
+    } else {
+        global.clone().into()
+    };
     let promise = fetch
-        .call2(&global, &url.into(), &init)
+        .call2(&this, &url.into(), &init)
         .map_err(js_transport_error)?
         .dyn_into::<Promise>()
         .map_err(js_transport_error)?;
@@ -233,7 +476,7 @@ async fn fetch(
         .map_err(js_transport_error)?
         .as_string()
         .unwrap_or_default();
-    let text = Reflect::get(&response, &"text".into())
+    let array_buffer = Reflect::get(&response, &"arrayBuffer".into())
         .map_err(js_transport_error)?
         .dyn_into::<Function>()
         .map_err(js_transport_error)?
@@ -241,11 +484,10 @@ async fn fetch(
         .map_err(js_transport_error)?
         .dyn_into::<Promise>()
         .map_err(js_transport_error)?;
-    let body = JsFuture::from(text)
+    let body = JsFuture::from(array_buffer)
         .await
-        .map_err(js_transport_error)?
-        .as_string()
-        .unwrap_or_default();
+        .map_err(js_transport_error)?;
+    let body = Uint8Array::new(&body).to_vec();
     if body.len() > MAX_SYNC_PULL_RESPONSE_BYTES {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -278,21 +520,38 @@ impl Drop for AbortOnDrop {
     }
 }
 
+fn json_body(value: &impl serde::Serialize, operation: &str) -> Result<JsValue, LixError> {
+    serde_json::to_string(value)
+        .map(JsValue::from)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("{operation}: {error}"),
+            )
+        })
+}
+
+fn encode_query(value: &str) -> String {
+    String::from(js_sys::encode_uri_component(value))
+}
+
 fn ensure_success(response: FetchResponse, operation: &str) -> Result<(), LixError> {
+    ensure_success_ref(&response, operation)
+}
+
+fn ensure_success_ref(response: &FetchResponse, operation: &str) -> Result<(), LixError> {
     if (200..300).contains(&response.status) {
         return Ok(());
     }
-    Err(response_error(&response, operation))
+    Err(response_error(response, operation))
 }
 
 fn decode_response<T>(response: FetchResponse, operation: &str) -> Result<T, LixError>
 where
     T: serde::de::DeserializeOwned,
 {
-    if !(200..300).contains(&response.status) {
-        return Err(response_error(&response, operation));
-    }
-    serde_json::from_str(&response.body).map_err(|error| {
+    ensure_success_ref(&response, operation)?;
+    serde_json::from_slice(&response.body).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("decode {operation} response: {error}"),
@@ -300,8 +559,21 @@ where
     })
 }
 
+fn decode_optional_response<T>(
+    response: FetchResponse,
+    operation: &str,
+) -> Result<Option<T>, LixError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if response.status == 404 {
+        return Ok(None);
+    }
+    decode_response(response, operation).map(Some)
+}
+
 fn response_error(response: &FetchResponse, operation: &str) -> LixError {
-    if let Ok(envelope) = serde_json::from_str::<ErrorResponse>(&response.body)
+    if let Ok(envelope) = serde_json::from_slice::<ErrorResponse>(&response.body)
         && !envelope.error.code.is_empty()
     {
         let mut error = LixError::new(
@@ -313,11 +585,19 @@ fn response_error(response: &FetchResponse, operation: &str) -> LixError {
         }
         return error;
     }
+    if response.status == 413 {
+        return LixError::new(
+            "LIX_ERROR_REQUEST_BODY_TOO_LARGE",
+            format!("{operation} exceeded an HTTP intermediary transfer limit"),
+        );
+    }
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!(
             "{operation} failed with {} {}: {}",
-            response.status, response.status_text, response.body
+            response.status,
+            response.status_text,
+            String::from_utf8_lossy(&response.body)
         ),
     )
 }

@@ -5,6 +5,7 @@ mod kv;
 pub(crate) mod metrics;
 #[cfg(test)]
 mod stats;
+mod transfer;
 mod types;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,10 +18,15 @@ pub(crate) use codec::{
     decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
 };
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
-pub(crate) use kv::load_bytes_many;
+pub(crate) use kv::{load_bytes_many, load_metadata_many};
 pub(crate) use kv::{
-    BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
-    BINARY_CAS_MANIFEST_SPACE,
+    BINARY_CAS_CHUNK_DEMAND_SPACE, BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE,
+    BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
+};
+pub(crate) use transfer::{
+    CanonicalBlobChunk, CanonicalBlobManifest, chunk_presence_many, load_canonical_blob_chunks,
+    load_verified_chunk, stage_deferred_canonical_manifest, stage_transfer_publication_fence,
+    stage_verified_canonical_manifest, stage_verified_raw_chunk,
 };
 pub(crate) use types::{
     BlobBytesBatch, BlobChunkReceipt, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
@@ -39,6 +45,7 @@ pub(crate) struct BinaryCasGcSweep {
     pub(crate) reclaimed_manifest_rows: usize,
     pub(crate) reclaimed_manifest_chunk_rows: usize,
     pub(crate) reclaimed_chunk_rows: usize,
+    pub(crate) reclaimed_demand_marker_rows: usize,
 }
 
 /// Stages the owner's authenticated binary-CAS reclamation operation.

@@ -6,7 +6,6 @@ use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
-use crate::row_pk::RowPk;
 use crate::hot_state::HotStateContext;
 use crate::hot_state::HotStateRowRequest;
 use crate::init::InitReceipt;
@@ -15,19 +14,20 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::{
     DEFAULT_MAX_LIVE_PLUGIN_STORES, DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost,
 };
+use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
+use crate::row_pk::RowPk;
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
-use crate::sync::SyncModeState;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StoragePrefix,
     StorageReadOptions, StorageWriteOptions,
 };
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
+use crate::sync::SyncModeState;
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
-use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
@@ -206,6 +206,18 @@ where
 
     pub(crate) fn collaboration_write_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.collaboration_write_gate)
+    }
+
+    pub(crate) async fn load_repository_default_branch_id(
+        &self,
+        read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    ) -> Result<String, LixError> {
+        crate::session::load_default_branch_id_from_index(
+            self.hot_state.as_ref(),
+            self.branch_ctx.as_ref(),
+            read,
+        )
+        .await
     }
 
     /// Loads the current commit head for a branch.
@@ -2167,8 +2179,8 @@ mod tests {
             &mut gc_writes,
             &mut gc_preconditions,
         )
-            .await
-            .expect("repository GC should collect superseded sparse epochs");
+        .await
+        .expect("repository GC should collect superseded sparse epochs");
         adapter
             .commit_write_set(
                 gc_writes,

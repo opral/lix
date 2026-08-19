@@ -22,16 +22,15 @@ mod tree;
 mod types;
 
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
-pub(crate) use storage::load_commit_state_authority_ids;
 pub(crate) use commit_root_rebuild::{
     load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
     try_stage_collapsed_rebuild_plans_with_writer,
 };
+#[cfg(test)]
+pub(crate) use context::DIFF_ROW_CREATED_AT_VALIDATIONS;
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
-#[cfg(test)]
-pub(crate) use context::DIFF_ROW_CREATED_AT_VALIDATIONS;
 pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
     decode_current_state_data_part_commit_ids, decode_current_state_data_part_refs,
@@ -67,6 +66,7 @@ pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_tre
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;
+pub(crate) use storage::load_commit_state_authority_ids;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
 #[cfg(test)]
@@ -76,7 +76,7 @@ pub(crate) use storage::{
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
     CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology,
     StagedCommitStateManifest, commit_delta_contains_schema, commit_delta_member_scopes,
-    direct_change_locator,
+    commit_history_is_deferred, direct_change_locator, load_canonical_change_locator,
     load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
@@ -84,12 +84,12 @@ pub(crate) use storage::{
     load_local_selected_change_owner_commit_ids, load_owned_commit_delta_entries,
     load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_topology,
     load_retained_commit_snapshots_for_schemas, scan_change_records_from_commit_deltas,
-    scan_change_records_from_commit_deltas_excluding_commits,
     scan_commit_delta_inventory, scan_commit_delta_values, scan_commit_state_manifest_commit_ids,
     selected_change_selection_fingerprint, stage_addressable_commit_deltas,
     stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
-    stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
+    stage_commit_deltas_for_commit_state, stage_commit_history_available,
+    stage_commit_history_deferred, stage_commit_state_manifest_with_handle,
     stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
@@ -118,7 +118,8 @@ pub(crate) use storage::stage_delete_commit_state_manifest_for_gc;
 // registry is compiled in every configuration, so these are too.
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-    TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+    TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE, TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+    TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
 };
 #[cfg(test)]
 pub(crate) use storage::{
@@ -133,21 +134,20 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use tree::test_gc_leaf_chunk;
+pub(crate) use types::CurrentStatePartSource;
 pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
-    TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
-    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
-    RowPkRangeBound, row_pk_satisfies_bounds,
+    RowPkRangeBound, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
+    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateDeltaRef,
+    TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
+    row_pk_satisfies_bounds,
 };
-pub(crate) use types::CurrentStatePartSource;
 #[cfg(test)]
-pub(crate) use types::{
-    CurrentStatePartDescriptor, ReplacementPartSource, TrackedStateCommitRootParent,
-};
+pub(crate) use types::{CurrentStatePartDescriptor, ReplacementPartSource};
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 
 #[cfg(feature = "storage-benches")]

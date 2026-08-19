@@ -12,6 +12,28 @@ import type {
 	LixTelemetrySpan,
 } from "../types.js";
 
+export type WorkerSyncServerOptions = {
+	url: string;
+	headers?: [string, string][];
+	dynamicHeaders: boolean;
+	customFetch: boolean;
+};
+
+export type WorkerSyncFetchRequest = {
+	url: string;
+	method: string;
+	headers: [string, string][];
+	body?: string | Uint8Array;
+	credentials?: RequestCredentials;
+};
+
+export type WorkerSyncFetchResponse = {
+	status: number;
+	statusText: string;
+	headers: [string, string][];
+	body: Uint8Array;
+};
+
 export type WorkerRequest = {
 	id: number;
 	operation: WorkerOperation;
@@ -22,7 +44,7 @@ export type WorkerOperation =
 			kind: "open";
 			storage: LixStorageConfig;
 			telemetryEnabled: boolean;
-			server?: { url: string; headers: [string, string][] };
+			server?: WorkerSyncServerOptions;
 	  }
 	| {
 			kind: "execute";
@@ -63,7 +85,21 @@ export type WorkerOperation =
 
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
-	| { kind: "observe.close"; observeId: number };
+	| { kind: "observe.close"; observeId: number }
+	| {
+			kind: "sync.headers.result";
+			requestId: number;
+			result:
+				| { ok: true; headers: [string, string][] }
+				| { ok: false; error: SerializedWorkerError };
+	  }
+	| {
+			kind: "sync.fetch.result";
+			requestId: number;
+			result:
+				| { ok: true; response: WorkerSyncFetchResponse }
+				| { ok: false; error: SerializedWorkerError };
+	  };
 
 export type WorkerInput = WorkerRequest | WorkerNotification;
 
@@ -94,7 +130,10 @@ export type SerializedWorkerError = {
 export type WorkerResponse =
 	| { id: number; ok: true; value?: unknown }
 	| { id: number; ok: false; error: SerializedWorkerError }
-	| { kind: "telemetry"; span: LixTelemetrySpan };
+	| { kind: "telemetry"; span: LixTelemetrySpan }
+	| { kind: "sync.headers"; requestId: number }
+	| { kind: "sync.fetch"; requestId: number; request: WorkerSyncFetchRequest }
+	| { kind: "sync.fetch.cancel"; requestId: number };
 
 export function serializeWorkerError(error: unknown): SerializedWorkerError {
 	if (!(error instanceof Error)) {

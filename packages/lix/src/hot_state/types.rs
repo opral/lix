@@ -225,9 +225,7 @@ impl MaterializedHotStateBatch {
         }
         let mut ordinals = (0..self.len()).collect::<Vec<_>>();
         if !ordinals.is_sorted_by(|left, right| self.row_pks[*left] <= self.row_pks[*right]) {
-            ordinals.sort_unstable_by(|left, right| {
-                self.row_pks[*left].cmp(&self.row_pks[*right])
-            });
+            ordinals.sort_unstable_by(|left, right| self.row_pks[*left].cmp(&self.row_pks[*right]));
         }
         if ordinals.iter().copied().eq(0..self.len()) {
             return self.row_pks;
@@ -1264,9 +1262,9 @@ impl MaterializedHotStateBatchBuilder {
             return;
         }
         assert!(row < self.len(), "live-state row ordinal out of bounds");
-        self.columnar_base_coordinate.get_or_insert_with(|| {
-            vec![ColumnarBaseCoordinate::default(); self.row_pks.len()]
-        })[row] = value;
+        self.columnar_base_coordinate
+            .get_or_insert_with(|| vec![ColumnarBaseCoordinate::default(); self.row_pks.len()])
+            [row] = value;
     }
 
     pub(crate) fn finish(self) -> MaterializedHotStateBatch {
@@ -1632,14 +1630,8 @@ mod batch_tests {
 
         assert!(batch.singleton.is_none());
         assert_eq!(batch.len(), 2);
-        assert_eq!(
-            batch.row(0).row_pk().as_single_string().unwrap(),
-            "first"
-        );
-        assert_eq!(
-            batch.row(1).row_pk().as_single_string().unwrap(),
-            "second"
-        );
+        assert_eq!(batch.row(0).row_pk().as_single_string().unwrap(), "first");
+        assert_eq!(batch.row(1).row_pk().as_single_string().unwrap(), "second");
         assert_eq!(batch.row(0).columnar_base_coordinate(), Some(coordinate));
         assert_eq!(batch.row(1).columnar_base_coordinate(), None);
     }
@@ -1841,10 +1833,7 @@ mod batch_tests {
                 })
                 .collect(),
         );
-        let survivors = batch
-            .iter()
-            .filter(|row| row.row_pk() == &shared)
-            .count();
+        let survivors = batch.iter().filter(|row| row.row_pk() == &shared).count();
         assert_eq!(survivors, 500);
         let row_column = batch.row_column_ptr();
 

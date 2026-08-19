@@ -88,12 +88,6 @@ pub(in crate::sync) async fn sleep(duration: Duration) -> Result<(), LixError> {
     Ok(())
 }
 
-pub(in crate::sync) fn deadline(
-    duration: Duration,
-) -> impl Future<Output = Result<(), LixError>> + Send {
-    sleep(duration)
-}
-
 struct WorkerDone {
     finished: Arc<AtomicBool>,
     notify: Arc<tokio::sync::Notify>,

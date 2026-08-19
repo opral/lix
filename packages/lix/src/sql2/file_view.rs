@@ -16,18 +16,6 @@ pub(crate) struct SessionFileViews {
 #[derive(Default)]
 struct SessionFileViewsState {
     plugin_files: BTreeMap<SessionFileViewKey, SessionPluginFileView>,
-    /// Bytes received as a lazy sync file projection. These bytes are a local
-    /// read overlay: canonical descriptor/blob rows remain authoritative and
-    /// the overlay is replaced by the next canonical file projection.
-    /// Read collectors share this immutable map by `Arc`; a write clones it
-    /// copy-on-write. This keeps ordinary row-only reads O(1) in the number of
-    /// cached files instead of cloning every durable byte projection.
-    sync_files: Arc<BTreeMap<SessionFileViewKey, SessionSyncFileView>>,
-    /// Read collectors are isolated from the live session. They may use
-    /// copy-on-write for temporary plugin acknowledgements; the canonical
-    /// session must publish cache mutations by replacing the shared pointer
-    /// even while a collector still holds an older map.
-    read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -60,12 +48,6 @@ pub(crate) struct SessionPluginFileView {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SessionSyncFileView {
-    pub(crate) path: String,
-    pub(crate) content: Arc<Vec<u8>>,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) enum SessionFileViewMutation {
     Set {
         key: SessionFileViewKey,
@@ -74,29 +56,14 @@ pub(crate) enum SessionFileViewMutation {
     Remove {
         key: SessionFileViewKey,
     },
-    SetSyncFile {
-        key: SessionFileViewKey,
-        view: SessionSyncFileView,
-    },
-    RemoveSyncFile {
-        key: SessionFileViewKey,
-    },
 }
 
 impl SessionFileViews {
-    /// Creates an isolated read collector carrying only durable raw-file
-    /// projections. Plugin acknowledgements are intentionally collected in a
-    /// fresh map and applied to the session only after the read succeeds;
-    /// sharing the whole cache would make a failed read publish derived state.
+    /// Creates an isolated read collector. Plugin acknowledgements are
+    /// collected in a fresh map and applied to the session only after the read
+    /// succeeds; sharing the cache would make a failed read publish state.
     pub(crate) fn fork_for_read(&self) -> Self {
-        let state = self.lock();
-        Self {
-            inner: Arc::new(Mutex::new(SessionFileViewsState {
-                plugin_files: BTreeMap::new(),
-                sync_files: Arc::clone(&state.sync_files),
-                read_only: true,
-            })),
-        }
+        Self::default()
     }
 
     pub(crate) fn has_plugin_file_at_path(&self, branch_id: &str, path: &str) -> bool {
@@ -131,39 +98,7 @@ impl SessionFileViews {
         key: SessionFileViewKey,
         view: SessionPluginFileView,
     ) {
-        let mut state = self.lock();
-        Arc::make_mut(&mut state.sync_files).remove(&key);
-        state.plugin_files.insert(key, view);
-    }
-
-    pub(crate) fn sync_file_content(&self, key: &SessionFileViewKey) -> Option<(String, Vec<u8>)> {
-        let state = self.lock();
-        state
-            .sync_files
-            .get(key)
-            .map(|view| (view.path.clone(), view.content.as_ref().clone()))
-    }
-
-    /// Restores a durable raw-file projection after a process/session restart.
-    /// Canonical plugin views still win when a later semantic read materializes
-    /// the same file, exactly as they do for an in-process projection.
-    pub(crate) fn remember_sync_file_view(
-        &self,
-        key: SessionFileViewKey,
-        path: String,
-        content: Vec<u8>,
-    ) {
-        let mut state = self.lock();
-        state.plugin_files.remove(&key);
-        let mut sync_files = (*state.sync_files).clone();
-        sync_files.insert(
-            key,
-            SessionSyncFileView {
-                path,
-                content: Arc::new(content),
-            },
-        );
-        state.sync_files = Arc::new(sync_files);
+        self.lock().plugin_files.insert(key, view);
     }
 
     pub(crate) fn apply_mutations(
@@ -171,61 +106,15 @@ impl SessionFileViews {
         mutations: impl IntoIterator<Item = SessionFileViewMutation>,
     ) {
         let mut state = self.lock();
-        // Read collectors hold an Arc to the current sync map. A normal
-        // copy-on-write update would then publish the projection only to the
-        // transaction/collector that happened to receive it, losing it from
-        // the live session. Hydration is a durable cache publication, so
-        // merge all sync mutations into a fresh map and replace the shared
-        // pointer once per batch. Read forks keep their old immutable map;
-        // subsequent reads see the newly published one.
-        let mut next_sync_files: Option<BTreeMap<SessionFileViewKey, SessionSyncFileView>> = None;
         for mutation in mutations {
             match mutation {
                 SessionFileViewMutation::Set { key, view } => {
-                    if let Some(sync_files) = next_sync_files.as_mut() {
-                        sync_files.remove(&key);
-                    } else if state.read_only {
-                        Arc::make_mut(&mut state.sync_files).remove(&key);
-                    } else {
-                        let mut sync_files = (*state.sync_files).clone();
-                        sync_files.remove(&key);
-                        next_sync_files = Some(sync_files);
-                    }
                     state.plugin_files.insert(key, view);
                 }
                 SessionFileViewMutation::Remove { key } => {
-                    if let Some(sync_files) = next_sync_files.as_mut() {
-                        sync_files.remove(&key);
-                    } else if state.read_only {
-                        Arc::make_mut(&mut state.sync_files).remove(&key);
-                    } else {
-                        let mut sync_files = (*state.sync_files).clone();
-                        sync_files.remove(&key);
-                        next_sync_files = Some(sync_files);
-                    }
                     state.plugin_files.remove(&key);
-                }
-                SessionFileViewMutation::SetSyncFile { key, view } => {
-                    state.plugin_files.remove(&key);
-                    let sync_files = next_sync_files.get_or_insert_with(|| {
-                        (*state.sync_files).clone()
-                    });
-                    sync_files.insert(key, view);
-                }
-                SessionFileViewMutation::RemoveSyncFile { key } => {
-                    if state.read_only {
-                        Arc::make_mut(&mut state.sync_files).remove(&key);
-                    } else {
-                        let sync_files = next_sync_files.get_or_insert_with(|| {
-                            (*state.sync_files).clone()
-                        });
-                        sync_files.remove(&key);
-                    }
                 }
             }
-        }
-        if let Some(sync_files) = next_sync_files {
-            state.sync_files = Arc::new(sync_files);
         }
     }
 
@@ -236,7 +125,6 @@ impl SessionFileViews {
     pub(crate) fn clear(&self) {
         let mut state = self.lock();
         state.plugin_files.clear();
-        state.sync_files = Arc::new(BTreeMap::new());
     }
 
     pub(crate) fn plugin_file_mutations(&self) -> Vec<SessionFileViewMutation> {

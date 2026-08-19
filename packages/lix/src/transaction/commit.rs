@@ -165,6 +165,7 @@ pub(crate) async fn commit_prepared_writes(
         &commit_parent_heads,
         read,
         &BTreeMap::new(),
+        false,
         prepared_writes,
     )
     .await?;
@@ -191,6 +192,10 @@ pub(crate) struct MaterializedCommit {
     /// from another commit alters the visible filesystem without appearing in
     /// these rows, and the caller must rebuild for those shapes.
     pub(crate) filesystem_delta_rows: Vec<MaterializedHotStateRow>,
+    /// Canonical protocol commits emitted only for an Authority transaction's
+    /// atomic transfer-size preflight. Other roles leave this empty and avoid
+    /// protocol DTO and JSON parsing work.
+    pub(crate) sync_commits: Vec<crate::sync::commit::SyncCommit>,
 }
 
 /// Materializes a prepared commit with branch heads already resolved from the
@@ -204,6 +209,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
+    capture_sync_commits: bool,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
     Box::pin(validate_active_account_and_account_rows(
@@ -584,6 +590,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             writes,
             preconditions,
             filesystem_delta_rows: Vec::new(),
+            sync_commits: Vec::new(),
         });
     }
 
@@ -610,11 +617,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
 
-    let checkpoint_commit_ids = prepared_writes
-        .checkpoint_publications
-        .iter()
-        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
-        .collect::<BTreeSet<_>>();
     let staged_delta_index = Box::pin(stage_tracked_commit_delta_index(
         read,
         &mut writes,
@@ -629,7 +631,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         &replacement_generations,
         &ordered_replacements,
-        &checkpoint_commit_ids,
+        capture_sync_commits,
     ))
     .await?;
 
@@ -876,6 +878,21 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     } else {
         Vec::new()
     };
+    let sync_commits = if capture_sync_commits {
+        materialize_staged_sync_commits(
+            active_account_id,
+            &state_rows,
+            &row_index.tracked_row_indices_by_commit,
+            &staged_commits,
+            &selected_change_records,
+            &selected_change_payloads,
+            &certified_packet_root_rows,
+            &ordered_replacements,
+            &staged_delta_index,
+        )?
+    } else {
+        Vec::new()
+    };
     if !staged_hot_heads.deferred_fresh_hot_plans.is_empty() {
         if staged_hot_heads.deferred_fresh_hot_plans.len() != 1 {
             return Err(LixError::new(
@@ -900,6 +917,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         writes,
         preconditions,
         filesystem_delta_rows,
+        sync_commits,
     })
 }
 
@@ -1123,6 +1141,7 @@ struct StagedChangelogCommit {
 struct StagedCommitDeltaIndex {
     ordered_addressable_commits: BTreeSet<CommitId>,
     inventories: BTreeMap<CommitId, CommitStateMutationInventory>,
+    sync_ordered_change_ids: BTreeMap<CommitId, Vec<ChangeId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2266,10 +2285,11 @@ async fn stage_tracked_commit_delta_index(
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
-    checkpoint_commit_ids: &BTreeSet<CommitId>,
+    capture_sync_commits: bool,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
+    let mut sync_ordered_change_ids = BTreeMap::new();
     let commit_rows = commit_rows
         .iter()
         .map(|commit| (commit.commit_id, commit))
@@ -2356,6 +2376,10 @@ async fn stage_tracked_commit_delta_index(
                 )?
             };
             inventories.insert(root.commit_id, stage.mutation_inventory().clone());
+            if capture_sync_commits {
+                sync_ordered_change_ids
+                    .insert(root.commit_id, stage.assigned_change_ids().collect());
+            }
             ordered_addressable_commits.insert(root.commit_id);
             continue;
         }
@@ -2488,6 +2512,12 @@ async fn stage_tracked_commit_delta_index(
             };
             if let Some(ordered_stage) = ordered_stage {
                 inventories.insert(root.commit_id, ordered_stage.mutation_inventory().clone());
+                if capture_sync_commits {
+                    sync_ordered_change_ids.insert(
+                        root.commit_id,
+                        ordered_stage.assigned_change_ids().collect(),
+                    );
+                }
                 state_rows.set_ordered_addressable_change_ids(state_row_indices, ordered_stage)?;
                 ordered_addressable_commits.insert(root.commit_id);
                 continue;
@@ -2551,10 +2581,8 @@ async fn stage_tracked_commit_delta_index(
                 "lix.perf.commit_delta_selected_sources"
             );
         }
-        let is_checkpoint_commit = checkpoint_commit_ids.contains(&root.commit_id);
         let selected_source_alias = if certified_root_rows.is_empty()
             && !state_row_indices.is_empty()
-            && is_checkpoint_commit
             && selected_members_by_source.len() == 1
         {
             let source_commit_id = *selected_members_by_source
@@ -2574,49 +2602,54 @@ async fn stage_tracked_commit_delta_index(
                     {
                         return false;
                     }
-                    if source.direct_segment_row_counts.is_empty() {
-                        let selected = selected_changes(&staged.selected_change_batches)
-                            .map(|change_ref| {
-                                (
-                                    encode_key_ref(TrackedStateKeyRef {
-                                        schema_key: change_ref.schema_key(),
-                                        file_id: change_ref.file_id(),
-                                        row_pk: change_ref.row_pk(),
-                                    }),
-                                    (
-                                        change_ref.change_id,
-                                        change_ref.deleted,
-                                        change_ref.created_at,
-                                        change_ref.updated_at,
-                                    ),
-                                )
-                            })
-                            .collect::<HashMap<_, _>>();
-                        return usize::try_from(source.member_count).ok() == Some(selected.len())
-                            && source.selection_fingerprint
-                                == crate::tracked_state::selected_change_selection_fingerprint(
-                                    selected.iter().map(
-                                        |(key, (change_id, deleted, created_at, updated_at))| {
-                                            (
-                                                key.as_slice(),
-                                                *change_id,
-                                                *deleted,
-                                                *created_at,
-                                                *updated_at,
-                                            )
-                                        },
-                                    ),
-                                );
+                    let membership_certified = staged
+                        .selected_change_batches
+                        .iter()
+                        .all(StagedCommitChangeBatch::source_membership_certified);
+                    if !source.direct_segment_row_counts.is_empty() && membership_certified {
+                        return dense_selected_source_is_exact(
+                            source_commit_id,
+                            &source.direct_segment_row_counts,
+                            true,
+                            selected_changes(&staged.selected_change_batches),
+                        );
                     }
-                    dense_selected_source_is_exact(
-                        source_commit_id,
-                        &source.direct_segment_row_counts,
-                        staged
-                            .selected_change_batches
-                            .iter()
-                            .all(StagedCommitChangeBatch::source_membership_certified),
-                        selected_changes(&staged.selected_change_batches),
-                    )
+                    // Ordinary merge analysis already supplies exact selected
+                    // identities but does not carry the checkpoint-only dense
+                    // membership certificate. Prove the same fact against the
+                    // source manifest's count and order-independent fingerprint.
+                    let selected = selected_changes(&staged.selected_change_batches)
+                        .map(|change_ref| {
+                            (
+                                encode_key_ref(TrackedStateKeyRef {
+                                    schema_key: change_ref.schema_key(),
+                                    file_id: change_ref.file_id(),
+                                    row_pk: change_ref.row_pk(),
+                                }),
+                                (
+                                    change_ref.change_id,
+                                    change_ref.deleted,
+                                    change_ref.created_at,
+                                    change_ref.updated_at,
+                                ),
+                            )
+                        })
+                        .collect::<HashMap<_, _>>();
+                    usize::try_from(source.member_count).ok() == Some(selected.len())
+                        && source.selection_fingerprint
+                            == crate::tracked_state::selected_change_selection_fingerprint(
+                                selected.iter().map(
+                                    |(key, (change_id, deleted, created_at, updated_at))| {
+                                        (
+                                            key.as_slice(),
+                                            *change_id,
+                                            *deleted,
+                                            *created_at,
+                                            *updated_at,
+                                        )
+                                    },
+                                ),
+                            )
                 })
                 .then_some(source_commit_id)
         } else {
@@ -2677,7 +2710,191 @@ async fn stage_tracked_commit_delta_index(
     Ok(StagedCommitDeltaIndex {
         ordered_addressable_commits,
         inventories,
+        sync_ordered_change_ids,
     })
+}
+
+#[expect(clippy::too_many_arguments)]
+fn materialize_staged_sync_commits(
+    active_account_id: &str,
+    state_rows: &PreparedStateBatch,
+    tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
+    selected_change_payloads: &HashMap<
+        SelectedChangeKey,
+        crate::changelog::MaterializedChangePayload,
+    >,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
+    ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    staged_delta_index: &StagedCommitDeltaIndex,
+) -> Result<Vec<crate::sync::commit::SyncCommit>, LixError> {
+    use crate::sync::commit::{SyncCommit, SyncCommitMemberRef, encode_sync_commit_member};
+
+    let mut commits = Vec::with_capacity(staged_commits.len());
+    for (commit_id, staged) in staged_commits {
+        let mut members = Vec::with_capacity(staged.change_count);
+
+        for &row_index in tracked_row_indices_by_commit
+            .get(commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let row = state_rows.row(row_index);
+            let delta = tracked_delta_from_state_row(row)?;
+            members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                change_id: delta.change_id,
+                authored: true,
+                schema_key: delta.schema_key,
+                file_id: delta.file_id,
+                row_pk: delta.row_pk,
+                deleted: delta.deleted,
+                snapshot_json: row
+                    .snapshot
+                    .map(crate::transaction_types::StageJson::normalized),
+                metadata_json: row
+                    .metadata
+                    .map(crate::transaction_types::StageJson::normalized),
+                row_created_at: delta.created_at,
+                row_updated_at: delta.updated_at,
+                change_account_id: active_account_id,
+                change_created_at: row.updated_at,
+                origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
+            })?);
+        }
+
+        if let Some(journal) = ordered_replacements.get(commit_id) {
+            let change_ids = staged_delta_index
+                .sync_ordered_change_ids
+                .get(commit_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("sync preflight lacks ordered addresses for commit '{commit_id}'"),
+                    )
+                })?;
+            if change_ids.len() != journal.row_count() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "sync preflight ordered address count disagrees for commit '{commit_id}'"
+                    ),
+                ));
+            }
+            let lifecycle_created_at = staged_delta_index
+                .inventories
+                .get(commit_id)
+                .and_then(|inventory| inventory.lifecycle_summary.as_ref())
+                .map(|summary| summary.uniform_created_at)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "sync preflight ordered commit '{commit_id}' lacks lifecycle authority"
+                        ),
+                    )
+                })?;
+            for (row, &change_id) in journal.iter().zip(change_ids) {
+                let row_pk = RowPk::single(row.identity());
+                members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                    change_id,
+                    authored: true,
+                    schema_key: journal.schema_key(),
+                    file_id: None,
+                    row_pk: &row_pk,
+                    deleted: false,
+                    snapshot_json: Some(row.snapshot()),
+                    metadata_json: None,
+                    row_created_at: lifecycle_created_at,
+                    row_updated_at: journal.timestamp(),
+                    change_account_id: active_account_id,
+                    change_created_at: journal.timestamp(),
+                    origin_key: None,
+                })?);
+            }
+        }
+
+        for row in certified_packet_root_rows
+            .get(commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let change_id = row.change_id.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync preflight certified row lacks a change id",
+                )
+            })?;
+            members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                change_id,
+                authored: true,
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                row_pk: &row.row_pk,
+                deleted: row.deleted,
+                snapshot_json: row.snapshot_content.as_deref(),
+                metadata_json: row.metadata.as_deref(),
+                row_created_at: row.created_at,
+                row_updated_at: row.updated_at,
+                change_account_id: active_account_id,
+                change_created_at: row.updated_at,
+                origin_key: None,
+            })?);
+        }
+
+        for change_ref in selected_changes(&staged.selected_change_batches) {
+            let key = selected_change_key(change_ref);
+            let record = selected_change_records.get(&key);
+            let payload = selected_change_payloads.get(&key);
+            members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                change_id: change_ref.change_id,
+                authored: false,
+                schema_key: change_ref.schema_key(),
+                file_id: change_ref.file_id(),
+                row_pk: change_ref.row_pk(),
+                deleted: change_ref.deleted,
+                snapshot_json: payload.and_then(|payload| payload.snapshot_content.as_deref()),
+                metadata_json: payload.and_then(|payload| payload.metadata.as_deref()),
+                row_created_at: change_ref.created_at,
+                row_updated_at: change_ref.updated_at,
+                change_account_id: record.map_or(active_account_id, |record| &record.account_id),
+                change_created_at: record.map_or(change_ref.updated_at, |record| record.created_at),
+                origin_key: record.and_then(|record| record.origin_key.as_deref()),
+            })?);
+        }
+
+        members.sort_unstable_by(|left, right| {
+            let left_row_pk = RowPk::from_typed_json_array_value(&left.row_pk)
+                .expect("staged sync member primary key was just encoded");
+            let right_row_pk = RowPk::from_typed_json_array_value(&right.row_pk)
+                .expect("staged sync member primary key was just encoded");
+            (&left.schema_key, &left.file_id, left_row_pk).cmp(&(
+                &right.schema_key,
+                &right.file_id,
+                right_row_pk,
+            ))
+        });
+        let has_selected_members = members.iter().any(|member| !member.authored);
+        let selected_source_commit_id = (has_selected_members
+            && staged.record.parent_commit_ids.len() > 1)
+            .then(|| staged.record.parent_commit_ids[1]);
+        let commit = SyncCommit {
+            commit_id: staged.record.commit_id.to_string(),
+            parent_commit_ids: staged
+                .record
+                .parent_commit_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            account_id: staged.record.account_id.clone(),
+            created_at: staged.record.created_at.to_string(),
+            selected_source_commit_id: selected_source_commit_id.map(|id| id.to_string()),
+            members,
+        };
+        commit.validate()?;
+        commits.push(commit);
+    }
+    Ok(commits)
 }
 
 fn try_stage_lossless_columnar_mutations(
@@ -7624,7 +7841,7 @@ mod tests {
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            false,
         )
         .await
         .expect("mixed certified delta should stage");
