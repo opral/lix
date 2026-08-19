@@ -2,13 +2,13 @@
 
 use std::convert::Infallible;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use http::header::CONTENT_TYPE;
-use http::{Method, Request, Response};
+use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -29,6 +29,7 @@ const OFFLINE_COMMIT_COUNT: usize = 513;
 #[derive(Debug, Default)]
 struct HttpProbe {
     pushes: AtomicU64,
+    push_conflicts: AtomicU64,
     delta_pulls: AtomicU64,
     snapshot_row_pulls: AtomicU64,
     history_gets: AtomicU64,
@@ -37,6 +38,8 @@ struct HttpProbe {
     drop_next_push_ack: AtomicBool,
     reject_requests: AtomicBool,
     one_way_delay_millis: AtomicU64,
+    gated_pushes: AtomicU64,
+    push_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -97,6 +100,21 @@ async fn first_local_write_pushes_before_deferred_history_is_read() {
 }
 
 impl HttpProbe {
+    fn gate_next_two_pushes(&self) {
+        *self.push_gate.lock().expect("push gate lock") =
+            Some(Arc::new(tokio::sync::Barrier::new(2)));
+        self.gated_pushes.store(2, Ordering::Release);
+    }
+
+    fn push_gate_slot(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.gated_pushes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .ok()?;
+        self.push_gate.lock().expect("push gate lock").clone()
+    }
+
     fn drop_next_push_ack(&self) {
         self.drop_next_push_ack.store(true, Ordering::Release);
     }
@@ -216,6 +234,116 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
         "a warm reopen must retain the authority repository identity",
     );
     reopened.close().await.expect("close reopened replica");
+    stop_server(server_task).await;
+    authority.close().await.expect("close authority");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_pages() {
+    let authority = Arc::new(open_lix().await.expect("open authority"));
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/gone.md', CAST('version one' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create historical file");
+    let file_id = authority
+        .execute("SELECT id FROM lix_file WHERE path = '/gone.md'", &[])
+        .await
+        .expect("read historical file id")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("file id decodes");
+    authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint first file version");
+    authority
+        .execute(
+            "UPDATE lix_file SET content = CAST('version two' AS BYTEA) WHERE id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("update historical file");
+    authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint second file version");
+    authority
+        .execute(
+            "DELETE FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("delete historical file");
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/kept.md', CAST('kept' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create surviving file");
+    authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint deletion and surviving file");
+    for index in 0..105 {
+        put_value(&authority, &format!("history-page-{index:03}"), "value").await;
+    }
+    let head = active_head(&authority).await;
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    let history_before_timeline = probe.history_gets.load(Ordering::Acquire);
+    let checkpoints = replica
+        .execute("SELECT commit_id FROM lix_checkpoint", &[])
+        .await
+        .expect("hot checkpoint timeline renders without cold history");
+    assert!(checkpoints.len() >= 3);
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        history_before_timeline,
+        "listing checkpoints must not fetch file history",
+    );
+
+    let history = replica
+        .execute(
+            "SELECT content FROM lix_file_history($1) WHERE id = $2 ORDER BY lixcol_depth",
+            &[Value::Text(head.clone()), Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("cold file history hydrates through bounded pages");
+    let versions = history
+        .rows()
+        .iter()
+        .filter_map(|row| row.get::<Vec<u8>>("content").ok())
+        .collect::<Vec<_>>();
+    assert!(versions.iter().any(|bytes| bytes == b"version one"));
+    assert!(versions.iter().any(|bytes| bytes == b"version two"));
+    let page_requests = probe.history_gets.load(Ordering::Acquire) - history_before_timeline;
+    assert!(
+        (2..=5).contains(&page_requests),
+        "more than 100 cold commits plus checkpoint topology should hydrate in a few bounded pages, got {page_requests}",
+    );
+
+    replica
+        .execute(
+            "SELECT content FROM lix_file_history($1) WHERE id = $2 ORDER BY lixcol_depth",
+            &[Value::Text(head), Value::Text(file_id)],
+        )
+        .await
+        .expect("repeat history read is local");
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire) - history_before_timeline,
+        page_requests,
+        "a repeated history query must issue zero network requests",
+    );
+
+    replica.close().await.expect("close replica");
     stop_server(server_task).await;
     authority.close().await.expect("close authority");
 }
@@ -441,6 +569,79 @@ async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
     wait_for_value(&authority, "concurrent-bob", "bob").await;
     wait_for_value(&alice, "concurrent-bob", "bob").await;
     wait_for_value(&bob, "concurrent-alice", "alice").await;
+
+    alice.close().await.expect("close alice");
+    bob.close().await.expect("close bob");
+    stop_server(server_task).await;
+    authority.close().await.expect("close authority");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
+    let authority = Arc::new(open_lix().await.expect("open authority"));
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/existing.md', CAST('base' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("seed existing file");
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let alice_dir = TempDir::new().expect("alice tempdir");
+    let bob_dir = TempDir::new().expect("bob tempdir");
+    let alice = open_replica(alice_dir.path(), &url).await;
+    let bob = open_replica(bob_dir.path(), &url).await;
+
+    let pulls_before_hydration = probe.delta_pulls.load(Ordering::Acquire);
+    let (alice_content, bob_content) = tokio::join!(
+        read_file_content(&alice, "/existing.md"),
+        read_file_content(&bob, "/existing.md"),
+    );
+    assert_eq!(alice_content, Some(b"base".to_vec()));
+    assert_eq!(bob_content, Some(b"base".to_vec()));
+    wait_for_counter(&probe.delta_pulls, pulls_before_hydration + 2).await;
+
+    // Hold both publish requests until they have been built from the same
+    // authority head. Exactly one CAS must then lose with HTTP 409.
+    probe.gate_next_two_pushes();
+    let (created, edited) = tokio::join!(
+        alice.execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/created.md', CAST('created' AS BYTEA))",
+            &[],
+        ),
+        bob.execute(
+            "UPDATE lix_file SET content = CAST('edited' AS BYTEA) WHERE path = '/existing.md'",
+            &[],
+        ),
+    );
+    created.expect("Alice creates a file locally");
+    edited.expect("Bob edits the existing file locally");
+
+    wait_for_file_content(&authority, "/created.md", b"created").await;
+    wait_for_file_content(&authority, "/existing.md", b"edited").await;
+    wait_for_file_content(&alice, "/created.md", b"created").await;
+    wait_for_file_content(&alice, "/existing.md", b"edited").await;
+    wait_for_file_content(&bob, "/created.md", b"created").await;
+    wait_for_file_content(&bob, "/existing.md", b"edited").await;
+    assert_eq!(
+        probe.push_conflicts.load(Ordering::Acquire),
+        1,
+        "two publishes from one head must exercise exactly one stale ref CAS",
+    );
+
+    // Sync publishes pending work before it waits for a remote event. If both
+    // clients consume this authority-only event without another push, their
+    // durable outboxes were empty after reconciliation.
+    let pushes_after_convergence = probe.pushes.load(Ordering::Acquire);
+    put_value(&authority, "outbox-sentinel", "authority-only").await;
+    wait_for_value(&alice, "outbox-sentinel", "authority-only").await;
+    wait_for_value(&bob, "outbox-sentinel", "authority-only").await;
+    assert_eq!(
+        probe.pushes.load(Ordering::Acquire),
+        pushes_after_convergence,
+        "converged replicas must not retain pending outbox work",
+    );
 
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
@@ -732,6 +933,42 @@ where
     })
 }
 
+async fn read_file_content<S>(lix: &Lix<S>, path: &str) -> Option<Vec<u8>>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "SELECT content FROM lix_file WHERE path = $1",
+        &[Value::Text(path.to_owned())],
+    )
+    .await
+    .expect("read file content")
+    .rows()
+    .first()
+    .and_then(|row| row.get::<Vec<u8>>("content").ok())
+}
+
+async fn wait_for_file_content<S>(lix: &Lix<S>, path: &str, expected: &[u8])
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            if read_file_content(lix, path).await.as_deref() == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for synchronized file content at {path}: {:?}",
+            String::from_utf8_lossy(expected),
+        )
+    });
+}
+
 async fn wait_for_value<S>(lix: &Lix<S>, key: &str, expected: &str)
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -894,6 +1131,9 @@ where
         .await
         .expect("collect HTTP request body")
         .to_bytes();
+    if is_push && let Some(gate) = probe.push_gate_slot() {
+        gate.wait().await;
+    }
     let response = protocol
         .handle(
             Request::from_parts(parts, ServerProtocolBody::full(body)),
@@ -903,6 +1143,9 @@ where
             },
         )
         .await;
+    if is_push && response.status() == StatusCode::CONFLICT {
+        probe.push_conflicts.fetch_add(1, Ordering::Release);
+    }
     let (parts, body) = response.into_parts();
     let body = body
         .collect()

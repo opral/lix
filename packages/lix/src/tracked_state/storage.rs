@@ -13619,6 +13619,16 @@ fn validate_commit_state_manifest_header(
             "tracked_state commit_state_manifest has an invalid snapshot root",
         ));
     }
+    if stored
+        .snapshot_root
+        .as_ref()
+        .is_some_and(|root| root.complete_state_fence && !root.parent_roots.is_empty())
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state complete-state fence retains physical parent roots",
+        ));
+    }
     super::scoped_current_state::validate_touched_scope_filter(&stored.touched_scope_filter)?;
     if stored
         .current_state_scoped_ranges
@@ -13701,6 +13711,12 @@ fn validate_commit_state_manifest_inner(
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state rootless commit_state_manifest cannot publish a snapshot root",
+            ));
+        }
+        if root.complete_state_fence && !root.parent_roots.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state complete-state fence retains physical parent roots",
             ));
         }
     }
@@ -18921,6 +18937,7 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
+            complete_state_fence: false,
         };
         let mut writes = storage.new_write_set();
         manifest.snapshot_root = Some(Box::new(authoritative.clone()));
@@ -18986,6 +19003,7 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
+            complete_state_fence: false,
         };
         original.snapshot_root = Some(Box::new(rebuilt));
         let error = encode_commit_state_manifest(&original)

@@ -485,6 +485,10 @@ where
         self.engine.sync_mode()
     }
 
+    pub(crate) fn notify_observers_for_sync(&self) {
+        self.engine.notify_observers();
+    }
+
     pub(crate) async fn repository_default_branch_id_for_sync(
         &self,
         read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
@@ -718,13 +722,24 @@ where
         metadata: ExecuteStatementMetadata,
         idempotency: Option<ExecuteIdempotency>,
     ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + 'static {
-        Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
-            sql,
-            params,
-            options,
-            metadata,
-            idempotency,
-        )
+        // SAFETY: the retry future owns the Lix handle and every request
+        // value. Reusing the same idempotency identity on each attempt is the
+        // required contract: a pre-commit history demand has no receipt, while
+        // an already committed attempt replays its durable receipt.
+        unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                self.retry_sync_demands(|| {
+                    Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
+                        sql.clone(),
+                        params.clone(),
+                        options.clone(),
+                        metadata.clone(),
+                        idempotency.clone(),
+                    )
+                })
+                .await
+            })
+        }
     }
 
     /// Executes statements sequentially against one atomic snapshot.
@@ -802,12 +817,31 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
     ) -> impl Future<Output = Result<Vec<ExecuteResult>, LixError>> + Send + 'static {
-        Arc::clone(&self.session).execute_batch_with_idempotency_and_options_and_metadata(
-            statements,
-            options,
-            statement_metadata,
-            idempotency,
-        )
+        // Preserve the exact request identity across lazy-history retries so a
+        // commit-outcome-unknown response can still be retried safely with the
+        // caller's original key.
+        unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                self.retry_sync_demands(|| {
+                    Arc::clone(&self.session)
+                        .execute_batch_with_idempotency_and_options_and_metadata(
+                            statements.clone(),
+                            options.clone(),
+                            statement_metadata.clone(),
+                            idempotency.clone(),
+                        )
+                })
+                .await
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sync_demand_sender_for_test(
+        &mut self,
+        sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
+    ) {
+        self.sync_demand_tx = Some(sender);
     }
 
     pub fn observe(
@@ -1435,7 +1469,7 @@ mod tests {
         let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(4);
         lix.sync_demand_tx = Some(demand_tx);
         let responder = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 demand_rx
                     .recv()
                     .await
@@ -1458,13 +1492,18 @@ mod tests {
                         "second history body is deferred",
                     )
                     .with_details(serde_json::json!({ "commitIds": ["second"] }))),
+                    2 => Err(LixError::commit_not_found(
+                        uuid::Uuid::now_v7().to_string(),
+                        "walk_commit_graph",
+                        "graph_node",
+                    )),
                     _ => Ok("hydrated"),
                 })
             })
             .await
             .expect("distinct demands should retry to success");
         assert_eq!(result, "hydrated");
-        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
         responder.await.expect("demand responder should finish");
     }
 

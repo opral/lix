@@ -23,8 +23,8 @@ use crate::common::LixTimestamp;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::hot_state::{
-    HotStateContext, HotStateRowRequest, HotTrackedSnapshot, MaterializedHotStateRow,
-    TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    CompleteWorkingDiffMode, HotStateContext, HotStateRowRequest, HotTrackedSnapshot,
+    MaterializedHotStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_tracked_working_diff_epoch,
 };
 use crate::json_store::{
@@ -3871,6 +3871,61 @@ fn global_branch_schema_keys(
     Some(schema_keys)
 }
 
+async fn load_working_diff_epoch_for_publication(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    checkpoint_commit_id: Option<CommitId>,
+    parent_commit_id: Option<CommitId>,
+    parent_control: Option<BranchHeadControl>,
+    parent_generation: Option<CommitId>,
+) -> Result<Option<TrackedWorkingDiffEpoch>, LixError> {
+    if checkpoint_commit_id.is_some() {
+        return Ok(None);
+    }
+    let (Some(parent_commit_id), Some(control), Some(parent_generation)) =
+        (parent_commit_id, parent_control, parent_generation)
+    else {
+        return Ok(None);
+    };
+    if control.head_commit_id != parent_commit_id {
+        return Ok(None);
+    }
+
+    let epoch = TrackedHeadContext::new()
+        .reader(read)
+        .working_diff_epoch(branch_id)
+        .await?;
+    match (control.working_diff_checkpoint_commit_id, epoch) {
+        (None, None) => Ok(None),
+        (Some(checkpoint_commit_id), Some(epoch))
+            if epoch.checkpoint_commit_id == checkpoint_commit_id
+                && epoch.generation == parent_generation =>
+        {
+            Ok(Some(epoch))
+        }
+        (Some(checkpoint_commit_id), None) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' has no working-diff epoch"
+            ),
+        )),
+        (None, Some(epoch)) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' has working-diff epoch '{}' without a checkpoint cursor",
+                epoch.checkpoint_commit_id
+            ),
+        )),
+        (Some(checkpoint_commit_id), Some(epoch)) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' in generation '{parent_generation}' does not match working-diff epoch '{}' in generation '{}'",
+                epoch.checkpoint_commit_id, epoch.generation
+            ),
+        )),
+    }
+}
+
 async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -4234,7 +4289,23 @@ async fn stage_tracked_head(
             }
             _ => None,
         };
-
+        // Every publication route advances the same private working-diff
+        // epoch. Resolve it before selecting a physical current-state route
+        // so complete lifecycle snapshots cannot bypass cursor carry-forward.
+        let working_diff_epoch = load_working_diff_epoch_for_publication(
+            read,
+            &root.branch_id,
+            checkpoint_commit_id,
+            root.parent_commit_id,
+            parent_control,
+            parent_generation,
+        )
+        .await?;
+        let working_diff_capture_checkpoint_commit_id = working_diff_epoch
+            .as_ref()
+            .map(|epoch| epoch.checkpoint_commit_id);
+        let working_diff_checkpoint_commit_id =
+            checkpoint_commit_id.or(working_diff_capture_checkpoint_commit_id);
         if !staged.selected_change_batches.is_empty() {
             reject_selected_tracked_refs_with_untracked_rows(
                 read,
@@ -4252,6 +4323,24 @@ async fn stage_tracked_head(
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
             let owned_absence_guards = owned_absence_guards(&absence_guards);
+            let working_diff_mode = match (checkpoint_commit_id, working_diff_epoch.as_ref()) {
+                (Some(_), _) => CompleteWorkingDiffMode::ResetClean,
+                (None, Some(epoch)) => {
+                    let checkpoint = load_persisted_lifecycle_tracked_snapshot(
+                        read,
+                        &root.branch_id,
+                        epoch.checkpoint_commit_id,
+                    )
+                    .await?;
+                    CompleteWorkingDiffMode::Rebase {
+                        checkpoint_commit_id: epoch.checkpoint_commit_id,
+                        checkpoint: HotTrackedSnapshot::from_materialized_rows(
+                            checkpoint.into_values().collect(),
+                        )?,
+                    }
+                }
+                (None, None) => CompleteWorkingDiffMode::Disabled,
+            };
             // One generation carries both retentions, so the branch's
             // history-free rows are preserved from — and republished into —
             // that same complete snapshot. There is no second root to advance.
@@ -4265,12 +4354,27 @@ async fn stage_tracked_head(
                     &[],
                     &untracked_deltas,
                     &owned_absence_guards,
-                    checkpoint_commit_id,
+                    working_diff_mode,
                     &mut coverage,
                 )
                 .await?;
-            let mut control =
-                normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
+            if let Some(epoch) = &working_diff_epoch {
+                stage_tracked_working_diff_epoch(
+                    writes,
+                    &root.branch_id,
+                    TrackedWorkingDiffEpoch {
+                        checkpoint_commit_id: epoch.checkpoint_commit_id,
+                        generation,
+                        coverage,
+                    },
+                )?;
+            }
+            let mut control = normal_branch_head_control(
+                root,
+                parent_control,
+                generation,
+                working_diff_checkpoint_commit_id,
+            )?;
             control.reset_schema_presence();
             control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
@@ -4287,36 +4391,6 @@ async fn stage_tracked_head(
                 ),
             )
         })?;
-        let working_diff_epoch = if checkpoint_commit_id.is_some() {
-            None
-        } else {
-            match (root.parent_commit_id, parent_control) {
-                (Some(parent_commit_id), Some(control))
-                    if control.head_commit_id == parent_commit_id =>
-                {
-                    match tracked_head
-                        .reader(read)
-                        .working_diff_epoch(&root.branch_id)
-                        .await
-                    {
-                        Ok(Some(epoch))
-                            if epoch.generation == parent_generation
-                                && control.working_diff_checkpoint_commit_id
-                                    == Some(epoch.checkpoint_commit_id) =>
-                        {
-                            Some(epoch)
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        };
-        let working_diff_capture_checkpoint_commit_id = working_diff_epoch
-            .as_ref()
-            .map(|epoch| epoch.checkpoint_commit_id);
-        let working_diff_checkpoint_commit_id =
-            checkpoint_commit_id.or(working_diff_capture_checkpoint_commit_id);
         let mut coverage = working_diff_epoch
             .as_ref()
             .map(|epoch| epoch.coverage)
@@ -5437,11 +5511,62 @@ async fn stage_root_backed_branch_publication(
         Some(generation) => generation,
         None => {
             let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
-            tracked_head.writer(read, writes).stage_root_current_base(
-                branch_id,
-                generation,
-                head_commit_id,
-            );
+            if let Some(checkpoint_commit_id) =
+                previous_control.and_then(|control| control.working_diff_checkpoint_commit_id)
+            {
+                // Moving an existing branch to another immutable root changes
+                // its serving generation but not its private checkpoint. Build
+                // the new generation and its sparse dirty index together so a
+                // later ordinary write cannot observe a cursor bound to the
+                // retired generation.
+                let current =
+                    load_persisted_lifecycle_tracked_snapshot(read, branch_id, head_commit_id)
+                        .await?;
+                let checkpoint = load_persisted_lifecycle_tracked_snapshot(
+                    read,
+                    branch_id,
+                    checkpoint_commit_id,
+                )
+                .await?;
+                let mut coverage = WorkingDiffIndexCoverage::default();
+                let empty_guards = BTreeSet::new();
+                tracked_head
+                    .writer(read, writes)
+                    .stage_complete_current_state_with_working_diff(
+                        branch_id,
+                        generation,
+                        HotTrackedSnapshot::from_materialized_rows(
+                            current.into_values().collect(),
+                        )?,
+                        None,
+                        &[],
+                        &[],
+                        &empty_guards,
+                        CompleteWorkingDiffMode::Rebase {
+                            checkpoint_commit_id,
+                            checkpoint: HotTrackedSnapshot::from_materialized_rows(
+                                checkpoint.into_values().collect(),
+                            )?,
+                        },
+                        &mut coverage,
+                    )
+                    .await?;
+                stage_tracked_working_diff_epoch(
+                    writes,
+                    branch_id,
+                    TrackedWorkingDiffEpoch {
+                        checkpoint_commit_id,
+                        generation,
+                        coverage,
+                    },
+                )?;
+            } else {
+                tracked_head.writer(read, writes).stage_root_current_base(
+                    branch_id,
+                    generation,
+                    head_commit_id,
+                );
+            }
             generation
         }
     };
@@ -7711,6 +7836,113 @@ mod tests {
         }
     }
 
+    struct FailingWorkingDiffEpochRead {
+        inner: MemoryRead,
+    }
+
+    impl StorageRead for FailingWorkingDiffEpochRead {
+        async fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> Result<GetManyResult, StorageError> {
+            if requests
+                .iter()
+                .any(|request| request.space == crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE)
+            {
+                return Err(StorageError::Io(
+                    "injected working-diff epoch read failure".to_owned(),
+                ));
+            }
+            self.inner.get_many(requests).await
+        }
+
+        async fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: KeyRange,
+            opts: BeginScanOptions,
+        ) -> Result<ScanCursor<'_>, StorageError> {
+            self.inner.begin_scan(space, range, opts).await
+        }
+    }
+
+    fn working_diff_epoch_test_control(
+        head_commit_id: CommitId,
+        generation: CommitId,
+        checkpoint_commit_id: Option<CommitId>,
+    ) -> BranchHeadControl {
+        BranchHeadControl {
+            head_commit_id,
+            tracked_generation: generation,
+            current_state_revision: 1,
+            working_diff_checkpoint_commit_id: checkpoint_commit_id,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            ref_change_id: change_id("working-diff-epoch-test-ref"),
+            schema_presence_bloom: [0; 4],
+        }
+    }
+
+    #[tokio::test]
+    async fn working_diff_epoch_storage_error_fails_publication_closed() {
+        let memory = Memory::new();
+        let read = StorageAdapterReadScope::new(FailingWorkingDiffEpochRead {
+            inner: memory
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("failing epoch read should open"),
+        });
+        let head = commit_id("epoch-read-error-head");
+        let checkpoint = commit_id("epoch-read-error-checkpoint");
+        let error = load_working_diff_epoch_for_publication(
+            &read,
+            "epoch-read-error-branch",
+            None,
+            Some(head),
+            Some(working_diff_epoch_test_control(
+                head,
+                head,
+                Some(checkpoint),
+            )),
+            Some(head),
+        )
+        .await
+        .expect_err("storage errors must not be downgraded to an absent epoch");
+        assert!(
+            error
+                .message
+                .contains("injected working-diff epoch read failure"),
+            "unexpected propagated storage error: {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_working_diff_epoch_fails_publication_closed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("missing epoch read should open");
+        let head = commit_id("missing-epoch-head");
+        let checkpoint = commit_id("missing-epoch-checkpoint");
+        let error = load_working_diff_epoch_for_publication(
+            &read,
+            "missing-epoch-branch",
+            None,
+            Some(head),
+            Some(working_diff_epoch_test_control(
+                head,
+                head,
+                Some(checkpoint),
+            )),
+            Some(head),
+        )
+        .await
+        .expect_err("a checkpoint cursor without its epoch must fail closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("has no working-diff epoch"));
+    }
+
     #[test]
     fn selected_change_refs_reject_overlap_with_normal_rows() {
         let row = tracked_global_row("normal-change");
@@ -9594,7 +9826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_working_diff_epoch_is_not_promoted_into_the_next_head() {
+    async fn mismatched_working_diff_epoch_fails_publication_closed() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -9637,6 +9869,30 @@ mod tests {
             .await
             .expect("first commit should persist");
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open checkpoint cursor seed read");
+        let mut control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load("01920000-0000-7000-8000-0000000000a1")
+            .await
+            .expect("load checkpoint cursor seed control")
+            .expect("checkpoint cursor seed control must exist");
+        control.working_diff_checkpoint_commit_id = Some(first_commit);
+        let mut cursor_writes = StorageWriteSet::new();
+        stage_branch_head_control(
+            &mut cursor_writes,
+            "01920000-0000-7000-8000-0000000000a1",
+            control,
+        )
+        .expect("stage checkpoint cursor seed");
+        drop(read);
+        storage
+            .commit_write_set(cursor_writes, StorageWriteOptions::default())
+            .await
+            .expect("persist checkpoint cursor seed");
+
         // This deliberately names the right serving generation but a
         // checkpoint that the marker never bound. It models a stale or
         // corrupted auxiliary epoch; the next serial commit must not turn it
@@ -9667,7 +9923,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open second commit read");
-        let (writes, _) = commit_prepared_writes(
+        let error = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             None,
@@ -9691,11 +9947,12 @@ mod tests {
             },
         )
         .await
-        .expect("second commit should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("second commit should persist");
+        .expect_err("a mismatched working-diff marker must fail publication closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(
+            error.message.contains("does not match working-diff epoch"),
+            "unexpected mismatched epoch error: {error:?}",
+        );
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -9707,19 +9964,9 @@ mod tests {
             .await
             .expect("load branch control")
             .expect("branch control must exist");
-        assert_eq!(control.head_commit_id, second_commit);
-        assert!(
-            TrackedHeadContext::new()
-                .reader(read)
-                .working_diff_for_control(
-                    "01920000-0000-7000-8000-0000000000a1",
-                    control,
-                    &crate::tracked_state::TrackedStateDiffRequest::default(),
-                )
-                .await
-                .expect("stale epoch must select fallback, not error")
-                .is_none(),
-            "a stale epoch must not be rebound by a later serial commit"
+        assert_eq!(
+            control.head_commit_id, first_commit,
+            "a rejected publication must leave the prior head intact",
         );
     }
 

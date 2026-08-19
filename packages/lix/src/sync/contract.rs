@@ -45,10 +45,12 @@ pub trait SyncTransport: SyncTransportBounds {
         limit: usize,
     ) -> SyncTransportFuture<'a, SyncSnapshotRowPage>;
 
-    /// Loads exact immutable commits without changing live sync state.
+    /// Loads one bounded first-parent history page without changing live sync
+    /// state. A later missing ancestor becomes the head of the next demand.
     fn history<'a>(
         &'a self,
-        commit_ids: &'a [String],
+        head: &'a str,
+        limit: usize,
     ) -> SyncTransportFuture<'a, SyncHistoryResponse>;
 
     /// Loads one canonical flat blob manifest, if it is registered.

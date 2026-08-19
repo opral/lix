@@ -234,6 +234,16 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		input: RequestInfo | URL,
 		init?: RequestInit,
 	): Promise<Response> {
+		const responseLimit = (
+			init as (RequestInit & { lixResponseLimit?: unknown }) | undefined
+		)?.lixResponseLimit;
+		if (
+			typeof responseLimit !== "number" ||
+			!Number.isSafeInteger(responseLimit) ||
+			responseLimit <= 0
+		) {
+			throw new TypeError("Browser sync fetch has no valid response limit");
+		}
 		const requestId = nextSyncRequestId++;
 		const request: WorkerSyncFetchRequest = {
 			url:
@@ -246,6 +256,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			headers: headerEntries(init?.headers),
 			body: serializableBody(init?.body),
 			credentials: init?.credentials,
+			responseLimit,
 		};
 		const response = new Promise<WorkerSyncFetchResponse>((resolve, reject) => {
 			pendingSyncFetch.set(requestId, { resolve, reject });

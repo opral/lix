@@ -29,14 +29,14 @@ pub(crate) use hot::{
 };
 pub(crate) use hot::{
     CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE, CERTIFIED_ROW_BATCH_SPACE,
-    COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef, DIFF_SPACE, DeferredFreshHotPlan,
-    DeferredFreshHotRowRef, DeferredFreshHotRows, FILE_SPACE, HotIndexEntry, HotIndexValue,
-    HotStateTransactionCache, HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE,
-    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RootBaseBatchCache,
-    RowColumnarOverlayRow, load_certified_rows_at_commit, materialize_certified_root_rows,
-    scan_certified_history_rows, stage_certified_row_batches, stage_hot_index_entries,
-    stage_retire_hot_generation,
+    COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef, CompleteWorkingDiffMode, DIFF_SPACE,
+    DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows, FILE_SPACE, HotIndexEntry,
+    HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, INDEX_SPACE,
+    PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
+    ROW_SPACE, RootBaseBatchCache, RowColumnarOverlayRow, load_certified_rows_at_commit,
+    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_row_batches,
+    stage_hot_index_entries, stage_retire_hot_generation,
 };
 
 /// Stable physical address of a row in an immutable columnar base.

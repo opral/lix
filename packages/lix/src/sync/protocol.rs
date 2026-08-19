@@ -88,13 +88,6 @@ pub struct SyncCommitHeader {
     pub first_parent_jump_commit_id: Option<String>,
     /// Number of first-parent edges covered by the jump target.
     pub first_parent_jump_span: Option<u64>,
-    /// Canonical state-root digest when the authority can certify it.
-    ///
-    /// A snapshot must include this certificate for every direct first parent
-    /// of an advertised branch head so the head remains topology-valid while
-    /// historical commit bodies stay lazy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_root_id: Option<String>,
 }
 
 /// Current row state transferred during bootstrap.
@@ -173,7 +166,21 @@ pub enum SyncRepositoryPullResponse {
     },
 }
 
-/// Explicit immutable history fetch. It never changes refs or the live cursor.
+/// One complete-state fence in a bounded history page.
+///
+/// The digest covers the live (tombstone-filtered) row stream at `commit_id`.
+/// It deliberately does not reuse the commit's physical state-root digest:
+/// physical roots include tombstones and storage ancestry, while a detached
+/// history fence is a self-contained live snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncHistoryBoundary {
+    pub commit_id: String,
+    pub live_state_root_id: String,
+}
+
+/// One bounded, first-parent history page. It never changes refs or the live
+/// cursor. Commits are ordered oldest-to-newest so import is one forward pass.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncHistoryResponse {
@@ -181,7 +188,8 @@ pub struct SyncHistoryResponse {
     /// Lightweight topology certificates needed to install the requested
     /// commits without loading historical member payloads.
     pub commit_headers: Vec<SyncCommitHeader>,
-    pub missing_commit_ids: Vec<String>,
+    /// Commits in this page with at least one parent outside the page.
+    pub boundaries: Vec<SyncHistoryBoundary>,
 }
 
 /// One BLAKE3-addressed FastCDC chunk in a canonical flat blob manifest.

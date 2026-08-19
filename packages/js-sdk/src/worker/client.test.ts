@@ -77,6 +77,7 @@ test("browser sync custom fetch crosses the worker boundary", async () => {
 			method: "GET",
 			headers: [["authorization", "Bearer fresh"]],
 			credentials: "include",
+			responseLimit: 1024,
 		},
 	});
 	await new Promise((resolve) => setTimeout(resolve, 0));
@@ -107,6 +108,64 @@ test("browser sync custom fetch crosses the worker boundary", async () => {
 	);
 });
 
+test("browser sync cancels a streamed response at the Rust byte limit", async () => {
+	const transport = fakeConnection();
+	let streamCancelled = false;
+	let fetchAborted = false;
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease(undefined, undefined, {
+		url: "https://example.test/repository",
+		fetch: async (_input, init) => {
+			init?.signal?.addEventListener("abort", () => {
+				fetchAborted = true;
+			});
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array([1, 2, 3]));
+						controller.enqueue(new Uint8Array([4, 5, 6]));
+					},
+					cancel() {
+						streamCancelled = true;
+					},
+				}),
+			);
+		},
+	});
+
+	transport.emit({
+		kind: "sync.fetch",
+		requestId: 9,
+		request: {
+			url: "https://example.test/repository/lix/v1/sync/pull",
+			method: "GET",
+			headers: [],
+			responseLimit: 4,
+		},
+	});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	expect(streamCancelled).toBe(true);
+	expect(fetchAborted).toBe(true);
+	const result = transport.sent.find(
+		(message) =>
+			"kind" in message &&
+			message.kind === "sync.fetch.result" &&
+			message.requestId === 9,
+	);
+	expect(result).toMatchObject({
+		kind: "sync.fetch.result",
+		requestId: 9,
+		result: {
+			ok: false,
+			error: {
+				code: "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE",
+				message: "sync fetch response exceeds 4 bytes",
+			},
+		},
+	});
+});
+
 test("browser sync cancellation aborts the bridged fetch", async () => {
 	const transport = fakeConnection();
 	let aborted = false;
@@ -133,6 +192,7 @@ test("browser sync cancellation aborts the bridged fetch", async () => {
 			url: "https://example.test/repository/lix/v1/sync/pull",
 			method: "GET",
 			headers: [],
+			responseLimit: 1024,
 		},
 	});
 	await Promise.resolve();

@@ -128,7 +128,7 @@ mod tests {
         let http = include_str!("http.rs");
         assert!(http.contains("/sync/push"));
         assert!(http.contains("HandshakeResponse"));
-        assert!(http.contains("MAX_SYNC_HISTORY_COMMIT_IDS"));
+        assert!(http.contains("MAX_SYNC_HISTORY_PAGE_SIZE"));
         assert!(http.contains("response_error"));
         assert!(include_str!("platform/native.rs").contains("tokio::runtime"));
         assert!(include_str!("platform/native_http.rs").contains("reqwest::"));

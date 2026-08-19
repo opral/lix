@@ -20,6 +20,7 @@ const SYNC_RESPONSE_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE";
 const SYNC_REQUEST_TOO_LARGE_CODE: &str = "LIX_ERROR_REQUEST_BODY_TOO_LARGE";
 const SYNC_ITEM_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_ITEM_TOO_LARGE";
 const SYNC_SNAPSHOT_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE";
+const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
 
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
@@ -150,7 +151,7 @@ where
         .filter_map(|branch| branch.head_commit_id.clone())
         .collect::<BTreeSet<_>>();
     let (history, rows) = futures_util::try_join!(
-        fetch_history_objects(transport, head_ids),
+        fetch_history_objects(transport, head_ids, 1),
         fetch_snapshot_rows(transport, branches),
     )?;
     Ok(PreparedRepositorySnapshot {
@@ -180,43 +181,75 @@ pub(crate) async fn demand_sync_for_error(
     demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
     error: &LixError,
 ) -> Result<bool, LixError> {
+    let Some(request) = sync_demand_request_for_error(error)? else {
+        return Ok(false);
+    };
+    send_sync_demand(demand_tx, request).await?;
+    Ok(true)
+}
+
+fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRequest>, LixError> {
     let (field, context) = match error.code.as_str() {
         "LIX_SYNC_HISTORY_REQUIRED" => ("commitIds", "history"),
         "LIX_SYNC_CHUNKS_REQUIRED" => ("chunkIds", "chunk"),
-        _ => return Ok(false),
+        // A sparse replica deliberately has no record for the parent just
+        // beyond its bounded header frontier. Commit-graph readers report the
+        // same structured absence as every other missing commit; sync mode is
+        // the only layer that needs to reinterpret it as a history fetch.
+        LixError::CODE_COMMIT_NOT_FOUND if is_sparse_commit_graph_miss(error) => {
+            ("commit_id", "history")
+        }
+        _ => return Ok(None),
     };
-    let ids = error
+    let value = error
         .details
         .as_ref()
         .and_then(|details| details.get(field))
-        .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
+                SYNC_DEMAND_STALLED_CODE,
                 format!("sync {context} demand error omitted {field}"),
             )
-        })?
-        .iter()
-        .map(|id| {
-            id.as_str().map(str::to_owned).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("sync {context} demand {field} must be strings"),
-                )
+        })?;
+    let ids = match value {
+        serde_json::Value::Array(ids) => ids
+            .iter()
+            .map(|id| {
+                id.as_str().map(str::to_owned).ok_or_else(|| {
+                    LixError::new(
+                        SYNC_DEMAND_STALLED_CODE,
+                        format!("sync {context} demand {field} must be strings"),
+                    )
+                })
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?,
+        serde_json::Value::String(id) => vec![id.clone()],
+        _ => {
+            return Err(LixError::new(
+                SYNC_DEMAND_STALLED_CODE,
+                format!("sync {context} demand {field} must be strings"),
+            ));
+        }
+    };
     if ids.is_empty() {
         return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
+            SYNC_DEMAND_STALLED_CODE,
             format!("sync {context} demand error contained no {field}"),
         ));
     }
-    let request = match error.code.as_str() {
-        "LIX_SYNC_HISTORY_REQUIRED" => SyncDemandRequest::History(ids),
+    Ok(Some(match error.code.as_str() {
         "LIX_SYNC_CHUNKS_REQUIRED" => SyncDemandRequest::Chunks(ids),
+        "LIX_SYNC_HISTORY_REQUIRED" | LixError::CODE_COMMIT_NOT_FOUND => {
+            SyncDemandRequest::History(ids)
+        }
         _ => unreachable!("demand error code was classified above"),
-    };
+    }))
+}
+
+async fn send_sync_demand(
+    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+    request: SyncDemandRequest,
+) -> Result<(), LixError> {
     let (response, done) = tokio::sync::oneshot::channel();
     demand_tx
         .send(SyncDemand { request, response })
@@ -224,56 +257,52 @@ pub(crate) async fn demand_sync_for_error(
         .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
     done.await
         .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker stopped"))??;
-    Ok(true)
+    Ok(())
+}
+
+fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
+    error.code == LixError::CODE_COMMIT_NOT_FOUND
+        && error.details.as_ref().is_some_and(|details| {
+            details.get("operation").and_then(serde_json::Value::as_str)
+                == Some("walk_commit_graph")
+                && details.get("role").and_then(serde_json::Value::as_str) == Some("graph_node")
+        })
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct SyncDemandRetry {
     seen: BTreeSet<String>,
-    rounds: usize,
 }
 
 impl SyncDemandRetry {
+    fn admit(&mut self, error: LixError) -> Result<SyncDemandRequest, LixError> {
+        let Some(request) = sync_demand_request_for_error(&error)? else {
+            return Err(error);
+        };
+        let identity = format!(
+            "{}:{}",
+            error.code,
+            serde_json::to_string(&error.details).unwrap_or_default()
+        );
+        if !self.seen.insert(identity) {
+            return Err(LixError::new(
+                SYNC_DEMAND_STALLED_CODE,
+                "sync demand hydration did not make progress",
+            ));
+        }
+        Ok(request)
+    }
+
     pub(crate) async fn hydrate_for_retry(
         &mut self,
         demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
         error: LixError,
     ) -> Result<(), LixError> {
-        let demand_identity = match error.code.as_str() {
-            "LIX_SYNC_HISTORY_REQUIRED" | "LIX_SYNC_CHUNKS_REQUIRED" => Some(format!(
-                "{}:{}",
-                error.code,
-                serde_json::to_string(&error.details).unwrap_or_default()
-            )),
-            _ => None,
-        };
-        let Some(identity) = demand_identity else {
-            return Err(error);
-        };
         let Some(demand_tx) = demand_tx else {
             return Err(error);
         };
-        if !self.seen.insert(identity) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync demand hydration did not make progress",
-            ));
-        }
-        if self.rounds >= super::MAX_SYNC_REQUEST_ITEMS {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "sync demand hydration exceeded {} rounds",
-                    super::MAX_SYNC_REQUEST_ITEMS
-                ),
-            ));
-        }
-        self.rounds += 1;
-        if demand_sync_for_error(demand_tx, &error).await? {
-            Ok(())
-        } else {
-            Err(error)
-        }
+        let request = self.admit(error)?;
+        send_sync_demand(demand_tx, request).await
     }
 }
 
@@ -367,6 +396,7 @@ async fn run_sync_worker<StorageImpl>(
     let mut delta_pull_limit = SYNC_DELTA_PULL_LIMIT;
     let mut push_item_limit = super::MAX_SYNC_REQUEST_ITEMS;
     let mut change_watcher = lix.sync_mode_state().change_watcher();
+    let mut internal_demand_retry = SyncDemandRetry::default();
 
     while !*shutdown_rx.borrow() {
         if transport.is_none() {
@@ -430,9 +460,11 @@ async fn run_sync_worker<StorageImpl>(
         };
         match result {
             Ok(IterationResult::Applied | IterationResult::LocalChange) => {
+                internal_demand_retry = SyncDemandRetry::default();
                 retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
             }
             Ok(IterationResult::Demand(first)) => {
+                internal_demand_retry = SyncDemandRetry::default();
                 let mut demands = vec![first];
                 while let Ok(demand) = demand_rx.try_recv() {
                     demands.push(demand);
@@ -458,6 +490,31 @@ async fn run_sync_worker<StorageImpl>(
                 retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
             }
             Err(error) => {
+                let error = match internal_demand_retry.admit(error) {
+                    Ok(request) => {
+                        let result = {
+                            let hydration = hydrate_sync_request(&lix, &current, request).fuse();
+                            let shutdown = shutdown_rx.changed().fuse();
+                            futures_util::pin_mut!(hydration, shutdown);
+                            select_biased! {
+                                _ = shutdown => None,
+                                result = hydration => Some(result),
+                            }
+                        };
+                        let Some(result) = result else {
+                            break;
+                        };
+                        match result {
+                            Ok(()) => {
+                                retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
+                                continue;
+                            }
+                            Err(error) => error,
+                        }
+                    }
+                    Err(error) => error,
+                };
+                internal_demand_retry = SyncDemandRetry::default();
                 if is_terminal_sync_error(&error) {
                     tracing::error!(error = ?error, "sync repository cannot make progress");
                     break;
@@ -786,8 +843,27 @@ fn snapshot_pull_error(error: LixError) -> LixError {
 fn is_terminal_sync_error(error: &LixError) -> bool {
     matches!(
         error.code.as_str(),
-        SYNC_ITEM_TOO_LARGE_CODE | SYNC_SNAPSHOT_TOO_LARGE_CODE
+        SYNC_ITEM_TOO_LARGE_CODE | SYNC_SNAPSHOT_TOO_LARGE_CODE | SYNC_DEMAND_STALLED_CODE
     )
+}
+
+async fn hydrate_sync_request<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    request: SyncDemandRequest,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    match request {
+        SyncDemandRequest::History(ids) => {
+            hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
+        }
+        SyncDemandRequest::Chunks(ids) => {
+            hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
+        }
+    }
 }
 
 async fn hydrate_sync_demands<StorageImpl, Transport>(
@@ -844,52 +920,55 @@ where
     Transport: SyncTransport,
 {
     let pending = lix
-        .deferred_sync_history_ids(&requested)
+        .sync_history_demand_ids(&requested)
         .await?
         .into_iter()
         .collect::<BTreeSet<_>>();
     if pending.is_empty() {
         return Ok(());
     }
-    let fetched = fetch_history_objects(transport, pending).await?;
+    let fetched =
+        fetch_history_objects(transport, pending, super::MAX_SYNC_HISTORY_PAGE_SIZE).await?;
+    let boundaries = fetched
+        .boundaries
+        .iter()
+        .map(|boundary| super::SyncBranchHead {
+            branch_id: boundary.commit_id.clone(),
+            head_commit_id: Some(boundary.commit_id.clone()),
+            hot_state_root_id: boundary.live_state_root_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let rows = fetch_snapshot_rows(transport, &boundaries).await?;
     register_commit_blob_manifests(lix, transport, &fetched.commits).await?;
+    register_snapshot_row_blob_manifests(lix, transport, &rows).await?;
     lix.import_sync_history_headers(&fetched.commit_headers)
         .await?;
-    lix.import_sync_history(&fetched.commits).await
+    lix.import_sync_history_boundaries(&fetched.commits, &fetched.boundaries, &rows)
+        .await
 }
 
 #[derive(Debug)]
 struct FetchedHistory {
     commits: Vec<super::SyncCommit>,
     commit_headers: Vec<super::SyncCommitHeader>,
+    boundaries: Vec<super::SyncHistoryBoundary>,
 }
 
 async fn fetch_history_objects<Transport>(
     transport: &Transport,
-    mut pending: BTreeSet<String>,
+    pending: BTreeSet<String>,
+    requested_page_limit: usize,
 ) -> Result<FetchedHistory, LixError>
 where
     Transport: SyncTransport,
 {
     let mut commits = BTreeMap::new();
     let mut commit_headers = BTreeMap::new();
-    let mut history_batch_limit = super::MAX_SYNC_HISTORY_COMMIT_IDS;
-    while !pending.is_empty() {
-        let (batch, response) =
-            fetch_history_batch_adaptive(transport, &pending, &mut history_batch_limit).await?;
-        for commit_id in &batch {
-            pending.remove(commit_id);
-        }
-        if !response.missing_commit_ids.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_COMMIT_NOT_FOUND,
-                format!(
-                    "sync history is missing commits: {}",
-                    response.missing_commit_ids.join(", ")
-                ),
-            ));
-        }
-        let requested = batch.iter().cloned().collect::<BTreeSet<_>>();
+    let mut boundaries = BTreeMap::new();
+    let mut history_page_limit = requested_page_limit;
+    for head in pending {
+        let response =
+            fetch_history_page_adaptive(transport, &head, &mut history_page_limit).await?;
         for header in response.commit_headers {
             if let Some(existing) = commit_headers.insert(header.commit_id.clone(), header.clone())
                 && existing != header
@@ -908,22 +987,32 @@ where
             .iter()
             .map(|commit| commit.commit_id.clone())
             .collect::<BTreeSet<_>>();
-        if !requested.is_subset(&returned) {
+        if !returned.contains(&head) {
             return Err(LixError::new(
                 LixError::CODE_COMMIT_NOT_FOUND,
-                "sync history response omitted a requested commit",
+                format!("sync history response omitted requested head '{head}'"),
             ));
         }
-        for commit in response_commits.drain(..) {
-            if !requested.contains(&commit.commit_id) {
+        for boundary in response.boundaries {
+            if !returned.contains(&boundary.commit_id) {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     format!(
-                        "sync history returned unrelated commit '{}'",
-                        commit.commit_id
+                        "sync history returned boundary '{}' outside its page",
+                        boundary.commit_id
                     ),
                 ));
             }
+            if let Some(existing) = boundaries.insert(boundary.commit_id.clone(), boundary.clone())
+                && existing != boundary
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync history returned conflicting boundary roots",
+                ));
+            }
+        }
+        for commit in response_commits.drain(..) {
             if let Some(existing) = commits.insert(commit.commit_id.clone(), commit.clone())
                 && existing != commit
             {
@@ -958,21 +1047,27 @@ where
     Ok(FetchedHistory {
         commits: ordered,
         commit_headers: commit_headers.into_values().collect(),
+        boundaries: boundaries.into_values().collect(),
     })
 }
 
-async fn fetch_history_batch_adaptive<Transport>(
+async fn fetch_history_page_adaptive<Transport>(
     transport: &Transport,
-    pending: &BTreeSet<String>,
+    head: &str,
     limit: &mut usize,
-) -> Result<(Vec<String>, super::SyncHistoryResponse), LixError>
+) -> Result<super::SyncHistoryResponse, LixError>
 where
     Transport: SyncTransport,
 {
     loop {
-        let batch = pending.iter().take(*limit).cloned().collect::<Vec<_>>();
-        match transport.history(&batch).await {
-            Ok(response) => return Ok((batch, response)),
+        match transport.history(head, *limit).await {
+            Ok(response) if response.commits.len() <= *limit => return Ok(response),
+            Ok(_) => {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync history response exceeds the requested page limit",
+                ));
+            }
             Err(error) if is_response_too_large(&error) && *limit > 1 => {
                 *limit = smaller_page_limit(*limit);
             }
@@ -1272,6 +1367,8 @@ mod tests {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         max_history_items: Option<usize>,
         commit_headers: Vec<super::super::SyncCommitHeader>,
+        history_boundaries: BTreeMap<String, super::super::SyncHistoryBoundary>,
+        boundary_rows: BTreeMap<String, Vec<super::super::SyncSnapshotRow>>,
         blobs: BTreeMap<String, super::super::SyncBlobManifest>,
         blob_calls: Arc<Mutex<Vec<String>>>,
         chunks: BTreeMap<String, Vec<u8>>,
@@ -1304,47 +1401,85 @@ mod tests {
 
         fn snapshot_rows<'a>(
             &'a self,
-            _branch_id: &'a str,
-            _head_commit_id: &'a str,
-            _continuation: Option<&'a str>,
+            branch_id: &'a str,
+            head_commit_id: &'a str,
+            continuation: Option<&'a str>,
             _limit: usize,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncSnapshotRowPage> {
-            Box::pin(async { Err(LixError::unknown("unused history snapshot rows")) })
+            Box::pin(async move {
+                if continuation.is_some() || branch_id != head_commit_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "unexpected history snapshot page request",
+                    ));
+                }
+                Ok(super::super::SyncSnapshotRowPage {
+                    branch_id: branch_id.to_owned(),
+                    head_commit_id: head_commit_id.to_owned(),
+                    rows: self
+                        .boundary_rows
+                        .get(head_commit_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    continuation: None,
+                })
+            })
         }
 
         fn history<'a>(
             &'a self,
-            commit_ids: &'a [String],
+            head: &'a str,
+            limit: usize,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncHistoryResponse> {
             Box::pin(async move {
                 self.calls
                     .lock()
                     .expect("history calls lock")
-                    .push(commit_ids.to_vec());
-                if self
-                    .max_history_items
-                    .is_some_and(|limit| commit_ids.len() > limit)
-                {
+                    .push(vec![head.to_owned()]);
+                if self.max_history_items.is_some_and(|cap| limit > cap) {
                     return Err(LixError::new(
                         SYNC_RESPONSE_TOO_LARGE_CODE,
                         "test history response exceeds cap",
                     ));
                 }
-                let mut commits = Vec::new();
-                let mut missing_commit_ids = Vec::new();
-                for commit_id in commit_ids {
-                    if self.missing.contains(commit_id) {
-                        missing_commit_ids.push(commit_id.clone());
-                    } else if let Some(commit) = self.commits.get(commit_id) {
-                        commits.push(commit.clone());
-                    } else {
-                        missing_commit_ids.push(commit_id.clone());
-                    }
+                if self.missing.contains(head) || !self.commits.contains_key(head) {
+                    return Err(LixError::commit_not_found(head, "test_history", "head"));
                 }
+                let mut next = Some(head.to_owned());
+                let mut newest_first = Vec::new();
+                while let Some(commit_id) = next
+                    && newest_first.len() < limit
+                {
+                    let Some(commit) = self.commits.get(&commit_id).cloned() else {
+                        break;
+                    };
+                    next = commit.parent_commit_ids.first().cloned();
+                    newest_first.push(commit);
+                }
+                let returned = newest_first
+                    .iter()
+                    .map(|commit| commit.commit_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let boundaries = newest_first
+                    .iter()
+                    .filter(|commit| {
+                        commit
+                            .parent_commit_ids
+                            .first()
+                            .is_some_and(|parent| !returned.contains(parent.as_str()))
+                    })
+                    .map(|commit| {
+                        self.history_boundaries
+                            .get(&commit.commit_id)
+                            .cloned()
+                            .expect("test boundary has a certified live root")
+                    })
+                    .collect();
+                newest_first.reverse();
                 Ok(super::super::SyncHistoryResponse {
-                    commits,
+                    commits: newest_first,
                     commit_headers: self.commit_headers.clone(),
-                    missing_commit_ids,
+                    boundaries,
                 })
             })
         }
@@ -1450,7 +1585,8 @@ mod tests {
 
         fn history<'a>(
             &'a self,
-            _commit_ids: &'a [String],
+            _head: &'a str,
+            _limit: usize,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncHistoryResponse> {
             Box::pin(async { Err(LixError::unknown("unused capped-pull history")) })
         }
@@ -1573,7 +1709,8 @@ mod tests {
 
         fn history<'a>(
             &'a self,
-            _commit_ids: &'a [String],
+            _head: &'a str,
+            _limit: usize,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncHistoryResponse> {
             Box::pin(async { Err(LixError::unknown("unused paged-snapshot history")) })
         }
@@ -1631,6 +1768,23 @@ mod tests {
         String,
         String,
         BTreeMap<String, super::super::SyncCommit>,
+        Vec<super::super::SyncCommitHeader>,
+        BTreeMap<String, super::super::SyncHistoryBoundary>,
+        BTreeMap<String, Vec<super::super::SyncSnapshotRow>>,
+    ) {
+        history_fixture_with_depth(1).await
+    }
+
+    async fn history_fixture_with_depth(
+        commits_after_parent: usize,
+    ) -> (
+        Lix<Memory>,
+        String,
+        String,
+        BTreeMap<String, super::super::SyncCommit>,
+        Vec<super::super::SyncCommitHeader>,
+        BTreeMap<String, super::super::SyncHistoryBoundary>,
+        BTreeMap<String, Vec<super::super::SyncSnapshotRow>>,
     ) {
         let authority = open_lix().await.expect("authority opens");
         authority
@@ -1647,13 +1801,18 @@ mod tests {
             .rows()[0]
             .get::<String>("id")
             .expect("parent id");
-        authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('history-b', 'b')",
-                &[],
-            )
-            .await
-            .expect("second history commit");
+        for index in 0..commits_after_parent {
+            authority
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!("history-{index}")),
+                        Value::Text(index.to_string()),
+                    ],
+                )
+                .await
+                .expect("extend history fixture");
+        }
         let snapshot = authority
             .pull_sync_repository(None, 128)
             .await
@@ -1671,27 +1830,69 @@ mod tests {
             .find(|branch| branch.branch_id == *default_branch_id)
             .and_then(|branch| branch.head_commit_id.clone())
             .expect("default head");
-        let ids = branches
+        let mut snapshot_commits = BTreeMap::new();
+        let mut snapshot_headers = BTreeMap::new();
+        for branch_head in branches
             .iter()
-            .filter_map(|branch| branch.head_commit_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .filter_map(|branch| branch.head_commit_id.as_deref())
+        {
+            let page = authority
+                .sync_history(branch_head, 1)
+                .await
+                .expect("authority history");
+            snapshot_commits.extend(
+                page.commits
+                    .into_iter()
+                    .map(|commit| (commit.commit_id.clone(), commit)),
+            );
+            snapshot_headers.extend(
+                page.commit_headers
+                    .into_iter()
+                    .map(|header| (header.commit_id.clone(), header)),
+            );
+        }
+        let history = super::super::SyncHistoryResponse {
+            commits: snapshot_commits.into_values().collect(),
+            commit_headers: snapshot_headers.into_values().collect(),
+            boundaries: Vec::new(),
+        };
+        let all_commit_ids = authority
+            .execute("SELECT id FROM lix_commit", &[])
+            .await
+            .expect("authority commit ids")
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("id").expect("commit id"))
             .collect::<Vec<_>>();
-        let history = authority
-            .sync_history(&ids)
-            .await
-            .expect("authority history");
-        let deferred_parent = authority
-            .sync_history(std::slice::from_ref(&parent))
-            .await
-            .expect("authority deferred parent");
-        let commits = history
-            .commits
-            .iter()
-            .chain(deferred_parent.commits.iter())
-            .cloned()
-            .map(|commit| (commit.commit_id.clone(), commit))
-            .collect();
+        let mut commits = BTreeMap::new();
+        let mut headers = BTreeMap::new();
+        let mut history_boundaries = BTreeMap::new();
+        let mut boundary_rows = BTreeMap::new();
+        for commit_id in all_commit_ids {
+            let response = authority
+                .sync_history(&commit_id, 1)
+                .await
+                .expect("authority singleton test history");
+            commits.extend(
+                response
+                    .commits
+                    .into_iter()
+                    .map(|commit| (commit.commit_id.clone(), commit)),
+            );
+            for header in response.commit_headers {
+                headers.entry(header.commit_id.clone()).or_insert(header);
+            }
+            for boundary in response.boundaries {
+                history_boundaries.insert(boundary.commit_id.clone(), boundary);
+            }
+            let page = authority
+                .pull_sync_snapshot_rows(&commit_id, &commit_id, None, 512)
+                .await
+                .expect("authority history boundary rows");
+            assert!(page.continuation.is_none(), "test boundary fits one page");
+            boundary_rows.insert(commit_id, page.rows);
+        }
+        let commit_headers = headers.into_values().collect();
         let mut rows = Vec::new();
         for branch in branches {
             let Some(head_commit_id) = branch.head_commit_id.as_deref() else {
@@ -1729,7 +1930,15 @@ mod tests {
             )
             .await
             .expect("snapshot installs");
-        (replica, parent, head, commits)
+        (
+            replica,
+            parent,
+            head,
+            commits,
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
+        )
     }
 
     #[test]
@@ -1831,8 +2040,8 @@ mod tests {
     fn live_history_and_snapshot_use_distinct_protocol_limits() {
         assert_eq!(SYNC_DELTA_PULL_LIMIT, 512);
         assert_eq!(SYNC_SNAPSHOT_ROW_LIMIT, 512);
-        assert_eq!(crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS, 128);
-        assert!(crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS < SYNC_DELTA_PULL_LIMIT);
+        assert_eq!(crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE, 100);
+        assert!(crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE < SYNC_DELTA_PULL_LIMIT);
     }
 
     #[tokio::test]
@@ -1858,7 +2067,7 @@ mod tests {
             .get::<String>("id")
             .expect("head id");
         let response = authority
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("authority exports one deep head");
         assert_eq!(response.commits.len(), 1);
@@ -1866,6 +2075,11 @@ mod tests {
             response.commit_headers.len() <= 6,
             "header closure must stay bounded independently of history depth",
         );
+        let response_boundaries = response
+            .boundaries
+            .into_iter()
+            .map(|boundary| (boundary.commit_id.clone(), boundary))
+            .collect();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let transport = HistoryTransport {
             commits: response
@@ -1877,14 +2091,20 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: None,
             commit_headers: response.commit_headers,
+            history_boundaries: response_boundaries,
+            boundary_rows: BTreeMap::new(),
             blobs: BTreeMap::new(),
             blob_calls: Arc::new(Mutex::new(Vec::new())),
             chunks: BTreeMap::new(),
             chunk_calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let fetched = fetch_history_objects(&transport, BTreeSet::from([head.clone()]))
-            .await
-            .expect("deep head fetch succeeds");
+        let fetched = fetch_history_objects(
+            &transport,
+            BTreeSet::from([head.clone()]),
+            super::super::MAX_SYNC_HISTORY_PAGE_SIZE,
+        )
+        .await
+        .expect("deep head fetch succeeds");
         assert_eq!(fetched.commits.len(), 1);
         assert!(fetched.commit_headers.len() <= 6);
         assert_eq!(
@@ -1911,34 +2131,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_response_cap_reduces_the_requested_commit_batch() {
+    async fn history_response_cap_reduces_the_page_size() {
+        let (_replica, _parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
         let calls = Arc::new(Mutex::new(Vec::new()));
         let transport = HistoryTransport {
-            commits: BTreeMap::new(),
+            commits,
             missing: BTreeSet::new(),
             calls: Arc::clone(&calls),
             max_history_items: Some(2),
-            commit_headers: Vec::new(),
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
             blobs: BTreeMap::new(),
             blob_calls: Arc::new(Mutex::new(Vec::new())),
             chunks: BTreeMap::new(),
             chunk_calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let pending = (0..4).map(|index| format!("commit-{index}")).collect();
         let mut limit = 4;
-        let (batch, _) = fetch_history_batch_adaptive(&transport, &pending, &mut limit)
+        fetch_history_page_adaptive(&transport, &head, &mut limit)
             .await
-            .expect("a smaller history batch fits");
+            .expect("a smaller history page fits");
         assert_eq!(limit, 2);
-        assert_eq!(batch.len(), 2);
         assert_eq!(
-            calls
-                .lock()
-                .expect("history calls lock")
-                .iter()
-                .map(Vec::len)
-                .collect::<Vec<_>>(),
-            vec![4, 2]
+            calls.lock().expect("history calls lock").len(),
+            2,
+            "one oversized page is retried at half the size",
         );
     }
 
@@ -1950,14 +2168,15 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: Some(0),
             commit_headers: Vec::new(),
+            history_boundaries: BTreeMap::new(),
+            boundary_rows: BTreeMap::new(),
             blobs: BTreeMap::new(),
             blob_calls: Arc::new(Mutex::new(Vec::new())),
             chunks: BTreeMap::new(),
             chunk_calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let pending = BTreeSet::from(["commit-0".to_owned()]);
         let mut limit = 1;
-        let error = fetch_history_batch_adaptive(&transport, &pending, &mut limit)
+        let error = fetch_history_page_adaptive(&transport, "commit-0", &mut limit)
             .await
             .expect_err("one oversized commit cannot be batched further");
         assert_eq!(error.code, SYNC_ITEM_TOO_LARGE_CODE);
@@ -2054,6 +2273,31 @@ mod tests {
         assert!(is_terminal_sync_error(&error));
     }
 
+    #[test]
+    fn malformed_or_repeated_internal_demand_is_terminal() {
+        let malformed = LixError::new(
+            "LIX_SYNC_CHUNKS_REQUIRED",
+            "chunk demand omitted its identifiers",
+        );
+        let error = SyncDemandRetry::default()
+            .admit(malformed)
+            .expect_err("malformed demand must stop the worker");
+        assert_eq!(error.code, SYNC_DEMAND_STALLED_CODE);
+        assert!(is_terminal_sync_error(&error));
+
+        let demand = || {
+            LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunk demand")
+                .with_details(serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
+        };
+        let mut retry = SyncDemandRetry::default();
+        retry.admit(demand()).expect("first demand is admitted");
+        let error = retry
+            .admit(demand())
+            .expect_err("a repeated demand proves hydration made no progress");
+        assert_eq!(error.code, SYNC_DEMAND_STALLED_CODE);
+        assert!(is_terminal_sync_error(&error));
+    }
+
     #[tokio::test]
     async fn structured_history_error_uses_the_single_demand_channel() {
         let commit_id = uuid::Uuid::now_v7().to_string();
@@ -2071,6 +2315,39 @@ mod tests {
         };
         let (hydrated, ()) = tokio::join!(waiter, responder);
         assert!(hydrated.expect("history response succeeds"));
+    }
+
+    #[tokio::test]
+    async fn sparse_commit_graph_miss_uses_the_history_demand_channel() {
+        let commit_id = uuid::Uuid::now_v7().to_string();
+        let error =
+            LixError::commit_not_found(commit_id.clone(), "walk_commit_graph", "graph_node");
+        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let waiter = demand_sync_for_error(&demand_tx, &error);
+        let responder = async {
+            let demand = demand_rx.recv().await.expect("history demand arrives");
+            assert!(matches!(
+                demand.request,
+                SyncDemandRequest::History(ids) if ids == vec![commit_id]
+            ));
+            demand.response.send(Ok(())).expect("waiter remains live");
+        };
+        let (hydrated, ()) = tokio::join!(waiter, responder);
+        assert!(hydrated.expect("history response succeeds"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_missing_commit_is_not_reclassified_as_lazy_history() {
+        let commit_id = uuid::Uuid::now_v7().to_string();
+        let error = LixError::commit_not_found(commit_id, "load_branch_head", "head");
+        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+
+        assert!(
+            !demand_sync_for_error(&demand_tx, &error)
+                .await
+                .expect("unrelated missing commit remains unrelated")
+        );
+        assert!(demand_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2145,6 +2422,8 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
             commit_headers: Vec::new(),
+            history_boundaries: BTreeMap::new(),
+            boundary_rows: BTreeMap::new(),
             blobs: BTreeMap::from([(manifest.blob_id.clone(), manifest)]),
             blob_calls: Arc::clone(&blob_calls),
             chunks,
@@ -2279,7 +2558,8 @@ mod tests {
 
     #[tokio::test]
     async fn one_history_demand_hydrates_and_retries_sql_while_deduping_callers() {
-        let (replica, parent, head, commits) = history_fixture().await;
+        let (replica, parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
         let error = replica
             .execute(
                 "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
@@ -2295,7 +2575,9 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::clone(&calls),
             max_history_items: None,
-            commit_headers: Vec::new(),
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
             blobs: BTreeMap::new(),
             blob_calls: Arc::new(Mutex::new(Vec::new())),
             chunks: BTreeMap::new(),
@@ -2355,14 +2637,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_sparse_boundary_hydrates_through_shared_retry_path() {
+        let (replica, _parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture_with_depth(32).await;
+
+        // This is the engine shape behind Atelier's History list: checkpoints
+        // are joined to the file-history surface to compute per-checkpoint
+        // counts. It must drive cold-history hydration on a fresh replica.
+        let sql = "SELECT COUNT(DISTINCT history.id) AS entries \
+                   FROM lix_checkpoint AS checkpoint \
+                   LEFT JOIN lix_file_history() AS history \
+                     ON history.lixcol_observed_commit_id = checkpoint.commit_id";
+        let mut error = replica
+            .execute(sql, &[])
+            .await
+            .expect_err("the sparse graph boundary is initially absent");
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND, "{error:?}");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = HistoryTransport {
+            commits,
+            missing: BTreeSet::new(),
+            calls: Arc::clone(&calls),
+            max_history_items: None,
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
+            blobs: BTreeMap::new(),
+            blob_calls: Arc::new(Mutex::new(Vec::new())),
+            chunks: BTreeMap::new(),
+            chunk_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut retry = SyncDemandRetry::default();
+        loop {
+            let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+            let hydrate = retry.hydrate_for_retry(Some(&demand_tx), error);
+            let serve = async {
+                let demand = demand_rx.recv().await.expect("history demand arrives");
+                let mut results =
+                    hydrate_sync_demands(&replica, &transport, std::slice::from_ref(&demand)).await;
+                let result = results.pop().expect("one demand result");
+                demand
+                    .response
+                    .send(result.clone())
+                    .expect("retry waiter remains live");
+                result
+            };
+            let (retry_result, hydration_result) = tokio::join!(hydrate, serve);
+            retry_result.expect("shared retry accepts the graph miss");
+            hydration_result.expect("history boundary hydrates");
+            match replica.execute(sql, &[]).await {
+                Ok(_) => break,
+                Err(next) => error = next,
+            }
+        }
+        let calls = calls.lock().expect("history calls lock");
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|request| request.len() == 1));
+        let hydrated_ids = calls.iter().flatten().cloned().collect::<BTreeSet<_>>();
+        drop(calls);
+
+        let adapter = replica.storage_adapter();
+        let read = adapter
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .expect("history manifest read opens");
+        for commit_id in hydrated_ids {
+            let commit_id =
+                crate::changelog::CommitId::parse_lix(&commit_id, "hydrated history manifest")
+                    .expect("hydrated id is canonical");
+            let manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+                .await
+                .expect("hydrated manifest loads")
+                .expect("hydrated boundary has a manifest");
+            assert!(
+                manifest.snapshot_root.is_some(),
+                "history boundaries must be complete rooted snapshots",
+            );
+            assert_eq!(manifest.replay_debt.depth, 0);
+            assert_eq!(manifest.replay_debt.rows, 0);
+            assert_eq!(manifest.replay_debt.bytes, 0);
+        }
+        drop(read);
+
+        replica
+            .execute(sql, &[])
+            .await
+            .expect("Atelier History query reconstructs from hydrated cold commits");
+    }
+
+    #[tokio::test]
     async fn missing_history_id_leaves_its_deferred_marker() {
-        let (replica, parent, _head, commits) = history_fixture().await;
+        let (replica, parent, _head, commits, _commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
         let transport = HistoryTransport {
             commits,
             missing: BTreeSet::from([parent.clone()]),
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
             commit_headers: Vec::new(),
+            history_boundaries,
+            boundary_rows,
             blobs: BTreeMap::new(),
             blob_calls: Arc::new(Mutex::new(Vec::new())),
             chunks: BTreeMap::new(),
@@ -2386,17 +2761,28 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
         assert_eq!(
             replica
-                .deferred_sync_history_ids(&BTreeSet::from([parent.clone()]))
+                .sync_history_demand_ids(&BTreeSet::from([parent.clone()]))
                 .await
                 .expect("marker query"),
             vec![parent],
             "a missing history response must not clear the local demand marker",
         );
+
+        let sparse_boundary = uuid::Uuid::now_v7().to_string();
+        assert_eq!(
+            replica
+                .sync_history_demand_ids(&BTreeSet::from([sparse_boundary.clone()]))
+                .await
+                .expect("missing record query"),
+            vec![sparse_boundary],
+            "a commit beyond the bounded header frontier must remain demandable",
+        );
     }
 
     #[tokio::test]
     async fn explicit_transaction_surfaces_structured_history_demand() {
-        let (replica, parent, head, _commits) = history_fixture().await;
+        let (replica, parent, head, _commits, _commit_headers, _history_boundaries, _boundary_rows) =
+            history_fixture().await;
         let mut transaction = replica
             .begin_transaction()
             .await

@@ -35,8 +35,8 @@ pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
 pub(crate) use protocol::SyncRefUpdate;
 pub(crate) use protocol::{
     SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead, SyncCommitHeader,
-    SyncEvent, SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
-    SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
+    SyncEvent, SyncHistoryBoundary, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
+    SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
 pub(crate) use repository::{
     SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
@@ -48,7 +48,7 @@ pub(crate) use runtime::{
 };
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_SYNC_HISTORY_COMMIT_IDS: usize = 128;
+pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYNC_REMOTE_ID_BYTES: usize = 4 * 1024;

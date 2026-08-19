@@ -6894,6 +6894,15 @@ pub(crate) struct HotTrackedSnapshot {
     rows: HotRowMap,
 }
 
+pub(crate) enum CompleteWorkingDiffMode {
+    Disabled,
+    ResetClean,
+    Rebase {
+        checkpoint_commit_id: CommitId,
+        checkpoint: HotTrackedSnapshot,
+    },
+}
+
 impl HotTrackedSnapshot {
     pub(crate) fn from_materialized_rows(
         tracked_rows: Vec<MaterializedTrackedStateRow>,
@@ -8980,7 +8989,7 @@ where
         tracked_deltas: &[CurrentStateDeltaRef<'_>],
         untracked_deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        working_diff_mode: CompleteWorkingDiffMode,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
         let mut rows = parent_tracked.rows;
@@ -9003,16 +9012,26 @@ where
             apply_complete_hot_snapshot_delta(&mut rows, delta, absence_guards)?;
         }
 
-        // A replacement generation cannot inherit a checkpoint baseline from
-        // its source: that before image belongs to the retired generation.
-        // The one exception is publishing the checkpoint itself, where every
-        // final tracked row is the clean baseline by definition.
-        let tracked_baseline = if working_diff_capture_checkpoint_commit_id.is_some() {
-            WorkingDiffBaseline::Clean
-        } else {
-            WorkingDiffBaseline::Disabled
-        };
-        normalize_complete_hot_snapshot_baselines(&mut rows, tracked_baseline)?;
+        match working_diff_mode {
+            CompleteWorkingDiffMode::Disabled => {
+                normalize_complete_hot_snapshot_baselines(&mut rows, WorkingDiffBaseline::Disabled)?
+            }
+            CompleteWorkingDiffMode::ResetClean => {
+                normalize_complete_hot_snapshot_baselines(&mut rows, WorkingDiffBaseline::Clean)?
+            }
+            CompleteWorkingDiffMode::Rebase {
+                checkpoint_commit_id,
+                checkpoint,
+            } => rebase_complete_hot_snapshot_working_diff(
+                self.writes,
+                branch_id,
+                generation,
+                checkpoint_commit_id,
+                &mut rows,
+                checkpoint.rows,
+                coverage,
+            )?,
+        }
 
         let mut final_tracked = BTreeMap::new();
         let mut schema_keys = BTreeSet::new();
@@ -9025,7 +9044,6 @@ where
 
         stage_complete_collection_controls(self.writes, branch_id, generation, &rows)?;
         stage_complete_hot_rows(self.writes, branch_id, generation, rows);
-        *coverage = WorkingDiffIndexCoverage::default();
         Ok((
             HotTrackedSnapshot {
                 rows: final_tracked,
@@ -9033,6 +9051,73 @@ where
             schema_keys,
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebase_complete_hot_snapshot_working_diff(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    checkpoint_commit_id: CommitId,
+    rows: &mut HotRowMap,
+    checkpoint_rows: HotRowMap,
+    coverage: &mut WorkingDiffIndexCoverage,
+) -> Result<(), LixError> {
+    *coverage = WorkingDiffIndexCoverage::default();
+    let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
+    let mut diff_key_bytes = Vec::new();
+    let mut diff_puts = Vec::new();
+
+    for (identity, bytes) in rows.iter_mut() {
+        let after = decode_head_value(bytes.as_ref())?;
+        if after.untracked {
+            continue;
+        }
+        let before = checkpoint_rows
+            .get(identity)
+            .map(|bytes| decode_head_value(bytes.as_ref()))
+            .transpose()?;
+        let before_version = before.and_then(HeadValueView::working_diff_version);
+        let after_version = after
+            .working_diff_version()
+            .ok_or_else(|| head_value_error("complete tracked row has no working-diff version"))?;
+        let (baseline, dirty) = match before_version {
+            Some(before) if before.change_id == after_version.change_id => {
+                (WorkingDiffBaseline::Clean, false)
+            }
+            Some(before) => (
+                WorkingDiffBaseline::BeforePresent {
+                    checkpoint_commit_id,
+                    version: before,
+                },
+                true,
+            ),
+            None => (
+                WorkingDiffBaseline::BeforeAbsent {
+                    checkpoint_commit_id,
+                },
+                !after.deleted,
+            ),
+        };
+        *bytes = Bytes::from(reencode_head_value_with_baseline(after, baseline)?);
+        if dirty {
+            let key = append_hot_diff_key_parts(
+                &mut diff_key_bytes,
+                &scope,
+                &identity.schema_key,
+                &identity.row_pk,
+                identity.file_id.as_deref(),
+            );
+            coverage
+                .add_encoded_group_key(&diff_key_bytes[key.clone()])
+                .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
+            diff_puts.push(EncodedPut {
+                key: buffer_range(&key),
+                value: BufferRange::default(),
+            });
+        }
+    }
+    stage_hot_diff_batch(writes, &scope, diff_key_bytes, diff_puts)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -209,7 +209,7 @@ async fn fetch(
         )
         .map_err(js_transport_error)?;
     let mut abort_on_drop = AbortOnDrop {
-        controller,
+        controller: controller.clone(),
         timeout: Some(BrowserTimeout {
             global: global.clone().into(),
             handle: timeout_handle,
@@ -219,6 +219,12 @@ async fn fetch(
     };
     Reflect::set(&init, &"method".into(), &method.into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"credentials".into(), &"include".into()).map_err(js_transport_error)?;
+    Reflect::set(
+        &init,
+        &"lixResponseLimit".into(),
+        &JsValue::from_f64(response_limit as f64),
+    )
+    .map_err(js_transport_error)?;
     let header_pairs = Array::new();
     for (name, value) in headers {
         let pair = Array::new();
@@ -258,27 +264,92 @@ async fn fetch(
         .map_err(js_transport_error)?
         .as_string()
         .unwrap_or_default();
-    let array_buffer = Reflect::get(&response, &"arrayBuffer".into())
-        .map_err(js_transport_error)?
-        .dyn_into::<Function>()
-        .map_err(js_transport_error)?
-        .call0(&response)
-        .map_err(js_transport_error)?
-        .dyn_into::<Promise>()
-        .map_err(js_transport_error)?;
-    let body = JsFuture::from(array_buffer)
-        .await
-        .map_err(js_transport_error)?;
-    let body = Uint8Array::new(&body).to_vec();
-    if body.len() > response_limit {
-        return Err(response_too_large(operation));
-    }
+    let body = read_response_body(&response, response_limit, operation, &controller).await?;
     abort_on_drop.disarm();
     Ok(RawHttpResponse {
         status,
         status_text,
         body,
     })
+}
+
+async fn read_response_body(
+    response: &JsValue,
+    response_limit: usize,
+    operation: &str,
+    controller: &Object,
+) -> Result<Vec<u8>, LixError> {
+    let stream = Reflect::get(response, &"body".into()).map_err(js_transport_error)?;
+    if stream.is_null() || stream.is_undefined() {
+        return Ok(Vec::new());
+    }
+    let reader = Reflect::get(&stream, &"getReader".into())
+        .map_err(js_transport_error)?
+        .dyn_into::<Function>()
+        .map_err(js_transport_error)?
+        .call0(&stream)
+        .map_err(js_transport_error)?;
+    let read = Reflect::get(&reader, &"read".into())
+        .map_err(js_transport_error)?
+        .dyn_into::<Function>()
+        .map_err(js_transport_error)?;
+    let mut body = Vec::new();
+    loop {
+        let result = read
+            .call0(&reader)
+            .map_err(js_transport_error)?
+            .dyn_into::<Promise>()
+            .map_err(js_transport_error)?;
+        let result = JsFuture::from(result).await.map_err(js_transport_error)?;
+        let done = Reflect::get(&result, &"done".into())
+            .map_err(js_transport_error)?
+            .as_bool()
+            .unwrap_or(false);
+        if done {
+            release_reader(&reader);
+            return Ok(body);
+        }
+        let chunk = Reflect::get(&result, &"value".into())
+            .map_err(js_transport_error)?
+            .dyn_into::<Uint8Array>()
+            .map_err(js_transport_error)?;
+        let chunk_len = usize::try_from(chunk.length()).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "browser sync response chunk length exceeds usize",
+            )
+        })?;
+        if body.len().saturating_add(chunk_len) > response_limit {
+            abort_controller(controller);
+            cancel_reader(&reader);
+            return Err(response_too_large(operation));
+        }
+        let offset = body.len();
+        body.resize(offset + chunk_len, 0);
+        chunk.copy_to(&mut body[offset..]);
+    }
+}
+
+fn cancel_reader(reader: &JsValue) {
+    let Ok(cancel) = Reflect::get(reader, &"cancel".into()) else {
+        return;
+    };
+    let Ok(cancel) = cancel.dyn_into::<Function>() else {
+        return;
+    };
+    let Ok(result) = cancel.call0(reader) else {
+        return;
+    };
+    let _ = result;
+    release_reader(reader);
+}
+
+fn release_reader(reader: &JsValue) {
+    if let Ok(release) = Reflect::get(reader, &"releaseLock".into())
+        && let Ok(release) = release.dyn_into::<Function>()
+    {
+        let _ = release.call0(reader);
+    }
 }
 
 struct AbortOnDrop {
@@ -329,8 +400,13 @@ fn abort_controller(controller: &Object) {
 }
 
 fn js_transport_error(error: JsValue) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("browser sync fetch failed: {error:?}"),
-    )
+    let code = Reflect::get(&error, &"code".into())
+        .ok()
+        .and_then(|code| code.as_string())
+        .unwrap_or_else(|| LixError::CODE_INTERNAL_ERROR.to_owned());
+    let detail = Reflect::get(&error, &"message".into())
+        .ok()
+        .and_then(|message| message.as_string())
+        .unwrap_or_else(|| format!("{error:?}"));
+    LixError::new(code, format!("browser sync fetch failed: {detail}"))
 }

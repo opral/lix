@@ -1630,11 +1630,11 @@ where
                 result_response(sync_pull(lease, query).await)
             }
             (&Method::GET, "/lix/v1/sync/history") => {
-                let commit_ids = match decode_sync_history_query(parts.uri.query()) {
-                    Ok(commit_ids) => commit_ids,
+                let query = match decode_query::<SyncHistoryQuery>(parts.uri.query()) {
+                    Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
-                result_response(sync_history(lease, commit_ids).await)
+                result_response(sync_history(lease, query).await)
             }
             (&Method::GET, "/lix/v1/sync/blob") => {
                 let query = match decode_query::<SyncBlobQuery>(parts.uri.query()) {
@@ -2463,13 +2463,15 @@ where
 
 async fn sync_history<S>(
     lease: SessionLease<S>,
-    commit_ids: Vec<String>,
+    request: SyncHistoryQuery,
 ) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let response = lease
-        .run_cancellable_read(move |lix| async move { lix.sync_history(&commit_ids).await })
+        .run_cancellable_read(move |lix| async move {
+            lix.sync_history(&request.head, request.limit).await
+        })
         .await?;
     bounded_sync_json_response(response, "sync history", MAX_SYNC_PULL_RESPONSE_BYTES)
 }
@@ -4118,6 +4120,13 @@ impl Default for SyncPullRequest {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncHistoryQuery {
+    head: String,
+    limit: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncBlobQuery {
     blob_id: Option<String>,
 }
@@ -4126,35 +4135,6 @@ struct SyncBlobQuery {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncChunkQuery {
     chunk_id: Option<String>,
-}
-
-fn decode_sync_history_query(query: Option<&str>) -> Result<Vec<String>, ApiError> {
-    let pairs = serde_urlencoded::from_str::<Vec<(String, String)>>(query.unwrap_or_default())
-        .map_err(|error| ApiError::bad_request(format!("invalid sync history query: {error}")))?;
-    if pairs.iter().any(|(key, _)| key != "commitId") {
-        return Err(ApiError::bad_request(
-            "sync history accepts only repeated commitId parameters",
-        ));
-    }
-    let commit_ids = pairs
-        .into_iter()
-        .map(|(_, commit_id)| commit_id)
-        .collect::<Vec<_>>();
-    if commit_ids.is_empty() || commit_ids.len() > crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS {
-        return Err(ApiError::bad_request(format!(
-            "sync history requires between 1 and {} commitId parameters",
-            crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS,
-        )));
-    }
-    if commit_ids
-        .iter()
-        .any(|commit_id| commit_id.is_empty() || commit_id.len() > 255)
-    {
-        return Err(ApiError::bad_request(
-            "sync history commitId parameters must be between 1 and 255 bytes",
-        ));
-    }
-    Ok(commit_ids)
 }
 
 const fn default_sync_pull_limit() -> usize {
@@ -4928,8 +4908,8 @@ mod tests {
     use http_body_util::BodyExt as _;
     use lix::storage::{
         BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, MemoryRead,
-        MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
-        StorageRead, StorageSpace, StorageWrite, WriteOptions,
+        MemoryWrite, PutBatch, ReadDurability, ReadOptions, ScanCursor, SpaceId, Storage,
+        StorageError, StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
     use lix::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TracingTelemetrySink,
@@ -4993,10 +4973,10 @@ mod tests {
     #[test]
     fn openapi_sync_wire_tracks_the_exact_snapshot_and_merge_dtos() {
         let openapi = include_str!("../../server-protocol.openapi.yaml");
-        assert!(openapi.contains("required: [kind, cursor, defaultBranchId, branches]"));
+        assert!(openapi.contains("required: [kind, cursor, lixId, defaultBranchId, branches]"));
         assert!(openapi.contains("required: [branchId, headCommitId, hotStateRootId]"));
         assert!(openapi.contains("required: [branchId, headCommitId, rows, continuation]"));
-        assert!(openapi.contains("required: [commits, commitHeaders, missingCommitIds]"));
+        assert!(openapi.contains("required: [commits, commitHeaders, boundaries]"));
         assert!(!openapi.contains("headCommits:"));
         assert!(openapi.contains(
             "required: [commitId, parentCommitIds, accountId, createdAt, selectedSourceCommitId, members]"
@@ -5074,6 +5054,45 @@ mod tests {
     trait TestStorage: Storage + Clone + Send + Sync + 'static {}
 
     impl<S> TestStorage for S where S: Storage + Clone + Send + Sync + 'static {}
+
+    /// Memory commits synchronously but deliberately declines durable reads.
+    /// This wrapper gives protocol idempotency tests a durable tier with the
+    /// same immediately committed state, without changing Memory's production
+    /// capability contract.
+    #[derive(Clone, Debug, Default)]
+    struct DurableMemoryStorage(Memory);
+
+    impl DurableMemoryStorage {
+        fn new() -> Self {
+            Self(Memory::new())
+        }
+    }
+
+    impl Storage for DurableMemoryStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(
+            &self,
+            mut options: ReadOptions,
+        ) -> Result<Self::Read<'_>, StorageError> {
+            options.durability = ReadDurability::Visible;
+            self.0.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.0.begin_write(options).await
+        }
+    }
 
     #[derive(Clone)]
     struct Router<S: TestStorage> {
@@ -6532,6 +6551,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idempotent_batch_hydrates_sparse_history_then_replays_one_durable_result() {
+        let authority = open_lix().await.expect("open history authority");
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/history.md', CAST('one' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("seed historical file");
+        let file_id = authority
+            .execute("SELECT id FROM lix_file WHERE path = '/history.md'", &[])
+            .await
+            .expect("load historical file id")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("file id");
+        authority
+            .create_checkpoint()
+            .await
+            .expect("checkpoint first version");
+        authority
+            .execute(
+                "UPDATE lix_file SET content = CAST('two' AS BYTEA) WHERE id = $1",
+                &[Value::Text(file_id)],
+            )
+            .await
+            .expect("write second historical version");
+
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("load sparse snapshot metadata");
+        let SyncRepositoryPullResponse::Snapshot {
+            default_branch_id,
+            branches,
+            ..
+        } = &snapshot
+        else {
+            panic!("initial pull must be a snapshot")
+        };
+        let branch = branches
+            .iter()
+            .find(|branch| branch.branch_id == *default_branch_id)
+            .expect("default branch metadata");
+        let head = branch.head_commit_id.clone().expect("default branch head");
+        let mut bootstrap_commits = std::collections::BTreeMap::new();
+        let mut bootstrap_headers = std::collections::BTreeMap::new();
+        for branch_head in branches
+            .iter()
+            .filter_map(|branch| branch.head_commit_id.as_deref())
+        {
+            let page = authority
+                .sync_history(branch_head, 1)
+                .await
+                .expect("load exact branch head body and sparse headers");
+            bootstrap_commits.extend(
+                page.commits
+                    .into_iter()
+                    .map(|commit| (commit.commit_id.clone(), commit)),
+            );
+            for header in page.commit_headers {
+                match bootstrap_headers.entry(header.commit_id.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(header);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        assert_eq!(entry.get(), &header, "duplicate sparse header agrees");
+                    }
+                }
+            }
+        }
+        let parent = bootstrap_commits[&head]
+            .parent_commit_ids
+            .first()
+            .cloned()
+            .expect("head has a deferred parent");
+        let mut snapshot_rows = Vec::new();
+        for branch in branches {
+            let Some(branch_head) = branch.head_commit_id.as_deref() else {
+                continue;
+            };
+            let mut continuation = None;
+            loop {
+                let page = authority
+                    .pull_sync_snapshot_rows(
+                        &branch.branch_id,
+                        branch_head,
+                        continuation.as_deref(),
+                        512,
+                    )
+                    .await
+                    .expect("load hot snapshot rows");
+                snapshot_rows.extend(page.rows);
+                let Some(next) = page.continuation else {
+                    break;
+                };
+                continuation = Some(next);
+            }
+        }
+
+        let storage = DurableMemoryStorage::new();
+        crate::engine::Engine::initialize_with_main_branch_id(
+            storage.clone(),
+            Some(default_branch_id),
+        )
+        .await
+        .expect("initialize sparse replica storage");
+        let mut replica = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("open sparse replica");
+        replica
+            .set_sync_role(crate::sync::SyncRole::Replica {
+                remote_id: "test://server-protocol-history".to_owned(),
+            })
+            .expect("set sparse replica role");
+        replica
+            .apply_sync_repository_snapshot(
+                "test://server-protocol-history",
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &bootstrap_commits.into_values().collect::<Vec<_>>(),
+                &bootstrap_headers.into_values().collect::<Vec<_>>(),
+                &snapshot_rows,
+            )
+            .await
+            .expect("install sparse replica snapshot");
+
+        let (demand_tx, mut demand_rx) = mpsc::channel(1);
+        replica.set_sync_demand_sender_for_test(demand_tx);
+        let replica = Arc::new(replica);
+        let hydrate_replica = Arc::clone(&replica);
+        let hydrate_authority = authority.clone();
+        let hydration = tokio::spawn(async move {
+            let demand = demand_rx.recv().await.expect("history demand arrives");
+            let history = hydrate_authority
+                .sync_history(&parent, crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE)
+                .await
+                .expect("load demanded history");
+            let historical_blob_ids = history
+                .commits
+                .iter()
+                .flat_map(|commit| &commit.members)
+                .filter(|member| member.schema_key == "lix_binary_blob_ref" && !member.deleted)
+                .filter_map(|member| {
+                    member
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.get("blob_hash"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            for blob_id in historical_blob_ids {
+                let manifest = hydrate_authority
+                    .get_sync_blob_manifest(blob_id)
+                    .await
+                    .expect("load historical blob manifest")
+                    .expect("historical blob manifest exists");
+                hydrate_replica
+                    .register_deferred_sync_blob_manifest(&manifest)
+                    .await
+                    .expect("register historical blob manifest lazily");
+            }
+            let mut boundary_rows = Vec::new();
+            for boundary in &history.boundaries {
+                let mut continuation = None;
+                loop {
+                    let page = hydrate_authority
+                        .pull_sync_snapshot_rows(
+                            &boundary.commit_id,
+                            &boundary.commit_id,
+                            continuation.as_deref(),
+                            512,
+                        )
+                        .await
+                        .expect("load demanded boundary rows");
+                    boundary_rows.extend(page.rows);
+                    let Some(next) = page.continuation else {
+                        break;
+                    };
+                    continuation = Some(next);
+                }
+            }
+            hydrate_replica
+                .import_sync_history_headers(&history.commit_headers)
+                .await
+                .expect("import demanded headers");
+            hydrate_replica
+                .import_sync_history_boundaries(
+                    &history.commits,
+                    &history.boundaries,
+                    &boundary_rows,
+                )
+                .await
+                .expect("import demanded bodies");
+            demand.succeed_for_test();
+        });
+
+        let router = handler(LixServerProtocol::new(replica));
+        let (session_id, _) = new_session(&router).await;
+        let headers = [(IDEMPOTENCY_KEY_HEADER, "sparse-history-batch")];
+        let body = json!({
+            "statements": [
+                {
+                    "sql": format!(
+                        "SELECT COUNT(*) AS versions FROM lix_file_history('{head}')"
+                    ),
+                    "params": []
+                },
+                {
+                    "sql": "INSERT INTO lix_key_value (key, value) VALUES ('history-hydrated', 'once') RETURNING value",
+                    "params": []
+                }
+            ]
+        });
+        let first = request_with_headers(
+            &router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            &headers,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        assert!(first[0]["rows"][0][0]["value"].as_i64().unwrap_or(0) >= 2);
+        hydration.await.expect("history hydration task");
+
+        let replay = request_with_headers(
+            &router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            &headers,
+            Some(body),
+        )
+        .await;
+        let replay_status = replay.status();
+        let replay = response_json(replay).await;
+        assert_eq!(replay_status, StatusCode::OK, "replay response: {replay}");
+        assert_eq!(replay, first);
+
+        let count = request(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'history-hydrated'"
+            })),
+        )
+        .await;
+        assert_eq!(count.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(count).await["rows"][0][0],
+            json!({ "kind": "int", "value": 1 })
+        );
+    }
+
+    #[tokio::test]
     async fn keyed_write_without_durable_receipt_proof_is_not_acknowledged() {
         let storage = PostCommitUnknownStorage::new();
         let lix = Arc::new(
@@ -7126,20 +7406,14 @@ mod tests {
     }
 
     #[test]
-    fn sync_history_query_is_only_a_bounded_repeated_commit_id_list() {
-        assert_eq!(
-            decode_sync_history_query(Some("commitId=one&commitId=two"))
-                .expect("repeated commit ids"),
-            ["one", "two"]
-        );
-        assert!(decode_sync_history_query(None).is_err());
-        assert!(decode_sync_history_query(Some("commitId=")).is_err());
-        assert!(decode_sync_history_query(Some("head=legacy")).is_err());
-        let too_many = (0..=crate::sync::MAX_SYNC_HISTORY_COMMIT_IDS)
-            .map(|index| format!("commitId={index}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        assert!(decode_sync_history_query(Some(&too_many)).is_err());
+    fn sync_history_query_is_one_head_and_limit() {
+        let query = decode_query::<SyncHistoryQuery>(Some("head=one&limit=10"))
+            .expect("history page query");
+        assert_eq!(query.head, "one");
+        assert_eq!(query.limit, 10);
+        assert!(decode_query::<SyncHistoryQuery>(Some("head=one")).is_err());
+        assert!(decode_query::<SyncHistoryQuery>(Some("commitId=legacy")).is_err());
+        assert!(decode_query::<SyncHistoryQuery>(Some("head=one&before=two")).is_err());
     }
 
     #[test]
@@ -7303,7 +7577,7 @@ mod tests {
             .expect("diverged branches should create a merge commit");
 
         let (session_id, _) = new_session(&app.router).await;
-        let history_path = format!("/lix/v1/sync/history?commitId={merge_commit_id}");
+        let history_path = format!("/lix/v1/sync/history?head={merge_commit_id}&limit=1");
         let history = request(&app.router, "GET", &history_path, Some(&session_id), None).await;
         assert_eq!(history.status(), StatusCode::OK);
         let history = response_json(history).await;
@@ -7337,7 +7611,7 @@ mod tests {
             }
             let response = app
                 .lix
-                .sync_history(std::slice::from_ref(&commit_id))
+                .sync_history(&commit_id, 1)
                 .await
                 .expect("source history closure should load");
             for commit in response.commits {
@@ -7408,19 +7682,10 @@ mod tests {
         )
         .await;
         assert_eq!(roundtrip.status(), StatusCode::OK);
-        let mut roundtrip = response_json(roundtrip).await;
+        let roundtrip = response_json(roundtrip).await;
         assert_eq!(roundtrip["commits"], history["commits"]);
-        assert_eq!(roundtrip["missingCommitIds"], history["missingCommitIds"]);
-        let mut expected_headers = history["commitHeaders"].clone();
-        for headers in [&mut roundtrip["commitHeaders"], &mut expected_headers] {
-            for header in headers.as_array_mut().expect("commit headers array") {
-                header
-                    .as_object_mut()
-                    .expect("commit header object")
-                    .remove("stateRootId");
-            }
-        }
-        assert_eq!(roundtrip["commitHeaders"], expected_headers);
+        assert_eq!(roundtrip["commitHeaders"], history["commitHeaders"]);
+        assert_eq!(roundtrip["boundaries"], history["boundaries"]);
     }
 
     #[tokio::test]
@@ -11546,7 +11811,12 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = LixServerProtocol::with_options(
-            Arc::new(open_lix().as_protocol_root().await.expect("open second lix")),
+            Arc::new(
+                open_lix()
+                    .as_protocol_root()
+                    .await
+                    .expect("open second lix"),
+            ),
             ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ServerProtocolOptions::default()

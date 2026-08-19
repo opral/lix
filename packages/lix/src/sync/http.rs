@@ -6,7 +6,7 @@
 use serde::Deserialize;
 
 use super::{
-    MAX_SYNC_HISTORY_COMMIT_IDS, MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT,
+    MAX_SYNC_HISTORY_PAGE_SIZE, MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT,
     SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
     SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportBounds,
     SyncTransportFuture, validate_blake3_id, validate_sync_remote_id,
@@ -200,22 +200,19 @@ where
 
     fn history<'a>(
         &'a self,
-        commit_ids: &'a [String],
+        head: &'a str,
+        limit: usize,
     ) -> SyncTransportFuture<'a, SyncHistoryResponse> {
         Box::pin(async move {
-            if commit_ids.is_empty() || commit_ids.len() > MAX_SYNC_HISTORY_COMMIT_IDS {
+            if head.is_empty() || limit == 0 || limit > MAX_SYNC_HISTORY_PAGE_SIZE {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     format!(
-                        "sync history requires 1 through {MAX_SYNC_HISTORY_COMMIT_IDS} commit IDs"
+                        "sync history requires a head and a limit from 1 through {MAX_SYNC_HISTORY_PAGE_SIZE}"
                     ),
                 ));
             }
-            let query = commit_ids
-                .iter()
-                .map(|commit_id| format!("commitId={}", encode_query(commit_id)))
-                .collect::<Vec<_>>()
-                .join("&");
+            let query = format!("head={}&limit={limit}", encode_query(head));
             let request = self.request(
                 Method::Get,
                 &format!("/sync/history?{query}"),

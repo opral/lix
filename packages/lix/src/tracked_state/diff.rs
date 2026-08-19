@@ -2157,6 +2157,7 @@ mod tests {
                     changed_key_count: 1,
                     row_count_estimate: result.row_count as u64,
                     tree_height: result.tree_height as u32,
+                    complete_state_fence: false,
                 },
             )
             .await
@@ -2355,6 +2356,7 @@ mod tests {
                     changed_key_count: 1,
                     row_count_estimate: result.row_count as u64,
                     tree_height: result.tree_height as u32,
+                    complete_state_fence: false,
                 },
             )
             .await
@@ -3540,6 +3542,7 @@ mod tests {
                 changed_key_count,
                 row_count_estimate: result.row_count as u64,
                 tree_height: result.tree_height as u32,
+                complete_state_fence: false,
             },
         )
         .await
@@ -3581,6 +3584,7 @@ mod tests {
                 .message
                 .contains("nearest available first-parent root")
             || error.message.contains("references unexpected parent")
+            || error.message.contains("without a complete-state fence")
             || error.message.contains("missing changelog winner")
             || error.message.contains("has change")
             || error.message.contains("omits current changelog change")

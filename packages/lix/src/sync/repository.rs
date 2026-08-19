@@ -25,8 +25,8 @@ use crate::changelog::{
 use crate::commit_graph::CommitGraphContext;
 use crate::common::LixTimestamp;
 use crate::hot_state::{
-    CurrentStateDeltaRef, HotTrackedSnapshot, TrackedHeadContext, TrackedWorkingDiffEpoch,
-    WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
+    CompleteWorkingDiffMode, CurrentStateDeltaRef, HotTrackedSnapshot, TrackedHeadContext,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
 };
 use crate::json_store::{
     JSON_INLINE_MAX_BYTES, JsonSlot, JsonWritePlacementRef, NormalizedJsonRef,
@@ -40,13 +40,12 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     CertifiedCommitStateTopologyParent, CommitStateManifest, CommitStateReplayDebt,
-    StagedCommitStateManifest, TrackedStateCommitDeltaRef, TrackedStateCommitRootParent,
-    TrackedStateContext, TrackedStateDeltaRef, TrackedStateKey, TrackedStateRootId,
-    TrackedStateScanRequest, commit_delta_member_scopes, commit_history_is_deferred,
-    direct_change_locator, incomplete_touched_scope_filter, load_change_record_by_id,
-    load_commit_state_manifest, load_published_commit_state_topology,
-    stage_certified_commit_state_manifest_with_handle, stage_change_locators,
-    stage_commit_history_available, stage_commit_history_deferred,
+    StagedCommitStateManifest, TrackedStateCommitDeltaRef, TrackedStateContext,
+    TrackedStateDeltaRef, TrackedStateKey, TrackedStateRootId, TrackedStateScanRequest,
+    commit_delta_member_scopes, commit_history_is_deferred, direct_change_locator,
+    incomplete_touched_scope_filter, load_change_record_by_id, load_commit_state_manifest,
+    load_published_commit_state_topology, stage_certified_commit_state_manifest_with_handle,
+    stage_change_locators, stage_commit_history_available, stage_commit_history_deferred,
     stage_commit_state_manifest_with_handle, stage_current_state_scoped_ranges_from_topology,
     stage_imported_addressable_commit_deltas,
 };
@@ -55,8 +54,8 @@ use crate::{Lix, LixError};
 
 use super::commit::{SyncCommit, SyncCommitMember, export_sync_commit, load_sync_commit};
 use super::protocol::{
-    SyncBranchHead, SyncCommitHeader, SyncEvent, SyncHistoryResponse, SyncPushRequest,
-    SyncPushResponse, SyncRefUpdate, SyncRepositoryPullResponse, SyncSnapshotRow,
+    SyncBranchHead, SyncCommitHeader, SyncEvent, SyncHistoryBoundary, SyncHistoryResponse,
+    SyncPushRequest, SyncPushResponse, SyncRefUpdate, SyncRepositoryPullResponse, SyncSnapshotRow,
     SyncSnapshotRowPage,
 };
 
@@ -111,10 +110,7 @@ fn parse_sync_state_root_id(value: &str) -> Result<TrackedStateRootId, LixError>
     Ok(TrackedStateRootId::new(*hash.as_bytes()))
 }
 
-fn sync_header_from_record(
-    record: &CommitRecord,
-    state_root_id: Option<String>,
-) -> SyncCommitHeader {
+fn sync_header_from_record(record: &CommitRecord) -> SyncCommitHeader {
     SyncCommitHeader {
         commit_id: record.commit_id.to_string(),
         parent_commit_ids: record
@@ -129,7 +125,6 @@ fn sync_header_from_record(
             .then(|| record.first_parent_jump_commit_id.to_string()),
         first_parent_jump_span: (record.first_parent_jump_span > 0)
             .then_some(record.first_parent_jump_span),
-        state_root_id,
     }
 }
 
@@ -535,7 +530,6 @@ struct ParsedSyncHeader {
     generation: u64,
     first_parent_jump_commit_id: CommitId,
     first_parent_jump_span: u64,
-    state_root_id: Option<TrackedStateRootId>,
 }
 
 impl ParsedSyncHeader {
@@ -593,11 +587,6 @@ impl ParsedSyncHeader {
             generation: header.generation,
             first_parent_jump_commit_id,
             first_parent_jump_span,
-            state_root_id: header
-                .state_root_id
-                .as_deref()
-                .map(parse_sync_state_root_id)
-                .transpose()?,
         })
     }
 
@@ -884,10 +873,10 @@ async fn commit_reaches_ancestor(
             // Snapshot sync deliberately omits cold history bodies. Equality
             // with the requested ancestor is checked before this load, so an
             // absent older body is an unknown ancestry boundary, not local
-            // corruption. Classifying it as non-reachability lets the normal
-            // branch reconciler rebase hot pending work without a history
-            // fetch on the write path.
-            return Ok(false);
+            // corruption. Another merge parent can still prove reachability,
+            // so keep walking every locally-known path before classifying the
+            // relation as unknown/non-reachable.
+            continue;
         };
         pending.extend(record.parent_commit_ids);
     }
@@ -1212,184 +1201,229 @@ where
             ));
         }
         let adapter = self.storage_adapter();
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let Some(state) = load_replica_state(&read, remote_id).await?.0 else {
-            return Ok(None);
-        };
-        let controls = BranchHeadControlContext::new().reader(&read).scan().await?;
-        let local_heads = controls
-            .into_iter()
-            .map(|(branch_id, control)| (branch_id, control.head_commit_id))
-            .collect::<BTreeMap<_, _>>();
-        let mut known = state
-            .authoritative_heads
-            .values()
-            .filter_map(|head| head.as_deref())
-            .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        for commit_id in &state.authority_known_commit_ids {
-            known.insert(CommitId::parse_lix(
-                commit_id,
-                "sync authority-known commit",
-            )?);
-        }
-        let mut commit_ids = BTreeSet::new();
-        let mut ref_updates = Vec::new();
-        let mut ref_updates_without_payload = BTreeSet::new();
-        let branch_ids = local_heads
-            .keys()
-            .chain(state.authoritative_heads.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        // Divergence can be created locally without a new remote event (for
-        // example reset to an old commit followed by a write). Reconcile it
-        // proactively; silently omitting the ref would otherwise leave the
-        // runtime waiting forever on a cursor that has already been consumed.
-        for branch_id in &branch_ids {
-            let Some(local) = local_heads.get(branch_id).copied() else {
-                continue;
+        let mut attempted_reconciliations = BTreeSet::new();
+        let mut remaining_reconciliations = None;
+        loop {
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let Some(state) = load_replica_state(&read, remote_id).await?.0 else {
+                return Ok(None);
             };
-            let Some(authoritative) = state
+            let controls = BranchHeadControlContext::new().reader(&read).scan().await?;
+            let local_heads = controls
+                .into_iter()
+                .map(|(branch_id, control)| (branch_id, control.head_commit_id))
+                .collect::<BTreeMap<_, _>>();
+            let mut known = state
                 .authoritative_heads
-                .get(branch_id)
-                .and_then(|head| head.as_deref())
+                .values()
+                .filter_map(|head| head.as_deref())
                 .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
-                .transpose()?
-            else {
-                continue;
-            };
-            if local == authoritative
-                || commit_reaches_ancestor(&read, local, authoritative).await?
-                || commit_reaches_ancestor(&read, authoritative, local).await?
-            {
-                continue;
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            for commit_id in &state.authority_known_commit_ids {
+                known.insert(CommitId::parse_lix(
+                    commit_id,
+                    "sync authority-known commit",
+                )?);
             }
-            drop(read);
-            self.reconcile_sync_branch(branch_id, &authoritative.to_string())
-                .await?;
-            return Box::pin(self.build_sync_push_bounded(remote_id, max_items)).await;
-        }
-        for branch_id in branch_ids {
-            let local = local_heads.get(&branch_id).copied();
-            let authoritative = state
-                .authoritative_heads
-                .get(&branch_id)
-                .and_then(|head| head.as_deref())
-                .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
-                .transpose()?;
-            if local == authoritative {
-                continue;
-            }
-            if let Some(local_head) = local {
-                if let Some(authority_head) = authoritative
-                    && commit_reaches_ancestor(&read, authority_head, local_head).await?
+            let mut commit_ids = BTreeSet::new();
+            let mut ref_updates = Vec::new();
+            let mut ref_updates_without_payload = BTreeSet::new();
+            let branch_ids = local_heads
+                .keys()
+                .chain(state.authoritative_heads.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            remaining_reconciliations.get_or_insert(branch_ids.len());
+            // Divergence can be created locally without a new remote event (for
+            // example reset to an old commit followed by a write). Remember one
+            // reconciliation candidate, but first construct every independent
+            // dependency-ready push. One conflicted branch must not hold the
+            // repository's other refs behind its merge.
+            let mut pending_reconciliation = None;
+            let mut divergent_branch_ids = BTreeSet::new();
+            for branch_id in &branch_ids {
+                let Some(local) = local_heads.get(branch_id).copied() else {
+                    continue;
+                };
+                let Some(authoritative) = state
+                    .authoritative_heads
+                    .get(branch_id)
+                    .and_then(|head| head.as_deref())
+                    .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
+                    .transpose()?
+                else {
+                    continue;
+                };
+                if local == authoritative
+                    || commit_reaches_ancestor(&read, local, authoritative).await?
+                    || commit_reaches_ancestor(&read, authoritative, local).await?
                 {
-                    // A deliberate reset to a historical authority commit has
-                    // no commit payload to upload; the ref CAS itself is the
-                    // complete operation.
-                    ref_updates.push(SyncRefUpdate {
-                        branch_id: branch_id.clone(),
-                        expected_head_commit_id: Some(authority_head.to_string()),
-                        head_commit_id: Some(local_head.to_string()),
-                    });
-                    ref_updates_without_payload.insert(branch_id);
                     continue;
                 }
-                let mut reached_authority = authoritative.is_none();
-                let mut pending = vec![local_head];
-                let mut branch_commit_ids = BTreeSet::new();
-                while let Some(cursor) = pending.pop() {
-                    if Some(cursor) == authoritative || known.contains(&cursor) {
-                        reached_authority = true;
-                        continue;
-                    }
-                    if !branch_commit_ids.insert(cursor) {
-                        continue;
-                    }
-                    let record = load_commit_record(&read, cursor).await?.ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_COMMIT_NOT_FOUND,
-                            format!("local sync head '{cursor}' has no commit record"),
-                        )
-                    })?;
-                    pending.extend(record.parent_commit_ids.iter().copied());
+                if pending_reconciliation.is_none() {
+                    pending_reconciliation = Some((branch_id.clone(), local, authoritative));
                 }
-                if authoritative.is_some() && !reached_authority {
-                    // Pull/apply owns divergence reconciliation. Never publish
-                    // a stale expected head or overwrite pending local work.
-                    // One divergent branch must not stall independent refs.
-                    continue;
-                }
-                commit_ids.extend(branch_commit_ids);
+                divergent_branch_ids.insert(branch_id.clone());
             }
-            ref_updates.push(SyncRefUpdate {
-                branch_id,
-                expected_head_commit_id: authoritative.map(|head| head.to_string()),
-                head_commit_id: local.map(|head| head.to_string()),
-            });
-        }
-        if ref_updates.is_empty() {
-            return Ok(None);
-        }
-        let mut remaining = BTreeMap::new();
-        for commit_id in commit_ids {
-            let commit = load_sync_commit(&read, commit_id).await?.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_COMMIT_NOT_FOUND,
-                    format!("local sync commit '{commit_id}' is missing"),
-                )
-            })?;
-            remaining.insert(commit_id, commit);
-        }
-        let mut included = known.clone();
-        let mut commits = Vec::with_capacity(max_items.min(remaining.len()));
-        while commits.len() < max_items && !remaining.is_empty() {
-            let ready = remaining
-                .iter()
-                .find(|(_, commit)| {
-                    commit
-                        .parent_commit_ids
-                        .iter()
-                        .map(|dependency| CommitId::parse_lix(dependency, "sync commit dependency"))
-                        .all(|dependency| dependency.is_ok_and(|id| included.contains(&id)))
-                })
-                .map(|(commit_id, _)| *commit_id)
-                .ok_or_else(|| {
+            for branch_id in branch_ids {
+                let local = local_heads.get(&branch_id).copied();
+                let authoritative = state
+                    .authoritative_heads
+                    .get(&branch_id)
+                    .and_then(|head| head.as_deref())
+                    .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
+                    .transpose()?;
+                if local == authoritative {
+                    continue;
+                }
+                // Authority-known ancestry is enough to make a commit payload
+                // dependency-complete, but it does not make a stale ref update
+                // safe. Reconciliation owns every truly divergent ref.
+                if divergent_branch_ids.contains(&branch_id) {
+                    continue;
+                }
+                if let Some(local_head) = local {
+                    if let Some(authority_head) = authoritative
+                        && commit_reaches_ancestor(&read, authority_head, local_head).await?
+                    {
+                        // A deliberate reset to a historical authority commit has
+                        // no commit payload to upload; the ref CAS itself is the
+                        // complete operation.
+                        ref_updates.push(SyncRefUpdate {
+                            branch_id: branch_id.clone(),
+                            expected_head_commit_id: Some(authority_head.to_string()),
+                            head_commit_id: Some(local_head.to_string()),
+                        });
+                        ref_updates_without_payload.insert(branch_id);
+                        continue;
+                    }
+                    let mut reached_authority = authoritative.is_none();
+                    let mut pending = vec![local_head];
+                    let mut branch_commit_ids = BTreeSet::new();
+                    while let Some(cursor) = pending.pop() {
+                        if Some(cursor) == authoritative || known.contains(&cursor) {
+                            reached_authority = true;
+                            continue;
+                        }
+                        if !branch_commit_ids.insert(cursor) {
+                            continue;
+                        }
+                        let record = load_commit_record(&read, cursor).await?.ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_COMMIT_NOT_FOUND,
+                                format!("local sync head '{cursor}' has no commit record"),
+                            )
+                        })?;
+                        pending.extend(record.parent_commit_ids.iter().copied());
+                    }
+                    if authoritative.is_some() && !reached_authority {
+                        // Pull/apply owns divergence reconciliation. Never publish
+                        // a stale expected head or overwrite pending local work.
+                        // One divergent branch must not stall independent refs.
+                        continue;
+                    }
+                    commit_ids.extend(branch_commit_ids);
+                }
+                ref_updates.push(SyncRefUpdate {
+                    branch_id,
+                    expected_head_commit_id: authoritative.map(|head| head.to_string()),
+                    head_commit_id: local.map(|head| head.to_string()),
+                });
+            }
+            if ref_updates.is_empty() {
+                let Some((branch_id, local_head, authoritative_head)) = pending_reconciliation
+                else {
+                    return Ok(None);
+                };
+                let remaining = remaining_reconciliations
+                    .as_mut()
+                    .expect("reconciliation budget initializes with branch ids");
+                if *remaining == 0 {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "sync reconciliation exceeded the initial branch count",
+                    ));
+                }
+                *remaining -= 1;
+                if !attempted_reconciliations.insert((
+                    branch_id.clone(),
+                    local_head,
+                    authoritative_head,
+                )) {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "sync reconciliation for branch '{branch_id}' did not advance its head"
+                        ),
+                    ));
+                }
+                drop(read);
+                self.reconcile_sync_branch(&branch_id, &authoritative_head.to_string())
+                    .await?;
+                continue;
+            }
+            let mut remaining = BTreeMap::new();
+            for commit_id in commit_ids {
+                let commit = load_sync_commit(&read, commit_id).await?.ok_or_else(|| {
                     LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "local sync commit graph has an unavailable dependency or cycle",
+                        LixError::CODE_COMMIT_NOT_FOUND,
+                        format!("local sync commit '{commit_id}' is missing"),
                     )
                 })?;
-            included.insert(ready);
-            commits.push(remaining.remove(&ready).expect("ready sync commit exists"));
-        }
+                remaining.insert(commit_id, commit);
+            }
+            let mut included = known.clone();
+            let mut commits = Vec::with_capacity(max_items.min(remaining.len()));
+            while commits.len() < max_items && !remaining.is_empty() {
+                let ready = remaining
+                    .iter()
+                    .find(|(_, commit)| {
+                        commit
+                            .parent_commit_ids
+                            .iter()
+                            .map(|dependency| {
+                                CommitId::parse_lix(dependency, "sync commit dependency")
+                            })
+                            .all(|dependency| dependency.is_ok_and(|id| included.contains(&id)))
+                    })
+                    .map(|(commit_id, _)| *commit_id)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "local sync commit graph has an unavailable dependency or cycle",
+                        )
+                    })?;
+                included.insert(ready);
+                commits.push(remaining.remove(&ready).expect("ready sync commit exists"));
+            }
 
-        let mut capacity = max_items.saturating_sub(commits.len());
-        let mut selected_ref_updates = Vec::new();
-        for update in ref_updates {
-            if capacity == 0 {
-                break;
+            let mut capacity = max_items.saturating_sub(commits.len());
+            let mut selected_ref_updates = Vec::new();
+            for update in ref_updates {
+                if capacity == 0 {
+                    break;
+                }
+                let target_is_ready = match update.head_commit_id.as_deref() {
+                    None => true,
+                    Some(_) if ref_updates_without_payload.contains(&update.branch_id) => true,
+                    Some(head) => included.contains(&CommitId::parse_lix(head, "sync ref target")?),
+                };
+                if target_is_ready {
+                    selected_ref_updates.push(update);
+                    capacity -= 1;
+                }
             }
-            let target_is_ready = match update.head_commit_id.as_deref() {
-                None => true,
-                Some(_) if ref_updates_without_payload.contains(&update.branch_id) => true,
-                Some(head) => included.contains(&CommitId::parse_lix(head, "sync ref target")?),
-            };
-            if target_is_ready {
-                selected_ref_updates.push(update);
-                capacity -= 1;
+            if commits.is_empty() && selected_ref_updates.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "bounded sync push could not select a dependency-complete item",
+                ));
             }
+            return Ok(Some(SyncPushRequest {
+                commits,
+                ref_updates: selected_ref_updates,
+            }));
         }
-        if commits.is_empty() && selected_ref_updates.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "bounded sync push could not select a dependency-complete item",
-            ));
-        }
-        Ok(Some(SyncPushRequest {
-            commits,
-            ref_updates: selected_ref_updates,
-        }))
     }
 
     pub(crate) async fn apply_sync_repository_pull(
@@ -1440,6 +1474,18 @@ where
                     state
                         .authority_known_commit_ids
                         .extend(event.commits.iter().map(|commit| commit.commit_id.clone()));
+                    // Only unattached acknowledgement frontiers are needed to
+                    // continue a dependency-closed multi-page upload. Parents
+                    // are superseded by their children, and a ref-attached tip
+                    // is already represented by authoritative_heads. Keeping
+                    // every observed authority commit made this set grow with
+                    // remote traffic whenever one local branch stayed
+                    // divergent.
+                    for commit in &event.commits {
+                        for parent in &commit.parent_commit_ids {
+                            state.authority_known_commit_ids.remove(parent);
+                        }
+                    }
                     for (update, observation) in event.ref_updates.iter().zip(observed) {
                         let authoritative = state
                             .authoritative_heads
@@ -1463,6 +1509,9 @@ where
                         state
                             .authoritative_heads
                             .insert(update.branch_id.clone(), update.head_commit_id.clone());
+                        if let Some(head) = update.head_commit_id.as_ref() {
+                            state.authority_known_commit_ids.remove(head);
+                        }
                     }
                     drop(read);
                     self.import_sync_repository(
@@ -1471,6 +1520,7 @@ where
                             ref_updates: applicable_refs,
                         },
                         SyncImportPurpose::ReplicaDelta,
+                        None,
                     )
                     .await?;
                     for (branch_id, authority_head) in divergent_refs {
@@ -2061,23 +2111,7 @@ where
             drop(tracked_writer);
             snapshot_root.changed_key_count = u64::try_from(parsed_heads[&head].members.len())
                 .map_err(|_| LixError::unknown("sync head mutation count exceeds u64"))?;
-            if let Some(parent) = records[&head].parent_commit_ids.first().copied() {
-                let parent_root = header_by_id
-                    .get(&parent)
-                    .and_then(|header| header.state_root_id.as_ref())
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync snapshot head '{head}' first parent '{parent}' has no stateRootId certificate"
-                            ),
-                        )
-                    })?;
-                snapshot_root.parent_roots = vec![TrackedStateCommitRootParent {
-                    commit_id: parent,
-                    root_id: parent_root.clone(),
-                }];
-            }
+            snapshot_root.complete_state_fence = true;
             stage_commit_state_manifest_with_handle(
                 &mut writes,
                 &CommitStateManifest {
@@ -2131,7 +2165,7 @@ where
                     &deltas,
                     &[],
                     &BTreeSet::new(),
-                    Some(head),
+                    CompleteWorkingDiffMode::ResetClean,
                     &mut coverage,
                 )
                 .await?;
@@ -2190,6 +2224,7 @@ where
                 },
             )
             .await?;
+        self.notify_observers_for_sync();
         self.sync_mode_state().notify_sync_change();
         Ok(())
     }
@@ -2198,7 +2233,7 @@ where
         &self,
         request: &SyncPushRequest,
     ) -> Result<SyncPushResponse, LixError> {
-        self.import_sync_repository(request, SyncImportPurpose::AuthorityPush)
+        self.import_sync_repository(request, SyncImportPurpose::AuthorityPush, None)
             .await
     }
 
@@ -2209,6 +2244,25 @@ where
                 ref_updates: Vec::new(),
             },
             SyncImportPurpose::History,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn import_sync_history_boundaries(
+        &self,
+        commits: &[SyncCommit],
+        boundaries: &[SyncHistoryBoundary],
+        rows: &[SyncSnapshotRow],
+    ) -> Result<(), LixError> {
+        self.import_sync_repository(
+            &SyncPushRequest {
+                commits: commits.to_vec(),
+                ref_updates: Vec::new(),
+            },
+            SyncImportPurpose::History,
+            Some((boundaries, rows)),
         )
         .await?;
         Ok(())
@@ -2280,6 +2334,7 @@ where
         &self,
         request: &SyncPushRequest,
         purpose: SyncImportPurpose,
+        history_boundaries: Option<(&[SyncHistoryBoundary], &[SyncSnapshotRow])>,
     ) -> Result<SyncPushResponse, LixError> {
         if purpose == SyncImportPurpose::History && !request.ref_updates.is_empty() {
             return Err(LixError::new(
@@ -2295,6 +2350,79 @@ where
                     LixError::CODE_INVALID_PARAM,
                     "sync push contains duplicate commit ids",
                 ));
+            }
+        }
+        let mut boundary_roots = BTreeMap::new();
+        let mut boundary_rows = BTreeMap::<CommitId, Vec<ParsedSnapshotRow>>::new();
+        let mut boundary_coordinates = BTreeSet::new();
+        if let Some((boundaries, rows)) = history_boundaries {
+            if purpose != SyncImportPurpose::History {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync snapshot boundaries are only valid for history import",
+                ));
+            }
+            for boundary in boundaries {
+                let commit_id =
+                    CommitId::parse_lix(&boundary.commit_id, "sync history boundary commit id")?;
+                let root = parse_sync_state_root_id(&boundary.live_state_root_id)?;
+                if boundary_roots.insert(commit_id, root).is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync history contains duplicate boundaries",
+                    ));
+                }
+            }
+            for commit_id in boundary_roots.keys() {
+                if !parsed.contains_key(commit_id) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("sync history boundary '{commit_id}' is outside its page"),
+                    ));
+                }
+                boundary_rows.insert(*commit_id, Vec::new());
+            }
+            for commit in parsed.values() {
+                let external_parent = commit
+                    .parent_commit_ids
+                    .iter()
+                    .any(|parent| !parsed.contains_key(parent));
+                if external_parent && !boundary_roots.contains_key(&commit.commit_id) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "sync history commit '{}' has external topology but no boundary",
+                            commit.commit_id
+                        ),
+                    ));
+                }
+            }
+            for row in rows {
+                let commit_id =
+                    CommitId::parse_lix(&row.branch_id, "sync history boundary snapshot branch")?;
+                let parsed_row = parse_snapshot_row(row)?;
+                if !boundary_coordinates.insert((
+                    commit_id,
+                    parsed_row.schema_key.clone(),
+                    parsed_row.file_id.clone(),
+                    parsed_row.row_pk.clone(),
+                )) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync history boundary repeats a row coordinate",
+                    ));
+                }
+                boundary_rows
+                    .get_mut(&commit_id)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            format!(
+                                "sync history snapshot rows reference unrelated boundary '{commit_id}'"
+                            ),
+                        )
+                    })?
+                    .push(parsed_row);
             }
         }
         let mut parsed_refs = Vec::with_capacity(request.ref_updates.len());
@@ -2491,6 +2619,12 @@ where
             .flat_map(ParsedCommit::dependencies)
             .filter(|dependency| !parsed.contains_key(dependency))
             .collect::<BTreeSet<_>>();
+        let required_external_topologies = parsed
+            .iter()
+            .filter(|(commit_id, _)| !boundary_rows.contains_key(commit_id))
+            .flat_map(|(_, commit)| commit.dependencies())
+            .filter(|dependency| !parsed.contains_key(dependency))
+            .collect::<BTreeSet<_>>();
         for dependency in dependencies {
             records.insert(
                 dependency,
@@ -2503,17 +2637,19 @@ where
                         )
                     })?,
             );
-            published_topologies.insert(
-                dependency,
-                load_published_commit_state_topology(&read, dependency)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("sync dependency '{dependency}' has no state authority"),
-                        )
-                    })?,
-            );
+            if required_external_topologies.contains(&dependency) {
+                published_topologies.insert(
+                    dependency,
+                    load_published_commit_state_topology(&read, dependency)
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!("sync dependency '{dependency}' has no state authority"),
+                            )
+                        })?,
+                );
+            }
         }
         for (_, _, head) in &parsed_refs {
             if let Some(head) = head
@@ -2535,6 +2671,22 @@ where
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
         stage_large_json_payloads(&mut writes, parsed.values())?;
+        let boundary_json = boundary_rows
+            .values()
+            .flatten()
+            .flat_map(|row| {
+                [
+                    Some(row.snapshot_json.as_str()),
+                    row.metadata_json.as_deref(),
+                ]
+            })
+            .flatten()
+            .filter(|json| json.len() > JSON_INLINE_MAX_BYTES)
+            .map(NormalizedJsonRef::new)
+            .collect::<Vec<_>>();
+        crate::json_store::JsonStoreContext::new()
+            .writer()
+            .stage_batch(&mut writes, JsonWritePlacementRef::OutOfBand, boundary_json)?;
         for commit_id in parsed.keys().copied() {
             stage_commit_history_available(&mut writes, commit_id);
         }
@@ -2553,6 +2705,7 @@ where
             .collect::<BTreeSet<_>>();
         let external_first_parents = root_remaining
             .iter()
+            .filter(|commit_id| !boundary_rows.contains_key(commit_id))
             .filter_map(|commit_id| parsed[commit_id].parent_commit_ids.first().copied())
             .filter(|parent| !root_remaining.contains(parent))
             .collect::<BTreeSet<_>>();
@@ -2588,6 +2741,9 @@ where
         }
         while !root_remaining.is_empty() {
             let ready = root_remaining.iter().copied().find(|commit_id| {
+                if boundary_rows.contains_key(commit_id) {
+                    return true;
+                }
                 parsed[commit_id]
                     .parent_commit_ids
                     .first()
@@ -2602,26 +2758,52 @@ where
                 ));
             };
             let commit = &parsed[&commit_id];
-            let parent = commit.parent_commit_ids.first().map(ToString::to_string);
-            let root_deltas = commit
-                .members
-                .iter()
-                .map(|member| member.as_root_delta(commit_id))
-                .collect::<Vec<_>>();
+            let parent = if boundary_rows.contains_key(&commit_id) {
+                None
+            } else {
+                commit.parent_commit_ids.first().map(ToString::to_string)
+            };
+            let root_deltas = if let Some(rows) = boundary_rows.get(&commit_id) {
+                rows.iter()
+                    .map(ParsedSnapshotRow::as_root_delta)
+                    .collect::<Vec<_>>()
+            } else {
+                commit
+                    .members
+                    .iter()
+                    .map(|member| member.as_root_delta(commit_id))
+                    .collect::<Vec<_>>()
+            };
             tracked_writer
                 .stage_commit_root(&commit_id.to_string(), parent.as_deref(), root_deltas)
                 .await?;
-            let root = tracked_writer
+            let mut root = tracked_writer
                 .staged_commit_roots()
                 .find(|root| root.commit_id == commit_id)
                 .cloned()
                 .ok_or_else(|| LixError::unknown("sync import did not stage its commit root"))?;
-            if let Some(parent) = commit.parent_commit_ids.first()
+            if !boundary_rows.contains_key(&commit_id)
+                && let Some(parent) = commit.parent_commit_ids.first()
                 && root.parent_roots.first().map(|root| root.commit_id) != Some(*parent)
             {
                 return Err(LixError::unknown(format!(
                     "sync import root '{commit_id}' did not retain first parent '{parent}'",
                 )));
+            }
+            if boundary_rows.contains_key(&commit_id) {
+                let expected_root = &boundary_roots[&commit_id];
+                if &root.root_id != expected_root {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "sync history boundary rows for '{commit_id}' do not match liveStateRootId"
+                        ),
+                    ));
+                }
+                root.changed_key_count = u64::try_from(commit.members.len())
+                    .map_err(|_| LixError::unknown("sync history mutation count exceeds u64"))?;
+                root.complete_state_fence = true;
+                debug_assert!(root.parent_roots.is_empty());
             }
             imported_roots.insert(commit_id, root);
             root_remaining.remove(&commit_id);
@@ -2771,6 +2953,48 @@ where
         let mut staged_manifests = BTreeMap::<CommitId, StagedCommitStateManifest>::new();
         let mut appended_records = Vec::new();
         let mut appended_changes = BTreeMap::<ChangeId, ChangeRecord>::new();
+        for row in boundary_rows.values().flatten() {
+            let change = ChangeRecord {
+                format_version: 2,
+                change_id: row.change_id,
+                account_id: row.change_account_id.clone(),
+                schema_key: row.schema_key.clone(),
+                row_pk: row.row_pk.clone(),
+                file_id: row.file_id.clone(),
+                snapshot: row.snapshot.clone(),
+                metadata: row.metadata.clone(),
+                created_at: row.change_created_at,
+                origin_key: row.origin_key.clone(),
+            };
+            match load_existing_sync_change(&read, change.change_id).await? {
+                Some(existing) if existing != change => {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "sync history boundary change '{}' conflicts with an existing change",
+                            change.change_id
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => match appended_changes.entry(change.change_id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(change);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get() == &change => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            format!(
+                                "sync history boundary repeats change '{}' with different content",
+                                change.change_id
+                            ),
+                        ));
+                    }
+                },
+            }
+        }
         let mut newly_imported = Vec::new();
         let mut remaining = parsed
             .keys()
@@ -2779,6 +3003,9 @@ where
             .collect::<BTreeSet<_>>();
         while !remaining.is_empty() {
             let ready = remaining.iter().copied().find(|commit_id| {
+                if boundary_rows.contains_key(commit_id) {
+                    return true;
+                }
                 parsed[commit_id].dependencies().all(|dependency| {
                     if parsed.contains_key(&dependency) && !existing.contains(&dependency) {
                         staged_manifests.contains_key(&dependency)
@@ -2878,54 +3105,73 @@ where
             stage_change_locators(&mut writes, &authored_locators);
             let mutations = staged_delta.mutation_inventory().clone();
 
-            let parent_inputs = commit
-                .parent_commit_ids
-                .iter()
-                .map(|parent| {
-                    staged_manifests
-                        .get(parent)
-                        .map(CertifiedCommitStateTopologyParent::Staged)
-                        .or_else(|| {
-                            published_topologies
-                                .get(parent)
-                                .map(CertifiedCommitStateTopologyParent::PublishedTopology)
-                        })
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!("sync parent '{parent}' lost its state authority"),
-                            )
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let publication = stage_current_state_scoped_ranges_from_topology(
-                &read,
-                &mut writes,
-                &parent_inputs,
-                None,
-                commit_id,
-                &commit.account_id,
-                &mutations,
-            )
-            .await?;
-            let manifest = CommitStateManifest {
-                commit_id,
-                change_account_id: commit.account_id.clone(),
-                replay_debt: CommitStateReplayDebt::default(),
-                mutations,
-                touched_scope_filter: publication.touched_scope_filter().clone(),
-                current_state_scoped_ranges: publication.root(),
-                snapshot_root: Some(Box::new(
-                    imported_roots
-                        .remove(&commit_id)
-                        .expect("every new sync commit staged a root"),
-                )),
+            let staged_manifest = if boundary_rows.contains_key(&commit_id) {
+                stage_commit_state_manifest_with_handle(
+                    &mut writes,
+                    &CommitStateManifest {
+                        commit_id,
+                        change_account_id: commit.account_id.clone(),
+                        replay_debt: CommitStateReplayDebt::default(),
+                        mutations,
+                        touched_scope_filter: incomplete_touched_scope_filter(),
+                        current_state_scoped_ranges: None,
+                        snapshot_root: Some(Box::new(
+                            imported_roots
+                                .remove(&commit_id)
+                                .expect("every history boundary staged a root"),
+                        )),
+                    },
+                )?
+            } else {
+                let parent_inputs = commit
+                    .parent_commit_ids
+                    .iter()
+                    .map(|parent| {
+                        staged_manifests
+                            .get(parent)
+                            .map(CertifiedCommitStateTopologyParent::Staged)
+                            .or_else(|| {
+                                published_topologies
+                                    .get(parent)
+                                    .map(CertifiedCommitStateTopologyParent::PublishedTopology)
+                            })
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!("sync parent '{parent}' lost its state authority"),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let publication = stage_current_state_scoped_ranges_from_topology(
+                    &read,
+                    &mut writes,
+                    &parent_inputs,
+                    None,
+                    commit_id,
+                    &commit.account_id,
+                    &mutations,
+                )
+                .await?;
+                let manifest = CommitStateManifest {
+                    commit_id,
+                    change_account_id: commit.account_id.clone(),
+                    replay_debt: CommitStateReplayDebt::default(),
+                    mutations,
+                    touched_scope_filter: publication.touched_scope_filter().clone(),
+                    current_state_scoped_ranges: publication.root(),
+                    snapshot_root: Some(Box::new(
+                        imported_roots
+                            .remove(&commit_id)
+                            .expect("every new sync commit staged a root"),
+                    )),
+                };
+                stage_certified_commit_state_manifest_with_handle(
+                    &mut writes,
+                    &manifest,
+                    &publication,
+                )?
             };
-            let staged_manifest = stage_certified_commit_state_manifest_with_handle(
-                &mut writes,
-                &manifest,
-                &publication,
-            )?;
 
             let generation = commit
                 .parent_commit_ids
@@ -3150,61 +3396,96 @@ where
                 },
             )
             .await?;
+        self.notify_observers_for_sync();
         self.sync_mode_state().notify_sync_change();
         Ok(SyncPushResponse { cursor })
     }
 
-    pub(crate) async fn deferred_sync_history_ids(
+    pub(crate) async fn sync_history_demand_ids(
         &self,
         commit_ids: &BTreeSet<String>,
     ) -> Result<Vec<String>, LixError> {
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let mut deferred = Vec::new();
+        let mut pending = Vec::new();
         for commit_id in commit_ids {
-            let parsed = CommitId::parse_lix(commit_id, "sync deferred history commit id")?;
-            if commit_history_is_deferred(&read, parsed).await? {
-                deferred.push(commit_id.clone());
+            let parsed = CommitId::parse_lix(commit_id, "sync history demand commit id")?;
+            if load_commit_record(&read, parsed).await?.is_none()
+                || commit_history_is_deferred(&read, parsed).await?
+            {
+                pending.push(commit_id.clone());
             }
         }
-        Ok(deferred)
+        Ok(pending)
     }
 
     pub(crate) async fn sync_history(
         &self,
-        commit_ids: &[String],
+        head: &str,
+        limit: usize,
     ) -> Result<SyncHistoryResponse, LixError> {
+        if limit == 0 || limit > super::MAX_SYNC_HISTORY_PAGE_SIZE {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "sync history limit must be between 1 and {}",
+                    super::MAX_SYNC_HISTORY_PAGE_SIZE
+                ),
+            ));
+        }
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let mut commits = Vec::with_capacity(commit_ids.len());
-        let mut missing_commit_ids = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut body_ids = BTreeSet::new();
-        for commit_id in commit_ids {
-            if !seen.insert(commit_id.clone()) {
-                continue;
-            }
-            let parsed = CommitId::parse_lix(commit_id, "sync history commit id")?;
-            match load_sync_commit(&read, parsed).await? {
-                Some(commit) => {
-                    body_ids.insert(parsed);
-                    commits.push(commit);
-                }
-                None => missing_commit_ids.push(commit_id.clone()),
-            }
+        let head = CommitId::parse_lix(head, "sync history head")?;
+        load_commit_record(&read, head)
+            .await?
+            .ok_or_else(|| LixError::commit_not_found(head.to_string(), "sync_history", "head"))?;
+        let mut next = Some(head);
+        let mut newest_first = Vec::with_capacity(limit);
+        while let Some(commit_id) = next
+            && newest_first.len() < limit
+        {
+            let record = load_commit_record(&read, commit_id).await?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("sync history chain is missing commit '{commit_id}'"),
+                )
+            })?;
+            next = record.parent_commit_ids.first().copied();
+            newest_first.push(record);
+        }
+        let body_ids = newest_first
+            .iter()
+            .map(|record| record.commit_id)
+            .collect::<BTreeSet<_>>();
+        let boundary_ids = newest_first
+            .iter()
+            .filter(|record| {
+                record
+                    .parent_commit_ids
+                    .iter()
+                    .any(|parent| !body_ids.contains(parent))
+            })
+            .map(|record| record.commit_id)
+            .collect::<BTreeSet<_>>();
+        let mut commits = Vec::with_capacity(newest_first.len());
+        for record in newest_first.iter().rev() {
+            commits.push(
+                load_sync_commit(&read, record.commit_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "sync history commit '{}' has no complete body",
+                                record.commit_id
+                            ),
+                        )
+                    })?,
+            );
         }
         let mut header_ids = body_ids.clone();
-        // Every requested body may be used as a hot snapshot head. Its root
-        // certifies that paged rows were complete, not merely well-formed.
-        let mut required_root_certificates = body_ids.clone();
-        for commit_id in &body_ids {
-            let record = load_commit_record(&read, *commit_id)
-                .await?
-                .expect("exported history body has a commit record");
+        for record in &newest_first {
             header_ids.extend(record.parent_commit_ids.iter().copied());
-            if let Some(parent) = record.parent_commit_ids.first() {
-                required_root_certificates.insert(*parent);
-            }
             if record.first_parent_jump_span > 0 {
                 header_ids.insert(record.first_parent_jump_commit_id);
             }
@@ -3228,64 +3509,45 @@ where
             let record = load_commit_record(&read, commit_id)
                 .await?
                 .expect("validated history boundary remains present");
-            let existing_root = load_commit_state_manifest(&read, commit_id)
-                .await?
-                .and_then(|manifest| manifest.snapshot_root)
-                .map(|root| root.root_id);
-            let state_root =
-                if existing_root.is_some() || !required_root_certificates.contains(&commit_id) {
-                    existing_root
-                } else {
-                    // Native repositories may predate durable state-root manifests.
-                    // Derive the boundary certificate into a discarded write set:
-                    // the wire gains an exact proof without mutating authority state.
-                    let mut tracked = TrackedStateContext::new().reader(&read);
-                    let rows = tracked
-                        .scan_batch_at_commit(
-                            &commit_id.to_string(),
-                            &TrackedStateScanRequest::default(),
-                        )
-                        .await?;
-                    let deltas = rows.iter().map(|row| TrackedStateDeltaRef {
-                        schema_key: row.schema_key(),
-                        file_id: row.file_id(),
-                        row_pk: row.row_pk(),
-                        change_id: row.change_id(),
-                        commit_id: row.commit_id(),
-                        deleted: row.deleted(),
-                        created_at: row.created_at(),
-                        updated_at: row.updated_at(),
-                    });
-                    let mut transient_writes = adapter.new_write_set();
-                    let tracked_context = TrackedStateContext::new();
-                    let mut writer = tracked_context.writer(&read, &mut transient_writes);
-                    writer
-                        .stage_commit_root(&commit_id.to_string(), None, deltas)
-                        .await?;
-                    Some(
-                        writer
-                            .staged_commit_roots()
-                            .find(|root| root.commit_id == commit_id)
-                            .expect("transient sync history root was staged")
-                            .root_id
-                            .clone(),
-                    )
-                };
-            if required_root_certificates.contains(&commit_id) && state_root.is_none() {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "sync history direct-parent boundary '{commit_id}' has no state-root certificate"
-                    ),
-                ));
-            }
-            let state_root_id = state_root.as_ref().map(format_sync_state_root_id);
-            commit_headers.push(sync_header_from_record(&record, state_root_id));
+            commit_headers.push(sync_header_from_record(&record));
+        }
+        let mut boundaries = Vec::with_capacity(boundary_ids.len());
+        for commit_id in boundary_ids {
+            let mut tracked = TrackedStateContext::new().reader(&read);
+            let rows = tracked
+                .scan_batch_at_commit(&commit_id.to_string(), &TrackedStateScanRequest::default())
+                .await?;
+            let deltas = rows.iter().map(|row| TrackedStateDeltaRef {
+                schema_key: row.schema_key(),
+                file_id: row.file_id(),
+                row_pk: row.row_pk(),
+                change_id: row.change_id(),
+                commit_id: row.commit_id(),
+                deleted: false,
+                created_at: row.created_at(),
+                updated_at: row.updated_at(),
+            });
+            let mut transient_writes = adapter.new_write_set();
+            let tracked_context = TrackedStateContext::new();
+            let mut writer = tracked_context.writer(&read, &mut transient_writes);
+            writer
+                .stage_commit_root(&commit_id.to_string(), None, deltas)
+                .await?;
+            let live_state_root_id = writer
+                .staged_commit_roots()
+                .find(|root| root.commit_id == commit_id)
+                .expect("transient history boundary root was staged")
+                .root_id
+                .clone();
+            boundaries.push(SyncHistoryBoundary {
+                commit_id: commit_id.to_string(),
+                live_state_root_id: format_sync_state_root_id(&live_state_root_id),
+            });
         }
         Ok(SyncHistoryResponse {
             commits,
             commit_headers,
-            missing_commit_ids,
+            boundaries,
         })
     }
 
@@ -3539,6 +3801,7 @@ mod tests {
         CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, NullableKeyFilter, SwitchBranchOptions, Value,
         open_lix,
     };
+    use std::time::Duration;
 
     const TEST_REMOTE: &str = "https://sync.example/repository";
 
@@ -3569,6 +3832,101 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ancestry_walk_explores_other_merge_parents_after_a_sparse_boundary() {
+        let lix = open_lix().await.expect("open Lix");
+        let snapshot = lix
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("load initial snapshot");
+        let (_, ancestor) = default_head(&snapshot);
+        let ancestor =
+            CommitId::parse_lix(&ancestor, "known merge ancestor").expect("ancestor id parses");
+        let absent = CommitId::for_test_label("absent-secondary-merge-parent");
+        let merge = CommitId::for_test_label("sparse-merge-descendant");
+
+        let adapter = lix.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open ancestor read");
+        let ancestor_record = load_commit_record(&read, ancestor)
+            .await
+            .expect("load ancestor")
+            .expect("ancestor exists");
+        drop(read);
+        let mut merge_header = sync_header_from_record(&ancestor_record);
+        merge_header.commit_id = merge.to_string();
+        // The walker is LIFO. Put the absent parent last so it is visited
+        // before the known ancestor and cannot mask the reachable path.
+        merge_header.parent_commit_ids = vec![ancestor.to_string(), absent.to_string()];
+        merge_header.generation = ancestor_record.generation.saturating_add(1);
+        merge_header.first_parent_jump_commit_id = None;
+        merge_header.first_parent_jump_span = None;
+        lix.import_sync_history_headers(&[merge_header])
+            .await
+            .expect("install sparse merge header");
+
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open ancestry read");
+        assert!(
+            commit_reaches_ancestor(&read, merge, ancestor)
+                .await
+                .expect("known merge parent proves reachability"),
+            "an absent sibling parent must not hide a known ancestor path",
+        );
+    }
+
+    #[tokio::test]
+    async fn applying_a_sync_delta_invalidates_observers_without_waiting_for_storage_polling() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        write_key_value(&authority, "observed-sync-value", "before").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("authority snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let params = [Value::Text("observed-sync-value".to_owned())];
+        let mut events = replica
+            .observe("SELECT value FROM lix_key_value WHERE key = $1", &params)
+            .expect("observe replica value");
+        events
+            .next()
+            .await
+            .expect("initial observer evaluation succeeds")
+            .expect("initial observer event exists");
+
+        write_key_value(&authority, "observed-sync-value", "after").await;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("authority delta should load");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("replica should apply remote delta");
+
+        let event = tokio::time::timeout(Duration::from_millis(100), events.next())
+            .await
+            .expect("direct sync apply should wake observers before the 250 ms storage poll")
+            .expect("remote observer evaluation succeeds")
+            .expect("remote observer event exists");
+        assert_eq!(
+            event.rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("observed value decodes"),
+            serde_json::json!("after"),
+        );
+    }
+
     fn default_head(snapshot: &SyncRepositoryPullResponse) -> (String, String) {
         let SyncRepositoryPullResponse::Snapshot {
             default_branch_id,
@@ -3593,14 +3951,38 @@ mod tests {
         let SyncRepositoryPullResponse::Snapshot { branches, .. } = snapshot else {
             unreachable!("initial pull is a snapshot");
         };
-        let head_ids = branches
+        let mut commits = BTreeMap::new();
+        let mut headers = BTreeMap::new();
+        let mut boundaries = BTreeMap::new();
+        for head in branches
             .iter()
-            .filter_map(|branch| branch.head_commit_id.clone())
-            .collect::<Vec<_>>();
-        let history = authority
-            .sync_history(&head_ids)
-            .await
-            .expect("snapshot head history should load");
+            .filter_map(|branch| branch.head_commit_id.as_deref())
+        {
+            let page = authority
+                .sync_history(head, 1)
+                .await
+                .expect("snapshot head history should load");
+            commits.extend(
+                page.commits
+                    .into_iter()
+                    .map(|commit| (commit.commit_id.clone(), commit)),
+            );
+            headers.extend(
+                page.commit_headers
+                    .into_iter()
+                    .map(|header| (header.commit_id.clone(), header)),
+            );
+            boundaries.extend(
+                page.boundaries
+                    .into_iter()
+                    .map(|boundary| (boundary.commit_id.clone(), boundary)),
+            );
+        }
+        let history = SyncHistoryResponse {
+            commits: commits.into_values().collect(),
+            commit_headers: headers.into_values().collect(),
+            boundaries: boundaries.into_values().collect(),
+        };
         let mut rows = Vec::new();
         for branch in branches {
             let Some(head) = branch.head_commit_id.as_deref() else {
@@ -3724,12 +4106,86 @@ mod tests {
         }
     }
 
+    async fn working_diff_count(lix: &Lix<Memory>) -> i64 {
+        lix.execute("SELECT COUNT(*) AS count FROM lix_working_diff", &[])
+            .await
+            .expect("working diff should remain readable")
+            .rows()[0]
+            .get::<i64>("count")
+            .expect("working diff count should decode")
+    }
+
+    async fn read_file_content(lix: &Lix<Memory>, path: &str) -> Value {
+        lix.execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_owned())],
+        )
+        .await
+        .expect("file content should remain readable")
+        .rows()[0]
+            .get::<Value>("content")
+            .expect("file content should decode")
+    }
+
     async fn publish_pending(replica: &Lix<Memory>, authority: &Lix<Memory>) -> SyncPushRequest {
         let request = replica
             .build_sync_push(TEST_REMOTE)
             .await
             .expect("pending push should build")
             .expect("replica should have pending work");
+        authority
+            .push_sync_repository(&request)
+            .await
+            .expect("authority should accept pending work");
+        request
+    }
+
+    async fn transfer_commit_blobs(
+        source: &Lix<Memory>,
+        target: &Lix<Memory>,
+        commits: &[SyncCommit],
+    ) {
+        let blob_ids = commits
+            .iter()
+            .flat_map(|commit| commit.members.iter())
+            .filter(|member| member.schema_key == "lix_binary_blob_ref" && !member.deleted)
+            .filter_map(|member| member.snapshot.as_ref())
+            .filter_map(|snapshot| snapshot["blob_hash"].as_str().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        for blob_id in blob_ids {
+            let manifest = source
+                .get_sync_blob_manifest(&blob_id)
+                .await
+                .expect("outbound manifest should load")
+                .expect("outbound manifest should exist");
+            for chunk in &manifest.chunks {
+                let bytes = source
+                    .get_sync_chunk(&chunk.chunk_id)
+                    .await
+                    .expect("outbound chunk should load")
+                    .expect("outbound chunk should exist");
+                target
+                    .put_sync_chunk(&chunk.chunk_id, &bytes)
+                    .await
+                    .expect("authority should accept chunk");
+            }
+            target
+                .register_sync_blob_manifest(&manifest)
+                .await
+                .expect("authority should accept manifest");
+        }
+    }
+
+    async fn publish_pending_with_blobs(
+        replica: &Lix<Memory>,
+        authority: &Lix<Memory>,
+    ) -> SyncPushRequest {
+        let request = replica
+            .build_sync_push(TEST_REMOTE)
+            .await
+            .expect("pending push should build")
+            .expect("replica should have pending work");
+        transfer_commit_blobs(replica, authority, &request.commits).await;
         authority
             .push_sync_repository(&request)
             .await
@@ -3861,7 +4317,7 @@ mod tests {
             .expect("non-root snapshot should load");
         let (_, head) = default_head(&snapshot);
         let history = authority
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("head history should load");
         let head_commits = &history.commits;
@@ -3894,7 +4350,7 @@ mod tests {
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         assert_eq!(read_key_value(&replica, "bootstrap").await, "visible");
         let history_error = replica
-            .sync_history(std::slice::from_ref(&deferred_parent))
+            .sync_history(&deferred_parent, 1)
             .await
             .expect_err("a header-only ancestor must demand lazy history");
         assert_eq!(history_error.code, "LIX_SYNC_HISTORY_REQUIRED");
@@ -3989,7 +4445,7 @@ mod tests {
             .expect("deep snapshot metadata should load");
         let (_, head) = default_head(&snapshot);
         let history = authority
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("deep head history should load");
         let header_ids = history
@@ -4027,7 +4483,7 @@ mod tests {
             .expect("checkpoint snapshot should load");
         let (_, head) = default_head(&snapshot);
         let authority_commit = authority
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("authority checkpoint history should load")
             .commits
@@ -4054,7 +4510,7 @@ mod tests {
             .expect("a source-less complete checkpoint owns its selected payloads");
         assert_eq!(
             authority
-                .sync_history(std::slice::from_ref(&forged_id))
+                .sync_history(&forged_id, 1)
                 .await
                 .expect("complete checkpoint history should load")
                 .commits,
@@ -4099,7 +4555,7 @@ mod tests {
         );
         drop(read);
         let replica_commit = loop {
-            match replica.sync_history(std::slice::from_ref(&head)).await {
+            match replica.sync_history(&head, 1).await {
                 Ok(history) => {
                     break history
                         .commits
@@ -4116,18 +4572,20 @@ mod tests {
                         .iter()
                         .map(|id| id.as_str().expect("history demand id").to_owned())
                         .collect::<Vec<_>>();
-                    let history = authority
-                        .sync_history(&commit_ids)
-                        .await
-                        .expect("deferred checkpoint dependency should load");
-                    replica
-                        .import_sync_history_headers(&history.commit_headers)
-                        .await
-                        .expect("checkpoint dependency headers should import");
-                    replica
-                        .import_sync_history(&history.commits)
-                        .await
-                        .expect("checkpoint dependency bodies should import");
+                    for commit_id in commit_ids {
+                        let history = authority
+                            .sync_history(&commit_id, 1)
+                            .await
+                            .expect("deferred checkpoint dependency should load");
+                        replica
+                            .import_sync_history_headers(&history.commit_headers)
+                            .await
+                            .expect("checkpoint dependency headers should import");
+                        replica
+                            .import_sync_history(&history.commits)
+                            .await
+                            .expect("checkpoint dependency bodies should import");
+                    }
                 }
                 Err(error) => panic!("replica checkpoint history should load: {error:?}"),
             }
@@ -4206,7 +4664,7 @@ mod tests {
             .expect("source snapshot should load");
         let (_, source_head) = default_head(&source_snapshot);
         let source_commit = source
-            .sync_history(std::slice::from_ref(&source_head))
+            .sync_history(&source_head, 1)
             .await
             .expect("source history should load")
             .commits
@@ -4235,7 +4693,7 @@ mod tests {
         assert_eq!(second.cursor, first.cursor);
         assert_eq!(
             target
-                .sync_history(std::slice::from_ref(&source_head))
+                .sync_history(&source_head, 1)
                 .await
                 .expect("imported history should load")
                 .commits,
@@ -4331,6 +4789,20 @@ mod tests {
                 .apply_sync_repository_pull(TEST_REMOTE, &delta)
                 .await
                 .expect("replica should persist the authority acknowledgement");
+            let read = replica
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("acknowledgement state read should open");
+            let acknowledged = load_replica_state(&read, TEST_REMOTE)
+                .await
+                .expect("acknowledgement state should load")
+                .0
+                .expect("replica state should exist");
+            assert!(
+                acknowledged.authority_known_commit_ids.len() <= 1,
+                "a linear multi-page upload retains only its unattached frontier",
+            );
             push_count += 1;
         }
 
@@ -4364,7 +4836,7 @@ mod tests {
             .expect("source snapshot should load");
         let (_, source_head) = default_head(&source_snapshot);
         let source_commit = source
-            .sync_history(std::slice::from_ref(&source_head))
+            .sync_history(&source_head, 1)
             .await
             .expect("source history should load")
             .commits
@@ -4394,14 +4866,11 @@ mod tests {
             LixError::CODE_TRANSACTION_CONFLICT,
             "unexpected pre-CAS failure: {error:?}",
         );
-        assert_eq!(
-            target
-                .sync_history(std::slice::from_ref(&source_head))
-                .await
-                .expect("history query should succeed")
-                .missing_commit_ids,
-            vec![source_head]
-        );
+        let error = target
+            .sync_history(&source_head, 1)
+            .await
+            .expect_err("missing history head must fail");
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -4448,7 +4917,7 @@ mod tests {
             .expect("source snapshot should load");
         let (_, head) = default_head(&snapshot);
         let mut commit = source
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("source history should load")
             .commits
@@ -4476,7 +4945,7 @@ mod tests {
             .expect("the complete commit's authoritative id should use locator fallback");
         assert_eq!(
             target
-                .sync_history(std::slice::from_ref(&head))
+                .sync_history(&head, 1)
                 .await
                 .expect("imported history should load")
                 .commits,
@@ -4749,6 +5218,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_merge_history_page_boundaries_cover_every_external_parent() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "base", "shared").await;
+        let base_snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("base snapshot should load");
+        let cold = replica_from_snapshot(&authority, &base_snapshot).await;
+        let left = replica_from_snapshot(&authority, &base_snapshot).await;
+        let right = replica_from_snapshot(&authority, &base_snapshot).await;
+
+        write_key_value(&left, "left", "authority-first").await;
+        write_key_value(&right, "right", "secondary-parent").await;
+        publish_pending(&left, &authority).await;
+        let delta = authority
+            .pull_sync_repository(Some(0), 128)
+            .await
+            .expect("authority delta should load");
+        right
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("right replica should reconcile into a merge");
+        let merge_push = publish_pending(&right, &authority).await;
+        let merge_head = merge_push.ref_updates[0]
+            .head_commit_id
+            .clone()
+            .expect("merge push should advance the branch");
+
+        let page = authority
+            .sync_history(&merge_head, 2)
+            .await
+            .expect("cold merge page should load");
+        let body_ids = page
+            .commits
+            .iter()
+            .map(|commit| commit.commit_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let merge = page
+            .commits
+            .iter()
+            .find(|commit| commit.commit_id == merge_head)
+            .expect("page should contain its merge head");
+        assert_eq!(merge.parent_commit_ids.len(), 2);
+        assert!(
+            body_ids.contains(merge.parent_commit_ids[0].as_str()),
+            "the merge first parent should be in the page"
+        );
+        assert!(
+            merge
+                .parent_commit_ids
+                .iter()
+                .any(|parent| !body_ids.contains(parent.as_str())),
+            "the merge secondary parent should be outside the page"
+        );
+        let boundary_ids = page
+            .boundaries
+            .iter()
+            .map(|boundary| boundary.commit_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            boundary_ids.contains(merge_head.as_str()),
+            "a merge with an external secondary parent must be a boundary"
+        );
+        assert_eq!(
+            boundary_ids.len(),
+            2,
+            "the merge and the page's oldest first-parent commit both need boundaries"
+        );
+
+        let mut rows = Vec::new();
+        for boundary in &page.boundaries {
+            let mut continuation = None;
+            loop {
+                let row_page = authority
+                    .pull_sync_snapshot_rows(
+                        &boundary.commit_id,
+                        &boundary.commit_id,
+                        continuation.as_deref(),
+                        MAX_REPOSITORY_PULL_LIMIT,
+                    )
+                    .await
+                    .expect("boundary snapshot rows should load");
+                rows.extend(row_page.rows);
+                let Some(next) = row_page.continuation else {
+                    break;
+                };
+                continuation = Some(next);
+            }
+        }
+        cold.import_sync_history_headers(&page.commit_headers)
+            .await
+            .expect("cold replica should accept sparse topology");
+        cold.import_sync_history_boundaries(&page.commits, &page.boundaries, &rows)
+            .await
+            .expect("cold replica should import a merge page with two boundaries");
+        assert_eq!(
+            cold.sync_history(&merge_head, 2)
+                .await
+                .expect("imported merge history should be readable")
+                .commits,
+            page.commits,
+        );
+    }
+
+    #[tokio::test]
     async fn history_headers_reject_a_forged_generation() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "generation", "parent").await;
@@ -4759,7 +5333,7 @@ mod tests {
             .expect("snapshot metadata should load");
         let (_, head) = default_head(&snapshot);
         let mut history = authority
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("history should load");
         history
@@ -4787,7 +5361,7 @@ mod tests {
             .expect("snapshot metadata should load");
         let (_, head) = default_head(&snapshot);
         let history = authority
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("history should load");
         let original = history
@@ -4829,7 +5403,7 @@ mod tests {
             .expect("snapshot should load");
         let (_, head) = default_head(&snapshot);
         let template = authority
-            .sync_history(std::slice::from_ref(&head))
+            .sync_history(&head, 1)
             .await
             .expect("history should load")
             .commit_headers
@@ -4845,14 +5419,12 @@ mod tests {
         first_header.generation = 2;
         first_header.first_parent_jump_commit_id = None;
         first_header.first_parent_jump_span = None;
-        first_header.state_root_id = None;
         let mut second_header = template;
         second_header.commit_id = second;
         second_header.parent_commit_ids = vec![first, omitted];
         second_header.generation = 2;
         second_header.first_parent_jump_commit_id = None;
         second_header.first_parent_jump_span = None;
-        second_header.state_root_id = None;
 
         let replica = open_lix().await.expect("replica should open");
         let error = replica
@@ -4874,7 +5446,7 @@ mod tests {
             .expect("snapshot should load");
         let (main_branch_id, authority_head) = default_head(&snapshot);
         let history = authority
-            .sync_history(std::slice::from_ref(&authority_head))
+            .sync_history(&authority_head, 1)
             .await
             .expect("authority head history should load");
         let historical_head = history
@@ -4953,22 +5525,28 @@ mod tests {
                     ref_updates: Vec::new(),
                 },
                 SyncImportPurpose::ReplicaDelta,
+                None,
             )
             .await
             .expect("consumed delta commits should be locally available");
 
         // Model a consumed cursor whose authority receipt was persisted before
         // local reconciliation (the same graph shape as reset-to-old + write).
+        let SyncRepositoryPullResponse::Snapshot { branches, .. } = &snapshot else {
+            unreachable!("fixture response is a snapshot");
+        };
+        let mut authoritative_heads = branches
+            .iter()
+            .map(|branch| (branch.branch_id.clone(), branch.head_commit_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        authoritative_heads.insert(branch_id.clone(), Some(authority_head.clone()));
         local
             .store_replica_state(
                 TEST_REMOTE,
                 SyncReplicaState {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
-                    authoritative_heads: BTreeMap::from([(
-                        branch_id.clone(),
-                        Some(authority_head.clone()),
-                    )]),
+                    authoritative_heads,
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -4992,6 +5570,126 @@ mod tests {
         assert_ne!(
             update.head_commit_id.as_deref(),
             Some(authority_head.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn divergent_branch_does_not_starve_an_independent_ready_ref() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "base", "shared").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (divergent_branch_id, base_head) = default_head(&snapshot);
+        let local = replica_from_snapshot(&authority, &snapshot).await;
+        let remote_writer = replica_from_snapshot(&authority, &snapshot).await;
+        let independent_branch_id = "01920000-0000-7000-8000-000000001501".to_owned();
+        local
+            .create_branch(CreateBranchOptions {
+                id: Some(independent_branch_id.clone()),
+                name: "independent ready branch".to_owned(),
+                from_commit_id: Some(base_head.clone()),
+            })
+            .await
+            .expect("independent branch should be created");
+        local
+            .switch_branch(SwitchBranchOptions {
+                branch_id: divergent_branch_id.clone(),
+            })
+            .await
+            .expect("fixture should return to the branch that will diverge");
+
+        write_key_value(&local, "local-divergence", "local").await;
+        let local_head_before = {
+            let read = local
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("local head read should open");
+            BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&divergent_branch_id)
+                .await
+                .expect("local head should load")
+                .expect("local branch should exist")
+                .head_commit_id
+        };
+
+        write_key_value(&remote_writer, "authority-divergence", "remote").await;
+        let published = publish_pending(&remote_writer, &authority).await;
+        let authority_head = published.ref_updates[0]
+            .head_commit_id
+            .clone()
+            .expect("remote push should advance authority");
+        local
+            .import_sync_repository(
+                &SyncPushRequest {
+                    commits: published.commits,
+                    ref_updates: Vec::new(),
+                },
+                SyncImportPurpose::ReplicaDelta,
+                None,
+            )
+            .await
+            .expect("authority commits should import without moving local refs");
+
+        let SyncRepositoryPullResponse::Snapshot { branches, .. } = &snapshot else {
+            unreachable!("fixture response is a snapshot");
+        };
+        let mut authoritative_heads = branches
+            .iter()
+            .map(|branch| (branch.branch_id.clone(), branch.head_commit_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        authoritative_heads.insert(divergent_branch_id.clone(), Some(authority_head));
+        local
+            .store_replica_state(
+                TEST_REMOTE,
+                SyncReplicaState {
+                    active_account_id: local.active_account_id().to_owned(),
+                    cursor: 1,
+                    authoritative_heads,
+                    authority_known_commit_ids: BTreeSet::new(),
+                },
+            )
+            .await
+            .expect("authority receipt should store");
+
+        let push = local
+            .build_sync_push(TEST_REMOTE)
+            .await
+            .expect("independent push should build")
+            .expect("independent branch ref should be ready");
+        assert!(
+            push.ref_updates
+                .iter()
+                .any(|update| update.branch_id == independent_branch_id),
+            "the ready branch must publish before divergent reconciliation",
+        );
+        assert!(
+            push.ref_updates
+                .iter()
+                .all(|update| update.branch_id != divergent_branch_id),
+            "the stale expected head must not be published",
+        );
+
+        let local_head_after = {
+            let read = local
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("post-build local head read should open");
+            BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&divergent_branch_id)
+                .await
+                .expect("post-build local head should load")
+                .expect("post-build local branch should exist")
+                .head_commit_id
+        };
+        assert_eq!(
+            local_head_after, local_head_before,
+            "building independent work must not reconcile the divergent branch first",
         );
     }
 
@@ -5087,6 +5785,147 @@ mod tests {
 
         assert_eq!(read_key_value(&authority, "left").await, "from-left");
         assert_eq!(read_key_value(&authority, "right").await, "from-right");
+    }
+
+    #[tokio::test]
+    async fn divergent_file_insert_and_edit_preserve_checkpoint_cursor_and_both_rows() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/existing.md".to_owned()),
+                    Value::Text("base".to_owned()),
+                ],
+            )
+            .await
+            .expect("base file should commit");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (branch_id, _) = default_head(&snapshot);
+        let inserting_replica = replica_from_snapshot(&authority, &snapshot).await;
+        let editing_replica = replica_from_snapshot(&authority, &snapshot).await;
+        let (snapshot_history, _) = snapshot_parts(&authority, &snapshot).await;
+        transfer_commit_blobs(&authority, &inserting_replica, &snapshot_history.commits).await;
+        transfer_commit_blobs(&authority, &editing_replica, &snapshot_history.commits).await;
+
+        inserting_replica
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/created.md".to_owned()),
+                    Value::Text("created".to_owned()),
+                ],
+            )
+            .await
+            .expect("new file should commit locally");
+        editing_replica
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
+                &[
+                    Value::Text("edited".to_owned()),
+                    Value::Text("/existing.md".to_owned()),
+                ],
+            )
+            .await
+            .expect("existing file should edit locally");
+
+        for replica in [&inserting_replica, &editing_replica] {
+            let read = replica
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("pre-reconcile control read should open");
+            let control = BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&branch_id)
+                .await
+                .expect("pre-reconcile control should load")
+                .expect("pre-reconcile control should exist");
+            assert!(
+                control.working_diff_checkpoint_commit_id.is_some(),
+                "ordinary local file writes must preserve the checkpoint cursor",
+            );
+            assert!(
+                working_diff_count(replica).await > 0,
+                "ordinary local file writes must remain dirty against the checkpoint",
+            );
+        }
+
+        publish_pending_with_blobs(&editing_replica, &authority).await;
+        let delta = authority
+            .pull_sync_repository(Some(0), 128)
+            .await
+            .expect("authority delta should load");
+        let SyncRepositoryPullResponse::Delta { events, .. } = &delta else {
+            panic!("a cursor pull should return a delta");
+        };
+        for event in events {
+            transfer_commit_blobs(&authority, &inserting_replica, &event.commits).await;
+        }
+        inserting_replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("file divergence should reconcile");
+
+        let adapter = inserting_replica.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch control read should open");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("branch control should load")
+            .expect("branch control should exist");
+        assert!(
+            control.working_diff_checkpoint_commit_id.is_some(),
+            "reconciliation must preserve the private checkpoint cursor",
+        );
+        drop(read);
+
+        let paths = inserting_replica
+            .execute(
+                "SELECT path FROM lix_file WHERE path IN ('/created.md', '/existing.md') ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("both reconciled files should remain queryable");
+        assert_eq!(paths.rows().len(), 2);
+        assert!(
+            working_diff_count(&inserting_replica).await > 0,
+            "reconciliation must retain the pending insert in working diff",
+        );
+        assert_eq!(
+            read_file_content(&inserting_replica, "/existing.md").await,
+            Value::Blob(b"edited".to_vec().into()),
+        );
+
+        let retry = inserting_replica
+            .build_sync_push(TEST_REMOTE)
+            .await
+            .expect("reconciled push should build")
+            .expect("created file should remain pending");
+        transfer_commit_blobs(&inserting_replica, &authority, &retry.commits).await;
+        authority
+            .push_sync_repository(&retry)
+            .await
+            .expect("authority should accept the reconciled file edit");
+        let authority_paths = authority
+            .execute(
+                "SELECT path FROM lix_file WHERE path IN ('/created.md', '/existing.md') ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("authority should expose both files");
+        assert_eq!(authority_paths.rows().len(), 2);
+        assert_eq!(
+            read_file_content(&authority, "/existing.md").await,
+            Value::Blob(b"edited".to_vec().into()),
+        );
     }
 
     #[tokio::test]

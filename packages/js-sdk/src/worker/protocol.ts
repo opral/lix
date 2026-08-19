@@ -25,6 +25,7 @@ export type WorkerSyncFetchRequest = {
 	headers: [string, string][];
 	body?: string | Uint8Array;
 	credentials?: RequestCredentials;
+	responseLimit: number;
 };
 
 export type WorkerSyncFetchResponse = {

@@ -388,7 +388,11 @@ export class LixWorkerClient {
 				credentials: request.credentials,
 				signal: controller.signal,
 			});
-			const body = new Uint8Array(await response.arrayBuffer());
+			const body = await readSyncResponseBody(
+				response,
+				request.responseLimit,
+				controller,
+			);
 			this.notify({
 				kind: "sync.fetch.result",
 				requestId,
@@ -403,7 +407,7 @@ export class LixWorkerClient {
 				},
 			});
 		} catch (error) {
-			if (!controller.signal.aborted) {
+			if (!controller.signal.aborted || isSyncResponseTooLarge(error)) {
 				this.notify({
 					kind: "sync.fetch.result",
 					requestId,
@@ -430,6 +434,69 @@ export class LixWorkerClient {
 		this.pending.clear();
 		this.connection.unref();
 	}
+}
+
+async function readSyncResponseBody(
+	response: Response,
+	limit: number,
+	controller: AbortController,
+): Promise<Uint8Array> {
+	if (!Number.isSafeInteger(limit) || limit <= 0) {
+		throw new TypeError("Browser sync fetch has no valid response limit");
+	}
+	const declaredLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(declaredLength) && declaredLength > limit) {
+		const error = syncResponseTooLarge(limit);
+		controller.abort(error);
+		throw error;
+	}
+	const stream = response.body;
+	if (!stream) return new Uint8Array();
+
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > limit) {
+				const error = syncResponseTooLarge(limit);
+				controller.abort(error);
+				await reader.cancel(error).catch(() => undefined);
+				throw error;
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const body = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return body;
+}
+
+function syncResponseTooLarge(limit: number): Error & { code: string } {
+	const error = new Error(`sync fetch response exceeds ${limit} bytes`) as Error & {
+		code: string;
+	};
+	error.name = "LixError";
+	error.code = "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE";
+	return error;
+}
+
+function isSyncResponseTooLarge(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		(error as Error & { code?: string }).code ===
+			"LIX_ERROR_SYNC_RESPONSE_TOO_LARGE"
+	);
 }
 
 function workerClosedError(): Error & { code: string } {

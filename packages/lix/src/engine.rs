@@ -206,6 +206,10 @@ where
         self.sync_mode.clone()
     }
 
+    pub(crate) fn notify_observers(&self) {
+        self.observe_invalidation.bump();
+    }
+
     pub(crate) fn collaboration_write_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.collaboration_write_gate)
     }
