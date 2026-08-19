@@ -133,7 +133,11 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD16";
 // commit independently from semantic graph ancestry.
 // Version 10 splits the authority header from a separately keyed mutation
 // catalog and authenticates a content-addressed hierarchical part directory.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS10";
+// Version 11 adds the detached complete-state fence to snapshot-root metadata.
+// V10 remains readable because deployed repositories already contain these
+// immutable headers; the sync wire protocol itself has no compatibility lane.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS11";
+const COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC: &[u8] = b"LXCS10";
 const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI1";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
@@ -641,6 +645,67 @@ struct StoredCommitStateManifest {
     current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
     #[musli(with = storage_codec::option)]
     snapshot_root: Option<Box<TrackedStateCommitRoot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredCommitStateManifestV10 {
+    commit_id: CommitId,
+    change_account_id: String,
+    replay_debt: crate::tracked_state::CommitStateReplayDebt,
+    #[musli(with = storage_codec::option)]
+    selected_source_commit_id: Option<[u8; 16]>,
+    mutation_inventory_digest: [u8; 32],
+    mutation_transition_digest: [u8; 32],
+    mutation_member_count: u32,
+    mutation_part_count: u32,
+    #[musli(with = storage_codec::option)]
+    mutation_directory_root: Option<super::mutation_directory::MutationDirectoryRoot>,
+    touched_scope_filter: crate::tracked_state::types::CommitStateTouchedScopeFilter,
+    #[musli(with = storage_codec::option)]
+    current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    #[musli(with = storage_codec::option)]
+    snapshot_root: Option<Box<TrackedStateCommitRootV10>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct TrackedStateCommitRootV10 {
+    commit_id: CommitId,
+    root_id: TrackedStateRootId,
+    parent_roots: Vec<crate::tracked_state::types::TrackedStateCommitRootParent>,
+    changed_key_count: u64,
+    row_count_estimate: u64,
+    tree_height: u32,
+}
+
+impl From<StoredCommitStateManifestV10> for StoredCommitStateManifest {
+    fn from(stored: StoredCommitStateManifestV10) -> Self {
+        Self {
+            commit_id: stored.commit_id,
+            change_account_id: stored.change_account_id,
+            replay_debt: stored.replay_debt,
+            selected_source_commit_id: stored.selected_source_commit_id,
+            mutation_inventory_digest: stored.mutation_inventory_digest,
+            mutation_transition_digest: stored.mutation_transition_digest,
+            mutation_member_count: stored.mutation_member_count,
+            mutation_part_count: stored.mutation_part_count,
+            mutation_directory_root: stored.mutation_directory_root,
+            touched_scope_filter: stored.touched_scope_filter,
+            current_state_scoped_ranges: stored.current_state_scoped_ranges,
+            snapshot_root: stored.snapshot_root.map(|root| {
+                Box::new(TrackedStateCommitRoot {
+                    commit_id: root.commit_id,
+                    root_id: root.root_id,
+                    parent_roots: root.parent_roots,
+                    changed_key_count: root.changed_key_count,
+                    row_count_estimate: root.row_count_estimate,
+                    tree_height: root.tree_height,
+                    complete_state_fence: false,
+                })
+            }),
+        }
+    }
 }
 
 /// Small separately keyed mutation catalog. Large ordered part metadata lives
@@ -13554,14 +13619,18 @@ fn decode_encoded_commit_state_manifest(
 fn decode_stored_commit_state_manifest(
     bytes: &[u8],
 ) -> Result<StoredCommitStateManifest, LixError> {
-    let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC) else {
+    let stored = if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC) {
+        storage_codec::decode("tracked_state commit_state_manifest", payload)?
+    } else if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC) {
+        let stored: StoredCommitStateManifestV10 =
+            storage_codec::decode("tracked_state v10 commit_state_manifest", payload)?;
+        stored.into()
+    } else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state commit_state_manifest has an unsupported format; recreate the repository",
         ));
     };
-    let stored: StoredCommitStateManifest =
-        storage_codec::decode("tracked_state commit_state_manifest", payload)?;
     validate_commit_state_manifest_header(&stored)?;
     Ok(stored)
 }
@@ -18625,6 +18694,64 @@ mod tests {
         let decoded =
             decode_encoded_commit_state_manifest(&encoded).expect("manifest should round trip");
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn commit_state_manifest_v10_snapshot_root_decodes_without_a_complete_state_fence() {
+        let mut manifest = commit_state_manifest_fixture();
+        manifest.replay_debt = CommitStateReplayDebt::default();
+        manifest.snapshot_root = Some(Box::new(TrackedStateCommitRoot {
+            commit_id: manifest.commit_id,
+            root_id: TrackedStateRootId::new([1; 32]),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            complete_state_fence: false,
+        }));
+        let encoded = encode_commit_state_manifest(&manifest).expect("v11 fixture should encode");
+        let stored: super::StoredCommitStateManifest = storage_codec::decode(
+            "tracked_state v11 commit_state_manifest fixture",
+            encoded
+                .header
+                .strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC)
+                .expect("fixture has v11 magic"),
+        )
+        .expect("v11 fixture header should decode");
+        let legacy_root = stored.snapshot_root.as_ref().map(|root| {
+            Box::new(super::TrackedStateCommitRootV10 {
+                commit_id: root.commit_id,
+                root_id: root.root_id.clone(),
+                parent_roots: root.parent_roots.clone(),
+                changed_key_count: root.changed_key_count,
+                row_count_estimate: root.row_count_estimate,
+                tree_height: root.tree_height,
+            })
+        });
+        let legacy = super::StoredCommitStateManifestV10 {
+            commit_id: stored.commit_id,
+            change_account_id: stored.change_account_id.clone(),
+            replay_debt: stored.replay_debt,
+            selected_source_commit_id: stored.selected_source_commit_id,
+            mutation_inventory_digest: stored.mutation_inventory_digest,
+            mutation_transition_digest: stored.mutation_transition_digest,
+            mutation_member_count: stored.mutation_member_count,
+            mutation_part_count: stored.mutation_part_count,
+            mutation_directory_root: stored.mutation_directory_root.clone(),
+            touched_scope_filter: stored.touched_scope_filter.clone(),
+            current_state_scoped_ranges: stored.current_state_scoped_ranges.clone(),
+            snapshot_root: legacy_root,
+        };
+        let payload =
+            storage_codec::encode("tracked_state v10 commit_state_manifest fixture", &legacy)
+                .expect("v10 fixture should encode");
+        let mut bytes = super::COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC.to_vec();
+        bytes.extend_from_slice(&payload);
+
+        let decoded = super::decode_stored_commit_state_manifest(&bytes)
+            .expect("deployed v10 manifest should remain readable");
+        assert_eq!(decoded, stored);
+        assert!(!decoded.snapshot_root.unwrap().complete_state_fence);
     }
 
     #[test]

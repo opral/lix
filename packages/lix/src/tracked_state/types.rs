@@ -157,7 +157,6 @@ pub(crate) struct TrackedStateCommitRoot {
     /// Certifies that this root contains the commit's complete logical state
     /// even though its semantic first parent is not retained as physical tree
     /// ancestry. Ordinary roots must leave this false.
-    #[musli(default)]
     pub(crate) complete_state_fence: bool,
 }
 
