@@ -186,66 +186,88 @@ where
     }
 
     /// Adds trusted built-in schemas introduced after a repository was
-    /// created. This is catalog evolution, not a physical storage migration:
-    /// the registration is an ordinary tracked global fact authored by the
-    /// system account, so it follows the same history and synchronization
-    /// rules as the schemas seeded during initialization.
+    /// created. This is catalog evolution, not a physical storage migration.
+    /// Initialization registers built-ins in the global catalog and in every
+    /// branch-local catalog; upgrades mirror that shape so the schema is
+    /// immediately writable on existing branches. The registrations remain
+    /// ordinary tracked facts authored by the system account.
     async fn ensure_builtin_schema_registrations(&self) -> Result<(), LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let reader = self.hot_state.reader(read);
-        let mut missing = Vec::new();
+        let mut builtins = Vec::new();
         for schema in crate::schema::seed_schema_definitions() {
             let key = crate::schema::schema_key_from_definition(schema)?;
-            let row = reader
-                .load_row(&HotStateRowRequest {
-                    schema_key: "lix_registered_schema".to_string(),
-                    branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    row_pk: crate::schema::registered_schema_row_pk(&key.schema_key)?,
-                    file_id: NullableKeyFilter::Null,
-                })
-                .await?;
-            if row.is_none() {
-                missing.push((
-                    key.schema_key,
-                    serde_json::to_string(schema).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("could not encode built-in schema registration: {error}"),
-                        )
-                    })?,
-                ));
-            }
-        }
-        if missing.is_empty() {
-            return Ok(());
+            builtins.push((
+                key.schema_key,
+                serde_json::to_string(schema).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("could not encode built-in schema registration: {error}"),
+                    )
+                })?,
+            ));
         }
 
-        let session = self
+        let global_session = self
             .open_session_at_with_account(GLOBAL_BRANCH_ID, crate::SYSTEM_ACCOUNT_ID)
             .await?;
-        let mut sql = String::from(
-            "INSERT INTO lix_registered_schema \
-             (schema_key, value, lixcol_global, lixcol_untracked) VALUES ",
-        );
-        let mut params = Vec::with_capacity(missing.len() * 2);
-        for (index, (schema_key, schema_json)) in missing.into_iter().enumerate() {
-            if index > 0 {
-                sql.push_str(", ");
-            }
-            let key_param = index * 2 + 1;
-            let value_param = key_param + 1;
-            sql.push_str(&format!(
-                "(${key_param}, CAST(${value_param} AS JSONB), true, false)"
-            ));
-            params.push(crate::Value::Text(schema_key));
-            params.push(crate::Value::Text(schema_json));
+        let branch_rows = global_session
+            .execute("SELECT id FROM lix_branch ORDER BY id", &[])
+            .await?;
+        let mut branch_ids = std::collections::BTreeSet::from([GLOBAL_BRANCH_ID.to_string()]);
+        for row in branch_rows.rows() {
+            branch_ids.insert(row.get::<String>("id")?);
         }
-        sql.push_str(" ON CONFLICT (schema_key) DO NOTHING");
-        session.execute(&sql, &params).await?;
+
+        for branch_id in branch_ids {
+            let session = self
+                .open_session_at_with_account(&branch_id, crate::SYSTEM_ACCOUNT_ID)
+                .await?;
+            let is_global_catalog = branch_id == GLOBAL_BRANCH_ID;
+            let registered = session
+                .execute(
+                    "SELECT value ->> 'key' AS schema_key \
+                     FROM lix_registered_schema_by_branch \
+                     WHERE lixcol_branch_id = $1 \
+                       AND lixcol_global = $2 \
+                       AND lixcol_untracked = false",
+                    &[
+                        crate::Value::Text(branch_id),
+                        crate::Value::Boolean(is_global_catalog),
+                    ],
+                )
+                .await?
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("schema_key"))
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+            let missing = builtins
+                .iter()
+                .filter(|(schema_key, _)| !registered.contains(schema_key))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                continue;
+            }
+
+            let mut sql = String::from(
+                "INSERT INTO lix_registered_schema \
+                 (schema_key, value, lixcol_global, lixcol_untracked) VALUES ",
+            );
+            let mut params = Vec::with_capacity(missing.len() * 2);
+            for (index, (schema_key, schema_json)) in missing.into_iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                let key_param = index * 2 + 1;
+                let value_param = key_param + 1;
+                sql.push_str(&format!(
+                    "(${key_param}, CAST(${value_param} AS JSONB), \
+                     {is_global_catalog}, false)"
+                ));
+                params.push(crate::Value::Text(schema_key.clone()));
+                params.push(crate::Value::Text(schema_json.clone()));
+            }
+            sql.push_str(" ON CONFLICT (schema_key) DO NOTHING");
+            session.execute(&sql, &params).await?;
+        }
         Ok(())
     }
 
