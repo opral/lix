@@ -1,10 +1,10 @@
 ---
-description: Lix combines files, a SQL database, and version control in one repository that you embed in your product.
+description: Lix gives your product a repository with files, SQL, and version control in one place.
 ---
 
 # What is Lix?
 
-Lix combines **files, a SQL database, and version control in one repository**. You embed it in your product.
+Lix gives your product a repository: **files, SQL, and version control in one place**. You embed it in your product.
 
 Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge.
 
