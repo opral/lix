@@ -3419,6 +3419,39 @@ where
         Ok(pending)
     }
 
+    async fn complete_live_root_at_commit(
+        &self,
+        read: &(impl StorageAdapterRead + ?Sized),
+        commit_id: CommitId,
+    ) -> Result<TrackedStateRootId, LixError> {
+        let mut tracked = TrackedStateContext::new().reader(read);
+        let rows = tracked
+            .scan_batch_at_commit(&commit_id.to_string(), &TrackedStateScanRequest::default())
+            .await?;
+        let deltas = rows.iter().map(|row| TrackedStateDeltaRef {
+            schema_key: row.schema_key(),
+            file_id: row.file_id(),
+            row_pk: row.row_pk(),
+            change_id: row.change_id(),
+            commit_id: row.commit_id(),
+            deleted: false,
+            created_at: row.created_at(),
+            updated_at: row.updated_at(),
+        });
+        let mut transient_writes = self.storage_adapter().new_write_set();
+        let tracked_context = TrackedStateContext::new();
+        let mut writer = tracked_context.writer(read, &mut transient_writes);
+        writer
+            .stage_commit_root(&commit_id.to_string(), None, deltas)
+            .await?;
+        Ok(writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == commit_id)
+            .expect("complete live root was staged")
+            .root_id
+            .clone())
+    }
+
     pub(crate) async fn sync_history(
         &self,
         head: &str,
@@ -3513,32 +3546,7 @@ where
         }
         let mut boundaries = Vec::with_capacity(boundary_ids.len());
         for commit_id in boundary_ids {
-            let mut tracked = TrackedStateContext::new().reader(&read);
-            let rows = tracked
-                .scan_batch_at_commit(&commit_id.to_string(), &TrackedStateScanRequest::default())
-                .await?;
-            let deltas = rows.iter().map(|row| TrackedStateDeltaRef {
-                schema_key: row.schema_key(),
-                file_id: row.file_id(),
-                row_pk: row.row_pk(),
-                change_id: row.change_id(),
-                commit_id: row.commit_id(),
-                deleted: false,
-                created_at: row.created_at(),
-                updated_at: row.updated_at(),
-            });
-            let mut transient_writes = adapter.new_write_set();
-            let tracked_context = TrackedStateContext::new();
-            let mut writer = tracked_context.writer(&read, &mut transient_writes);
-            writer
-                .stage_commit_root(&commit_id.to_string(), None, deltas)
-                .await?;
-            let live_state_root_id = writer
-                .staged_commit_roots()
-                .find(|root| root.commit_id == commit_id)
-                .expect("transient history boundary root was staged")
-                .root_id
-                .clone();
+            let live_state_root_id = self.complete_live_root_at_commit(&read, commit_id).await?;
             boundaries.push(SyncHistoryBoundary {
                 commit_id: commit_id.to_string(),
                 live_state_root_id: format_sync_state_root_id(&live_state_root_id),
@@ -3745,35 +3753,9 @@ where
             .await?;
         let mut branches = Vec::with_capacity(controls.len());
         for (branch_id, control) in &controls {
-            let mut tracked = TrackedStateContext::new().reader(&read);
-            let rows = tracked
-                .scan_batch_at_commit(
-                    &control.head_commit_id.to_string(),
-                    &TrackedStateScanRequest::default(),
-                )
+            let hot_state_root_id = self
+                .complete_live_root_at_commit(&read, control.head_commit_id)
                 .await?;
-            let deltas = rows.iter().map(|row| TrackedStateDeltaRef {
-                schema_key: row.schema_key(),
-                file_id: row.file_id(),
-                row_pk: row.row_pk(),
-                change_id: row.change_id(),
-                commit_id: row.commit_id(),
-                deleted: false,
-                created_at: row.created_at(),
-                updated_at: row.updated_at(),
-            });
-            let mut transient_writes = adapter.new_write_set();
-            let tracked_context = TrackedStateContext::new();
-            let mut writer = tracked_context.writer(&read, &mut transient_writes);
-            writer
-                .stage_commit_root(&control.head_commit_id.to_string(), None, deltas)
-                .await?;
-            let hot_state_root_id = writer
-                .staged_commit_roots()
-                .find(|root| root.commit_id == control.head_commit_id)
-                .expect("hot snapshot root was staged")
-                .root_id
-                .clone();
             branches.push(SyncBranchHead {
                 branch_id: branch_id.clone(),
                 head_commit_id: Some(control.head_commit_id.to_string()),
