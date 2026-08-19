@@ -1771,7 +1771,7 @@ where
                     // Commit bodies remain in the changelog; the event is
                     // only an ordered list of immutable identities.
                     staged_sync_event =
-                        crate::sync::repository::stage_repository_transaction_event(
+                        crate::sync::stage_repository_transaction_event(
                             &read,
                             &mut automatic_sync_writes,
                             &mut automatic_sync_preconditions,
@@ -1820,7 +1820,7 @@ where
         };
         if let Some(staged_sync_event) = &staged_sync_event
             && let Err(error) =
-                crate::sync::repository::validate_repository_transaction_event_transfer(
+                crate::sync::validate_repository_transaction_event_transfer(
                     staged_sync_event,
                     &materialized.sync_commits,
                 )

@@ -195,7 +195,7 @@ pub(crate) struct MaterializedCommit {
     /// Canonical protocol commits emitted only for an Authority transaction's
     /// atomic transfer-size preflight. Other roles leave this empty and avoid
     /// protocol DTO and JSON parsing work.
-    pub(crate) sync_commits: Vec<crate::sync::commit::SyncCommit>,
+    pub(crate) sync_commits: Vec<crate::sync::SyncCommit>,
 }
 
 /// Materializes a prepared commit with branch heads already resolved from the
@@ -2728,8 +2728,8 @@ fn materialize_staged_sync_commits(
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     staged_delta_index: &StagedCommitDeltaIndex,
-) -> Result<Vec<crate::sync::commit::SyncCommit>, LixError> {
-    use crate::sync::commit::{SyncCommit, SyncCommitMemberRef, encode_sync_commit_member};
+) -> Result<Vec<crate::sync::SyncCommit>, LixError> {
+    use crate::sync::{SyncCommit, SyncCommitMemberRef, encode_sync_commit_member};
 
     let mut commits = Vec::with_capacity(staged_commits.len());
     for (commit_id, staged) in staged_commits {

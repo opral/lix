@@ -112,11 +112,9 @@ pub const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace =
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE;
 pub const UPLOAD_STATE_SPACE: StorageSpace = crate::session::UPLOAD_STATE_SPACE;
 pub const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = crate::session::UPLOAD_MANIFEST_LEAF_SPACE;
-pub const SYNC_SEQUENCE_SPACE: StorageSpace = crate::sync::repository::SYNC_SEQUENCE_SPACE;
-pub const SYNC_REPOSITORY_EVENT_SPACE: StorageSpace =
-    crate::sync::repository::SYNC_REPOSITORY_EVENT_SPACE;
-pub const SYNC_REPLICA_STATE_SPACE: StorageSpace =
-    crate::sync::repository::SYNC_REPLICA_STATE_SPACE;
+pub const SYNC_SEQUENCE_SPACE: StorageSpace = crate::sync::SYNC_SEQUENCE_SPACE;
+pub const SYNC_REPOSITORY_EVENT_SPACE: StorageSpace = crate::sync::SYNC_REPOSITORY_EVENT_SPACE;
+pub const SYNC_REPLICA_STATE_SPACE: StorageSpace = crate::sync::SYNC_REPLICA_STATE_SPACE;
 pub const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = crate::gc::CHECKPOINT_RECOVERY_REF_SPACE;
 pub const CHECKPOINT_GC_STATE_SPACE: StorageSpace = crate::gc::CHECKPOINT_GC_STATE_SPACE;
 

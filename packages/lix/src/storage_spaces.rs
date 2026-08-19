@@ -68,9 +68,9 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
     crate::session::UPLOAD_STATE_SPACE,
     crate::session::UPLOAD_MANIFEST_LEAF_SPACE,
-    crate::sync::repository::SYNC_SEQUENCE_SPACE,
-    crate::sync::repository::SYNC_REPOSITORY_EVENT_SPACE,
-    crate::sync::repository::SYNC_REPLICA_STATE_SPACE,
+    crate::sync::SYNC_SEQUENCE_SPACE,
+    crate::sync::SYNC_REPOSITORY_EVENT_SPACE,
+    crate::sync::SYNC_REPLICA_STATE_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The

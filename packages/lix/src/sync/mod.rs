@@ -8,11 +8,12 @@
 //! cancellation.
 
 mod blob;
-pub(crate) mod commit;
+mod commit;
 mod contract;
+mod http;
 mod platform;
 mod protocol;
-pub(crate) mod repository;
+mod repository;
 mod runtime;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,22 +22,30 @@ use std::time::Duration;
 
 use crate::LixError;
 
-pub(crate) use commit::SyncCommit;
+pub(crate) use commit::{SyncCommit, SyncCommitMemberRef, encode_sync_commit_member};
 pub(crate) use contract::SyncTransport;
 #[cfg(target_family = "wasm")]
+#[doc(hidden)]
 pub use platform::{
     BROWSER_TRANSPORT_CONFIG_HEADER, register_browser_sync_transport,
     unregister_browser_sync_transport,
 };
 pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
+#[cfg(feature = "server-protocol")]
+pub(crate) use protocol::SyncRefUpdate;
 pub(crate) use protocol::{
     SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead, SyncCommitHeader,
-    SyncEvent, SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRefUpdate,
-    SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
+    SyncEvent, SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
+    SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
 pub(crate) use runtime::{
     PreparedSync, SyncDemand, SyncRuntime, activate_sync_mode, demand_sync_for_error,
     prepare_sync_mode,
+};
+pub(crate) use repository::{
+    SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
+    has_any_sync_replica_state, load_sync_replica_account, stage_repository_transaction_event,
+    validate_repository_transaction_event_transfer,
 };
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;

@@ -1135,11 +1135,9 @@ where
                         "remote transaction capability does not match the active transaction",
                     ));
                 }
-                let execution = active.transaction.execute(&sql, &params);
-                let execution = match options.origin_key {
-                    Some(origin_key) => execution.with_origin_key(origin_key),
-                    None => execution,
-                };
+                let execution = active
+                    .transaction
+                    .execute_with_options(&sql, &params, options);
                 tokio::select! {
                     biased;
                     _ = &mut cancelled => {

@@ -4312,7 +4312,7 @@ pub(crate) fn stage_commit_deltas_for_commit_state(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
 ) -> Result<AddressableCommitDeltaStage, LixError> {
-    stage_commit_deltas_inner(writes, deltas, None, None)
+    stage_commit_deltas_inner(writes, deltas, None, None, false)
 }
 
 pub(crate) fn stage_addressable_commit_deltas(
@@ -4326,7 +4326,27 @@ pub(crate) fn stage_addressable_commit_deltas(
             "tracked_state addressability column does not match commit deltas",
         ));
     }
-    stage_commit_deltas_inner(writes, deltas, Some(addressable), None)
+    stage_commit_deltas_inner(writes, deltas, Some(addressable), None, false)
+}
+
+/// Stages commit deltas received from a sync authority.
+///
+/// Imported commits retain their wire change ids. A UUID can look directly
+/// addressable while having been assigned under a different physical packing
+/// order, so a mismatch falls back to an explicit locator instead of rewriting
+/// the authoritative identity.
+pub(crate) fn stage_imported_addressable_commit_deltas(
+    writes: &mut StorageWriteSet,
+    deltas: &[TrackedStateCommitDeltaRef<'_>],
+    addressable: &[bool],
+) -> Result<AddressableCommitDeltaStage, LixError> {
+    if addressable.len() != deltas.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state addressability column does not match commit deltas",
+        ));
+    }
+    stage_commit_deltas_inner(writes, deltas, Some(addressable), None, true)
 }
 
 pub(crate) fn stage_addressable_commit_deltas_with_selected_source(
@@ -4346,6 +4366,7 @@ pub(crate) fn stage_addressable_commit_deltas_with_selected_source(
         deltas,
         Some(addressable),
         Some(selected_source_commit_id),
+        false,
     )
 }
 
@@ -5287,6 +5308,7 @@ fn stage_commit_deltas_inner(
     deltas: &[TrackedStateCommitDeltaRef<'_>],
     addressable: Option<&[bool]>,
     selected_source_commit_id: Option<CommitId>,
+    preserve_mismatched_change_ids: bool,
 ) -> Result<AddressableCommitDeltaStage, LixError> {
     let Some(&commit_id) = deltas.first().map(|delta| &delta.delta.commit_id) else {
         return Ok(AddressableCommitDeltaStage {
@@ -5390,6 +5412,15 @@ fn stage_commit_deltas_inner(
                 }
                 let value = decode_value(&entry.value)?;
                 let change_id = addressable_change_id(commit_id, segment_index, ordinal)?;
+                if preserve_mismatched_change_ids && value.change_id != change_id {
+                    // Imported complete commits retain their authoritative
+                    // change ids. A UUID can look directly addressable while
+                    // having been assigned under a different physical packing
+                    // order; keep it verbatim and publish an explicit locator.
+                    addressable[source_index] = false;
+                    assigned_change_ids[source_indices[source_index]] = value.change_id;
+                    continue;
+                }
                 entry.value = Bytes::from(encode_value_ref(TrackedStateIndexValueRef {
                     change_id,
                     commit_id: value.commit_id,

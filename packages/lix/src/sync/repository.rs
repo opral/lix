@@ -33,9 +33,10 @@ use crate::json_store::{
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{
-    Storage, StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
-    StoragePrecondition, StorageProjectedValue, StorageReadOptions, StorageSpace, StorageSpaceId,
-    StorageWriteOptions, StorageWriteSet, ValueSemantics, exact_get_many,
+    Storage, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StorageGetManyRequest, StorageGetOptions, StorageKey, StoragePrecondition, StoragePrefix,
+    StorageProjectedValue, StorageReadOptions, StorageSpace, StorageSpaceId, StorageWriteOptions,
+    StorageWriteSet, ValueSemantics, exact_get_many,
 };
 use crate::tracked_state::{
     CertifiedCommitStateTopologyParent, CommitStateManifest, CommitStateReplayDebt,
@@ -44,9 +45,10 @@ use crate::tracked_state::{
     TrackedStateScanRequest, commit_delta_member_scopes, commit_history_is_deferred,
     direct_change_locator, incomplete_touched_scope_filter, load_change_record_by_id,
     load_commit_state_manifest, load_published_commit_state_topology,
-    stage_addressable_commit_deltas, stage_certified_commit_state_manifest_with_handle,
-    stage_change_locators, stage_commit_history_available, stage_commit_history_deferred,
+    stage_certified_commit_state_manifest_with_handle, stage_change_locators,
+    stage_commit_history_available, stage_commit_history_deferred,
     stage_commit_state_manifest_with_handle, stage_current_state_scoped_ranges_from_topology,
+    stage_imported_addressable_commit_deltas,
 };
 use crate::transaction::PreparedWriteSet;
 use crate::{Lix, LixError};
@@ -294,6 +296,26 @@ pub(crate) async fn load_sync_replica_account(
         .map(|state| state.active_account_id))
 }
 
+pub(crate) async fn has_any_sync_replica_state(
+    read: &(impl StorageAdapterRead + ?Sized),
+) -> Result<bool, LixError> {
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = read
+        .begin_scan(
+            SYNC_REPLICA_STATE_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    Ok(!cursor.next_page(1).await?.is_empty())
+}
+
 fn stage_replica_state(
     writes: &mut StorageWriteSet,
     preconditions: &mut Vec<StoragePrecondition>,
@@ -519,11 +541,34 @@ struct ParsedSyncHeader {
 impl ParsedSyncHeader {
     fn parse(header: &SyncCommitHeader) -> Result<Self, LixError> {
         let commit_id = CommitId::parse_lix(&header.commit_id, "sync commit header")?;
+        if header.account_id.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync commit header accountId must not be empty",
+            ));
+        }
+        let mut unique_parents = BTreeSet::new();
         let parent_commit_ids = header
             .parent_commit_ids
             .iter()
             .map(|parent| CommitId::parse_lix(parent, "sync parent header"))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|parent| {
+                let parent = parent?;
+                if parent == commit_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync commit header cannot be its own parent",
+                    ));
+                }
+                if !unique_parents.insert(parent) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync commit header parent ids must be unique",
+                    ));
+                }
+                Ok(parent)
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
         let (first_parent_jump_commit_id, first_parent_jump_span) = match (
             &header.first_parent_jump_commit_id,
             header.first_parent_jump_span,
@@ -569,6 +614,98 @@ impl ParsedSyncHeader {
             touched_scope_digest: CommitTouchedScopeDigest::opaque(),
         }
     }
+}
+
+fn validate_sync_header_set(
+    headers: &BTreeMap<CommitId, ParsedSyncHeader>,
+    context: &str,
+) -> Result<(), LixError> {
+    let mut remaining = headers.keys().copied().collect::<BTreeSet<_>>();
+    let mut resolved = BTreeSet::new();
+    while !remaining.is_empty() {
+        let ready = remaining.iter().copied().find(|commit_id| {
+            headers[commit_id]
+                .parent_commit_ids
+                .iter()
+                .all(|parent| !headers.contains_key(parent) || resolved.contains(parent))
+        });
+        let Some(commit_id) = ready else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("{context} commit header graph contains a cycle"),
+            ));
+        };
+        remaining.remove(&commit_id);
+        resolved.insert(commit_id);
+    }
+
+    for header in headers.values() {
+        let known_parent_generations = header
+            .parent_commit_ids
+            .iter()
+            .filter_map(|parent| headers.get(parent).map(|parent| parent.generation))
+            .collect::<Vec<_>>();
+        if header.parent_commit_ids.is_empty() && header.generation != 0 {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "{context} root header '{}' has invalid generation",
+                    header.commit_id
+                ),
+            ));
+        }
+        if !header.parent_commit_ids.is_empty() && header.generation == 0 {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "{context} non-root header '{}' has invalid generation",
+                    header.commit_id
+                ),
+            ));
+        }
+        if let Some(max_known_parent) = known_parent_generations.iter().copied().max() {
+            let exact = max_known_parent
+                .checked_add(1)
+                .ok_or_else(|| LixError::unknown("sync history generation overflow"))?;
+            let all_parents_known =
+                known_parent_generations.len() == header.parent_commit_ids.len();
+            if (all_parents_known && header.generation != exact)
+                || (!all_parents_known && header.generation <= max_known_parent)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "{context} header '{}' has invalid generation",
+                        header.commit_id
+                    ),
+                ));
+            }
+        }
+        if header.first_parent_jump_span > 0 {
+            let jump = headers
+                .get(&header.first_parent_jump_commit_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' is missing jump boundary '{}'",
+                            header.commit_id, header.first_parent_jump_commit_id
+                        ),
+                    )
+                })?;
+            if header.generation.checked_sub(header.first_parent_jump_span) != Some(jump.generation)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "{context} header '{}' has an invalid jump span",
+                        header.commit_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1381,7 +1518,9 @@ where
         rows: &[SyncSnapshotRow],
     ) -> Result<(), LixError> {
         let SyncRepositoryPullResponse::Snapshot {
-            cursor, branches, ..
+            cursor,
+            default_branch_id,
+            branches,
         } = metadata
         else {
             return Err(LixError::new(
@@ -1400,6 +1539,7 @@ where
             remote_id,
             active_account_id,
             *cursor,
+            default_branch_id,
             branches,
             head_commits,
             commit_headers,
@@ -1438,6 +1578,7 @@ where
         remote_id: &str,
         active_account_id: &str,
         cursor: u64,
+        default_branch_id: &str,
         branches: &[SyncBranchHead],
         head_commits: &[SyncCommit],
         commit_headers: &[SyncCommitHeader],
@@ -1458,6 +1599,33 @@ where
             .iter()
             .map(parse_snapshot_row)
             .collect::<Result<Vec<_>, _>>()?;
+        let default_branch_row_pk = RowPk::single(crate::init::DEFAULT_BRANCH_KEY);
+        let mut tracked_default_branch_ids = parsed_rows
+            .iter()
+            .filter(|row| {
+                row.branch_id == crate::GLOBAL_BRANCH_ID
+                    && row.schema_key == "lix_key_value"
+                    && row.file_id.is_none()
+                    && row.row_pk == default_branch_row_pk
+            })
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(&row.snapshot_json)
+                    .ok()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .get("value")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+            });
+        if tracked_default_branch_ids.next().flatten().as_deref() != Some(default_branch_id)
+            || tracked_default_branch_ids.next().is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot defaultBranchId disagrees with its canonical tracked row",
+            ));
+        }
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let branch_ids = branches
@@ -1468,6 +1636,17 @@ where
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "sync snapshot contains duplicate branch ids",
+            ));
+        }
+        if branches
+            .iter()
+            .filter(|branch| branch.branch_id == default_branch_id)
+            .count()
+            != 1
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot must contain exactly one headed default branch",
             ));
         }
         let observed = BranchHeadControlContext::new()
@@ -1536,51 +1715,7 @@ where
                 ));
             }
         }
-        for header in header_by_id.values() {
-            if header
-                .parent_commit_ids
-                .iter()
-                .all(|parent| header_by_id.contains_key(parent))
-            {
-                let expected_generation = header
-                    .parent_commit_ids
-                    .iter()
-                    .map(|parent| header_by_id[parent].generation)
-                    .max()
-                    .map_or(Ok(0), |generation| {
-                        generation
-                            .checked_add(1)
-                            .ok_or_else(|| LixError::unknown("sync snapshot generation overflow"))
-                    })?;
-                if header.generation != expected_generation {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("sync header '{}' has invalid generation", header.commit_id),
-                    ));
-                }
-            }
-            if header.first_parent_jump_span > 0 {
-                let jump = header_by_id
-                    .get(&header.first_parent_jump_commit_id)
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync header '{}' is missing jump boundary '{}'",
-                                header.commit_id, header.first_parent_jump_commit_id
-                            ),
-                        )
-                    })?;
-                if header.generation.checked_sub(header.first_parent_jump_span)
-                    != Some(jump.generation)
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("sync header '{}' has invalid jump span", header.commit_id),
-                    ));
-                }
-            }
-        }
+        validate_sync_header_set(&header_by_id, "sync snapshot")?;
         let mut appended_records = Vec::with_capacity(header_by_id.len());
         for header in header_by_id.values() {
             if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
@@ -1810,7 +1945,8 @@ where
                             .is_some_and(|locator| locator.commit_id == commit.commit_id)
                 })
                 .collect::<Vec<_>>();
-            let staged = stage_addressable_commit_deltas(&mut writes, &deltas, &addressable)?;
+            let staged =
+                stage_imported_addressable_commit_deltas(&mut writes, &deltas, &addressable)?;
             for ((member, assigned), addressable) in delta_members
                 .iter()
                 .zip(&staged.assigned_change_ids)
@@ -1860,7 +1996,7 @@ where
         }
         ChangelogContext::new()
             .writer(&mut &read, &mut writes)
-            .stage_append(ChangelogAppend {
+            .stage_certified_sparse_append(ChangelogAppend {
                 commits: appended_records,
                 changes: changes.into_values().collect(),
             })
@@ -2059,54 +2195,7 @@ where
                 ));
             }
         }
-        for header in parsed.values() {
-            if header
-                .parent_commit_ids
-                .iter()
-                .all(|parent| parsed.contains_key(parent))
-            {
-                let expected_generation = header
-                    .parent_commit_ids
-                    .iter()
-                    .map(|parent| parsed[parent].generation)
-                    .max()
-                    .map_or(Ok(0), |generation| {
-                        generation
-                            .checked_add(1)
-                            .ok_or_else(|| LixError::unknown("sync history generation overflow"))
-                    })?;
-                if header.generation != expected_generation {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync history header '{}' has invalid generation",
-                            header.commit_id
-                        ),
-                    ));
-                }
-            }
-            if header.first_parent_jump_span > 0 {
-                let jump = parsed
-                    .get(&header.first_parent_jump_commit_id)
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync history header '{}' is missing jump boundary '{}'",
-                                header.commit_id, header.first_parent_jump_commit_id
-                            ),
-                        )
-                    })?;
-                if header.generation.checked_sub(header.first_parent_jump_span)
-                    != Some(jump.generation)
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync history header has an invalid jump span",
-                    ));
-                }
-            }
-        }
+        validate_sync_header_set(&parsed, "sync history")?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let mut new_records = Vec::new();
@@ -2132,7 +2221,7 @@ where
         }
         ChangelogContext::new()
             .writer(&mut &read, &mut writes)
-            .stage_append(ChangelogAppend {
+            .stage_certified_sparse_append(ChangelogAppend {
                 commits: new_records,
                 changes: Vec::new(),
             })
@@ -2207,6 +2296,16 @@ where
 
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let default_branch_id = self.repository_default_branch_id_for_sync(&read).await?;
+        if parsed_refs
+            .iter()
+            .any(|(update, _, head)| update.branch_id == default_branch_id && head.is_none())
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync push cannot delete the repository default branch",
+            ));
+        }
         let observations = BranchHeadControlContext::new()
             .reader(&read)
             .load_observed(&branch_ids)
@@ -2565,6 +2664,13 @@ where
                             ));
                         }
                     }
+                    // A non-merge checkpoint is a complete, source-less state
+                    // selection. Its member payload is the protocol authority;
+                    // requiring every selected change body to have arrived in
+                    // an earlier push recreates an ordering-only side channel.
+                    if source.is_none() {
+                        continue;
+                    }
                     if let Some(authored) = authored_by_change.get(&member.change_id) {
                         if !selected_payload_matches_authored(member, authored) {
                             return Err(LixError::new(
@@ -2668,7 +2774,8 @@ where
                             .is_some_and(|locator| locator.commit_id == commit_id)
                 })
                 .collect::<Vec<_>>();
-            let staged_delta = stage_addressable_commit_deltas(&mut writes, &deltas, &addressable)?;
+            let staged_delta =
+                stage_imported_addressable_commit_deltas(&mut writes, &deltas, &addressable)?;
             for ((member, assigned), addressable) in delta_members
                 .iter()
                 .zip(&staged_delta.assigned_change_ids)
@@ -2977,6 +3084,14 @@ where
                 cursor: current_cursor,
             });
         }
+        if !published_ref_updates.is_empty() {
+            // A remote head movement can reveal filesystem and account rows
+            // selected from older commits even when the pushed tip authored
+            // neither schema. Invalidate the same derived read caches as a
+            // local transaction before publishing the ref atomically.
+            crate::filesystem::stage_path_index_revision(&mut writes);
+            crate::account::stage_account_revision(&mut writes);
+        }
         let cursor = if purpose == SyncImportPurpose::AuthorityPush
             && (!newly_imported.is_empty() || !published_ref_updates.is_empty())
         {
@@ -3069,11 +3184,6 @@ where
                     format!("sync history boundary '{commit_id}' is missing"),
                 )
             })?;
-            for parent in &record.parent_commit_ids {
-                if header_ids.insert(*parent) {
-                    pending_header_ids.push(*parent);
-                }
-            }
             if record.first_parent_jump_span > 0
                 && header_ids.insert(record.first_parent_jump_commit_id)
             {
@@ -3802,9 +3912,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deep_snapshot_includes_the_transitive_jump_header_closure() {
+    async fn deep_snapshot_imports_a_bounded_sparse_jump_header_closure() {
         let authority = open_lix().await.expect("authority should open");
-        for generation in 0..8 {
+        for generation in 0..32 {
             write_key_value(
                 &authority,
                 "deep-history",
@@ -3826,6 +3936,10 @@ mod tests {
             .iter()
             .map(|header| header.commit_id.as_str())
             .collect::<BTreeSet<_>>();
+        assert!(
+            header_ids.len() <= 6,
+            "bootstrap topology must stay bounded independently of history depth",
+        );
         for header in &history.commit_headers {
             if let Some(jump) = header.first_parent_jump_commit_id.as_deref() {
                 assert!(
@@ -3869,15 +3983,22 @@ mod tests {
             .find(|member| !member.authored)
             .expect("checkpoint should contain a selected member");
         forged_member.change_id = ChangeId::for_test_label("unknown-checkpoint-change").to_string();
-        let forged_error = authority
+        let forged_id = forged_checkpoint.commit_id.clone();
+        authority
             .push_sync_repository(&SyncPushRequest {
-                commits: vec![forged_checkpoint],
+                commits: vec![forged_checkpoint.clone()],
                 ref_updates: Vec::new(),
             })
             .await
-            .expect_err("authority must reject an unknown selected checkpoint change");
-        assert_eq!(forged_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(forged_error.message.contains("unavailable"));
+            .expect("a source-less complete checkpoint owns its selected payloads");
+        assert_eq!(
+            authority
+                .sync_history(std::slice::from_ref(&forged_id))
+                .await
+                .expect("complete checkpoint history should load")
+                .commits,
+            vec![forged_checkpoint],
+        );
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         let selected_ids = authority_commit
             .members
@@ -4223,6 +4344,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_rejects_deleting_the_repository_default_branch() {
+        let authority = open_lix().await.expect("authority should open");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (default_branch_id, default_head_id) = default_head(&snapshot);
+
+        let error = authority
+            .push_sync_repository(&SyncPushRequest {
+                commits: Vec::new(),
+                ref_updates: vec![SyncRefUpdate {
+                    branch_id: default_branch_id.clone(),
+                    expected_head_commit_id: Some(default_head_id.clone()),
+                    head_commit_id: None,
+                }],
+            })
+            .await
+            .expect_err("the repository default branch cannot be deleted");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+
+        let after = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should remain readable");
+        assert_eq!(default_head(&after), (default_branch_id, default_head_id));
+    }
+
+    #[tokio::test]
+    async fn authority_preserves_a_noncanonical_looking_change_via_locator_fallback() {
+        let source = open_lix().await.expect("source should open");
+        let baseline = source
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("baseline snapshot should load");
+        let target = replica_from_snapshot(&source, &baseline).await;
+        write_key_value(&source, "forged-address", "payload").await;
+        let snapshot = source
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("source snapshot should load");
+        let (_, head) = default_head(&snapshot);
+        let mut commit = source
+            .sync_history(std::slice::from_ref(&head))
+            .await
+            .expect("source history should load")
+            .commits
+            .into_iter()
+            .next()
+            .expect("source head should have a body");
+        let member = commit
+            .members
+            .iter_mut()
+            .find(|member| member.authored)
+            .expect("written commit should have an authored member");
+        let mut forged = *CommitId::parse_lix(&head, "forged commit")
+            .expect("head should parse")
+            .as_uuid()
+            .as_bytes();
+        forged[12..].copy_from_slice(&50_u32.to_be_bytes());
+        member.change_id = ChangeId::new(uuid::Uuid::from_bytes(forged)).to_string();
+
+        target
+            .push_sync_repository(&SyncPushRequest {
+                commits: vec![commit.clone()],
+                ref_updates: Vec::new(),
+            })
+            .await
+            .expect("the complete commit's authoritative id should use locator fallback");
+        assert_eq!(
+            target
+                .sync_history(std::slice::from_ref(&head))
+                .await
+                .expect("imported history should load")
+                .commits,
+            vec![commit],
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_metadata_without_the_default_branch() {
+        let authority = open_lix().await.expect("authority should open");
+        let mut snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (history, rows) = snapshot_parts(&authority, &snapshot).await;
+        let (default_branch_id, _) = default_head(&snapshot);
+        let SyncRepositoryPullResponse::Snapshot { branches, .. } = &mut snapshot else {
+            unreachable!("initial pull is a snapshot");
+        };
+        branches.retain(|branch| branch.branch_id != default_branch_id);
+
+        let storage = Memory::new();
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(&default_branch_id))
+            .await
+            .expect("replica storage should initialize");
+        let replica = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("replica should open");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica {
+                remote_id: TEST_REMOTE.to_owned(),
+            })
+            .expect("replica role should install");
+        let error = replica
+            .apply_sync_repository_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+            )
+            .await
+            .expect_err("default-less metadata must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("headed default branch"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_a_default_branch_that_disagrees_with_tracked_state() {
+        let authority = open_lix().await.expect("authority should open");
+        let secondary = authority
+            .create_branch(CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-000000001501".to_owned()),
+                name: "secondary".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("secondary branch should be created");
+        let mut snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (history, rows) = snapshot_parts(&authority, &snapshot).await;
+        let SyncRepositoryPullResponse::Snapshot {
+            default_branch_id, ..
+        } = &mut snapshot
+        else {
+            unreachable!("initial pull is a snapshot");
+        };
+        *default_branch_id = secondary.id.clone();
+
+        let storage = Memory::new();
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(&secondary.id))
+            .await
+            .expect("replica storage should initialize");
+        let replica = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("replica should open");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica {
+                remote_id: TEST_REMOTE.to_owned(),
+            })
+            .expect("replica role should install");
+        let error = replica
+            .apply_sync_repository_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+            )
+            .await
+            .expect_err("metadata cannot redefine the tracked repository default");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("canonical tracked row"));
+    }
+
+    #[tokio::test]
     async fn snapshot_rejects_and_preserves_a_locally_advanced_same_id_branch() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "authority-only", "remote").await;
@@ -4299,7 +4594,19 @@ mod tests {
         let (branch_id, _) = default_head(&snapshot);
         let (history, mut rows) = snapshot_parts(&authority, &snapshot).await;
         assert!(rows.len() > 1, "fixture must have more than one live row");
-        rows.pop();
+        let omitted = rows
+            .iter()
+            .position(|row| {
+                row.schema_key == "lix_key_value"
+                    && row
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.get("key"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("complete-a")
+            })
+            .expect("fixture row should exist");
+        rows.remove(omitted);
 
         let storage = Memory::new();
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
@@ -4407,6 +4714,92 @@ mod tests {
             .expect_err("forged generation must be rejected");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("invalid generation"));
+    }
+
+    #[tokio::test]
+    async fn history_headers_reject_self_and_duplicate_parents() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "header-parent", "child").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot metadata should load");
+        let (_, head) = default_head(&snapshot);
+        let history = authority
+            .sync_history(std::slice::from_ref(&head))
+            .await
+            .expect("history should load");
+        let original = history
+            .commit_headers
+            .iter()
+            .find(|header| header.commit_id == head)
+            .expect("head header should exist")
+            .clone();
+        let replica = open_lix().await.expect("replica should open");
+
+        let mut self_parent = original.clone();
+        self_parent.parent_commit_ids = vec![self_parent.commit_id.clone()];
+        let error = replica
+            .import_sync_history_headers(&[self_parent])
+            .await
+            .expect_err("a header cannot be its own parent");
+        assert!(error.message.contains("own parent"));
+
+        let mut duplicate_parent = original;
+        let parent = duplicate_parent
+            .parent_commit_ids
+            .first()
+            .expect("written head should have a parent")
+            .clone();
+        duplicate_parent.parent_commit_ids = vec![parent.clone(), parent];
+        let error = replica
+            .import_sync_history_headers(&[duplicate_parent])
+            .await
+            .expect_err("header parents must be unique");
+        assert!(error.message.contains("must be unique"));
+    }
+
+    #[tokio::test]
+    async fn history_headers_reject_a_sparse_two_node_cycle() {
+        let authority = open_lix().await.expect("authority should open");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, head) = default_head(&snapshot);
+        let template = authority
+            .sync_history(std::slice::from_ref(&head))
+            .await
+            .expect("history should load")
+            .commit_headers
+            .into_iter()
+            .next()
+            .expect("a template header should exist");
+        let first = CommitId::for_test_label("sparse-cycle-first").to_string();
+        let second = CommitId::for_test_label("sparse-cycle-second").to_string();
+        let omitted = CommitId::for_test_label("sparse-cycle-omitted").to_string();
+        let mut first_header = template.clone();
+        first_header.commit_id.clone_from(&first);
+        first_header.parent_commit_ids = vec![second.clone(), omitted.clone()];
+        first_header.generation = 2;
+        first_header.first_parent_jump_commit_id = None;
+        first_header.first_parent_jump_span = None;
+        first_header.state_root_id = None;
+        let mut second_header = template;
+        second_header.commit_id = second;
+        second_header.parent_commit_ids = vec![first, omitted];
+        second_header.generation = 2;
+        second_header.first_parent_jump_commit_id = None;
+        second_header.first_parent_jump_span = None;
+        second_header.state_root_id = None;
+
+        let replica = open_lix().await.expect("replica should open");
+        let error = replica
+            .import_sync_history_headers(&[first_header, second_header])
+            .await
+            .expect_err("sparse boundaries cannot conceal an in-batch cycle");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("graph contains a cycle"));
     }
 
     #[tokio::test]

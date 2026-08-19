@@ -334,22 +334,13 @@ async fn open_lix_inner<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    // Fresh sync initialization uses one handshake and one snapshot. The same
-    // snapshot chooses the local default branch and is then applied verbatim;
-    // reopened repositories do no network work on their open path.
+    // A fresh repository or one left in the initialization/bootstrap crash
+    // window needs one handshake and snapshot before its application session
+    // can be bound to the authority's account. Reopens with durable state for
+    // this exact remote remain entirely local.
     let mut prepared_sync: Option<crate::sync::PreparedSync> = if let Some(server) = server.as_ref()
     {
-        let missing = {
-            let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
-            let read = adapter
-                .begin_read(crate::storage_adapter::StorageReadOptions::default())
-                .await?;
-            matches!(
-                crate::init::repository_protocol_status(&read).await?,
-                crate::init::RepositoryProtocolStatus::Missing
-            )
-        };
-        if missing {
+        if sync_requires_preparation(&storage, server.url.trim_end_matches('/')).await? {
             Some(crate::sync::prepare_sync_mode(server).await?)
         } else {
             None
@@ -366,7 +357,7 @@ where
             let read = adapter
                 .begin_read(crate::storage_adapter::StorageReadOptions::default())
                 .await?;
-            crate::sync::repository::load_sync_replica_account(
+            crate::sync::load_sync_replica_account(
                 &read,
                 server.url.trim_end_matches('/'),
             )
@@ -408,6 +399,38 @@ where
         }
     }
     Ok(lix)
+}
+
+async fn sync_requires_preparation<StorageImpl>(
+    storage: &StorageImpl,
+    remote_id: &str,
+) -> Result<bool, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await?;
+    if matches!(
+        crate::init::repository_protocol_status(&read).await?,
+        crate::init::RepositoryProtocolStatus::Missing
+    ) {
+        return Ok(true);
+    }
+    if crate::sync::load_sync_replica_account(&read, remote_id)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    if crate::sync::has_any_sync_replica_state(&read).await? {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "an initialized sync replica cannot be rebound to a different remote",
+        ));
+    }
+    Ok(true)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -1048,11 +1071,20 @@ where
         sql: &'a str,
         params: &'a [Value],
     ) -> TransactionExecuteBuilder<'a, StorageImpl> {
+        self.execute_with_options(sql, params, ExecuteOptions::default())
+    }
+
+    pub(crate) fn execute_with_options<'a>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a [Value],
+        options: ExecuteOptions,
+    ) -> TransactionExecuteBuilder<'a, StorageImpl> {
         TransactionExecuteBuilder {
             transaction: self,
             sql,
             params,
-            options: ExecuteOptions::default(),
+            options,
         }
     }
 
@@ -1185,6 +1217,61 @@ mod tests {
         assert_eq!(result, "hydrated");
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
         responder.await.expect("demand responder should finish");
+    }
+
+    #[tokio::test]
+    async fn initialized_store_without_remote_replica_state_prepares_synchronously() {
+        let storage = Memory::new();
+        Engine::initialize_with_main_branch_id(storage.clone(), None)
+            .await
+            .expect("simulate initialization before a crashed first bootstrap");
+        assert!(
+            sync_requires_preparation(&storage, "https://sync.example/repository")
+                .await
+                .expect("preparation decision should load"),
+            "an initialized store without state for this remote must bind the account before open returns",
+        );
+    }
+
+    #[tokio::test]
+    async fn initialized_replica_reopens_only_for_its_exact_remote() {
+        let storage = Memory::new();
+        Engine::initialize_with_main_branch_id(storage.clone(), None)
+            .await
+            .expect("initialize replica storage");
+        let remote_id = "https://sync.example/repository";
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::sync::SYNC_REPLICA_STATE_SPACE,
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(remote_id.as_bytes())),
+            serde_json::to_vec(&serde_json::json!({
+                "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID,
+                "cursor": 0,
+                "authoritativeHeads": {},
+                "authorityKnownCommitIds": []
+            }))
+            .expect("replica state should encode"),
+        );
+        adapter
+            .commit_write_set(
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
+            .await
+            .expect("replica state should commit");
+
+        assert!(
+            !sync_requires_preparation(&storage, remote_id)
+                .await
+                .expect("exact remote decision should load"),
+            "a durable exact-remote replica must reopen without network preparation",
+        );
+        let error = sync_requires_preparation(&storage, "https://sync.example/other-repository")
+            .await
+            .expect_err("an initialized replica cannot silently change authorities");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("different remote"));
     }
 
     #[tokio::test]

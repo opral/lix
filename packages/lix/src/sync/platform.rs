@@ -19,12 +19,13 @@ mod wasm_http;
 #[cfg(not(target_family = "wasm"))]
 pub(super) use native::{SyncTask, sleep, spawn_sync_task};
 #[cfg(not(target_family = "wasm"))]
-pub(super) use native_http::HttpSyncTransport;
+pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<native_http::NativeHttpClient>;
 #[cfg(target_family = "wasm")]
 pub(super) use wasm::{SyncTask, sleep, spawn_sync_task};
 #[cfg(target_family = "wasm")]
-pub(super) use wasm_http::HttpSyncTransport;
+pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<wasm_http::BrowserHttpClient>;
 #[cfg(target_family = "wasm")]
+#[doc(hidden)]
 pub use wasm_http::{
     BROWSER_TRANSPORT_CONFIG_HEADER, register_browser_sync_transport,
     unregister_browser_sync_transport,
@@ -64,6 +65,7 @@ mod tests {
             ("blob.rs", include_str!("blob.rs")),
             ("commit.rs", include_str!("commit.rs")),
             ("contract.rs", include_str!("contract.rs")),
+            ("http.rs", include_str!("http.rs")),
             ("protocol.rs", include_str!("protocol.rs")),
             ("repository.rs", include_str!("repository.rs")),
             ("runtime.rs", include_str!("runtime.rs")),
@@ -116,8 +118,18 @@ mod tests {
             if name.ends_with("_http.rs") {
                 assert!(!source.contains("activeBranchId"), "{name}");
                 assert!(!source.contains("list_branches"), "{name}");
+                assert!(!source.contains("/sync/"), "{name}");
+                assert!(!source.contains("HandshakeResponse"), "{name}");
+                assert!(!source.contains("ErrorResponse"), "{name}");
+                assert!(!source.contains("MAX_SYNC_HISTORY"), "{name}");
+                assert!(!source.contains("from_secs(5)"), "{name}");
             }
         }
+        let http = include_str!("http.rs");
+        assert!(http.contains("/sync/push"));
+        assert!(http.contains("HandshakeResponse"));
+        assert!(http.contains("MAX_SYNC_HISTORY_COMMIT_IDS"));
+        assert!(http.contains("response_error"));
         assert!(include_str!("platform/native.rs").contains("tokio::runtime"));
         assert!(include_str!("platform/native_http.rs").contains("reqwest::"));
         assert!(include_str!("platform/wasm.rs").contains("spawn_local"));
