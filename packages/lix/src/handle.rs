@@ -1064,7 +1064,8 @@ mod tests {
         assert!(opened_spans(&spans.lock().expect("spans")).is_empty());
 
         lix.bind_session();
-        let opened = opened_spans(&spans.lock().expect("spans"));
+        let spans = spans.lock().expect("spans");
+        let opened = opened_spans(&spans);
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].start.name, "lix.opened");
         assert_eq!(attribute_string(opened[0], "lix.id"), Some(lix.lix_id()));
