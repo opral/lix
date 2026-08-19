@@ -682,7 +682,9 @@ async fn verify_after_crash<B: CrashBackend>(
     {
         let history_rows = scalar_i64(
             &lix,
-            &format!("SELECT COUNT(*) AS n FROM {SCHEMA_KEY}_history() WHERE generation = $1"),
+            &format!(
+                "SELECT COUNT(*) AS n FROM lix_history('{SCHEMA_KEY}') WHERE generation = $1"
+            ),
             &[Value::Integer(visible)],
         )
         .await
