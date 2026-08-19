@@ -586,14 +586,13 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               Open source · MIT
             </p>
             <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Give your product a repository: files, SQL, and version control
-              in one place
+              Embeddable repository for your product
             </h1>
             <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              Lix is a repository you embed in your product. Everything inside
-              is versioned data: file content, app tables, reviews, comments.
-              There is no external control plane to sync. Agents read and write
-              normal files. Your product queries SQL.
+              Files, SQL database, and version control in one. Everything
+              inside is versioned data: file content, app tables, reviews,
+              comments. There is no external control plane to sync. Agents
+              read and write normal files. Your product queries SQL.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
