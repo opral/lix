@@ -93,9 +93,7 @@ pub(crate) enum SyncRole {
     #[default]
     Disabled,
     Authority,
-    Replica {
-        remote_id: String,
-    },
+    Replica,
 }
 
 /// The complete process-local sync coordination state.

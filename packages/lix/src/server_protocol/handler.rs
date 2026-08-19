@@ -6663,9 +6663,7 @@ mod tests {
             .await
             .expect("open sparse replica");
         replica
-            .set_sync_role(crate::sync::SyncRole::Replica {
-                remote_id: "test://server-protocol-history".to_owned(),
-            })
+            .set_sync_role(crate::sync::SyncRole::Replica)
             .expect("set sparse replica role");
         replica
             .apply_sync_repository_snapshot(

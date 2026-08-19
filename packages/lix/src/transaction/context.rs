@@ -1783,7 +1783,7 @@ where
                         transaction.await_durable_commit = true;
                     }
                 }
-                crate::sync::SyncRole::Replica { .. } => {
+                crate::sync::SyncRole::Replica => {
                     // The immutable commit and ref are the durable outbox.
                     // `build_sync_push` discovers unpublished local heads; no
                     // second row-pack queue is maintained.

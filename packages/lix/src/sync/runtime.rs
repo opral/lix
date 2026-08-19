@@ -322,9 +322,7 @@ where
 {
     let remote_id = server.url.trim_end_matches('/').to_owned();
     let headers = server.headers.clone();
-    lix.set_sync_role(crate::sync::SyncRole::Replica {
-        remote_id: remote_id.clone(),
-    })?;
+    lix.set_sync_role(crate::sync::SyncRole::Replica)?;
 
     // Reopens remain local. A fresh open hands in the already-fetched snapshot
     // used to choose the repository's default branch during initialization.
@@ -1915,9 +1913,7 @@ mod tests {
             .await
             .expect("replica opens");
         replica
-            .set_sync_role(super::super::SyncRole::Replica {
-                remote_id: "https://sync.example/history".to_owned(),
-            })
+            .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role");
         replica
             .apply_sync_repository_snapshot(

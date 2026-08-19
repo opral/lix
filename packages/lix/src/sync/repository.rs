@@ -4024,9 +4024,7 @@ mod tests {
             .await
             .expect("replica should open");
         replica
-            .set_sync_role(super::super::SyncRole::Replica {
-                remote_id: TEST_REMOTE.to_owned(),
-            })
+            .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         replica
             .apply_sync_repository_snapshot(
@@ -4976,9 +4974,7 @@ mod tests {
             .await
             .expect("replica should open");
         replica
-            .set_sync_role(super::super::SyncRole::Replica {
-                remote_id: TEST_REMOTE.to_owned(),
-            })
+            .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         let error = replica
             .apply_sync_repository_snapshot(
@@ -5028,9 +5024,7 @@ mod tests {
             .await
             .expect("replica should open");
         replica
-            .set_sync_role(super::super::SyncRole::Replica {
-                remote_id: TEST_REMOTE.to_owned(),
-            })
+            .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         let error = replica
             .apply_sync_repository_snapshot(
@@ -5074,9 +5068,7 @@ mod tests {
             .get::<String>("id")
             .expect("local head should be text");
         local
-            .set_sync_role(super::super::SyncRole::Replica {
-                remote_id: TEST_REMOTE.to_owned(),
-            })
+            .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         let (history, rows) = snapshot_parts(&authority, &snapshot).await;
 
@@ -5147,9 +5139,7 @@ mod tests {
             .await
             .expect("replica should open");
         replica
-            .set_sync_role(super::super::SyncRole::Replica {
-                remote_id: TEST_REMOTE.to_owned(),
-            })
+            .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         let error = replica
             .apply_sync_repository_snapshot(
