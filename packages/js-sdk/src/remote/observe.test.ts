@@ -588,6 +588,123 @@ test("a local branch switch setup failure preserves a healthy observation", asyn
 	await lix.close();
 });
 
+test("remote observe reconnects after a gone protocol session instead of failing", async () => {
+	const requests: Request[] = [];
+	let nextSession = 0;
+	let observeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					if (request.headers.has("lix-session-id")) {
+						return protocolSessionGone();
+					}
+					nextSession += 1;
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${nextSession}`,
+					});
+				}
+				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/execute")) {
+					return executeValueResponse("recovered");
+				}
+				observeCalls += 1;
+				if (observeCalls === 1) return protocolSessionGone();
+				return heldSseResponse(
+					sseFrame(
+						"next",
+						multiplexObservePayload("observe-1", "stale", 0, 1),
+					),
+					request.signal,
+				);
+			},
+		},
+	});
+
+	const events = lix.observe("SELECT value");
+	expect((await events.next())?.result.rows[0]?.get("value")).toBe(
+		"recovered",
+	);
+	expect(observeCalls).toBe(2);
+	expect(
+		requests
+			.filter((request) => request.method === "GET")
+			.map((request) => ({
+				sessionId: request.headers.get("lix-session-id"),
+				activeBranchId: new URL(request.url).searchParams.get(
+					"activeBranchId",
+				),
+			})),
+	).toEqual([
+		{ sessionId: null, activeBranchId: null },
+		{ sessionId: null, activeBranchId: "main-id" },
+	]);
+	expect(
+		requests
+			.filter((request) =>
+				new URL(request.url).pathname.endsWith("/observe/multiplex"),
+			)
+			.map((request) => request.headers.get("lix-session-id")),
+	).toEqual(["session-1", "session-2"]);
+
+	events.close();
+	await lix.close();
+});
+
+test("remote observe fails if the recovered protocol session is also gone", async () => {
+	vi.useFakeTimers();
+	try {
+		let handshakeCalls = 0;
+		let observeCalls = 0;
+		const lix = await openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/@acme/repository",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					const pathname = new URL(request.url).pathname;
+					if (pathname.endsWith("/lix/v1/")) {
+						handshakeCalls += 1;
+						expect(request.headers.has("lix-session-id")).toBe(false);
+						return Response.json({
+							protocolVersion: 2,
+							activeBranchId: "main-id",
+							activeAccountId: "00000000-0000-7000-8000-000000000002",
+							sessionId: `session-${handshakeCalls}`,
+						});
+					}
+					if (request.method === "DELETE") return closedSession();
+					observeCalls += 1;
+					return protocolSessionGone();
+				},
+			},
+		});
+
+		const events = lix.observe("SELECT value");
+		await expect(events.next()).rejects.toMatchObject({
+			code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+			status: 410,
+		});
+		expect(handshakeCalls).toBe(2);
+		expect(observeCalls).toBe(2);
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(observeCalls).toBe(2);
+
+		events.close();
+		await lix.close();
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
 test("remote observe reconnects retryable failures with fresh headers", async () => {
 	vi.useFakeTimers();
 	try {
@@ -729,6 +846,19 @@ function handshake(): Response {
 		activeAccountId: "00000000-0000-7000-8000-000000000002",
 		sessionId: "session-1",
 	});
+}
+
+function protocolSessionGone(): Response {
+	return Response.json(
+		{
+			error: {
+				code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+				message:
+					"the Lix protocol session is unknown, expired, or closed; open a new client session",
+			},
+		},
+		{ status: 410 },
+	);
 }
 
 function closedSession(): Response {
