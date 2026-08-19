@@ -16,7 +16,6 @@ use crate::branch::{
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::domain::Domain;
-use crate::row_pk::RowPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::{
@@ -27,6 +26,7 @@ use crate::json_store::JsonStoreContext;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::PluginRuntimeHost;
+use crate::row_pk::RowPk;
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
     SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
@@ -451,6 +451,11 @@ where
         };
         self.ensure_open()?;
         Ok(write_access)
+    }
+
+    /// In-memory branch this session was bound with. Does not read storage.
+    pub(crate) fn bound_branch_id(&self) -> Result<String, LixError> {
+        self.branch.get()
     }
 
     /// Resolves the branch this session should operate on right now.

@@ -118,7 +118,7 @@ pub(crate) fn start_batch(
             "SQL coherent read batch",
             "coherent_read_batch",
         ),
-        TelemetrySpanKind::SqlQuery => return None,
+        TelemetrySpanKind::SqlQuery | TelemetrySpanKind::LixOpened => return None,
     };
     Some(ActiveTelemetrySpan::start(
         sink,

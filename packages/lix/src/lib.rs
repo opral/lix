@@ -141,6 +141,7 @@ pub use handle::{
     ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction, OpenAnotherSessionBuilder,
     OpenLixBuilder, TransactionExecuteBuilder, open_lix,
 };
+pub use telemetry::bind_session;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,

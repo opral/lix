@@ -1834,6 +1834,7 @@ where
             close_removed_session(record).await;
         }
         pending_open.commit();
+        lease.record.lix.bind_session();
         Ok(lease)
     }
 
@@ -4394,7 +4395,9 @@ mod tests {
         MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
         StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use lix::telemetry::TracingTelemetrySink;
+    use lix::telemetry::{
+        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TracingTelemetrySink,
+    };
     use lix::{Blob, Memory, open_lix};
     use serde_json::{Value as JsonValue, json};
     use std::io::Write as _;
@@ -6369,6 +6372,76 @@ mod tests {
             .expect("binary batch response")
     }
 
+    fn opened_spans(spans: &[CompletedTelemetrySpan]) -> Vec<&CompletedTelemetrySpan> {
+        spans
+            .iter()
+            .filter(|span| span.start.kind == TelemetrySpanKind::LixOpened)
+            .collect()
+    }
+
+    async fn app_with_callback_telemetry(
+        spans: Arc<Mutex<Vec<CompletedTelemetrySpan>>>,
+    ) -> TestApp {
+        let captured = Arc::clone(&spans);
+        let lix = Arc::new(
+            open_lix()
+                .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
+                    captured.lock().expect("spans").push(span);
+                })))
+                .await
+                .expect("open lix"),
+        );
+        let server = LixServerProtocol::new(lix);
+        let router = handler(server.clone());
+        TestApp { server, router }
+    }
+
+    #[tokio::test]
+    async fn handshake_that_creates_a_session_emits_one_opened_span() {
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let app = app_with_callback_telemetry(Arc::clone(&spans)).await;
+        spans.lock().expect("spans").clear();
+
+        let (session_id, first) = new_session(&app.router).await;
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 1);
+
+        let resumed = request(&app.router, "GET", "/lix/v1/", Some(&session_id), None).await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 1);
+
+        let execute = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({ "sql": "SELECT 1", "params": [] })),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::OK);
+        {
+            let spans = spans.lock().expect("spans");
+            assert_eq!(opened_spans(&spans).len(), 1);
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.start.kind == TelemetrySpanKind::SqlQuery),
+                "SQL spans still work after handshake bind"
+            );
+        }
+
+        let (second_session_id, second) = new_session(&app.router).await;
+        assert_ne!(second_session_id, session_id);
+        assert_eq!(second["activeBranchId"], first["activeBranchId"]);
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handshake_without_a_sink_emits_no_opened_span() {
+        let app = app().await;
+        let (_session_id, _) = new_session(&app.router).await;
+        assert!(app.server.inner.root.telemetry().is_none());
+    }
+
     #[tokio::test]
     async fn handshake_issues_and_resumes_a_256_bit_server_session() {
         let app = app().await;
@@ -7865,11 +7938,13 @@ mod tests {
         let second_value = response_json(visible_from_second).await["rows"][0][0].clone();
         let first_value = response_json(visible_from_first).await["rows"][0][0].clone();
         assert_eq!(first_value, second_value);
-        assert!([
-            json!({ "kind": "jsonb", "value": "first" }),
-            json!({ "kind": "jsonb", "value": "second" }),
-        ]
-        .contains(&first_value));
+        assert!(
+            [
+                json!({ "kind": "jsonb", "value": "first" }),
+                json!({ "kind": "jsonb", "value": "second" }),
+            ]
+            .contains(&first_value)
+        );
     }
 
     #[tokio::test]
