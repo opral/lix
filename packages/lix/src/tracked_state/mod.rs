@@ -71,7 +71,6 @@ pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_tre
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;
-#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
 #[cfg(test)]
 pub(crate) use storage::stage_sweep_unreachable_content_nodes;
@@ -140,7 +139,8 @@ pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
-    CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
+    CommitStateMutationInventory, CommitStateReplayDebt, CommitStateTouchedScopeFilter,
+    MaterializedTrackedStateRow,
     TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
     RowPkRangeBound, row_pk_satisfies_bounds,

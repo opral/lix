@@ -17,7 +17,6 @@ pub(crate) fn append_commit_record(
     storage_codec::append("commit record", bytes, record)
 }
 
-#[cfg(test)]
 pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
     encode_change_record_ref(&ChangeRecordRef {
         format_version: record.format_version,
@@ -100,7 +99,6 @@ pub(crate) fn append_transaction_change_record(
     )
 }
 
-#[cfg(test)]
 fn encode_change_record_ref(record: &ChangeRecordRef<'_>) -> Result<Vec<u8>, LixError> {
     let mut bytes = Vec::new();
     append_change_record_ref(&mut bytes, record)?;

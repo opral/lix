@@ -11175,6 +11175,25 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
     })
 }
 
+/// Decodes the stable HOT row identity for offline repository migration.
+/// Value compatibility remains entirely inside the migration module.
+pub(crate) fn decode_hot_row_key_for_migration(
+    bytes: &[u8],
+) -> Result<TrackedStateKey, LixError> {
+    let mut offset = 0usize;
+    let (_, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
+    if branch_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error("hot row branch id has an invalid terminator"));
+    }
+    let _generation = read_generation(bytes, &mut offset)?;
+    let identity = decode_hot_row_key_in_scope(bytes, &bytes[..offset])?;
+    Ok(TrackedStateKey {
+        schema_key: identity.schema_key,
+        file_id: identity.file_id,
+        row_pk: identity.row_pk,
+    })
+}
+
 /// Distinguishes the two record kinds sharing [`INDEX_SPACE`]: entries and
 /// the per-collection completeness witness. Entries sort after the witness for
 /// a given schema, so a witness probe is a point read and never scans entries.

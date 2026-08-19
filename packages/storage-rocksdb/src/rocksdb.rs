@@ -640,6 +640,38 @@ impl StorageWrite for RocksDBWrite {
         }
     }
 
+    fn replace_many_for_migration(
+        &mut self,
+        _token: &lix::storage::MigrationReplaceToken,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            if space.value_semantics != ValueSemantics::Immutable
+                || space.value_integrity == ValueIntegrity::ContentAddressed
+            {
+                return Err(StorageError::Corruption(
+                    "migration replacement requires an immutable storage space".to_string(),
+                ));
+            }
+            let cf = column_family(&self.inner.db, space);
+            let prefix = space.id.0.to_be_bytes();
+            let mut physical_key = Vec::new();
+            for entry in entries.entries {
+                physical_key.clear();
+                physical_key.extend_from_slice(&prefix);
+                physical_key.extend_from_slice(&entry.key.0);
+                let value = stored_value_bytes(entry.value);
+                self.stats.put_entries += 1;
+                self.stats.written_bytes += value.len() as u64;
+                self.batch
+                    .put_cf(cf, physical_key.as_slice(), value.as_ref());
+            }
+            self.stats.storage_calls += 1;
+            Ok(())
+        }
+    }
+
     fn delete_many(
         &mut self,
         space: StorageSpace,
@@ -717,7 +749,7 @@ impl StorageWrite for RocksDBWrite {
             self.inner
                 .db
                 .write_opt(self.batch, &write_options)
-                .map_err(rocksdb_error)?;
+                .map_err(|error| StorageError::CommitOutcomeUnknown(error.to_string()))?;
             Ok(CommitResult {
                 commit_id: None,
                 stats: self.stats,

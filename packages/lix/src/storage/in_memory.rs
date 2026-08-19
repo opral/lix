@@ -414,6 +414,31 @@ impl StorageWrite for MemoryWrite {
         Ok(())
     }
 
+    async fn replace_many_for_migration(
+        &mut self,
+        _token: &crate::storage::MigrationReplaceToken,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        if space.value_semantics != ValueSemantics::Immutable
+            || space.value_integrity == crate::storage::ValueIntegrity::ContentAddressed
+        {
+            return Err(StorageError::Corruption(
+                "migration replacement requires an immutable storage space".to_string(),
+            ));
+        }
+        for entry in entries.entries {
+            let key = physical_key(space.id, &entry.key);
+            let value = stored_value_bytes(entry.value);
+            self.stats.put_entries += 1;
+            self.stats.written_bytes += value.len() as u64;
+            self.overlay.deletes.remove(&key);
+            self.overlay.puts.insert(key, value);
+        }
+        self.stats.storage_calls += 1;
+        Ok(())
+    }
+
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         for key in keys {
             let key = physical_key(space.id, key);

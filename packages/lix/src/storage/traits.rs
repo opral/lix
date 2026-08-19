@@ -3,6 +3,19 @@ use crate::storage::{
     ReadOptions, ScanCursor, StorageError, StorageSpace, WriteOptions,
 };
 
+/// Opaque authority proving that an immutable overwrite belongs to the
+/// engine's offline repository migration transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct MigrationReplaceToken {
+    _private: (),
+}
+
+impl MigrationReplaceToken {
+    pub(crate) const fn issue() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// An ordered byte-key entry storage with coherent read views, batched point
 /// access, space-scoped scans, and atomic batched writes.
 ///
@@ -94,6 +107,22 @@ pub trait StorageWrite: Send {
         space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Atomically replaces values whose stable physical keys predate a
+    /// repository-format migration.
+    ///
+    /// This is deliberately separate from `put_many`: ordinary immutable
+    /// writes must continue rejecting same-key/different-value assignments.
+    /// Backends may leave superseded content-addressed payloads unreachable;
+    /// their normal garbage collection can reclaim those after publication.
+    fn replace_many_for_migration(
+        &mut self,
+        _token: &MigrationReplaceToken,
+        _space: StorageSpace,
+        _entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async { Err(StorageError::Unsupported(crate::storage::Capability::MigrationReplace)) }
+    }
 
     /// Deletes the given keys of one space. Batches hold at most one
     /// mutation per key; engine write-set lowering produces sorted keys.

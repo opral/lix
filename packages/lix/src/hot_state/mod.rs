@@ -63,7 +63,7 @@ pub(crate) use tracked_head::{
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
     ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
     TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    stage_hot_index_entries, stage_tracked_working_diff_epoch, decode_typed_payload,
+    decode_hot_row_key_for_migration, stage_hot_index_entries, stage_tracked_working_diff_epoch, decode_typed_payload,
     encode_typed_payload,
 };
 #[allow(unused_imports)]

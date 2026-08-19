@@ -452,7 +452,11 @@ where
                 Err(not_initialized_error())
             }
         }
-        crate::init::RepositoryProtocolStatus::Unsupported => {
+        crate::init::RepositoryProtocolStatus::MigrationRequired { found_version } => {
+            Err(crate::init::migration_required_error(found_version))
+        }
+        crate::init::RepositoryProtocolStatus::TooNew { .. }
+        | crate::init::RepositoryProtocolStatus::Malformed => {
             Err(crate::init::unsupported_repository_protocol_error())
         }
         crate::init::RepositoryProtocolStatus::Missing => {

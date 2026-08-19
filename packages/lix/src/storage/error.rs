@@ -31,6 +31,7 @@ pub enum Capability {
     UnorderedPoints,
     ReverseScan,
     DeleteRange,
+    MigrationReplace,
     Preconditions,
     IdempotentCommit,
     PredicatePushdown,

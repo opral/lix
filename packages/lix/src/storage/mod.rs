@@ -20,7 +20,7 @@ pub use predicate::{
     HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, StoragePredicate, Support,
 };
-pub use traits::{Storage, StorageRead, StorageWrite};
+pub use traits::{MigrationReplaceToken, Storage, StorageRead, StorageWrite};
 pub use types::{
     BeginScanOptions, BufferRange, CommitResult, CoreProjection, EncodedMutationBatch,
     EncodedMutationBatchError, EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key,

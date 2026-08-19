@@ -13,7 +13,7 @@ use lix::storage::{
     KeyRange, Memory, MemoryRead, MemoryWrite, Precondition, PreconditionFailure, ProjectedValue,
     PutBatch, ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId,
     Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
-    ValueSemantics, WriteOptions, WriteStats,
+    ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -254,6 +254,26 @@ impl StorageWrite for BrowserWrite {
         }
     }
 
+    async fn replace_many_for_migration(
+        &mut self,
+        token: &lix::storage::MigrationReplaceToken,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(write) => {
+                write
+                    .replace_many_for_migration(token, space, entries)
+                    .await
+            }
+            Self::IndexedDb(write) => {
+                write
+                    .replace_many_for_migration(token, space, entries)
+                    .await
+            }
+        }
+    }
+
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         match self {
             Self::Memory(write) => write.delete_many(space, keys).await,
@@ -423,6 +443,31 @@ impl StorageWrite for IndexedDbWrite {
                 }
                 self.immutable_values.insert(key.clone(), value.clone());
             }
+            self.stats.put_entries += 1;
+            self.stats.written_bytes += value.len() as u64;
+            self.overlay.deletes.remove(&key);
+            self.overlay.puts.insert(key, value);
+        }
+        self.stats.storage_calls += 1;
+        Ok(())
+    }
+
+    async fn replace_many_for_migration(
+        &mut self,
+        _token: &lix::storage::MigrationReplaceToken,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        if space.value_semantics != ValueSemantics::Immutable
+            || space.value_integrity == ValueIntegrity::ContentAddressed
+        {
+            return Err(StorageError::Corruption(
+                "migration replacement requires an immutable storage space".to_string(),
+            ));
+        }
+        for entry in entries.entries {
+            let key = physical_key(space.id, &entry.key);
+            let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
             self.overlay.deletes.remove(&key);

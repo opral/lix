@@ -71,7 +71,9 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// JSON representation to the schema-fingerprinted native typed-row payload.
 /// Older repositories are deliberately rejected at open rather than decoded
 /// through a compatibility fallback.
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 69;
+const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -80,8 +82,37 @@ const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
 pub(crate) enum RepositoryProtocolStatus {
     /// The current layout has one authoritative current-state plane.
     Current,
+    MigrationRequired { found_version: u32 },
+    TooNew { found_version: u32 },
+    Malformed,
     Missing,
-    Unsupported,
+}
+
+pub(crate) fn parse_repository_protocol(value: &[u8]) -> RepositoryProtocolStatus {
+    let Some(version_bytes) = value.strip_prefix(REPOSITORY_PROTOCOL_PREFIX) else {
+        return RepositoryProtocolStatus::Malformed;
+    };
+    if version_bytes.is_empty() || !version_bytes.iter().all(u8::is_ascii_digit) {
+        return RepositoryProtocolStatus::Malformed;
+    }
+    let Ok(version_text) = std::str::from_utf8(version_bytes) else {
+        return RepositoryProtocolStatus::Malformed;
+    };
+    let Ok(version) = version_text.parse::<u32>() else {
+        return RepositoryProtocolStatus::Malformed;
+    };
+    if version.to_string().as_bytes() != version_bytes {
+        return RepositoryProtocolStatus::Malformed;
+    }
+    match version.cmp(&CURRENT_FORMAT_VERSION) {
+        std::cmp::Ordering::Less => RepositoryProtocolStatus::MigrationRequired {
+            found_version: version,
+        },
+        std::cmp::Ordering::Equal => RepositoryProtocolStatus::Current,
+        std::cmp::Ordering::Greater => RepositoryProtocolStatus::TooNew {
+            found_version: version,
+        },
+    }
 }
 
 pub(crate) fn stage_repository_protocol(writes: &mut StorageWriteSet) {
@@ -102,12 +133,8 @@ pub(crate) async fn repository_protocol_status(
     .materialize(read, StorageGetOptions::default())
     .await?;
     Ok(match values.value.into_iter().next().flatten() {
-        Some(StorageProjectedValue::FullValue(value))
-            if value.as_ref() == REPOSITORY_PROTOCOL_VALUE =>
-        {
-            RepositoryProtocolStatus::Current
-        }
-        Some(_) => RepositoryProtocolStatus::Unsupported,
+        Some(StorageProjectedValue::FullValue(value)) => parse_repository_protocol(value.as_ref()),
+        Some(_) => RepositoryProtocolStatus::Malformed,
         None => RepositoryProtocolStatus::Missing,
     })
 }
@@ -116,6 +143,15 @@ pub(crate) fn unsupported_repository_protocol_error() -> LixError {
     LixError::new(
         "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
         "repository uses an unsupported storage protocol; recreate the repository",
+    )
+}
+
+pub(crate) fn migration_required_error(found_version: u32) -> LixError {
+    LixError::new(
+        "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED",
+        format!(
+            "repository format v{found_version} must be migrated to v{CURRENT_FORMAT_VERSION} with lix::migration::migrate_repository before opening"
+        ),
     )
 }
 
@@ -546,7 +582,9 @@ where
             "LIX_ERROR_ALREADY_INITIALIZED",
             "engine storage is already initialized; initialization does not migrate or overwrite repositories",
         )),
-        RepositoryProtocolStatus::Unsupported => Err(unsupported_repository_protocol_error()),
+        RepositoryProtocolStatus::MigrationRequired { .. }
+        | RepositoryProtocolStatus::TooNew { .. }
+        | RepositoryProtocolStatus::Malformed => Err(unsupported_repository_protocol_error()),
         RepositoryProtocolStatus::Missing => {
             if StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(read)
                 .await?
@@ -1014,7 +1052,7 @@ mod tests {
             repository_protocol_status(&read)
                 .await
                 .expect("protocol status should load"),
-            RepositoryProtocolStatus::Unsupported
+            RepositoryProtocolStatus::Malformed
         );
     }
 
@@ -1043,7 +1081,7 @@ mod tests {
             repository_protocol_status(&read)
                 .await
                 .expect("protocol status should load"),
-            RepositoryProtocolStatus::Unsupported
+            RepositoryProtocolStatus::Malformed
         );
     }
 
@@ -1072,7 +1110,31 @@ mod tests {
             repository_protocol_status(&read)
                 .await
                 .expect("protocol status should load"),
-            RepositoryProtocolStatus::Unsupported
+            RepositoryProtocolStatus::MigrationRequired { found_version: 68 }
+        );
+    }
+
+    #[test]
+    fn repository_protocol_parser_distinguishes_versions() {
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v69"),
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v68"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 68 }
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v70"),
+            RepositoryProtocolStatus::TooNew { found_version: 70 }
+        );
+        assert_eq!(
+            parse_repository_protocol(b"not-a-lix-format"),
+            RepositoryProtocolStatus::Malformed
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v069"),
+            RepositoryProtocolStatus::Malformed
         );
     }
 

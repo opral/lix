@@ -30,7 +30,8 @@ pub(crate) use hot::{
     HotStateTransactionCache, HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RootBaseBatchCache,
-    RowColumnarOverlayRow, stage_hot_index_entries, stage_retire_hot_generation,
+    RowColumnarOverlayRow, decode_hot_row_key_for_migration, stage_hot_index_entries,
+    stage_retire_hot_generation,
 };
 
 /// Stable physical address of a row in an immutable columnar base.

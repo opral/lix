@@ -27,7 +27,7 @@ use lix::storage::{
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
     ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOrder, SpaceId,
     Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
-    ValueSemantics, WriteOptions, WriteStats,
+    ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -3623,6 +3623,64 @@ impl StorageWrite for SlateDBWrite {
                 self.stats.written_bytes += value.len() as u64;
                 self.overlay.insert(key, Some(value));
             }
+            self.stats.storage_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn replace_many_for_migration(
+        &mut self,
+        _token: &lix::storage::MigrationReplaceToken,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            if space.value_semantics != ValueSemantics::Immutable
+                || space.value_integrity == ValueIntegrity::ContentAddressed
+            {
+                return Err(StorageError::Corruption(
+                    "migration replacement requires an immutable storage space".to_string(),
+                ));
+            }
+            let put_entries = entries.entries.len() as u64;
+            let mut segment_writer = ImmutableSegmentWriter::default();
+            let mut written_bytes = 0_u64;
+            for entry in entries.entries {
+                let physical_key = physical_key(space.id, &entry.key)?;
+                let value = stored_value_bytes(entry.value);
+                written_bytes = written_bytes.saturating_add(value.len() as u64);
+                segment_writer.insert(physical_key, value)?;
+            }
+            let immutable_segments = segment_writer.finish(|_| true)?;
+            let immutable_locators = immutable_segments
+                .iter()
+                .flat_map(|segment| {
+                    let segment_len = segment.values.last().map_or(0, |(_, range)| range.end);
+                    segment.values.iter().map(move |(physical_key, range)| {
+                        let locator = ImmutableValueLocator {
+                            segment_id: segment.id.clone(),
+                            segment_len,
+                            range: range.clone(),
+                        };
+                        encode_immutable_locator(&locator)
+                            .map(|locator| (physical_key.clone(), locator))
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            if let Some(counters) = &self.immutable_value_store.counters {
+                counters
+                    .inner
+                    .immutable_locator_rows
+                    .fetch_add(immutable_locators.len() as u64, Ordering::Relaxed);
+            }
+            self.immutable_value_store
+                .put_segments(immutable_segments)
+                .await?;
+            for (physical_key, locator) in immutable_locators {
+                self.overlay.insert(physical_key, Some(locator));
+            }
+            self.stats.put_entries += put_entries;
+            self.stats.written_bytes += written_bytes;
             self.stats.storage_calls += 1;
             Ok(())
         }
