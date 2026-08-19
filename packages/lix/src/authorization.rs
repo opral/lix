@@ -78,6 +78,53 @@ pub(crate) fn authorize(
     })
 }
 
+/// Converts one applicable standard grant into Cedar source. The caller
+/// resolves resource inheritance; Cedar still evaluates the principal (and in
+/// particular group membership), action, custom permits, and custom forbids.
+pub(crate) fn default_grant_policy(
+    principal_type: &str,
+    principal_id: Option<&str>,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<String, LixError> {
+    let (principal_operator, principal) = match principal_type {
+        "account" => (
+            "==",
+            entity_uid(
+                "Account",
+                principal_id.ok_or_else(|| {
+                    invalid_policy("grant", "account grant is missing principal_id")
+                })?,
+            )?,
+        ),
+        "anonymous" => (
+            "==",
+            entity_uid("Account", crate::ANONYMOUS_ACCOUNT_ID)?,
+        ),
+        "group" => (
+            "in",
+            entity_uid(
+                "Group",
+                principal_id.ok_or_else(|| {
+                    invalid_policy("grant", "group grant is missing principal_id")
+                })?,
+            )?,
+        ),
+        other => {
+            return Err(invalid_policy(
+                "grant",
+                format!("unsupported principal type '{other}'"),
+            ));
+        }
+    };
+    let action = entity_uid("Action", action)?;
+    let resource = entity_uid(resource_type, resource_id)?;
+    Ok(format!(
+        "permit (principal {principal_operator} {principal}, action == {action}, resource == {resource});"
+    ))
+}
+
 fn entity_uid(entity_type: &str, id: &str) -> Result<EntityUID, LixError> {
     EntityUID::with_eid_and_type(entity_type, id)
         .map_err(|error| invalid_policy("entity_type", error))
@@ -93,7 +140,10 @@ fn invalid_policy(kind: &'static str, error: impl std::fmt::Display) -> LixError
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorizationDecision, AuthorizationDocuments, AuthorizationRequest, authorize};
+    use super::{
+        AuthorizationDecision, AuthorizationDocuments, AuthorizationRequest, authorize,
+        default_grant_policy,
+    };
 
     const SCHEMA: &str = r#"
         entity Account in [Team];
@@ -188,6 +238,36 @@ mod tests {
             )
             .unwrap(),
             AuthorizationDecision::Allow
+        );
+    }
+
+    #[test]
+    fn default_grants_are_cedar_policies_and_custom_forbids_win() {
+        let grant = default_grant_policy(
+            "anonymous",
+            None,
+            "view",
+            "File",
+            "01920000-0000-7000-8000-000000000001",
+        )
+        .unwrap();
+        let policies = format!(
+            "{grant}\nforbid (principal, action == Action::\"view\", resource == File::\"01920000-0000-7000-8000-000000000001\");"
+        );
+        assert_eq!(
+            authorize(
+                AuthorizationDocuments {
+                    schema: SCHEMA,
+                    policies: &policies,
+                    entities: None,
+                },
+                request(
+                    crate::ANONYMOUS_ACCOUNT_ID,
+                    "01920000-0000-7000-8000-000000000001",
+                ),
+            )
+            .unwrap(),
+            AuthorizationDecision::Deny
         );
     }
 }

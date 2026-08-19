@@ -1,0 +1,63 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "lix_permission_grant",
+  "columns": [
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false,
+      "default_expression": "uuidv7()"
+    },
+    {
+      "name": "principal_type",
+      "type": "text",
+      "nullable": false,
+      "description": "The kind of principal receiving access: account, group, or anonymous."
+    },
+    {
+      "name": "principal_id",
+      "type": "text",
+      "nullable": true,
+      "description": "The account or group identifier. Null only for the anonymous principal."
+    },
+    {
+      "name": "access_level",
+      "type": "text",
+      "nullable": false,
+      "description": "The standard access level: viewer, commenter, contributor, editor, or manager."
+    },
+    {
+      "name": "resource_type",
+      "type": "text",
+      "nullable": false,
+      "description": "The resource scope: repository, directory, file, table, or row."
+    },
+    {
+      "name": "directory_id",
+      "type": "uuid",
+      "nullable": true,
+      "description": "The stable directory identifier for a directory grant."
+    },
+    {
+      "name": "file_id",
+      "type": "uuid",
+      "nullable": true,
+      "description": "The stable file identifier for file, table, and row grants."
+    },
+    {
+      "name": "schema_key",
+      "type": "text",
+      "nullable": true,
+      "description": "The schema key for table and row grants."
+    },
+    {
+      "name": "row_pk",
+      "type": "jsonb",
+      "nullable": true,
+      "description": "The canonical primary-key tuple for a row grant."
+    }
+  ],
+  "primary_key": [
+    "id"
+  ]
+}

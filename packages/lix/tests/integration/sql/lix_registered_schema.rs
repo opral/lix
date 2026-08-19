@@ -410,6 +410,7 @@ simulation_test!(
             "lix_directory_descriptor",
             "lix_file_descriptor",
             "lix_key_value",
+            "lix_permission_grant",
             "lix_registered_schema",
         ] {
             assert!(

@@ -206,6 +206,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
+    validate_prepared_permission_grant_rows(&prepared_writes)?;
     Box::pin(validate_active_account_and_account_rows(
         read,
         &prepared_writes,
@@ -3375,6 +3376,7 @@ async fn build_lifecycle_tracked_snapshots(
 }
 
 const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
+const PERMISSION_GRANT_SCHEMA_KEY: &str = "lix_permission_grant";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -6775,6 +6777,149 @@ fn validate_prepared_account_rows(prepared_writes: &PreparedWriteSet) -> Result<
         }
     }
     Ok(())
+}
+
+/// Permission grants are repository-wide facts. They are tracked on the
+/// global branch so every working branch observes one authorization boundary
+/// and permission edits never become ordinary branch merge inputs.
+fn validate_prepared_permission_grant_rows(
+    prepared_writes: &PreparedWriteSet,
+) -> Result<(), LixError> {
+    for row in prepared_writes
+        .state_rows
+        .iter()
+        .filter(|row| row.schema_key.as_str() == PERMISSION_GRANT_SCHEMA_KEY)
+    {
+        if row.branch_id.as_str() != crate::GLOBAL_BRANCH_ID
+            || !row.global
+            || row.untracked
+            || row.file_id.is_some()
+        {
+            return Err(invalid_permission_grant(
+                "lix_permission_grant rows must be tracked global rows on the global branch",
+            ));
+        }
+
+        let Some(snapshot) = row.snapshot else {
+            continue;
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot.normalized()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("lix_permission_grant row has invalid JSON: {error}"),
+                )
+            })?;
+        validate_permission_grant_value(&value)?;
+    }
+    Ok(())
+}
+
+fn validate_permission_grant_value(value: &serde_json::Value) -> Result<(), LixError> {
+    let principal_type = required_permission_grant_text(value, "principal_type")?;
+    let principal_id = optional_permission_grant_text(value, "principal_id")?;
+    match principal_type {
+        "anonymous" if principal_id.is_some() => {
+            return Err(invalid_permission_grant(
+                "anonymous permission grants must not set principal_id",
+            ));
+        }
+        "account" | "group" if principal_id.is_none_or(str::is_empty) => {
+            return Err(invalid_permission_grant(format!(
+                "{principal_type} permission grants require principal_id"
+            )));
+        }
+        "account" => {
+            RowPk::uuid_from_canonical(principal_id.expect("account id checked above")).map_err(
+                |_| invalid_permission_grant("account principal_id must be a canonical UUID"),
+            )?;
+        }
+        "group" | "anonymous" => {}
+        _ => {
+            return Err(invalid_permission_grant(format!(
+                "unsupported permission principal_type '{principal_type}'"
+            )));
+        }
+    }
+
+    let access_level = required_permission_grant_text(value, "access_level")?;
+    if !matches!(
+        access_level,
+        "viewer" | "commenter" | "contributor" | "editor" | "manager"
+    ) {
+        return Err(invalid_permission_grant(format!(
+            "unsupported permission access_level '{access_level}'"
+        )));
+    }
+
+    let resource_type = required_permission_grant_text(value, "resource_type")?;
+    let directory_id = optional_permission_grant_text(value, "directory_id")?;
+    let file_id = optional_permission_grant_text(value, "file_id")?;
+    let schema_key = optional_permission_grant_text(value, "schema_key")?;
+    let row_pk = value.get("row_pk").filter(|value| !value.is_null());
+
+    let valid_shape = match resource_type {
+        "repository" => {
+            directory_id.is_none() && file_id.is_none() && schema_key.is_none() && row_pk.is_none()
+        }
+        "directory" => {
+            directory_id.is_some() && file_id.is_none() && schema_key.is_none() && row_pk.is_none()
+        }
+        "file" => {
+            directory_id.is_none() && file_id.is_some() && schema_key.is_none() && row_pk.is_none()
+        }
+        "table" => {
+            directory_id.is_none()
+                && file_id.is_some()
+                && schema_key.is_some_and(|key| !key.is_empty())
+                && row_pk.is_none()
+        }
+        "row" => {
+            directory_id.is_none()
+                && file_id.is_some()
+                && schema_key.is_some_and(|key| !key.is_empty())
+                && row_pk.is_some_and(|pk| {
+                    pk.as_array().is_some_and(|components| !components.is_empty())
+                })
+        }
+        _ => {
+            return Err(invalid_permission_grant(format!(
+                "unsupported permission resource_type '{resource_type}'"
+            )));
+        }
+    };
+    if !valid_shape {
+        return Err(invalid_permission_grant(format!(
+            "permission resource columns do not match resource_type '{resource_type}'"
+        )));
+    }
+    Ok(())
+}
+
+fn required_permission_grant_text<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, LixError> {
+    optional_permission_grant_text(value, field)?.ok_or_else(|| {
+        invalid_permission_grant(format!("permission grant requires {field}"))
+    })
+}
+
+fn optional_permission_grant_text<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<Option<&'a str>, LixError> {
+    match value.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(invalid_permission_grant(format!(
+            "permission grant {field} must be text or null"
+        ))),
+    }
+}
+
+fn invalid_permission_grant(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_INVALID_PARAM, message)
 }
 
 async fn validate_account_deletions(
