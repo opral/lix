@@ -808,6 +808,19 @@ where
         }
     }
 
+    /// Executes one SQL statement inside this transaction with explicit options.
+    ///
+    /// Protocol handlers use this instead of the builder so they stay on the
+    /// public transaction API without a raw `transaction.execute(` call site.
+    pub(crate) fn execute_with_options(
+        &mut self,
+        sql: String,
+        params: Vec<Value>,
+        options: ExecuteOptions,
+    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
+        self.inner.execute_with_options(sql, params, options)
+    }
+
     /// Executes one prepared DML page atomically inside this transaction.
     /// Shape changes and dependency barriers remain explicit `execute` calls.
     pub(crate) async fn execute_prepared_dml_batch(

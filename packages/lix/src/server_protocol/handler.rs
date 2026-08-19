@@ -1120,12 +1120,7 @@ where
                         "remote transaction capability does not match the active transaction",
                     ));
                 }
-                let execution = super::execute_protocol_transaction(
-                    &mut active.transaction,
-                    &sql,
-                    &params,
-                    options,
-                );
+                let execution = active.transaction.execute_with_options(sql, params, options);
                 tokio::select! {
                     biased;
                     _ = &mut cancelled => {
