@@ -8,6 +8,48 @@ use serde::{Deserialize, Serialize};
 
 use super::commit::SyncCommit;
 
+/// Returns the exact JSON size of a one-event delta response without cloning
+/// commit payloads. Both HTTP admission and ordinary Authority transactions
+/// use this single wire projection so an accepted event is always pullable.
+pub(crate) fn encoded_delta_event_len(
+    cursor: u64,
+    commits: &[&SyncCommit],
+    ref_updates: &[SyncRefUpdate],
+) -> Result<usize, crate::LixError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BorrowedEvent<'a> {
+        cursor: u64,
+        commits: &'a [&'a SyncCommit],
+        ref_updates: &'a [SyncRefUpdate],
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BorrowedDelta<'a> {
+        kind: &'static str,
+        cursor: u64,
+        events: [BorrowedEvent<'a>; 1],
+    }
+
+    serde_json::to_vec(&BorrowedDelta {
+        kind: "delta",
+        cursor,
+        events: [BorrowedEvent {
+            cursor,
+            commits,
+            ref_updates,
+        }],
+    })
+    .map(|encoded| encoded.len())
+    .map_err(|error| {
+        crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            format!("encode sync delta event: {error}"),
+        )
+    })
+}
+
 /// One atomic compare-and-swap update to a repository branch ref.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,8 +177,8 @@ pub enum SyncRepositoryPullResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SyncHistoryResponse {
     pub commits: Vec<SyncCommit>,
-    /// Bounded topology certificates for requested commits and the direct
-    /// parent/jump boundaries needed to validate them without eager history.
+    /// Lightweight topology certificates needed to install the requested
+    /// commits without loading historical member payloads.
     pub commit_headers: Vec<SyncCommitHeader>,
     pub missing_commit_ids: Vec<String>,
 }

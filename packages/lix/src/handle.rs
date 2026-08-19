@@ -13,6 +13,7 @@ use lix::{
     SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::{
+    collections::BTreeSet,
     future::{Future, IntoFuture},
     pin::Pin,
     sync::Arc,
@@ -243,24 +244,15 @@ where
         // the Sync session; storage handles are Send by the Storage contract.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                let first = self
-                    .lix
-                    .session
-                    .execute_with_options(&self.sql, &self.params, self.options.clone())
-                    .await;
-                match first {
-                    Err(error) => {
-                        if self.lix.hydrate_sync_demand_for_error(&error).await? {
-                            self.lix
-                                .session
-                                .execute_with_options(&self.sql, &self.params, self.options)
-                                .await
-                        } else {
-                            Err(error)
-                        }
-                    }
-                    result => result,
-                }
+                self.lix
+                    .retry_sync_demands(|| {
+                        self.lix.session.execute_with_options(
+                            &self.sql,
+                            &self.params,
+                            self.options.clone(),
+                        )
+                    })
+                    .await
             })
         })
     }
@@ -300,24 +292,13 @@ where
         // only the Sync session across suspension.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                let first = self
-                    .lix
-                    .session
-                    .execute_batch_with_options(&self.statements, self.options.clone())
-                    .await;
-                match first {
-                    Err(error) => {
-                        if self.lix.hydrate_sync_demand_for_error(&error).await? {
-                            self.lix
-                                .session
-                                .execute_batch_with_options(&self.statements, self.options)
-                                .await
-                        } else {
-                            Err(error)
-                        }
-                    }
-                    result => result,
-                }
+                self.lix
+                    .retry_sync_demands(|| {
+                        self.lix
+                            .session
+                            .execute_batch_with_options(&self.statements, self.options.clone())
+                    })
+                    .await
             })
         })
     }
@@ -438,6 +419,49 @@ where
             return Ok(false);
         };
         crate::sync::demand_sync_for_error(demand_tx, error).await
+    }
+
+    async fn retry_sync_demands<T, Operation, OperationFuture>(
+        &self,
+        mut operation: Operation,
+    ) -> Result<T, LixError>
+    where
+        Operation: FnMut() -> OperationFuture,
+        OperationFuture: Future<Output = Result<T, LixError>>,
+    {
+        const MAX_DEMAND_ROUNDS: usize = crate::sync::MAX_SYNC_REQUEST_ITEMS;
+        let mut seen = BTreeSet::new();
+        for _ in 0..MAX_DEMAND_ROUNDS {
+            match operation().await {
+                Err(error) => {
+                    let demand_identity = match error.code.as_str() {
+                        "LIX_SYNC_HISTORY_REQUIRED" | "LIX_SYNC_CHUNKS_REQUIRED" => Some(format!(
+                            "{}:{}",
+                            error.code,
+                            serde_json::to_string(&error.details).unwrap_or_default()
+                        )),
+                        _ => None,
+                    };
+                    if let Some(identity) = demand_identity
+                        && !seen.insert(identity)
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "sync demand hydration did not make progress",
+                        ));
+                    }
+                    if self.hydrate_sync_demand_for_error(&error).await? {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                result => return result,
+            }
+        }
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("sync demand hydration exceeded {MAX_DEMAND_ROUNDS} rounds"),
+        ))
     }
 
     pub(crate) fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
@@ -651,20 +675,8 @@ where
         range: Option<std::ops::Range<u64>>,
     ) -> Result<Option<lix::FileRead>, LixError> {
         let path = path.into();
-        match self
-            .session
-            .read_file_content(path.clone(), range.clone())
+        self.retry_sync_demands(|| self.session.read_file_content(path.clone(), range.clone()))
             .await
-        {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session.read_file_content(path, range).await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
     }
 
     pub(crate) async fn execute_with_options_and_metadata(
@@ -674,22 +686,15 @@ where
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
     ) -> Result<ExecuteResult, LixError> {
-        match self
-            .session
-            .execute_with_options_and_metadata(sql, params, options.clone(), metadata.clone())
-            .await
-        {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session
-                        .execute_with_options_and_metadata(sql, params, options, metadata)
-                        .await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
+        self.retry_sync_demands(|| {
+            self.session.execute_with_options_and_metadata(
+                sql,
+                params,
+                options.clone(),
+                metadata.clone(),
+            )
+        })
+        .await
     }
 
     pub(crate) fn execute_with_idempotency_and_options_and_metadata(
@@ -767,30 +772,14 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        match self
-            .session
-            .execute_batch_with_options_and_metadata(
+        self.retry_sync_demands(|| {
+            self.session.execute_batch_with_options_and_metadata(
                 statements,
                 options.clone(),
                 statement_metadata.clone(),
             )
-            .await
-        {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session
-                        .execute_batch_with_options_and_metadata(
-                            statements,
-                            options,
-                            statement_metadata,
-                        )
-                        .await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
+        })
+        .await
     }
 
     pub(crate) fn execute_batch_with_idempotency_and_options_and_metadata(
@@ -865,16 +854,8 @@ where
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
-        match self.session.create_branch(options.clone()).await {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session.create_branch(options).await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
+        self.retry_sync_demands(|| self.session.create_branch(options.clone()))
+            .await
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
@@ -883,30 +864,12 @@ where
 
     /// Reverses the latest undoable tracked commit on this handle's active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        match self.session.undo().await {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session.undo().await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
+        self.retry_sync_demands(|| self.session.undo()).await
     }
 
     /// Replays the latest tracked commit abandoned by undo on this handle's active branch.
     pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        match self.session.redo().await {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session.redo().await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
+        self.retry_sync_demands(|| self.session.redo()).await
     }
 
     pub fn switch_branch(
@@ -931,16 +894,8 @@ where
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
-        match self.session.merge_branch(options.clone()).await {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session.merge_branch(options).await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
+        self.retry_sync_demands(|| self.session.merge_branch(options.clone()))
+            .await
     }
 
     pub(crate) async fn replay_execute_idempotency_result(
@@ -956,16 +911,8 @@ where
         &self,
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
-        match self.session.merge_branch_preview(options.clone()).await {
-            Err(error) => {
-                if self.hydrate_sync_demand_for_error(&error).await? {
-                    self.session.merge_branch_preview(options).await
-                } else {
-                    Err(error)
-                }
-            }
-            result => result,
-        }
+        self.retry_sync_demands(|| self.session.merge_branch_preview(options.clone()))
+            .await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
@@ -1199,6 +1146,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retries_distinct_sync_demands_until_the_operation_succeeds() {
+        let mut lix = open_lix().await.expect("open Lix");
+        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(4);
+        lix.sync_demand_tx = Some(demand_tx);
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                demand_rx
+                    .recv()
+                    .await
+                    .expect("demand should arrive")
+                    .succeed_for_test();
+            }
+        });
+        let attempts = AtomicUsize::new(0);
+        let result = lix
+            .retry_sync_demands(|| {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(match attempt {
+                    0 => Err(LixError::new(
+                        "LIX_SYNC_HISTORY_REQUIRED",
+                        "first history body is deferred",
+                    )
+                    .with_details(serde_json::json!({ "commitIds": ["first"] }))),
+                    1 => Err(LixError::new(
+                        "LIX_SYNC_HISTORY_REQUIRED",
+                        "second history body is deferred",
+                    )
+                    .with_details(serde_json::json!({ "commitIds": ["second"] }))),
+                    _ => Ok("hydrated"),
+                })
+            })
+            .await
+            .expect("distinct demands should retry to success");
+        assert_eq!(result, "hydrated");
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        responder.await.expect("demand responder should finish");
+    }
 
     #[tokio::test]
     async fn sessions_share_one_engine_but_have_independent_lifecycles() {

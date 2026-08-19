@@ -891,22 +891,6 @@ pub(crate) fn validate_repository_transaction_event_transfer(
     event: &StagedRepositoryTransactionEvent,
     materialized_commits: &[SyncCommit],
 ) -> Result<(), LixError> {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct BorrowedEvent<'a> {
-        cursor: u64,
-        commits: Vec<&'a SyncCommit>,
-        ref_updates: &'a [SyncRefUpdate],
-    }
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct BorrowedDelta<'a> {
-        kind: &'static str,
-        cursor: u64,
-        events: [BorrowedEvent<'a>; 1],
-    }
-
     let commits_by_id = materialized_commits
         .iter()
         .map(|commit| (commit.commit_id.as_str(), commit))
@@ -931,29 +915,14 @@ pub(crate) fn validate_repository_transaction_event_transfer(
             "authority sync preflight materialized a commit outside its repository event",
         ));
     }
-    let encoded = serde_json::to_vec(&BorrowedDelta {
-        kind: "delta",
-        cursor: event.cursor,
-        events: [BorrowedEvent {
-            cursor: event.cursor,
-            commits,
-            ref_updates: &event.ref_updates,
-        }],
-    })
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("encode authority sync preflight event: {error}"),
-        )
-    })?;
+    let encoded_len = super::encoded_delta_event_len(event.cursor, &commits, &event.ref_updates)?;
     let transfer_limit = repository_transaction_event_transfer_limit();
-    if encoded.len() > transfer_limit {
+    if encoded_len > transfer_limit {
         return Err(LixError::new(
             "LIX_ERROR_SYNC_ITEM_TOO_LARGE",
             format!(
                 "authority transaction would publish a {} byte sync event, exceeding the {} byte transfer limit",
-                encoded.len(),
-                transfer_limit,
+                encoded_len, transfer_limit,
             ),
         ));
     }
@@ -3092,15 +3061,23 @@ where
                 header_ids.insert(record.first_parent_jump_commit_id);
             }
         }
-        for commit_id in header_ids.clone() {
+        let mut pending_header_ids = header_ids.iter().copied().collect::<Vec<_>>();
+        while let Some(commit_id) = pending_header_ids.pop() {
             let record = load_commit_record(&read, commit_id).await?.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("sync history boundary '{commit_id}' is missing"),
                 )
             })?;
-            if record.first_parent_jump_span > 0 {
-                header_ids.insert(record.first_parent_jump_commit_id);
+            for parent in &record.parent_commit_ids {
+                if header_ids.insert(*parent) {
+                    pending_header_ids.push(*parent);
+                }
+            }
+            if record.first_parent_jump_span > 0
+                && header_ids.insert(record.first_parent_jump_commit_id)
+            {
+                pending_header_ids.push(record.first_parent_jump_commit_id);
             }
         }
         let mut commit_headers = Vec::with_capacity(header_ids.len());
@@ -3822,6 +3799,43 @@ mod tests {
             .await
             .expect("the new file should be readable");
         assert_eq!(files.rows().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deep_snapshot_includes_the_transitive_jump_header_closure() {
+        let authority = open_lix().await.expect("authority should open");
+        for generation in 0..8 {
+            write_key_value(
+                &authority,
+                "deep-history",
+                &format!("generation-{generation}"),
+            )
+            .await;
+        }
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("deep snapshot metadata should load");
+        let (_, head) = default_head(&snapshot);
+        let history = authority
+            .sync_history(std::slice::from_ref(&head))
+            .await
+            .expect("deep head history should load");
+        let header_ids = history
+            .commit_headers
+            .iter()
+            .map(|header| header.commit_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for header in &history.commit_headers {
+            if let Some(jump) = header.first_parent_jump_commit_id.as_deref() {
+                assert!(
+                    header_ids.contains(jump),
+                    "jump target {jump} for {} must be present",
+                    header.commit_id,
+                );
+            }
+        }
+        replica_from_snapshot(&authority, &snapshot).await;
     }
 
     #[tokio::test]

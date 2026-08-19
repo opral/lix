@@ -410,6 +410,22 @@ impl WasmLix {
         })
     }
 
+    #[wasm_bindgen(js_name = importFilesystemPaths)]
+    pub async fn import_filesystem_paths(&self, _paths: Vec<String>) -> Result<(), JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "importFilesystemPaths requires filesystem storage",
+        )))
+    }
+
+    #[wasm_bindgen(js_name = syncDiskToLix)]
+    pub async fn sync_disk_to_lix(&self) -> Result<(), JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "syncDiskToLix requires filesystem storage",
+        )))
+    }
+
     #[wasm_bindgen(js_name = mergeBranchPreview)]
     pub async fn merge_branch_preview(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: MergeBranchOptionsDto = from_js(options)?;

@@ -3,7 +3,7 @@
 //! Lix synchronizes its existing primitives: complete immutable commits,
 //! compare-and-swap branch refs, and BLAKE3-addressed binary chunks. Live
 //! synchronization has one ordered repository cursor. Current rows and commit
-//! topology bootstrap eagerly; historical commit payloads and blobs load on
+//! topology bootstraps eagerly; historical commit payloads and blobs load on
 //! demand. Platform-specific code is limited to tasks, timers, HTTP, and
 //! cancellation.
 
@@ -21,18 +21,18 @@ use std::time::Duration;
 
 use crate::LixError;
 
-pub use commit::{SyncCommit, SyncCommitMember};
-pub use contract::SyncTransport;
+pub(crate) use commit::SyncCommit;
+pub(crate) use contract::SyncTransport;
 #[cfg(target_family = "wasm")]
 pub use platform::{
     BROWSER_TRANSPORT_CONFIG_HEADER, register_browser_sync_transport,
     unregister_browser_sync_transport,
 };
-pub use platform::{SyncTransportBounds, SyncTransportFuture};
-pub use protocol::{
+pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
+pub(crate) use protocol::{
     SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead, SyncCommitHeader,
     SyncEvent, SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRefUpdate,
-    SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage,
+    SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
 pub(crate) use runtime::{
     PreparedSync, SyncDemand, SyncRuntime, activate_sync_mode, demand_sync_for_error,

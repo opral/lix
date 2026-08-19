@@ -4,13 +4,13 @@ use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
 use crate::LixError;
 use crate::sync::{
-    MAX_SYNC_HISTORY_COMMIT_IDS, MAX_SYNC_PULL_RESPONSE_BYTES, SyncBlobManifest,
-    SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
+    MAX_SYNC_HISTORY_COMMIT_IDS, MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT,
+    SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
     SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportFuture,
     validate_blake3_id, validate_sync_remote_id,
 };
@@ -432,8 +432,31 @@ async fn fetch(
     // Dropping the shared pull future must stop the browser request too. A
     // dropped `JsFuture` does not cancel its Promise, so cancellation lives at
     // this adapter boundary through AbortController.
+    let controller: Object = controller.into();
+    let timeout_controller = controller.clone();
+    let timeout_callback: Closure<dyn FnMut()> = Closure::wrap(Box::new(move || {
+        abort_controller(&timeout_controller);
+    }));
+    let set_timeout = Reflect::get(&global, &"setTimeout".into())
+        .map_err(js_transport_error)?
+        .dyn_into::<Function>()
+        .map_err(js_transport_error)?;
+    let timeout_ms =
+        (SYNC_LONG_POLL_TIMEOUT + std::time::Duration::from_secs(5)).as_millis() as f64;
+    let timeout_handle = set_timeout
+        .call2(
+            &global,
+            timeout_callback.as_ref(),
+            &JsValue::from_f64(timeout_ms),
+        )
+        .map_err(js_transport_error)?;
     let mut abort_on_drop = AbortOnDrop {
-        controller: controller.into(),
+        controller,
+        timeout: Some(BrowserTimeout {
+            global: global.clone().into(),
+            handle: timeout_handle,
+            _callback: timeout_callback,
+        }),
         armed: true,
     };
     Reflect::set(&init, &"method".into(), &method.into()).map_err(js_transport_error)?;
@@ -494,7 +517,7 @@ async fn fetch(
             format!("sync response exceeds {MAX_SYNC_PULL_RESPONSE_BYTES} bytes"),
         ));
     }
-    abort_on_drop.armed = false;
+    abort_on_drop.disarm();
     Ok(FetchResponse {
         status,
         status_text,
@@ -504,19 +527,49 @@ async fn fetch(
 
 struct AbortOnDrop {
     controller: Object,
+    timeout: Option<BrowserTimeout>,
     armed: bool,
+}
+
+struct BrowserTimeout {
+    global: JsValue,
+    handle: JsValue,
+    _callback: Closure<dyn FnMut()>,
+}
+
+impl AbortOnDrop {
+    fn disarm(&mut self) {
+        self.clear_timeout();
+        self.armed = false;
+    }
+
+    fn clear_timeout(&mut self) {
+        let Some(timeout) = self.timeout.take() else {
+            return;
+        };
+        if let Ok(clear_timeout) = Reflect::get(&timeout.global, &"clearTimeout".into())
+            && let Ok(clear_timeout) = clear_timeout.dyn_into::<Function>()
+        {
+            let _ = clear_timeout.call1(&timeout.global, &timeout.handle);
+        }
+    }
 }
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
+        self.clear_timeout();
         if !self.armed {
             return;
         }
-        if let Ok(abort) = Reflect::get(&self.controller, &"abort".into())
-            && let Ok(abort) = abort.dyn_into::<Function>()
-        {
-            let _ = abort.call0(&self.controller);
-        }
+        abort_controller(&self.controller);
+    }
+}
+
+fn abort_controller(controller: &Object) {
+    if let Ok(abort) = Reflect::get(controller, &"abort".into())
+        && let Ok(abort) = abort.dyn_into::<Function>()
+    {
+        let _ = abort.call0(controller);
     }
 }
 

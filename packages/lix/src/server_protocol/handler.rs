@@ -2354,36 +2354,10 @@ fn ensure_sync_push_event_fits(
     request: &SyncPushRequest,
     max_bytes: usize,
 ) -> Result<(), ApiError> {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct AdmissionEvent<'a> {
-        cursor: u64,
-        commits: &'a [crate::sync::SyncCommit],
-        ref_updates: &'a [crate::sync::SyncRefUpdate],
-    }
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct AdmissionDelta<'a> {
-        kind: &'static str,
-        cursor: u64,
-        events: [AdmissionEvent<'a>; 1],
-    }
-    let event = AdmissionDelta {
-        kind: "delta",
-        cursor: u64::MAX,
-        events: [AdmissionEvent {
-            cursor: u64::MAX,
-            commits: &request.commits,
-            ref_updates: &request.ref_updates,
-        }],
-    };
-    let encoded = serde_json::to_vec(&event).map_err(|error| {
-        ApiError::from(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("encode sync push event admission: {error}"),
-        ))
-    })?;
-    if encoded.len() > max_bytes {
+    let commits = request.commits.iter().collect::<Vec<_>>();
+    let encoded_len =
+        crate::sync::encoded_delta_event_len(u64::MAX, &commits, &request.ref_updates)?;
+    if encoded_len > max_bytes {
         return Err(ApiError::sync_push_event_too_large(max_bytes));
     }
     Ok(())
@@ -4949,8 +4923,8 @@ mod tests {
     use http_body_util::BodyExt as _;
     use lix::storage::{
         BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, MemoryRead,
-        MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage,
-        StorageError, StorageRead, StorageSpace, StorageWrite, WriteOptions,
+        MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
+        StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
     use lix::telemetry::TracingTelemetrySink;
     use lix::{Blob, Memory, open_lix};
@@ -5627,7 +5601,6 @@ mod tests {
         fn fail_next_commit(&self) {
             self.fail_next_commit.store(true, Ordering::Release);
         }
-
     }
 
     struct PostCommitUnknownWrite {

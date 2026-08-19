@@ -34,6 +34,13 @@ pub(crate) struct SyncDemand {
     response: tokio::sync::oneshot::Sender<Result<(), LixError>>,
 }
 
+#[cfg(test)]
+impl SyncDemand {
+    pub(crate) fn succeed_for_test(self) {
+        let _ = self.response.send(Ok(()));
+    }
+}
+
 #[derive(Debug)]
 enum SyncDemandRequest {
     History(Vec<String>),
@@ -71,18 +78,28 @@ pub(crate) async fn prepare_sync_mode(
 ) -> Result<PreparedSync, LixError> {
     let remote_id = server.url.trim_end_matches('/');
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
-    let snapshot = transport
-        .pull(None, SYNC_DELTA_PULL_LIMIT)
-        .await
-        .map_err(snapshot_pull_error)?;
-    let default_branch_id = snapshot_default_branch_id(&snapshot)?.to_owned();
-    super::validate_sync_branch_id(&default_branch_id)?;
-    let snapshot = prepare_repository_snapshot(&transport, snapshot).await?;
+    let (snapshot, default_branch_id) = fetch_repository_snapshot(&transport).await?;
     Ok(PreparedSync {
         transport,
         snapshot,
         default_branch_id,
     })
+}
+
+async fn fetch_repository_snapshot<Transport>(
+    transport: &Transport,
+) -> Result<(PreparedRepositorySnapshot, String), LixError>
+where
+    Transport: SyncTransport,
+{
+    let metadata = transport
+        .pull(None, SYNC_DELTA_PULL_LIMIT)
+        .await
+        .map_err(snapshot_pull_error)?;
+    let default_branch_id = snapshot_default_branch_id(&metadata)?.to_owned();
+    super::validate_sync_branch_id(&default_branch_id)?;
+    let snapshot = prepare_repository_snapshot(transport, metadata).await?;
+    Ok((snapshot, default_branch_id))
 }
 
 fn snapshot_default_branch_id(response: &SyncRepositoryPullResponse) -> Result<&str, LixError> {
@@ -418,17 +435,7 @@ where
     // work. This prevents an engine's synthetic initialization commit from
     // being mistaken for user-authored repository history.
     if lix.load_sync_repository_cursor(remote_id).await?.is_none() {
-        let snapshot = transport
-            .pull(None, SYNC_DELTA_PULL_LIMIT)
-            .await
-            .map_err(snapshot_pull_error)?;
-        if !matches!(snapshot, SyncRepositoryPullResponse::Snapshot { .. }) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "cursor-less sync pull did not return a repository snapshot",
-            ));
-        }
-        let snapshot = prepare_repository_snapshot(transport, snapshot).await?;
+        let (snapshot, _) = fetch_repository_snapshot(transport).await?;
         register_commit_blob_manifests(lix, transport, &snapshot.commits).await?;
         register_snapshot_row_blob_manifests(lix, transport, &snapshot.rows).await?;
         lix.apply_sync_repository_snapshot(
@@ -578,6 +585,7 @@ where
     let mut page_limit = SYNC_SNAPSHOT_ROW_LIMIT;
     for (branch_id, head_commit_id) in targets {
         let mut continuation = None;
+        let mut seen_continuations = BTreeSet::new();
         loop {
             let page = fetch_snapshot_row_page_adaptive(
                 transport,
@@ -602,9 +610,16 @@ where
                 ));
             }
             let next = page.continuation;
-            if next.as_ref().is_some_and(|next| {
-                next.len() > 4096 || continuation.as_ref().is_some_and(|current| current == next)
-            }) {
+            if next.is_some() && page.rows.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync snapshot row page returned a continuation without rows",
+                ));
+            }
+            if next
+                .as_ref()
+                .is_some_and(|next| next.len() > 4096 || !seen_continuations.insert(next.clone()))
+            {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     "sync snapshot row continuation is invalid or did not advance",
@@ -1404,6 +1419,14 @@ mod tests {
     struct PagedSnapshotTransport {
         max_items: usize,
         calls: Arc<Mutex<Vec<(Option<String>, usize)>>>,
+        behavior: SnapshotPageBehavior,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SnapshotPageBehavior {
+        Normal,
+        Cycle,
+        EmptyContinuation,
     }
 
     impl SyncTransport for PagedSnapshotTransport {
@@ -1448,10 +1471,21 @@ mod tests {
                         "test snapshot row response exceeds cap",
                     ));
                 }
-                let (row_id, next) = match continuation {
-                    None => ("first", Some("next".to_owned())),
-                    Some("next") => ("second", None),
-                    Some(_) => {
+                let (row_id, next) = match (self.behavior, continuation) {
+                    (SnapshotPageBehavior::Normal, None) => ("first", Some("next".to_owned())),
+                    (SnapshotPageBehavior::Normal, Some("next")) => ("second", None),
+                    (SnapshotPageBehavior::Cycle, None) => ("first", Some("a".to_owned())),
+                    (SnapshotPageBehavior::Cycle, Some("a")) => ("second", Some("b".to_owned())),
+                    (SnapshotPageBehavior::Cycle, Some("b")) => ("third", Some("a".to_owned())),
+                    (SnapshotPageBehavior::EmptyContinuation, None) => {
+                        return Ok(super::super::SyncSnapshotRowPage {
+                            branch_id: branch_id.to_owned(),
+                            head_commit_id: head_commit_id.to_owned(),
+                            rows: Vec::new(),
+                            continuation: Some("next".to_owned()),
+                        });
+                    }
+                    _ => {
                         return Err(LixError::new(
                             LixError::CODE_INVALID_PARAM,
                             "unknown test continuation",
@@ -1865,6 +1899,7 @@ mod tests {
         let transport = PagedSnapshotTransport {
             max_items: 2,
             calls: Arc::clone(&calls),
+            behavior: SnapshotPageBehavior::Normal,
         };
         let mut limit = 4;
         let page = fetch_snapshot_row_page_adaptive(&transport, "branch", "head", None, &mut limit)
@@ -1884,6 +1919,7 @@ mod tests {
         let transport = PagedSnapshotTransport {
             max_items: SYNC_SNAPSHOT_ROW_LIMIT,
             calls: Arc::clone(&calls),
+            behavior: SnapshotPageBehavior::Normal,
         };
         let snapshot = SyncRepositoryPullResponse::Snapshot {
             cursor: 7,
@@ -1912,6 +1948,29 @@ mod tests {
                 (Some("next".to_owned()), SYNC_SNAPSHOT_ROW_LIMIT)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_row_paging_rejects_cycles_and_empty_progress() {
+        let branches = vec![super::super::SyncBranchHead {
+            branch_id: "branch".to_owned(),
+            head_commit_id: Some("head".to_owned()),
+            hot_state_root_id: "0".repeat(64),
+        }];
+        for behavior in [
+            SnapshotPageBehavior::Cycle,
+            SnapshotPageBehavior::EmptyContinuation,
+        ] {
+            let transport = PagedSnapshotTransport {
+                max_items: SYNC_SNAPSHOT_ROW_LIMIT,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                behavior,
+            };
+            let error = fetch_snapshot_rows(&transport, &branches)
+                .await
+                .expect_err("malformed continuation must not hang bootstrap");
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        }
     }
 
     #[test]

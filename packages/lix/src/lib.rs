@@ -103,7 +103,7 @@ mod schema;
 pub mod server_protocol;
 mod session;
 #[doc(hidden)]
-pub mod sync;
+mod sync;
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
 mod sql_profile;
