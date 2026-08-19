@@ -16,7 +16,6 @@ mod protocol;
 mod repository;
 mod runtime;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -108,7 +107,6 @@ pub(crate) enum SyncRole {
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
     role: Arc<RwLock<SyncRole>>,
-    change_version: Arc<AtomicU64>,
     change_watch: Arc<tokio::sync::watch::Sender<u64>>,
     apply_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -117,7 +115,6 @@ impl Default for SyncModeState {
     fn default() -> Self {
         Self {
             role: Arc::new(RwLock::new(SyncRole::Disabled)),
-            change_version: Arc::new(AtomicU64::new(0)),
             change_watch: Arc::new(tokio::sync::watch::channel(0).0),
             apply_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -143,8 +140,8 @@ impl SyncModeState {
     }
 
     pub(crate) fn notify_sync_change(&self) {
-        let version = self.change_version.fetch_add(1, Ordering::AcqRel) + 1;
-        self.change_watch.send_replace(version);
+        self.change_watch
+            .send_modify(|version| *version = version.wrapping_add(1));
     }
 
     pub(crate) async fn lock_apply_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
