@@ -950,6 +950,12 @@ mod tests {
             started: Mutex<Vec<TelemetrySpanKind>>,
         }
 
+        impl SqlOnlySink {
+            fn into_sink(self: Arc<Self>) -> Arc<dyn TelemetrySink> {
+                self
+            }
+        }
+
         impl TelemetrySink for SqlOnlySink {
             fn enabled(&self, kind: TelemetrySpanKind) -> bool {
                 !matches!(kind, TelemetrySpanKind::LixOpened)
@@ -980,7 +986,7 @@ mod tests {
             started: Mutex::new(Vec::new()),
         });
         let lix = open_lix()
-            .with_telemetry(Arc::clone(&sink) as Arc<dyn TelemetrySink>)
+            .with_telemetry(Arc::clone(&sink).into_sink())
             .await
             .expect("open Lix");
         lix.execute("SELECT 1", &[]).await.expect("execute");

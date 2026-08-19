@@ -372,6 +372,10 @@ mod tests {
                 enabled_kinds: Mutex::new(Vec::new()),
             }
         }
+
+        fn into_sink(self: Arc<Self>) -> Arc<dyn TelemetrySink> {
+            self
+        }
     }
 
     impl TelemetrySink for RecordingSink {
@@ -422,7 +426,7 @@ mod tests {
     #[test]
     fn disabled_opened_kind_does_not_start_a_span() {
         let sink = Arc::new(RecordingSink::new(false));
-        let trait_sink: Arc<dyn TelemetrySink> = Arc::clone(&sink) as Arc<dyn TelemetrySink>;
+        let trait_sink = Arc::clone(&sink).into_sink();
         bind_session(Some(&trait_sink), "lix-id", "branch-id", Some("account-id"));
         assert_eq!(
             *sink.enabled_kinds.lock().expect("enabled kinds"),
@@ -434,7 +438,7 @@ mod tests {
     #[test]
     fn bind_session_emits_vendor_neutral_opened_attributes() {
         let sink = Arc::new(RecordingSink::new(true));
-        let trait_sink: Arc<dyn TelemetrySink> = Arc::clone(&sink) as Arc<dyn TelemetrySink>;
+        let trait_sink = Arc::clone(&sink).into_sink();
         bind_session(Some(&trait_sink), "lix-id", "branch-id", Some("account-id"));
         let started = sink.started.lock().expect("started spans").clone();
         assert_eq!(started.len(), 1);
@@ -460,7 +464,7 @@ mod tests {
     #[test]
     fn bind_session_omits_account_when_absent() {
         let sink = Arc::new(RecordingSink::new(true));
-        let trait_sink: Arc<dyn TelemetrySink> = Arc::clone(&sink) as Arc<dyn TelemetrySink>;
+        let trait_sink = Arc::clone(&sink).into_sink();
         bind_session(Some(&trait_sink), "lix-id", "branch-id", None);
         let started = sink.started.lock().expect("started spans").clone();
         assert_eq!(started.len(), 1);
