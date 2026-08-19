@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 mod checkpoint;
+mod authorization;
 mod context;
 mod create_branch;
 mod execute;

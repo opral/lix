@@ -981,16 +981,71 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 	const schemas = await lix.execute(
 		"SELECT table_name \
 		 FROM information_schema.tables \
-		 WHERE table_name IN ($1, $2, $3) \
+		 WHERE table_name IN ($1, $2, $3, $4) \
 		 ORDER BY table_name",
-		["csv_row", "csv_table", "markdown_node"],
+		[
+			"cedar_permission_source",
+			"csv_row",
+			"csv_table",
+			"markdown_node",
+		],
 	);
 	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
+		"cedar_permission_source",
 		"csv_row",
 		"csv_table",
 		"markdown_node",
 	]);
 
+	await lix.close();
+});
+
+test("bundled Cedar plugin projects canonical files into read-only rows", async () => {
+	const lix = await openLix();
+	const cedar = (await bundledPluginArchives()).find(
+		(plugin) => plugin.key === "plugin_cedar",
+	);
+	if (!cedar) throw new Error("expected bundled Cedar plugin");
+	await upsertPluginArchive(lix, cedar.key, cedar.archiveBytes);
+
+	const encoder = new TextEncoder();
+	await writeFile(
+		lix,
+		"/.lix/permissions/schema.cedarschema",
+		encoder.encode(
+			'entity Account; entity File; action "view" appliesTo { principal: Account, resource: File };',
+		),
+	);
+	await writeFile(
+		lix,
+		"/.lix/permissions/publications.cedar",
+		encoder.encode(""),
+	);
+	await writeFile(
+		lix,
+		"/.lix/permissions/entities.cedar.json",
+		encoder.encode("[]"),
+	);
+
+	const projected = await lix.execute(
+		"SELECT kind, path, source FROM cedar_permission_source ORDER BY path",
+	);
+	expect(projected.rows.map((row) => row.get("kind"))).toEqual([
+		"entities",
+		"policy",
+		"schema",
+	]);
+	expect(projected.rows.map((row) => row.get("path"))).toEqual([
+		"/.lix/permissions/entities.cedar.json",
+		"/.lix/permissions/publications.cedar",
+		"/.lix/permissions/schema.cedarschema",
+	]);
+
+	await expect(
+		lix.execute(
+			"UPDATE cedar_permission_source SET source = '' WHERE kind = 'schema'",
+		),
+	).rejects.toThrow(/read-only/i);
 	await lix.close();
 });
 

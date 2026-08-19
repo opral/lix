@@ -48,6 +48,7 @@ macro_rules! engine_surface {
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 engine_surface! {
 pub(crate) mod account;
+pub(crate) mod authorization;
 mod binary_cas;
 pub(crate) mod branch;
 mod background_task;
@@ -152,6 +153,7 @@ pub use schema::{
 pub use lix_schema as schema_v1;
 
 pub use common::LixError;
+pub use authorization::AuthorizationDecision;
 pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};

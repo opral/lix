@@ -652,6 +652,20 @@ where
         );
     }
 
+    /// Evaluates the active account against the repository's Cedar policy.
+    /// Repositories without `/.lix/permissions/schema.cedarschema` report an
+    /// inactive decision and retain their existing behavior.
+    pub async fn authorize(
+        &self,
+        action: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<crate::AuthorizationDecision, LixError> {
+        self.session
+            .authorize(action, resource_type, resource_id)
+            .await
+    }
+
     /// Creates an active global account if it does not exist. Existing mutable
     /// account fields are deliberately left unchanged.
     pub(crate) async fn ensure_account(

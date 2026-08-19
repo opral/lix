@@ -1,0 +1,30 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "cedar_permission_source",
+  "description": "Read-only projection of one canonical Cedar permission file.",
+  "columns": [
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false
+    },
+    {
+      "name": "kind",
+      "type": "text",
+      "nullable": false
+    },
+    {
+      "name": "path",
+      "type": "text",
+      "nullable": false
+    },
+    {
+      "name": "source",
+      "type": "text",
+      "nullable": false
+    }
+  ],
+  "primary_key": [
+    "id"
+  ]
+}

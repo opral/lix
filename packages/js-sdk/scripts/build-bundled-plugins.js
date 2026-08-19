@@ -67,6 +67,8 @@ const cargoArgs = [
 	"--manifest-path",
 	join(repoRoot, "Cargo.toml"),
 	"-p",
+	"plugin_cedar",
+	"-p",
 	"plugin_csv",
 	"-p",
 	"plugin_markdown",
@@ -77,6 +79,23 @@ cargoArgs.push("--profile", profile);
 await run("cargo", cargoArgs);
 
 await mkdir(outDir, { recursive: true });
+await writeBundledPlugin({
+	crateName: "plugin_cedar",
+	fileName: "plugin_cedar.lixplugin",
+	files: [
+		["manifest.json", join(repoRoot, "plugins", "cedar", "manifest.json")],
+		[
+			"schema/cedar_permission_source.json",
+			join(
+				repoRoot,
+				"plugins",
+				"cedar",
+				"schema",
+				"cedar_permission_source.json",
+			),
+		],
+	],
+});
 await writeBundledPlugin({
 	crateName: "plugin_csv",
 	fileName: "plugin_csv.lixplugin",

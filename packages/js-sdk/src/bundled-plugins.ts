@@ -6,6 +6,10 @@ export type BundledPluginArchive = {
 
 const BUNDLED_PLUGIN_MANIFEST = [
 	{
+		key: "plugin_cedar",
+		fileName: "plugin_cedar.lixplugin",
+	},
+	{
 		key: "plugin_markdown",
 		fileName: "plugin_markdown.lixplugin",
 	},

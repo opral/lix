@@ -1,0 +1,11 @@
+{
+  "key": "plugin_cedar",
+  "file_match": {
+    "path_glob": "/.lix/permissions/*",
+    "content": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/cedar_permission_source.json"
+  ]
+}

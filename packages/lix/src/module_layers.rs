@@ -96,6 +96,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
         "background_task",
         "executor-neutral engine worker plumbing, no repository semantics",
     ),
+    (
+        "authorization",
+        "repository policy parsing and Cedar evaluation; not yet placed",
+    ),
     ("catalog", "not yet analysed"),
     ("domain", "pure predicates, no owned invariant"),
     ("engine", "entry point; reaches everywhere by design"),

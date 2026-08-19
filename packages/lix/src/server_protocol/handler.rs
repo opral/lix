@@ -3613,6 +3613,7 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         | LixError::CODE_COMMIT_NOT_FOUND
         | LixError::CODE_TABLE_NOT_FOUND
         | LixError::CODE_COLUMN_NOT_FOUND => StatusCode::NOT_FOUND,
+        LixError::CODE_PERMISSION_DENIED => StatusCode::FORBIDDEN,
         LixError::CODE_CLOSED | LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED => {
             StatusCode::CONFLICT
         }
@@ -7049,6 +7050,77 @@ mod tests {
                 .to_bytes()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn binary_file_read_enforces_repository_cedar_policy() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let public_file_id = "01920000-0000-7000-8000-000000000101";
+        let private_file_id = "01920000-0000-7000-8000-000000000102";
+        let schema = r#"
+            entity Account;
+            entity File;
+            action "view" appliesTo { principal: Account, resource: File };
+        "#;
+        let policies = format!(
+            r#"permit (
+                principal == Account::"{}",
+                action == Action::"view",
+                resource == File::"{public_file_id}"
+            );"#,
+            lix::ANONYMOUS_ACCOUNT_ID
+        );
+        let seeded = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_file (id, path, content) VALUES ($1, '/public.txt', CAST('public' AS BYTEA)), ($2, '/private.txt', CAST('private' AS BYTEA)), ($3, '/.lix/permissions/schema.cedarschema', CAST($4 AS BYTEA)), ($5, '/.lix/permissions/publications.cedar', CAST($6 AS BYTEA))",
+                "params": [
+                    { "kind": "text", "value": public_file_id },
+                    { "kind": "text", "value": private_file_id },
+                    { "kind": "text", "value": "01920000-0000-7000-8000-000000000103" },
+                    { "kind": "text", "value": schema },
+                    { "kind": "text", "value": "01920000-0000-7000-8000-000000000104" },
+                    { "kind": "text", "value": policies }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(seeded.status(), StatusCode::OK);
+
+        let allowed = request(
+            &app.router,
+            "GET",
+            "/lix/v1/file?path=%2Fpublic.txt",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed
+                .into_body()
+                .collect()
+                .await
+                .expect("public file body")
+                .to_bytes()
+                .as_ref(),
+            b"public"
+        );
+
+        let denied = request(
+            &app.router,
+            "GET",
+            "/lix/v1/file?path=%2Fprivate.txt",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(denied).await, LixError::CODE_PERMISSION_DENIED);
     }
 
     #[tokio::test]

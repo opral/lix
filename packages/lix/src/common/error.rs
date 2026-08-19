@@ -72,6 +72,13 @@ impl LixError {
     /// A SQL write targeted a read-only internal/component surface.
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
 
+    /// Cedar denied an authorization request for the active account.
+    pub const CODE_PERMISSION_DENIED: &'static str = "LIX_PERMISSION_DENIED";
+
+    /// Repository-owned Cedar schema, policy, or entity data is invalid.
+    pub const CODE_INVALID_PERMISSION_POLICY: &'static str =
+        "LIX_INVALID_PERMISSION_POLICY";
+
     /// SQL syntax is valid, but the feature is intentionally outside the Lix
     /// SQL surface.
     pub const CODE_UNSUPPORTED_SQL: &'static str = "LIX_UNSUPPORTED_SQL";

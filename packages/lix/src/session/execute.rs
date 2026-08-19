@@ -1178,6 +1178,14 @@ where
         // SQL remains available for callers that intentionally need broader
         // `lix_file` predicates or legacy path shapes.
         crate::common::LixPath::try_from_file_path(&path)?;
+        // SAFETY: `require_file_view` only performs ordinary session SQL reads
+        // and Cedar evaluation. Both own their values across suspension; the
+        // higher-ranked storage read lifetime is the same compiler limitation
+        // already covered by this module's send-future proofs.
+        Box::pin(unsafe {
+            super::AssumeSendFuture::new(self.require_file_view(&path))
+        })
+        .await?;
 
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
