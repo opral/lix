@@ -401,7 +401,7 @@ mod tests {
         fn finish(self: Box<Self>, _end: TelemetrySpanEnd) {}
     }
 
-    fn attribute_string(start: &TelemetrySpanStart, key: &str) -> Option<&str> {
+    fn attribute_string<'a>(start: &'a TelemetrySpanStart, key: &str) -> Option<&'a str> {
         start.attributes.iter().find_map(|attribute| {
             if attribute.key == key {
                 match &attribute.value {

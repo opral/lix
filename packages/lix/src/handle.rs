@@ -881,7 +881,7 @@ mod tests {
             .collect()
     }
 
-    fn attribute_string(span: &CompletedTelemetrySpan, key: &str) -> Option<&str> {
+    fn attribute_string<'a>(span: &'a CompletedTelemetrySpan, key: &str) -> Option<&'a str> {
         span.start.attributes.iter().find_map(|attribute| {
             if attribute.key == key {
                 match &attribute.value {
