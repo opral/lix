@@ -43,6 +43,7 @@ pub trait ProtocolHttpStream: Send {
 }
 
 /// Streaming HTTP response (observe multiplex).
+#[expect(missing_debug_implementations)]
 pub struct ProtocolHttpStreamResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -80,11 +81,3 @@ pub trait ProtocolHttp: Send + Sync {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>);
 }
 
-pub(crate) fn header_value<'a>(
-    headers: &'a [(String, String)],
-    name: &str,
-) -> Option<&'a str> {
-    headers
-        .iter()
-        .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
-}

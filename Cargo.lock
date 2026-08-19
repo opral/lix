@@ -2993,6 +2993,7 @@ dependencies = [
 name = "lix_js_sdk"
 version = "0.12.3"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
  "chrono",

@@ -636,7 +636,7 @@ struct LixValueDto {
     blob: Option<ByteBuf>,
 }
 
-fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
+pub(crate) fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
     let values: Vec<LixValueDto> = from_js(value)?;
     values
         .into_iter()
@@ -645,7 +645,7 @@ fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
         .map_err(lix_error_to_js)
 }
 
-fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
+pub(crate) fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
     if !Array::is_array(&value) {
         return Err(lix_error_to_js(invalid_param(
             "executeBatch statements must be an array",
@@ -829,7 +829,7 @@ struct ObserveEventDto {
     rows: ExecuteResultDto,
 }
 
-fn execute_result_to_js(result: RsExecuteResult) -> Result<JsValue, JsValue> {
+pub(crate) fn execute_result_to_js(result: RsExecuteResult) -> Result<JsValue, JsValue> {
     let result = ExecuteResultDto::try_from(result).map_err(lix_error_to_js)?;
     to_js(&result)
 }
@@ -871,12 +871,12 @@ fn observe_next_in_flight_error() -> JsValue {
     )
 }
 
-fn from_js<T: DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {
+pub(crate) fn from_js<T: DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {
     serde_wasm_bindgen::from_value(value)
         .map_err(|error| js_bridge_error(format!("invalid JavaScript value: {error}")))
 }
 
-fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+pub(crate) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
     value
         .serialize(
             &serde_wasm_bindgen::Serializer::new()
@@ -890,7 +890,7 @@ fn js_bridge_error(message: impl AsRef<str>) -> JsValue {
     js_sys::Error::new(message.as_ref()).into()
 }
 
-fn lix_error_to_js(error: LixError) -> JsValue {
+pub(crate) fn lix_error_to_js(error: LixError) -> JsValue {
     let js_error = js_sys::Error::new(&error.message);
     js_error.set_name("LixError");
     let object: &JsValue = js_error.as_ref();
@@ -906,12 +906,33 @@ fn lix_error_to_js(error: LixError) -> JsValue {
             &JsValue::from_str(&hint),
         );
     }
+    if let Some(status) = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("httpStatus"))
+        .and_then(|value| value.as_u64())
+    {
+        let _ = Reflect::set(
+            object,
+            &JsValue::from_str("status"),
+            &JsValue::from_f64(js_number(status)),
+        );
+    }
     if let Some(details) = error.details
         && let Ok(details) = to_js(&details)
     {
         let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
     }
     js_error.into()
+}
+
+pub(crate) fn observe_event_to_js(event: lix::ObserveEvent) -> Result<JsValue, JsValue> {
+    let rows = ExecuteResultDto::try_from(event.rows).map_err(lix_error_to_js)?;
+    to_js(&ObserveEventDto {
+        sequence: js_number(event.sequence),
+        mutation_sequence: js_number(event.mutation_sequence),
+        rows,
+    })
 }
 
 #[cfg(test)]

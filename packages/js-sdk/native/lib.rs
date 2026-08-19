@@ -11,3 +11,5 @@ mod napi;
 mod telemetry;
 #[cfg(target_family = "wasm")]
 mod wasm;
+#[cfg(target_family = "wasm")]
+mod wasm_remote;

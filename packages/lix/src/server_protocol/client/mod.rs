@@ -58,6 +58,7 @@ pub struct RemoteExecuteOptions {
     pub idempotency_key: Option<String>,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct RemoteTransaction<H: ProtocolHttp> {
     inner: Arc<ClientInner<H>>,
     transaction_id: String,
@@ -127,6 +128,7 @@ impl<H: ProtocolHttp + 'static> RemoteTransaction<H> {
     }
 }
 
+#[expect(missing_debug_implementations)]
 pub struct ServerProtocolClient<H: ProtocolHttp> {
     inner: Arc<ClientInner<H>>,
 }

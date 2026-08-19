@@ -96,6 +96,7 @@ impl CoalescedOutcomes {
     }
 }
 
+#[expect(missing_debug_implementations)]
 pub struct RemoteObserveEvents {
     outcomes: Arc<CoalescedOutcomes>,
     closed: Arc<AtomicBool>,
@@ -704,7 +705,7 @@ fn apply_blob_delta(
     }
     let rows = base.rows.rows();
     let columns = base.rows.columns();
-    let Some(crate::Value::Blob(blob)) = rows.first().and_then(|row| row.values().first()) else {
+    let Some(Value::Blob(blob)) = rows.first().and_then(|row| row.values().first()) else {
         return Err(protocol_error(
             "observe blob delta base is not a point blob result",
         ));
