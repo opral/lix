@@ -880,12 +880,15 @@ async fn commit_reaches_ancestor(
         if !seen.insert(commit_id) {
             continue;
         }
-        let record = load_commit_record(read, commit_id).await?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_COMMIT_NOT_FOUND,
-                format!("sync ancestry commit '{commit_id}' is missing"),
-            )
-        })?;
+        let Some(record) = load_commit_record(read, commit_id).await? else {
+            // Snapshot sync deliberately omits cold history bodies. Equality
+            // with the requested ancestor is checked before this load, so an
+            // absent older body is an unknown ancestry boundary, not local
+            // corruption. Classifying it as non-reachability lets the normal
+            // branch reconciler rebase hot pending work without a history
+            // fetch on the write path.
+            return Ok(false);
+        };
         pending.extend(record.parent_commit_ids);
     }
     Ok(false)
@@ -3538,6 +3541,33 @@ mod tests {
     };
 
     const TEST_REMOTE: &str = "https://sync.example/repository";
+
+    #[tokio::test]
+    async fn ancestry_walk_stops_at_an_absent_lazy_history_boundary() {
+        let lix = open_lix().await.expect("open Lix");
+        let adapter = lix.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open ancestry read");
+        let absent = CommitId::parse_lix(
+            "01920000-0000-7000-8000-000000000501",
+            "absent history commit",
+        )
+        .expect("test commit ID parses");
+        let other = CommitId::parse_lix(
+            "01920000-0000-7000-8000-000000000502",
+            "other history commit",
+        )
+        .expect("test commit ID parses");
+
+        assert!(
+            !commit_reaches_ancestor(&read, absent, other)
+                .await
+                .expect("absent lazy history is an unknown boundary"),
+            "an omitted cold commit cannot prove reachability",
+        );
+    }
 
     fn default_head(snapshot: &SyncRepositoryPullResponse) -> (String, String) {
         let SyncRepositoryPullResponse::Snapshot {
