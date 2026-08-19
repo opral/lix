@@ -13,9 +13,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix | Files, a SQL database, and version control in one repository";
+    const title = "Lix | Embeddable repository for your product";
     const description =
-      "Lix is a repository you embed in your product. Agents read and write normal files, your product queries SQL, and Lix versions everything both write.";
+      "Lix is an embeddable repository for your product. Files, SQL database, and version control in one. No external control plane to sync.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({

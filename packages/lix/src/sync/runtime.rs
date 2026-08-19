@@ -51,6 +51,7 @@ enum SyncDemandRequest {
 pub(crate) struct PreparedSync {
     transport: HttpSyncTransport,
     snapshot: PreparedRepositorySnapshot,
+    lix_id: String,
     default_branch_id: String,
 }
 
@@ -67,6 +68,10 @@ impl PreparedSync {
         &self.default_branch_id
     }
 
+    pub(crate) fn lix_id(&self) -> &str {
+        &self.lix_id
+    }
+
     pub(crate) fn active_account_id(&self) -> &str {
         self.transport.active_account_id()
     }
@@ -78,17 +83,18 @@ pub(crate) async fn prepare_sync_mode(
 ) -> Result<PreparedSync, LixError> {
     let remote_id = server.url.trim_end_matches('/');
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
-    let (snapshot, default_branch_id) = fetch_repository_snapshot(&transport).await?;
+    let (snapshot, lix_id, default_branch_id) = fetch_repository_snapshot(&transport).await?;
     Ok(PreparedSync {
         transport,
         snapshot,
+        lix_id,
         default_branch_id,
     })
 }
 
 async fn fetch_repository_snapshot<Transport>(
     transport: &Transport,
-) -> Result<(PreparedRepositorySnapshot, String), LixError>
+) -> Result<(PreparedRepositorySnapshot, String, String), LixError>
 where
     Transport: SyncTransport,
 {
@@ -96,17 +102,29 @@ where
         .pull(None, SYNC_DELTA_PULL_LIMIT)
         .await
         .map_err(snapshot_pull_error)?;
-    let default_branch_id = snapshot_default_branch_id(&metadata)?.to_owned();
+    let (lix_id, default_branch_id) = snapshot_repository_identity(&metadata)?;
+    let lix_id = lix_id.to_owned();
+    let default_branch_id = default_branch_id.to_owned();
+    if crate::storage_codec::id_string::uuid_bytes_from_canonical(&lix_id).is_none() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync snapshot lixId must be a canonical UUID",
+        ));
+    }
     super::validate_sync_branch_id(&default_branch_id)?;
     let snapshot = prepare_repository_snapshot(transport, metadata).await?;
-    Ok((snapshot, default_branch_id))
+    Ok((snapshot, lix_id, default_branch_id))
 }
 
-fn snapshot_default_branch_id(response: &SyncRepositoryPullResponse) -> Result<&str, LixError> {
+fn snapshot_repository_identity(
+    response: &SyncRepositoryPullResponse,
+) -> Result<(&str, &str), LixError> {
     match response {
         SyncRepositoryPullResponse::Snapshot {
-            default_branch_id, ..
-        } => Ok(default_branch_id),
+            lix_id,
+            default_branch_id,
+            ..
+        } => Ok((lix_id, default_branch_id)),
         SyncRepositoryPullResponse::Delta { .. } => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "initial sync pull did not return a repository snapshot",
@@ -242,6 +260,7 @@ where
             .await?;
         register_snapshot_row_blob_manifests(lix, &prepared.transport, &prepared.snapshot.rows)
             .await?;
+        let authority_lix_id = prepared.lix_id().to_owned();
         lix.apply_sync_repository_snapshot(
             &remote_id,
             prepared.active_account_id(),
@@ -251,6 +270,7 @@ where
             &prepared.snapshot.rows,
         )
         .await?;
+        lix.align_repository_identity_for_sync(authority_lix_id)?;
         lix.align_primary_account_for_sync(prepared.active_account_id())
             .await?;
         Some(prepared.transport)
@@ -435,7 +455,8 @@ where
     // work. This prevents an engine's synthetic initialization commit from
     // being mistaken for user-authored repository history.
     if lix.load_sync_repository_cursor(remote_id).await?.is_none() {
-        let (snapshot, _) = fetch_repository_snapshot(transport).await?;
+        let (snapshot, _lix_id, _default_branch_id) =
+            fetch_repository_snapshot(transport).await?;
         register_commit_blob_manifests(lix, transport, &snapshot.commits).await?;
         register_snapshot_row_blob_manifests(lix, transport, &snapshot.rows).await?;
         lix.apply_sync_repository_snapshot(
@@ -1923,6 +1944,7 @@ mod tests {
         };
         let snapshot = SyncRepositoryPullResponse::Snapshot {
             cursor: 7,
+            lix_id: "00000000-0000-7000-8000-000000000001".to_owned(),
             default_branch_id: "branch".to_owned(),
             branches: vec![super::super::SyncBranchHead {
                 branch_id: "branch".to_owned(),
@@ -2191,16 +2213,18 @@ mod tests {
     }
 
     #[test]
-    fn prepared_snapshot_uses_explicit_default_branch() {
+    fn prepared_snapshot_uses_explicit_repository_identity() {
+        let lix_id = uuid::Uuid::now_v7().to_string();
         let default_branch_id = uuid::Uuid::now_v7().to_string();
         let snapshot = SyncRepositoryPullResponse::Snapshot {
             cursor: 3,
+            lix_id: lix_id.clone(),
             default_branch_id: default_branch_id.clone(),
             branches: Vec::new(),
         };
         assert_eq!(
-            snapshot_default_branch_id(&snapshot).expect("snapshot default"),
-            default_branch_id
+            snapshot_repository_identity(&snapshot).expect("snapshot identity"),
+            (lix_id.as_str(), default_branch_id.as_str())
         );
     }
 

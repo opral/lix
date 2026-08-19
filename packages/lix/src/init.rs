@@ -36,7 +36,7 @@ use bytes::Bytes;
 use serde_json::json;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const LIX_ID_KEY: &str = "lix_id";
+pub(crate) const LIX_ID_KEY: &str = "lix_id";
 pub(crate) const DEFAULT_BRANCH_KEY: &str = "lix_default_branch_id";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const ACCOUNT_SCHEMA_KEY: &str = "lix_account";

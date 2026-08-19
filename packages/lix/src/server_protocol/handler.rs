@@ -1135,9 +1135,7 @@ where
                         "remote transaction capability does not match the active transaction",
                     ));
                 }
-                let execution = active
-                    .transaction
-                    .execute_with_options(&sql, &params, options);
+                let execution = active.transaction.execute_with_options(sql, params, options);
                 tokio::select! {
                     biased;
                     _ = &mut cancelled => {
@@ -1421,6 +1419,10 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     /// Creates a protocol server with the default session limits.
+    ///
+    /// Open `root` with [`lix::OpenLixBuilder::as_protocol_root`] so attaching
+    /// a sink does not emit `lix.opened` for the internal handle. Handshake
+    /// session creation remains the client bind.
     pub fn new(root: Arc<Lix<S>>) -> Self {
         Self::with_options(root, ServerProtocolOptions::default())
             .expect("default protocol server options must be valid")
@@ -1911,6 +1913,7 @@ where
             close_removed_session(record).await;
         }
         pending_open.commit();
+        lease.record.lix.bind_session();
         Ok(lease)
     }
 
@@ -4924,7 +4927,9 @@ mod tests {
         MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
         StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use lix::telemetry::TracingTelemetrySink;
+    use lix::telemetry::{
+        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TracingTelemetrySink,
+    };
     use lix::{Blob, Memory, open_lix};
     use serde_json::{Value as JsonValue, json};
     use std::io::Write as _;
@@ -5737,6 +5742,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5783,6 +5789,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5816,6 +5823,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -5853,6 +5861,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -6044,6 +6053,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -6097,6 +6107,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -6180,6 +6191,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -6270,6 +6282,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -6349,7 +6362,7 @@ mod tests {
     }
 
     async fn app_with_options(options: ServerProtocolOptions) -> TestApp {
-        let lix = Arc::new(open_lix().await.expect("open lix"));
+        let lix = Arc::new(open_lix().as_protocol_root().await.expect("open lix"));
         let server =
             LixServerProtocol::with_options(lix.clone(), options).expect("protocol server");
         let router = handler(server.clone());
@@ -6364,7 +6377,13 @@ mod tests {
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
-        let lix = Arc::new(open_lix().with_storage(storage).await.expect("open Lix"));
+        let lix = Arc::new(
+            open_lix()
+                .with_storage(storage)
+                .as_protocol_root()
+                .await
+                .expect("open Lix"),
+        );
         handler(LixServerProtocol::new(lix))
     }
 
@@ -6514,6 +6533,7 @@ mod tests {
         let lix = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -6568,6 +6588,7 @@ mod tests {
         let lix = Arc::new(
             open_lix()
                 .with_telemetry(Arc::new(TracingTelemetrySink::new()))
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -6994,6 +7015,81 @@ mod tests {
             )
             .await
             .expect("binary batch response")
+    }
+
+    fn opened_spans(spans: &[CompletedTelemetrySpan]) -> Vec<&CompletedTelemetrySpan> {
+        spans
+            .iter()
+            .filter(|span| span.start.kind == TelemetrySpanKind::LixOpened)
+            .collect()
+    }
+
+    async fn app_with_callback_telemetry(
+        spans: Arc<Mutex<Vec<CompletedTelemetrySpan>>>,
+    ) -> TestApp {
+        let captured = Arc::clone(&spans);
+        let lix = Arc::new(
+            open_lix()
+                .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
+                    captured.lock().expect("spans").push(span);
+                })))
+                .as_protocol_root()
+                .await
+                .expect("open lix"),
+        );
+        let server = LixServerProtocol::new(lix.clone());
+        let router = handler(server.clone());
+        TestApp {
+            lix,
+            server,
+            router,
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_that_creates_a_session_emits_one_opened_span() {
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let app = app_with_callback_telemetry(Arc::clone(&spans)).await;
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 0);
+
+        let (session_id, first) = new_session(&app.router).await;
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 1);
+
+        let resumed = request(&app.router, "GET", "/lix/v1/", Some(&session_id), None).await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 1);
+
+        let execute = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({ "sql": "SELECT 1", "params": [] })),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::OK);
+        {
+            let spans = spans.lock().expect("spans");
+            assert_eq!(opened_spans(&spans).len(), 1);
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.start.kind == TelemetrySpanKind::SqlQuery),
+                "SQL spans still work after handshake bind"
+            );
+        }
+
+        let (second_session_id, second) = new_session(&app.router).await;
+        assert_ne!(second_session_id, session_id);
+        assert_eq!(second["activeBranchId"], first["activeBranchId"]);
+        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handshake_without_a_sink_emits_no_opened_span() {
+        let app = app().await;
+        let (_session_id, _) = new_session(&app.router).await;
+        assert!(app.server.inner.root.telemetry().is_none());
     }
 
     #[tokio::test]
@@ -10650,6 +10746,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open Lix"),
         );
@@ -10902,6 +10999,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -10972,6 +11070,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -11006,6 +11105,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -11057,6 +11157,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -11136,6 +11237,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -11321,6 +11423,7 @@ mod tests {
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
+                .as_protocol_root()
                 .await
                 .expect("open lix"),
         );
@@ -11424,7 +11527,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_capacity_is_rejected() {
-        let lix = open_lix().await.expect("open lix");
+        let lix = open_lix().as_protocol_root().await.expect("open lix");
         let result = LixServerProtocol::with_options(
             Arc::new(lix),
             ServerProtocolOptions {
@@ -11439,7 +11542,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = LixServerProtocol::with_options(
-            Arc::new(open_lix().await.expect("open second lix")),
+            Arc::new(open_lix().as_protocol_root().await.expect("open second lix")),
             ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ServerProtocolOptions::default()

@@ -1519,6 +1519,7 @@ where
     ) -> Result<(), LixError> {
         let SyncRepositoryPullResponse::Snapshot {
             cursor,
+            lix_id,
             default_branch_id,
             branches,
         } = metadata
@@ -1539,6 +1540,7 @@ where
             remote_id,
             active_account_id,
             *cursor,
+            lix_id,
             default_branch_id,
             branches,
             head_commits,
@@ -1578,6 +1580,7 @@ where
         remote_id: &str,
         active_account_id: &str,
         cursor: u64,
+        lix_id: &str,
         default_branch_id: &str,
         branches: &[SyncBranchHead],
         head_commits: &[SyncCommit],
@@ -1600,6 +1603,33 @@ where
             .map(parse_snapshot_row)
             .collect::<Result<Vec<_>, _>>()?;
         let default_branch_row_pk = RowPk::single(crate::init::DEFAULT_BRANCH_KEY);
+        let lix_id_row_pk = RowPk::single(crate::init::LIX_ID_KEY);
+        let mut tracked_lix_ids = parsed_rows
+            .iter()
+            .filter(|row| {
+                row.branch_id == crate::GLOBAL_BRANCH_ID
+                    && row.schema_key == "lix_key_value"
+                    && row.file_id.is_none()
+                    && row.row_pk == lix_id_row_pk
+            })
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(&row.snapshot_json)
+                    .ok()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .get("value")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+            });
+        if tracked_lix_ids.next().flatten().as_deref() != Some(lix_id)
+            || tracked_lix_ids.next().is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot lixId disagrees with its canonical tracked row",
+            ));
+        }
         let mut tracked_default_branch_ids = parsed_rows
             .iter()
             .filter(|row| {
@@ -3487,6 +3517,7 @@ where
         }
         let metadata = SyncRepositoryPullResponse::Snapshot {
             cursor,
+            lix_id: self.lix_id().to_owned(),
             default_branch_id,
             branches,
         };

@@ -13,7 +13,7 @@ use serde_json::{Value as JsonValue, json};
 
 #[tokio::test]
 async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
-    let root = Arc::new(open_lix().await.expect("open Lix"));
+    let root = Arc::new(open_lix().as_protocol_root().await.expect("open Lix"));
     root.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[

@@ -149,6 +149,7 @@ pub use sync::{
     BROWSER_TRANSPORT_CONFIG_HEADER, register_browser_sync_transport,
     unregister_browser_sync_transport,
 };
+pub use telemetry::bind_session;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,

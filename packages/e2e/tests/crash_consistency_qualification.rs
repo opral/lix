@@ -1315,6 +1315,7 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
             let lix = Arc::new(
                 open_lix()
                     .with_storage(storage.clone())
+                    .as_protocol_root()
                     .await
                     .expect("open durable round-trip Lix"),
             );

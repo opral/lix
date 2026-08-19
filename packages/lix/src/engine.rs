@@ -47,6 +47,7 @@ pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter
     sync_mode: SyncModeState,
     plugin_host: PluginRuntimeHost,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    lix_id: Arc<str>,
 }
 
 pub(crate) struct EngineOptions {
@@ -165,7 +166,7 @@ where
             commit_graph,
         ));
         let branch_ctx = Arc::new(BranchContext::new());
-        assert_initialized(storage.clone(), hot_state.as_ref()).await?;
+        let lix_id = assert_initialized(storage.clone(), hot_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
         // execution-scoped SQL context, optionally wrapped by a transaction
@@ -193,6 +194,7 @@ where
             sync_mode: SyncModeState::default(),
             plugin_host,
             telemetry: options.telemetry,
+            lix_id,
         })
     }
 
@@ -218,6 +220,18 @@ where
             read,
         )
         .await
+    }
+
+    pub(crate) fn lix_id(&self) -> &str {
+        &self.lix_id
+    }
+
+    pub(crate) fn set_lix_id_for_sync(&mut self, lix_id: String) {
+        self.lix_id = Arc::from(lix_id);
+    }
+
+    pub(crate) fn telemetry(&self) -> Option<&Arc<dyn TelemetrySink>> {
+        self.telemetry.as_ref()
     }
 
     /// Loads the current commit head for a branch.
@@ -432,7 +446,7 @@ where
 async fn assert_initialized<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     hot_state: &HotStateContext,
-) -> Result<(), LixError>
+) -> Result<Arc<str>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -444,19 +458,17 @@ where
         // group value could otherwise be decoded before we reject it.
         crate::init::RepositoryProtocolStatus::Current => {
             let reader = hot_state.reader(read);
-            let initialized = reader
+            let row = reader
                 .load_row(&HotStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
                     row_pk: RowPk::single("lix_id"),
                     file_id: NullableKeyFilter::Null,
                 })
-                .await?
-                .is_some();
-            if initialized {
-                Ok(())
-            } else {
-                Err(not_initialized_error())
+                .await?;
+            match row {
+                Some(row) => lix_id_from_snapshot(row.snapshot_content.as_deref()),
+                None => Err(not_initialized_error()),
             }
         }
         crate::init::RepositoryProtocolStatus::Unsupported => {
@@ -492,6 +504,33 @@ async fn repository_has_changelog_commit(
         )
         .await?;
     Ok(!cursor.next_page(1).await?.is_empty())
+}
+
+fn lix_id_from_snapshot(snapshot_content: Option<&str>) -> Result<Arc<str>, LixError> {
+    let snapshot_content = snapshot_content.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "repository lix_id is missing snapshot_content",
+        )
+    })?;
+    let snapshot =
+        serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("repository lix_id snapshot is invalid JSON: {error}"),
+            )
+        })?;
+    snapshot
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(Arc::from)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "repository lix_id value must be a non-empty string",
+            )
+        })
 }
 
 fn not_initialized_error() -> LixError {

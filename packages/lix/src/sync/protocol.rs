@@ -163,6 +163,7 @@ pub struct SyncEvent {
 pub enum SyncRepositoryPullResponse {
     Snapshot {
         cursor: u64,
+        lix_id: String,
         default_branch_id: String,
         branches: Vec<SyncBranchHead>,
     },
@@ -252,6 +253,7 @@ mod tests {
             .collect();
         let value = serde_json::to_value(SyncRepositoryPullResponse::Snapshot {
             cursor: 9,
+            lix_id: "00000000-0000-7000-8000-000000000001".to_owned(),
             default_branch_id: "branch-0".to_owned(),
             branches,
         })
@@ -262,7 +264,7 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["branches", "cursor", "defaultBranchId", "kind"]
+            ["branches", "cursor", "defaultBranchId", "kind", "lixId"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),

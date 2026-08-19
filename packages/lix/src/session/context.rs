@@ -471,6 +471,11 @@ where
         Ok(write_access)
     }
 
+    /// In-memory branch this session was bound with. Does not read storage.
+    pub(crate) fn bound_branch_id(&self) -> Result<String, LixError> {
+        self.branch.get()
+    }
+
     /// Resolves the branch this session should operate on right now.
     ///
     /// This is a read-path helper. Write flows must resolve the active branch

@@ -58,6 +58,7 @@ impl HttpProbe {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
     let authority = Arc::new(open_lix().await.expect("open authority"));
+    let authority_lix_id = authority.lix_id().to_owned();
     put_value(&authority, "bootstrap-parent", "lazy-history").await;
     let history_parent = active_head(&authority).await;
     put_value(&authority, "bootstrap", "from-authority").await;
@@ -66,6 +67,12 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
     let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
+
+    assert_eq!(
+        replica.lix_id(),
+        authority_lix_id,
+        "the first local session must bind to the authority repository identity",
+    );
 
     assert_eq!(
         read_value(&replica, "bootstrap").await.as_deref(),
@@ -143,6 +150,14 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
     .expect("timed out waiting for first synchronized file");
 
     replica.close().await.expect("close replica");
+    drop(replica);
+    let reopened = open_replica(replica_dir.path(), &url).await;
+    assert_eq!(
+        reopened.lix_id(),
+        authority_lix_id,
+        "a warm reopen must retain the authority repository identity",
+    );
+    reopened.close().await.expect("close reopened replica");
     stop_server(server_task).await;
     authority.close().await.expect("close authority");
 }
