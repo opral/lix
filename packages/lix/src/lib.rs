@@ -99,7 +99,7 @@ mod prepared_dml;
 #[cfg(any(test, feature = "storage-benches"))]
 pub mod registered_spaces;
 mod schema;
-#[cfg(feature = "server-protocol")]
+#[cfg(any(feature = "server-protocol", feature = "server-protocol-client"))]
 pub mod server_protocol;
 mod session;
 pub(crate) mod sql2;

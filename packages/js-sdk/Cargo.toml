@@ -38,7 +38,8 @@ tokio = { version = "1", features = ["rt", "sync"] }
 mimalloc.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-lix = { workspace = true, default-features = false }
+lix = { workspace = true, default-features = false, features = ["server-protocol-client"] }
+async-stream = "0.3"
 blake3 = "1"
 bytes = "1"
 console_error_panic_hook = "0.1"
