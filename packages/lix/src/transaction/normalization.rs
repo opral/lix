@@ -70,60 +70,164 @@ pub(crate) fn normalize_raw_write_row_in_place(
         ));
     };
 
-    if let Some(certificate) = row
-        .snapshot
-        .and_then(TransactionJson::canonical_batch_certificate)
-        .map(|certificate| certificate.into_owned())
-    {
-        let normalized = row
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_normalized_shared)
-            .expect("a canonical v2 certificate belongs to a canonical batch row");
-        if certificate.schema_fingerprint() != schema_plan.fingerprint()
-            || !schema_plan.accepts_canonical_certificate()
+    // Typed plugin rows are authoritative native Schema v1 values. They must
+    // be normalized and carried forward without manufacturing an outer JSON
+    // snapshot; generic SQL/filesystem rows continue through the JSON branch
+    // below. The component boundary has already applied plugin semantics, so
+    // this host-side check is limited to the pinned schema fingerprint, row
+    // shape, complete durable encoding, and identity agreement.
+    if rows.row(row_index).typed_snapshot.is_some() {
+        let schema_key = rows.row(row_index).schema_key.clone();
+        let mut typed = rows
+            .take_typed_snapshot(row_index)
+            .expect("typed snapshot presence was just checked");
+        if !schema_plan
+            .fingerprint()
+            .matches_bytes(&typed.schema_fingerprint)
         {
-            // A schema amendment can be staged after the plugin transition
-            // was drained against its pinned SQL catalog. The old certificate
-            // is then only a transport optimization: decode the retained
-            // canonical bytes and run the ordinary current-plan path below.
-            rows.set_snapshot(
-                row_index,
-                Some(TransactionJson::from_unvalidated_shared_normalized_content(
-                    normalized,
-                )),
-            );
-        } else {
-            if row.row_pk != Some(certificate.row_pk()) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed plugin row '{}' has a schema fingerprint that does not match the transaction catalog",
+                    schema_key
+                ),
+            ));
+        }
+        if typed.boundary_validation_certified() {
+            let Some(staged_row_pk) = rows.row(row_index).row_pk else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "boundary-certified typed row lost its durable primary key before transaction normalization",
+                ));
+            };
+            if !staged_row_pk.matches_schema_values(&typed.row_pk) {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "certified plugin identity does not match the staged row_pk for schema '{}'",
-                        row.schema_key
+                        "typed plugin row '{}' durable primary key does not match its typed primary key",
+                        schema_key
                     ),
                 ));
             }
-            if let Some(metadata) = row.metadata {
-                if !metadata.metadata_content_certified() {
-                    validate_row_metadata(
-                        metadata.value(),
-                        format!("metadata for schema '{}'", row.schema_key),
-                    )?;
-                }
-            }
-            *rows.row_pk_mut(row_index) = Some(certificate.row_pk().clone());
-            rows.set_snapshot(
-                row_index,
-                Some(TransactionJson::from_certified_shared_normalized_row_content(normalized)),
-            );
+            rows.set_typed_snapshot(row_index, Some(typed));
+            let row = rows.row(row_index);
+            validate_normalized_row_content(row, None, schema_plan)?;
+            let requires_transaction_validation =
+                !schema_plan.uniques.is_empty() || !schema_plan.foreign_keys.is_empty();
             canonicalize_descriptor_file_id(rows, row_index)?;
             return Ok(NormalizedRowFacts {
                 schema_plan_id,
                 facts: PreparedRowFacts {
                     row_content_validated: true,
-                    requires_transaction_validation: false,
+                    requires_transaction_validation,
                 },
             });
         }
+        if schema_plan.compiled_schema.defaults_would_apply(&typed.row) {
+            let timestamp_functions = functions.clone();
+            let typed = std::sync::Arc::make_mut(&mut typed);
+            typed.invalidate_durable_payload();
+            schema_plan
+                .compiled_schema
+                .apply_defaults(
+                    &mut typed.row,
+                    || functions.call_uuid_v7(),
+                    || {
+                        let timestamp = *default_timestamp
+                            .get_or_insert_with(|| timestamp_functions.call_timestamp());
+                        i64::try_from(timestamp.milliseconds_since_unix_epoch())
+                            .expect("Lix timestamps fit signed milliseconds")
+                            * 1_000
+                    },
+                )
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!("typed plugin row '{schema_key}' failed to apply Schema v1 defaults: {error}"),
+                    )
+                })?;
+        }
+        schema_plan
+            .compiled_schema
+            .validate_complete_row(&typed.row)
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("typed plugin row '{schema_key}' failed Schema v1 validation: {error}"),
+                )
+            })?;
+        let primary_key = schema_plan.compiled_schema.primary_key();
+        if typed.row_pk.is_empty() {
+            let row_pk = primary_key
+                .iter()
+                .map(|column| {
+                    typed.row.get(column).cloned().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!("typed plugin row '{schema_key}' is missing primary-key column '{column}'"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let typed = std::sync::Arc::make_mut(&mut typed);
+            typed.invalidate_durable_payload();
+            typed.row_pk = row_pk.into();
+        }
+        if typed.row_pk.len() != primary_key.len()
+            || primary_key
+                .iter()
+                .zip(typed.row_pk.iter())
+                .any(|(column, value)| typed.row.get(column) != Some(value))
+        {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed plugin row '{}' primary key does not match its typed row",
+                    schema_key
+                ),
+            ));
+        }
+        let typed_row_pk = RowPk::from_schema_values(&typed.row_pk).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("typed plugin row '{schema_key}' has an invalid primary key: {error}"),
+            )
+        })?;
+        if rows.row(row_index).row_pk.is_none() {
+            *rows.row_pk_mut(row_index) = Some(typed_row_pk.clone());
+        }
+        let staged_row_pk = rows
+            .row(row_index)
+            .row_pk
+            .expect("typed row primary key was just materialized");
+        if staged_row_pk != &typed_row_pk {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed plugin row '{}' durable primary key does not match its typed primary key",
+                    schema_key
+                ),
+            ));
+        }
+        typed.durable_payload().map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("typed plugin row '{schema_key}' is not durably encodable: {error:?}"),
+            )
+        })?;
+        rows.set_typed_snapshot(row_index, Some(typed));
+        let row = rows.row(row_index);
+        validate_normalized_row_content(row, None, schema_plan)?;
+        let requires_transaction_validation =
+            !schema_plan.uniques.is_empty() || !schema_plan.foreign_keys.is_empty();
+        canonicalize_descriptor_file_id(rows, row_index)?;
+        return Ok(NormalizedRowFacts {
+            schema_plan_id,
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation,
+            },
+        });
     }
 
     let row = rows.row(row_index);
@@ -161,8 +265,9 @@ pub(crate) fn normalize_raw_write_row_in_place(
         if schema_plan.defaults.would_apply(snapshot_object) {
             // Missing defaults are the uncommon rewrite path. Materialize
             // only this row, apply the semantic change, and canonicalize the
-            // result once. Complete plugin snapshots retain their batch
-            // handle through the branch below.
+            // result once. Complete engine JSON rows retain their batch
+            // handle through the branch below; plugin-owned rows use typed
+            // payloads and do not enter this branch.
             let mut snapshot = snapshot_object_for_mutation(snapshot, row)?;
             apply_defaults(
                 &mut snapshot,
@@ -560,99 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn normalization_retains_complete_canonical_batch_rows() {
-        let normalized = br#"{"id":"row-from-batch","value":"hello"}"#.to_vec();
-        let end = u32::try_from(normalized.len()).expect("fixture length");
-        let mut batch = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
-            vec![json!({"id": "row-from-batch", "value": "hello"})],
-            normalized,
-            vec![(0, end)],
-            1,
-            1,
-        )
-        .expect("canonical batch");
-        let batch_row = batch.pop().expect("canonical row");
-        let mut catalog = catalog_with(vec![schema_with_default_id()]);
-        let row = TransactionWriteRow {
-            row_pk: None,
-            schema_key: "normalization_schema".into(),
-            snapshot: Some(TransactionJson::from_canonical_batch(batch_row.clone())),
-            ..base_stage_row()
-        };
-
-        let normalized = normalize_test_row(row, &mut catalog, functions()).expect("normalize row");
-        let retained = normalized
-            .snapshot
-            .as_ref()
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("complete row must retain its canonical batch");
-
-        assert!(batch_row.shares_batch_with(retained));
-        assert_eq!(
-            normalized.row_pk.as_ref(),
-            Some(&RowPk::single("row-from-batch"))
-        );
-        assert_eq!(retained.validation_counts(), (1, 1));
-    }
-
-    #[test]
-    fn canonical_certificate_falls_back_when_schema_plan_was_amended() {
-        let old_schema = certificate_test_schema(None);
-        let old_catalog = catalog_with(vec![old_schema]);
-        let (_, old_plan) = old_catalog
-            .snapshot()
-            .plan_for_key("certificate_schema")
-            .expect("old certificate schema");
-        let normalized = br#"{"id":"row-1","value":"old-value"}"#.to_vec();
-        let end = u32::try_from(normalized.len()).expect("fixture length");
-        let certificate = crate::plugin::runtime::WasmCanonicalJsonCertificate::new(
-            RowPk::single("row-1"),
-            old_plan.shared_fingerprint(),
-        );
-        let mut batch = crate::plugin::runtime::WasmCanonicalJson::from_mixed_batch_parts(
-            vec![None],
-            vec![Some(certificate)],
-            normalized,
-            vec![(0, end)],
-            1,
-            0,
-        )
-        .expect("certified canonical batch");
-        let batch_row = batch.pop().expect("certified row");
-
-        // A harmless amendment still forces the ordinary decoded path.
-        let mut amended_catalog = catalog_with(vec![certificate_test_schema(Some("old-value"))]);
-        let row = TransactionWriteRow {
-            row_pk: Some(RowPk::single("row-1")),
-            schema_key: "certificate_schema".into(),
-            snapshot: Some(TransactionJson::from_canonical_batch(batch_row.clone())),
-            ..base_stage_row()
-        };
-        let row = normalize_test_row(row, &mut amended_catalog, functions()).expect("amended row");
-        assert!(
-            row.snapshot
-                .as_ref()
-                .and_then(TransactionJson::canonical_batch_row)
-                .is_none(),
-            "a stale certificate must be replaced by an ordinary decoded row"
-        );
-        assert_eq!(normalized_snapshot(&row)["value"], "old-value");
-
-        // A stricter amendment must be enforced rather than bypassed by the
-        // old plan's otherwise valid certificate.
-        let mut rejecting_catalog = catalog_with(vec![certificate_test_schema(Some("new-value"))]);
-        let row = TransactionWriteRow {
-            row_pk: Some(RowPk::single("row-1")),
-            schema_key: "certificate_schema".into(),
-            snapshot: Some(TransactionJson::from_canonical_batch(batch_row)),
-            ..base_stage_row()
-        };
-        let error = normalize_test_row(row, &mut rejecting_catalog, functions())
-            .expect_err("amended row-local constraint must be enforced");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-    }
-
-    #[test]
     fn historical_shared_snapshot_is_revalidated_after_schema_amendment() {
         let canonical = crate::common::SharedStr::from(r#"{"id":"row-1","value":"old-value"}"#);
         let row = || TransactionWriteRow {
@@ -763,6 +775,113 @@ mod tests {
             error
                 .message
                 .contains("does not match primary_key-derived row_pk")
+        );
+    }
+
+    #[test]
+    fn normalization_rejects_typed_primary_key_that_disagrees_with_durable_identity() {
+        let mut catalog = catalog_with(vec![schema_with_default_id()]);
+        let fingerprint = catalog
+            .snapshot()
+            .plan_for_key("normalization_schema")
+            .expect("schema plan")
+            .1
+            .fingerprint()
+            .bytes();
+        let typed = std::sync::Arc::new(crate::plugin::runtime::WasmTypedRow {
+            schema_fingerprint: fingerprint,
+            row_pk: vec![lix_schema::Value::Text("right-id".to_owned())].into(),
+            row: lix_schema::Row::from([
+                ("id".to_owned(), lix_schema::Value::Text("right-id".to_owned())),
+                ("value".to_owned(), lix_schema::Value::Text("hello".to_owned())),
+            ]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        });
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push_typed_parts(
+            Some(RowPk::single("wrong-id")),
+            "normalization_schema".into(),
+            None,
+            Some(typed),
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            crate::GLOBAL_BRANCH_ID.into(),
+        );
+        let mut default_timestamp = None;
+
+        let error = normalize_raw_write_row_in_place(
+            &mut rows,
+            0,
+            &mut catalog,
+            functions(),
+            &mut default_timestamp,
+        )
+        .expect_err("typed envelope identity mismatch must fail");
+
+        assert!(error.message.contains("durable primary key does not match"));
+    }
+
+    #[test]
+    fn normalization_materializes_defaults_in_typed_rows() {
+        let mut catalog = catalog_with(vec![schema_with_overridden_default()]);
+        let fingerprint = catalog
+            .snapshot()
+            .plan_for_key("overridden_default_schema")
+            .expect("schema plan")
+            .1
+            .fingerprint()
+            .bytes();
+        let typed = std::sync::Arc::new(crate::plugin::runtime::WasmTypedRow {
+            schema_fingerprint: fingerprint,
+            row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+            row: lix_schema::Row::from([(
+                "id".to_owned(),
+                lix_schema::Value::Text("row-1".to_owned()),
+            )]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        });
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push_typed_parts(
+            Some(RowPk::single("row-1")),
+            "overridden_default_schema".into(),
+            None,
+            Some(typed),
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            crate::GLOBAL_BRANCH_ID.into(),
+        );
+        let mut default_timestamp = None;
+
+        normalize_raw_write_row_in_place(
+            &mut rows,
+            0,
+            &mut catalog,
+            functions(),
+            &mut default_timestamp,
+        )
+        .expect("typed defaults normalize");
+
+        assert_eq!(
+            rows.row(0)
+                .typed_snapshot
+                .expect("typed row remains native")
+                .row
+                .get("status"),
+            Some(&lix_schema::Value::Text("literal".to_owned()))
         );
     }
 

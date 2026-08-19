@@ -3,7 +3,7 @@ name = "plugin_csv"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "CSV plugin for the row-first Lix Wasm Component API v1"
+description = "CSV plugin for the row-first Lix Wasm Component API v2"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -23,5 +23,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64 = "0.22"
 lix = { workspace = true, default-features = true }
+lix-schema = { path = "../../packages/lix-schema" }
 serde_json = "1"
 uuid = { version = "1", features = ["std"] }

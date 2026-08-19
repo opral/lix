@@ -519,7 +519,9 @@ fn tracked_row_payload_eq(
     // direction (a conflict is surfaced rather than a difference hidden).
     match (payloads.get(left.change_id), payloads.get(right.change_id)) {
         (Some(left), Some(right)) => {
-            left.snapshot == right.snapshot && left.metadata == right.metadata
+            left.snapshot == right.snapshot
+                && left.metadata == right.metadata
+                && left.typed_payload == right.typed_payload
         }
         _ => false,
     }

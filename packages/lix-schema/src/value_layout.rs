@@ -170,16 +170,20 @@ pub fn canonical_text_bytes(value: &str) -> Result<&[u8], EncodeError> {
 /// guards for them anyway.
 pub fn canonical_jsonb_bytes(value: &Value) -> Result<Vec<u8>, EncodeError> {
     let mut normalised = value.clone();
-    normalise_jsonb(&mut normalised)?;
+    canonicalize_jsonb_in_place(&mut normalised)?;
     serde_json::to_vec(&normalised).map_err(|error| EncodeError(error.to_string()))
 }
 
-fn normalise_jsonb(value: &mut Value) -> Result<(), EncodeError> {
+/// Canonicalizes an owned JSONB DOM without cloning it.
+///
+/// Decoders use this when they already own the parsed value; borrowed writers
+/// continue through [`canonical_jsonb_bytes`].
+pub fn canonicalize_jsonb_in_place(value: &mut Value) -> Result<(), EncodeError> {
     match value {
         Value::String(text) => reject_nul(text)?,
         Value::Array(values) => {
             for value in values {
-                normalise_jsonb(value)?;
+                canonicalize_jsonb_in_place(value)?;
             }
         }
         Value::Object(values) => {
@@ -188,7 +192,7 @@ fn normalise_jsonb(value: &mut Value) -> Result<(), EncodeError> {
             entries.sort_by(|(left, _), (right, _)| left.cmp(right));
             for (key, mut value) in entries {
                 reject_nul(&key)?;
-                normalise_jsonb(&mut value)?;
+                canonicalize_jsonb_in_place(&mut value)?;
                 values.insert(key, value);
             }
         }
@@ -490,9 +494,14 @@ pub fn decode_body(plan: &[BodyColumn], body: &[u8]) -> Result<Vec<BodyValue>, E
                     .map_err(|error| EncodeError(error.to_string()))?
                     .to_owned(),
             ),
-            BodyKind::Jsonb => BodyValue::Jsonb(
-                serde_json::from_slice(payload).map_err(|error| EncodeError(error.to_string()))?,
-            ),
+            BodyKind::Jsonb => {
+                let value: Value = serde_json::from_slice(payload)
+                    .map_err(|error| EncodeError(error.to_string()))?;
+                if canonical_jsonb_bytes(&value)? != payload {
+                    return err("JSONB payload is not canonical");
+                }
+                BodyValue::Jsonb(value)
+            }
             _ => unreachable!(),
         };
     }

@@ -3,7 +3,7 @@
 //! Unlike complete-replacement parts, these rows retain exact per-row provenance
 //! and lifecycle timestamps because a sparse post-image may mix many authoring
 //! commits. Mutation inventory remains the historical authority; this payload is
-//! a rebuildable serving accelerator.
+//! a rebuildable serving accelerator. Plugin rows carry native typed bytes.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -31,9 +31,9 @@ pub(crate) const CURRENT_STATE_DATA_PART_MAX_ROWS: usize = 512;
 pub(crate) const CURRENT_STATE_DATA_PART_TARGET_BYTES: usize = 64 * 1024;
 const CURRENT_STATE_DATA_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CURRENT_STATE_DATA_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
-const RAW_MAGIC: &[u8; 7] = b"LXCSP01";
-const ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ1";
-const DIGEST_CONTEXT: &str = "lix native current-state data part v1";
+const RAW_MAGIC: &[u8; 7] = b"LXCSP02";
+const ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ2";
+const DIGEST_CONTEXT: &str = "lix native current-state data part v2";
 const REFS_DIGEST_CONTEXT: &str = "lix native current-state data part refs v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +42,7 @@ pub(crate) struct CurrentStateDataRow {
     pub(crate) value: TrackedStateIndexValue,
     pub(crate) snapshot: JsonSlot,
     pub(crate) metadata: JsonSlot,
+    pub(crate) typed_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -55,6 +56,8 @@ struct StoredCurrentStateDataRow {
     snapshot: JsonSlot,
     #[musli(with = crate::json_store::json_slot_storage)]
     metadata: JsonSlot,
+    #[musli(with = storage_codec::option)]
+    typed_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +91,7 @@ pub(crate) fn encode_current_state_data_part(
             ),
             snapshot: row.snapshot.clone(),
             metadata: row.metadata.clone(),
+            typed_payload: row.typed_payload.clone(),
         })
         .collect::<Vec<_>>();
     let payload = storage_codec::encode("native current-state data part", &stored)?;
@@ -224,6 +228,7 @@ pub(crate) fn decode_current_state_data_part(
                 value: decode_value(&row.encoded_value)?,
                 snapshot: row.snapshot,
                 metadata: row.metadata,
+                typed_payload: row.typed_payload,
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
@@ -246,7 +251,12 @@ fn validate_rows(rows: &[CurrentStateDataRow]) -> Result<(), LixError> {
         || rows.len() > CURRENT_STATE_DATA_PART_MAX_ROWS
         || rows
             .iter()
-            .any(|row| row.encoded_key.is_empty() || row.value.deleted || row.snapshot.is_none())
+            .any(|row| {
+                row.encoded_key.is_empty()
+                    || row.value.deleted
+                    || (row.snapshot.is_none() && row.typed_payload.is_none())
+                    || (row.snapshot.is_some() && row.typed_payload.is_some())
+            })
         || rows
             .windows(2)
             .any(|pair| pair[0].encoded_key >= pair[1].encoded_key)
@@ -297,6 +307,7 @@ mod tests {
             },
             snapshot: JsonSlot::Inline(format!(r#"{{"index":{index}}}"#).into()),
             metadata: JsonSlot::None,
+            typed_payload: None,
         }
     }
 
@@ -333,5 +344,51 @@ mod tests {
         rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
         rows[0].value.deleted = true;
         assert!(encode_bounded_current_state_data_parts(&rows).is_err());
+    }
+
+    #[test]
+    fn native_parts_round_trip_typed_payload_without_json() {
+        let typed = crate::plugin::runtime::WasmTypedRow {
+            schema_fingerprint: [8; 32],
+            row_pk: vec![lix_schema::Value::Text("typed-row".to_owned())].into(),
+            row: lix_schema::Row::from([(
+                "value".to_owned(),
+                lix_schema::Value::Int8(7),
+            )]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+        let row = CurrentStateDataRow {
+            encoded_key: b"typed-row".to_vec(),
+            value: TrackedStateIndexValue {
+                change_id: ChangeId::for_test_label("typed-change"),
+                commit_id: CommitId::for_test_label("typed-commit"),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            },
+            snapshot: JsonSlot::None,
+            metadata: JsonSlot::None,
+            typed_payload: Some(
+                crate::hot_state::encode_typed_payload(&typed).expect("typed payload encodes"),
+            ),
+        };
+        let part = encode_bounded_current_state_data_parts(&[row.clone()])
+            .expect("typed current-state part should encode")
+            .pop()
+            .expect("one part");
+        let decoded = decode_current_state_data_part(&part.digest, &part.bytes)
+            .expect("typed current-state part should decode");
+        assert_eq!(decoded[0], row);
+        assert_eq!(
+            crate::hot_state::decode_typed_payload(
+                decoded[0]
+                    .typed_payload
+                    .as_deref()
+                    .expect("typed payload should be present")
+            )
+            .expect("typed payload decodes"),
+            typed
+        );
     }
 }

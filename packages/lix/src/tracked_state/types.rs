@@ -2,7 +2,9 @@ use crate::NullableKeyFilter;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::row_pk::RowPk;
+use crate::plugin::runtime::WasmTypedRow;
 use bytes::Bytes;
+use std::sync::Arc;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
 pub(crate) const COMMIT_STATE_MAX_REPLAY_DEPTH: u16 = 32;
@@ -76,6 +78,8 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) delta: TrackedStateDeltaRef<'a>,
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) typed_snapshot: Option<&'a WasmTypedRow>,
+    pub(crate) typed_payload: Option<&'a [u8]>,
     pub(crate) origin_key: Option<&'a str>,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     pub(crate) authored: bool,
@@ -389,9 +393,15 @@ pub(crate) struct CommitStateMutationInventory {
     pub(crate) selected_source_commit_id: Option<[u8; 16]>,
     pub(crate) member_count: u32,
     pub(crate) selection_fingerprint: [u8; 32],
-    /// Exact row counts for every directly addressable part. Empty means the
-    /// generic locator-indexed layout.
+    /// Exact physical row counts for every part that participates in direct
+    /// addressing. Empty means the generic locator-indexed layout.
     pub(crate) direct_part_row_counts: Vec<u16>,
+    /// Authenticated direct ownership, one little-endian bitset per direct
+    /// part. A set bit means the row at that physical ordinal owns the
+    /// derivable ChangeId; a clear bit is an authored row that must use its
+    /// explicit locator. This keeps mixed typed imports point-addressable
+    /// without treating an embedded-id mismatch as fallback authority.
+    pub(crate) direct_part_ownership: Vec<Vec<u8>>,
     /// Compact physical identities for a complete replacement. Range bounds
     /// live in the rebuildable current-state directory; history can always
     /// recover them by decoding these immutable parts.
@@ -436,18 +446,46 @@ impl CommitStateMutationInventory {
             }
     }
 
+    pub(crate) fn direct_coordinate_owned(
+        &self,
+        part_index: usize,
+        local_row: u16,
+    ) -> Option<bool> {
+        if let Some(&row_count) = self.direct_part_row_counts.get(part_index) {
+            if local_row >= row_count {
+                return None;
+            }
+        }
+        let ownership = self.direct_part_ownership.get(part_index)?;
+        let ordinal = usize::from(local_row);
+        Some(*ownership.get(ordinal / 8)? & (1 << (ordinal % 8)) != 0)
+    }
+
+    pub(crate) fn direct_addresses_are_fully_owned(&self) -> bool {
+        !self.direct_part_row_counts.is_empty()
+            && self
+                .direct_part_row_counts
+                .iter()
+                .enumerate()
+                .all(|(part_index, &row_count)| {
+                    (0..row_count).all(|local_row| {
+                        self.direct_coordinate_owned(part_index, local_row) == Some(true)
+                    })
+                })
+    }
+
     /// Whether this local inventory can contain a finite selected member whose
     /// payload owner must be resolved through the canonical change locator.
     ///
     /// A selected-source alias is whole-source authority, not a finite
-    /// selection. A non-empty direct-address inventory proves every member
-    /// owns its encoded slot, and columnar parts are authored history by
-    /// contract. Only the remaining mixed/generic layouts require decoding
-    /// local members to distinguish authored rows from finite selections.
+    /// selection. A fully-owned direct-address inventory and columnar parts
+    /// are authored history by contract. Mixed/generic layouts require
+    /// decoding local members to distinguish authored rows from finite
+    /// selections.
     pub(crate) fn may_contain_finite_selected_members(&self) -> bool {
         self.member_count != 0
             && self.selected_source_commit_id.is_none()
-            && self.direct_part_row_counts.is_empty()
+            && !self.direct_addresses_are_fully_owned()
             && self.columnar_parts.is_none()
     }
 }
@@ -483,12 +521,14 @@ pub(crate) struct CommitStateManifest {
 /// They intentionally do not carry an `untracked` flag: commit roots contain
 /// tracked history only. Mutable untracked rows share the current-state
 /// projection with tracked rows, but never enter a commit root or changelog.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedTrackedStateRow {
     pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
+    #[serde(skip)]
+    pub(crate) typed_snapshot: Option<Arc<WasmTypedRow>>,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) deleted: bool,
     pub(crate) created_at: String,

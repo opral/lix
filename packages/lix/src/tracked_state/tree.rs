@@ -277,17 +277,32 @@ impl TrackedStateTree {
         root_id: &TrackedStateRootId,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let keys = keys
+            .iter()
+            .map(|key| TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                row_pk: &key.row_pk,
+            })
+            .collect::<Vec<_>>();
+        self.get_many_refs(store, root_id, &keys).await
+    }
+
+    /// Resolves borrowed native identities without first cloning every schema,
+    /// file, and primary-key component into row-owned keys.
+    pub(crate) async fn get_many_refs(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        keys: &[TrackedStateKeyRef<'_>],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut key_batch = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
-        for key in keys {
-            key_batch.push(TrackedStateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                row_pk: &key.row_pk,
-            });
+        for &key in keys {
+            key_batch.push(key);
         }
         let encoded_keys = key_batch.finish();
         self.get_many_encoded(store, root_id, &encoded_keys).await

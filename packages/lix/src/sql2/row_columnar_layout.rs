@@ -369,6 +369,12 @@ fn optional_derived_row_group_set(
 fn row_columnar_metadata(spec: &SchemaSurfaceSpec) -> HashMap<String, String> {
     let mut metadata = HashMap::from([
         (
+            "lix.schema_v1.fingerprint".to_owned(),
+            blake3::Hash::from_bytes(spec.schema_fingerprint)
+                .to_hex()
+                .to_string(),
+        ),
+        (
             ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
             spec.columnar_layout_fingerprint(),
         ),

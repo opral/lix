@@ -1,0 +1,37 @@
+{
+  "schema": "lix.plugin-api-benchmark-qualification.v1",
+  "baseline_revision": "89aea5d55773586ea60f77c1d9dddcfc8b394dd1",
+  "default_samples": 61,
+  "default_warmups": 5,
+  "environment_requirements": {
+    "machine": "x86_64",
+    "release": "6.17.0-23-generic",
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "cpu_microcode": "0xb404035",
+    "cpu_governor": "performance",
+    "selected_cpu": 0,
+    "selected_cpu_thread_siblings": "0,16",
+    "selected_cpu_core_siblings": "0-31",
+    "smt_active": "1",
+    "isolated_cpus": "",
+    "load_average_1m": { "max": 8.0 },
+    "rustc_release": "1.97.0-nightly",
+    "rustc_commit_hash": "b954122bbe6c4a244c511a9a168c6d5438d8f58f"
+  },
+  "timed_harness_sha256": {
+    "packages/e2e/tests/plugin_api_benchmarks.rs": "0e0e25b6dfac09d3c11c1a0fcf42a1986a19e7f4594b6311cee1e43ef2852d48",
+    "packages/e2e/tests/benchmark_metrics.rs": "38ae82e1a8a107c30fc089b79f1fdefd7ed4d15498614ff27f161da8372cedca",
+    "packages/e2e/benchmarks/plugin_api_corpus.json": "cd7664a9c9c5c23a81e73f1c97b1aab822943e9c7718d23d3801497de99f595a"
+  },
+  "orchestrator_sha256": {
+    "packages/e2e/benchmarks/plugin_api_benchmark.py": "7b8ef8d20ca0d3fed6055463b9bd0e6be4a5b944d6fb548822ede37a19f01078",
+    "packages/e2e/benchmarks/test_plugin_api_benchmark.py": "d2d530b02e084fb0024319f0ae3efa341ad0bd0bab73db623a39c0d6bba1b27a",
+    "packages/e2e/PLUGIN_TYPED_ROW_BENCHMARK_PLAN.md": "5425995ea55040e7791d16bf498735a3e7704366e8c971d5a68bff0dc5e42e90",
+    "Cargo.lock": "8cea877d74ad5f0f841056910e29b1fdad822bcebd8e98a9ff6b977bc1065dd9",
+    "tooling/Cargo.lock": "d017adba35dd692e0b02a52e78c8d27126754f9bf696461fb5bf74ad491c512f",
+    "rust-toolchain.toml": "8466f4b35845571a94c6643d01e1dc4361b520041d9de8053e0f6b961edb3ea2"
+  },
+  "normalized_timed_contract_sha256": "ef00b006bf49d65d1e0c08030229626ece047d890a15c231a7af90337dd801e9",
+  "adapter_contract_sha256": "903673aa5b917050cdb42d38223c0c3ad74ec71c25d95eabbbe292fc23c431ac",
+  "baseline_adapter_patch_sha256": "b61e7ab4978b305f35b77ba104f5ca999f5204af79bec6e7036b72d7b8bd9b69"
+}

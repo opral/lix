@@ -17,7 +17,8 @@ use wasmtime::component::Component;
 #[cfg(test)]
 use wasmtime::component::Linker;
 use wasmtime::{
-    Cache, CacheConfig, Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
+    Cache, CacheConfig, Config, Engine, ProfilingStrategy, ResourceLimiter, Store, StoreLimits,
+    StoreLimitsBuilder,
 };
 use wasmtime_wasi::{
     ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
@@ -31,6 +32,7 @@ const MAX_PLUGIN_MEMORIES: usize = 1;
 const MAX_PLUGIN_TABLES: usize = 8;
 const MAX_PLUGIN_TABLE_ELEMENTS: usize = 1_000_000;
 const LIX_WASMTIME_CACHE_DIR_ENV: &str = "LIX_WASMTIME_CACHE_DIR";
+const LIX_WASMTIME_PROFILER_ENV: &str = "LIX_WASMTIME_PROFILER";
 
 pub fn runtime() -> Result<Arc<dyn WasmRuntime>, LixError> {
     Ok(Arc::new(WasmtimePluginRuntime::new()?))
@@ -41,8 +43,24 @@ fn create_engine(consume_fuel: bool, epoch_interruption: bool) -> wasmtime::Resu
     config.wasm_component_model(true);
     config.consume_fuel(consume_fuel);
     config.epoch_interruption(epoch_interruption);
+    configure_profiler(&mut config)?;
     configure_component_cache(&mut config)?;
     Engine::new(&config)
+}
+
+fn configure_profiler(config: &mut Config) -> wasmtime::Result<()> {
+    let Some(value) = env::var_os(LIX_WASMTIME_PROFILER_ENV) else {
+        return Ok(());
+    };
+    match value.to_str() {
+        Some("perf-map") => {
+            config.profiler(ProfilingStrategy::PerfMap);
+            Ok(())
+        }
+        _ => Err(wasmtime::Error::msg(format!(
+            "{LIX_WASMTIME_PROFILER_ENV} must be 'perf-map'"
+        ))),
+    }
 }
 
 /// Enables Wasmtime's host-local AOT cache for sandboxed plugin components.

@@ -292,7 +292,7 @@ mod tests {
             std::iter::empty::<(&str, ComponentExportKind, u32)>(),
         );
         component.export(
-            "lix:plugin/file-projection@1.0.0",
+            "lix:plugin/file-projection@2.0.0",
             ComponentExportKind::Instance,
             instance,
             None,

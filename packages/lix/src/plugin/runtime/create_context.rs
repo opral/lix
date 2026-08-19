@@ -11,9 +11,12 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::LixError;
 use crate::binary_cas::BlobId;
+use crate::catalog::CatalogSnapshot;
 #[cfg(test)]
 use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
+#[cfg(test)]
+use crate::hot_state::MaterializedHotStateBatchBuilder;
 use crate::hot_state::{MaterializedHotStateExactBatch, MaterializedHotStateRow};
 use crate::plugin::runtime::{
     WasmChangeEffect, WasmCreateContext, WasmHostBytes, WasmHostRowChanges, WasmRow, WasmRowChange,
@@ -158,7 +161,10 @@ pub(crate) fn validate_create_changes<B>(
                 local_ref,
                 ..
             } => {
-                if creatable.binary_search(schema_key).is_err() {
+                if creatable
+                    .binary_search_by(|candidate| candidate.as_str().cmp(schema_key.as_str()))
+                    .is_err()
+                {
                     return Err(invalid_id(format!(
                         "plugin '{}' emitted a keyless create for schema '{}' without a UUIDv7 primary-key default",
                         plugin.key(),
@@ -194,49 +200,75 @@ pub(crate) fn validate_create_changes<B>(
 pub(crate) fn materialize_keyless_creates(
     changes: &mut WasmHostRowChanges,
     creates: WasmCreateContext,
+    schemas: &CatalogSnapshot,
 ) -> Result<(), LixError> {
     for change in &mut changes.changes {
         let WasmRowChange::Create {
             schema_key,
             local_ref,
-            resolved_key,
-            snapshot_content,
+            payload,
+            ..
         } = change
         else {
             continue;
         };
         let id = creates.component(*local_ref)?;
-        let WasmHostBytes::CanonicalJson(canonical) = snapshot_content else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "validated keyless creates must own parsed canonical snapshots",
+        let WasmHostBytes::Typed(typed) = payload;
+        if !typed.boundary_create_validation_certified() {
+            return Err(invalid_id(
+                "typed create reached identity materialization without boundary validation",
             ));
-        };
-        let key = resolved_key.take().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "validated keyless create has no schema-resolved primary key",
-            )
+        }
+        let (_, schema_plan) = schemas.plan_for_key(schema_key.as_str()).ok_or_else(|| {
+            invalid_id(format!(
+                "typed create references unknown schema '{}'",
+                schema_key.as_str()
+            ))
         })?;
-        if key.schema_key.as_str() != schema_key
-            || key.row_pk.len() != 1
-            || key.row_pk[0].as_str() != id
+        if !schema_plan
+            .fingerprint()
+            .matches_bytes(&typed.schema_fingerprint)
         {
             return Err(invalid_id(format!(
-                "resolved keyless create for schema '{schema_key}' does not match its create context"
+                "typed create fingerprint does not match schema '{}'",
+                schema_key.as_str()
             )));
         }
-        if canonical.certificate().is_none() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "resolved keyless create did not retain its schema-validation certificate",
-            ));
+        let [primary_key] = schema_plan.compiled_schema.primary_key() else {
+            return Err(invalid_id(format!(
+                "typed create schema '{}' must have one generated primary key",
+                schema_key.as_str()
+            )));
+        };
+        let fingerprint = typed.schema_fingerprint;
+        let typed_mut = std::sync::Arc::make_mut(typed);
+        typed_mut.invalidate_durable_payload();
+        let generated = lix_schema::Value::Uuid(id);
+        match typed_mut.row.get(primary_key) {
+            Some(lix_schema::Value::Uuid(existing)) if *existing == id => {}
+            Some(_) => {
+                return Err(invalid_id(
+                    "typed create identity does not match its create-context reference",
+                ));
+            }
+            None => {
+                typed_mut.row.insert(primary_key.clone(), generated.clone());
+            }
         }
+        typed_mut.row_pk = vec![generated.clone()].into();
+        // Boundary validation already proved every supplied column and that
+        // the generated UUID column is the create's only omitted requirement.
+        // Inserting that exact UUID completes the row; validating every other
+        // column a second time here only repeats the page-level proof.
+        typed_mut.certify_boundary_validation().map_err(|error| {
+            invalid_id(format!(
+                "materialized typed create is not durably encodable: {error:?}"
+            ))
+        })?;
+        let key = WasmRowKey::from_typed_parts(schema_key.clone(), fingerprint, vec![generated])?;
+        let payload = WasmHostBytes::Typed(std::sync::Arc::clone(typed));
         *change = WasmRowChange::Upsert {
-            row: WasmRow {
-                key,
-                snapshot_content: WasmHostBytes::CanonicalJson(canonical.clone()),
-            },
+            row: WasmRow { key, payload },
             effect: WasmChangeEffect::Content,
         };
     }
@@ -258,12 +290,13 @@ pub(crate) fn require_existing_id_authorities(
         ));
     }
     for (slot, key) in keys.iter().enumerate() {
-        let valid = rows.row(slot).is_some_and(|row| {
+        let observed = rows.row(slot);
+        let valid = observed.is_some_and(|row| {
             !row.deleted()
-                && row.snapshot_content().is_some()
+                && row.typed_snapshot().is_some()
                 && key.schema_key == row.schema_key()
                 && key.row_pk.len() == 1
-                && RowPk::uuid_from_canonical(&key.row_pk[0])
+                && typed_key_uuid(key)
                     .is_ok_and(|row_pk| row.row_pk() == &row_pk)
                 && row.file_id() == Some(file_id)
                 && row.branch_id() == branch_id
@@ -275,8 +308,19 @@ pub(crate) fn require_existing_id_authorities(
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
-                    "plugin '{}' emitted a keyed update for creatable schema '{}' row {:?}, but that row does not exist",
-                    plugin.key(), key.schema_key, key.row_pk
+                    "plugin '{}' emitted a keyed update for creatable schema '{}' row {:?}, but no matching typed row exists in the file lane (observed={:?})",
+                    plugin.key(),
+                    key.schema_key,
+                    key.row_pk,
+                    observed.map(|row| (
+                        row.schema_key(),
+                        row.row_pk(),
+                        row.file_id(),
+                        row.branch_id(),
+                        row.untracked(),
+                        row.deleted(),
+                        row.typed_snapshot().is_some(),
+                    )),
                 ),
             )
             .with_hint(
@@ -285,6 +329,21 @@ pub(crate) fn require_existing_id_authorities(
         }
     }
     Ok(())
+}
+
+fn typed_key_uuid(key: &WasmRowKey) -> Result<RowPk, LixError> {
+    let [lix_schema::Value::Uuid(_)] = key.row_pk.as_ref() else {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            "creatable row primary key is not a UUID",
+        ));
+    };
+    RowPk::from_schema_values(&key.row_pk).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("invalid typed UUID primary key: {error}"),
+        )
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,7 +571,7 @@ fn invalid_id(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::plugin::runtime::{PluginRegistryEntryInput, PluginRuntime};
-    use crate::plugin::runtime::{WasmCanonicalJson, WasmChangeEffect, WasmHostBytes, WasmRow};
+    use crate::plugin::runtime::{WasmChangeEffect, WasmHostBytes, WasmRow, WasmTypedRow};
 
     fn actor_key() -> PluginActorKey {
         PluginActorKey {
@@ -540,7 +599,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: "plugin_csv".to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: crate::plugin::runtime::PluginCapabilities {
                 column_merger: true,
                 file_projection: true,
@@ -559,38 +618,74 @@ mod tests {
         .expect("plugin")
     }
 
-    fn upsert(id: String) -> WasmRowChange<WasmHostBytes> {
+    fn create_catalog() -> CatalogSnapshot {
+        CatalogSnapshot::from_visible_schemas(&[json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "csv_row",
+            "columns": [
+                { "name": "row_id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                { "name": "cells", "type": "jsonb", "nullable": false },
+                { "name": "order_key", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["row_id"]
+        })])
+        .expect("create test catalog")
+    }
+
+    fn typed_row(id: &str) -> WasmHostBytes {
+        let id = id.to_owned();
+        WasmHostBytes::Typed(std::sync::Arc::new(WasmTypedRow {
+            schema_fingerprint: [0; 32],
+            row_pk: vec![lix_schema::Value::Text(id.clone())].into(),
+            row: lix_schema::Row::from([
+                (
+                    "cells".to_owned(),
+                    lix_schema::Value::Jsonb(JsonValue::Array(Vec::new()).into()),
+                ),
+                ("id".to_owned(), lix_schema::Value::Text(id)),
+                (
+                    "order_key".to_owned(),
+                    lix_schema::Value::Text("a".to_owned()),
+                ),
+            ]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        }))
+    }
+
+    fn upsert(id: uuid::Uuid) -> WasmRowChange<WasmHostBytes> {
         WasmRowChange::Upsert {
             row: WasmRow {
-                key: WasmRowKey::from_owned_parts("csv_row", vec![id]),
-                snapshot_content: WasmHostBytes::Inline(b"{}".to_vec().into()),
+                key: WasmRowKey::from_typed_parts(
+                    "csv_row",
+                    [0; 32],
+                    vec![lix_schema::Value::Uuid(id)],
+                )
+                .unwrap(),
+                payload: typed_row("id"),
             },
             effect: WasmChangeEffect::Content,
         }
     }
 
-    fn canonical(value: JsonValue) -> WasmHostBytes {
-        let normalized = serde_json::to_vec(&value).expect("canonical test JSON");
-        let normalized_len = u32::try_from(normalized.len()).expect("test JSON fits u32");
-        let canonical = WasmCanonicalJson::from_batch_parts(
-            vec![value],
-            normalized,
-            vec![(0, normalized_len)],
-            0,
-            1,
-        )
-        .expect("canonical test batch")
-        .pop()
-        .expect("one canonical test row");
-        WasmHostBytes::CanonicalJson(canonical)
-    }
-
     fn create(local_ref: u64) -> WasmRowChange<WasmHostBytes> {
+        let mut payload = typed_row("created");
+        let WasmHostBytes::Typed(row) = &mut payload;
+        let row = std::sync::Arc::make_mut(row);
+        row.row_pk = std::sync::Arc::from([]);
+        row.row.remove("id");
+        row.schema_fingerprint = create_catalog()
+            .plan_for_key("csv_row")
+            .expect("create schema")
+            .1
+            .fingerprint()
+            .bytes();
+        row.certify_boundary_create_validation();
         WasmRowChange::Create {
-            schema_key: "csv_row".to_string(),
+            schema_key: "csv_row".into(),
             local_ref,
             resolved_key: None,
-            snapshot_content: canonical(json!({})),
+            payload,
         }
     }
 
@@ -627,9 +722,69 @@ mod tests {
             .expect("valid UUIDv7 seed")
             .creates();
         let value = creates.component(42).expect("uuid");
-        let parsed = uuid::Uuid::parse_str(&value).expect("canonical UUID");
-        assert_eq!(parsed.get_version_num(), 7);
-        assert_eq!(&parsed.as_bytes()[12..], &42_u32.to_be_bytes());
+        assert_eq!(value.get_version_num(), 7);
+        assert_eq!(&value.as_bytes()[12..], &42_u32.to_be_bytes());
+    }
+
+    #[test]
+    fn materializing_create_identity_reuses_the_unique_typed_row_owner() {
+        let creates = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
+            .expect("valid UUIDv7 seed")
+            .creates();
+        let mut changes = WasmHostRowChanges {
+            changes: vec![create(42)],
+        };
+        let before = match &changes.changes[0] {
+            WasmRowChange::Create {
+                payload: WasmHostBytes::Typed(row),
+                ..
+            } => std::sync::Arc::as_ptr(row),
+            _ => unreachable!("fixture is a typed create"),
+        };
+
+        materialize_keyless_creates(&mut changes, creates, &create_catalog())
+            .expect("materialize create");
+
+        let (after, generated) = match &changes.changes[0] {
+            WasmRowChange::Upsert { row, .. } => {
+                let WasmHostBytes::Typed(payload) = &row.payload;
+                (std::sync::Arc::as_ptr(payload), row.key.row_pk[0].clone())
+            }
+            _ => panic!("create must become an upsert"),
+        };
+        assert_eq!(
+            before, after,
+            "unique typed row ownership should move in place"
+        );
+        assert!(matches!(generated, lix_schema::Value::Uuid(_)));
+    }
+
+    #[test]
+    fn materializing_create_rejects_a_conflicting_embedded_identity() {
+        let bound = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
+            .expect("valid UUIDv7 seed");
+        let expected = bound.creates().component(42).expect("generated id");
+        let mut change = create(42);
+        let WasmRowChange::Create {
+            payload: WasmHostBytes::Typed(row),
+            ..
+        } = &mut change
+        else {
+            unreachable!("fixture is a typed create");
+        };
+        std::sync::Arc::make_mut(row).row.insert(
+            "row_id".to_owned(),
+            lix_schema::Value::Uuid(uuid::Uuid::from_u128(expected.as_u128() + 1)),
+        );
+        let error = materialize_keyless_creates(
+            &mut WasmHostRowChanges {
+                changes: vec![change],
+            },
+            bound.creates(),
+            &create_catalog(),
+        )
+        .expect_err("conflicting plugin identity must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
     }
 
     #[test]
@@ -660,10 +815,10 @@ mod tests {
 
         let malformed = WasmRowChanges {
             changes: vec![WasmRowChange::Create {
-                schema_key: "other".to_string(),
+                schema_key: "other".into(),
                 local_ref: 0,
                 resolved_key: None,
-                snapshot_content: WasmHostBytes::Inline(Vec::new().into()),
+                payload: typed_row("malformed"),
             }],
         };
         assert!(validate_create_changes(&plugin(), &malformed).is_err());
@@ -676,12 +831,15 @@ mod tests {
             .creates()
             .component(1)
             .expect("generated UUID");
-        let key = WasmRowKey::from_owned_parts("csv_row", vec![id.clone()]);
+        let key =
+            WasmRowKey::from_typed_parts("csv_row", [0; 32], vec![lix_schema::Value::Uuid(id)])
+                .unwrap();
         let row = MaterializedHotStateRow {
-            row_pk: RowPk::uuid_from_canonical(&id).expect("typed UUID primary key"),
+            row_pk: RowPk::from_schema_values(&[lix_schema::Value::Uuid(id)])
+                .expect("typed UUID primary key"),
             schema_key: "csv_row".into(),
             file_id: Some("01920000-0000-7000-8000-0000000000a2".into()),
-            snapshot_content: Some("{}".into()),
+            snapshot_content: None,
             metadata: None,
             deleted: false,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
@@ -693,10 +851,29 @@ mod tests {
             branch_id: "main".into(),
         };
 
+        let mut batch = MaterializedHotStateBatchBuilder::with_capacity(1);
+        batch.push_owned(row.clone());
+        let ordinal = 0;
+        batch.set_typed_snapshot(
+            ordinal,
+            Some(std::sync::Arc::new(WasmTypedRow {
+                schema_fingerprint: [0; 32],
+                row_pk: vec![lix_schema::Value::Uuid(id)].into(),
+                row: lix_schema::Row::from([("id".to_owned(), lix_schema::Value::Uuid(id))]),
+                native_payload: std::sync::OnceLock::new(),
+                boundary_create_validation: std::sync::OnceLock::new(),
+            })),
+        );
+        let exact = MaterializedHotStateExactBatch::new(
+            batch.finish(),
+            vec![Some(u32::try_from(ordinal).expect("one test row fits u32"))],
+        )
+        .expect("typed authority batch");
+
         require_existing_id_authorities(
             &plugin(),
             &[key.clone()],
-            &MaterializedHotStateExactBatch::from_rows(vec![Some(row.clone())]),
+            &exact,
             "01920000-0000-7000-8000-0000000000a2",
             "main",
             false,
@@ -709,35 +886,12 @@ mod tests {
         require_existing_id_authorities(
             &plugin(),
             &[key],
-            &MaterializedHotStateExactBatch::from_rows(vec![Some(row)]),
+            &exact,
             "01920000-0000-7000-8000-0000000000a2",
             "main",
             true,
         )
         .expect_err("a tracked authority row must not satisfy an untracked create");
-    }
-
-    #[test]
-    fn unresolved_create_is_rejected_before_transaction_staging() {
-        let context = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
-            .expect("valid UUIDv7 seed")
-            .creates();
-        let mut changes = WasmRowChanges {
-            changes: vec![WasmRowChange::Create {
-                schema_key: "csv_row".to_string(),
-                local_ref: 42,
-                resolved_key: None,
-                snapshot_content: canonical(json!({
-                    "cells": ["Alice", "42"],
-                    "order_key": "4000000000000001"
-                })),
-            }],
-        };
-
-        let error = materialize_keyless_creates(&mut changes, context)
-            .expect_err("schema resolution must precede transaction staging");
-        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
-        assert!(error.message.contains("schema-resolved primary key"));
     }
 
     #[test]

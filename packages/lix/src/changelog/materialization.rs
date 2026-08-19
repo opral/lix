@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -12,6 +13,8 @@ use crate::storage_adapter::{
 };
 
 use super::{CHANGE_SPACE, ChangeId, ChangeRecord, decode_change_record};
+use crate::plugin::runtime::WasmTypedRow;
+use crate::row_pk::RowPk;
 
 const CHANGE_STORAGE_KEY_BYTES: usize = 16;
 
@@ -52,17 +55,18 @@ impl ChangeRecordProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct MaterializedChangePayload {
     pub(crate) identity: Option<MaterializedChangeIdentity>,
     pub(crate) snapshot_content: Option<SharedStr>,
     pub(crate) metadata: Option<SharedStr>,
+    pub(crate) typed_snapshot: Option<Arc<WasmTypedRow>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedChangeIdentity {
     pub(crate) schema_key: String,
-    pub(crate) row_pk: crate::row_pk::RowPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -212,6 +216,7 @@ where
                         identity: None,
                         snapshot_content: None,
                         metadata: None,
+                        typed_snapshot: None,
                     },
                 )
             })
@@ -222,6 +227,27 @@ where
     let mut plans = Vec::with_capacity(changes.len());
     for change in changes {
         let change_id = change.change_id;
+        if change.snapshot.is_some() && change.typed_payload.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "change '{}' carries both JSON and typed row payloads",
+                    change_id
+                ),
+            ));
+        }
+        let typed_snapshot = change
+            .typed_payload
+            .map(|payload| {
+                let native_payload: Arc<[u8]> = payload.into();
+                WasmTypedRow::decode_durable_payload(
+                    native_payload,
+                    &change.schema_key,
+                    &change.row_pk,
+                )
+            })
+            .transpose()?
+            .map(Arc::new);
         plans.push((
             change_id,
             MaterializedChangeIdentity {
@@ -231,26 +257,30 @@ where
             },
             materialized_json_slot(projection.snapshot_content, change.snapshot, &mut json_refs),
             materialized_json_slot(projection.metadata, change.metadata, &mut json_refs),
+            typed_snapshot,
         ));
     }
 
     let mut json_values = load_json_values(store, &json_refs).await?;
     plans
         .into_iter()
-        .map(|(change_id, identity, snapshot, metadata)| {
-            Ok((
-                change_id,
-                MaterializedChangePayload {
-                    identity: Some(identity),
-                    snapshot_content: materialized_json_string(
-                        snapshot,
-                        &json_refs,
-                        &mut json_values,
-                    )?,
-                    metadata: materialized_json_string(metadata, &json_refs, &mut json_values)?,
-                },
-            ))
-        })
+        .map(
+            |(change_id, identity, snapshot, metadata, typed_snapshot)| {
+                Ok((
+                    change_id,
+                    MaterializedChangePayload {
+                        identity: Some(identity),
+                        snapshot_content: materialized_json_string(
+                            snapshot,
+                            &json_refs,
+                            &mut json_values,
+                        )?,
+                        metadata: materialized_json_string(metadata, &json_refs, &mut json_values)?,
+                        typed_snapshot,
+                    },
+                ))
+            },
+        )
         .collect()
 }
 
@@ -447,7 +477,7 @@ mod tests {
         let first = test_change_record();
         let mut second = first.clone();
         second.schema_key = "derived-row".to_owned();
-        second.row_pk = crate::row_pk::RowPk::single("row-2");
+        second.row_pk = RowPk::single("row-2");
 
         let payloads = materialize_known_change_payloads_in_order(
             &read,
@@ -477,6 +507,42 @@ mod tests {
                 .expect("second identity")
                 .schema_key,
             second.schema_key
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_rejects_typed_payload_with_corrupted_stored_identity() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut change = test_change_record();
+        change.snapshot = JsonSlot::None;
+        change.row_pk = RowPk::single("stored-row");
+        change.typed_payload = Some(
+            crate::plugin::wire::typed::encode_native_row_payload(
+                &[3; 32],
+                &[lix_schema::Value::Text("payload-row".to_owned())],
+                &lix_schema::Row::from([(
+                    "id".to_owned(),
+                    lix_schema::Value::Text("payload-row".to_owned()),
+                )]),
+            )
+            .expect("typed payload should encode"),
+        );
+
+        let error = materialize_known_change_payloads_in_order(
+            &read,
+            [change].into_iter(),
+            ChangeRecordProjection::full(),
+        )
+        .await
+        .expect_err("payload identity corruption must fail before materialization");
+
+        assert!(
+            error.message.contains("does not match the stored envelope"),
+            "{error:?}"
         );
     }
 

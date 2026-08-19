@@ -59,6 +59,13 @@ pub(crate) enum SessionFileViewMutation {
 }
 
 impl SessionFileViews {
+    pub(crate) fn unfiltered_plugin_file_view(
+        &self,
+        key: &SessionFileViewKey,
+    ) -> Option<SessionPluginFileView> {
+        self.lock().plugin_files.get(key).cloned()
+    }
+
     pub(crate) fn has_plugin_file_at_path(&self, branch_id: &str, path: &str) -> bool {
         self.lock()
             .plugin_files

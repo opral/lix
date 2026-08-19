@@ -2,6 +2,7 @@ use crate::order_key::OrderKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,9 +28,9 @@ pub(crate) enum NodeKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NodeSnapshot {
-    pub(crate) id: String,
+    pub(crate) id: Uuid,
     pub(crate) kind: NodeKind,
-    pub(crate) parent_id: Option<String>,
+    pub(crate) parent_id: Option<Uuid>,
     pub(crate) order_key: Option<String>,
     pub(crate) payload: Value,
     pub(crate) format: Value,
@@ -78,13 +79,13 @@ impl NodeTree {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Projection {
-    pub(crate) nodes_by_id: BTreeMap<String, NodeSnapshot>,
+    pub(crate) nodes_by_id: BTreeMap<Uuid, NodeSnapshot>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct InlineNode {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) id: Option<String>,
+    pub(crate) id: Option<Uuid>,
     #[serde(flatten)]
     pub(crate) content: InlineContent,
 }
@@ -297,13 +298,14 @@ pub(crate) fn parse_inline_payload(payload: &Value) -> Result<Vec<InlineNode>, S
     .map_err(|error| format!("invalid inline payload: {error}"))
 }
 
-pub(crate) fn replace_column_ids(value: &mut Value, replacements: &BTreeMap<String, String>) {
+pub(crate) fn replace_column_ids(value: &mut Value, replacements: &BTreeMap<Uuid, Uuid>) {
     match value {
         Value::Object(object) => {
             if let Some(Value::String(column_id)) = object.get_mut("column_id")
-                && let Some(replacement) = replacements.get(column_id)
+                && let Ok(id) = Uuid::parse_str(column_id)
+                && let Some(replacement) = replacements.get(&id)
             {
-                *column_id = replacement.clone();
+                *column_id = replacement.to_string();
             }
             for child in object.values_mut() {
                 replace_column_ids(child, replacements);

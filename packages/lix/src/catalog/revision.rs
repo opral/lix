@@ -33,14 +33,16 @@ pub(crate) async fn load_catalog_revision(
         .map(CatalogRevision::from_storage_bytes))
 }
 
-pub(crate) fn stage_catalog_revision(writes: &mut StorageWriteSet) {
+pub(crate) fn stage_catalog_revision(writes: &mut StorageWriteSet) -> CatalogRevision {
+    let bytes = Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes());
     writes.put(
         REVISION_SPACE,
         revision_key(REVISION_KEY_CATALOG),
         StorageValue {
-            bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+            bytes: bytes.clone(),
         },
     );
+    CatalogRevision::from_storage_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -69,7 +71,7 @@ mod tests {
         );
 
         let mut writes = storage.new_write_set();
-        stage_catalog_revision(&mut writes);
+        let staged_revision = stage_catalog_revision(&mut writes);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -86,11 +88,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("next read should open");
-        assert!(
+        assert_eq!(
             load_catalog_revision(&next_read)
                 .await
-                .expect("committed revision should load")
-                .is_some()
+                .expect("committed revision should load"),
+            Some(staged_revision),
+            "the caller can index derived state by the exact staged revision"
         );
     }
 

@@ -8,19 +8,16 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
+use crate::{LixError, common::SharedStr, row_pk::RowPk, wasm::WasmLimits};
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde_json::Value as JsonValue;
-use smallvec::SmallVec;
 
-use crate::{
-    LixError, catalog::SchemaPlanFingerprint, common::SharedStr, row_pk::RowPk, wasm::WasmLimits,
-};
-
-pub const PACKET_FORMAT_V1: u16 = 1;
-pub const WASM_COMPONENT_API_VERSION: &str = "1.0.0";
+pub const PACKET_FORMAT_V2: u16 = 2;
+pub const CURRENT_PACKET_FORMAT: u16 = PACKET_FORMAT_V2;
+pub const WASM_COMPONENT_API_VERSION: &str = "2.0.0";
 /// Canonical ABI page charge for one renderer splice before inline insert
 /// bytes. Both inline and output-backed edits pay this fixed metadata cost.
 pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
@@ -51,7 +48,7 @@ impl Default for WasmTransitionLimits {
     fn default() -> Self {
         Self {
             max_record_bytes: MIB_U32,
-            // Match the largest fixed page schedule that the v3 push sink
+            // Match the largest fixed page schedule that the v2 typed-page sink
             // safely uses under the same Wasm linear-memory limit. Records
             // remain capped independently at one MiB.
             max_page_bytes: TRANSITION_PAGE_BYTES,
@@ -148,6 +145,22 @@ impl WasmTransitionLimits {
     }
 }
 
+/// Forbidden outer-row JSON work at the plugin boundary.
+///
+/// The typed-row hard cut has no production caller. This enum and
+/// [`WasmTransitionCounters::record_outer_row_json_operation`] are the single
+/// instrumentation choke point for any future implementation: recording is
+/// required before an outer snapshot is parsed, serialized, canonicalized, or
+/// materialized as a JSON DOM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum OuterRowJsonOperation {
+    Parse,
+    Serialize,
+    Canonicalize,
+    DomFallback,
+}
+
 /// Measurable work for a component transition. Engine-owned counters and binding-
 /// owned counters share one snapshot so benchmarks can fail on hidden
 /// O(document) work even when wall-clock timing happens to improve.
@@ -178,6 +191,37 @@ pub struct WasmTransitionCounters {
     pub row_input_attachment_bytes: u64,
     pub row_output_attachment_writes: u64,
     pub row_output_attachment_bytes: u64,
+    /// Typed row transport work at the host/guest boundary.
+    pub typed_row_decode_records: u64,
+    pub typed_row_decode_bytes: u64,
+    /// Host CPU time spent decoding native typed pages, measured per callback.
+    pub typed_row_decode_nanos: u64,
+    pub typed_row_encode_records: u64,
+    pub typed_row_encode_bytes: u64,
+    pub typed_row_schema_validation_calls: u64,
+    pub typed_row_schema_validation_bytes: u64,
+    /// Host CPU time spent authenticating decoded rows against Schema v1.
+    pub typed_row_schema_validation_nanos: u64,
+    /// Complete native rows observed by transaction preparation after either
+    /// the component or SQL construction boundary. Already-certified rows are
+    /// counted as typed-path evidence without being validated a second time.
+    pub typed_transaction_validation_calls: u64,
+    pub typed_transaction_validation_bytes: u64,
+    pub row_page_callback_calls: u64,
+    /// Input-source callbacks that returned the terminal `none` page. Together
+    /// with input/output page counts this exactly accounts for every callback.
+    pub row_input_page_eof_callbacks: u64,
+    /// Hard-cut proof counters. Production typed-row workloads must leave all
+    /// of these at zero; a positive-control test proves every counter can
+    /// become nonzero through the centralized operation hook.
+    pub outer_row_json_parse_calls: u64,
+    pub outer_row_json_parse_bytes: u64,
+    pub outer_row_json_serialize_calls: u64,
+    pub outer_row_json_serialize_bytes: u64,
+    pub outer_row_json_canonicalize_calls: u64,
+    pub outer_row_json_canonicalize_bytes: u64,
+    pub outer_row_json_dom_fallback_calls: u64,
+    pub outer_row_json_dom_fallback_bytes: u64,
     pub component_import_calls: u64,
     /// Exported guest entries. Prototype A requires exactly one for an initial
     /// file transition, independent of page and source-read counts.
@@ -218,6 +262,34 @@ pub struct WasmTransitionCounters {
 }
 
 impl WasmTransitionCounters {
+    #[doc(hidden)]
+    pub fn record_outer_row_json_operation(
+        &mut self,
+        operation: OuterRowJsonOperation,
+        bytes: u64,
+    ) {
+        let (calls, measured_bytes) = match operation {
+            OuterRowJsonOperation::Parse => (
+                &mut self.outer_row_json_parse_calls,
+                &mut self.outer_row_json_parse_bytes,
+            ),
+            OuterRowJsonOperation::Serialize => (
+                &mut self.outer_row_json_serialize_calls,
+                &mut self.outer_row_json_serialize_bytes,
+            ),
+            OuterRowJsonOperation::Canonicalize => (
+                &mut self.outer_row_json_canonicalize_calls,
+                &mut self.outer_row_json_canonicalize_bytes,
+            ),
+            OuterRowJsonOperation::DomFallback => (
+                &mut self.outer_row_json_dom_fallback_calls,
+                &mut self.outer_row_json_dom_fallback_bytes,
+            ),
+        };
+        *calls = calls.saturating_add(1);
+        *measured_bytes = measured_bytes.saturating_add(bytes);
+    }
+
     /// Adds one completed transition snapshot to an engine-wide aggregate.
     ///
     /// Counters saturate instead of wrapping so diagnostic instrumentation can
@@ -268,6 +340,66 @@ impl WasmTransitionCounters {
         self.row_output_attachment_bytes = self
             .row_output_attachment_bytes
             .saturating_add(other.row_output_attachment_bytes);
+        self.typed_row_decode_records = self
+            .typed_row_decode_records
+            .saturating_add(other.typed_row_decode_records);
+        self.typed_row_decode_bytes = self
+            .typed_row_decode_bytes
+            .saturating_add(other.typed_row_decode_bytes);
+        self.typed_row_decode_nanos = self
+            .typed_row_decode_nanos
+            .saturating_add(other.typed_row_decode_nanos);
+        self.typed_row_encode_records = self
+            .typed_row_encode_records
+            .saturating_add(other.typed_row_encode_records);
+        self.typed_row_encode_bytes = self
+            .typed_row_encode_bytes
+            .saturating_add(other.typed_row_encode_bytes);
+        self.typed_row_schema_validation_calls = self
+            .typed_row_schema_validation_calls
+            .saturating_add(other.typed_row_schema_validation_calls);
+        self.typed_row_schema_validation_bytes = self
+            .typed_row_schema_validation_bytes
+            .saturating_add(other.typed_row_schema_validation_bytes);
+        self.typed_row_schema_validation_nanos = self
+            .typed_row_schema_validation_nanos
+            .saturating_add(other.typed_row_schema_validation_nanos);
+        self.typed_transaction_validation_calls = self
+            .typed_transaction_validation_calls
+            .saturating_add(other.typed_transaction_validation_calls);
+        self.typed_transaction_validation_bytes = self
+            .typed_transaction_validation_bytes
+            .saturating_add(other.typed_transaction_validation_bytes);
+        self.row_page_callback_calls = self
+            .row_page_callback_calls
+            .saturating_add(other.row_page_callback_calls);
+        self.row_input_page_eof_callbacks = self
+            .row_input_page_eof_callbacks
+            .saturating_add(other.row_input_page_eof_callbacks);
+        self.outer_row_json_parse_calls = self
+            .outer_row_json_parse_calls
+            .saturating_add(other.outer_row_json_parse_calls);
+        self.outer_row_json_parse_bytes = self
+            .outer_row_json_parse_bytes
+            .saturating_add(other.outer_row_json_parse_bytes);
+        self.outer_row_json_serialize_calls = self
+            .outer_row_json_serialize_calls
+            .saturating_add(other.outer_row_json_serialize_calls);
+        self.outer_row_json_serialize_bytes = self
+            .outer_row_json_serialize_bytes
+            .saturating_add(other.outer_row_json_serialize_bytes);
+        self.outer_row_json_canonicalize_calls = self
+            .outer_row_json_canonicalize_calls
+            .saturating_add(other.outer_row_json_canonicalize_calls);
+        self.outer_row_json_canonicalize_bytes = self
+            .outer_row_json_canonicalize_bytes
+            .saturating_add(other.outer_row_json_canonicalize_bytes);
+        self.outer_row_json_dom_fallback_calls = self
+            .outer_row_json_dom_fallback_calls
+            .saturating_add(other.outer_row_json_dom_fallback_calls);
+        self.outer_row_json_dom_fallback_bytes = self
+            .outer_row_json_dom_fallback_bytes
+            .saturating_add(other.outer_row_json_dom_fallback_bytes);
         self.component_import_calls = self
             .component_import_calls
             .saturating_add(other.component_import_calls);
@@ -383,434 +515,266 @@ pub trait WasmByteSource: Send + Sync {
     fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError>;
 }
 
-#[derive(Clone)]
-pub struct WasmSourceSlice {
-    pub source: Arc<dyn WasmByteSource>,
-    pub range: WasmSourceRange,
+#[derive(Debug, Clone)]
+pub enum WasmHostBytes {
+    /// Native Schema v1 values retained after typed-row page validation. This
+    /// is the only row payload accepted by the plugin runtime.
+    Typed(Arc<WasmTypedRow>),
 }
 
-impl fmt::Debug for WasmSourceSlice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("WasmSourceSlice")
-            .field("source_len", &self.source.len())
-            .field("range", &self.range)
-            .finish()
+#[derive(Debug)]
+pub struct WasmTypedRow {
+    pub(crate) schema_fingerprint: [u8; 32],
+    pub(crate) row_pk: Arc<[lix_schema::Value]>,
+    pub(crate) row: lix_schema::Row,
+    pub(crate) native_payload: OnceLock<NativePayloadCache>,
+    pub(crate) boundary_create_validation: OnceLock<BoundaryValidationToken>,
+}
+
+impl Clone for WasmTypedRow {
+    fn clone(&self) -> Self {
+        // Boundary certificates authorize this exact owner and must never be
+        // copied onto a value that `Arc::make_mut` is about to modify.
+        Self {
+            schema_fingerprint: self.schema_fingerprint,
+            row_pk: self.row_pk.clone(),
+            row: self.row.clone(),
+            native_payload: OnceLock::new(),
+            boundary_create_validation: OnceLock::new(),
+        }
     }
 }
 
-impl WasmSourceSlice {
-    pub fn validate(&self) -> Result<(), LixError> {
-        if self.range.end()? > self.source.len() {
-            return Err(invalid_param("component source slice is out of bounds"));
+#[derive(Debug)]
+pub(crate) enum NativePayloadCache {
+    /// Bytes reconstructed from durable state or encoded by an internal
+    /// caller. Their presence alone carries no ingress-validation authority.
+    Durable {
+        bytes: Arc<[u8]>,
+        boundary_validation: OnceLock<BoundaryValidationToken>,
+    },
+    /// Bytes encoded only after the catalog-backed component boundary proved
+    /// the complete row shape and its typed identity.
+    BoundaryValidated {
+        bytes: Arc<[u8]>,
+        _proof: BoundaryValidationToken,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundaryValidationToken {
+    _private: (),
+}
+
+impl NativePayloadCache {
+    fn bytes(&self) -> &Arc<[u8]> {
+        match self {
+            Self::Durable { bytes, .. } | Self::BoundaryValidated { bytes, .. } => bytes,
+        }
+    }
+}
+
+impl PartialEq for WasmTypedRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_fingerprint == other.schema_fingerprint
+            && self.row_pk == other.row_pk
+            && self.row == other.row
+    }
+}
+
+impl WasmTypedRow {
+    pub(crate) fn validate_durable_envelope(
+        &self,
+        stored_schema_key: &str,
+        stored_row_pk: &RowPk,
+    ) -> Result<(), LixError> {
+        let payload_row_pk = RowPk::from_schema_values(&self.row_pk).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "durable typed payload for schema '{stored_schema_key}' has an invalid row identity: {error}"
+                ),
+            )
+        })?;
+        if &payload_row_pk != stored_row_pk {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "durable typed payload identity does not match the stored envelope for schema '{stored_schema_key}'"
+                ),
+            ));
         }
         Ok(())
     }
-}
 
-#[derive(Debug, Clone)]
-pub enum WasmHostBytes {
-    /// Immutable bytes that can retain a slice of a materialization batch
-    /// without allocating a row-owned buffer.
-    Inline(Bytes),
-    Source(WasmSourceSlice),
-    CanonicalJson(WasmCanonicalJson),
-}
-
-/// One canonical JSON row backed by cursor-page storage.
-///
-/// Cloning a row clones only this owner pointer and row ordinal. Snapshot
-/// values and canonical bytes stay owned once by the bounded batch produced
-/// while draining the enclosing component cursor page. Certified pages retain their
-/// original shared UTF-8 row buffers; decoded or mixed pages use one compact
-/// normalized arena.
-#[derive(Debug, Clone)]
-pub struct WasmCanonicalJson {
-    batch: Arc<WasmCanonicalJsonBatch>,
-    row: u32,
-}
-
-#[derive(Debug)]
-struct WasmCanonicalJsonBatch {
-    storage: WasmCanonicalJsonStorage,
-    parse_count: usize,
-    serialize_count: usize,
-    arena_allocation_count: u8,
-}
-
-#[derive(Debug)]
-enum WasmCanonicalJsonStorage {
-    Arena {
-        values: Box<[Option<JsonValue>]>,
-        certificates: Box<[Option<WasmCanonicalJsonCertificate>]>,
-        normalized: SharedStr,
-        offsets: Box<[WasmCanonicalJsonOffset]>,
-    },
-    CertifiedRows {
-        decoded_values: OnceLock<Box<[OnceLock<JsonValue>]>>,
-        row_pks: Box<[RowPk]>,
-        schema_fingerprints: Box<[Arc<SchemaPlanFingerprint>]>,
-        schema_fingerprint_indices: Box<[u32]>,
-        normalized: Box<[SharedStr]>,
-        normalized_len: u32,
-    },
-}
-
-/// Schema and identity facts proven while streaming one exact canonical guest
-/// snapshot. The row key remains the protocol's owner of schema metadata;
-/// this certificate retains the typed identity plus one shared fingerprint of
-/// the exact schema plan against which the proof was issued.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WasmCanonicalJsonCertificate {
-    row_pk: RowPk,
-    schema_fingerprint: Arc<SchemaPlanFingerprint>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct WasmCanonicalJsonCertificateRef<'a> {
-    row_pk: &'a RowPk,
-    schema_fingerprint: &'a Arc<SchemaPlanFingerprint>,
-}
-
-#[cfg(test)]
-impl WasmCanonicalJsonCertificateRef<'_> {
-    pub(crate) fn row_pk(&self) -> &RowPk {
-        self.row_pk
+    /// Decodes a durable typed row and binds its embedded identity to the
+    /// authoritative storage envelope before the row can be materialized.
+    pub(crate) fn decode_durable_payload(
+        payload: Arc<[u8]>,
+        stored_schema_key: &str,
+        stored_row_pk: &RowPk,
+    ) -> Result<Self, LixError> {
+        let decoded = crate::plugin::wire::typed::decode_native_row_payload(&payload).map_err(
+            |error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot decode durable typed payload for schema '{stored_schema_key}': {error:?}"
+                    ),
+                )
+            },
+        )?;
+        let row = Self {
+            schema_fingerprint: decoded.schema_fingerprint,
+            row_pk: decoded.row_pk.into(),
+            row: decoded.row,
+            native_payload: OnceLock::from(NativePayloadCache::Durable {
+                bytes: payload,
+                boundary_validation: OnceLock::new(),
+            }),
+            boundary_create_validation: OnceLock::new(),
+        };
+        row.validate_durable_envelope(stored_schema_key, stored_row_pk)?;
+        Ok(row)
     }
-}
 
-impl WasmCanonicalJsonCertificate {
-    pub(crate) fn new(row_pk: RowPk, schema_fingerprint: Arc<SchemaPlanFingerprint>) -> Self {
-        Self {
-            row_pk,
-            schema_fingerprint,
+    /// Binds a decoded durable row's storage envelope to the schema selected
+    /// by its consumer. This must run before typed values are filtered,
+    /// projected, or otherwise exposed.
+    pub(crate) fn validate_resolved_schema_binding(
+        &self,
+        stored_schema_key: &str,
+        resolved_schema_key: &str,
+        resolved_schema_fingerprint: &[u8; 32],
+    ) -> Result<(), LixError> {
+        if stored_schema_key != resolved_schema_key {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "durable typed row stored as schema '{stored_schema_key}' cannot be exposed as resolved schema '{resolved_schema_key}'"
+                ),
+            ));
         }
-    }
-
-    pub(crate) fn row_pk(&self) -> &RowPk {
-        &self.row_pk
-    }
-
-    pub(crate) fn schema_fingerprint(&self) -> &SchemaPlanFingerprint {
-        self.schema_fingerprint.as_ref()
-    }
-
-    fn borrowed(&self) -> WasmCanonicalJsonCertificateRef<'_> {
-        WasmCanonicalJsonCertificateRef {
-            row_pk: &self.row_pk,
-            schema_fingerprint: &self.schema_fingerprint,
+        if &self.schema_fingerprint != resolved_schema_fingerprint {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "durable typed row fingerprint for schema '{stored_schema_key}' does not match the resolved schema"
+                ),
+            ));
         }
+        Ok(())
     }
-}
 
-impl WasmCanonicalJsonCertificateRef<'_> {
-    pub(crate) fn into_owned(self) -> WasmCanonicalJsonCertificate {
-        WasmCanonicalJsonCertificate {
-            row_pk: self.row_pk.clone(),
-            schema_fingerprint: self.schema_fingerprint.clone(),
+    pub(crate) fn invalidate_durable_payload(&mut self) {
+        self.native_payload.take();
+    }
+
+    pub(crate) fn durable_payload(&self) -> Result<Arc<[u8]>, crate::plugin::wire::typed::Error> {
+        if let Some(payload) = self.native_payload.get() {
+            return Ok(Arc::clone(payload.bytes()));
         }
+        let payload: Arc<[u8]> = crate::plugin::wire::typed::encode_native_row_payload(
+            &self.schema_fingerprint,
+            &self.row_pk,
+            &self.row,
+        )?
+        .into();
+        let _ = self.native_payload.set(NativePayloadCache::Durable {
+            bytes: Arc::clone(&payload),
+            boundary_validation: OnceLock::new(),
+        });
+        Ok(self
+            .native_payload
+            .get()
+            .map_or(payload, |cached| Arc::clone(cached.bytes())))
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-struct WasmCanonicalJsonOffset {
-    start: u32,
-    end: u32,
-}
+    /// Records the stronger proof produced by catalog-backed component
+    /// ingress. Callers must first validate the complete Schema v1 row and
+    /// its primary-key envelope.
+    pub(crate) fn certify_boundary_validation(
+        &self,
+    ) -> Result<(), crate::plugin::wire::typed::Error> {
+        if let Some(NativePayloadCache::Durable {
+            boundary_validation,
+            ..
+        }) = self.native_payload.get()
+        {
+            let _ = boundary_validation.set(BoundaryValidationToken { _private: () });
+        } else if self.native_payload.get().is_none() {
+            let payload: Arc<[u8]> = crate::plugin::wire::typed::encode_native_row_payload(
+                &self.schema_fingerprint,
+                &self.row_pk,
+                &self.row,
+            )?
+            .into();
+            let _ = self
+                .native_payload
+                .set(NativePayloadCache::BoundaryValidated {
+                    bytes: payload,
+                    _proof: BoundaryValidationToken { _private: () },
+                });
+        }
+        Ok(())
+    }
 
-impl WasmCanonicalJson {
-    pub(crate) fn from_batch_parts(
-        values: Vec<JsonValue>,
-        normalized: Vec<u8>,
-        offsets: Vec<(u32, u32)>,
-        parse_count: usize,
-        serialize_count: usize,
-    ) -> Result<Vec<Self>, LixError> {
-        let row_count = values.len();
-        let mut optional_values = Vec::with_capacity(row_count);
-        optional_values.extend(values.into_iter().map(Some));
-        Self::from_mixed_batch_parts(
-            optional_values,
-            vec![None; row_count],
-            normalized,
-            offsets,
-            parse_count,
-            serialize_count,
+    pub(crate) fn boundary_validation_certified(&self) -> bool {
+        matches!(
+            self.native_payload.get(),
+            Some(NativePayloadCache::BoundaryValidated { .. })
+        ) || matches!(
+            self.native_payload.get(),
+            Some(NativePayloadCache::Durable {
+                boundary_validation,
+                ..
+            }) if boundary_validation.get().is_some()
         )
     }
 
-    pub(crate) fn from_mixed_batch_parts(
-        values: Vec<Option<JsonValue>>,
-        certificates: Vec<Option<WasmCanonicalJsonCertificate>>,
-        normalized: Vec<u8>,
-        offsets: Vec<(u32, u32)>,
-        parse_count: usize,
-        serialize_count: usize,
-    ) -> Result<Vec<Self>, LixError> {
-        if values.len() != offsets.len() {
-            return Err(invalid_param(
-                "canonical JSON batch value and offset counts differ",
-            ));
-        }
-        if certificates.len() != offsets.len() {
-            return Err(invalid_param(
-                "canonical JSON batch certificate and offset counts differ",
-            ));
-        }
-        if values
+    pub(super) fn certify_boundary_create_validation(&self) {
+        let _ = self
+            .boundary_create_validation
+            .set(BoundaryValidationToken { _private: () });
+    }
+
+    pub(super) fn boundary_create_validation_certified(&self) -> bool {
+        self.boundary_create_validation.get().is_some()
+    }
+
+    pub fn estimated_size(&self) -> u64 {
+        let key = 4_u64.saturating_add(self.row_pk.iter().map(typed_value_size).sum::<u64>());
+        let values = self
+            .row
             .iter()
-            .zip(&certificates)
-            .any(|(value, certificate)| value.is_some() == certificate.is_some())
-        {
-            return Err(invalid_param(
-                "canonical JSON batch rows must own exactly one decoded value or certificate",
-            ));
-        }
-        // `Bytes::from(Vec<u8>)` retains the Vec allocation even when it has
-        // spare capacity. `SharedStr` then validates and retains that same
-        // immutable allocation, so row materialization can take cheap slices
-        // instead of copying each canonical payload.
-        let arena_allocation_count = u8::from(normalized.capacity() != 0);
-        let normalized = SharedStr::from_utf8(Bytes::from(normalized))
-            .map_err(|_| invalid_param("canonical JSON batch arena is not UTF-8"))?;
-        let arena_len = u32::try_from(normalized.len())
-            .map_err(|_| invalid_param("canonical JSON batch arena exceeds u32"))?;
-        let mut previous_end = 0_u32;
-        let mut validated_offsets = Vec::with_capacity(offsets.len());
-        for (start, end) in offsets {
-            if start != previous_end || end < start || end > arena_len {
-                return Err(invalid_param(
-                    "canonical JSON batch offsets are invalid or non-contiguous",
-                ));
-            }
-            if !normalized.as_str().is_char_boundary(start as usize)
-                || !normalized.as_str().is_char_boundary(end as usize)
-            {
-                return Err(invalid_param(
-                    "canonical JSON batch offsets split a UTF-8 scalar",
-                ));
-            }
-            previous_end = end;
-            validated_offsets.push(WasmCanonicalJsonOffset { start, end });
-        }
-        if previous_end != arena_len {
-            return Err(invalid_param(
-                "canonical JSON batch offsets do not cover the arena",
-            ));
-        }
-
-        Self::from_validated_batch(WasmCanonicalJsonBatch {
-            storage: WasmCanonicalJsonStorage::Arena {
-                values: values.into_boxed_slice(),
-                certificates: certificates.into_boxed_slice(),
-                normalized,
-                offsets: validated_offsets.into_boxed_slice(),
-            },
-            parse_count,
-            serialize_count,
-            arena_allocation_count,
-        })
-    }
-
-    pub(crate) fn from_certified_batch_parts(
-        normalized: Vec<SharedStr>,
-        row_pks: Vec<RowPk>,
-        schema_fingerprints: Vec<Arc<SchemaPlanFingerprint>>,
-        schema_fingerprint_indices: Vec<u32>,
-        parse_count: usize,
-    ) -> Result<Vec<Self>, LixError> {
-        if normalized.len() != row_pks.len() || normalized.len() != schema_fingerprint_indices.len()
-        {
-            return Err(invalid_param(
-                "certified canonical JSON batch row and metadata counts differ",
-            ));
-        }
-        if schema_fingerprint_indices
-            .iter()
-            .any(|index| *index as usize >= schema_fingerprints.len())
-        {
-            return Err(invalid_param(
-                "certified canonical JSON batch schema index is invalid",
-            ));
-        }
-
-        let normalized_len = normalized.iter().try_fold(0_u32, |total, row| {
-            let row_len = u32::try_from(row.len())
-                .map_err(|_| invalid_param("certified canonical JSON row exceeds u32"))?;
-            total
-                .checked_add(row_len)
-                .ok_or_else(|| invalid_param("certified canonical JSON batch exceeds u32"))
-        })?;
-
-        Self::from_validated_batch(WasmCanonicalJsonBatch {
-            storage: WasmCanonicalJsonStorage::CertifiedRows {
-                decoded_values: OnceLock::new(),
-                row_pks: row_pks.into_boxed_slice(),
-                schema_fingerprints: schema_fingerprints.into_boxed_slice(),
-                schema_fingerprint_indices: schema_fingerprint_indices.into_boxed_slice(),
-                normalized: normalized.into_boxed_slice(),
-                normalized_len,
-            },
-            parse_count,
-            serialize_count: 0,
-            arena_allocation_count: 0,
-        })
-    }
-
-    fn from_validated_batch(batch: WasmCanonicalJsonBatch) -> Result<Vec<Self>, LixError> {
-        let batch = Arc::new(batch);
-        let mut rows = Vec::with_capacity(batch.row_count());
-        for row in 0..batch.row_count() {
-            rows.push(Self {
-                batch: batch.clone(),
-                row: u32::try_from(row)
-                    .map_err(|_| invalid_param("canonical JSON batch has too many rows"))?,
-            });
-        }
-        Ok(rows)
-    }
-
-    pub fn value(&self) -> &JsonValue {
-        match &self.batch.storage {
-            WasmCanonicalJsonStorage::Arena { values, .. } => values[self.row_index()]
-                .as_ref()
-                .expect("certified canonical JSON rows do not own decoded values"),
-            WasmCanonicalJsonStorage::CertifiedRows {
-                decoded_values,
-                normalized,
-                ..
-            } => decoded_values
-                .get_or_init(|| (0..normalized.len()).map(|_| OnceLock::new()).collect())
-                [self.row_index()]
-            .get_or_init(|| {
-                serde_json::from_str(normalized[self.row_index()].as_str())
-                    .expect("certified canonical JSON must parse")
-            }),
-        }
-    }
-
-    pub(crate) fn certificate(&self) -> Option<WasmCanonicalJsonCertificateRef<'_>> {
-        match &self.batch.storage {
-            WasmCanonicalJsonStorage::Arena { certificates, .. } => certificates[self.row_index()]
-                .as_ref()
-                .map(WasmCanonicalJsonCertificate::borrowed),
-            WasmCanonicalJsonStorage::CertifiedRows {
-                row_pks,
-                schema_fingerprints,
-                schema_fingerprint_indices,
-                ..
-            } => Some(WasmCanonicalJsonCertificateRef {
-                row_pk: &row_pks[self.row_index()],
-                schema_fingerprint: &schema_fingerprints
-                    [schema_fingerprint_indices[self.row_index()] as usize],
-            }),
-        }
-    }
-
-    pub fn normalized(&self) -> &str {
-        match &self.batch.storage {
-            WasmCanonicalJsonStorage::Arena {
-                normalized,
-                offsets,
-                ..
-            } => normalized
-                .as_str()
-                .get(offset_range(offsets[self.row_index()]))
-                .expect("canonical JSON row offsets were validated at batch construction"),
-            WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => {
-                normalized[self.row_index()].as_str()
-            }
-        }
-    }
-
-    pub(crate) fn normalized_shared(&self) -> SharedStr {
-        match &self.batch.storage {
-            WasmCanonicalJsonStorage::Arena {
-                normalized,
-                offsets,
-                ..
-            } => normalized
-                .slice(offset_range(offsets[self.row_index()]))
-                .expect("canonical JSON row offsets were validated at batch construction"),
-            WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => {
-                normalized[self.row_index()].clone()
-            }
-        }
-    }
-
-    pub fn row_index(&self) -> usize {
-        self.row as usize
-    }
-
-    pub fn batch_row_count(&self) -> usize {
-        self.batch.row_count()
-    }
-
-    pub fn batch_arena_len(&self) -> usize {
-        match &self.batch.storage {
-            WasmCanonicalJsonStorage::Arena { normalized, .. } => normalized.len(),
-            WasmCanonicalJsonStorage::CertifiedRows { normalized_len, .. } => {
-                *normalized_len as usize
-            }
-        }
-    }
-
-    pub fn shares_batch_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.batch, &other.batch)
-    }
-
-    pub fn validation_counts(&self) -> (usize, usize) {
-        (self.batch.parse_count, self.batch.serialize_count)
-    }
-
-    pub fn batch_arena_allocation_count(&self) -> usize {
-        self.batch.arena_allocation_count as usize
-    }
-
-    #[cfg(test)]
-    pub(crate) fn batch_decoded_value_count(&self) -> usize {
-        match &self.batch.storage {
-            WasmCanonicalJsonStorage::Arena { values, .. } => {
-                values.iter().filter(|value| value.is_some()).count()
-            }
-            WasmCanonicalJsonStorage::CertifiedRows { decoded_values, .. } => decoded_values
-                .get()
-                .map(|values| values.iter().filter(|value| value.get().is_some()).count())
-                .unwrap_or(0),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn batch_certified_schema_count(&self) -> usize {
-        match &self.batch.storage {
-            WasmCanonicalJsonStorage::Arena { .. } => 0,
-            WasmCanonicalJsonStorage::CertifiedRows {
-                schema_fingerprints,
-                ..
-            } => schema_fingerprints.len(),
-        }
+            .map(|(name, value)| {
+                4_u64
+                    .saturating_add(name.len() as u64)
+                    .saturating_add(typed_value_size(value))
+            })
+            .sum::<u64>();
+        key.saturating_add(4)
+            .saturating_add(values)
+            .saturating_add(64)
     }
 }
 
-impl WasmCanonicalJsonBatch {
-    fn row_count(&self) -> usize {
-        match &self.storage {
-            WasmCanonicalJsonStorage::Arena { offsets, .. } => offsets.len(),
-            WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => normalized.len(),
-        }
+fn typed_value_size(value: &lix_schema::Value) -> u64 {
+    match value {
+        lix_schema::Value::Null => 1,
+        lix_schema::Value::Text(value) => value.len() as u64 + 5,
+        lix_schema::Value::Uuid(_) => 17,
+        lix_schema::Value::Int8(_) | lix_schema::Value::Float8(_) => 9,
+        lix_schema::Value::Boolean(_) => 2,
+        lix_schema::Value::Jsonb(value) => value.estimated_binary_size().saturating_add(5),
+        lix_schema::Value::Timestamptz(_) => 9,
     }
-}
-
-fn offset_range(offset: WasmCanonicalJsonOffset) -> std::ops::Range<usize> {
-    offset.start as usize..offset.end as usize
 }
 
 impl WasmHostBytes {
     pub fn len(&self) -> u64 {
         match self {
-            Self::Inline(bytes) => bytes.len() as u64,
-            Self::Source(slice) => slice.range.length,
-            Self::CanonicalJson(json) => json.normalized().len() as u64,
+            Self::Typed(row) => row.estimated_size(),
         }
     }
 
@@ -842,38 +806,144 @@ pub struct WasmInputSplice {
     pub insert: WasmInputBytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone)]
 pub struct WasmRowKey {
     pub schema_key: SharedStr,
-    pub row_pk: SmallVec<[SharedStr; 2]>,
+    pub schema_fingerprint: [u8; 32],
+    pub row_pk: Arc<[lix_schema::Value]>,
+}
+
+impl PartialEq for WasmRowKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_key == other.schema_key
+            && self.schema_fingerprint == other.schema_fingerprint
+            && typed_key_values_cmp(&self.row_pk, &other.row_pk).is_eq()
+    }
+}
+
+impl Eq for WasmRowKey {}
+
+impl PartialOrd for WasmRowKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WasmRowKey {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.schema_key
+            .cmp(&other.schema_key)
+            .then_with(|| self.schema_fingerprint.cmp(&other.schema_fingerprint))
+            .then_with(|| typed_key_values_cmp(&self.row_pk, &other.row_pk))
+    }
+}
+
+impl Hash for WasmRowKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.schema_key.hash(state);
+        self.schema_fingerprint.hash(state);
+        for value in self.row_pk.iter() {
+            hash_typed_key_value(value, state);
+        }
+    }
 }
 
 impl WasmRowKey {
-    pub fn from_owned_parts(schema_key: impl Into<SharedStr>, row_pk: Vec<String>) -> Self {
-        Self {
+    pub fn from_typed_parts(
+        schema_key: impl Into<SharedStr>,
+        schema_fingerprint: [u8; 32],
+        row_pk: impl Into<Arc<[lix_schema::Value]>>,
+    ) -> Result<Self, LixError> {
+        let row_pk = row_pk.into();
+        if row_pk.is_empty()
+            || row_pk.iter().any(|value| {
+                !matches!(
+                    value,
+                    lix_schema::Value::Text(_)
+                        | lix_schema::Value::Uuid(_)
+                        | lix_schema::Value::Int8(_)
+                )
+            })
+        {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                "typed row keys must contain one or more text, uuid, or int8 values",
+            ));
+        }
+        Ok(Self {
             schema_key: schema_key.into(),
-            row_pk: row_pk.into_iter().map(SharedStr::from).collect(),
+            schema_fingerprint,
+            row_pk,
+        })
+    }
+}
+
+#[inline]
+fn typed_key_values_cmp(
+    left: &[lix_schema::Value],
+    right: &[lix_schema::Value],
+) -> std::cmp::Ordering {
+    use lix_schema::Value;
+
+    match (left, right) {
+        ([Value::Text(left)], [Value::Text(right)]) => return left.cmp(right),
+        ([Value::Uuid(left)], [Value::Uuid(right)]) => return left.cmp(right),
+        ([Value::Int8(left)], [Value::Int8(right)]) => return left.cmp(right),
+        _ => {}
+    }
+    for (left, right) in left.iter().zip(right) {
+        let ordering = typed_key_value_cmp(left, right);
+        if !ordering.is_eq() {
+            return ordering;
         }
     }
+    left.len().cmp(&right.len())
+}
 
-    pub fn from_shared_parts(
-        schema_key: SharedStr,
-        row_pk: impl IntoIterator<Item = SharedStr>,
-    ) -> Self {
-        Self {
-            schema_key,
-            row_pk: row_pk.into_iter().collect(),
+fn typed_key_value_cmp(left: &lix_schema::Value, right: &lix_schema::Value) -> std::cmp::Ordering {
+    fn tag(value: &lix_schema::Value) -> u8 {
+        match value {
+            lix_schema::Value::Text(_) => 0,
+            lix_schema::Value::Uuid(_) => 1,
+            lix_schema::Value::Int8(_) => 2,
+            _ => unreachable!("typed row key construction rejects non-key values"),
         }
+    }
+    tag(left)
+        .cmp(&tag(right))
+        .then_with(|| match (left, right) {
+            (lix_schema::Value::Text(left), lix_schema::Value::Text(right)) => left.cmp(right),
+            (lix_schema::Value::Uuid(left), lix_schema::Value::Uuid(right)) => left.cmp(right),
+            (lix_schema::Value::Int8(left), lix_schema::Value::Int8(right)) => left.cmp(right),
+            _ => std::cmp::Ordering::Equal,
+        })
+}
+
+fn hash_typed_key_value<H: Hasher>(value: &lix_schema::Value, state: &mut H) {
+    match value {
+        lix_schema::Value::Text(value) => {
+            0_u8.hash(state);
+            value.hash(state);
+        }
+        lix_schema::Value::Uuid(value) => {
+            1_u8.hash(state);
+            value.hash(state);
+        }
+        lix_schema::Value::Int8(value) => {
+            2_u8.hash(state);
+            value.hash(state);
+        }
+        _ => unreachable!("typed row key construction rejects non-key values"),
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct WasmRow<B> {
     pub key: WasmRowKey,
-    /// Complete Snapshot JSON for this schema. Production component is currently
-    /// restricted to Lix's durable JSON subset; the packet-v1
-    /// arbitrary-precision extension remains gated on a durable codec.
-    pub snapshot_content: B,
+    /// Native Schema v1 row payload for the schema identified by `key`.
+    pub payload: B,
 }
 
 pub type WasmHostRow = WasmRow<WasmHostBytes>;
@@ -889,13 +959,13 @@ pub enum WasmChangeEffect {
 #[derive(Debug, Clone)]
 pub enum WasmRowChange<B> {
     Create {
-        schema_key: String,
+        schema_key: SharedStr,
         local_ref: u64,
-        /// v3 may resolve the host-namespaced primary key before canonical
-        /// validation. component leaves this absent and retains keyless semantics
+        /// The v2 host may resolve the host-namespaced primary key before canonical
+        /// validation. The component leaves this absent and retains keyless semantics
         /// until create-context materialization.
         resolved_key: Option<WasmRowKey>,
-        snapshot_content: B,
+        payload: B,
     },
     Upsert {
         row: WasmRow<B>,
@@ -1021,7 +1091,7 @@ pub(crate) fn validate_change_cursor_key_uniqueness<B>(
 }
 
 pub type WasmHostRowChanges = WasmRowChanges<WasmHostBytes>;
-pub type WasmGuestRowChanges = WasmRowChanges<WasmGuestBytes>;
+pub type WasmGuestRowChanges = WasmRowChanges<WasmGuestRowPayload>;
 
 #[derive(Debug, Clone)]
 pub struct WasmRowPage {
@@ -1030,7 +1100,7 @@ pub struct WasmRowPage {
 
 /// Bounded, complete host rows. `None` is permanent EOF and every
 /// successful page must be non-empty and no larger than `max_bytes` once
-/// packet-v1 encoded.
+/// encoded in the current typed-page format.
 pub trait WasmRowSource: Send {
     fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError>;
 }
@@ -1047,23 +1117,24 @@ pub trait WasmRowChangeSource: Send {
 }
 
 /// One same-column concurrent overlap presented to a column merger. Complete
-/// rows remain available as read-only context, but the plugin can replace only
-/// the named column value.
+/// rows and overlapping values are native Schema v1 values; no row snapshot
+/// or JSON column representation crosses the component boundary.
 #[derive(Debug, Clone)]
-pub struct WasmColumnMerge<B> {
+pub struct WasmColumnMerge {
     pub ordinal: u32,
     pub key: WasmRowKey,
     pub file_id: Option<String>,
     pub column: String,
-    pub base: Option<B>,
-    pub a: Option<B>,
-    pub b: Option<B>,
-    pub base_row: B,
-    pub a_row: B,
-    pub b_row: B,
+    pub schema_fingerprint: [u8; 32],
+    pub base: Option<lix_schema::Value>,
+    pub a: Option<lix_schema::Value>,
+    pub b: Option<lix_schema::Value>,
+    pub base_row: Arc<WasmTypedRow>,
+    pub a_row: Arc<WasmTypedRow>,
+    pub b_row: Arc<WasmTypedRow>,
 }
 
-pub type WasmHostColumnMerge = WasmColumnMerge<WasmHostBytes>;
+pub type WasmHostColumnMerge = WasmColumnMerge;
 
 #[derive(Debug, Clone)]
 pub struct WasmColumnMergePage {
@@ -1077,12 +1148,12 @@ pub trait WasmColumnMergeSource: Send {
 #[derive(Debug, Clone)]
 pub enum WasmColumnMergeResult<B> {
     UseLww,
-    /// `None` removes an optional column. `Some` contains its canonical JSON
-    /// value, including JSON `null` when the column is explicitly null.
+    /// `None` removes an optional column. `Some` contains the native Schema v1
+    /// value, including `Value::Jsonb(Null)` for an explicit JSON null.
     Replace(Option<B>),
 }
 
-pub type WasmGuestColumnMergeResult = WasmColumnMergeResult<WasmGuestBytes>;
+pub type WasmGuestColumnMergeResult = WasmColumnMergeResult<WasmGuestColumnValue>;
 
 #[derive(Debug, Clone)]
 pub struct WasmColumnMergeResultPage {
@@ -1099,12 +1170,14 @@ pub struct WasmCreateContext {
 }
 
 impl WasmCreateContext {
-    pub fn row_pk(self, local_ref: u64) -> Result<Vec<String>, LixError> {
-        Ok(vec![self.component(local_ref)?])
+    pub fn row_pk(self, local_ref: u64) -> Result<Vec<lix_schema::Value>, LixError> {
+        Ok(vec![lix_schema::Value::Uuid(self.component(local_ref)?)])
     }
 
-    pub fn component(self, local_ref: u64) -> Result<String, LixError> {
-        Ok(uuid::Uuid::from_bytes(self.component_uuid_bytes(local_ref)?).to_string())
+    pub fn component(self, local_ref: u64) -> Result<uuid::Uuid, LixError> {
+        Ok(uuid::Uuid::from_bytes(
+            self.component_uuid_bytes(local_ref)?,
+        ))
     }
 
     pub(crate) fn component_uuid_bytes(self, local_ref: u64) -> Result<[u8; 16], LixError> {
@@ -1125,15 +1198,6 @@ pub struct WasmOpenFileInput {
     pub descriptor: WasmFileDescriptor,
     pub file: Arc<dyn WasmByteSource>,
     pub creates: WasmCreateContext,
-    /// Whether this file may represent a complete parse as a certified row
-    /// packet instead of ordinary per-row changes.
-    ///
-    /// A certified packet is materialized by expanding it from the file's
-    /// published commit root, so the caller must set this to `false` for any
-    /// file that publishes no commit. The same rows are then produced through
-    /// the ordinary change path instead. This is a representation choice made
-    /// by the host; the guest emits the same rows either way.
-    pub certified_packets_available: bool,
 }
 
 impl fmt::Debug for WasmOpenFileInput {
@@ -1143,10 +1207,6 @@ impl fmt::Debug for WasmOpenFileInput {
             .field("descriptor", &self.descriptor)
             .field("file_len", &self.file.len())
             .field("creates", &self.creates)
-            .field(
-                "certified_packets_available",
-                &self.certified_packets_available,
-            )
             .finish()
     }
 }
@@ -1369,96 +1429,10 @@ macro_rules! handle_type {
 
 handle_type!(WasmDocumentHandle);
 
-/// Runtime-private immutable document state retained outside a Wasm Store.
-///
-/// The engine treats the payload as opaque. A compatible component runtime
-/// may restore it into a fresh Store after actor eviction, avoiding durable
-/// row hydration while preserving the same semantic authority checks.
-#[derive(Debug, Clone)]
-pub struct WasmDurableDocumentCheckpoint {
-    bytes: crate::Blob,
-}
-
-impl WasmDurableDocumentCheckpoint {
-    const MAGIC: &'static [u8; 8] = b"LIXDPR01";
-    pub const MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
-
-    pub fn new(bytes: crate::Blob) -> Result<Self, LixError> {
-        if bytes.len() > Self::MAX_DECODED_BYTES {
-            return Err(LixError::new(
-                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
-                "plugin runtime checkpoint exceeds the 128 MiB encode limit",
-            ));
-        }
-        let decoded_len = u64::try_from(bytes.len()).map_err(|_| {
-            LixError::new(
-                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
-                "plugin runtime checkpoint exceeds u64",
-            )
-        })?;
-        let compressed = crate::compression::compress_zstd_level_1(&bytes).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to compress plugin runtime checkpoint: {error}"),
-            )
-        })?;
-        let mut encoded = Vec::with_capacity(16 + compressed.len());
-        encoded.extend_from_slice(Self::MAGIC);
-        encoded.extend_from_slice(&decoded_len.to_le_bytes());
-        encoded.extend_from_slice(&compressed);
-        Ok(Self {
-            bytes: encoded.into(),
-        })
-    }
-
-    pub fn bytes(&self) -> crate::Blob {
-        self.bytes.clone()
-    }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<crate::Blob, LixError> {
-        let header = bytes.get(..16).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                "plugin runtime checkpoint is truncated",
-            )
-        })?;
-        if &header[..8] != Self::MAGIC {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                "plugin runtime checkpoint has an unsupported format",
-            ));
-        }
-        let decoded_len = usize::try_from(u64::from_le_bytes(
-            header[8..16].try_into().expect("fixed checkpoint length"),
-        ))
-        .map_err(|_| {
-            LixError::new(
-                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
-                "plugin runtime checkpoint exceeds host address space",
-            )
-        })?;
-        if decoded_len > Self::MAX_DECODED_BYTES {
-            return Err(LixError::new(
-                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
-                "plugin runtime checkpoint exceeds the 128 MiB decode limit",
-            ));
-        }
-        crate::compression::decompress_zstd(&bytes[16..], decoded_len)
-            .map(crate::Blob::from)
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!("plugin runtime checkpoint failed decompression: {error}"),
-                )
-            })
-    }
-}
-
 #[derive(Clone)]
 pub struct WasmDocumentCheckpoint {
     payload: Arc<dyn Any + Send + Sync>,
     retained_bytes: u64,
-    durable: Option<WasmDurableDocumentCheckpoint>,
 }
 
 impl fmt::Debug for WasmDocumentCheckpoint {
@@ -1478,22 +1452,6 @@ impl WasmDocumentCheckpoint {
         Self {
             payload: Arc::new(payload),
             retained_bytes,
-            durable: None,
-        }
-    }
-
-    pub fn new_with_durable<T>(
-        payload: T,
-        retained_bytes: u64,
-        durable: WasmDurableDocumentCheckpoint,
-    ) -> Self
-    where
-        T: Any + Send + Sync,
-    {
-        Self {
-            payload: Arc::new(payload),
-            retained_bytes,
-            durable: Some(durable),
         }
     }
 
@@ -1503,10 +1461,6 @@ impl WasmDocumentCheckpoint {
 
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes
-    }
-
-    pub fn durable_checkpoint(&self) -> Option<WasmDurableDocumentCheckpoint> {
-        self.durable.clone()
     }
 }
 handle_type!(WasmChangeCursorHandle);
@@ -1522,11 +1476,25 @@ pub struct WasmOutputRange {
     pub length: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum WasmGuestRowPayload {
+    /// Native Schema v1 values emitted by a typed-row page.
+    Typed(Arc<WasmTypedRow>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum WasmGuestBytes {
     /// A shared slice of the guest packet payload. Every inline value decoded
     /// from one packet page retains the same backing allocation.
     Inline(Bytes),
+    Output(WasmOutputRange),
+}
+
+/// A typed column-merge replacement whose bytes are streamed through the
+/// page-local output table and decoded as one native Schema v1 value by the
+/// host.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WasmGuestColumnValue {
     Output(WasmOutputRange),
 }
 
@@ -1538,14 +1506,14 @@ pub struct WasmChangePage {
     pub outputs: Option<WasmByteOutputsHandle>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmOutputSplice {
     pub offset: u64,
     pub delete_len: u64,
     pub insert: WasmGuestBytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmEditPage {
     pub edits: Vec<WasmOutputSplice>,
     /// Exactly one page-local table supplies all output ranges in `edits`.
@@ -1581,7 +1549,7 @@ impl WasmChangeDrainValidator {
                 "a component change cursor advanced after EOF",
             ));
         }
-        if page.format_version != PACKET_FORMAT_V1 {
+        if page.format_version != CURRENT_PACKET_FORMAT {
             return Err(invalid_param(
                 "unsupported component change packet format version",
             ));
@@ -1599,32 +1567,25 @@ impl WasmChangeDrainValidator {
             ));
         }
 
-        let mut page_refs = 0u32;
         for change in &page.changes.changes {
-            let output = match change {
+            match change {
                 WasmRowChange::Create {
-                    snapshot_content, ..
-                } => match snapshot_content {
-                    WasmGuestBytes::Output(range) => Some(range),
-                    WasmGuestBytes::Inline(_) => None,
-                },
-                WasmRowChange::Upsert { row, .. } => match &row.snapshot_content {
-                    WasmGuestBytes::Output(range) => Some(range),
-                    WasmGuestBytes::Inline(_) => None,
-                },
-                WasmRowChange::Delete(_) => None,
-            };
-            if let Some(range) = output {
-                range
-                    .offset
-                    .checked_add(range.length)
-                    .ok_or_else(|| invalid_param("component change output range overflowed"))?;
-                page_refs = page_refs.checked_add(1).ok_or_else(|| {
-                    invalid_param("component attachment reference count overflowed")
-                })?;
+                    payload: WasmGuestRowPayload::Typed(_),
+                    ..
+                }
+                | WasmRowChange::Upsert {
+                    row:
+                        WasmRow {
+                            payload: WasmGuestRowPayload::Typed(_),
+                            ..
+                        },
+                    ..
+                }
+                | WasmRowChange::Delete(_) => {}
             }
         }
-        validate_attachment_table_presence(page_refs, page.outputs.is_some())?;
+        validate_attachment_table_presence(0, page.outputs.is_some())?;
+        let page_refs = 0u32;
         self.attachment_refs = self
             .attachment_refs
             .checked_add(page_refs)
@@ -1774,41 +1735,6 @@ pub struct WasmFileTransition {
     pub replace_all_rows: bool,
 }
 
-/// One immutable, host-validated semantic batch which remains encoded until
-/// storage/query consumption.
-///
-/// This is deliberately format-neutral at the runtime boundary. The format
-/// id selects a registered engine codec; pages retain the guest's bounded
-/// framing and share their backing buffers through transaction commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmCertifiedCreateRange {
-    pub schema_key: String,
-    pub first_local_ref: u32,
-    pub last_local_ref: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmCertifiedRowBatch {
-    pub format: u16,
-    pub schema_keys: Vec<String>,
-    pub row_count: u64,
-    pub creates: WasmCreateContext,
-    /// Host-validated compact identities created by this batch. Keeping ranges
-    /// here avoids reparsing or expanding certified packet payloads merely to
-    /// establish successor authority.
-    pub create_ranges: Vec<WasmCertifiedCreateRange>,
-    /// True when this batch replaces every prior segment for the file.
-    /// Incremental transitions emit sparse overlays instead.
-    pub complete_file_state: bool,
-    pub pages: Vec<Bytes>,
-}
-
-/// Dense snapshot packets synthesized only after ordinary component guest output has
-/// completed host validation. Guest-emitted certified batches intentionally
-/// cannot claim this format.
-pub(crate) const HOST_CERTIFIED_PACKET_FORMAT: u16 = 3;
-pub(crate) const HOST_CERTIFIED_ZSTD_PACKET_FORMAT: u16 = 4;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmRowTransition {
     pub transition: WasmTransitionHandle,
@@ -1871,19 +1797,6 @@ pub trait WasmComponentActor: Send {
         ))
     }
 
-    /// Restores a process-independent runtime checkpoint against the exact
-    /// accepted file bytes named by the visible materialization.
-    async fn restore_durable_document(
-        &mut self,
-        _checkpoint: &[u8],
-        _accepted: &[u8],
-    ) -> Result<WasmDocumentHandle, LixError> {
-        Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            "this component actor does not support durable document checkpoints",
-        ))
-    }
-
     async fn open_file(
         &mut self,
         limits: WasmTransitionLimits,
@@ -1938,17 +1851,6 @@ pub trait WasmComponentActor: Send {
         cursor: WasmChangeCursorHandle,
         max_bytes: u32,
     ) -> Result<Option<WasmChangePage>, LixError>;
-
-    /// Takes encoded semantic batches accumulated while draining `transition`.
-    ///
-    /// Ordinary component actors never produce these. A v3 adapter may return a
-    /// batch only after every bounded page has passed its format validator.
-    fn take_certified_row_batches(
-        &mut self,
-        _transition: WasmTransitionHandle,
-    ) -> Vec<WasmCertifiedRowBatch> {
-        Vec::new()
-    }
 
     async fn next_column_merge_result_page(
         &mut self,
@@ -2120,124 +2022,63 @@ mod tests {
     }
 
     #[test]
-    fn durable_document_checkpoint_roundtrips_and_bounds_decompression() {
-        let original: crate::Blob = b"repeated plugin state".repeat(4_096).into();
-        let checkpoint = WasmDurableDocumentCheckpoint::new(original.clone()).unwrap();
-        assert_eq!(
-            WasmDurableDocumentCheckpoint::decode(&checkpoint.bytes()).unwrap(),
-            original
-        );
+    fn outer_row_json_counter_positive_control_covers_every_forbidden_operation() {
+        let mut counters = WasmTransitionCounters::default();
+        for operation in [
+            OuterRowJsonOperation::Parse,
+            OuterRowJsonOperation::Serialize,
+            OuterRowJsonOperation::Canonicalize,
+            OuterRowJsonOperation::DomFallback,
+        ] {
+            counters.record_outer_row_json_operation(operation, 17);
+        }
+        let mut aggregate = WasmTransitionCounters::default();
+        aggregate.accumulate(counters);
 
-        let mut oversized = Vec::from(WasmDurableDocumentCheckpoint::MAGIC.as_slice());
-        oversized.extend_from_slice(
-            &u64::try_from(WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES + 1)
-                .unwrap()
-                .to_le_bytes(),
-        );
-        assert_eq!(
-            WasmDurableDocumentCheckpoint::decode(&oversized)
-                .expect_err("oversized checkpoint must fail before decompression")
-                .code,
-            LixError::CODE_PLUGIN_RESOURCE_LIMIT
-        );
+        assert_eq!(aggregate.outer_row_json_parse_calls, 1);
+        assert_eq!(aggregate.outer_row_json_parse_bytes, 17);
+        assert_eq!(aggregate.outer_row_json_serialize_calls, 1);
+        assert_eq!(aggregate.outer_row_json_serialize_bytes, 17);
+        assert_eq!(aggregate.outer_row_json_canonicalize_calls, 1);
+        assert_eq!(aggregate.outer_row_json_canonicalize_bytes, 17);
+        assert_eq!(aggregate.outer_row_json_dom_fallback_calls, 1);
+        assert_eq!(aggregate.outer_row_json_dom_fallback_bytes, 17);
     }
 
     #[test]
-    fn canonical_json_rows_share_one_utf8_arena_without_copying() {
-        let first = r#"{"label":"é"}"#;
-        let second = r#"{"label":"雪"}"#;
-        let first_end = u32::try_from(first.len()).unwrap();
-        let arena_len = first.len() + second.len();
-        let mut normalized = Vec::with_capacity(arena_len + 64);
-        normalized.extend_from_slice(first.as_bytes());
-        normalized.extend_from_slice(second.as_bytes());
-        let arena_pointer = normalized.as_ptr();
+    fn durable_payload_cache_can_be_boundary_certified_after_encoding() {
+        let row = WasmTypedRow {
+            schema_fingerprint: [7; 32],
+            row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+            row: lix_schema::Row::from([("id", lix_schema::Value::Text("row-1".to_owned()))]),
+            native_payload: OnceLock::new(),
+            boundary_create_validation: OnceLock::new(),
+        };
 
-        let rows = WasmCanonicalJson::from_batch_parts(
-            vec![
-                serde_json::from_str(first).unwrap(),
-                serde_json::from_str(second).unwrap(),
-            ],
-            normalized,
-            vec![(0, first_end), (first_end, arena_len as u32)],
-            2,
-            2,
-        )
-        .unwrap();
-
-        let first_shared = rows[0].normalized_shared();
-        let second_shared = rows[1].normalized_shared();
-        assert_eq!(rows[0].normalized(), first);
-        assert_eq!(rows[1].normalized(), second);
-        assert_eq!(first_shared.as_str(), first);
-        assert_eq!(second_shared.as_str(), second);
-        assert_eq!(first_shared.as_bytes().as_ptr(), arena_pointer);
-        assert!(first_shared.shares_buffer_with(&second_shared));
-        assert_eq!(first_shared.retained_buffer_len(), arena_len);
-        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
-        assert_eq!(rows[0].validation_counts(), (2, 2));
+        row.durable_payload().expect("encode durable payload");
+        assert!(!row.boundary_validation_certified());
+        row.certify_boundary_validation()
+            .expect("certify encoded payload");
+        assert!(row.boundary_validation_certified());
     }
 
     #[test]
-    fn canonical_json_rejects_offsets_inside_unicode_scalars() {
-        let normalized = "é{}".as_bytes().to_vec();
-        let error = WasmCanonicalJson::from_batch_parts(
-            vec![JsonValue::Null, JsonValue::Object(Default::default())],
-            normalized,
-            vec![(0, 1), (1, 4)],
-            2,
-            2,
-        )
-        .unwrap_err();
-
-        assert!(error.message.contains("UTF-8 scalar"));
-    }
-
-    #[test]
-    fn canonical_json_large_batch_reserves_its_handle_vector_once() {
-        let row_count = 10_000usize;
-        let normalized = b"null".repeat(row_count);
-        let offsets = (0..row_count)
-            .map(|row| {
-                let start = u32::try_from(row * 4).expect("test arena fits u32");
-                (start, start + 4)
-            })
-            .collect();
-
-        let rows = WasmCanonicalJson::from_batch_parts(
-            vec![JsonValue::Null; row_count],
-            normalized,
-            offsets,
-            row_count,
-            row_count,
-        )
-        .expect("large canonical batch");
-
-        assert_eq!(rows.len(), row_count);
-        assert_eq!(
-            rows.capacity(),
-            row_count,
-            "the handle column must be reserved at its final size"
-        );
-        assert_eq!(rows.last().expect("last row").row_index(), row_count - 1);
-        assert!(rows[0].shares_batch_with(rows.last().expect("last row")));
-    }
-
-    #[test]
-    fn large_common_keys_stay_inline_and_duplicate_sort_borrows_original_owners() {
+    fn duplicate_sort_borrows_native_key_owners() {
         let schema = SharedStr::from_static("csv_row");
-        let namespace = SharedStr::from_static("namespace");
-        let row = SharedStr::from_static("row");
         let changes = (0..10_000)
             .map(|ordinal| {
                 let row_pk = if ordinal % 2 == 0 {
-                    [namespace.clone()].into_iter().collect()
+                    vec![lix_schema::Value::Text("namespace".to_owned())]
                 } else {
-                    [namespace.clone(), row.clone()].into_iter().collect()
+                    vec![
+                        lix_schema::Value::Text("namespace".to_owned()),
+                        lix_schema::Value::Text("row".to_owned()),
+                    ]
                 };
                 WasmRowChange::<WasmGuestBytes>::Delete(WasmRowKey {
                     schema_key: schema.clone(),
-                    row_pk,
+                    schema_fingerprint: [7; 32],
+                    row_pk: row_pk.into(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2245,15 +2086,7 @@ mod tests {
         for (ordinal, change) in changes.iter().enumerate() {
             let key = change.row_key().expect("delete carries a row key");
             assert_eq!(key.row_pk.len(), 1 + (ordinal % 2));
-            assert!(
-                !key.row_pk.spilled(),
-                "one- and two-component protocol keys must stay inline"
-            );
             assert!(key.schema_key.shares_buffer_with(&schema));
-            assert!(key.row_pk[0].shares_buffer_with(&namespace));
-            if ordinal % 2 == 1 {
-                assert!(key.row_pk[1].shares_buffer_with(&row));
-            }
         }
 
         let mut original_owner_addresses = changes
@@ -2289,16 +2122,39 @@ mod tests {
     }
 
     #[test]
+    fn typed_row_key_retains_native_components() {
+        let id =
+            uuid::Uuid::parse_str("01920000-0000-7000-8000-0000000000aa").expect("fixture UUID");
+        let values = vec![lix_schema::Value::Uuid(id), lix_schema::Value::Int8(42)];
+        let key =
+            WasmRowKey::from_typed_parts("typed", [7; 32], values.clone()).expect("typed key");
+        let same_native_key =
+            WasmRowKey::from_typed_parts("typed", [7; 32], values.clone()).expect("typed key");
+        assert_eq!(key.row_pk.as_ref(), values.as_slice());
+        assert_eq!(key.schema_fingerprint, [7; 32]);
+        assert_eq!(key, same_native_key);
+        assert_eq!(key.cmp(&same_native_key), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
     fn cursor_key_uniqueness_accepts_arbitrary_unique_order() {
         let changes = vec![
-            WasmRowChange::<WasmGuestBytes>::Delete(WasmRowKey::from_shared_parts(
-                SharedStr::from_static("schema-z"),
-                [SharedStr::from_static("row-z")],
-            )),
-            WasmRowChange::<WasmGuestBytes>::Delete(WasmRowKey::from_shared_parts(
-                SharedStr::from_static("schema-a"),
-                [SharedStr::from_static("row-a")],
-            )),
+            WasmRowChange::<WasmGuestBytes>::Delete(
+                WasmRowKey::from_typed_parts(
+                    "schema-z",
+                    [1; 32],
+                    vec![lix_schema::Value::Text("row-z".to_owned())],
+                )
+                .unwrap(),
+            ),
+            WasmRowChange::<WasmGuestBytes>::Delete(
+                WasmRowKey::from_typed_parts(
+                    "schema-a",
+                    [2; 32],
+                    vec![lix_schema::Value::Text("row-a".to_owned())],
+                )
+                .unwrap(),
+            ),
         ];
 
         validate_change_cursor_key_uniqueness(&changes)
@@ -2313,7 +2169,7 @@ mod tests {
         };
         assert_eq!(
             creates.component(42).unwrap(),
-            "01920000-0000-7000-8000-00000000002a"
+            uuid::Uuid::parse_str("01920000-0000-7000-8000-00000000002a").unwrap()
         );
         assert_eq!(creates.row_pk(7).unwrap().len(), 1);
         assert!(creates.component(u64::from(u32::MAX) + 1).is_err());
@@ -2353,7 +2209,12 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_row_keys() {
-        let key = WasmRowKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
+        let key = WasmRowKey::from_typed_parts(
+            "csv_row",
+            [0; 32],
+            vec![lix_schema::Value::Text("row".to_owned())],
+        )
+        .unwrap();
         let duplicate = WasmRowChanges::<WasmGuestBytes> {
             changes: vec![
                 WasmRowChange::Delete(key.clone()),
@@ -2438,9 +2299,14 @@ mod tests {
 
     #[test]
     fn change_drain_validator_owns_framing_but_not_key_copies() {
-        let key = WasmRowKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
+        let key = WasmRowKey::from_typed_parts(
+            "csv_row",
+            [0; 32],
+            vec![lix_schema::Value::Text("row".to_owned())],
+        )
+        .unwrap();
         let page = WasmChangePage {
-            format_version: PACKET_FORMAT_V1,
+            format_version: CURRENT_PACKET_FORMAT,
             changes: WasmRowChanges {
                 changes: vec![WasmRowChange::Delete(key)],
             },
@@ -2552,7 +2418,7 @@ mod tests {
     #[test]
     fn production_wit_is_versioned_and_row_first() {
         let wit = include_str!("../../../wit/lix-plugin.wit");
-        assert!(wit.starts_with("package lix:plugin@1.0.0;"));
+        assert!(wit.starts_with("package lix:plugin@2.0.0;"));
         assert!(wit.contains("resource transition"));
         assert!(wit.contains("interface column-merger"));
         assert!(wit.contains("interface file-projection"));

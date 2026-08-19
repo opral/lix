@@ -1,13 +1,13 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "excalidraw_file",
-  "description": "One Excalidraw files-map entry keyed by its native map key. Binary data and numeric metadata stay inside file_json as text.",
+  "description": "One Excalidraw files-map entry keyed by its native map key. Binary data and numeric metadata are stored in native JSONB.",
   "columns": [
     {
       "name": "file_json",
-      "type": "text",
+      "type": "jsonb",
       "nullable": false,
-      "description": "The complete exact Excalidraw binary-file JSON object encoded as text."
+      "description": "The complete Excalidraw binary-file JSON object."
     },
     {
       "name": "id",

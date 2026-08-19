@@ -65,6 +65,7 @@ struct TrackedStatePayloadColumns {
     change_ids: Vec<ChangeId>,
     snapshots: Vec<JsonSlot>,
     metadata: Vec<JsonSlot>,
+    typed_payloads: Vec<Option<Vec<u8>>>,
     id_ordinals: HashMap<ChangeId, u32>,
 }
 
@@ -74,6 +75,7 @@ pub(crate) struct TrackedStatePayloadRef<'a> {
     pub(crate) change_id: ChangeId,
     pub(crate) snapshot: &'a JsonSlot,
     pub(crate) metadata: &'a JsonSlot,
+    pub(crate) typed_payload: Option<&'a [u8]>,
 }
 
 /// One changed identity between two commit roots.
@@ -237,6 +239,16 @@ impl TrackedStatePayloadBatch {
     pub(crate) fn from_payloads(
         payloads: impl IntoIterator<Item = (ChangeId, JsonSlot, JsonSlot)>,
     ) -> Result<Self, LixError> {
+        Self::from_payloads_with_typed(
+            payloads
+                .into_iter()
+                .map(|(change_id, snapshot, metadata)| (change_id, snapshot, metadata, None)),
+        )
+    }
+
+    pub(crate) fn from_payloads_with_typed(
+        payloads: impl IntoIterator<Item = (ChangeId, JsonSlot, JsonSlot, Option<Vec<u8>>)>,
+    ) -> Result<Self, LixError> {
         let mut payloads = payloads.into_iter().collect::<Vec<_>>();
         if payloads.is_empty() {
             return Ok(Self::default());
@@ -247,14 +259,17 @@ impl TrackedStatePayloadBatch {
                 "tracked-state payload batch exceeds the ordinal range",
             ));
         }
-        payloads.sort_unstable_by_key(|(change_id, _, _)| *change_id);
+        payloads.sort_unstable_by_key(|(change_id, _, _, _)| *change_id);
 
         let row_count = payloads.len();
         let mut change_ids = Vec::with_capacity(row_count);
         let mut snapshots = Vec::with_capacity(row_count);
         let mut metadata = Vec::with_capacity(row_count);
+        let mut typed_payloads = Vec::with_capacity(row_count);
         let mut id_ordinals = HashMap::with_capacity(row_count);
-        for (ordinal, (change_id, snapshot, row_metadata)) in payloads.into_iter().enumerate() {
+        for (ordinal, (change_id, snapshot, row_metadata, typed_payload)) in
+            payloads.into_iter().enumerate()
+        {
             let ordinal = u32::try_from(ordinal).expect("payload row count was bounded to u32");
             if id_ordinals.insert(change_id, ordinal).is_some() {
                 return Err(LixError::new(
@@ -267,12 +282,14 @@ impl TrackedStatePayloadBatch {
             change_ids.push(change_id);
             snapshots.push(snapshot);
             metadata.push(row_metadata);
+            typed_payloads.push(typed_payload);
         }
         Ok(Self {
             columns: Arc::new(TrackedStatePayloadColumns {
                 change_ids,
                 snapshots,
                 metadata,
+                typed_payloads,
                 id_ordinals,
             }),
         })
@@ -284,6 +301,7 @@ impl TrackedStatePayloadBatch {
             change_id: self.columns.change_ids[ordinal],
             snapshot: &self.columns.snapshots[ordinal],
             metadata: &self.columns.metadata[ordinal],
+            typed_payload: self.columns.typed_payloads[ordinal].as_deref(),
         })
     }
 
@@ -311,9 +329,9 @@ impl TrackedStatePayloadBatch {
         if self.is_empty() {
             0
         } else {
-            // Three dense columns plus one change-id ordinal index, regardless
+            // Four dense columns plus one change-id ordinal index, regardless
             // of logical row count.
-            4
+            5
         }
     }
 }
@@ -471,7 +489,9 @@ fn tracked_value_payload_eq(
     }
     match (payloads.get(left.change_id), payloads.get(right.change_id)) {
         (Some(left), Some(right)) => {
-            left.snapshot == right.snapshot && left.metadata == right.metadata
+            left.snapshot == right.snapshot
+                && left.metadata == right.metadata
+                && left.typed_payload == right.typed_payload
         }
         _ => false,
     }
@@ -1581,7 +1601,7 @@ mod tests {
         assert_eq!(payloads.len(), 10_000);
         assert_eq!(
             payloads.large_buffer_count(),
-            4,
+            5,
             "payload row count must not change the number of column buffers"
         );
         assert!(payloads.shares_owner_with(&cloned));
@@ -3658,6 +3678,7 @@ mod tests {
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
+            typed_snapshot: None,
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),

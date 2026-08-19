@@ -2470,12 +2470,8 @@ where
             if let Some((spec, row_pk)) =
                 resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
             {
-                let reader: Arc<dyn sql2::RowSnapshotReader> = Arc::new(
-                    sql2::CurrentRowSnapshotReader::new(
-                        Arc::clone(&self.hot_state),
-                        read_store.clone(),
-                    ),
-                );
+                let reader: Arc<dyn crate::hot_state::HotStateReader> =
+                    Arc::new(self.hot_state.reader(read_store.clone()));
                 let query = sql2::execute_exact_schema_point_read(
                     &spec,
                     &active_branch_id,
@@ -7793,7 +7789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_certified_batches_preserve_local_conflict_statement_index() {
+    async fn consecutive_parameter_batches_preserve_local_conflict_statement_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",

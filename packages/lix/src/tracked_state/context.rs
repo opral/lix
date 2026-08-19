@@ -1262,16 +1262,6 @@ where
         MaterializedTrackedStateExactBatch::new(batch, slots)
     }
 
-    /// Borrows the storage snapshot this reader was opened over.
-    ///
-    /// Callers use it to run a read that belongs to a *different* plane against
-    /// the same snapshot — notably the live-state certified-history fallback in
-    /// semantic merge. Keeping that call on the caller's side is what lets this
-    /// module stay free of references into the derived hot plane.
-    pub(crate) fn store(&self) -> &S {
-        &self.store
-    }
-
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn load_batch_at_commit(
         &mut self,
@@ -1449,10 +1439,17 @@ where
     ) -> Result<TrackedStatePayloadBatch, LixError> {
         let rows = batch.side_rows().collect::<Vec<_>>();
         let changes = self.load_routed_tree_diff_changes(&rows).await?;
-        TrackedStatePayloadBatch::from_payloads(
+        TrackedStatePayloadBatch::from_payloads_with_typed(
             changes
                 .into_iter()
-                .map(|(change_id, change)| (change_id, change.snapshot, change.metadata)),
+                .map(|(change_id, change)| {
+                    (
+                        change_id,
+                        change.snapshot,
+                        change.metadata,
+                        change.typed_payload,
+                    )
+                }),
         )
     }
 
@@ -1465,10 +1462,17 @@ where
         let changes = self
             .load_routed_tree_diff_changes(&batch.comparison_rows())
             .await?;
-        TrackedStatePayloadBatch::from_payloads(
+        TrackedStatePayloadBatch::from_payloads_with_typed(
             changes
                 .into_iter()
-                .map(|(change_id, change)| (change_id, change.snapshot, change.metadata)),
+                .map(|(change_id, change)| {
+                    (
+                        change_id,
+                        change.snapshot,
+                        change.metadata,
+                        change.typed_payload,
+                    )
+                }),
         )
     }
 
@@ -2324,10 +2328,17 @@ where
     ) -> Result<TrackedStatePayloadBatch, LixError> {
         let records =
             crate::changelog::load_change_records(&self.store, change_ids.iter().copied()).await?;
-        TrackedStatePayloadBatch::from_payloads(
+        TrackedStatePayloadBatch::from_payloads_with_typed(
             records
                 .into_iter()
-                .map(|(change_id, record)| (change_id, record.snapshot, record.metadata)),
+                .map(|(change_id, record)| {
+                    (
+                        change_id,
+                        record.snapshot,
+                        record.metadata,
+                        record.typed_payload,
+                    )
+                }),
         )
     }
 
@@ -4052,10 +4063,10 @@ where
             let explicit_keys = (!certified_replacement_markers.is_empty()).then(|| {
                 deltas
                     .iter()
-                    .map(|delta| TrackedStateKey {
-                        schema_key: delta.schema_key.to_string(),
-                        file_id: delta.file_id.map(str::to_string),
-                        row_pk: delta.row_pk.clone(),
+                    .map(|delta| TrackedStateKeyRef {
+                        schema_key: delta.schema_key,
+                        file_id: delta.file_id,
+                        row_pk: delta.row_pk,
                     })
                     .collect::<BTreeSet<_>>()
             });
@@ -4087,10 +4098,15 @@ where
                     )
                     .await?;
                 for (key, value) in rows {
+                    let key_ref = TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        row_pk: &key.row_pk,
+                    };
                     if explicit_keys
                         .as_ref()
                         .expect("certified marker requires explicit-key inventory")
-                        .contains(&key)
+                        .contains(&key_ref)
                     {
                         continue;
                     }
@@ -4110,10 +4126,10 @@ where
         let mut parent_values = if let Some(base_root) = base_root.as_ref() {
             let keys = deltas
                 .iter()
-                .map(|delta| TrackedStateKey {
-                    schema_key: delta.schema_key.to_string(),
-                    file_id: delta.file_id.map(str::to_string),
-                    row_pk: delta.row_pk.clone(),
+                .map(|delta| TrackedStateKeyRef {
+                    schema_key: delta.schema_key,
+                    file_id: delta.file_id,
+                    row_pk: delta.row_pk,
                 })
                 .collect::<Vec<_>>();
             // A root fence can reconstruct several skipped ordinary commits
@@ -4121,7 +4137,9 @@ where
             // and the chunk overlay so a child can preserve `created_at` from
             // an ancestor whose chunks have not reached storage yet.
             let staged_read = storage::TrackedStateStagedRead::new(self.store, &self.chunk_overlay);
-            self.tree.get_many(&staged_read, base_root, &keys).await?
+            self.tree
+                .get_many_refs(&staged_read, base_root, &keys)
+                .await?
         } else {
             vec![None; deltas.len()]
         };
@@ -4131,16 +4149,14 @@ where
             };
 
             let mut marker_keys = Vec::new();
-            let mut marker_ordinals = BTreeMap::<(String, Option<String>), usize>::new();
+            let mut marker_ordinals = BTreeMap::<(&str, Option<&str>), usize>::new();
             for delta in &deltas {
                 if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
                     continue;
                 }
                 for scope in [
-                    Some((delta.schema_key.to_string(), None)),
-                    delta
-                        .file_id
-                        .map(|file_id| (delta.schema_key.to_string(), Some(file_id.to_string()))),
+                    Some((delta.schema_key, None)),
+                    delta.file_id.map(|file_id| (delta.schema_key, Some(file_id))),
                 ]
                 .into_iter()
                 .flatten()
@@ -4153,8 +4169,8 @@ where
                         schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_string(),
                         file_id: None,
                         row_pk: RowPk::single(collection_scope_key(CollectionScopeRef {
-                            schema_key: &scope.0,
-                            file_id: scope.1.as_deref(),
+                            schema_key: scope.0,
+                            file_id: scope.1,
                         })),
                     });
                     marker_ordinals.insert(scope, ordinal);
@@ -4175,10 +4191,8 @@ where
                         continue;
                     }
                     let retired = [
-                        Some((delta.schema_key.to_string(), None)),
-                        delta.file_id.map(|file_id| {
-                            (delta.schema_key.to_string(), Some(file_id.to_string()))
-                        }),
+                        Some((delta.schema_key, None)),
+                        delta.file_id.map(|file_id| (delta.schema_key, Some(file_id))),
                     ]
                     .into_iter()
                     .flatten()
@@ -4731,7 +4745,8 @@ fn validate_diff_row_against_changelog(
         )));
     };
     tracked_state_winner_identity_for_diff_row(row, change)?;
-    if row.deleted != change.snapshot.is_none() {
+    let change_deleted = change.snapshot.is_none() && change.typed_payload.is_none();
+    if row.deleted != change_deleted {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{}' deleted flag does not match changelog snapshot",
             row.change_id
@@ -4764,7 +4779,8 @@ fn validate_tree_diff_row_against_changelog(
         change_id,
         change,
     )?;
-    if row.deleted() != change.snapshot.is_none() {
+    let change_deleted = change.snapshot.is_none() && change.typed_payload.is_none();
+    if row.deleted() != change_deleted {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{change_id}' deleted flag does not match changelog snapshot"
         )));
@@ -4901,10 +4917,8 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::branch::BranchHeadControl;
     use crate::changelog::CommitRecord;
-    use crate::hot_state::CertifiedRowBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
-    use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmCreateContext};
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
@@ -5237,6 +5251,7 @@ mod tests {
             schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
             file_id: None,
             snapshot_content: Some(r#"{"live_count":1}"#.into()),
+            typed_snapshot: None,
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:01Z".to_owned(),
@@ -5328,6 +5343,7 @@ mod tests {
             schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
             file_id: None,
             snapshot_content: Some(r#"{"live_count":1}"#.into()),
+            typed_snapshot: None,
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:01Z".to_owned(),
@@ -9131,217 +9147,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_exact_read_uses_self_contained_commit_payload() {
-        const COMMIT_LABEL: &str = "certified-historical-exact";
-        const BRANCH_ID: &str = "certified-branch";
-        const FILE_ID: &str = "certified.csv";
-        const SCHEMA_KEY: &str = "certified_row";
-
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_for_test(&storage, &tracked_state, COMMIT_LABEL, None, &[])
-            .await
-            .expect("empty tracked root should write");
-
-        let commit_id = CommitId::for_test_label(COMMIT_LABEL);
-        let creates = WasmCreateContext {
-            high: 0x0192_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let local_ref = 7_u32;
-        let mut page = Vec::new();
-        page.extend_from_slice(&local_ref.to_le_bytes());
-        page.extend_from_slice(&1_u64.to_le_bytes());
-        page.push(0);
-        page.extend_from_slice(&0_u32.to_le_bytes());
-        page.extend_from_slice(&1_u16.to_le_bytes());
-        page.extend_from_slice(&5_u32.to_le_bytes());
-        page.extend_from_slice(b"value");
-        let page = crate::plugin::wire::encode_single_section(
-            crate::plugin::wire::Representation::SchemaRows,
-            crate::plugin::wire::Operation::Create,
-            SCHEMA_KEY,
-            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
-            1,
-            page,
-        )
-        .expect("test schema-row page");
-        let batches = [WasmCertifiedRowBatch {
-            format: 1,
-            schema_keys: vec![SCHEMA_KEY.to_owned()],
-            row_count: 1,
-            creates,
-            create_ranges: Vec::new(),
-            complete_file_state: true,
-            pages: vec![Bytes::from(page)],
-        }];
-        let files = [CertifiedRowBatchFileRef {
-            branch_id: BRANCH_ID,
-            file_id: FILE_ID,
-            batches: &batches,
-        }];
-        let control = BranchHeadControl {
-            head_commit_id: commit_id,
-            tracked_generation: commit_id,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at: crate::common::LixTimestamp::expect_parse(
-                "certified test timestamp",
-                "2026-01-01T00:00:00Z",
-            ),
-            updated_at: crate::common::LixTimestamp::expect_parse(
-                "certified test timestamp",
-                "2026-01-01T00:00:00Z",
-            ),
-            ref_change_id: ChangeId::for_test_label("certified-branch-ref"),
-        };
-        let controls = BTreeMap::from([(BRANCH_ID.to_owned(), control)]);
-        let commit_created_at = BTreeMap::from([(commit_id, control.created_at)]);
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("certified batch read should open");
-        let mut writes = storage.new_write_set();
-        crate::hot_state::stage_certified_row_batches(
-            &read,
-            &mut writes,
-            &files,
-            &controls,
-            &BTreeMap::new(),
-            &commit_created_at,
-            &BTreeSet::new(),
-        )
-        .await
-        .expect("certified batch should stage");
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("certified batch should commit");
-
-        let id = creates
-            .component_uuid_bytes(u64::from(local_ref))
-            .expect("certified local reference should form an id");
-        let key = TrackedStateKey {
-            schema_key: SCHEMA_KEY.to_owned(),
-            file_id: Some(FILE_ID.to_owned()),
-            row_pk: RowPk::uuid_from_bytes(id),
-        };
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("certified authority read should open");
-        let certified = crate::hot_state::scan_certified_history_rows(
-            &read,
-            &BTreeSet::from([commit_id]),
-            &TrackedStateScanRequest {
-                filter: crate::tracked_state::TrackedStateFilter {
-                    schema_keys: vec![SCHEMA_KEY.to_owned()],
-                    row_pks: vec![key.row_pk.clone()],
-                    file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_owned())],
-                    row_pk_lower: None,
-                    row_pk_upper: None,
-                    include_tombstones: true,
-                },
-                read_columns: crate::tracked_state::TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
-                },
-                limit: None,
-            },
-        )
-        .await
-        .expect("certified authority should scan");
-        let certified_change_id = certified[0]
-            .change_id
-            .expect("certified row should carry a change id");
-        let durable_change_id = ChangeId::for_test_label("certified-reference-durable-change-id");
-        assert_ne!(durable_change_id, certified_change_id);
-        let mut authority = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
-            .await
-            .expect("commit-state authority should load")
-            .expect("root fixture should publish commit-state authority");
-        let mut writes = storage.new_write_set();
-        let staged = crate::tracked_state::stage_commit_deltas_for_commit_state(
-            &mut writes,
-            &[crate::tracked_state::TrackedStateCommitDeltaRef {
-                delta: TrackedStateDeltaRef {
-                    schema_key: SCHEMA_KEY,
-                    file_id: Some(FILE_ID),
-                    row_pk: &key.row_pk,
-                    change_id: durable_change_id,
-                    commit_id,
-                    deleted: false,
-                    created_at: control.created_at,
-                    updated_at: control.created_at,
-                },
-                snapshot: crate::json_store::JsonSlotRef::Inline(
-                    certified[0]
-                        .snapshot_content
-                        .as_ref()
-                        .expect("certified fixture has a snapshot")
-                        .as_str(),
-                ),
-                metadata: crate::json_store::JsonSlotRef::None,
-                origin_key: Some("certified-origin"),
-                base_coordinate: None,
-                authored: true,
-            }],
-        )
-        .expect("certified commit delta should stage");
-        crate::tracked_state::stage_change_locators(&mut writes, &staged.locators);
-        authority.mutations = staged.mutation_inventory().clone();
-        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
-            &mut writes,
-            &authority,
-        )
-        .expect("certified commit-state authority should update atomically");
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("certified commit delta should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("certified locator read should open");
-        let inventory = crate::tracked_state::scan_commit_delta_inventory(&read)
-            .await
-            .expect("authored inventory should load");
-        let inventory_member = inventory
-            .commits
-            .get(&commit_id)
-            .and_then(|entry| entry.members.first())
-            .expect("authored inventory member should exist");
-        assert!(inventory_member.change.snapshot.is_some());
-        let canonical = crate::tracked_state::load_change_record_by_id(&read, durable_change_id)
-            .await
-            .expect("authored locator should load")
-            .expect("authored locator should exist");
-        assert!(canonical.snapshot.is_some());
-        assert_eq!(canonical.origin_key.as_deref(), Some("certified-origin"));
-        drop(read);
-        let exact = tracked_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("historical exact read should open"),
-            )
-            .load_projected_batch_at_commit(
-                &commit_id.to_string(),
-                &[key],
-                &ChangeRecordProjection::full(),
-            )
-            .await
-            .expect("certified historical exact row should load");
-        assert!(
-            exact.row(0).is_none(),
-            "certified packet authority must not fabricate an identity omitted from the commit root"
-        );
-    }
-
-    #[tokio::test]
     async fn large_rootless_scan_materializes_from_flat_replay_without_row_caches_or_tree() {
         const COMMIT_ID: &str = "rootless-flat-scan";
         const ROW_COUNT: usize = HISTORICAL_ENCODED_LOOKUP_MIN_ROWS;
@@ -9938,6 +9743,7 @@ mod tests {
             schema_key: "test_schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
+            typed_snapshot: None,
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),

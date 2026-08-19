@@ -35,6 +35,7 @@ use crate::sql2::history_route::{
 use crate::sql2::providers::schema::{
     parse_snapshot, row_f64_value, row_i64_value, row_json_text_value,
 };
+use crate::sql2::row_projection::{RowProjectionDecoder, row_projection_error_to_datafusion_error};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
@@ -282,7 +283,9 @@ static ROW_HISTORY_SYSTEM_COLS: ColumnTable<SchemaHistoryRow> = ColumnTable {
         ("lixcol_depth", Col::I64(|row| Some(i64::from(row.depth)))),
         (
             HISTORY_COL_IS_DELETED,
-            Col::Bool(|row| Some(row.change.snapshot_content.is_none())),
+            Col::Bool(|row| {
+                Some(row.change.snapshot_content.is_none() && row.change.typed_snapshot.is_none())
+            }),
         ),
     ],
 };
@@ -304,6 +307,17 @@ fn row_history_record_batch(
     spec: &SchemaSurfaceSpec,
     rows: &[SchemaHistoryRow],
 ) -> Result<RecordBatch> {
+    for row in rows {
+        if let Some(typed) = row.change.typed_snapshot.as_deref() {
+            typed
+                .validate_resolved_schema_binding(
+                    &row.change.schema_key,
+                    &spec.schema_key,
+                    &spec.schema_fingerprint,
+                )
+                .map_err(lix_error_to_datafusion_error)?;
+        }
+    }
     // Parse each authenticated history payload once for the complete Arrow
     // projection. The former per-column path reparsed the same whole-row JSON
     // for every projected field.
@@ -320,6 +334,15 @@ fn row_history_record_batch(
     let system_batch = ROW_HISTORY_SYSTEM_COLS
         .build(Arc::new(Schema::new(system_fields)), rows)
         .map_err(row_history_batch_error)?;
+    if rows.iter().any(|row| row.change.typed_snapshot.is_some()) {
+        return row_history_record_batch_with_typed_rows(
+            schema,
+            spec,
+            rows,
+            &snapshots,
+            &system_batch,
+        );
+    }
     let columns = schema
         .fields()
         .iter()
@@ -328,6 +351,62 @@ fn row_history_record_batch(
                 || row_history_column_array(field.name(), spec, rows, &snapshots),
                 |array| Ok(Arc::clone(array)),
             )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(rows.len())),
+    )?)
+}
+
+fn row_history_record_batch_with_typed_rows(
+    schema: &SchemaRef,
+    spec: &SchemaSurfaceSpec,
+    rows: &[SchemaHistoryRow],
+    snapshots: &[Option<JsonValue>],
+    system_batch: &RecordBatch,
+) -> Result<RecordBatch> {
+    let decoder = RowProjectionDecoder::new(
+        spec,
+        schema.fields().iter().filter_map(|field| {
+            (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
+        }),
+    )
+    .map_err(row_projection_error_to_datafusion_error)?;
+    let mut visible_columns = decoder
+        .decode_mixed_arrow_columns(rows.iter().map(|row| {
+            (
+                row.change.snapshot_content.as_deref().map(str::as_bytes),
+                row.change.typed_snapshot.as_deref().map(|typed| &typed.row),
+            )
+        }))
+        .map_err(row_projection_error_to_datafusion_error)?
+        .into_iter();
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if let Some(array) = system_batch.column_by_name(field.name()) {
+                return Ok(Arc::clone(array));
+            }
+            let decoded = visible_columns.next().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "row history typed decoder omitted a visible column".to_owned(),
+                )
+            })?;
+            if spec
+                .primary_key_paths
+                .iter()
+                .any(|path| matches!(path.as_slice(), [name] if name == field.name()))
+            {
+                // Deletes have no payload. Preserve the history surface's
+                // established identity projection for both typed rows and
+                // tombstones without reconstructing an outer JSON snapshot.
+                row_history_column_array(field.name(), spec, rows, snapshots)
+            } else {
+                Ok(decoded)
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
@@ -443,13 +522,70 @@ fn row_history_column_value<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, OnceLock};
+
+    use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     use serde_json::json;
 
-    use crate::sql2::catalog::derive_schema_surface_spec_from_schema;
+    use crate::plugin::runtime::WasmTypedRow;
+    use crate::row_pk::RowPk;
+    use crate::sql2::catalog::{
+        SchemaSurfaceShape, derive_schema_surface_spec_from_schema, schema_surface_schema,
+    };
+    use crate::sql2::change_materialization::MaterializedChange;
 
-    use super::row_history_route_from_filters;
+    use super::{SchemaHistoryRow, row_history_record_batch, row_history_route_from_filters};
+
+    #[test]
+    fn history_projection_rejects_stale_durable_typed_fingerprint() {
+        let spec = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "message",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        }))
+        .expect("schema should derive");
+        let schema: SchemaRef = schema_surface_schema(&spec, SchemaSurfaceShape::History);
+        let row = SchemaHistoryRow {
+            change: MaterializedChange {
+                id: "change-1".to_owned(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                row_pk: RowPk::single("row-1"),
+                schema_key: "message".to_owned(),
+                file_id: None,
+                snapshot_content: None,
+                metadata: None,
+                typed_snapshot: Some(Arc::new(WasmTypedRow {
+                    schema_fingerprint: [0xff; 32],
+                    row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+                    row: lix_schema::Row::from([
+                        (
+                            "body".to_owned(),
+                            lix_schema::Value::Text("hello".to_owned()),
+                        ),
+                        ("id".to_owned(), lix_schema::Value::Text("row-1".to_owned())),
+                    ]),
+                    native_payload: OnceLock::new(),
+                    boundary_create_validation: OnceLock::new(),
+                })),
+                created_at: "2026-08-18T00:00:00Z".to_owned(),
+                origin_key: None,
+            },
+            observed_commit_id: "commit-1".to_owned(),
+            commit_created_at: None,
+            as_of_commit_id: "commit-1".to_owned(),
+            depth: 0,
+        };
+
+        let error = row_history_record_batch(&schema, &spec, &[row])
+            .expect_err("history must reject a stale typed fingerprint");
+        assert!(error.to_string().contains("fingerprint"), "{error:?}");
+    }
 
     #[test]
     fn public_composite_key_filters_route_in_schema_order() {

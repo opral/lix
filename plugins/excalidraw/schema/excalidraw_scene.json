@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "excalidraw_scene",
-  "description": "The stable root of an Excalidraw scene. The exact source layout outside elements and files is retained as an opaque string so durable snapshots remain number-free.",
+  "description": "The stable root of an Excalidraw scene. The exact source layout outside elements and files is retained as typed text.",
   "columns": [
     {
       "name": "elements_tail_json",

@@ -4,29 +4,29 @@
 //! exported guest call reads sparse ranges and pushes bounded semantic pages.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::plugin::wire::{Operation, Page as RowPage, Representation, encode_single_section};
+use crate::plugin::wire::typed::{
+    self as typed_wire, Mutation as BorrowedTypedMutation, OwnedMutation as TypedMutation,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lix::plugin::runtime::v1::{
-    ByteEdit as ArenaByteEdit, Digest as ArenaDigest, Root as ArenaRoot, Store as ArenaStore,
+    ByteEdit as ArenaByteEdit, Root as ArenaRoot, Store as ArenaStore,
     Transaction as ArenaTransaction,
 };
 use lix::plugin::runtime::{
-    PACKET_FORMAT_V1, PluginCapabilities, WasmByteOutputsHandle, WasmCertifiedCreateRange,
-    WasmCertifiedRowBatch, WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage,
-    WasmColdFileUpdate, WasmColumnMergeCursorHandle,
+    CURRENT_PACKET_FORMAT, PluginCapabilities, WasmByteOutputsHandle, WasmChangeCursorHandle,
+    WasmChangeEffect, WasmChangePage, WasmColdFileUpdate, WasmColumnMergeCursorHandle,
     WasmColumnMergeResult as RuntimeColumnMergeResult, WasmColumnMergeResultPage,
     WasmColumnMergeTransition, WasmColumnMergeUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
-    WasmEditCursorHandle, WasmEditPage, WasmFileTransition, WasmFileUpdate, WasmGuestBytes,
-    WasmHostBytes, WasmHostColumnMerge, WasmInputBytes, WasmOpenFileInput, WasmOpenRowsInput,
-    WasmOutputRange, WasmOutputSplice, WasmRow, WasmRowChange, WasmRowChanges, WasmRowKey,
-    WasmRowTransition, WasmRowUpdate, WasmTransitionCounters, WasmTransitionHandle,
-    WasmTransitionLimits,
+    WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle, WasmEditCursorHandle,
+    WasmEditPage, WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmGuestColumnValue,
+    WasmGuestRowPayload, WasmHostBytes, WasmHostColumnMerge, WasmInputBytes, WasmOpenFileInput,
+    WasmOpenRowsInput, WasmOutputRange, WasmOutputSplice, WasmRow, WasmRowChange, WasmRowChanges,
+    WasmRowKey, WasmRowTransition, WasmRowUpdate, WasmTransitionCounters, WasmTransitionHandle,
+    WasmTransitionLimits, WasmTypedRow,
 };
 use lix::wasm::WasmLimits;
 use lix::{LixError, SharedStr};
@@ -46,7 +46,6 @@ const COMPONENT_MAX_BATCH_BYTES: u32 = 16 * 1024 * 1024;
 // Wasmtime Store. This bounds both actor and pushed-page residency without
 // creating an executor thread or serializing different plugin types.
 const COMPONENT_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT: usize = 1;
-const CERTIFIED_CREATED_PACKET_V1: u16 = 2;
 
 fn take_borrowed_resource<T: Send + 'static>(
     table: &mut ResourceTable,
@@ -123,13 +122,10 @@ type SharedByteBudget = Arc<Mutex<u64>>;
 
 struct TransitionState {
     limits: WasmTransitionLimits,
-    creates: WasmCreateContext,
     started: Instant,
     total_bytes: SharedByteBudget,
     pages: VecDeque<PendingChangePage>,
     replace_all_rows: bool,
-    attachments: Vec<Bytes>,
-    pending_attachment: Option<PendingRowAttachment>,
     counters: WasmTransitionCounters,
     allow_file_replacement: bool,
     file_replacement: Option<PendingFileReplacement>,
@@ -148,18 +144,12 @@ struct PendingFileReplacement {
     complete: bool,
 }
 
-struct PendingRowAttachment {
-    expected_len: u64,
-    bytes: Vec<u8>,
-}
-
 struct RowChangeState {
     limits: WasmTransitionLimits,
     started: Instant,
     total_bytes: SharedByteBudget,
     source: RowChangeInputSource,
-    next_ordinal: u32,
-    lazy_snapshots: HashMap<u32, WasmHostBytes>,
+    track_seen_row_keys: bool,
     seen_row_keys: BTreeSet<WasmRowKey>,
     counters: WasmTransitionCounters,
 }
@@ -199,13 +189,10 @@ struct PendingReplacement {
 /// to the existing one-page-at-a-time drain.
 #[derive(Clone)]
 enum PendingChangePage {
-    Packet {
-        record_count: u32,
-        payload: Vec<u8>,
-        attachments: Arc<[Bytes]>,
-        max_page_bytes: u32,
-        limits: WasmTransitionLimits,
-        creates: WasmCreateContext,
+    Typed {
+        schema_key: String,
+        schema_fingerprint: [u8; 32],
+        mutations: Vec<TypedMutation>,
     },
     Decoded(WasmChangePage),
 }
@@ -213,23 +200,164 @@ enum PendingChangePage {
 impl PendingChangePage {
     fn decode(self) -> Result<WasmChangePage, LixError> {
         match self {
-            Self::Packet {
-                record_count,
-                payload,
-                attachments,
-                max_page_bytes,
-                limits,
-                ..
-            } => decode_inline_change_page(
-                record_count,
-                payload,
-                &attachments,
-                max_page_bytes,
-                limits,
-            ),
+            Self::Typed {
+                schema_key,
+                schema_fingerprint,
+                mutations,
+            } => decode_typed_change_page(schema_key, schema_fingerprint, mutations),
             Self::Decoded(page) => Ok(page),
         }
     }
+}
+
+fn decode_typed_change_page(
+    schema_key: String,
+    schema_fingerprint: [u8; 32],
+    mutations: Vec<TypedMutation>,
+) -> Result<WasmChangePage, LixError> {
+    let schema_key = SharedStr::from(schema_key);
+    let mut changes = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
+        match mutation {
+            TypedMutation::Create { local_ref, row } => changes.push(WasmRowChange::Create {
+                schema_key: schema_key.clone(),
+                local_ref: u64::from(local_ref),
+                resolved_key: None,
+                payload: WasmGuestRowPayload::Typed(Arc::new(WasmTypedRow {
+                    schema_fingerprint,
+                    row_pk: Arc::from([]),
+                    row,
+                    native_payload: std::sync::OnceLock::new(),
+                    boundary_create_validation: std::sync::OnceLock::new(),
+                })),
+            }),
+            TypedMutation::Upsert {
+                row_pk,
+                row,
+                effect,
+            } => {
+                let row_pk: Arc<[lix_schema::Value]> = row_pk.into();
+                let key =
+                    typed_row_key(schema_key.clone(), schema_fingerprint, Arc::clone(&row_pk))?;
+                changes.push(WasmRowChange::Upsert {
+                    row: WasmRow {
+                        key,
+                        payload: WasmGuestRowPayload::Typed(Arc::new(WasmTypedRow {
+                            schema_fingerprint,
+                            row_pk,
+                            row,
+                            native_payload: std::sync::OnceLock::new(),
+                            boundary_create_validation: std::sync::OnceLock::new(),
+                        })),
+                    },
+                    effect: match effect {
+                        typed_wire::ChangeEffect::Content => WasmChangeEffect::Content,
+                        typed_wire::ChangeEffect::FormatOnly => WasmChangeEffect::FormatOnly,
+                    },
+                });
+            }
+            TypedMutation::Delete { row_pk } => {
+                changes.push(WasmRowChange::Delete(typed_row_key(
+                    schema_key.clone(),
+                    schema_fingerprint,
+                    row_pk.into(),
+                )?));
+            }
+        }
+    }
+    if changes.is_empty() {
+        return Err(component_error("typed row page contains no records"));
+    }
+    Ok(WasmChangePage {
+        format_version: CURRENT_PACKET_FORMAT,
+        changes: WasmRowChanges { changes },
+        outputs: None,
+    })
+}
+
+fn typed_row_key(
+    schema_key: SharedStr,
+    schema_fingerprint: [u8; 32],
+    row_pk: Arc<[lix_schema::Value]>,
+) -> Result<WasmRowKey, LixError> {
+    if row_pk.is_empty() {
+        return Err(component_error("typed row identity must not be empty"));
+    }
+    WasmRowKey::from_typed_parts(schema_key, schema_fingerprint, row_pk)
+}
+
+fn typed_input_mutations<'a>(
+    changes: &'a [WasmRowChange<WasmHostBytes>],
+) -> Result<Option<(String, [u8; 32], Vec<BorrowedTypedMutation<'a>>)>, LixError> {
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    let mut schema = None;
+    let mut mutations = Vec::with_capacity(changes.len());
+    for change in changes {
+        let (schema_key, fingerprint, mutation) = match change {
+            WasmRowChange::Create {
+                schema_key,
+                local_ref,
+                payload: WasmHostBytes::Typed(row),
+                ..
+            } => (
+                schema_key.as_str(),
+                row.schema_fingerprint,
+                BorrowedTypedMutation::Create {
+                    local_ref: u32::try_from(*local_ref)
+                        .map_err(|_| component_error("typed create reference exceeds u32"))?,
+                    row: &row.row,
+                },
+            ),
+            WasmRowChange::Upsert {
+                row:
+                    WasmRow {
+                        key: _,
+                        payload: WasmHostBytes::Typed(row),
+                    },
+                effect,
+            } => (
+                "",
+                row.schema_fingerprint,
+                BorrowedTypedMutation::Upsert {
+                    row_pk: &row.row_pk,
+                    row: &row.row,
+                    effect: match effect {
+                        WasmChangeEffect::Content => typed_wire::ChangeEffect::Content,
+                        WasmChangeEffect::FormatOnly => typed_wire::ChangeEffect::FormatOnly,
+                    },
+                },
+            ),
+            WasmRowChange::Delete(key) => (
+                key.schema_key.as_str(),
+                key.schema_fingerprint,
+                BorrowedTypedMutation::Delete {
+                    row_pk: &key.row_pk,
+                },
+            ),
+        };
+        let schema_key = if schema_key.is_empty() {
+            match change {
+                WasmRowChange::Upsert { row, .. } => row.key.schema_key.as_str(),
+                _ => schema_key,
+            }
+        } else {
+            schema_key
+        };
+        if let Some((expected_key, expected_fingerprint)) = schema.as_ref() {
+            if expected_key != schema_key || *expected_fingerprint != fingerprint {
+                return Err(component_error(
+                    "one typed input page must contain one schema fingerprint",
+                ));
+            }
+        } else {
+            schema = Some((schema_key.to_owned(), fingerprint));
+        }
+        mutations.push(mutation);
+    }
+    let (schema_key, fingerprint) = schema.expect("non-empty typed page has a schema");
+    Ok(Some((schema_key, fingerprint, mutations)))
 }
 
 fn append_replace_all_deletes(
@@ -256,7 +384,7 @@ fn append_replace_all_deletes(
         state
             .pages
             .push_back(PendingChangePage::Decoded(WasmChangePage {
-                format_version: PACKET_FORMAT_V1,
+                format_version: CURRENT_PACKET_FORMAT,
                 changes: WasmRowChanges {
                     changes: prior_keys.into_iter().map(WasmRowChange::Delete).collect(),
                 },
@@ -264,220 +392,6 @@ fn append_replace_all_deletes(
             }));
     }
     Ok(())
-}
-
-fn decode_inline_change_page(
-    record_count: u32,
-    payload: Vec<u8>,
-    attachments: &[Bytes],
-    max_bytes: u32,
-    limits: WasmTransitionLimits,
-) -> Result<WasmChangePage, LixError> {
-    if record_count == 0 {
-        return Err(component_error("guest returned a zero-record change page"));
-    }
-    if max_bytes == 0 || max_bytes > limits.max_page_bytes {
-        return Err(component_limit(
-            "change page max-bytes is outside its transition limit",
-        ));
-    }
-    if payload.len() > max_bytes as usize {
-        return Err(component_limit(
-            "guest change payload exceeds the requested max-bytes",
-        ));
-    }
-    let record_count = usize::try_from(record_count)
-        .map_err(|_| component_error("guest record count exceeds host bounds"))?;
-    if record_count > payload.len() / size_of::<u32>() {
-        return Err(component_error(
-            "guest record count exceeds its bounded payload framing",
-        ));
-    }
-
-    let payload = Bytes::from(payload);
-    let mut framed = PacketReader::new(&payload);
-    let row_size = size_of::<WasmRowChange<WasmGuestBytes>>();
-    let capacity = record_count.min(payload.len().checked_div(row_size).unwrap_or(record_count));
-    let mut changes = Vec::with_capacity(capacity);
-    for _ in 0..record_count {
-        let record_len = framed.read_u32()? as usize;
-        if record_len > limits.max_record_bytes as usize {
-            return Err(component_limit(format!(
-                "record is too large: {record_len} bytes"
-            )));
-        }
-        let mut record = framed.read_reader(record_len)?;
-        let change = match record.read_u8()? {
-            0 => {
-                let key = decode_row_key(&mut record)?;
-                let effect = match record.read_u8()? {
-                    0 => WasmChangeEffect::Content,
-                    1 => WasmChangeEffect::FormatOnly,
-                    _ => return Err(component_error("unknown change effect tag")),
-                };
-                WasmRowChange::Upsert {
-                    row: WasmRow {
-                        key,
-                        snapshot_content: decode_guest_blob(&mut record, attachments)?,
-                    },
-                    effect,
-                }
-            }
-            1 => WasmRowChange::Delete(decode_row_key(&mut record)?),
-            2 => WasmRowChange::Create {
-                schema_key: record.read_text()?.to_string(),
-                local_ref: record.read_u64()?,
-                resolved_key: None,
-                snapshot_content: decode_guest_blob(&mut record, attachments)?,
-            },
-            _ => return Err(component_error("unknown change tag")),
-        };
-        record.finish()?;
-        changes.push(change);
-    }
-    framed.finish()?;
-    Ok(WasmChangePage {
-        format_version: PACKET_FORMAT_V1,
-        changes: WasmRowChanges { changes },
-        outputs: None,
-    })
-}
-
-fn encode_packet_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
-    output.extend_from_slice(
-        &u32::try_from(value.len())
-            .map_err(|_| component_error("row packet text exceeds u32"))?
-            .to_le_bytes(),
-    );
-    output.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn decode_row_key(reader: &mut PacketReader<'_>) -> Result<WasmRowKey, LixError> {
-    let schema_key = reader.read_text()?;
-    let pk_count = reader.read_u32()?;
-    if pk_count as usize > reader.remaining() / size_of::<u32>() {
-        return Err(component_error(
-            "row primary-key component count exceeds packet bounds",
-        ));
-    }
-    let mut key = WasmRowKey::from_shared_parts(schema_key, std::iter::empty());
-    for _ in 0..pk_count {
-        key.row_pk.push(reader.read_text()?);
-    }
-    Ok(key)
-}
-
-fn decode_guest_blob(
-    reader: &mut PacketReader<'_>,
-    attachments: &[Bytes],
-) -> Result<WasmGuestBytes, LixError> {
-    match reader.read_u8()? {
-        0 => {
-            let length = reader.read_u32()? as usize;
-            Ok(WasmGuestBytes::Inline(reader.read_bytes(length)?))
-        }
-        1 => {
-            let ordinal = reader.read_u32()?;
-            let length = reader.read_u64()?;
-            let bytes = attachments
-                .get(ordinal as usize)
-                .ok_or_else(|| component_error("row attachment ordinal is out of bounds"))?;
-            if bytes.len() as u64 != length {
-                return Err(component_error("row attachment length does not match"));
-            }
-            Ok(WasmGuestBytes::Inline(bytes.clone()))
-        }
-        _ => Err(component_error("unknown blob-reference tag")),
-    }
-}
-
-struct PacketReader<'a> {
-    bytes: &'a Bytes,
-    offset: usize,
-    end: usize,
-}
-
-impl<'a> PacketReader<'a> {
-    fn new(bytes: &'a Bytes) -> Self {
-        Self {
-            bytes,
-            offset: 0,
-            end: bytes.len(),
-        }
-    }
-
-    fn remaining(&self) -> usize {
-        self.end.saturating_sub(self.offset)
-    }
-
-    fn read_exact(&mut self, length: usize) -> Result<&'a [u8], LixError> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or_else(|| component_error("packet range overflowed"))?;
-        if end > self.end {
-            return Err(component_error("truncated packet"));
-        }
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| component_error("truncated packet"))?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn read_bytes(&mut self, length: usize) -> Result<Bytes, LixError> {
-        let start = self.offset;
-        self.read_exact(length)?;
-        Ok(self.bytes.slice(start..self.offset))
-    }
-
-    fn read_reader(&mut self, length: usize) -> Result<Self, LixError> {
-        let start = self.offset;
-        self.read_exact(length)?;
-        Ok(Self {
-            bytes: self.bytes,
-            offset: start,
-            end: self.offset,
-        })
-    }
-
-    fn read_u8(&mut self) -> Result<u8, LixError> {
-        Ok(self.read_exact(1)?[0])
-    }
-
-    fn read_u32(&mut self) -> Result<u32, LixError> {
-        Ok(u32::from_le_bytes(
-            self.read_exact(4)?
-                .try_into()
-                .map_err(|_| component_error("invalid u32 field"))?,
-        ))
-    }
-
-    fn read_u64(&mut self) -> Result<u64, LixError> {
-        Ok(u64::from_le_bytes(
-            self.read_exact(8)?
-                .try_into()
-                .map_err(|_| component_error("invalid u64 field"))?,
-        ))
-    }
-
-    fn read_text(&mut self) -> Result<SharedStr, LixError> {
-        let length = self.read_u32()? as usize;
-        let bytes = self.read_exact(length)?;
-        let value = std::str::from_utf8(bytes)
-            .map_err(|_| component_error("packet text is not valid UTF-8"))?;
-        SharedStr::from_utf8_slice(self.bytes.clone(), value)
-            .ok_or_else(|| component_error("packet text is outside its page allocation"))
-    }
-
-    fn finish(&self) -> Result<(), LixError> {
-        if self.offset != self.end {
-            return Err(component_error("packet contains trailing bytes"));
-        }
-        Ok(())
-    }
 }
 
 fn component_limit(message: impl Into<String>) -> LixError {
@@ -496,19 +410,16 @@ fn validate_source_admission(length: u64, limits: WasmTransitionLimits) -> Resul
 impl TransitionState {
     fn new(
         limits: WasmTransitionLimits,
-        creates: WasmCreateContext,
+        _creates: WasmCreateContext,
         allow_file_replacement: bool,
         total_bytes: Option<SharedByteBudget>,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
-            creates,
             started: Instant::now(),
             total_bytes: total_bytes.unwrap_or_default(),
             pages: VecDeque::new(),
             replace_all_rows: false,
-            attachments: Vec::new(),
-            pending_attachment: None,
             counters: WasmTransitionCounters {
                 guest_export_calls: 1,
                 ..WasmTransitionCounters::default()
@@ -529,11 +440,6 @@ impl TransitionState {
     }
 
     fn take_pages(&mut self) -> Result<VecDeque<PendingChangePage>, LixError> {
-        if self.pending_attachment.is_some() {
-            return Err(component_error(
-                "row attachment remained incomplete after plugin return",
-            ));
-        }
         Ok(std::mem::take(&mut self.pages))
     }
 
@@ -670,11 +576,20 @@ impl RowChangeState {
             started: Instant::now(),
             total_bytes,
             source: RowChangeInputSource::Rows(source),
-            next_ordinal: 0,
-            lazy_snapshots: HashMap::new(),
+            track_seen_row_keys: true,
             seen_row_keys: BTreeSet::new(),
             counters: WasmTransitionCounters::default(),
         })
+    }
+
+    fn from_rows_without_key_inventory(
+        limits: WasmTransitionLimits,
+        source: Box<dyn lix::plugin::runtime::WasmRowSource>,
+        total_bytes: SharedByteBudget,
+    ) -> Result<Self, LixError> {
+        let mut state = Self::from_rows(limits, source, total_bytes)?;
+        state.track_seen_row_keys = false;
+        Ok(state)
     }
 
     fn from_changes(
@@ -687,8 +602,7 @@ impl RowChangeState {
             started: Instant::now(),
             total_bytes,
             source: RowChangeInputSource::Changes(source),
-            next_ordinal: 0,
-            lazy_snapshots: HashMap::new(),
+            track_seen_row_keys: false,
             seen_row_keys: BTreeSet::new(),
             counters: WasmTransitionCounters::default(),
         })
@@ -700,8 +614,10 @@ impl RowChangeState {
     ) -> Result<Option<Vec<WasmRowChange<WasmHostBytes>>>, LixError> {
         match &mut self.source {
             RowChangeInputSource::Rows(source) => Ok(source.next_page(max_bytes)?.map(|page| {
-                self.seen_row_keys
-                    .extend(page.rows.iter().map(|row| row.key.clone()));
+                if self.track_seen_row_keys {
+                    self.seen_row_keys
+                        .extend(page.rows.iter().map(|row| row.key.clone()));
+                }
                 page.rows
                     .into_iter()
                     .map(|row| WasmRowChange::Upsert {
@@ -737,6 +653,11 @@ impl RowChangeState {
                 "component row-change chunk exceeds max-page-bytes".to_owned(),
             ));
         }
+        self.charge_total(bytes)
+    }
+
+    fn charge_total(&mut self, bytes: usize) -> Result<(), bindings::lix::plugin::host::HostError> {
+        self.check_active()?;
         let mut total_bytes = self
             .total_bytes
             .lock()
@@ -775,12 +696,24 @@ fn merge_row_input_profile(target: &mut WasmTransitionCounters, source: &WasmTra
     target.row_input_attachment_bytes = target
         .row_input_attachment_bytes
         .saturating_add(source.row_input_attachment_bytes);
+    target.typed_row_encode_records = target
+        .typed_row_encode_records
+        .saturating_add(source.typed_row_encode_records);
+    target.typed_row_encode_bytes = target
+        .typed_row_encode_bytes
+        .saturating_add(source.typed_row_encode_bytes);
+    target.row_page_callback_calls = target
+        .row_page_callback_calls
+        .saturating_add(source.row_page_callback_calls);
+    target.row_input_page_eof_callbacks = target
+        .row_input_page_eof_callbacks
+        .saturating_add(source.row_input_page_eof_callbacks);
 }
 
 fn conflict_value<'a>(
     conflict: &'a WasmHostColumnMerge,
     side: bindings::lix::plugin::host::MergeSide,
-) -> Option<&'a WasmHostBytes> {
+) -> Option<&'a lix_schema::Value> {
     match side {
         bindings::lix::plugin::host::MergeSide::Base => conflict.base.as_ref(),
         bindings::lix::plugin::host::MergeSide::A => conflict.a.as_ref(),
@@ -791,7 +724,7 @@ fn conflict_value<'a>(
 fn conflict_row(
     conflict: &WasmHostColumnMerge,
     side: bindings::lix::plugin::host::MergeSide,
-) -> &WasmHostBytes {
+) -> &WasmTypedRow {
     match side {
         bindings::lix::plugin::host::MergeSide::Base => &conflict.base_row,
         bindings::lix::plugin::host::MergeSide::A => &conflict.a_row,
@@ -799,43 +732,45 @@ fn conflict_row(
     }
 }
 
-fn read_host_bytes(value: &WasmHostBytes, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
+fn read_encoded_bytes(bytes: &[u8], offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
     let end = offset
         .checked_add(u64::from(length))
         .ok_or_else(|| component_error("component conflict range overflowed"))?;
-    if end > value.len() {
+    if end > bytes.len() as u64 {
         return Err(component_error("component conflict range is out of bounds"));
     }
-    match value {
-        WasmHostBytes::Inline(bytes) => Ok(bytes.slice(offset as usize..end as usize).to_vec()),
-        WasmHostBytes::CanonicalJson(json) => {
-            Ok(json.normalized().as_bytes()[offset as usize..end as usize].to_vec())
-        }
-        WasmHostBytes::Source(slice) => slice
-            .source
-            .read(
-                slice.range.offset.checked_add(offset).ok_or_else(|| {
-                    component_error("component conflict source offset overflowed")
-                })?,
-                length,
-            )
-            .map_err(|error| {
-                component_error(format!("failed to read component conflict source: {error}"))
-            }),
-    }
+    Ok(bytes[offset as usize..end as usize].to_vec())
+}
+
+fn encoded_merge_value(value: &lix_schema::Value) -> Result<Vec<u8>, LixError> {
+    typed_wire::encode_value_bytes(value)
+        .map_err(|error| component_error(format!("failed to encode typed merge value: {error:?}")))
+}
+
+fn encoded_merge_value_len(value: &lix_schema::Value) -> Result<u64, LixError> {
+    typed_wire::encoded_value_size(value)
+        .map(|length| length as u64)
+        .map_err(|error| component_error(format!("failed to size typed merge value: {error:?}")))
+}
+
+fn encoded_merge_row(row: &WasmTypedRow) -> Result<Vec<u8>, LixError> {
+    typed_wire::encode_row_bytes(&row.row)
+        .map_err(|error| component_error(format!("failed to encode typed merge row: {error:?}")))
+}
+
+fn encoded_merge_row_len(row: &WasmTypedRow) -> Result<u64, LixError> {
+    typed_wire::encoded_row_size(&row.row)
+        .map(|length| length as u64)
+        .map_err(|error| component_error(format!("failed to size typed merge row: {error:?}")))
 }
 
 #[cfg(test)]
-fn create_context_from_uuid(value: &str) -> Option<WasmCreateContext> {
-    let id = uuid::Uuid::parse_str(value).ok()?;
-    if id.to_string() != value {
-        return None;
-    }
-    let bytes = id.into_bytes();
-    Some(WasmCreateContext {
+fn create_context_from_uuid(value: uuid::Uuid) -> WasmCreateContext {
+    let bytes = value.into_bytes();
+    WasmCreateContext {
         high: u64::from_be_bytes(bytes[..8].try_into().expect("eight UUID bytes")),
         low: u32::from_be_bytes(bytes[8..12].try_into().expect("four UUID bytes")),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -846,10 +781,10 @@ fn create_context_from_generated_row(
     if row.key.schema_key.as_str() != generated_schema {
         return None;
     }
-    let [id] = row.key.row_pk.as_slice() else {
+    let [lix_schema::Value::Uuid(id)] = row.key.row_pk.as_ref() else {
         return None;
     };
-    create_context_from_uuid(id.as_str())
+    Some(create_context_from_uuid(*id))
 }
 
 fn ensure_source_page(
@@ -1085,137 +1020,10 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         Ok(())
     }
 
-    fn begin_row_attachment(
-        &mut self,
-        resource: Resource<TransitionResource>,
-        total_length: u64,
-    ) -> Result<u32, bindings::lix::plugin::host::HostError> {
-        let shared = self
-            .table
-            .get(&resource)
-            .map_err(host_table_error)?
-            .state
-            .clone();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.check_active()?;
-        if state.pending_attachment.is_some() {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "row attachment is already open".to_owned(),
-            ));
-        }
-        if state.attachments.len() >= state.limits.max_attachment_refs as usize {
-            return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "row attachment count exceeds its transition limit".to_owned(),
-            ));
-        }
-        if total_length > state.limits.max_total_bytes {
-            return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "row attachment exceeds max-total-bytes".to_owned(),
-            ));
-        }
-        let capacity = usize::try_from(total_length).map_err(|_| {
-            bindings::lix::plugin::host::HostError::LimitExceeded(
-                "row attachment exceeds host address space".to_owned(),
-            )
-        })?;
-        let ordinal = u32::try_from(state.attachments.len()).map_err(|_| {
-            bindings::lix::plugin::host::HostError::LimitExceeded(
-                "row attachment ordinal exceeds u32".to_owned(),
-            )
-        })?;
-        state.pending_attachment = Some(PendingRowAttachment {
-            expected_len: total_length,
-            bytes: Vec::with_capacity(capacity),
-        });
-        state.counters.component_import_calls =
-            state.counters.component_import_calls.saturating_add(1);
-        Ok(ordinal)
-    }
-
-    fn write_row_attachment(
-        &mut self,
-        resource: Resource<TransitionResource>,
-        chunk: Vec<u8>,
-    ) -> Result<(), bindings::lix::plugin::host::HostError> {
-        let shared = self
-            .table
-            .get(&resource)
-            .map_err(host_table_error)?
-            .state
-            .clone();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.charge_page(chunk.len())?;
-        let pending = state.pending_attachment.as_mut().ok_or_else(|| {
-            bindings::lix::plugin::host::HostError::Rejected(
-                "row attachment chunk has no open attachment".to_owned(),
-            )
-        })?;
-        let next_len = pending
-            .bytes
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| {
-                bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "row attachment length overflowed".to_owned(),
-                )
-            })?;
-        if next_len as u64 > pending.expected_len {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "row attachment exceeds its declared length".to_owned(),
-            ));
-        }
-        pending.bytes.extend_from_slice(&chunk);
-        state.counters.component_import_calls =
-            state.counters.component_import_calls.saturating_add(1);
-        state.counters.row_output_attachment_writes = state
-            .counters
-            .row_output_attachment_writes
-            .saturating_add(1);
-        state.counters.row_output_attachment_bytes = state
-            .counters
-            .row_output_attachment_bytes
-            .saturating_add(chunk.len() as u64);
-        Ok(())
-    }
-
-    fn finish_row_attachment(
-        &mut self,
-        resource: Resource<TransitionResource>,
-    ) -> Result<(), bindings::lix::plugin::host::HostError> {
-        let shared = self
-            .table
-            .get(&resource)
-            .map_err(host_table_error)?
-            .state
-            .clone();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.check_active()?;
-        let pending = state.pending_attachment.take().ok_or_else(|| {
-            bindings::lix::plugin::host::HostError::Rejected(
-                "row attachment finish has no open attachment".to_owned(),
-            )
-        })?;
-        if pending.bytes.len() as u64 != pending.expected_len {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "row attachment ended before its declared length".to_owned(),
-            ));
-        }
-        state.attachments.push(Bytes::from(pending.bytes));
-        state.counters.component_import_calls =
-            state.counters.component_import_calls.saturating_add(1);
-        Ok(())
-    }
-
     fn emit_rows(
         &mut self,
         resource: Resource<TransitionResource>,
-        mut page: bindings::lix::plugin::host::RowPage,
+        page: bindings::lix::plugin::host::RowPage,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
         let state = self
             .table
@@ -1227,40 +1035,68 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.check_active()?;
-        let decoded = RowPage::decode(&page.payload).map_err(|error| {
-            bindings::lix::plugin::host::HostError::Rejected(format!("invalid row page: {error:?}"))
-        })?;
-        let page_wire_bytes = page.payload.len() as u64;
+        state.counters.row_page_callback_calls =
+            state.counters.row_page_callback_calls.saturating_add(1);
+        let attachment_bytes = page
+            .attachments
+            .iter()
+            .map(|attachment| attachment.len() as u64)
+            .sum::<u64>();
+        let attachment_count = page.attachments.len() as u64;
+        if state
+            .counters
+            .row_output_attachment_writes
+            .saturating_add(page.attachments.len() as u64)
+            > u64::from(state.limits.max_attachment_refs)
+        {
+            return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
+                "typed row attachment count exceeds its transition limit".to_owned(),
+            ));
+        }
+        let page_wire_bytes = (page.payload.len() as u64).saturating_add(attachment_bytes);
         if state.counters.packet_pages.saturating_add(1) > u64::from(state.limits.max_pages) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
                 "row page count exceeds its transition limit".to_owned(),
             ));
         }
+        // The framed page remains independently bounded. Attachments are
+        // charged against the aggregate transition budget so one native value
+        // may exceed a page without reintroducing inline JSON chunking.
         state.charge_page(page.payload.len())?;
-        let limits = state.limits;
-        let creates = state.creates;
-        let attachments: Arc<[Bytes]> = state.attachments.clone().into();
-        let total_record_count = decoded.record_count();
-        let section = decoded.section().map_err(|error| {
-            bindings::lix::plugin::host::HostError::Rejected(format!(
-                "invalid row page section: {error:?}"
-            ))
-        })?;
-        let payload_end = section.payload.len();
-        let record_count = section.record_count;
-        if section.representation != Representation::Snapshots {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "row page must use snapshot records".to_owned(),
-            ));
-        }
-        page.payload.truncate(payload_end);
-        let pending = PendingChangePage::Packet {
-            record_count,
-            payload: page.payload,
+        state.charge_total(page.attachments.iter().map(Vec::len).sum())?;
+        let bindings::lix::plugin::host::RowPage {
+            payload,
             attachments,
-            max_page_bytes: limits.max_page_bytes,
-            limits,
-            creates,
+        } = page;
+        let decode_started = Instant::now();
+        let (schema_key, schema_fingerprint, mutations) =
+            typed_wire::decode_page_parts_owned(payload, attachments).map_err(|error| {
+                bindings::lix::plugin::host::HostError::Rejected(format!(
+                    "invalid typed row page: {error:?}"
+                ))
+            })?;
+        state.counters.typed_row_decode_nanos = state
+            .counters
+            .typed_row_decode_nanos
+            .saturating_add(u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let record_count = u32::try_from(mutations.len()).map_err(|_| {
+            bindings::lix::plugin::host::HostError::Rejected(
+                "typed row page record count exceeds u32".to_owned(),
+            )
+        })?;
+        let total_record_count = record_count;
+        state.counters.typed_row_decode_records = state
+            .counters
+            .typed_row_decode_records
+            .saturating_add(u64::from(record_count));
+        state.counters.typed_row_decode_bytes = state
+            .counters
+            .typed_row_decode_bytes
+            .saturating_add(page_wire_bytes);
+        let pending = PendingChangePage::Typed {
+            schema_key,
+            schema_fingerprint,
+            mutations,
         };
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
@@ -1278,6 +1114,14 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             .counters
             .row_output_wire_bytes
             .saturating_add(page_wire_bytes);
+        state.counters.row_output_attachment_writes = state
+            .counters
+            .row_output_attachment_writes
+            .saturating_add(attachment_count);
+        state.counters.row_output_attachment_bytes = state
+            .counters
+            .row_output_attachment_bytes
+            .saturating_add(attachment_bytes);
         state.pages.push_back(pending);
         Ok(())
     }
@@ -1509,9 +1353,11 @@ impl bindings::lix::plugin::host::HostRowSource for WasiHostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.check_active()?;
+        state.counters.row_page_callback_calls =
+            state.counters.row_page_callback_calls.saturating_add(1);
         ensure_source_page(max_bytes, state.limits.max_page_bytes)?;
         let envelope_bytes = u32::try_from(
-            crate::plugin::wire::single_section_overhead("", &[]).expect("fixed page overhead"),
+            crate::plugin::wire::typed_page_overhead("").expect("fixed page overhead"),
         )
         .expect("fixed page overhead fits u32");
         let payload_budget = max_bytes.checked_sub(envelope_bytes).ok_or_else(|| {
@@ -1523,6 +1369,10 @@ impl bindings::lix::plugin::host::HostRowSource for WasiHostState {
             .next_page(payload_budget)
             .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?
         else {
+            state.counters.row_input_page_eof_callbacks = state
+                .counters
+                .row_input_page_eof_callbacks
+                .saturating_add(1);
             state.counters.component_import_calls =
                 state.counters.component_import_calls.saturating_add(1);
             return Ok(None);
@@ -1532,194 +1382,87 @@ impl bindings::lix::plugin::host::HostRowSource for WasiHostState {
                 "component row source returned an empty page".to_owned(),
             ));
         }
-        state.lazy_snapshots.clear();
-        let record_count = u32::try_from(changes.len()).map_err(|_| {
-            bindings::lix::plugin::host::HostError::LimitExceeded(
-                "row input page record count exceeds u32".to_owned(),
-            )
-        })?;
-        let mut payload = Vec::new();
-        for change in changes {
-            let ordinal = state.next_ordinal;
-            state.next_ordinal = state.next_ordinal.checked_add(1).ok_or_else(|| {
+        if let Some((schema_key, schema_fingerprint, mutations)) =
+            typed_input_mutations(&changes)
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?
+        {
+            let record_count = u32::try_from(mutations.len()).map_err(|_| {
                 bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "component row input ordinal overflowed".to_owned(),
+                    "typed row input record count exceeds u32".to_owned(),
                 )
             })?;
-            let (schema_key, row_pk, snapshot_content, effect) = match change {
-                WasmRowChange::Create {
-                    schema_key,
-                    resolved_key,
-                    snapshot_content,
-                    ..
-                } => {
-                    let key = resolved_key.ok_or_else(|| {
-                        bindings::lix::plugin::host::HostError::Rejected(
-                            "host-to-guest row input contains an unresolved create".to_owned(),
-                        )
+            let (page, attachments) =
+                typed_wire::encode_page_parts(&schema_key, &schema_fingerprint, &mutations)
+                    .map_err(|error| {
+                        bindings::lix::plugin::host::HostError::Rejected(format!(
+                            "failed to encode typed row input page: {error:?}"
+                        ))
                     })?;
-                    (
-                        schema_key,
-                        key.row_pk
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                        Some(snapshot_content),
-                        WasmChangeEffect::Content,
-                    )
-                }
-                WasmRowChange::Upsert { row, effect } => (
-                    row.key.schema_key.to_string(),
-                    row.key.row_pk.iter().map(ToString::to_string).collect(),
-                    Some(row.snapshot_content),
-                    effect,
-                ),
-                WasmRowChange::Delete(key) => (
-                    key.schema_key.to_string(),
-                    key.row_pk.iter().map(ToString::to_string).collect(),
-                    None,
-                    WasmChangeEffect::Content,
-                ),
-            };
-            let record_start = payload.len();
-            payload.extend_from_slice(&0_u32.to_le_bytes());
-            if snapshot_content.is_some() {
-                payload.push(0);
-            } else {
-                payload.push(1);
+            let page_bytes = page
+                .len()
+                .saturating_add(attachments.iter().map(Vec::len).sum::<usize>());
+            if page.len() > max_bytes as usize {
+                return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
+                    "typed row input page exceeds the requested byte limit".to_owned(),
+                ));
             }
-            encode_packet_text(&mut payload, &schema_key)
-                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
-            payload.extend_from_slice(
-                &u32::try_from(row_pk.len())
-                    .map_err(|_| {
-                        bindings::lix::plugin::host::HostError::LimitExceeded(
-                            "row input primary key has too many components".to_owned(),
-                        )
-                    })?
-                    .to_le_bytes(),
-            );
-            for component in &row_pk {
-                encode_packet_text(&mut payload, component).map_err(|error| {
-                    bindings::lix::plugin::host::HostError::Rejected(error.message)
-                })?;
+            if state
+                .counters
+                .row_input_attachment_reads
+                .saturating_add(attachments.len() as u64)
+                > u64::from(state.limits.max_attachment_refs)
+            {
+                return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
+                    "typed row input attachment count exceeds its transition limit".to_owned(),
+                ));
             }
-            if let Some(snapshot_content) = snapshot_content {
-                payload.push(match effect {
-                    WasmChangeEffect::Content => 0,
-                    WasmChangeEffect::FormatOnly => 1,
-                });
-                let inline_len = u32::try_from(snapshot_content.len()).ok();
-                let inline_fits = inline_len.is_some_and(|length| {
-                    payload
-                        .len()
-                        .checked_add(1 + 4 + length as usize)
-                        .is_some_and(|end| {
-                            end <= payload_budget as usize
-                                && end - record_start <= state.limits.max_record_bytes as usize
-                        })
-                });
-                if inline_fits {
-                    let length = inline_len.expect("checked inline length");
-                    payload.push(0);
-                    payload.extend_from_slice(&length.to_le_bytes());
-                    payload.extend_from_slice(
-                        &read_host_bytes(&snapshot_content, 0, length).map_err(|error| {
-                            bindings::lix::plugin::host::HostError::Rejected(error.message)
-                        })?,
-                    );
-                } else {
-                    payload.push(1);
-                    payload.extend_from_slice(&ordinal.to_le_bytes());
-                    payload.extend_from_slice(&snapshot_content.len().to_le_bytes());
-                    state.lazy_snapshots.insert(ordinal, snapshot_content);
-                }
-            }
-            let record_len = u32::try_from(payload.len() - record_start - 4).map_err(|_| {
-                bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "row input record exceeds u32".to_owned(),
-                )
-            })?;
-            payload[record_start..record_start + 4].copy_from_slice(&record_len.to_le_bytes());
+            let boundary_bytes = page_bytes;
+            state.charge(page.len())?;
+            state.charge_total(attachments.iter().map(Vec::len).sum())?;
+            state.counters.component_import_calls =
+                state.counters.component_import_calls.saturating_add(1);
+            state.counters.source_read_calls = state.counters.source_read_calls.saturating_add(1);
+            state.counters.source_bytes_read = state
+                .counters
+                .source_bytes_read
+                .saturating_add(boundary_bytes as u64);
+            state.counters.row_input_pages = state.counters.row_input_pages.saturating_add(1);
+            state.counters.row_input_records = state
+                .counters
+                .row_input_records
+                .saturating_add(u64::from(record_count));
+            state.counters.row_input_wire_bytes = state
+                .counters
+                .row_input_wire_bytes
+                .saturating_add(boundary_bytes as u64);
+            state.counters.row_input_attachment_reads = state
+                .counters
+                .row_input_attachment_reads
+                .saturating_add(attachments.len() as u64);
+            state.counters.row_input_attachment_bytes =
+                state.counters.row_input_attachment_bytes.saturating_add(
+                    attachments
+                        .iter()
+                        .map(|attachment| attachment.len() as u64)
+                        .sum(),
+                );
+            state.counters.typed_row_encode_records = state
+                .counters
+                .typed_row_encode_records
+                .saturating_add(u64::from(record_count));
+            state.counters.typed_row_encode_bytes = state
+                .counters
+                .typed_row_encode_bytes
+                .saturating_add(boundary_bytes as u64);
+            return Ok(Some(bindings::lix::plugin::host::RowPage {
+                payload: page,
+                attachments,
+            }));
         }
-        let page = encode_single_section(
-            Representation::Snapshots,
-            Operation::Mixed,
-            "",
-            &[],
-            record_count,
-            payload,
-        )
-        .map_err(|error| {
-            bindings::lix::plugin::host::HostError::Rejected(format!(
-                "failed to encode row input page: {error:?}"
-            ))
-        })?;
-        if page.len() > max_bytes as usize {
-            return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "row input page exceeds the requested byte limit".to_owned(),
-            ));
-        }
-        let boundary_bytes = page.len();
-        state.charge(boundary_bytes)?;
-        state.counters.component_import_calls =
-            state.counters.component_import_calls.saturating_add(1);
-        state.counters.source_read_calls = state.counters.source_read_calls.saturating_add(1);
-        state.counters.source_bytes_read = state
-            .counters
-            .source_bytes_read
-            .saturating_add(boundary_bytes as u64);
-        state.counters.row_input_pages = state.counters.row_input_pages.saturating_add(1);
-        state.counters.row_input_records = state
-            .counters
-            .row_input_records
-            .saturating_add(u64::from(record_count));
-        state.counters.row_input_wire_bytes = state
-            .counters
-            .row_input_wire_bytes
-            .saturating_add(boundary_bytes as u64);
-        Ok(Some(bindings::lix::plugin::host::RowPage { payload: page }))
-    }
-
-    fn read_attachment(
-        &mut self,
-        resource: Resource<RowSourceResource>,
-        ordinal: u32,
-        offset: u64,
-        length: u32,
-    ) -> Result<Option<Vec<u8>>, bindings::lix::plugin::host::HostError> {
-        let shared = self
-            .table
-            .get(&resource)
-            .map_err(host_table_error)?
-            .state
-            .clone();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.check_active()?;
-        ensure_source_page(length, state.limits.max_page_bytes)?;
-        let snapshot = state
-            .lazy_snapshots
-            .get(&ordinal)
-            .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
-        let bytes = read_host_bytes(snapshot, offset, length)
-            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
-        state.charge(bytes.len())?;
-        state.counters.component_import_calls =
-            state.counters.component_import_calls.saturating_add(1);
-        state.counters.source_read_calls = state.counters.source_read_calls.saturating_add(1);
-        state.counters.source_bytes_read = state
-            .counters
-            .source_bytes_read
-            .saturating_add(bytes.len() as u64);
-        state.counters.row_input_attachment_reads =
-            state.counters.row_input_attachment_reads.saturating_add(1);
-        state.counters.row_input_attachment_bytes = state
-            .counters
-            .row_input_attachment_bytes
-            .saturating_add(bytes.len() as u64);
-        Ok(Some(bytes))
+        return Err(bindings::lix::plugin::host::HostError::Rejected(
+            "host row input contains a legacy untyped row; typed Schema v1 rows are required"
+                .to_owned(),
+        ));
     }
 
     fn drop(&mut self, resource: Resource<RowSourceResource>) -> wasmtime::Result<()> {
@@ -1763,26 +1506,54 @@ impl bindings::lix::plugin::host::HostColumnMergeSource for WasiHostState {
             .conflicts
             .get(index as usize)
             .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
+        let primary_key = conflict
+            .key
+            .row_pk
+            .iter()
+            .map(|component| {
+                typed_wire::encode_key_value_bytes(component).map_err(|error| {
+                    bindings::lix::plugin::host::HostError::Rejected(format!(
+                        "invalid typed merge identity: {error:?}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let meta = bindings::lix::plugin::host::ColumnMergeMeta {
             ordinal: conflict.ordinal,
             schema_key: conflict.key.schema_key.to_string(),
-            row_pk: conflict
-                .key
-                .row_pk
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            primary_key,
+            schema_fingerprint: conflict.schema_fingerprint.to_vec(),
             file_id: conflict.file_id.clone(),
             column: conflict.column.clone(),
-            base_len: conflict.base.as_ref().map(WasmHostBytes::len),
-            a_len: conflict.a.as_ref().map(WasmHostBytes::len),
-            b_len: conflict.b.as_ref().map(WasmHostBytes::len),
-            base_row_len: conflict.base_row.len(),
-            a_row_len: conflict.a_row.len(),
-            b_row_len: conflict.b_row.len(),
+            base_len: conflict
+                .base
+                .as_ref()
+                .map(encoded_merge_value_len)
+                .transpose()
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?,
+            a_len: conflict
+                .a
+                .as_ref()
+                .map(encoded_merge_value_len)
+                .transpose()
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?,
+            b_len: conflict
+                .b
+                .as_ref()
+                .map(encoded_merge_value_len)
+                .transpose()
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?,
+            base_row_len: encoded_merge_row_len(&conflict.base_row)
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?,
+            a_row_len: encoded_merge_row_len(&conflict.a_row)
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?,
+            b_row_len: encoded_merge_row_len(&conflict.b_row)
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?,
         };
-        let metadata_bytes =
-            meta.schema_key.len() + meta.row_pk.iter().map(String::len).sum::<usize>() + 32;
+        let metadata_bytes = meta.schema_key.len()
+            + meta.primary_key.iter().map(Vec::len).sum::<usize>()
+            + meta.schema_fingerprint.len()
+            + 32;
         state.charge(metadata_bytes)?;
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
@@ -1815,7 +1586,9 @@ impl bindings::lix::plugin::host::HostColumnMergeSource for WasiHostState {
         let Some(value) = conflict_value(conflict, side) else {
             return Ok(None);
         };
-        let bytes = read_host_bytes(value, offset, length)
+        let encoded = encoded_merge_value(value)
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
+        let bytes = read_encoded_bytes(&encoded, offset, length)
             .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
         state.charge(bytes.len())?;
         state.counters.component_import_calls =
@@ -1851,7 +1624,9 @@ impl bindings::lix::plugin::host::HostColumnMergeSource for WasiHostState {
             .conflicts
             .get(index as usize)
             .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
-        let bytes = read_host_bytes(conflict_row(conflict, side), offset, length)
+        let encoded = encoded_merge_row(conflict_row(conflict, side))
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
+        let bytes = read_encoded_bytes(&encoded, offset, length)
             .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
         state.charge(bytes.len())?;
         state.counters.component_import_calls =
@@ -2035,449 +1810,6 @@ impl bindings::lix::plugin::host::HostColumnMergeSink for WasiHostState {
     fn drop(&mut self, resource: Resource<ResolutionSinkResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
         Ok(())
-    }
-}
-
-struct ValidatedCreatedPacketPage {
-    schemas: Vec<String>,
-    identities: Vec<ValidatedPacketIdentity>,
-}
-
-enum ValidatedPacketIdentity {
-    Explicit {
-        schema_index: u32,
-        fingerprint: [u8; 32],
-        generated_local_ref: Option<u64>,
-    },
-    Create {
-        schema_index: u32,
-        local_ref: u64,
-    },
-}
-
-enum CreatedPacketIdentity {
-    Explicit(WasmRowKey),
-    Create { schema_key: String, local_ref: u64 },
-}
-
-#[derive(Debug, Default)]
-struct CertifiedPacketSchemaKeys {
-    create_refs: std::collections::HashSet<u64>,
-    explicit_keys: std::collections::HashSet<[u8; 32]>,
-    explicit_create_refs: std::collections::HashSet<u64>,
-    create_ref_ranges: Vec<(u64, u64)>,
-}
-
-#[derive(Debug, Default)]
-struct CertifiedPacketRowKeys {
-    schemas: std::collections::BTreeMap<String, CertifiedPacketSchemaKeys>,
-}
-
-impl CertifiedPacketRowKeys {
-    fn contains_create_ref(keys: &CertifiedPacketSchemaKeys, local_ref: u64) -> bool {
-        keys.create_refs.contains(&local_ref)
-            || keys
-                .create_ref_ranges
-                .iter()
-                .any(|(first, last)| *first <= local_ref && local_ref <= *last)
-    }
-
-    fn generated_local_ref(components: &[String], creates: WasmCreateContext) -> Option<u64> {
-        let [component] = components else {
-            return None;
-        };
-        Self::generated_local_ref_component(component, creates)
-    }
-
-    fn generated_local_ref_component(component: &str, creates: WasmCreateContext) -> Option<u64> {
-        if component.len() != 36
-            || component
-                .as_bytes()
-                .iter()
-                .enumerate()
-                .any(|(index, byte)| {
-                    if matches!(index, 8 | 13 | 18 | 23) {
-                        *byte != b'-'
-                    } else {
-                        !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte)
-                    }
-                })
-        {
-            return None;
-        }
-        let id = uuid::Uuid::parse_str(component).ok()?;
-        let bytes = id.into_bytes();
-        if bytes[..8] != creates.high.to_be_bytes() || bytes[8..12] != creates.low.to_be_bytes() {
-            return None;
-        }
-        Some(u64::from(u32::from_be_bytes(bytes[12..].try_into().ok()?)))
-    }
-
-    fn explicit_key_fingerprint<'a>(components: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"lix-certified-packet-explicit-key-v1\0");
-        for component in components {
-            hasher.update(
-                &u64::try_from(component.len())
-                    .expect("packet key component length fits u64")
-                    .to_be_bytes(),
-            );
-            hasher.update(component);
-        }
-        *hasher.finalize().as_bytes()
-    }
-
-    fn insert(
-        &mut self,
-        identity: CreatedPacketIdentity,
-        creates: WasmCreateContext,
-        existing: &Self,
-    ) -> Result<(), LixError> {
-        let (schema_key, explicit_key, create_ref) = match identity {
-            CreatedPacketIdentity::Explicit(key) => {
-                let components = key
-                    .row_pk
-                    .into_iter()
-                    .map(|component| component.as_str().to_owned())
-                    .collect::<Vec<_>>();
-                let create_ref = Self::generated_local_ref(&components, creates);
-                (
-                    key.schema_key.as_str().to_owned(),
-                    Some(Self::explicit_key_fingerprint(
-                        components.iter().map(String::as_bytes),
-                    )),
-                    create_ref,
-                )
-            }
-            CreatedPacketIdentity::Create {
-                schema_key,
-                local_ref,
-            } => (schema_key, None, Some(local_ref)),
-        };
-        self.insert_compact(schema_key, explicit_key, create_ref, existing)
-    }
-
-    fn insert_compact(
-        &mut self,
-        schema_key: String,
-        explicit_key: Option<[u8; 32]>,
-        create_ref: Option<u64>,
-        existing: &Self,
-    ) -> Result<(), LixError> {
-        let existing = existing.schemas.get(&schema_key);
-        let page = self.schemas.entry(schema_key).or_default();
-        match explicit_key {
-            Some(fingerprint) => {
-                if existing.is_some_and(|keys| keys.explicit_keys.contains(&fingerprint))
-                    || !page.explicit_keys.insert(fingerprint)
-                    || create_ref.is_some_and(|local_ref| {
-                        existing.is_some_and(|keys| Self::contains_create_ref(keys, local_ref))
-                            || Self::contains_create_ref(page, local_ref)
-                    })
-                {
-                    return Err(duplicate_certified_packet_key());
-                }
-                if let Some(local_ref) = create_ref {
-                    page.explicit_create_refs.insert(local_ref);
-                }
-            }
-            None => {
-                let local_ref = create_ref.expect("create identity has a local reference");
-                if existing.is_some_and(|keys| {
-                    Self::contains_create_ref(keys, local_ref)
-                        || keys.explicit_create_refs.contains(&local_ref)
-                }) || page.explicit_create_refs.contains(&local_ref)
-                    || page
-                        .create_ref_ranges
-                        .iter()
-                        .any(|(first, last)| *first <= local_ref && local_ref <= *last)
-                    || !page.create_refs.insert(local_ref)
-                {
-                    return Err(duplicate_certified_packet_key());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn insert_validated(
-        &mut self,
-        identity: ValidatedPacketIdentity,
-        schemas: &[String],
-        existing: &Self,
-    ) -> Result<(), LixError> {
-        let (schema_index, fingerprint, create_ref, explicit) = match identity {
-            ValidatedPacketIdentity::Explicit {
-                schema_index,
-                fingerprint,
-                generated_local_ref,
-            } => (schema_index, Some(fingerprint), generated_local_ref, true),
-            ValidatedPacketIdentity::Create {
-                schema_index,
-                local_ref,
-            } => (schema_index, None, Some(local_ref), false),
-        };
-        let schema_key = schemas
-            .get(usize::try_from(schema_index).expect("schema index fits usize"))
-            .expect("validated packet identity has a known schema");
-        debug_assert_eq!(explicit, fingerprint.is_some());
-        self.insert_compact(schema_key.clone(), fingerprint, create_ref, existing)
-    }
-
-    fn extend(&mut self, page: Self) {
-        for (schema_key, page) in page.schemas {
-            let keys = self.schemas.entry(schema_key).or_default();
-            keys.create_refs.extend(page.create_refs);
-            keys.explicit_keys.extend(page.explicit_keys);
-            keys.explicit_create_refs.extend(page.explicit_create_refs);
-            keys.create_ref_ranges.extend(page.create_ref_ranges);
-        }
-    }
-
-    fn extend_ref(&mut self, page: &Self) {
-        for (schema_key, page) in &page.schemas {
-            let keys = self.schemas.entry(schema_key.clone()).or_default();
-            keys.create_refs.extend(page.create_refs.iter().copied());
-            keys.explicit_keys
-                .extend(page.explicit_keys.iter().copied());
-            keys.explicit_create_refs
-                .extend(page.explicit_create_refs.iter().copied());
-            keys.create_ref_ranges
-                .extend(page.create_ref_ranges.iter().copied());
-        }
-    }
-
-    fn take_create_ranges_for(&mut self, schema_keys: &[String]) -> Vec<WasmCertifiedCreateRange> {
-        let mut output = Vec::new();
-        for schema_key in schema_keys {
-            let Some(keys) = self.schemas.remove(schema_key) else {
-                continue;
-            };
-            let mut ranges = keys
-                .create_ref_ranges
-                .into_iter()
-                .chain(
-                    keys.create_refs
-                        .into_iter()
-                        .map(|local_ref| (local_ref, local_ref)),
-                )
-                .chain(
-                    keys.explicit_create_refs
-                        .into_iter()
-                        .map(|local_ref| (local_ref, local_ref)),
-                )
-                .collect::<Vec<_>>();
-            ranges.sort_unstable();
-            let mut compact = Vec::<(u64, u64)>::with_capacity(ranges.len());
-            for (first, last) in ranges {
-                if let Some((_, compact_last)) = compact.last_mut()
-                    && first <= compact_last.saturating_add(1)
-                {
-                    *compact_last = (*compact_last).max(last);
-                    continue;
-                }
-                compact.push((first, last));
-            }
-            output.extend(
-                compact
-                    .into_iter()
-                    .map(|(first, last)| WasmCertifiedCreateRange {
-                        schema_key: schema_key.clone(),
-                        first_local_ref: u32::try_from(first)
-                            .expect("validated create local ref fits u32"),
-                        last_local_ref: u32::try_from(last)
-                            .expect("validated create local ref fits u32"),
-                    }),
-            );
-        }
-        output
-    }
-}
-
-fn duplicate_certified_packet_key() -> LixError {
-    component_error("a component row key may occur only once across certified packet pages")
-}
-
-fn validate_new_certified_packet_keys(
-    page: ValidatedCreatedPacketPage,
-    existing: &CertifiedPacketRowKeys,
-) -> Result<(BTreeSet<String>, CertifiedPacketRowKeys), LixError> {
-    let ValidatedCreatedPacketPage {
-        schemas,
-        identities,
-    } = page;
-    let mut page_keys = CertifiedPacketRowKeys::default();
-    for identity in identities {
-        page_keys.insert_validated(identity, &schemas, existing)?;
-    }
-    Ok((schemas.into_iter().collect(), page_keys))
-}
-
-fn validate_ordinary_packet_page_keys(
-    page: &WasmChangePage,
-    creates: WasmCreateContext,
-    existing: &CertifiedPacketRowKeys,
-) -> Result<CertifiedPacketRowKeys, LixError> {
-    let mut page_keys = CertifiedPacketRowKeys::default();
-    for change in &page.changes.changes {
-        let identity = match change {
-            WasmRowChange::Create {
-                schema_key,
-                local_ref,
-                ..
-            } => CreatedPacketIdentity::Create {
-                schema_key: schema_key.clone(),
-                local_ref: *local_ref,
-            },
-            WasmRowChange::Upsert { row, .. } => CreatedPacketIdentity::Explicit(row.key.clone()),
-            WasmRowChange::Delete(key) => CreatedPacketIdentity::Explicit(key.clone()),
-        };
-        page_keys.insert(identity, creates, existing)?;
-    }
-    Ok(page_keys)
-}
-
-/// Returns packet metadata when every framed record is an inline snapshot write.
-/// Delete, attachment, and non-certified-schema pages fall back to the generic
-/// packet decoder.
-fn validate_created_packet_page(
-    record_count: u32,
-    payload: &[u8],
-    creates: WasmCreateContext,
-) -> Result<Option<ValidatedCreatedPacketPage>, String> {
-    if record_count == 0 {
-        return Err("packet page is empty".to_owned());
-    }
-    let mut input = PacketSliceReader { payload, offset: 0 };
-    let mut schemas = Vec::<String>::new();
-    let mut identities = Vec::with_capacity(record_count as usize);
-    let mut previous_local_ref = None;
-    for _ in 0..record_count {
-        let record_len = input.u32()? as usize;
-        let record_bytes = input.bytes(record_len)?;
-        let mut record = PacketSliceReader {
-            payload: record_bytes,
-            offset: 0,
-        };
-        let tag = record.u8()?;
-        let schema_len = record.u32()? as usize;
-        let schema = std::str::from_utf8(record.bytes(schema_len)?)
-            .map_err(|error| format!("packet schema is not UTF-8: {error}"))?;
-        if schema.is_empty() {
-            return Err("packet create schema is empty".to_owned());
-        }
-        let schema_index = match schemas.iter().position(|candidate| candidate == schema) {
-            Some(index) => index,
-            None => {
-                schemas.push(schema.to_owned());
-                schemas.len() - 1
-            }
-        };
-        let schema_index =
-            u32::try_from(schema_index).map_err(|_| "packet has too many schemas")?;
-        match tag {
-            0 => {
-                let component_count = record.u32()?;
-                if component_count == 0 {
-                    return Err("packet upsert key has no components".to_owned());
-                }
-                let mut fingerprint = blake3::Hasher::new();
-                fingerprint.update(b"lix-certified-packet-explicit-key-v1\0");
-                let mut only_component = None;
-                for _ in 0..component_count {
-                    let component_len = record.u32()? as usize;
-                    let component = record.bytes(component_len)?;
-                    let component = std::str::from_utf8(component)
-                        .map_err(|error| format!("packet key component is not UTF-8: {error}"))?;
-                    fingerprint.update(
-                        &u64::try_from(component.len())
-                            .expect("packet key component length fits u64")
-                            .to_be_bytes(),
-                    );
-                    fingerprint.update(component.as_bytes());
-                    if component_count == 1 {
-                        only_component = Some(component);
-                    }
-                }
-                if record.u8()? > 1 {
-                    return Err("packet upsert has an invalid effect".to_owned());
-                }
-                identities.push(ValidatedPacketIdentity::Explicit {
-                    schema_index,
-                    fingerprint: *fingerprint.finalize().as_bytes(),
-                    generated_local_ref: only_component.and_then(|component| {
-                        CertifiedPacketRowKeys::generated_local_ref_component(component, creates)
-                    }),
-                });
-            }
-            2 => {
-                let local_ref = record.u64()?;
-                if u32::try_from(local_ref).is_err() {
-                    return Err("packet create local ref exceeds u32".to_owned());
-                }
-                if previous_local_ref.is_some_and(|previous| previous >= local_ref) {
-                    return Err("packet create local refs must be strictly increasing".to_owned());
-                }
-                previous_local_ref = Some(local_ref);
-                identities.push(ValidatedPacketIdentity::Create {
-                    schema_index,
-                    local_ref,
-                });
-            }
-            1 => return Ok(None),
-            _ => return Err("packet page has an unknown change tag".to_owned()),
-        }
-        if record.u8()? != 0 {
-            return Ok(None);
-        }
-        let snapshot_len = record.u32()? as usize;
-        let _snapshot = record.bytes(snapshot_len)?;
-        if record.offset != record.payload.len() {
-            return Err("packet create record has trailing bytes".to_owned());
-        }
-    }
-    if input.offset != payload.len() {
-        return Err("packet page has trailing bytes".to_owned());
-    }
-    Ok(Some(ValidatedCreatedPacketPage {
-        schemas,
-        identities,
-    }))
-}
-
-struct PacketSliceReader<'a> {
-    payload: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> PacketSliceReader<'a> {
-    fn bytes(&mut self, length: usize) -> Result<&'a [u8], String> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or_else(|| "packet range overflowed".to_owned())?;
-        let value = self
-            .payload
-            .get(self.offset..end)
-            .ok_or_else(|| "packet ended early".to_owned())?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.bytes(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(
-            self.bytes(4)?.try_into().expect("exact u32 width"),
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(
-            self.bytes(8)?.try_into().expect("exact u64 width"),
-        ))
     }
 }
 
@@ -2693,7 +2025,6 @@ impl WasmComponentFactory for ComponentFactory {
             transitions: HashMap::new(),
             transition_permits: HashMap::new(),
             prospective_documents: ProspectiveDocuments::default(),
-            durable_checkpoint: DurableCheckpointCache::default(),
             retired: false,
             next_document: 1,
         }))
@@ -3664,7 +2995,10 @@ impl ComponentWorker {
             .transpose()?
             .unwrap_or_default();
         let total_bytes = SharedByteBudget::default();
-        let row_state = Arc::new(Mutex::new(RowChangeState::from_rows(
+        // Serialization consumes a complete durable row stream but never
+        // computes replacement tombstones. Avoid cloning and sorting every
+        // identity into the parse-changes-only predecessor inventory.
+        let row_state = Arc::new(Mutex::new(RowChangeState::from_rows_without_key_inventory(
             limits,
             input.rows,
             total_bytes.clone(),
@@ -3839,18 +3173,6 @@ impl ComponentWorker {
 struct CursorState {
     transition: WasmTransitionHandle,
     pages: VecDeque<PendingChangePage>,
-    complete_file_state: bool,
-    /// Whether a complete parse may be retained as a certified packet. See
-    /// [`WasmOpenFileInput::certified_packets_available`]: a file with no
-    /// published commit has no root to expand a packet from, so its pages take
-    /// the ordinary decode path instead.
-    certified_packets_available: bool,
-    certified_all_row_keys: CertifiedPacketRowKeys,
-    certified_packet_pages: Vec<Bytes>,
-    certified_packet_rows: u64,
-    certified_packet_creates: Option<WasmCreateContext>,
-    certified_packet_schema_keys: BTreeSet<String>,
-    certified_packet_row_keys: CertifiedPacketRowKeys,
 }
 
 struct ColumnMergeCursorState {
@@ -3881,36 +3203,8 @@ struct ComponentActor {
     transitions: HashMap<u64, WasmTransitionCounters>,
     transition_permits: HashMap<u64, tokio::sync::OwnedSemaphorePermit>,
     prospective_documents: ProspectiveDocuments,
-    durable_checkpoint: DurableCheckpointCache,
     retired: bool,
     next_document: u64,
-}
-
-fn encode_durable_document_checkpoint(
-    root: &ArenaRoot,
-    max_decoded_bytes: usize,
-) -> Option<WasmDurableDocumentCheckpoint> {
-    if root.successor_checkpoint_encoded_len().ok()? > max_decoded_bytes {
-        return None;
-    }
-    let bytes = root.encode_successor_checkpoint().ok()?.into();
-    WasmDurableDocumentCheckpoint::new(bytes).ok()
-}
-
-#[derive(Default)]
-struct DurableCheckpointCache(Option<(ArenaDigest, WasmDurableDocumentCheckpoint)>);
-
-impl DurableCheckpointCache {
-    fn get(&self, state_id: &ArenaDigest) -> Option<WasmDurableDocumentCheckpoint> {
-        self.0
-            .as_ref()
-            .filter(|(cached_state_id, _)| cached_state_id == state_id)
-            .map(|(_, checkpoint)| checkpoint.clone())
-    }
-
-    fn insert(&mut self, state_id: ArenaDigest, checkpoint: WasmDurableDocumentCheckpoint) {
-        self.0 = Some((state_id, checkpoint));
-    }
 }
 
 #[derive(Default)]
@@ -4017,23 +3311,7 @@ impl WasmComponentActor for ComponentActor {
             .root
             .successor_checkpoint();
         let retained_bytes = u64::try_from(root.retained_heap_bytes()).unwrap_or(u64::MAX);
-        let state_id = root.state.id();
-        let durable = if let Some(checkpoint) = self.durable_checkpoint.get(&state_id) {
-            Some(checkpoint)
-        } else {
-            encode_durable_document_checkpoint(
-                &root,
-                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
-            )
-            .inspect(|checkpoint| {
-                self.durable_checkpoint.insert(state_id, checkpoint.clone());
-            })
-        };
-        Ok(Some(if let Some(durable) = durable {
-            WasmDocumentCheckpoint::new_with_durable(root, retained_bytes, durable)
-        } else {
-            WasmDocumentCheckpoint::new(root, retained_bytes)
-        }))
+        Ok(Some(WasmDocumentCheckpoint::new(root, retained_bytes)))
     }
 
     async fn restore_document(
@@ -4047,30 +3325,6 @@ impl WasmComponentActor for ComponentActor {
                 component_error("component document checkpoint belongs to another runtime")
             })?
             .clone();
-        let document = self.allocate_document()?;
-        self.worker
-            .documents
-            .insert(document, ComponentDocument { root });
-        self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));
-        Ok(WasmDocumentHandle(document))
-    }
-
-    async fn restore_durable_document(
-        &mut self,
-        checkpoint: &[u8],
-        accepted: &[u8],
-    ) -> Result<WasmDocumentHandle, LixError> {
-        self.ensure_active()?;
-        let root =
-            ArenaRoot::decode_successor_checkpoint(accepted, checkpoint).map_err(|error| {
-                component_error(format!(
-                    "failed to decode component document checkpoint: {error}"
-                ))
-            })?;
-        self.durable_checkpoint.insert(
-            root.state.id(),
-            WasmDurableDocumentCheckpoint::new(checkpoint.to_vec().into())?,
-        );
         let document = self.allocate_document()?;
         self.worker
             .documents
@@ -4093,7 +3347,6 @@ impl WasmComponentActor for ComponentActor {
             self.execution_scheduler(),
         )
         .await?;
-        let certified_packets_available = input.certified_packets_available;
         let output = self.worker.open_file(document, limits, input);
         let output = match output {
             Ok(output) => output,
@@ -4108,14 +3361,6 @@ impl WasmComponentActor for ComponentActor {
             CursorState {
                 transition,
                 pages: output.pages,
-                complete_file_state: true,
-                certified_packets_available,
-                certified_all_row_keys: CertifiedPacketRowKeys::default(),
-                certified_packet_pages: Vec::new(),
-                certified_packet_rows: 0,
-                certified_packet_creates: None,
-                certified_packet_schema_keys: BTreeSet::new(),
-                certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
         self.transition_permits.insert(transition.0, permit);
@@ -4211,14 +3456,6 @@ impl WasmComponentActor for ComponentActor {
             CursorState {
                 transition,
                 pages: output.pages,
-                complete_file_state: output.replace_all_rows,
-                certified_packets_available: true,
-                certified_all_row_keys: CertifiedPacketRowKeys::default(),
-                certified_packet_pages: Vec::new(),
-                certified_packet_rows: 0,
-                certified_packet_creates: None,
-                certified_packet_schema_keys: BTreeSet::new(),
-                certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
         self.transition_permits.insert(transition.0, permit);
@@ -4260,14 +3497,6 @@ impl WasmComponentActor for ComponentActor {
             CursorState {
                 transition,
                 pages: output.pages,
-                complete_file_state: output.replace_all_rows,
-                certified_packets_available: true,
-                certified_all_row_keys: CertifiedPacketRowKeys::default(),
-                certified_packet_pages: Vec::new(),
-                certified_packet_rows: 0,
-                certified_packet_creates: None,
-                certified_packet_schema_keys: BTreeSet::new(),
-                certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
         self.transition_permits.insert(transition.0, permit);
@@ -4404,7 +3633,7 @@ impl WasmComponentActor for ComponentActor {
                         })?;
                         let length = snapshot.len() as u64;
                         page_outputs.push(snapshot);
-                        RuntimeColumnMergeResult::Replace(Some(WasmGuestBytes::Output(
+                        RuntimeColumnMergeResult::Replace(Some(WasmGuestColumnValue::Output(
                             WasmOutputRange {
                                 index,
                                 offset: 0,
@@ -4431,7 +3660,7 @@ impl WasmComponentActor for ComponentActor {
                 Some(handle)
             };
             pages.push_back(WasmColumnMergeResultPage {
-                format_version: PACKET_FORMAT_V1,
+                format_version: CURRENT_PACKET_FORMAT,
                 ordinals: page_ordinals,
                 results: page_results,
                 outputs,
@@ -4462,94 +3691,18 @@ impl WasmComponentActor for ComponentActor {
                 "component change cursor belongs to another transition",
             ));
         }
-        loop {
-            match cursor.pages.pop_front() {
-                Some(PendingChangePage::Decoded(page)) => return Ok(Some(page)),
-                Some(PendingChangePage::Packet {
-                    record_count,
-                    payload,
-                    attachments,
-                    max_page_bytes,
-                    limits,
-                    creates,
-                }) => {
-                    if let Some(validated_page) =
-                        validate_created_packet_page(record_count, &payload, creates)
-                            .map_err(component_error)?
-                    {
-                        // Certified immutable segments are the ownership unit
-                        // for complete bulk state. Sparse successors stay as
-                        // ordinary row overlays: this lets validation observe
-                        // their durable base directly and avoids paying a new
-                        // segment/manifest lifecycle for one or two rows.
-                        //
-                        // A file that publishes no commit takes the same
-                        // ordinary path even for a complete parse, because a
-                        // certified packet is materialized by expanding it from
-                        // the file's commit root and there is none to expand
-                        // from. Same rows, row-shaped instead of packed.
-                        if !cursor.complete_file_state || !cursor.certified_packets_available {
-                            let decoded = PendingChangePage::Packet {
-                                record_count,
-                                payload,
-                                attachments,
-                                max_page_bytes,
-                                limits,
-                                creates,
-                            }
-                            .decode()?;
-                            let page_keys = validate_ordinary_packet_page_keys(
-                                &decoded,
-                                creates,
-                                &cursor.certified_all_row_keys,
-                            )?;
-                            cursor.certified_all_row_keys.extend(page_keys);
-                            return Ok(Some(decoded));
-                        }
-                        if cursor
-                            .certified_packet_creates
-                            .is_some_and(|existing| existing != creates)
-                        {
-                            return Err(component_error(
-                                "one certified packet transition used multiple create contexts",
-                            ));
-                        }
-                        let (schema_keys, page_keys) = validate_new_certified_packet_keys(
-                            validated_page,
-                            &cursor.certified_all_row_keys,
-                        )?;
-                        cursor.certified_packet_creates = Some(creates);
-                        cursor.certified_packet_rows = cursor
-                            .certified_packet_rows
-                            .checked_add(u64::from(record_count))
-                            .ok_or_else(|| {
-                                component_error("certified packet row count overflowed")
-                            })?;
-                        cursor.certified_packet_schema_keys.extend(schema_keys);
-                        cursor.certified_all_row_keys.extend_ref(&page_keys);
-                        cursor.certified_packet_row_keys.extend(page_keys);
-                        cursor.certified_packet_pages.push(Bytes::from(payload));
-                    } else {
-                        let decoded = PendingChangePage::Packet {
-                            record_count,
-                            payload,
-                            attachments,
-                            max_page_bytes,
-                            limits,
-                            creates,
-                        }
-                        .decode()?;
-                        let page_keys = validate_ordinary_packet_page_keys(
-                            &decoded,
-                            creates,
-                            &cursor.certified_all_row_keys,
-                        )?;
-                        cursor.certified_all_row_keys.extend(page_keys);
-                        return Ok(Some(decoded));
-                    }
-                }
-                None => return Ok(None),
-            }
+        match cursor.pages.pop_front() {
+            Some(PendingChangePage::Decoded(page)) => Ok(Some(page)),
+            Some(PendingChangePage::Typed {
+                schema_key,
+                schema_fingerprint,
+                mutations,
+            }) => Ok(Some(decode_typed_change_page(
+                schema_key,
+                schema_fingerprint,
+                mutations,
+            )?)),
+            None => Ok(None),
         }
     }
 
@@ -4569,40 +3722,6 @@ impl WasmComponentActor for ComponentActor {
             ));
         }
         Ok(cursor.pages.pop_front())
-    }
-
-    fn take_certified_row_batches(
-        &mut self,
-        transition: WasmTransitionHandle,
-    ) -> Vec<WasmCertifiedRowBatch> {
-        let Some(cursor) = self
-            .cursors
-            .values_mut()
-            .find(|cursor| cursor.transition == transition)
-        else {
-            return Vec::new();
-        };
-        let mut batches = Vec::with_capacity(1);
-        if let Some(creates) = cursor.certified_packet_creates.take() {
-            let schema_keys = std::mem::take(&mut cursor.certified_packet_schema_keys)
-                .into_iter()
-                .collect::<Vec<_>>();
-            let create_ranges = cursor
-                .certified_packet_row_keys
-                .take_create_ranges_for(&schema_keys);
-            cursor.certified_packet_row_keys = CertifiedPacketRowKeys::default();
-            batches.push(WasmCertifiedRowBatch {
-                format: CERTIFIED_CREATED_PACKET_V1,
-                schema_keys,
-                row_count: std::mem::take(&mut cursor.certified_packet_rows),
-                creates,
-                create_ranges,
-                complete_file_state: cursor.complete_file_state,
-                pages: std::mem::take(&mut cursor.certified_packet_pages),
-            });
-        }
-        cursor.certified_all_row_keys = CertifiedPacketRowKeys::default();
-        batches
     }
 
     async fn next_edit_page(
@@ -4772,16 +3891,53 @@ fn component_transition_limits(
 mod tests {
     use super::*;
 
+    fn host_typed_row(schema_key: &str, id: &str) -> WasmHostBytes {
+        WasmHostBytes::Typed(Arc::new(WasmTypedRow {
+            schema_fingerprint: [0; 32],
+            row_pk: vec![lix_schema::Value::Text(id.to_owned())].into(),
+            row: lix_schema::Row::from([
+                ("id".to_owned(), lix_schema::Value::Text(id.to_owned())),
+                (
+                    "schema".to_owned(),
+                    lix_schema::Value::Text(schema_key.to_owned()),
+                ),
+            ]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        }))
+    }
+
+    fn guest_typed_row(schema_key: &str, id: &str) -> WasmGuestRowPayload {
+        match host_typed_row(schema_key, id) {
+            WasmHostBytes::Typed(row) => WasmGuestRowPayload::Typed(row),
+        }
+    }
+
+    fn text_key(schema_key: &str, values: &[&str]) -> WasmRowKey {
+        WasmRowKey::from_typed_parts(
+            schema_key,
+            [0; 32],
+            values
+                .iter()
+                .map(|value| lix_schema::Value::Text((*value).to_owned()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn uuid_key(schema_key: &str, value: uuid::Uuid) -> WasmRowKey {
+        WasmRowKey::from_typed_parts(schema_key, [0; 32], vec![lix_schema::Value::Uuid(value)])
+            .unwrap()
+    }
+
     #[test]
     fn warm_parse_changes_row_source_exposes_complete_current_rows() {
         let limits = WasmTransitionLimits::default();
-        let key = WasmRowKey::from_owned_parts("note", vec!["note-1".to_owned()]);
+        let key = text_key("note", &["note-1"]);
         let source = crate::plugin::runtime::VecRowSource::new(
             vec![WasmRow {
                 key: key.clone(),
-                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-                    br#"{"body":"current"}"#,
-                )),
+                payload: host_typed_row("note", "note-1"),
             }],
             limits,
         )
@@ -4808,8 +3964,8 @@ mod tests {
     #[test]
     fn replace_all_rows_synthesizes_delete_for_omitted_prior_row() {
         let limits = WasmTransitionLimits::default();
-        let keep = WasmRowKey::from_owned_parts("note", vec!["keep".to_owned()]);
-        let omitted = WasmRowKey::from_owned_parts("note", vec!["omitted".to_owned()]);
+        let keep = text_key("note", &["keep"]);
+        let omitted = text_key("note", &["omitted"]);
         let mut state =
             TransitionState::new(limits, WasmCreateContext { high: 1, low: 2 }, false, None)
                 .expect("transition state");
@@ -4817,14 +3973,12 @@ mod tests {
         state
             .pages
             .push_back(PendingChangePage::Decoded(WasmChangePage {
-                format_version: PACKET_FORMAT_V1,
+                format_version: CURRENT_PACKET_FORMAT,
                 changes: WasmRowChanges {
                     changes: vec![WasmRowChange::Upsert {
                         row: WasmRow {
                             key: keep.clone(),
-                            snapshot_content: WasmGuestBytes::Inline(Bytes::from_static(
-                                br#"{"body":"kept"}"#,
-                            )),
+                            payload: guest_typed_row("note", "keep"),
                         },
                         effect: WasmChangeEffect::Content,
                     }],
@@ -4844,244 +3998,6 @@ mod tests {
         assert!(matches!(deletes.as_slice(), [WasmRowChange::Delete(key)] if key == &omitted));
     }
 
-    #[cfg(any())]
-    #[derive(Clone, Debug)]
-    struct JsonTestSource(Vec<u8>);
-
-    #[cfg(any())]
-    impl WasmByteSource for JsonTestSource {
-        fn len(&self) -> u64 {
-            self.0.len() as u64
-        }
-
-        fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
-            let start = usize::try_from(offset)
-                .map_err(|_| component_error("JSON test source offset exceeds usize"))?;
-            let end = start
-                .checked_add(length as usize)
-                .ok_or_else(|| component_error("JSON test source range overflowed"))?;
-            self.0
-                .get(start..end)
-                .map(<[u8]>::to_vec)
-                .ok_or_else(|| component_error("JSON test source range is out of bounds"))
-        }
-    }
-
-    #[cfg(any())]
-    struct JsonTestRowSource {
-        rows: Option<Vec<WasmRow<WasmHostBytes>>>,
-    }
-
-    #[cfg(any())]
-    impl lix::plugin::runtime::WasmRowSource for JsonTestRowSource {
-        fn next_page(
-            &mut self,
-            _max_bytes: u32,
-        ) -> Result<Option<lix::plugin::runtime::WasmRowPage>, LixError> {
-            Ok(self
-                .rows
-                .take()
-                .map(|rows| lix::plugin::runtime::WasmRowPage { rows }))
-        }
-    }
-
-    #[cfg(any())]
-    fn assert_json_full_fallback_state_only(checkpoint: &WasmDocumentCheckpoint) {
-        let root = checkpoint
-            .downcast_ref::<ArenaRoot>()
-            .expect("default runtime checkpoint should contain an arena root");
-        let keys = root.state.keys().collect::<Vec<_>>();
-        assert_eq!(
-            keys.len(),
-            3,
-            "cold fallback should retain only namespace, fallback manifest, and one fallback page"
-        );
-        assert!(keys.contains(&b"json/fallback-rows".as_slice()));
-        assert!(
-            keys.iter()
-                .any(|key| key.starts_with(b"json/fallback-row-page/"))
-        );
-        assert!(!keys.contains(&b"json/scalar-index".as_slice()));
-        assert!(
-            !keys
-                .iter()
-                .any(|key| key.starts_with(b"json/scalar-index-page/"))
-        );
-        assert!(!keys.iter().any(|key| key.starts_with(b"json/scalar-page/")));
-    }
-
-    // Compiled-plugin behavior is covered by `lix_e2e`; keeping an artifact
-    // dependency here would create `lix -> plugin -> lix`.
-    #[cfg(any())]
-    #[tokio::test]
-    async fn json_cold_full_fallback_checkpoint_omits_scalar_state() {
-        let wasm = std::fs::read(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"))
-            .expect("read JSON component");
-        let factory = crate::default_wasm_runtime()
-            .expect("default Wasm runtime")
-            .compile_component(
-                wasm,
-                WasmLimits::default(),
-                PluginCapabilities {
-                    column_merger: true,
-                    file_projection: true,
-                },
-            )
-            .await
-            .expect("compile JSON component");
-        let descriptor = WasmFileDescriptor {
-            file_id: "direct-cold-fallback".to_owned(),
-            path: Some("/direct-cold-fallback.json".to_owned()),
-            plugin: WasmPluginSelection {
-                plugin_key: "plugin_json".to_owned(),
-                generation: "direct".to_owned(),
-            },
-        };
-        let creates = WasmCreateContext { high: 13, low: 17 };
-        let before = br#"{"a":"one","b":"two"}"#.to_vec();
-        let cold_after = br#"{"a":"ONE","b":"two"}"#.to_vec();
-        let rows = vec![
-            WasmRow {
-                key: WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
-                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-                    br#"{"id":"root","kind":"object"}"#,
-                )),
-            },
-            WasmRow {
-                key: WasmRowKey::from_owned_parts(
-                    "json_object_member",
-                    vec!["root".to_owned(), "a".to_owned()],
-                ),
-                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-                    br#"{"parent_id":"root","key":"a","order_key":"40","kind":"string","scalar_json":"\"one\""}"#,
-                )),
-            },
-            WasmRow {
-                key: WasmRowKey::from_owned_parts(
-                    "json_object_member",
-                    vec!["root".to_owned(), "b".to_owned()],
-                ),
-                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-                    br#"{"parent_id":"root","key":"b","order_key":"80","kind":"string","scalar_json":"\"two\""}"#,
-                )),
-            },
-        ];
-        let limits = WasmTransitionLimits::default();
-        let mut actor = factory.instantiate_actor().await.unwrap();
-        let cold = actor
-            .cold_file_changed(
-                limits,
-                WasmColdFileUpdate {
-                    before_descriptor: descriptor.clone(),
-                    after_descriptor: descriptor.clone(),
-                    before: Some(Arc::new(JsonTestSource(before))),
-                    edits: vec![WasmInputSplice {
-                        offset: 6,
-                        delete_len: 3,
-                        insert: WasmInputBytes::Inline(b"ONE".to_vec()),
-                    }],
-                    after: Arc::new(JsonTestSource(cold_after.clone())),
-                    creates,
-                    rows: Box::new(JsonTestRowSource { rows: Some(rows) }),
-                },
-            )
-            .await
-            .expect("cold full-fallback transition should succeed");
-        while actor
-            .next_change_page(cold.transition, cold.changes, 2 * 1024 * 1024)
-            .await
-            .unwrap()
-            .is_some()
-        {}
-        actor.finish_transition(cold.transition).await.unwrap();
-
-        let checkpoint = actor
-            .checkpoint_document(cold.document)
-            .await
-            .unwrap()
-            .expect("component actor should expose a checkpoint");
-        assert_json_full_fallback_state_only(&checkpoint);
-        let durable = checkpoint
-            .durable_checkpoint()
-            .expect("small JSON checkpoint should be durable");
-        let decoded = WasmDurableDocumentCheckpoint::decode(durable.bytes().as_ref())
-            .expect("durable JSON checkpoint should decode");
-        actor.retire().await.unwrap();
-
-        let mut reopened = factory.instantiate_actor().await.unwrap();
-        let document = reopened
-            .restore_durable_document(&decoded, &cold_after)
-            .await
-            .expect("durable fallback checkpoint should reopen against accepted bytes");
-        let successor_after = br#"{"a":"ONE","b":"TWO"}"#.to_vec();
-        let edit_offset = cold_after
-            .windows(3)
-            .position(|window| window == b"two")
-            .expect("fixture should contain edited scalar");
-        let successor = reopened
-            .file_changed(
-                document,
-                limits,
-                WasmFileUpdate {
-                    before_descriptor: descriptor.clone(),
-                    after_descriptor: descriptor,
-                    before: Arc::new(JsonTestSource(cold_after)),
-                    edits: vec![WasmInputSplice {
-                        offset: edit_offset as u64,
-                        delete_len: 3,
-                        insert: WasmInputBytes::Inline(b"TWO".to_vec()),
-                    }],
-                    after: Arc::new(JsonTestSource(successor_after.clone())),
-                    creates,
-                    rows: Some(Box::new(JsonTestRowSource { rows: Some(rows) })),
-                    prior_row_keys: None,
-                },
-            )
-            .await
-            .expect("full-path successor should read fallback state");
-        let mut changes = Vec::new();
-        while let Some(page) = reopened
-            .next_change_page(successor.transition, successor.changes, 2 * 1024 * 1024)
-            .await
-            .unwrap()
-        {
-            changes.extend(page.changes.changes);
-        }
-        let counters = reopened
-            .finish_transition(successor.transition)
-            .await
-            .unwrap();
-        assert!(
-            counters.state_read_calls >= 3,
-            "reopened successor should read namespace, fallback manifest, and fallback page"
-        );
-        assert_eq!(changes.len(), 1);
-        let WasmRowChange::Upsert { row, effect } = &changes[0] else {
-            panic!("successor should upsert the edited JSON member");
-        };
-        assert_eq!(*effect, WasmChangeEffect::Content);
-        assert_eq!(row.key.schema_key.as_str(), "json_object_member");
-        assert_eq!(row.key.row_pk[1].as_str(), "b");
-        let WasmGuestBytes::Inline(snapshot) = &row.snapshot_content else {
-            panic!("small JSON snapshot should remain inline");
-        };
-        let snapshot: serde_json::Value =
-            serde_json::from_slice(snapshot).expect("successor snapshot should be JSON");
-        assert_eq!(snapshot["scalar_json"], r#""TWO""#);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&successor_after).unwrap(),
-            serde_json::json!({"a": "ONE", "b": "TWO"})
-        );
-
-        let successor_checkpoint = reopened
-            .checkpoint_document(successor.document)
-            .await
-            .unwrap()
-            .expect("successor should expose a checkpoint");
-        assert_json_full_fallback_state_only(&successor_checkpoint);
-        reopened.retire().await.unwrap();
-    }
-
     #[test]
     fn plugin_lifecycle_boundary_requires_a_resolved_path() {
         assert_eq!(
@@ -5095,273 +4011,6 @@ mod tests {
             error.message,
             "component open requires a resolved plugin-owned file path"
         );
-    }
-
-    #[test]
-    fn oversized_durable_checkpoint_is_omitted_without_rejecting_the_root() {
-        let root = ArenaRoot::import(
-            ArenaStore::default(),
-            "checkpoint-test",
-            b"accepted",
-            std::iter::empty(),
-            [(b"index".to_vec(), b"opaque-state".to_vec())],
-        )
-        .successor_checkpoint();
-        let encoded_len = root.successor_checkpoint_encoded_len().unwrap();
-
-        assert!(encode_durable_document_checkpoint(&root, encoded_len - 1).is_none());
-        assert!(encode_durable_document_checkpoint(&root, encoded_len).is_some());
-    }
-
-    #[test]
-    fn durable_checkpoint_cache_retains_only_the_latest_state() {
-        let first = ArenaRoot::import(
-            ArenaStore::default(),
-            "checkpoint-test",
-            b"accepted",
-            std::iter::empty(),
-            [(b"index".to_vec(), b"first".to_vec())],
-        )
-        .successor_checkpoint();
-        let second = ArenaRoot::import(
-            ArenaStore::default(),
-            "checkpoint-test",
-            b"accepted",
-            std::iter::empty(),
-            [(b"index".to_vec(), b"second".to_vec())],
-        )
-        .successor_checkpoint();
-        let first_id = first.state.id();
-        let second_id = second.state.id();
-        let mut cache = DurableCheckpointCache::default();
-
-        cache.insert(
-            first_id,
-            encode_durable_document_checkpoint(
-                &first,
-                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
-            )
-            .unwrap(),
-        );
-        cache.insert(
-            second_id,
-            encode_durable_document_checkpoint(
-                &second,
-                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
-            )
-            .unwrap(),
-        );
-
-        assert!(cache.get(&first_id).is_none());
-        assert!(cache.get(&second_id).is_some());
-    }
-
-    fn push_text(output: &mut Vec<u8>, value: &str) {
-        output.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        output.extend_from_slice(value.as_bytes());
-    }
-
-    fn packet_page(tag: u8, schema: &str, identity: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-        let mut record = vec![tag];
-        push_text(&mut record, schema);
-        identity(&mut record);
-        record.push(0);
-        record.extend_from_slice(&2_u32.to_le_bytes());
-        record.extend_from_slice(b"{}");
-
-        let mut page = Vec::with_capacity(record.len() + 4);
-        page.extend_from_slice(&(record.len() as u32).to_le_bytes());
-        page.extend_from_slice(&record);
-        page
-    }
-
-    fn create_page(schema: &str, local_ref: u64) -> Vec<u8> {
-        packet_page(2, schema, |record| {
-            record.extend_from_slice(&local_ref.to_le_bytes());
-        })
-    }
-
-    fn upsert_page(schema: &str, component: &str) -> Vec<u8> {
-        upsert_components_page(schema, &[component])
-    }
-
-    fn upsert_components_page(schema: &str, components: &[&str]) -> Vec<u8> {
-        packet_page(0, schema, |record| {
-            record.extend_from_slice(&(components.len() as u32).to_le_bytes());
-            for component in components {
-                push_text(record, component);
-            }
-            record.push(0);
-        })
-    }
-
-    fn accept_page(
-        payload: &[u8],
-        creates: WasmCreateContext,
-        existing: &mut CertifiedPacketRowKeys,
-    ) -> Result<(), LixError> {
-        let page = validate_created_packet_page(1, payload, creates)
-            .expect("well-framed packet")
-            .expect("certifiable packet");
-        let (_, keys) = validate_new_certified_packet_keys(page, existing)?;
-        existing.extend(keys);
-        Ok(())
-    }
-
-    #[test]
-    fn certified_packet_rejects_duplicate_row_keys_across_pages() {
-        let creates = WasmCreateContext {
-            high: 0x019a_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let mut existing = CertifiedPacketRowKeys::default();
-
-        accept_page(&create_page("row", 7), creates, &mut existing).expect("first page is unique");
-        let duplicate_create = accept_page(&create_page("row", 7), creates, &mut existing)
-            .expect_err("a later page must not repeat a create identity");
-        assert_eq!(
-            duplicate_create.message,
-            "a component row key may occur only once across certified packet pages"
-        );
-
-        let generated_id = creates.component(7).expect("create identity");
-        let explicit_collision =
-            accept_page(&upsert_page("row", &generated_id), creates, &mut existing)
-                .expect_err("an explicit key must not collide with an earlier create");
-        assert_eq!(
-            explicit_collision.message,
-            "a component row key may occur only once across certified packet pages"
-        );
-
-        let mut explicit_keys = CertifiedPacketRowKeys::default();
-        accept_page(
-            &upsert_page("row", "stable-key"),
-            creates,
-            &mut explicit_keys,
-        )
-        .expect("first explicit key is unique");
-        let duplicate_explicit = accept_page(
-            &upsert_page("row", "stable-key"),
-            creates,
-            &mut explicit_keys,
-        )
-        .expect_err("a later page must not repeat an explicit key");
-        assert_eq!(
-            duplicate_explicit.message,
-            "a component row key may occur only once across certified packet pages"
-        );
-
-        let mut canonical_keys = CertifiedPacketRowKeys::default();
-        accept_page(&create_page("row", 7), creates, &mut canonical_keys)
-            .expect("canonical generated key");
-        accept_page(
-            &upsert_page("row", &generated_id.to_uppercase()),
-            creates,
-            &mut canonical_keys,
-        )
-        .expect("noncanonical UUID spelling is a distinct explicit key");
-
-        let mut component_boundaries = CertifiedPacketRowKeys::default();
-        accept_page(
-            &upsert_components_page("row", &["ab", "c"]),
-            creates,
-            &mut component_boundaries,
-        )
-        .expect("first compound key");
-        accept_page(
-            &upsert_components_page("row", &["a", "bc"]),
-            creates,
-            &mut component_boundaries,
-        )
-        .expect("component lengths must delimit the compact fingerprint");
-    }
-
-    #[test]
-    fn certified_packet_rejects_create_refs_outside_authority_format() {
-        let creates = WasmCreateContext {
-            high: 0x019a_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let result =
-            validate_created_packet_page(1, &create_page("row", u64::from(u32::MAX) + 1), creates);
-        assert!(matches!(
-            result,
-            Err(message) if message == "packet create local ref exceeds u32"
-        ));
-    }
-
-    #[test]
-    fn certified_packet_rejects_keys_repeated_by_ordinary_pages() {
-        let creates = WasmCreateContext {
-            high: 0x019a_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let generated_id = creates.component(7).expect("create identity");
-        let ordinary_payload = upsert_page("row", &generated_id);
-        let ordinary = decode_inline_change_page(
-            1,
-            ordinary_payload.clone(),
-            &[],
-            ordinary_payload.len() as u32,
-            WasmTransitionLimits::default(),
-        )
-        .expect("ordinary packet decodes");
-
-        let mut certified_first = CertifiedPacketRowKeys::default();
-        accept_page(&create_page("row", 7), creates, &mut certified_first)
-            .expect("certified create is unique");
-        let duplicate_ordinary =
-            validate_ordinary_packet_page_keys(&ordinary, creates, &certified_first)
-                .expect_err("ordinary write must not repeat a certified identity");
-        assert_eq!(
-            duplicate_ordinary.message,
-            "a component row key may occur only once across certified packet pages"
-        );
-
-        let mut ordinary_first = CertifiedPacketRowKeys::default();
-        let ordinary_keys = validate_ordinary_packet_page_keys(&ordinary, creates, &ordinary_first)
-            .expect("ordinary write is initially unique");
-        ordinary_first.extend(ordinary_keys);
-        let duplicate_certified = accept_page(
-            &upsert_page("row", &generated_id),
-            creates,
-            &mut ordinary_first,
-        )
-        .expect_err("certified write must not repeat an ordinary identity");
-        assert_eq!(
-            duplicate_certified.message,
-            "a component row key may occur only once across certified packet pages"
-        );
-    }
-
-    #[test]
-    fn certified_create_authorities_are_exported_as_compact_ranges() {
-        let creates = WasmCreateContext {
-            high: 0x019a_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let mut keys = CertifiedPacketRowKeys::default();
-        for local_ref in [7, 8, 9, 12] {
-            accept_page(&create_page("row", local_ref), creates, &mut keys)
-                .expect("create identity is unique");
-        }
-
-        assert_eq!(
-            keys.take_create_ranges_for(&["row".to_owned()]),
-            vec![
-                WasmCertifiedCreateRange {
-                    schema_key: "row".to_owned(),
-                    first_local_ref: 7,
-                    last_local_ref: 9,
-                },
-                WasmCertifiedCreateRange {
-                    schema_key: "row".to_owned(),
-                    first_local_ref: 12,
-                    last_local_ref: 12,
-                },
-            ]
-        );
-        assert!(keys.schemas.is_empty());
     }
 
     #[test]
@@ -5483,14 +4132,10 @@ mod tests {
             low: 0x8000_0000,
         };
         let generated_id = creates.component(7).expect("generated id");
+        let generated_id_text = generated_id.to_string();
         let user_key = WasmRow {
-            key: WasmRowKey::from_owned_parts(
-                "json_object_member",
-                vec!["root".to_owned(), generated_id.clone()],
-            ),
-            snapshot_content: WasmHostBytes::Inline(Bytes::from(format!(
-                r#"{{"key":"{generated_id}"}}"#
-            ))),
+            key: text_key("json_object_member", &["root", &generated_id_text]),
+            payload: host_typed_row("json_object_member", &generated_id_text),
         };
         assert_eq!(
             create_context_from_generated_row("json_array_item", &user_key),
@@ -5498,8 +4143,8 @@ mod tests {
         );
 
         let generated_item = WasmRow {
-            key: WasmRowKey::from_owned_parts("json_array_item", vec![generated_id]),
-            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(b"{}")),
+            key: uuid_key("json_array_item", generated_id),
+            payload: host_typed_row("json_array_item", "item"),
         };
         assert_eq!(
             create_context_from_generated_row("json_array_item", &generated_item),

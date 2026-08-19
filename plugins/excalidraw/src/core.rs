@@ -1,5 +1,6 @@
 use crate::order_key::OrderKey;
-use serde_json::{Map, Value, json};
+use lix::plugin::{TypedRow, TypedValue};
+use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -8,8 +9,11 @@ pub const ELEMENT_SCHEMA_KEY: &str = "excalidraw_element";
 pub const FILE_SCHEMA_KEY: &str = "excalidraw_file";
 
 const SCENE_ID: &str = "scene";
-const ELEMENTS_MARKER: &str = "\0lix-excalidraw-elements\0";
-const FILES_MARKER: &str = "\0lix-excalidraw-files\0";
+// Internal template markers are kept in the native typed text payload. NUL
+// bytes are not valid Schema v1 `text` values, so use collision-resistant
+// printable sentinels and validate their uniqueness before substitution.
+const ELEMENTS_MARKER: &str = "__LIX_EXCALIDRAW_ELEMENTS_9A7E__";
+const FILES_MARKER: &str = "__LIX_EXCALIDRAW_FILES_4C2B__";
 const MAX_JSON_DEPTH: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,19 +58,19 @@ pub enum ChangeEffect {
     FormatOnly,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowChange {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Option<Vec<u8>>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<TypedValue>,
+    pub row: Option<TypedRow>,
     pub effect: ChangeEffect,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowRecord {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Vec<u8>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<TypedValue>,
+    pub row: TypedRow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,7 +80,7 @@ pub struct ByteEdit {
     pub insert: Arc<Vec<u8>>,
 }
 
-type RowKey = (String, Vec<String>);
+type RowKey = (Arc<str>, String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SceneRow {
@@ -150,16 +154,16 @@ impl RowChange {
         Self {
             schema_key: record.schema_key,
             row_pk: record.row_pk,
-            snapshot: Some(record.snapshot),
+            row: Some(record.row),
             effect: ChangeEffect::Content,
         }
     }
 
     fn delete(schema_key: &str, id: &str) -> Self {
         Self {
-            schema_key: schema_key.to_owned(),
-            row_pk: vec![id.to_owned()],
-            snapshot: None,
+            schema_key: schema_key.into(),
+            row_pk: vec![TypedValue::Text(id.to_owned())],
+            row: None,
             effect: ChangeEffect::Content,
         }
     }
@@ -167,29 +171,38 @@ impl RowChange {
 
 impl SceneRow {
     fn record(&self) -> Result<RowRecord, String> {
-        let snapshot = serde_json::to_vec(&json!({
-            "id": SCENE_ID,
-            "template_json": self.template_json,
-            "elements_tail_json": self.elements_tail_json,
-            "files_tail_json": self.files_tail_json,
-            "files_present": self.files_present,
-        }))
-        .map_err(|error| format!("serialize Excalidraw scene snapshot: {error}"))?;
+        let mut row = TypedRow::new();
+        row.insert("id".to_owned(), TypedValue::Text(SCENE_ID.to_owned()));
+        row.insert(
+            "template_json".to_owned(),
+            TypedValue::Text(self.template_json.clone()),
+        );
+        row.insert(
+            "elements_tail_json".to_owned(),
+            TypedValue::Text(self.elements_tail_json.clone()),
+        );
+        row.insert(
+            "files_tail_json".to_owned(),
+            TypedValue::Text(self.files_tail_json.clone()),
+        );
+        row.insert(
+            "files_present".to_owned(),
+            TypedValue::Boolean(self.files_present),
+        );
         Ok(RowRecord {
-            schema_key: SCENE_SCHEMA_KEY.to_owned(),
-            row_pk: vec![SCENE_ID.to_owned()],
-            snapshot,
+            schema_key: SCENE_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Text(SCENE_ID.to_owned())],
+            row,
         })
     }
 
     fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, SCENE_SCHEMA_KEY)?;
-        if record.row_pk.as_slice() != [SCENE_ID] {
+        if text_primary_key(record)? != SCENE_ID {
             return Err("excalidraw_scene requires the single primary key \"scene\"".to_owned());
         }
-        let object = snapshot_object(record)?;
         require_fields(
-            &object,
+            &record.row,
             &[
                 "id",
                 "template_json",
@@ -198,14 +211,14 @@ impl SceneRow {
                 "files_present",
             ],
         )?;
-        if required_string(&object, "id")? != SCENE_ID {
-            return Err("excalidraw_scene snapshot id must be \"scene\"".to_owned());
+        if required_text(&record.row, "id")? != SCENE_ID {
+            return Err("excalidraw_scene row id must be \"scene\"".to_owned());
         }
-        let files_present = required_bool(&object, "files_present")?;
+        let files_present = required_typed_bool(&record.row, "files_present")?;
         let scene = Self {
-            template_json: required_string(&object, "template_json")?.to_owned(),
-            elements_tail_json: required_string(&object, "elements_tail_json")?.to_owned(),
-            files_tail_json: required_string(&object, "files_tail_json")?.to_owned(),
+            template_json: required_text(&record.row, "template_json")?.to_owned(),
+            elements_tail_json: required_text(&record.row, "elements_tail_json")?.to_owned(),
+            files_tail_json: required_text(&record.row, "files_tail_json")?.to_owned(),
             files_present,
         };
         scene.validate_template()?;
@@ -278,30 +291,39 @@ impl ElementRow {
     }
 
     fn record(&self) -> Result<RowRecord, String> {
-        let snapshot = serde_json::to_vec(&json!({
-            "id": self.id,
-            "order_key": self.order_key,
-            "leading_json": self.leading_json,
-            "element_type": self.element_type,
-            "is_deleted": self.is_deleted,
-            "element_json": self.element_json,
-        }))
-        .map_err(|error| format!("serialize Excalidraw element snapshot: {error}"))?;
+        let element_json = serde_json::from_str(&self.element_json)
+            .map_err(|error| format!("invalid Excalidraw element JSON: {error}"))?;
+        let mut row = TypedRow::new();
+        row.insert("id".to_owned(), TypedValue::Text(self.id.clone()));
+        row.insert(
+            "order_key".to_owned(),
+            TypedValue::Text(self.order_key.clone()),
+        );
+        row.insert(
+            "leading_json".to_owned(),
+            TypedValue::Text(self.leading_json.clone()),
+        );
+        row.insert(
+            "element_type".to_owned(),
+            TypedValue::Text(self.element_type.clone()),
+        );
+        row.insert(
+            "is_deleted".to_owned(),
+            TypedValue::Boolean(self.is_deleted),
+        );
+        row.insert("element_json".to_owned(), TypedValue::Jsonb(element_json));
         Ok(RowRecord {
-            schema_key: ELEMENT_SCHEMA_KEY.to_owned(),
-            row_pk: vec![self.id.clone()],
-            snapshot,
+            schema_key: ELEMENT_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Text(self.id.clone())],
+            row,
         })
     }
 
     fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, ELEMENT_SCHEMA_KEY)?;
-        let [id] = record.row_pk.as_slice() else {
-            return Err("excalidraw_element requires one primary-key component".to_owned());
-        };
-        let object = snapshot_object(record)?;
+        let id = text_primary_key(record)?;
         require_fields(
-            &object,
+            &record.row,
             &[
                 "id",
                 "order_key",
@@ -311,17 +333,19 @@ impl ElementRow {
                 "element_json",
             ],
         )?;
-        if required_string(&object, "id")? != id {
-            return Err("excalidraw_element snapshot id does not match its key".to_owned());
+        if required_text(&record.row, "id")? != id {
+            return Err("excalidraw_element row id does not match its key".to_owned());
         }
-        let declared_type = required_string(&object, "element_type")?;
-        let declared_deleted = required_bool(&object, "is_deleted")?;
+        let declared_type = required_text(&record.row, "element_type")?;
+        let declared_deleted = required_typed_bool(&record.row, "is_deleted")?;
+        let element_json = serde_json::to_string(required_jsonb(&record.row, "element_json")?)
+            .map_err(|error| format!("serialize Excalidraw element JSONB: {error}"))?;
         let row = Self::from_source(
-            required_string(&object, "order_key")?.to_owned(),
-            required_string(&object, "leading_json")?.to_owned(),
-            required_string(&object, "element_json")?.to_owned(),
+            required_text(&record.row, "order_key")?.to_owned(),
+            required_text(&record.row, "leading_json")?.to_owned(),
+            element_json,
         )?;
-        if row.id != *id {
+        if row.id != id {
             return Err("element_json id does not match the row key".to_owned());
         }
         if row.element_type != declared_type {
@@ -363,35 +387,43 @@ impl FileRow {
     }
 
     fn record(&self) -> Result<RowRecord, String> {
-        let snapshot = serde_json::to_vec(&json!({
-            "id": self.id,
-            "order_key": self.order_key,
-            "prefix_json": self.prefix_json,
-            "file_json": self.file_json,
-        }))
-        .map_err(|error| format!("serialize Excalidraw file snapshot: {error}"))?;
+        let file_json = serde_json::from_str(&self.file_json)
+            .map_err(|error| format!("invalid Excalidraw file JSON: {error}"))?;
+        let mut row = TypedRow::new();
+        row.insert("id".to_owned(), TypedValue::Text(self.id.clone()));
+        row.insert(
+            "order_key".to_owned(),
+            TypedValue::Text(self.order_key.clone()),
+        );
+        row.insert(
+            "prefix_json".to_owned(),
+            TypedValue::Text(self.prefix_json.clone()),
+        );
+        row.insert("file_json".to_owned(), TypedValue::Jsonb(file_json));
         Ok(RowRecord {
-            schema_key: FILE_SCHEMA_KEY.to_owned(),
-            row_pk: vec![self.id.clone()],
-            snapshot,
+            schema_key: FILE_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Text(self.id.clone())],
+            row,
         })
     }
 
     fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, FILE_SCHEMA_KEY)?;
-        let [id] = record.row_pk.as_slice() else {
-            return Err("excalidraw_file requires one primary-key component".to_owned());
-        };
-        let object = snapshot_object(record)?;
-        require_fields(&object, &["id", "order_key", "prefix_json", "file_json"])?;
-        if required_string(&object, "id")? != id {
-            return Err("excalidraw_file snapshot id does not match its key".to_owned());
+        let id = text_primary_key(record)?;
+        require_fields(
+            &record.row,
+            &["id", "order_key", "prefix_json", "file_json"],
+        )?;
+        if required_text(&record.row, "id")? != id {
+            return Err("excalidraw_file row id does not match its key".to_owned());
         }
+        let file_json = serde_json::to_string(required_jsonb(&record.row, "file_json")?)
+            .map_err(|error| format!("serialize Excalidraw file JSONB: {error}"))?;
         Self::from_source(
-            id.clone(),
-            required_string(&object, "order_key")?.to_owned(),
-            required_string(&object, "prefix_json")?.to_owned(),
-            required_string(&object, "file_json")?.to_owned(),
+            id.to_owned(),
+            required_text(&record.row, "order_key")?.to_owned(),
+            required_text(&record.row, "prefix_json")?.to_owned(),
+            file_json,
         )
     }
 }
@@ -575,7 +607,7 @@ impl Document {
         reconcile_order_keys(&self.0.elements, &mut parsed.elements)?;
         reconcile_order_keys(&self.0.files, &mut parsed.files)?;
         let after = Self::from_parsed_source(bytes, parsed);
-        let changes = diff_records(self.records()?, after.records()?);
+        let changes = diff_records(self.records()?, after.records()?)?;
         Ok((after, changes))
     }
 
@@ -592,18 +624,18 @@ impl Document {
         let mut records = self
             .records()?
             .into_iter()
-            .map(|record| (record_key(&record), record))
-            .collect::<HashMap<_, _>>();
+            .map(|record| Ok((record_key(&record)?, record)))
+            .collect::<Result<HashMap<_, _>, String>>()?;
         for change in changes {
             validate_change_key(change)?;
-            let key = (change.schema_key.clone(), change.row_pk.clone());
-            if let Some(snapshot) = &change.snapshot {
+            let key = change_key(change)?;
+            if let Some(row) = &change.row {
                 records.insert(
                     key,
                     RowRecord {
                         schema_key: change.schema_key.clone(),
                         row_pk: change.row_pk.clone(),
-                        snapshot: snapshot.clone(),
+                        row: row.clone(),
                     },
                 );
             } else {
@@ -629,7 +661,7 @@ impl Document {
         &self,
         change: &RowChange,
     ) -> Result<Option<(Self, Vec<ByteEdit>)>, String> {
-        let Some(snapshot) = &change.snapshot else {
+        let Some(row) = &change.row else {
             return Ok(None);
         };
         if change.row_pk.len() != 1 {
@@ -639,9 +671,9 @@ impl Document {
         let record = RowRecord {
             schema_key: change.schema_key.clone(),
             row_pk: change.row_pk.clone(),
-            snapshot: snapshot.clone(),
+            row: row.clone(),
         };
-        match change.schema_key.as_str() {
+        match change.schema_key.as_ref() {
             ELEMENT_SCHEMA_KEY => {
                 let replacement = ElementRow::parse(&record)?;
                 let Some(index) = self
@@ -800,11 +832,11 @@ impl RowImportBuilder {
     }
 
     pub fn push(&mut self, record: RowRecord) -> Result<(), String> {
-        let key = record_key(&record);
+        let key = record_key(&record)?;
         if !self.identities.insert(key.clone()) {
             return Err(format!("duplicate Excalidraw row {key:?}"));
         }
-        match record.schema_key.as_str() {
+        match record.schema_key.as_ref() {
             SCENE_SCHEMA_KEY => {
                 let scene = SceneRow::parse(&record)?;
                 if self.scene.replace(scene).is_some() {
@@ -1655,33 +1687,32 @@ fn validate_rendered_graph(
     Ok(())
 }
 
-fn diff_records(before: Vec<RowRecord>, after: Vec<RowRecord>) -> Vec<RowChange> {
+fn diff_records(before: Vec<RowRecord>, after: Vec<RowRecord>) -> Result<Vec<RowChange>, String> {
     let before = before
         .into_iter()
-        .map(|record| (record_key(&record), record.snapshot))
-        .collect::<HashMap<_, _>>();
+        .map(|record| Ok((record_key(&record)?, record.row)))
+        .collect::<Result<HashMap<_, _>, String>>()?;
     let after = after
         .into_iter()
-        .map(|record| (record_key(&record), record))
-        .collect::<HashMap<_, _>>();
+        .map(|record| Ok((record_key(&record)?, record)))
+        .collect::<Result<HashMap<_, _>, String>>()?;
     let mut changes = Vec::new();
-    for (schema_key, row_pk) in before.keys() {
-        if !after.contains_key(&(schema_key.clone(), row_pk.clone())) {
-            changes.push(RowChange::delete(
-                schema_key,
-                row_pk.first().expect("validated Excalidraw primary key"),
-            ));
+    for (schema_key, row_id) in before.keys() {
+        if !after.contains_key(&(schema_key.clone(), row_id.clone())) {
+            changes.push(RowChange::delete(schema_key, row_id));
         }
     }
     for (key, record) in after {
-        if before.get(&key) != Some(&record.snapshot) {
+        if before.get(&key) != Some(&record.row) {
             changes.push(RowChange::upsert(record));
         }
     }
     changes.sort_unstable_by(|left, right| {
-        (&left.schema_key, &left.row_pk).cmp(&(&right.schema_key, &right.row_pk))
+        change_key(left)
+            .expect("validated Excalidraw change")
+            .cmp(&change_key(right).expect("validated Excalidraw change"))
     });
-    changes
+    Ok(changes)
 }
 
 fn apply_splices(before: &[u8], splices: &[FileEdit<'_>]) -> Result<Vec<u8>, String> {
@@ -1709,23 +1740,34 @@ fn apply_splices(before: &[u8], splices: &[FileEdit<'_>]) -> Result<Vec<u8>, Str
     Ok(output)
 }
 
-fn record_key(record: &RowRecord) -> RowKey {
-    (record.schema_key.clone(), record.row_pk.clone())
+fn record_key(record: &RowRecord) -> Result<RowKey, String> {
+    Ok((
+        record.schema_key.clone(),
+        text_primary_key(record)?.to_owned(),
+    ))
+}
+
+fn change_key(change: &RowChange) -> Result<RowKey, String> {
+    Ok((
+        change.schema_key.clone(),
+        text_key_component(&change.row_pk)?.to_owned(),
+    ))
 }
 
 fn validate_change_key(change: &RowChange) -> Result<(), String> {
-    match (change.schema_key.as_str(), change.row_pk.as_slice()) {
-        (SCENE_SCHEMA_KEY, [id]) if id == SCENE_ID => Ok(()),
-        (ELEMENT_SCHEMA_KEY | FILE_SCHEMA_KEY, [id]) if !id.is_empty() => Ok(()),
-        (SCENE_SCHEMA_KEY | ELEMENT_SCHEMA_KEY | FILE_SCHEMA_KEY, _) => {
+    let id = text_key_component(&change.row_pk)?;
+    match change.schema_key.as_ref() {
+        SCENE_SCHEMA_KEY if id == SCENE_ID => Ok(()),
+        ELEMENT_SCHEMA_KEY | FILE_SCHEMA_KEY if !id.is_empty() => Ok(()),
+        SCENE_SCHEMA_KEY | ELEMENT_SCHEMA_KEY | FILE_SCHEMA_KEY => {
             Err("invalid Excalidraw row primary key".to_owned())
         }
-        (other, _) => Err(format!("unsupported Excalidraw row schema {other:?}")),
+        other => Err(format!("unsupported Excalidraw row schema {other:?}")),
     }
 }
 
 fn require_key(record: &RowRecord, expected: &str) -> Result<(), String> {
-    if record.schema_key == expected {
+    if record.schema_key.as_ref() == expected {
         Ok(())
     } else {
         Err(format!(
@@ -1735,68 +1777,65 @@ fn require_key(record: &RowRecord, expected: &str) -> Result<(), String> {
     }
 }
 
-fn snapshot_object(record: &RowRecord) -> Result<Map<String, Value>, String> {
-    let value: Value = serde_json::from_slice(&record.snapshot)
-        .map_err(|error| format!("invalid Excalidraw row snapshot: {error}"))?;
-    reject_numbers(&value)?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "Excalidraw row snapshot must be an object".to_owned())?
-        .clone();
-    Ok(object)
-}
-
-fn reject_numbers(value: &Value) -> Result<(), String> {
-    match value {
-        Value::Number(_) => Err(
-            "durable Excalidraw snapshots cannot contain JSON numbers; encode payload JSON as text"
-                .to_owned(),
-        ),
-        Value::Array(values) => {
-            for value in values {
-                reject_numbers(value)?;
-            }
-            Ok(())
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                reject_numbers(value)?;
-            }
-            Ok(())
-        }
-        Value::Null | Value::Bool(_) | Value::String(_) => Ok(()),
-    }
-}
-
-fn require_fields(object: &Map<String, Value>, required: &[&str]) -> Result<(), String> {
+fn require_fields(row: &TypedRow, required: &[&str]) -> Result<(), String> {
     let expected = required.iter().copied().collect::<HashSet<_>>();
     for field in required {
-        if !object.contains_key(*field) {
-            return Err(format!("Excalidraw snapshot is missing field {field:?}"));
+        if !row.contains_key(*field) {
+            return Err(format!("Excalidraw row is missing field {field:?}"));
         }
     }
-    for field in object.keys() {
-        if !expected.contains(field.as_str()) {
+    for field in row.keys() {
+        if !expected.contains(field) {
             return Err(format!(
-                "Excalidraw snapshot contains unsupported field {field:?}"
+                "Excalidraw row contains unsupported field {field:?}"
             ));
         }
     }
     Ok(())
 }
 
+fn text_primary_key(record: &RowRecord) -> Result<&str, String> {
+    text_key_component(&record.row_pk)
+}
+
+fn text_key_component(row_pk: &[TypedValue]) -> Result<&str, String> {
+    match row_pk {
+        [TypedValue::Text(id)] => Ok(id),
+        [_] => Err("Excalidraw row primary key must be typed text".to_owned()),
+        _ => Err("Excalidraw row requires one primary-key component".to_owned()),
+    }
+}
+
+fn required_text<'a>(row: &'a TypedRow, field: &str) -> Result<&'a str, String> {
+    match row.get(field) {
+        Some(TypedValue::Text(value)) => Ok(value),
+        _ => Err(format!("Excalidraw row field {field:?} must be typed text")),
+    }
+}
+
+fn required_typed_bool(row: &TypedRow, field: &str) -> Result<bool, String> {
+    match row.get(field) {
+        Some(TypedValue::Boolean(value)) => Ok(*value),
+        _ => Err(format!(
+            "Excalidraw row field {field:?} must be a typed boolean"
+        )),
+    }
+}
+
+fn required_jsonb<'a>(row: &'a TypedRow, field: &str) -> Result<&'a Value, String> {
+    match row.get(field) {
+        Some(TypedValue::Jsonb(value)) => Ok(value),
+        _ => Err(format!(
+            "Excalidraw row field {field:?} must be typed JSONB"
+        )),
+    }
+}
+
 fn required_string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
     object
         .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("Excalidraw snapshot field {field:?} must be a string"))
-}
-
-fn required_bool(object: &Map<String, Value>, field: &str) -> Result<bool, String> {
-    object
-        .get(field)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("Excalidraw snapshot field {field:?} must be a boolean"))
+        .ok_or_else(|| format!("Excalidraw JSON field {field:?} must be a string"))
 }
 
 fn validate_order_key(raw: &str) -> Result<(), String> {

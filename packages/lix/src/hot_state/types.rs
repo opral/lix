@@ -15,6 +15,7 @@ use crate::common::{
     fast_hash_builder,
 };
 use crate::row_pk::RowPk;
+use crate::plugin::runtime::WasmTypedRow;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
 
@@ -84,6 +85,7 @@ pub(crate) struct MaterializedHotStateBatch {
     branch_ids: Vec<BranchIdId>,
     row_pks: Vec<RowPk>,
     snapshot_content: Vec<Option<SharedStr>>,
+    typed_snapshots: Vec<Option<Arc<WasmTypedRow>>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
@@ -110,6 +112,7 @@ pub(crate) struct MaterializedHotStateBatch {
 #[derive(Debug, Clone)]
 struct MaterializedHotStateSingleton {
     row: MaterializedHotStateRow,
+    typed_snapshot: Option<Arc<WasmTypedRow>>,
     durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
@@ -180,7 +183,11 @@ impl MaterializedHotStateBatch {
     /// preserves the previous defensive ordering for mixed serving layouts.
     pub(crate) fn into_identity_ordered_snapshots(mut self) -> Vec<Option<Bytes>> {
         if let Some(singleton) = self.singleton.take() {
-            return vec![singleton.row.snapshot_content.map(SharedStr::into_bytes)];
+            return vec![singleton
+                .typed_snapshot
+                .is_none()
+                .then(|| singleton.row.snapshot_content.map(SharedStr::into_bytes))
+                .flatten()];
         }
         let mut ordinals = (0..self.len()).collect::<Vec<_>>();
         if !ordinals.is_sorted_by(|left, right| {
@@ -202,16 +209,25 @@ impl MaterializedHotStateBatch {
             return self
                 .snapshot_content
                 .into_iter()
-                .map(|snapshot| snapshot.map(SharedStr::into_bytes))
+                .zip(self.typed_snapshots)
+                .map(|(snapshot, typed)| {
+                    typed
+                        .is_none()
+                        .then(|| snapshot.map(SharedStr::into_bytes))
+                        .flatten()
+                })
                 .collect();
         }
 
         ordinals
             .into_iter()
             .map(|ordinal| {
-                self.snapshot_content[ordinal]
-                    .take()
-                    .map(SharedStr::into_bytes)
+                self.typed_snapshots[ordinal].is_none().then(|| {
+                    self.snapshot_content[ordinal]
+                        .take()
+                        .map(SharedStr::into_bytes)
+                })
+                .flatten()
             })
             .collect()
     }
@@ -309,6 +325,7 @@ impl MaterializedHotStateBatch {
         retain_by_mask(&mut self.branch_ids, &mask);
         retain_by_mask(&mut self.row_pks, &mask);
         retain_by_mask(&mut self.snapshot_content, &mask);
+        retain_by_mask(&mut self.typed_snapshots, &mask);
         retain_by_mask(&mut self.metadata, &mask);
         retain_by_mask(&mut self.deleted, &mask);
         retain_by_mask(&mut self.created_at, &mask);
@@ -468,6 +485,13 @@ impl<'a> MaterializedHotStateRowRef<'a> {
         self.singleton().map_or_else(
             || self.batch.snapshot_content[self.index].as_ref(),
             |singleton| singleton.row.snapshot_content.as_ref(),
+        )
+    }
+
+    pub(crate) fn typed_snapshot(self) -> Option<&'a Arc<WasmTypedRow>> {
+        self.singleton().map_or_else(
+            || self.batch.typed_snapshots[self.index].as_ref(),
+            |singleton| singleton.typed_snapshot.as_ref(),
         )
     }
 
@@ -799,6 +823,7 @@ pub(crate) struct MaterializedHotStateBatchBuilder {
     branch_ids: Vec<BranchIdId>,
     row_pks: Vec<RowPk>,
     snapshot_content: Vec<Option<SharedStr>>,
+    typed_snapshots: Vec<Option<Arc<WasmTypedRow>>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
@@ -866,6 +891,7 @@ impl MaterializedHotStateBatchBuilder {
             branch_ids: Vec::with_capacity(column_capacity),
             row_pks: Vec::with_capacity(column_capacity),
             snapshot_content: Vec::with_capacity(column_capacity),
+            typed_snapshots: Vec::with_capacity(column_capacity),
             metadata: Vec::with_capacity(column_capacity),
             deleted: Vec::with_capacity(column_capacity),
             created_at: Vec::with_capacity(column_capacity),
@@ -897,6 +923,7 @@ impl MaterializedHotStateBatchBuilder {
         if self.singleton_capacity && self.singleton.is_none() && self.row_pks.is_empty() {
             self.singleton = Some(Box::new(MaterializedHotStateSingleton {
                 row,
+                typed_snapshot: None,
                 durable_predecessor: None,
                 columnar_base_coordinate: None,
             }));
@@ -1146,7 +1173,9 @@ impl MaterializedHotStateBatchBuilder {
             let branch_id = branch_override.map_or_else(|| row.branch_owner(), Arc::from);
             let durable_predecessor = row.durable_predecessor().cloned();
             let columnar_base_coordinate = row.columnar_base_coordinate();
+            let typed_snapshot = row.typed_snapshot().cloned();
             self.push_owned(row.to_owned_with_branch(branch_id));
+            self.set_typed_snapshot(ordinal, typed_snapshot);
             if let Some(durable_predecessor) = durable_predecessor {
                 self.set_durable_predecessor(ordinal, durable_predecessor);
             }
@@ -1176,6 +1205,7 @@ impl MaterializedHotStateBatchBuilder {
             row.commit_id(),
             row.untracked(),
         );
+        self.set_typed_snapshot(ordinal, row.typed_snapshot().cloned());
         self.durable_predecessor
             .last_mut()
             .expect("pushed live-state row has a predecessor slot")
@@ -1208,6 +1238,7 @@ impl MaterializedHotStateBatchBuilder {
         self.branch_ids.push(branch_id);
         self.row_pks.push(row_pk);
         self.snapshot_content.push(snapshot_content);
+        self.typed_snapshots.push(None);
         self.metadata.push(metadata);
         self.deleted.push(deleted);
         self.created_at.push(created_at);
@@ -1229,6 +1260,19 @@ impl MaterializedHotStateBatchBuilder {
             return;
         }
         self.snapshot_content[row] = Some(value);
+    }
+
+    pub(crate) fn set_typed_snapshot(
+        &mut self,
+        row: usize,
+        value: Option<Arc<WasmTypedRow>>,
+    ) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
+            singleton.typed_snapshot = value;
+            return;
+        }
+        self.typed_snapshots[row] = value;
     }
 
     pub(crate) fn set_metadata(&mut self, row: usize, value: SharedStr) {
@@ -1278,6 +1322,7 @@ impl MaterializedHotStateBatchBuilder {
             branch_ids: self.branch_ids,
             row_pks: self.row_pks,
             snapshot_content: self.snapshot_content,
+            typed_snapshots: self.typed_snapshots,
             metadata: self.metadata,
             deleted: self.deleted,
             created_at: self.created_at,
@@ -1320,6 +1365,7 @@ impl TryFrom<&MaterializedHotStateRow> for MaterializedTrackedStateRow {
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
+            typed_snapshot: None,
             metadata: row.metadata.clone(),
             deleted: row.deleted,
             created_at: row.created_at.to_string(),
@@ -1543,6 +1589,8 @@ pub(crate) struct HotStateRowIdentityRef<'a> {
 
 #[cfg(test)]
 mod batch_tests {
+    use std::sync::OnceLock;
+
     use super::*;
 
     fn row(row_pk: RowPk) -> MaterializedHotStateRow {
@@ -1863,6 +1911,35 @@ mod batch_tests {
             filtered.row(0).schema_key().as_ptr(),
             filtered.row(499).schema_key().as_ptr()
         );
+    }
+
+    #[test]
+    fn filtering_keeps_typed_payloads_aligned_with_surviving_rows() {
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(2);
+        builder.push_owned(row(RowPk::single("tombstone")));
+        builder.push_owned(row(RowPk::single("live")));
+        let typed = Arc::new(WasmTypedRow {
+            schema_fingerprint: [7; 32],
+            row_pk: Arc::from([lix_schema::Value::Text("live".to_owned())]),
+            row: lix_schema::Row::from([(
+                "kind",
+                lix_schema::Value::Text("paragraph".to_owned()),
+            )]),
+            native_payload: OnceLock::new(),
+            boundary_create_validation: OnceLock::new(),
+        });
+        builder.set_typed_snapshot(1, Some(Arc::clone(&typed)));
+
+        let filtered = builder
+            .finish()
+            .filter(|row| row.typed_snapshot().is_some(), None);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.row(0).row_pk(), &RowPk::single("live"));
+        assert!(Arc::ptr_eq(
+            filtered.row(0).typed_snapshot().expect("typed payload"),
+            &typed
+        ));
     }
 
     #[test]

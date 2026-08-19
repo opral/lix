@@ -27,6 +27,7 @@ pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, Lix
         file_id: record.file_id.as_deref(),
         snapshot: record.snapshot.as_ref_slot(),
         metadata: record.metadata.as_ref_slot(),
+        typed_payload: record.typed_payload.as_deref(),
         created_at: record.created_at,
         origin_key: record.origin_key.as_deref(),
     })
@@ -46,6 +47,7 @@ pub(crate) fn append_change_record(
             file_id: record.file_id.as_deref(),
             snapshot: record.snapshot.as_ref_slot(),
             metadata: record.metadata.as_ref_slot(),
+            typed_payload: record.typed_payload.as_deref(),
             created_at: record.created_at,
             origin_key: record.origin_key.as_deref(),
         },
@@ -64,6 +66,7 @@ pub(crate) fn encode_transaction_change_record(
         file_id: record.file_id,
         snapshot: record.snapshot,
         metadata: record.metadata,
+        typed_payload: record.typed_payload,
         created_at: record.created_at,
         origin_key: record.origin_key,
     })
@@ -73,6 +76,13 @@ pub(crate) fn append_transaction_change_record(
     bytes: &mut Vec<u8>,
     record: &TransactionChangeRecordRef<'_>,
 ) -> Result<std::ops::Range<usize>, LixError> {
+    let encoded_typed = record
+        .typed_snapshot
+        .map(|row| {
+            row.durable_payload()
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, format!("cannot encode typed payload: {error:?}")))
+        })
+        .transpose()?;
     append_change_record_ref(
         bytes,
         &ChangeRecordRef {
@@ -83,6 +93,7 @@ pub(crate) fn append_transaction_change_record(
             file_id: record.file_id,
             snapshot: record.snapshot,
             metadata: record.metadata,
+            typed_payload: encoded_typed.as_deref().or(record.typed_payload),
             created_at: record.created_at,
             origin_key: record.origin_key,
         },
@@ -91,14 +102,21 @@ pub(crate) fn append_transaction_change_record(
 
 #[cfg(test)]
 fn encode_change_record_ref(record: &ChangeRecordRef<'_>) -> Result<Vec<u8>, LixError> {
-    // change_id is the storage key; the value intentionally omits it.
-    storage_codec::encode("change record", record)
+    let mut bytes = Vec::new();
+    append_change_record_ref(&mut bytes, record)?;
+    Ok(bytes)
 }
 
 fn append_change_record_ref(
     bytes: &mut Vec<u8>,
     record: &ChangeRecordRef<'_>,
 ) -> Result<std::ops::Range<usize>, LixError> {
+    if record.snapshot != crate::json_store::JsonSlotRef::None && record.typed_payload.is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "change record must not carry both JSON and typed payloads",
+        ));
+    }
     // change_id is the storage key; the value intentionally omits it.
     storage_codec::append("change record", bytes, record)
 }
@@ -108,7 +126,7 @@ pub(crate) fn decode_change_record(
     change_id: ChangeId,
 ) -> Result<ChangeRecord, LixError> {
     let view: ChangeRecordView<'_> = storage_codec::decode("change record", bytes)?;
-    Ok(ChangeRecord {
+    let record = ChangeRecord {
         format_version: view.format_version,
         change_id,
         account_id: view.account_id.to_string(),
@@ -117,9 +135,17 @@ pub(crate) fn decode_change_record(
         file_id: view.file_id,
         snapshot: view.snapshot,
         metadata: view.metadata,
+        typed_payload: view.typed_payload,
         created_at: view.created_at,
         origin_key: view.origin_key,
-    })
+    };
+    if record.snapshot.is_some() && record.typed_payload.is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "change record carries both JSON and typed payloads",
+        ));
+    }
+    Ok(record)
 }
 
 #[cfg(test)]
@@ -167,6 +193,7 @@ mod tests {
             file_id: Some("file-1".to_string()),
             snapshot: JsonSlot::Ref(JsonRef::for_content(b"snapshot")),
             metadata: JsonSlot::Ref(JsonRef::for_content(b"metadata")),
+            typed_payload: None,
             created_at: LixTimestamp::expect_parse("created_at", "2026-06-10T00:00:00.000Z"),
             origin_key: Some("codec-test-origin".to_string()),
         }

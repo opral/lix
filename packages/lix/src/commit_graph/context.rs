@@ -698,6 +698,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
         file_id: change.file_id,
         snapshot: change.snapshot,
         metadata: change.metadata,
+        typed_payload: change.typed_payload,
         created_at: change.created_at,
         origin_key: change.origin_key,
     }
@@ -919,7 +920,7 @@ fn change_matches_history_request(
     change: &CommitGraphChange,
     request: &CommitGraphChangeHistoryRequest,
 ) -> bool {
-    (request.include_tombstones || change.snapshot.is_some())
+    (request.include_tombstones || change.snapshot.is_some() || change.typed_payload.is_some())
         && (request.row_pks.is_empty() || request.row_pks.contains(&change.row_pk))
         && (request.schema_keys.is_empty() || request.schema_keys.contains(&change.schema_key))
         && (request.file_ids.is_empty()
@@ -952,6 +953,7 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
+        typed_payload: None,
         created_at: node.created_at,
         origin_key: None,
     }
@@ -1590,6 +1592,8 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1607,6 +1611,8 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1624,6 +1630,8 @@ mod tests {
                 },
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1963,6 +1971,7 @@ mod tests {
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::None,
                     metadata: crate::json_store::JsonSlot::None,
+                    typed_payload: None,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     origin_key: None,
                 },
@@ -1997,6 +2006,7 @@ mod tests {
                             crate::json_store::JsonSlot::from_json(content)
                         }),
                     metadata: crate::json_store::JsonSlot::None,
+                    typed_payload: None,
                     created_at: ts(created_at),
                     origin_key: None,
                 },
@@ -2133,12 +2143,14 @@ mod tests {
                         row_pk: &change.row_pk,
                         change_id: change.change_id,
                         commit_id: *commit_id,
-                        deleted: change.snapshot.is_none(),
+                        deleted: change.snapshot.is_none() && change.typed_payload.is_none(),
                         created_at: change.created_at,
                         updated_at: change.created_at,
                     },
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),
+                    typed_snapshot: None,
+                    typed_payload: None,
                     origin_key: change.origin_key.as_deref(),
                     base_coordinate: None,
                     authored: true,
@@ -2210,6 +2222,7 @@ mod tests {
             file_id: change.change.file_id.clone(),
             snapshot: change.change.snapshot.clone(),
             metadata: change.change.metadata.clone(),
+            typed_payload: None,
             created_at: change.change.created_at,
             origin_key: change.change.origin_key.clone(),
         }

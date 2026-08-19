@@ -386,6 +386,7 @@ mod tests {
                     updated_at: timestamp,
                     snapshot: snapshot.as_ref_slot(),
                     metadata: crate::json_store::JsonSlotRef::None,
+                    typed_snapshot: None,
                     columnar_base_coordinate: None,
                 }],
                 &std::collections::BTreeSet::new(),

@@ -3155,7 +3155,6 @@ dependencies = [
  "lix_collaboration_test_support",
  "mimalloc",
  "object_store 0.14.0",
- "plugin_conversation",
  "plugin_csv",
  "plugin_excalidraw",
  "plugin_json",
@@ -3168,6 +3167,7 @@ dependencies = [
  "slatedb",
  "smallvec",
  "tempfile",
+ "test_plugin_column_merger",
  "tokio",
  "tpchgen",
  "tracing",
@@ -3756,18 +3756,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin_conversation"
-version = "0.12.2"
-dependencies = [
- "lix",
-]
-
-[[package]]
 name = "plugin_csv"
 version = "0.12.2"
 dependencies = [
  "base64",
  "lix",
+ "lix-schema",
  "serde_json",
  "uuid",
 ]
@@ -3811,8 +3805,6 @@ version = "0.12.2"
 dependencies = [
  "base64",
  "lix",
- "serde",
- "serde_json",
  "uuid",
 ]
 
@@ -4661,6 +4653,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "test_plugin_column_merger"
+version = "0.11.0"
+dependencies = [
+ "lix",
 ]
 
 [[package]]

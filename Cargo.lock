@@ -3650,18 +3650,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin_conversation"
-version = "0.12.2"
-dependencies = [
- "lix",
-]
-
-[[package]]
 name = "plugin_csv"
 version = "0.12.2"
 dependencies = [
  "base64",
  "lix",
+ "lix-schema",
  "serde_json",
  "uuid",
 ]
@@ -3705,8 +3699,6 @@ version = "0.12.2"
 dependencies = [
  "base64",
  "lix",
- "serde",
- "serde_json",
  "uuid",
 ]
 

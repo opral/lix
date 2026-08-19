@@ -1,0 +1,26 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "merge_test_row",
+  "description": "Test-only row used to exercise per-column plugin merging.",
+  "columns": [
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false
+    },
+    {
+      "name": "body",
+      "type": "text",
+      "nullable": false
+    },
+    {
+      "name": "label",
+      "type": "text",
+      "nullable": false,
+      "description": "Control column that must retain host LWW behavior."
+    }
+  ],
+  "primary_key": [
+    "id"
+  ]
+}

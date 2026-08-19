@@ -1,7 +1,0 @@
-{
-  "key": "plugin_conversation",
-  "entry": "plugin.wasm",
-  "schemas": [
-    "schema/conversation.json"
-  ]
-}

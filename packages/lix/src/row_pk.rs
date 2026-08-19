@@ -25,6 +25,29 @@ pub(crate) struct RowPk {
 }
 
 impl RowPk {
+    /// Compares a durable engine identity with native Schema v1 key values
+    /// without rebuilding an intermediate `RowPk`.
+    #[inline(always)]
+    pub(crate) fn matches_schema_values(&self, values: &[lix_schema::Value]) -> bool {
+        self.components.len() == values.len()
+            && self
+                .components
+                .iter()
+                .zip(values)
+                .all(|(component, value)| match (component, value) {
+                    (RowPkComponent::Uuid(left), lix_schema::Value::Uuid(right)) => {
+                        left == right.as_bytes()
+                    }
+                    (RowPkComponent::Integer(left), lix_schema::Value::Int8(right)) => {
+                        left == right
+                    }
+                    (RowPkComponent::String(left), lix_schema::Value::Text(right)) => {
+                        left.as_str() == right
+                    }
+                    _ => false,
+                })
+    }
+
     /// How many refcounted buffer handles one `clone` of this key duplicates.
     ///
     /// A composite key shares one `Arc` over its component slice, so it costs
@@ -153,7 +176,10 @@ pub(crate) enum RowPkComponentType {
     // handle it, one of them feeding the schema-surface fingerprint
     // (sql2/catalog/schema_surface.rs), so removing the variant is a
     // design decision about binary primary keys, not dead-code hygiene.
-    #[allow(dead_code, reason = "unconstructible after the Schema v1 cut; see comment")]
+    #[allow(
+        dead_code,
+        reason = "unconstructible after the Schema v1 cut; see comment"
+    )]
     Bytes,
 }
 
@@ -261,9 +287,7 @@ impl RowPk {
 
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         let tuple_storage = match &self.components {
-            RowPkComponents::Shared(components) => {
-                components.len() * size_of::<RowPkComponent>()
-            }
+            RowPkComponents::Shared(components) => components.len() * size_of::<RowPkComponent>(),
             RowPkComponents::Empty | RowPkComponents::Single(_) => 0,
         };
         tuple_storage
@@ -278,9 +302,7 @@ impl RowPk {
                 .sum::<usize>()
     }
 
-    pub(crate) fn from_components(
-        components: RowPkComponentBuffer,
-    ) -> Result<Self, RowPkError> {
+    pub(crate) fn from_components(components: RowPkComponentBuffer) -> Result<Self, RowPkError> {
         if components.is_empty() {
             return Err(RowPkError::EmptyPrimaryKey);
         }
@@ -295,6 +317,24 @@ impl RowPk {
         Ok(Self {
             components: RowPkComponents::from_smallvec(components),
         })
+    }
+
+    /// Builds an engine identity directly from native Schema v1 primary-key
+    /// values. Schema v1 permits only UUID, INT8, and TEXT primary-key
+    /// columns, so accepting any other value here would erase type information
+    /// at the typed plugin boundary.
+    pub(crate) fn from_schema_values(values: &[lix_schema::Value]) -> Result<Self, RowPkError> {
+        let components = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| match value {
+                lix_schema::Value::Uuid(value) => Ok(RowPkComponent::Uuid(*value.as_bytes())),
+                lix_schema::Value::Int8(value) => Ok(RowPkComponent::Integer(*value)),
+                lix_schema::Value::Text(value) => Ok(RowPkComponent::String(value.clone().into())),
+                _ => Err(RowPkError::UnsupportedPrimaryKeyValue { index }),
+            })
+            .collect::<Result<RowPkComponentBuffer, _>>()?;
+        Self::from_components(components)
     }
 
     pub(crate) fn uuid_from_canonical(value: &str) -> Result<Self, RowPkError> {
@@ -495,9 +535,48 @@ impl RowPk {
     }
 
     pub(crate) fn as_json_array_text(&self) -> Result<String, LixError> {
-        serde_json::to_string(&self.as_json_array_value()?).map_err(|error| {
-            LixError::unknown(format!("failed to encode row pk as JSON: {error}"))
-        })
+        if self.components.is_empty() {
+            return Err(LixError::unknown(
+                "row primary key must contain at least one primary-key part",
+            ));
+        }
+        let mut encoded = Vec::with_capacity(self.components.len().saturating_mul(40) + 2);
+        encoded.push(b'[');
+        for (index, component) in self.components.iter().enumerate() {
+            if index != 0 {
+                encoded.push(b',');
+            }
+            match component {
+                RowPkComponent::Uuid(bytes) => {
+                    let mut buffer = [0_u8; 36];
+                    let uuid = uuid::Uuid::from_bytes(*bytes);
+                    let value = uuid.hyphenated().encode_lower(&mut buffer);
+                    encoded.push(b'"');
+                    encoded.extend_from_slice(value.as_bytes());
+                    encoded.push(b'"');
+                }
+                RowPkComponent::Integer(value) => {
+                    serde_json::to_writer(&mut encoded, value).map_err(|error| {
+                        LixError::unknown(format!("failed to encode row pk as JSON: {error}"))
+                    })?;
+                }
+                RowPkComponent::String(value) => {
+                    serde_json::to_writer(&mut encoded, value.as_str()).map_err(|error| {
+                        LixError::unknown(format!("failed to encode row pk as JSON: {error}"))
+                    })?;
+                }
+                RowPkComponent::Bytes(value) => {
+                    let value = base64::engine::general_purpose::STANDARD.encode(value);
+                    serde_json::to_writer(&mut encoded, &value).map_err(|error| {
+                        LixError::unknown(format!("failed to encode row pk as JSON: {error}"))
+                    })?;
+                }
+            }
+        }
+        encoded.push(b']');
+        // Every branch writes only ASCII syntax/UUID/base64 bytes or text
+        // accepted by serde_json's UTF-8 string serializer.
+        Ok(unsafe { String::from_utf8_unchecked(encoded) })
     }
 
     pub(crate) fn as_single_string(&self) -> Result<&str, LixError> {
@@ -740,9 +819,9 @@ where
                 ),
                 3 => RowPkComponent::Bytes(component.value.into()),
                 tag => {
-                    return Err(cx.message(format_args!(
-                        "unknown row primary-key component tag {tag}"
-                    )));
+                    return Err(
+                        cx.message(format_args!("unknown row primary-key component tag {tag}"))
+                    );
                 }
             };
             components.push(component);
@@ -784,14 +863,12 @@ fn component_from_external_shared_part(
             )?;
             Ok(RowPkComponent::Uuid(bytes))
         }
-        RowPkComponentType::Integer => {
-            Ok(RowPkComponent::Integer(part.as_str().parse().map_err(
-                |_| RowPkError::InvalidPrimaryKeyValue {
-                    index,
-                    expected: "integer",
-                },
-            )?))
-        }
+        RowPkComponentType::Integer => Ok(RowPkComponent::Integer(part.as_str().parse().map_err(
+            |_| RowPkError::InvalidPrimaryKeyValue {
+                index,
+                expected: "integer",
+            },
+        )?)),
         RowPkComponentType::String => Ok(RowPkComponent::String(part)),
         RowPkComponentType::Bytes => base64::engine::general_purpose::STANDARD
             .decode(part.as_bytes())
@@ -810,12 +887,10 @@ fn component_from_json_value(
 ) -> Result<RowPkComponent, RowPkError> {
     match component_type {
         RowPkComponentType::Uuid => {
-            let value = value
-                .as_str()
-                .ok_or(RowPkError::InvalidPrimaryKeyValue {
-                    index,
-                    expected: "UUID string",
-                })?;
+            let value = value.as_str().ok_or(RowPkError::InvalidPrimaryKeyValue {
+                index,
+                expected: "UUID string",
+            })?;
             let bytes = crate::storage_codec::id_string::uuid_bytes_from_canonical(value).ok_or(
                 RowPkError::InvalidPrimaryKeyValue {
                     index,
@@ -824,12 +899,15 @@ fn component_from_json_value(
             )?;
             Ok(RowPkComponent::Uuid(bytes))
         }
-        RowPkComponentType::Integer => value.as_i64().map(RowPkComponent::Integer).ok_or(
-            RowPkError::InvalidPrimaryKeyValue {
-                index,
-                expected: "signed 64-bit integer",
-            },
-        ),
+        RowPkComponentType::Integer => {
+            value
+                .as_i64()
+                .map(RowPkComponent::Integer)
+                .ok_or(RowPkError::InvalidPrimaryKeyValue {
+                    index,
+                    expected: "signed 64-bit integer",
+                })
+        }
         RowPkComponentType::String => value
             .as_str()
             .map(|value| RowPkComponent::String(value.into()))
@@ -838,12 +916,10 @@ fn component_from_json_value(
                 expected: "string",
             }),
         RowPkComponentType::Bytes => {
-            let value = value
-                .as_str()
-                .ok_or(RowPkError::InvalidPrimaryKeyValue {
-                    index,
-                    expected: "base64 string",
-                })?;
+            let value = value.as_str().ok_or(RowPkError::InvalidPrimaryKeyValue {
+                index,
+                expected: "base64 string",
+            })?;
             base64::engine::general_purpose::STANDARD
                 .decode(value)
                 .map(|value| RowPkComponent::Bytes(value.into()))
@@ -908,8 +984,8 @@ mod tests {
 
     #[test]
     fn composite_identity_projects_to_json_array_row_pk() {
-        let identity = RowPk::tuple(vec!["namespace".to_string(), "42".to_string()])
-            .expect("tuple identity");
+        let identity =
+            RowPk::tuple(vec!["namespace".to_string(), "42".to_string()]).expect("tuple identity");
 
         assert_eq!(
             identity
@@ -1065,10 +1141,7 @@ mod tests {
         assert_eq!(
             RowPk::from_shared_external_parts(
                 [SharedStr::from_static("not-an-integer")],
-                &[
-                    RowPkComponentType::Integer,
-                    RowPkComponentType::String,
-                ],
+                &[RowPkComponentType::Integer, RowPkComponentType::String,],
             ),
             Err(RowPkError::InvalidEncodedRowPk)
         );
@@ -1076,8 +1149,8 @@ mod tests {
 
     #[test]
     fn row_pk_json_array_roundtrips() {
-        let identity = RowPk::tuple(vec!["namespace".to_string(), "42".to_string()])
-            .expect("tuple identity");
+        let identity =
+            RowPk::tuple(vec!["namespace".to_string(), "42".to_string()]).expect("tuple identity");
         let encoded = identity
             .as_json_array_text()
             .expect("projection should work");
@@ -1109,8 +1182,8 @@ mod tests {
     fn row_pk_json_array_does_not_collide_on_delimiter_like_values() {
         let left =
             RowPk::tuple(vec!["a~b".to_string(), "c".to_string()]).expect("left tuple identity");
-        let right = RowPk::tuple(vec!["a".to_string(), "b~c".to_string()])
-            .expect("right tuple identity");
+        let right =
+            RowPk::tuple(vec!["a".to_string(), "b~c".to_string()]).expect("right tuple identity");
 
         assert_ne!(
             left.as_json_array_text().expect("left should encode"),
@@ -1120,8 +1193,8 @@ mod tests {
 
     #[test]
     fn composite_identity_rejects_single_string_projection() {
-        let identity = RowPk::tuple(vec!["namespace".to_string(), "42".to_string()])
-            .expect("tuple identity");
+        let identity =
+            RowPk::tuple(vec!["namespace".to_string(), "42".to_string()]).expect("tuple identity");
 
         assert!(identity.as_single_string().is_err());
     }
@@ -1130,8 +1203,8 @@ mod tests {
     fn composite_identity_does_not_collide_on_delimiter_like_values() {
         let left =
             RowPk::tuple(vec!["a~b".to_string(), "1".to_string()]).expect("left tuple identity");
-        let right = RowPk::tuple(vec!["a".to_string(), "b~1".to_string()])
-            .expect("right tuple identity");
+        let right =
+            RowPk::tuple(vec!["a".to_string(), "b~1".to_string()]).expect("right tuple identity");
 
         assert_ne!(
             left.as_json_array_text().expect("left should encode"),
@@ -1176,6 +1249,30 @@ mod tests {
         );
         assert_eq!(
             RowPk::from_json_array_text("[[\"nested\"]]"),
+            Err(RowPkError::UnsupportedPrimaryKeyValue { index: 0 })
+        );
+    }
+
+    #[test]
+    fn schema_values_preserve_native_primary_key_types() {
+        let id = uuid::Uuid::from_bytes([0x2a; 16]);
+        let identity = RowPk::from_schema_values(&[
+            lix_schema::Value::Uuid(id),
+            lix_schema::Value::Int8(-42),
+            lix_schema::Value::Text("part".to_owned()),
+        ])
+        .expect("Schema v1 primary key should decode");
+
+        assert_eq!(
+            identity.components.as_slice(),
+            &[
+                RowPkComponent::Uuid([0x2a; 16]),
+                RowPkComponent::Integer(-42),
+                RowPkComponent::String("part".into()),
+            ]
+        );
+        assert_eq!(
+            RowPk::from_schema_values(&[lix_schema::Value::Jsonb(serde_json::json!({}).into(),)]),
             Err(RowPkError::UnsupportedPrimaryKeyValue { index: 0 })
         );
     }
@@ -1226,10 +1323,7 @@ mod tests {
         assert_eq!(
             RowPk::from_primary_key_paths(
                 &snapshot,
-                &[
-                    vec!["row_pk".to_string()],
-                    vec!["schema_key".to_string()],
-                ],
+                &[vec!["row_pk".to_string()], vec!["schema_key".to_string()],],
             ),
             Err(RowPkError::InvalidPrimaryKeyValue {
                 index: 0,
@@ -1255,8 +1349,8 @@ mod tests {
         let bytes = crate::storage_codec::encode("row primary key", &identity)
             .expect("row pk should encode");
 
-        let decoded: RowPk = crate::storage_codec::decode("row primary key", &bytes)
-            .expect("row pk should decode");
+        let decoded: RowPk =
+            crate::storage_codec::decode("row primary key", &bytes).expect("row pk should decode");
 
         assert_eq!(decoded, identity);
     }

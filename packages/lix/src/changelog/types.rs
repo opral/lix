@@ -3,6 +3,7 @@ use crate::common::LixTimestamp;
 use crate::common::{ExactBatch, ExactValue};
 use crate::row_pk::RowPk;
 use crate::json_store::{JsonRef, JsonSlot};
+use crate::plugin::runtime::WasmTypedRow;
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -674,6 +675,9 @@ pub(crate) struct ChangeRecord {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: JsonSlot,
     pub(crate) metadata: JsonSlot,
+    /// Native Schema v1 payload for plugin rows. Generic engine rows leave
+    /// this absent and continue to use the JSON snapshot slot.
+    pub(crate) typed_payload: Option<Vec<u8>>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
 }
@@ -691,6 +695,8 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) typed_payload: Option<&'a [u8]>,
     pub(crate) created_at: LixTimestamp,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) origin_key: Option<&'a str>,
@@ -713,6 +719,10 @@ pub(crate) struct TransactionChangeRecordRef<'a> {
     pub(crate) file_id: Option<&'a str>,
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    /// Transaction rows retain the typed row until the terminal append so
+    /// encoding does not allocate a second durable JSON projection.
+    pub(crate) typed_snapshot: Option<&'a WasmTypedRow>,
+    pub(crate) typed_payload: Option<&'a [u8]>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<&'a str>,
 }
@@ -728,6 +738,8 @@ impl<'a> From<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
             file_id: record.file_id.as_deref(),
             snapshot: record.snapshot.as_ref_slot(),
             metadata: record.metadata.as_ref_slot(),
+            typed_snapshot: None,
+            typed_payload: record.typed_payload.as_deref(),
             created_at: record.created_at,
             origin_key: record.origin_key.as_deref(),
         }
@@ -758,6 +770,8 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) snapshot: JsonSlot,
     #[musli(with = crate::json_store::json_slot_storage)]
     pub(crate) metadata: JsonSlot,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) typed_payload: Option<Vec<u8>>,
     pub(crate) created_at: LixTimestamp,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) origin_key: Option<String>,

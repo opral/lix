@@ -442,6 +442,11 @@ pub(crate) fn current_state_mutation_authority_digest(
     }
     digest.update(&(inventory.part_count() as u64).to_be_bytes());
     digest.update(&(inventory.direct_part_row_counts.len() as u64).to_be_bytes());
+    digest.update(&(inventory.direct_part_ownership.len() as u64).to_be_bytes());
+    for ownership in &inventory.direct_part_ownership {
+        digest.update(&(ownership.len() as u64).to_be_bytes());
+        digest.update(ownership);
+    }
     let generic_part_count = if inventory.replacement_generation.is_some() {
         0
     } else {
@@ -1183,6 +1188,8 @@ mod tests {
                 },
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -1200,6 +1207,8 @@ mod tests {
                 },
                 snapshot: JsonSlotRef::Inline("{\"version\":2}"),
                 metadata: JsonSlotRef::None,
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -1338,6 +1347,8 @@ mod tests {
             },
             snapshot: JsonSlotRef::Inline("{\"version\":1}"),
             metadata: JsonSlotRef::None,
+            typed_snapshot: None,
+            typed_payload: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1443,6 +1454,8 @@ mod tests {
             },
             snapshot: JsonSlotRef::Inline("{\"version\":2}"),
             metadata: JsonSlotRef::None,
+            typed_snapshot: None,
+            typed_payload: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1539,6 +1552,8 @@ mod tests {
             },
             snapshot: JsonSlotRef::Inline("{\"version\":2}"),
             metadata: JsonSlotRef::None,
+            typed_snapshot: None,
+            typed_payload: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1556,6 +1571,8 @@ mod tests {
             },
             snapshot: JsonSlotRef::Inline("{\"version\":3}"),
             metadata: JsonSlotRef::None,
+            typed_snapshot: None,
+            typed_payload: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,

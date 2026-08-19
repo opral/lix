@@ -32,7 +32,7 @@ use crate::hot_state::{
     HotStateReadDomain, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRowRef,
 };
-use crate::plugin::runtime::PLUGIN_OWNER_KEY;
+use crate::plugin::runtime::{PLUGIN_OWNER_KEY, WasmTypedRow};
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{
@@ -383,7 +383,10 @@ async fn load_committed_constraint_rows(
 pub(crate) async fn validate_prepared_writes(
     input: TransactionValidationInput<'_>,
 ) -> Result<StagedIndexValues, LixError> {
-    validate_foreign_key_definitions(input.schema_catalog)?;
+    // `CatalogSnapshot::rebuild_plans` binds and validates every foreign key
+    // when the immutable transaction-visible catalog is constructed. Reparse
+    // of every schema here repeated that proof on every write and dominated
+    // small typed plugin updates.
     let staged_rows = input.staged_writes.rows().collect::<Vec<_>>();
     let constraint_rows = input.staged_writes.constraint_rows().collect::<Vec<_>>();
     let pending_file_descriptors = PendingFileDescriptorIndex::from_rows(&constraint_rows);
@@ -415,16 +418,16 @@ pub(crate) async fn validate_prepared_writes(
     let mut validated_constraint_rows =
         BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
     let mut file_owner_validator = FileOwnerReferenceValidator::default();
-    let mut staged_snapshots = Vec::new();
+    let mut staged_constraint_rows = Vec::new();
     let mut index_extractor = StagedIndexExtractor::new(input.schema_catalog);
     for row in &constraint_rows {
         let row = *row;
-        let Some(snapshot) = row.snapshot_json() else {
+        if row.is_tombstone() {
             pending_constraints.remember_tombstone(row);
             continue;
-        };
+        }
         let validated = validate_row_content(input.schema_catalog, &pending_schema_domains, row)?;
-        pending_constraints.remember_row(row, validated.schema_plan, snapshot)?;
+        pending_constraints.remember_row(row, validated.schema_plan, validated.payload)?;
         validated_constraint_rows.insert(row.domain_row_identity(), validated);
     }
     for row in &staged_rows {
@@ -441,8 +444,11 @@ pub(crate) async fn validate_prepared_writes(
                 validate_row_content(input.schema_catalog, &pending_schema_domains, row)
             })?;
         let schema_plan = validated.schema_plan;
-        let snapshot = validated.snapshot;
-        if let Some(snapshot) = snapshot {
+        match validated.payload {
+            ValidatedRowPayload::Deleted => {
+                pending_constraints.remember_tombstone(row);
+            }
+            ValidatedRowPayload::Json(snapshot) => {
             file_owner_validator
                 .validate(&input, &pending_file_descriptors, row)
                 .instrument(tracing::debug_span!(
@@ -453,7 +459,11 @@ pub(crate) async fn validate_prepared_writes(
             if !row.row_content_validated() {
                 validate_primary_key_identity(row, schema_plan, snapshot)?;
             }
-            pending_constraints.remember_foreign_key_references(row, schema_plan, snapshot)?;
+            pending_constraints.remember_foreign_key_references(
+                row,
+                schema_plan,
+                ValidatedRowPayload::Json(snapshot),
+            )?;
             // The hot index plane's values are lifted out here, where the
             // snapshot is already a parsed `JsonValue` that validation owns.
             // Commit therefore receives them pre-extracted and never decodes a
@@ -461,13 +471,29 @@ pub(crate) async fn validate_prepared_writes(
             // purpose, and routing around it with a second
             // `serde_json::from_str` was a whole extra parse of every row.
             index_extractor.observe(row, snapshot);
-            staged_snapshots.push((row, schema_plan, snapshot));
-        } else {
-            pending_constraints.remember_tombstone(row);
+            staged_constraint_rows.push((row, schema_plan, ValidatedRowPayload::Json(snapshot)));
+            }
+            ValidatedRowPayload::Typed(typed) => {
+                file_owner_validator
+                    .validate(&input, &pending_file_descriptors, row)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.validation.file_owner"
+                    ))
+                    .await?;
+                validate_typed_primary_key_identity(row, typed)?;
+                pending_constraints.remember_foreign_key_references(
+                    row,
+                    schema_plan,
+                    ValidatedRowPayload::Typed(typed),
+                )?;
+                index_extractor.observe_typed(row, &typed.row);
+                staged_constraint_rows.push((row, schema_plan, ValidatedRowPayload::Typed(typed)));
+            }
         }
     }
     let unresolved_foreign_keys =
-        validate_pending_foreign_keys(&input, &pending_constraints, &staged_snapshots)?;
+        validate_pending_foreign_keys(&input, &pending_constraints, &staged_constraint_rows)?;
     validate_pending_delete_restrictions(input.schema_catalog, &pending_constraints)?;
     let unresolved_foreign_keys =
         validate_committed_foreign_keys(&input, &pending_constraints, &unresolved_foreign_keys)
@@ -585,6 +611,44 @@ impl<'a> StagedIndexExtractor<'a> {
         });
     }
 
+    fn observe_typed(&mut self, row: PreparedValidationRow<'_>, typed: &lix_schema::Row) {
+        let schema_catalog = self.schema_catalog;
+        let spec = self
+            .specs
+            .entry(row.schema_key().to_owned())
+            .or_insert_with(|| {
+                schema_catalog
+                    .schema(row.schema_key())
+                    .and_then(|schema| {
+                        crate::sql2::derive_schema_surface_spec_from_schema(schema).ok()
+                    })
+                    .map(std::sync::Arc::new)
+            })
+            .clone();
+        let Some(spec) = spec else {
+            return;
+        };
+        if spec.indexed_columns.is_empty() {
+            return;
+        }
+        let PreparedValidationRow::State(state_row) = row;
+        self.values.rows.push(StagedIndexRow {
+            branch_id: state_row.branch_id.clone(),
+            schema_key: state_row.schema_key.clone(),
+            row_pk: state_row.row_pk.clone(),
+            columns: spec
+                .indexed_columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.ordinal,
+                        typed_hot_index_value(typed.get(&column.name)),
+                    )
+                })
+                .collect(),
+        });
+    }
+
     fn finish(self) -> StagedIndexValues {
         self.values
     }
@@ -600,6 +664,26 @@ fn hot_index_value(
         JsonValue::String(value) => Some(crate::hot_state::HotIndexValue::String(value.clone())),
         JsonValue::Number(value) => value.as_i64().map(crate::hot_state::HotIndexValue::Integer),
         _ => None,
+    }
+}
+
+fn typed_hot_index_value(
+    value: Option<&lix_schema::Value>,
+) -> Option<crate::hot_state::HotIndexValue> {
+    match value? {
+        lix_schema::Value::Text(value) => {
+            Some(crate::hot_state::HotIndexValue::String(value.clone()))
+        }
+        lix_schema::Value::Uuid(value) => Some(crate::hot_state::HotIndexValue::String(
+            value.to_string(),
+        )),
+        lix_schema::Value::Int8(value) | lix_schema::Value::Timestamptz(value) => {
+            Some(crate::hot_state::HotIndexValue::Integer(*value))
+        }
+        lix_schema::Value::Null
+        | lix_schema::Value::Float8(_)
+        | lix_schema::Value::Boolean(_)
+        | lix_schema::Value::Jsonb(_) => None,
     }
 }
 
@@ -662,8 +746,11 @@ pub(crate) fn prepared_tracked_rows_have_row_local_certificates(rows: &PreparedS
 /// normalization. The proof adds the only relationship that normally keeps
 /// file-scoped rows on the expensive transaction validator: one pending,
 /// planner-owned file descriptor and its engine-created blob materialization
-/// for their exact file incarnation. It rejects every transaction-wide schema
-/// constraint and every lifecycle shape that needs the ordinary validator.
+/// for their exact file incarnation. Native plugin constraints may certify
+/// only when the batch contains the complete replacement relation needed to
+/// prove every unique value and foreign-key target. Every lifecycle shape or
+/// external relationship that needs committed state retains the ordinary
+/// validator.
 ///
 /// This is intentionally derived from the immutable drained write set rather
 /// than stored during staging. Later writes and overlay coalescing therefore
@@ -671,11 +758,18 @@ pub(crate) fn prepared_tracked_rows_have_row_local_certificates(rows: &PreparedS
 pub(crate) struct FreshPluginFileImportCertificate<'a> {
     state_rows: &'a PreparedStateBatch,
     insert_selection: &'a crate::transaction::staging::PreparedInsertSelection,
+    /// `INSERT .. ON CONFLICT DO UPDATE` is lowered as an update-capable
+    /// statement even when the serialized filesystem planner proves that the
+    /// descriptor is new. Preserve the public absence check for that exact
+    /// planner-certified descriptor without forcing every plugin row through
+    /// the generic transaction validator.
+    planner_insert_ordinal: Option<usize>,
 }
 
-pub(crate) fn fresh_plugin_file_import_certificate(
-    prepared_writes: &PreparedWriteSet,
-) -> Option<FreshPluginFileImportCertificate<'_>> {
+pub(crate) fn fresh_plugin_file_import_certificate<'a>(
+    prepared_writes: &'a PreparedWriteSet,
+    schema_catalog: Option<&CatalogSnapshot>,
+) -> Option<FreshPluginFileImportCertificate<'a>> {
     let [file_content] = prepared_writes.file_content_writes.as_slice() else {
         return None;
     };
@@ -691,7 +785,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
             .is_empty()
         || !prepared_writes.extra_commit_parents_by_branch.is_empty()
         || !prepared_writes.checkpoint_publications.is_empty()
-        || !(1..=2).contains(&prepared_writes.insert_selection.len())
+        || prepared_writes.insert_selection.len() > 2
     {
         return None;
     }
@@ -699,11 +793,12 @@ pub(crate) fn fresh_plugin_file_import_certificate(
     let mut descriptor = None;
     let mut blob_ref = None;
     let mut plugin_owner_count = 0_usize;
+    let mut has_typed_constraints = false;
     for (row_index, row) in prepared_writes.state_rows.iter().enumerate() {
         if row.global
             || row.untracked
             || row.branch_id.as_str() != file_content.branch_id
-            || row.snapshot.is_none()
+            || (row.snapshot.is_none() && row.typed_snapshot.is_none())
             || !row.facts.row_content_validated
             || row.change_id.is_none()
             || row.commit_id.is_none()
@@ -745,10 +840,15 @@ pub(crate) fn fresh_plugin_file_import_certificate(
             _ => {
                 if row.file_id.map(crate::common::SharedStr::as_str)
                     != Some(file_content.file_id.as_str())
-                    || row.facts.requires_transaction_validation
                     || !plugin_reconciliation_update(row)
                 {
                     return None;
+                }
+                if row.facts.requires_transaction_validation {
+                    if row.typed_snapshot.is_none() {
+                        return None;
+                    }
+                    has_typed_constraints = true;
                 }
                 if row.schema_key == "lix_key_value"
                     && row
@@ -767,6 +867,14 @@ pub(crate) fn fresh_plugin_file_import_certificate(
     else {
         return None;
     };
+    if has_typed_constraints
+        && !certify_complete_native_file_constraints(
+            &prepared_writes.state_rows,
+            schema_catalog?,
+        )
+    {
+        return None;
+    }
     let descriptor_selected = prepared_insert_selection_matches_row(
         &prepared_writes.insert_selection,
         descriptor_index,
@@ -778,9 +886,14 @@ pub(crate) fn fresh_plugin_file_import_certificate(
         blob_ref,
     );
     let blob_ref_is_internal_update = plugin_reconciliation_update(blob_ref);
+    let planner_insert_ordinal = (!descriptor_selected
+        && prepared_writes.insert_selection.is_empty()
+        && filesystem_planner_validated_insert(&PreparedValidationRow::State(descriptor)))
+    .then_some(descriptor_index);
     if plugin_owner_count != 1
-        || !descriptor_selected
-        || prepared_writes.insert_selection.len() != 1 + usize::from(blob_ref_selected)
+        || (!descriptor_selected && planner_insert_ordinal.is_none())
+        || prepared_writes.insert_selection.len()
+            != usize::from(descriptor_selected) + usize::from(blob_ref_selected)
         || blob_ref_selected == blob_ref_is_internal_update
     {
         return None;
@@ -789,6 +902,126 @@ pub(crate) fn fresh_plugin_file_import_certificate(
     Some(FreshPluginFileImportCertificate {
         state_rows: &prepared_writes.state_rows,
         insert_selection: &prepared_writes.insert_selection,
+        planner_insert_ordinal,
+    })
+}
+
+/// Certifies transaction-wide Schema v1 constraints from one complete native
+/// file replacement. Every constrained row and every referenced target must
+/// be present in this exact prepared batch; relationships to an external
+/// schema, nested legacy pointer shapes, or malformed native values decline
+/// the certificate and retain the generic validator.
+fn certify_complete_native_file_constraints(
+    rows: &PreparedStateBatch,
+    catalog: &CatalogSnapshot,
+) -> bool {
+    type ConstraintPath = Vec<Vec<String>>;
+    type ConstraintTuple = Vec<Vec<u8>>;
+
+    let mut targets = BTreeMap::<(String, ConstraintPath), BTreeSet<ConstraintTuple>>::new();
+    let mut unique_values = BTreeSet::<(String, ConstraintPath, ConstraintTuple)>::new();
+
+    for row in rows.iter().filter(|row| row.typed_snapshot.is_some()) {
+        let Some((plan_id, plan)) = catalog.plan_for_key(row.schema_key.as_str()) else {
+            return false;
+        };
+        if plan_id != row.schema_plan_id {
+            return false;
+        }
+        let typed = row
+            .typed_snapshot
+            .expect("typed replacement row presence was filtered");
+        let Some(primary_key) = plan.primary_key.as_ref() else {
+            return false;
+        };
+        let Some(value) = native_constraint_tuple(&typed.row, primary_key, false) else {
+            return false;
+        };
+        targets
+            .entry((row.schema_key.to_string(), primary_key.clone()))
+            .or_default()
+            .insert(value);
+
+        for unique in &plan.uniques {
+            let Some(value) = native_constraint_tuple(&typed.row, unique, false) else {
+                return false;
+            };
+            if !unique_values.insert((
+                row.schema_key.to_string(),
+                unique.clone(),
+                value.clone(),
+            )) {
+                return false;
+            }
+            targets
+                .entry((row.schema_key.to_string(), unique.clone()))
+                .or_default()
+                .insert(value);
+        }
+    }
+
+    for row in rows.iter().filter(|row| row.typed_snapshot.is_some()) {
+        let Some((plan_id, plan)) = catalog.plan_for_key(row.schema_key.as_str()) else {
+            return false;
+        };
+        if plan_id != row.schema_plan_id {
+            return false;
+        }
+        let typed = row
+            .typed_snapshot
+            .expect("typed replacement row presence was filtered");
+        for foreign_key in &plan.foreign_keys {
+            let Some(local_value) =
+                native_constraint_tuple(&typed.row, &foreign_key.local_properties, true)
+            else {
+                // A nullable foreign-key tuple containing SQL NULL has no
+                // target obligation. Any other extraction failure declines
+                // in `native_constraint_tuple` before reaching this branch.
+                if native_constraint_contains_null(&typed.row, &foreign_key.local_properties) {
+                    continue;
+                }
+                return false;
+            };
+            let target = (
+                foreign_key.referenced_schema.schema_key.clone(),
+                foreign_key.referenced_properties.clone(),
+            );
+            if !targets
+                .get(&target)
+                .is_some_and(|values| values.contains(&local_value))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn native_constraint_tuple(
+    row: &lix_schema::Row,
+    paths: &[Vec<String>],
+    reject_null: bool,
+) -> Option<Vec<Vec<u8>>> {
+    let mut tuple = Vec::with_capacity(paths.len());
+    for path in paths {
+        let [column] = path.as_slice() else {
+            return None;
+        };
+        let value = row.get(column)?;
+        if reject_null && matches!(value, lix_schema::Value::Null) {
+            return None;
+        }
+        tuple.push(crate::plugin::wire::typed::encode_value_bytes(value).ok()?);
+    }
+    Some(tuple)
+}
+
+fn native_constraint_contains_null(row: &lix_schema::Row, paths: &[Vec<String>]) -> bool {
+    paths.iter().any(|path| {
+        let [column] = path.as_slice() else {
+            return false;
+        };
+        matches!(row.get(column), Some(lix_schema::Value::Null))
     })
 }
 
@@ -1547,7 +1780,9 @@ async fn validate_committed_insert_identities(
             // row, so probing that owned identity vector for every insert is
             // equivalent to this column check but turns a large batch into
             // O(n²) row-primary-key comparisons.
-            pending_constraints.is_none() || insert.row.snapshot.is_some()
+            pending_constraints.is_none()
+                || insert.row.snapshot.is_some()
+                || insert.row.typed_snapshot.is_some()
         }),
         pending_constraints,
     )
@@ -1625,9 +1860,21 @@ pub(crate) async fn validate_certified_fresh_plugin_file_import(
     hot_state: &dyn HotStateReader,
     certificate: FreshPluginFileImportCertificate<'_>,
 ) -> Result<(), LixError> {
+    let planner_insert = certificate.planner_insert_ordinal.map(|row_index| {
+        let row = certificate.state_rows.row(row_index);
+        PreparedInsertRef {
+            row_index,
+            row,
+            origin: row.origin,
+            statement_index: None,
+        }
+    });
     validate_committed_insert_identity_entries(
         hot_state,
-        certificate.insert_selection.iter(certificate.state_rows),
+        certificate
+            .insert_selection
+            .iter(certificate.state_rows)
+            .chain(planner_insert),
         None,
     )
     .await
@@ -2133,7 +2380,20 @@ impl PendingSchemaDomains {
 #[derive(Clone, Copy)]
 struct ValidatedRowContent<'a> {
     schema_plan: &'a SchemaPlan,
-    snapshot: Option<&'a JsonValue>,
+    payload: ValidatedRowPayload<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ValidatedRowPayload<'a> {
+    Deleted,
+    Json(&'a JsonValue),
+    Typed(&'a WasmTypedRow),
+}
+
+impl<'a> From<&'a JsonValue> for ValidatedRowPayload<'a> {
+    fn from(value: &'a JsonValue) -> Self {
+        Self::Json(value)
+    }
 }
 
 fn validate_row_content<'a>(
@@ -2143,15 +2403,110 @@ fn validate_row_content<'a>(
 ) -> Result<ValidatedRowContent<'a>, LixError> {
     let schema_plan = schema_plan_for_row(schema_catalog, pending_schema_domains, row)?;
     validate_schema_matches_row(row, schema_plan)?;
-    let snapshot = if row.row_content_validated() {
-        row.snapshot_json()
-    } else {
-        validate_snapshot_content(row, schema_plan)?
+    let payload = match (row.snapshot_json(), row.typed_snapshot()) {
+        (None, None) => ValidatedRowPayload::Deleted,
+        (Some(snapshot), None) => {
+            if !row.row_content_validated() {
+                validate_snapshot_content(row, schema_plan)?;
+            }
+            ValidatedRowPayload::Json(snapshot)
+        }
+        (None, Some(typed)) => {
+            validate_typed_row_content(row, schema_plan, typed)?;
+            ValidatedRowPayload::Typed(typed)
+        }
+        (Some(_), Some(_)) => {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "row for schema '{}' carries both JSON and typed payloads",
+                    row.schema_key()
+                ),
+            ));
+        }
     };
     Ok(ValidatedRowContent {
         schema_plan,
-        snapshot,
+        payload,
     })
+}
+
+fn validate_typed_row_content(
+    row: PreparedValidationRow<'_>,
+    schema_plan: &SchemaPlan,
+    typed: &WasmTypedRow,
+) -> Result<(), LixError> {
+    if typed.schema_fingerprint != schema_plan.fingerprint().bytes() {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "typed row schema fingerprint does not match schema '{}'",
+                row.schema_key()
+            ),
+        ));
+    }
+    // Catalog-backed plugin ingress has already validated the complete row,
+    // its embedded primary key, and its durable encoding. The certificate is
+    // stored in the payload cache and is cleared by every typed-row mutation,
+    // so only the transaction envelope remains to be authenticated here.
+    if typed.boundary_validation_certified() {
+        return validate_typed_primary_key_identity(row, typed);
+    }
+    schema_plan
+        .compiled_schema
+        .validate_complete_row(&typed.row)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed row validation failed for schema '{}': {error}",
+                    row.schema_key()
+                ),
+            )
+        })?;
+    let primary_key_columns = schema_plan.compiled_schema.primary_key();
+    if typed.row_pk.len() != primary_key_columns.len()
+        || primary_key_columns
+            .iter()
+            .zip(typed.row_pk.iter())
+            .any(|(column, value)| typed.row.get(column) != Some(value))
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "typed primary-key values do not match row columns for schema '{}'",
+                row.schema_key()
+            ),
+        ));
+    }
+    validate_typed_primary_key_identity(row, typed)
+}
+
+fn validate_typed_primary_key_identity(
+    row: PreparedValidationRow<'_>,
+    typed: &WasmTypedRow,
+) -> Result<(), LixError> {
+    if !row.row_pk().matches_schema_values(&typed.row_pk) {
+        let derived = RowPk::from_schema_values(&typed.row_pk).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed primary key is invalid for schema '{}': {error}",
+                    row.schema_key()
+                ),
+            )
+        })?;
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "primary-key constraint violation on schema '{}': durable row_pk '{}' does not match typed primary key '{}'",
+                row.schema_key(),
+                row.row_pk().as_json_array_text()?,
+                derived.as_json_array_text()?
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn schema_plan_for_row<'a>(
@@ -2260,15 +2615,16 @@ impl PendingConstraintIndexes {
         self.tombstones.push(PendingTombstone { identity });
     }
 
-    fn remember_row(
+    fn remember_row<'a>(
         &mut self,
         row: PreparedValidationRow<'_>,
         schema_plan: &SchemaPlan,
-        snapshot: &JsonValue,
+        payload: impl Into<ValidatedRowPayload<'a>>,
     ) -> Result<(), LixError> {
+        let payload = payload.into();
         self.remember_identity_target(row);
-        self.remember_primary_key_target(row, schema_plan, snapshot);
-        self.remember_unique_targets(row, schema_plan, snapshot)?;
+        self.remember_primary_key_target(row, schema_plan, payload);
+        self.remember_unique_targets(row, schema_plan, payload)?;
         Ok(())
     }
 
@@ -2280,10 +2636,10 @@ impl PendingConstraintIndexes {
         &mut self,
         row: PreparedValidationRow<'_>,
         schema_plan: &SchemaPlan,
-        snapshot: &JsonValue,
+        payload: ValidatedRowPayload<'_>,
     ) {
         if let Some(primary_key_paths) = schema_plan.primary_key.as_ref() {
-            self.remember_fk_target(row, primary_key_paths, snapshot);
+            self.remember_fk_target(row, primary_key_paths, payload);
         }
     }
 
@@ -2291,13 +2647,13 @@ impl PendingConstraintIndexes {
         &mut self,
         row: PreparedValidationRow<'_>,
         schema_plan: &SchemaPlan,
-        snapshot: &JsonValue,
+        payload: ValidatedRowPayload<'_>,
     ) -> Result<(), LixError> {
         for unique_paths in &schema_plan.uniques {
-            let Some(value) = UniqueConstraintValue::from_snapshot(snapshot, unique_paths) else {
+            let Some(value) = UniqueConstraintValue::from_payload(payload, unique_paths, false) else {
                 continue;
             };
-            self.remember_fk_target(row, unique_paths, snapshot);
+            self.remember_fk_target(row, unique_paths, payload);
             let key = PendingUniqueKey {
                 schema_key: row.schema_key().to_string(),
                 domain: row.domain(),
@@ -2330,9 +2686,9 @@ impl PendingConstraintIndexes {
         &mut self,
         row: PreparedValidationRow<'_>,
         pointer_group: &[Vec<String>],
-        snapshot: &JsonValue,
+        payload: ValidatedRowPayload<'_>,
     ) {
-        let Some(value) = UniqueConstraintValue::from_snapshot(snapshot, pointer_group) else {
+        let Some(value) = UniqueConstraintValue::from_payload(payload, pointer_group, false) else {
             return;
         };
         self.fk_targets
@@ -2348,16 +2704,18 @@ impl PendingConstraintIndexes {
             });
     }
 
-    fn remember_foreign_key_references(
+    fn remember_foreign_key_references<'a>(
         &mut self,
         row: PreparedValidationRow<'_>,
         schema_plan: &SchemaPlan,
-        snapshot: &JsonValue,
+        payload: impl Into<ValidatedRowPayload<'a>>,
     ) -> Result<(), LixError> {
+        let payload = payload.into();
         for foreign_key in &schema_plan.foreign_keys {
-            let Some(local_value) = UniqueConstraintValue::from_snapshot_non_null(
-                snapshot,
+            let Some(local_value) = UniqueConstraintValue::from_payload(
+                payload,
                 &foreign_key.local_properties,
+                true,
             ) else {
                 continue;
             };
@@ -2738,13 +3096,11 @@ async fn validate_committed_normal_delete_restriction_batches(
             {
                 continue;
             }
-            let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str())
-            else {
-                continue;
-            };
-            let snapshot = parse_committed_snapshot(row, snapshot_content)?;
-            let Some(value) =
-                UniqueConstraintValue::from_snapshot_non_null(&snapshot, &batch.local_properties)
+            let Some(value) = committed_constraint_value(
+                row,
+                &batch.local_properties,
+                true,
+            )?
             else {
                 continue;
             };
@@ -2780,14 +3136,7 @@ async fn committed_deleted_row_value(
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str()) else {
-        return Ok(None);
-    };
-    let snapshot = parse_committed_snapshot(row, snapshot_content)?;
-    Ok(UniqueConstraintValue::from_snapshot(
-        &snapshot,
-        referenced_properties,
-    ))
+    committed_constraint_value(row, referenced_properties, false)
 }
 
 fn committed_delete_restriction_error(
@@ -2823,6 +3172,36 @@ fn parse_committed_snapshot(
     })
 }
 
+fn committed_constraint_value(
+    row: MaterializedHotStateRowRef<'_>,
+    paths: &[Vec<String>],
+    reject_null: bool,
+) -> Result<Option<UniqueConstraintValue>, LixError> {
+    match (row.snapshot_content(), row.typed_snapshot()) {
+        (None, None) => Ok(None),
+        (Some(snapshot), None) => {
+            let snapshot = parse_committed_snapshot(row, snapshot.as_str())?;
+            Ok(UniqueConstraintValue::from_payload(
+                ValidatedRowPayload::Json(&snapshot),
+                paths,
+                reject_null,
+            ))
+        }
+        (None, Some(typed)) => Ok(UniqueConstraintValue::from_payload(
+            ValidatedRowPayload::Typed(typed.as_ref()),
+            paths,
+            reject_null,
+        )),
+        (Some(_), Some(_)) => Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "committed row for schema '{}' carries both JSON and typed payloads",
+                row.schema_key()
+            ),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnresolvedForeignKeyCheck {
     source_identity: DomainRowIdentity,
@@ -2834,14 +3213,15 @@ struct UnresolvedForeignKeyCheck {
 fn validate_pending_foreign_keys(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
-    staged_snapshots: &[(PreparedValidationRow<'_>, &SchemaPlan, &JsonValue)],
+    staged_rows: &[(PreparedValidationRow<'_>, &SchemaPlan, ValidatedRowPayload<'_>)],
 ) -> Result<Vec<UnresolvedForeignKeyCheck>, LixError> {
     let mut unresolved = Vec::new();
-    for (row, schema_plan, snapshot) in staged_snapshots {
+    for (row, schema_plan, payload) in staged_rows {
         for foreign_key in &schema_plan.foreign_keys {
-            let Some(local_value) = UniqueConstraintValue::from_snapshot_non_null(
-                snapshot,
+            let Some(local_value) = UniqueConstraintValue::from_payload(
+                *payload,
                 &foreign_key.local_properties,
+                true,
             ) else {
                 continue;
             };
@@ -3004,21 +3384,7 @@ async fn committed_normal_foreign_key_target_exists(
             if row.schema_key() != target.schema_key {
                 continue;
             }
-            let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str())
-            else {
-                continue;
-            };
-            let snapshot =
-                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                            row.schema_key()
-                        ),
-                    )
-                })?;
-            if UniqueConstraintValue::from_snapshot(&snapshot, &target.pointer_group).as_ref()
+            if committed_constraint_value(row, &target.pointer_group, false)?.as_ref()
                 == Some(&target.value)
             {
                 return Ok(true);
@@ -3180,23 +3546,11 @@ fn reject_committed_unique_conflicts(
         if pending_constraints.tombstones_identity(committed_row) {
             continue;
         }
-        let Some(snapshot_content) = committed_row
-            .snapshot_content()
-            .map(|snapshot| snapshot.as_str())
-        else {
-            continue;
-        };
-        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-            LixError::new(
-                LixError::CODE_SCHEMA_VALIDATION,
-                format!(
-                    "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                    committed_row.schema_key()
-                ),
-            )
-        })?;
-        let Some(committed_value) =
-            UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
+        let Some(committed_value) = committed_constraint_value(
+            committed_row,
+            &scope.pointer_group,
+            false,
+        )?
         else {
             continue;
         };
@@ -3273,17 +3627,8 @@ async fn committed_unique_value_is_unchanged(
     let Some(committed) = committed_rows.first() else {
         return Ok(false);
     };
-    let Some(snapshot_content) = committed
-        .snapshot_content()
-        .map(|snapshot| snapshot.as_str())
-    else {
-        return Ok(false);
-    };
-    let snapshot = parse_committed_snapshot(committed, snapshot_content)?;
-    Ok(
-        UniqueConstraintValue::from_snapshot(&snapshot, &key.pointer_group).as_ref()
-            == Some(&key.value),
-    )
+    Ok(committed_constraint_value(committed, &key.pointer_group, false)?.as_ref()
+        == Some(&key.value))
 }
 
 fn committed_row_is_in_exact_unique_scope(
@@ -3341,6 +3686,37 @@ impl UniqueConstraintValue {
         Some(Self(values))
     }
 
+    fn from_payload(
+        payload: ValidatedRowPayload<'_>,
+        paths: &[Vec<String>],
+        reject_null: bool,
+    ) -> Option<Self> {
+        match payload {
+            ValidatedRowPayload::Deleted => None,
+            ValidatedRowPayload::Json(snapshot) => {
+                if reject_null {
+                    Self::from_snapshot_non_null(snapshot, paths)
+                } else {
+                    Self::from_snapshot(snapshot, paths)
+                }
+            }
+            ValidatedRowPayload::Typed(typed) => {
+                let mut values = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let [column] = path.as_slice() else {
+                        return None;
+                    };
+                    let value = typed.row.get(column)?;
+                    if reject_null && matches!(value, lix_schema::Value::Null) {
+                        return None;
+                    }
+                    values.push(stable_typed_constraint_value(value)?);
+                }
+                Some(Self(values))
+            }
+        }
+    }
+
     /// The hot index plane's encoding of a single-column value, but only when
     /// the recovered value re-encodes to exactly this stable form.
     ///
@@ -3368,6 +3744,22 @@ impl UniqueConstraintValue {
         }
         format!("({})", self.0.join(", "))
     }
+}
+
+fn stable_typed_constraint_value(value: &lix_schema::Value) -> Option<String> {
+    Some(match value {
+        lix_schema::Value::Null => "null".to_string(),
+        lix_schema::Value::Text(value) => format!("{value:?}"),
+        lix_schema::Value::Uuid(value) => format!("{:?}", value.to_string()),
+        lix_schema::Value::Int8(value) | lix_schema::Value::Timestamptz(value) => {
+            value.to_string()
+        }
+        lix_schema::Value::Float8(value) => {
+            serde_json::Number::from_f64(*value)?.to_string()
+        }
+        lix_schema::Value::Boolean(value) => value.to_string(),
+        lix_schema::Value::Jsonb(value) => stable_unique_value(value.as_value()),
+    })
 }
 
 fn stable_unique_value(value: &JsonValue) -> String {
@@ -7184,7 +7576,7 @@ mod tests {
             .remember_foreign_key_references(
                 PreparedValidationRow::State(row.borrowed()),
                 test_plan_from_schema(fk_child_schema()),
-                &snapshot,
+                ValidatedRowPayload::Json(&snapshot),
             )
             .expect("child row should index FK reference");
 
@@ -7262,7 +7654,7 @@ mod tests {
             .remember_foreign_key_references(
                 PreparedValidationRow::State(child.borrowed()),
                 test_plan_from_schema(fk_child_schema()),
-                &child_snapshot,
+                ValidatedRowPayload::Json(&child_snapshot),
             )
             .expect("child row should index FK reference");
 
@@ -7304,7 +7696,7 @@ mod tests {
             &[(
                 PreparedValidationRow::State(row.borrowed()),
                 test_plan_from_schema(fk_child_schema()),
-                &snapshot,
+                ValidatedRowPayload::Json(&snapshot),
             )],
         )
         .expect("FK validation should collect unresolved checks");
@@ -7414,7 +7806,7 @@ mod tests {
             &[(
                 PreparedValidationRow::State(child.borrowed()),
                 test_plan_from_schema(fk_child_schema()),
-                &child_snapshot,
+                ValidatedRowPayload::Json(&child_snapshot),
             )],
         )
         .expect("FK validation should inspect pending targets");
@@ -7469,7 +7861,7 @@ mod tests {
             &[(
                 PreparedValidationRow::State(child.borrowed()),
                 test_plan_from_schema(fk_child_schema()),
-                &child_snapshot,
+                ValidatedRowPayload::Json(&child_snapshot),
             )],
         )
         .expect("FK validation should inspect pending targets");
@@ -7509,7 +7901,7 @@ mod tests {
             &[(
                 PreparedValidationRow::State(child.borrowed()),
                 test_plan_from_schema(fk_child_schema()),
-                &child_snapshot,
+                ValidatedRowPayload::Json(&child_snapshot),
             )],
         )
         .expect("pending FK validation should collect unresolved check");
@@ -7564,7 +7956,7 @@ mod tests {
             &[(
                 PreparedValidationRow::State(child.borrowed()),
                 test_plan_from_schema(fk_child_schema()),
-                &child_snapshot,
+                ValidatedRowPayload::Json(&child_snapshot),
             )],
         )
         .expect("pending FK validation should collect unresolved check");
@@ -8138,11 +8530,12 @@ mod tests {
         );
 
         // Site 7: `fresh_plugin_file_import_certificate` under
-        // `trust_filesystem_planner`. Its plugin-owned rows are admitted only
-        // while `requires_transaction_validation` is clear.
+        // `trust_filesystem_planner`. A constrained plugin row is admitted
+        // only with a typed snapshot and a catalog proving the complete
+        // native replacement relation.
         let mut writes = fresh_plugin_file_import_write_set();
         assert!(
-            fresh_plugin_file_import_certificate(&writes).is_some(),
+            fresh_plugin_file_import_certificate(&writes, None).is_some(),
             "the unmodified fixture must certify, or this test proves nothing"
         );
         let mut constrained = staged_row("indexed_schema", Some(r#"{"id":"root"}"#.to_string()));
@@ -8155,7 +8548,7 @@ mod tests {
         constrained.origin = Some(plugin_reconciliation_update_origin());
         writes.state_rows.push_test_row(constrained);
         assert!(
-            fresh_plugin_file_import_certificate(&writes).is_none(),
+            fresh_plugin_file_import_certificate(&writes, None).is_none(),
             "an indexed-schema row inside a plugin import must revoke the certificate"
         );
     }
@@ -8165,8 +8558,62 @@ mod tests {
         let writes = fresh_plugin_file_import_write_set();
 
         assert!(
-            fresh_plugin_file_import_certificate(&writes).is_some(),
+            fresh_plugin_file_import_certificate(&writes, None).is_some(),
             "a fresh trusted lix_file INSERT plus v2 blob materialization should certify"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_plugin_file_import_certificate_preserves_upsert_descriptor_absence() {
+        let mut writes = fresh_plugin_file_import_write_set();
+        // `INSERT .. ON CONFLICT DO UPDATE` can reach reconciliation with a
+        // planner-certified descriptor INSERT but no final insert-selection
+        // bit. The certificate must retain an explicit committed-identity
+        // probe for that descriptor.
+        writes.insert_selection = Default::default();
+        let certificate = fresh_plugin_file_import_certificate(&writes, None)
+            .expect("a serialized planner INSERT should certify without a selection bit");
+        validate_certified_fresh_plugin_file_import(&StrictEmptyHotStateReader, certificate)
+            .await
+            .expect("an absent planner-insert descriptor should validate");
+
+        let duplicate_descriptor = writes
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            .expect("fixture should include a descriptor");
+        let certificate = fresh_plugin_file_import_certificate(&writes, None)
+            .expect("the structural certificate remains valid before the committed probe");
+        let error = validate_certified_fresh_plugin_file_import(
+            &StrictStaticHotStateReader {
+                rows: vec![MaterializedHotStateRow::from(duplicate_descriptor)],
+            },
+            certificate,
+        )
+        .await
+        .expect_err("a duplicate planner-insert descriptor must still fail");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[test]
+    fn fresh_plugin_file_import_certificate_rejects_unselected_non_insert_descriptor() {
+        let mut writes = fresh_plugin_file_import_write_set();
+        writes.insert_selection = Default::default();
+        let descriptor_index = writes
+            .state_rows
+            .iter()
+            .enumerate()
+            .find_map(|(index, row)| {
+                (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY).then_some(index)
+            })
+            .expect("fixture should include a descriptor");
+        writes.state_rows.set_origin_for_test(
+            descriptor_index,
+            Some(plugin_reconciliation_update_origin()),
+        );
+        assert!(
+            fresh_plugin_file_import_certificate(&writes, None).is_none(),
+            "an unselected descriptor without planner INSERT authority must not certify"
         );
     }
 
@@ -8183,7 +8630,7 @@ mod tests {
             .collect::<Vec<_>>();
         missing_descriptor.state_rows.select_rows(&retained);
         missing_descriptor.insert_selection.select_rows(&retained);
-        assert!(fresh_plugin_file_import_certificate(&missing_descriptor).is_none());
+        assert!(fresh_plugin_file_import_certificate(&missing_descriptor, None).is_none());
 
         let mut cross_row_schema = fresh_plugin_file_import_write_set();
         let semantic_index = cross_row_schema
@@ -8196,13 +8643,278 @@ mod tests {
         cross_row_schema
             .state_rows
             .set_requires_transaction_validation(semantic_index, true);
-        assert!(fresh_plugin_file_import_certificate(&cross_row_schema).is_none());
+        assert!(fresh_plugin_file_import_certificate(&cross_row_schema, None).is_none());
+    }
+
+    fn native_constraint_batch(
+        catalog: &CatalogSnapshot,
+        rows: Vec<(&str, lix_schema::Row)>,
+    ) -> PreparedStateBatch {
+        let mut fixtures = Vec::with_capacity(rows.len());
+        let mut typed = Vec::with_capacity(rows.len());
+        for (schema_key, row) in rows {
+            let (plan_id, plan) = catalog
+                .plan_for_key(schema_key)
+                .expect("typed constraint fixture schema should resolve");
+            let id = match row.get("id") {
+                Some(lix_schema::Value::Text(id)) => id.clone(),
+                _ => panic!("typed constraint fixture requires a text id"),
+            };
+            let mut fixture = staged_row(schema_key, None);
+            fixture.schema_plan_id = plan_id;
+            fixture.row_pk = RowPk::single(id.clone());
+            fixture.schema_key = schema_key.into();
+            fixtures.push(fixture);
+            typed.push(Arc::new(WasmTypedRow {
+                schema_fingerprint: plan.fingerprint().bytes(),
+                row_pk: vec![lix_schema::Value::Text(id)].into(),
+                row,
+                native_payload: std::sync::OnceLock::new(),
+                boundary_create_validation: std::sync::OnceLock::new(),
+            }));
+        }
+        let mut batch = PreparedStateBatch::from_test_rows(fixtures);
+        for (index, row) in typed.into_iter().enumerate() {
+            batch.set_typed_snapshot(index, Some(row));
+        }
+        batch
+    }
+
+    #[tokio::test]
+    async fn typed_rows_do_not_bypass_pending_unique_validation() {
+        let visible_schemas = vec![unique_schema()];
+        let catalog = CatalogSnapshot::from_visible_schemas(&visible_schemas)
+            .expect("typed unique catalog should build");
+        let state_rows = native_constraint_batch(
+            &catalog,
+            vec![
+                (
+                    "unique_schema",
+                    lix_schema::Row::from([
+                        ("id".to_owned(), lix_schema::Value::Text("row-1".to_owned())),
+                        (
+                            "slug".to_owned(),
+                            lix_schema::Value::Text("duplicate".to_owned()),
+                        ),
+                        (
+                            "title".to_owned(),
+                            lix_schema::Value::Text("first".to_owned()),
+                        ),
+                    ]),
+                ),
+                (
+                    "unique_schema",
+                    lix_schema::Row::from([
+                        ("id".to_owned(), lix_schema::Value::Text("row-2".to_owned())),
+                        (
+                            "slug".to_owned(),
+                            lix_schema::Value::Text("duplicate".to_owned()),
+                        ),
+                        (
+                            "title".to_owned(),
+                            lix_schema::Value::Text("second".to_owned()),
+                        ),
+                    ]),
+                ),
+            ],
+        );
+        let staged_writes = PreparedWriteSet {
+            state_rows,
+            ..empty_staged_write_set()
+        };
+
+        let error = validate_prepared_writes(
+            TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &StaticHotStateReader { rows: Vec::new() },
+            ),
+        )
+        .await
+        .expect_err("duplicate native unique values must fail outside fresh import");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
+    async fn typed_rows_do_not_bypass_pending_foreign_key_validation() {
+        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
+        let catalog = CatalogSnapshot::from_visible_schemas(&visible_schemas)
+            .expect("typed foreign-key catalog should build");
+        let state_rows = native_constraint_batch(
+            &catalog,
+            vec![(
+                "fk_child_schema",
+                lix_schema::Row::from([
+                    ("id".to_owned(), lix_schema::Value::Text("child-1".to_owned())),
+                    (
+                        "parent_id".to_owned(),
+                        lix_schema::Value::Text("missing-parent".to_owned()),
+                    ),
+                ]),
+            )],
+        );
+        let staged_writes = PreparedWriteSet {
+            state_rows,
+            ..empty_staged_write_set()
+        };
+
+        let error = validate_prepared_writes(
+            TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &StaticHotStateReader { rows: Vec::new() },
+            ),
+        )
+        .await
+        .expect_err("native foreign key without a target must fail outside fresh import");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    #[tokio::test]
+    async fn typed_pending_foreign_key_resolves_against_typed_pending_target() {
+        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
+        let catalog = CatalogSnapshot::from_visible_schemas(&visible_schemas)
+            .expect("typed foreign-key catalog should build");
+        let state_rows = native_constraint_batch(
+            &catalog,
+            vec![
+                (
+                    "fk_parent_schema",
+                    lix_schema::Row::from([(
+                        "id".to_owned(),
+                        lix_schema::Value::Text("parent-1".to_owned()),
+                    )]),
+                ),
+                (
+                    "fk_child_schema",
+                    lix_schema::Row::from([
+                        ("id".to_owned(), lix_schema::Value::Text("child-1".to_owned())),
+                        (
+                            "parent_id".to_owned(),
+                            lix_schema::Value::Text("parent-1".to_owned()),
+                        ),
+                    ]),
+                ),
+            ],
+        );
+        let staged_writes = PreparedWriteSet {
+            state_rows,
+            ..empty_staged_write_set()
+        };
+
+        validate_prepared_writes(
+            TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &StaticHotStateReader { rows: Vec::new() },
+            ),
+        )
+        .await
+        .expect("native pending target must satisfy native pending foreign key");
+    }
+
+    #[test]
+    fn complete_native_file_constraints_certify_in_batch_foreign_keys() {
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            fk_parent_schema(),
+            fk_child_schema(),
+        ])
+        .expect("native constraint catalog should build");
+        let rows = native_constraint_batch(
+            &catalog,
+            vec![
+                (
+                    "fk_parent_schema",
+                    lix_schema::Row::from([(
+                        "id".to_owned(),
+                        lix_schema::Value::Text("parent-1".to_owned()),
+                    )]),
+                ),
+                (
+                    "fk_child_schema",
+                    lix_schema::Row::from([
+                        (
+                            "id".to_owned(),
+                            lix_schema::Value::Text("child-1".to_owned()),
+                        ),
+                        (
+                            "parent_id".to_owned(),
+                            lix_schema::Value::Text("parent-1".to_owned()),
+                        ),
+                    ]),
+                ),
+            ],
+        );
+
+        assert!(certify_complete_native_file_constraints(&rows, &catalog));
+    }
+
+    #[test]
+    fn complete_native_file_constraints_decline_external_foreign_keys() {
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            fk_parent_schema(),
+            fk_child_schema(),
+        ])
+        .expect("native constraint catalog should build");
+        let rows = native_constraint_batch(
+            &catalog,
+            vec![(
+                "fk_child_schema",
+                lix_schema::Row::from([
+                    (
+                        "id".to_owned(),
+                        lix_schema::Value::Text("child-1".to_owned()),
+                    ),
+                    (
+                        "parent_id".to_owned(),
+                        lix_schema::Value::Text("committed-parent".to_owned()),
+                    ),
+                ]),
+            )],
+        );
+
+        assert!(!certify_complete_native_file_constraints(&rows, &catalog));
+    }
+
+    #[test]
+    fn complete_native_file_constraints_reject_duplicate_unique_values() {
+        let catalog = CatalogSnapshot::from_visible_schemas(&[unique_schema()])
+            .expect("native unique catalog should build");
+        let rows = native_constraint_batch(
+            &catalog,
+            ["first", "second"]
+                .into_iter()
+                .map(|id| {
+                    (
+                        "unique_schema",
+                        lix_schema::Row::from([
+                            (
+                                "id".to_owned(),
+                                lix_schema::Value::Text(id.to_owned()),
+                            ),
+                            (
+                                "slug".to_owned(),
+                                lix_schema::Value::Text("duplicate".to_owned()),
+                            ),
+                            (
+                                "title".to_owned(),
+                                lix_schema::Value::Text(id.to_owned()),
+                            ),
+                        ]),
+                    )
+                })
+                .collect(),
+        );
+
+        assert!(!certify_complete_native_file_constraints(&rows, &catalog));
     }
 
     #[tokio::test]
     async fn fresh_plugin_file_import_certificate_retains_public_insert_absence_checks() {
         let writes = fresh_plugin_file_import_write_set();
-        let certificate = fresh_plugin_file_import_certificate(&writes)
+        let certificate = fresh_plugin_file_import_certificate(&writes, None)
             .expect("fixture should satisfy the structural certificate");
         validate_certified_fresh_plugin_file_import(&StrictEmptyHotStateReader, certificate)
             .await
@@ -8213,7 +8925,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
             .expect("fixture should include descriptor");
-        let certificate = fresh_plugin_file_import_certificate(&writes)
+        let certificate = fresh_plugin_file_import_certificate(&writes, None)
             .expect("certificate remains valid before committed lookup");
         let error = validate_certified_fresh_plugin_file_import(
             &StrictStaticHotStateReader {

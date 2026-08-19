@@ -108,6 +108,7 @@ pub(crate) async fn seed_branch_head_with_rows(
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
                     metadata: crate::json_store::JsonSlot::None,
+                    typed_payload: None,
                     created_at: test_timestamp(),
                     origin_key: None,
                 }],
@@ -152,6 +153,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
             snapshot: snapshot.as_ref_slot(),
             metadata: metadata.as_ref_slot(),
+            typed_snapshot: None,
             columnar_base_coordinate: None,
         })
         .collect::<Vec<_>>();
@@ -164,7 +166,6 @@ pub(crate) async fn seed_branch_head_with_rows(
             commit_id,
             &deltas,
             &BTreeSet::new(),
-            None,
             None,
             None,
             &mut working_diff_coverage,
@@ -250,7 +251,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
-                deleted: change.snapshot.is_none(),
+                deleted: change.snapshot.is_none() && change.typed_payload.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
                     &row.created_at,
@@ -276,6 +277,8 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -337,7 +340,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
-                deleted: change.snapshot.is_none(),
+                deleted: change.snapshot.is_none() && change.typed_payload.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
                     &row.created_at,
@@ -359,6 +362,8 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -407,7 +412,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: *change_commit_id,
-                deleted: change.snapshot.is_none(),
+                deleted: change.snapshot.is_none() && change.typed_payload.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
                     &row.created_at,
@@ -429,6 +434,8 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -810,6 +817,7 @@ pub(crate) fn tracked_change_from_materialized(
             .map_or(crate::json_store::JsonSlot::None, |content| {
                 crate::json_store::JsonSlot::from_json(content)
             }),
+        typed_payload: None,
         metadata: row
             .metadata
             .as_ref()

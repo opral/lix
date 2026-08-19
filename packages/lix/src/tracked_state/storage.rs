@@ -30,9 +30,6 @@ use crate::tracked_state::codec::{
     encode_schema_file_prefix, encode_schema_key_prefix, encode_single_string_key_ref_into,
     encode_value_ref,
 };
-pub(crate) use crate::tracked_state::types::{
-    CommitDeltaLifecycleSummary, CommitDeltaReplacementScope,
-};
 use crate::tracked_state::types::{
     ColumnarPageSource, CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
     CurrentStatePartDescriptor, CurrentStatePartSource, CurrentStateScopedRangeRoot,
@@ -41,6 +38,9 @@ use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
     TrackedStateKeyRef, TrackedStateRootId, TrackedStateSingleStringReplacementRef,
     TrackedStateTreeScanRequest,
+};
+pub(crate) use crate::tracked_state::types::{
+    CommitDeltaLifecycleSummary, CommitDeltaReplacementScope,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
@@ -110,8 +110,9 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // decoder. Version 16 permits direct-address leaves to reconstruct the exact
 // per-row ChangeId from one shared commit id and the first packed ordinal.
 // LXCD15 is deliberately rejected rather than read through a compatibility
-// decoder.
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD16";
+// decoder. Version 17 hard-cuts commit payload sidecars to native typed row
+// layouts for plugin-owned rows; LXCD16 is deliberately rejected.
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD17";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -127,7 +128,9 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD16";
 // Version 10 splits the authority header from a separately keyed mutation
 // catalog and authenticates a content-addressed hierarchical part directory.
 const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS10";
-const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI1";
+// Version 2 authenticates direct-part ownership bitmaps. LXMI1 has a
+// materially different packed shape and is deliberately rejected.
+const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI2";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -140,6 +143,11 @@ const COMMIT_DELTA_SIDECAR_ZSTD: u8 = 1;
 /// envelopes.
 const COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW: u8 = 3;
 const COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD: u8 = 4;
+/// Every entry is an authored native typed payload with empty JSON, metadata,
+/// origin, and base-coordinate columns. The indexed body stores the durable
+/// typed bytes directly, without one Musli envelope per row.
+const COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_RAW: u8 = 5;
+const COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_ZSTD: u8 = 6;
 // Tiny history records are faster and usually smaller once stored raw: the
 // zstd frame/header and compressor call cannot amortize over a point write.
 const COMMIT_DELTA_MIN_COMPRESS_BYTES: usize = 1024;
@@ -167,7 +175,7 @@ impl CommitDeltaSegmentEncodeError {
     }
 }
 
-#[derive(Clone, Copy, musli::Encode)]
+#[derive(Clone, musli::Encode)]
 #[musli(packed)]
 struct CommitDeltaPayloadRef<'a> {
     #[musli(with = crate::json_store::json_slot_storage_ref)]
@@ -175,19 +183,23 @@ struct CommitDeltaPayloadRef<'a> {
     #[musli(with = crate::json_store::json_slot_storage_ref)]
     metadata: crate::json_store::JsonSlotRef<'a>,
     #[musli(with = storage_codec::option)]
+    typed_payload: Option<&'a [u8]>,
+    #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
     #[musli(with = storage_codec::option)]
     base_coordinate: Option<TrackedStateBaseCoordinate>,
     authored: bool,
 }
 
-#[derive(Clone, Copy, musli::Encode)]
+#[derive(Clone, musli::Encode)]
 #[musli(packed)]
 struct CommitDeltaAuthoredPayloadRef<'a> {
     #[musli(with = crate::json_store::json_slot_storage_ref)]
     snapshot: crate::json_store::JsonSlotRef<'a>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
     metadata: crate::json_store::JsonSlotRef<'a>,
+    #[musli(with = storage_codec::option)]
+    typed_payload: Option<&'a [u8]>,
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
     #[musli(with = storage_codec::option)]
@@ -197,6 +209,7 @@ struct CommitDeltaAuthoredPayloadRef<'a> {
 const COMMIT_DELTA_PAYLOAD_AUTHORED: u8 = 0;
 const COMMIT_DELTA_PAYLOAD_SELECTED_REF: u8 = 1;
 const COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE: u8 = 2;
+const COMMIT_DELTA_PAYLOAD_AUTHORED_TYPED: u8 = 3;
 
 #[derive(Debug, musli::Decode)]
 #[musli(packed)]
@@ -205,6 +218,8 @@ struct CommitDeltaAuthoredPayload {
     snapshot: crate::json_store::JsonSlot,
     #[musli(with = crate::json_store::json_slot_storage)]
     metadata: crate::json_store::JsonSlot,
+    #[musli(with = storage_codec::option)]
+    typed_payload: Option<Vec<u8>>,
     #[musli(with = storage_codec::option)]
     origin_key: Option<String>,
     #[musli(with = storage_codec::option)]
@@ -247,6 +262,7 @@ struct CommitDeltaPayloadIndex<S> {
 enum CommitDeltaPayloadLayout {
     Indexed,
     AuthoredInline,
+    AuthoredTyped,
 }
 
 type CommitDeltaPayloadIndexRef<'a> = CommitDeltaPayloadIndex<Cow<'a, [u8]>>;
@@ -293,6 +309,23 @@ where
                 return Ok(CommitDeltaPayload::Authored(CommitDeltaAuthoredPayload {
                     snapshot: crate::json_store::JsonSlot::Inline(json.into()),
                     metadata: crate::json_store::JsonSlot::None,
+                    typed_payload: None,
+                    origin_key: None,
+                    base_coordinate: None,
+                }));
+            }
+            CommitDeltaPayloadLayout::AuthoredTyped => {
+                let payload = self.payload_range(entry_index)?;
+                if payload.is_empty() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state typed commit_delta member has an empty payload",
+                    ));
+                }
+                return Ok(CommitDeltaPayload::Authored(CommitDeltaAuthoredPayload {
+                    snapshot: crate::json_store::JsonSlot::None,
+                    metadata: crate::json_store::JsonSlot::None,
+                    typed_payload: Some(payload.to_vec()),
                     origin_key: None,
                     base_coordinate: None,
                 }));
@@ -326,6 +359,15 @@ where
             COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE => Ok(CommitDeltaPayload::SelectedTombstone(
                 decode_optional_base_coordinate(payload)?,
             )),
+            COMMIT_DELTA_PAYLOAD_AUTHORED_TYPED if !payload.is_empty() => {
+                Ok(CommitDeltaPayload::Authored(CommitDeltaAuthoredPayload {
+                    snapshot: crate::json_store::JsonSlot::None,
+                    metadata: crate::json_store::JsonSlot::None,
+                    typed_payload: Some(payload.to_vec()),
+                    origin_key: None,
+                    base_coordinate: None,
+                }))
+            }
             _ => Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state commit_delta member has an invalid payload tag",
@@ -585,9 +627,12 @@ struct CommitDeltaManifest {
     selected_source_commit_id: Option<[u8; 16]>,
     member_count: u32,
     selection_fingerprint: [u8; 32],
-    /// Exact dense address inventory for ordered, fully addressable commits.
-    /// An empty column denotes the generic unordered/mixed-address layout.
+    /// Exact physical ranges participating in direct addressing. An empty
+    /// column denotes the generic locator-only layout.
     direct_segment_row_counts: Vec<u16>,
+    /// One authenticated ownership bitset per direct segment. Set bits own
+    /// their derivable ChangeIds; clear bits are authored locator-backed rows.
+    direct_segment_ownership: Vec<Vec<u8>>,
     /// Collection partitions for which this commit is an authoritative base
     /// generation. A miss in one of these scopes must not fall through to a
     /// first-parent run. This persists the SQL executor's complete-replacement
@@ -643,6 +688,7 @@ struct StoredCommitStateManifest {
 struct StoredCommitMutationInventory {
     member_count: u32,
     selection_fingerprint: [u8; 32],
+    direct_part_ownership: Vec<Vec<u8>>,
     #[musli(with = storage_codec::option)]
     single_partition: Option<CommitDeltaReplacementScope>,
     #[musli(with = storage_codec::option)]
@@ -680,7 +726,17 @@ pub(crate) struct CommitDeltaSelectionCertificate {
     pub(crate) member_count: u32,
     pub(crate) selection_fingerprint: [u8; 32],
     pub(crate) direct_segment_row_counts: Vec<u16>,
+    pub(crate) direct_segment_ownership: Vec<Vec<u8>>,
     pub(crate) selected_source_commit_id: Option<CommitId>,
+}
+
+impl CommitDeltaSelectionCertificate {
+    pub(crate) fn direct_addresses_are_fully_owned(&self) -> bool {
+        direct_ownership_is_fully_owned(
+            &self.direct_segment_row_counts,
+            &self.direct_segment_ownership,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -702,6 +758,7 @@ fn commit_state_inventory_from_delta_manifest(
         member_count: manifest.member_count,
         selection_fingerprint: manifest.selection_fingerprint,
         direct_part_row_counts: manifest.direct_segment_row_counts.clone(),
+        direct_part_ownership: manifest.direct_segment_ownership.clone(),
         replacement_part_digests: manifest
             .segments
             .iter()
@@ -976,12 +1033,14 @@ async fn load_current_state_values_from_descriptors(
 
     let replacement = routed
         .iter()
-        .filter_map(|(_, (descriptor, output_indices))| match &descriptor.source {
-            CurrentStatePartSource::Replacement(source) => {
-                Some((descriptor, source, output_indices))
-            }
-            _ => None,
-        })
+        .filter_map(
+            |(_, (descriptor, output_indices))| match &descriptor.source {
+                CurrentStatePartSource::Replacement(source) => {
+                    Some((descriptor, source, output_indices))
+                }
+                _ => None,
+            },
+        )
         .collect::<Vec<_>>();
     let storage_keys = replacement
         .iter()
@@ -1078,12 +1137,14 @@ async fn load_current_state_values_from_descriptors(
     }
     let columnar = routed
         .iter()
-        .filter_map(|(_, (descriptor, output_indices))| match &descriptor.source {
-            CurrentStatePartSource::ColumnarPage(source) => {
-                Some((descriptor, source, output_indices))
-            }
-            _ => None,
-        })
+        .filter_map(
+            |(_, (descriptor, output_indices))| match &descriptor.source {
+                CurrentStatePartSource::ColumnarPage(source) => {
+                    Some((descriptor, source, output_indices))
+                }
+                _ => None,
+            },
+        )
         .collect::<Vec<_>>();
     let mut columnar_manifests = HashMap::new();
     for (_, source, _) in &columnar {
@@ -1511,6 +1572,7 @@ fn commit_delta_manifest_from_inventory(
         member_count: inventory.member_count,
         selection_fingerprint: inventory.selection_fingerprint,
         direct_segment_row_counts: inventory.direct_part_row_counts.clone(),
+        direct_segment_ownership: inventory.direct_part_ownership.clone(),
         single_partition: inventory.single_partition.clone(),
         lifecycle_summary: inventory.lifecycle_summary.clone(),
         replacement_generation: inventory.replacement_generation.clone(),
@@ -2774,7 +2836,9 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
     };
 
     if members.iter().any(|member| {
-        !member.value.deleted && member.change.snapshot == crate::json_store::JsonSlot::None
+        !member.value.deleted
+            && member.change.snapshot == crate::json_store::JsonSlot::None
+            && member.change.typed_payload.is_none()
     }) {
         // The selected/reference source owns this payload. Until it is
         // available through the same read-your-writes authority, omit this
@@ -2795,6 +2859,7 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
             value: member.value,
             snapshot: member.change.snapshot,
             metadata: member.change.metadata,
+            typed_payload: member.change.typed_payload.clone(),
         });
         if mutations.insert(encoded_key, row).is_some() {
             return Err(replacement_payload_error(
@@ -3299,12 +3364,15 @@ async fn load_scoped_current_state_descriptor_rows(
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
                         },
-                        snapshot: owned_scoped_json_slot(decoded.snapshot(ordinal)?.ok_or_else(
-                            || replacement_payload_error("replacement source omitted snapshot"),
-                        )?),
+                        snapshot: owned_scoped_json_slot(
+                            decoded
+                                .snapshot(ordinal)?
+                                .unwrap_or(crate::json_store::JsonSlotRef::None),
+                        ),
                         metadata: owned_scoped_json_slot(decoded.metadata(ordinal)?.ok_or_else(
                             || replacement_payload_error("replacement source omitted metadata"),
                         )?),
+                        typed_payload: decoded.typed_payload(ordinal)?.map(ToOwned::to_owned),
                     })
                 })
                 .collect::<Result<Vec<_>, LixError>>()?
@@ -3459,6 +3527,7 @@ async fn load_scoped_current_state_descriptor_rows(
                         },
                         snapshot: record.snapshot,
                         metadata: record.metadata,
+                        typed_payload: record.typed_payload,
                     })
                 })
                 .collect::<Result<Vec<_>, LixError>>()?
@@ -4415,6 +4484,9 @@ where
         direct_segment_row_counts: Vec::with_capacity(
             row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
         ),
+        direct_segment_ownership: Vec::with_capacity(
+            row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+        ),
         single_partition: None,
         lifecycle_summary,
         replacement_generation: None,
@@ -4459,6 +4531,9 @@ where
         let row_count_u16 =
             u16::try_from(candidate_len).expect("commit-delta segment row count fits u16");
         manifest.direct_segment_row_counts.push(row_count_u16);
+        manifest
+            .direct_segment_ownership
+            .push(fully_owned_direct_part(row_count_u16));
         segment_row_counts.push(row_count_u16);
         for _ in 0..candidate_len {
             pending.pop_front();
@@ -4605,6 +4680,7 @@ pub(crate) fn stage_ordered_columnar_mutations(
                 .expect("direct mutation segment row count fits u16")
         })
         .collect::<Vec<_>>();
+    let direct_part_ownership = fully_owned_direct_parts(&direct_part_row_counts);
     let lifecycle_summary = CommitDeltaLifecycleSummary {
         scope: CommitDeltaReplacementScope {
             schema_key: parts.schema_key.clone(),
@@ -4622,6 +4698,7 @@ pub(crate) fn stage_ordered_columnar_mutations(
             member_count: parts.row_count,
             selection_fingerprint: [0; 32],
             direct_part_row_counts,
+            direct_part_ownership,
             replacement_part_digests: Vec::new(),
             single_partition: Some(lifecycle_summary.scope.clone()),
             lifecycle_summary: Some(lifecycle_summary),
@@ -4635,8 +4712,8 @@ pub(crate) fn stage_ordered_columnar_mutations(
 }
 
 /// Publishes a complete replacement as compact immutable identity parts.
-/// Parts own identity routing and JSON authority: small values are inline and
-/// large values remain content-addressed references into the JSON store.
+/// Parts own identity routing and row-payload authority. Engine-owned JSON
+/// slots remain content-addressed; plugin rows use the native typed slot.
 pub(crate) struct ReplacementPartInput<'a> {
     key_start: usize,
     key_end: usize,
@@ -4645,6 +4722,8 @@ pub(crate) struct ReplacementPartInput<'a> {
     updated_at: crate::common::LixTimestamp,
     snapshot: crate::json_store::JsonSlotRef<'a>,
     metadata: crate::json_store::JsonSlotRef<'a>,
+    typed_snapshot: Option<&'a crate::plugin::runtime::WasmTypedRow>,
+    typed_payload: Option<&'a [u8]>,
 }
 
 pub(crate) trait ReplacementPartInputRef<'a>: Copy {
@@ -4681,6 +4760,8 @@ impl<'a> ReplacementPartInputRef<'a> for TrackedStateCommitDeltaRef<'a> {
             updated_at: self.delta.updated_at,
             snapshot: self.snapshot,
             metadata: self.metadata,
+            typed_snapshot: self.typed_snapshot,
+            typed_payload: self.typed_payload,
         })
     }
 }
@@ -4704,6 +4785,8 @@ impl<'a> ReplacementPartInputRef<'a> for TrackedStateSingleStringReplacementRef<
             updated_at: self.updated_at,
             snapshot: self.snapshot,
             metadata: self.metadata,
+            typed_snapshot: None,
+            typed_payload: None,
         })
     }
 }
@@ -4766,6 +4849,8 @@ where
         key_end: usize,
         snapshot: crate::json_store::JsonSlotRef<'a>,
         metadata: crate::json_store::JsonSlotRef<'a>,
+        typed_snapshot: Option<&'a crate::plugin::runtime::WasmTypedRow>,
+        typed_payload: Option<&'a [u8]>,
     }
 
     let suffix_row_count = deltas.len();
@@ -4821,10 +4906,13 @@ where
                 "tracked_state replacement member violates immutable replacement invariants",
             ));
         }
-        if matches!(delta.snapshot, crate::json_store::JsonSlotRef::None) {
+        if matches!(delta.snapshot, crate::json_store::JsonSlotRef::None)
+            && delta.typed_snapshot.is_none()
+            && delta.typed_payload.is_none()
+        {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "tracked_state replacement member has no canonical snapshot",
+                "tracked_state replacement member has no canonical row payload",
             ));
         }
         if commit_id
@@ -4853,6 +4941,8 @@ where
             key_end: delta.key_end,
             snapshot: delta.snapshot,
             metadata: delta.metadata,
+            typed_snapshot: delta.typed_snapshot,
+            typed_payload: delta.typed_payload,
         });
         if pending.len() == COMMIT_DELTA_SEGMENT_MAX_ROWS {
             encode_replacement_part_prefix(
@@ -4886,6 +4976,8 @@ where
                         encoded_key: &key_arena[row.key_start..row.key_end],
                         snapshot: row.snapshot,
                         metadata: row.metadata,
+                        typed_snapshot: row.typed_snapshot,
+                        typed_payload: row.typed_payload,
                     },
                 )
                 .collect::<Vec<_>>();
@@ -5013,6 +5105,7 @@ pub(crate) fn stage_preencoded_ordered_addressable_replacement_parts(
         member_count: u32::try_from(row_count).expect("replacement row count was bounded"),
         selection_fingerprint: [0; 32],
         direct_segment_row_counts: Vec::with_capacity(parts.len()),
+        direct_segment_ownership: Vec::with_capacity(parts.len()),
         single_partition: Some(generation.scope.clone()),
         lifecycle_summary: Some(generation.lifecycle_summary.clone()),
         replacement_generation: Some(stored_replacement_generation(
@@ -5027,6 +5120,9 @@ pub(crate) fn stage_preencoded_ordered_addressable_replacement_parts(
     let mut first_address = 0u32;
     for (segment_index, part) in parts.into_iter().enumerate() {
         manifest.direct_segment_row_counts.push(part.row_count());
+        manifest
+            .direct_segment_ownership
+            .push(fully_owned_direct_part(part.row_count()));
         let bounds = CommitDeltaSegmentBounds {
             first_key: part.first_key().to_vec(),
             last_key: part.last_key().to_vec(),
@@ -5225,9 +5321,29 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
     row_count: usize,
     compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
 ) -> Result<(CommitDeltaSegmentBounds, Vec<u8>), CommitDeltaSegmentEncodeError> {
+    let deltas = deltas.collect::<Vec<_>>();
+    let encoded_typed_payloads = deltas
+        .iter()
+        .map(|delta| {
+            delta
+                .typed_snapshot
+                .map(|row| {
+                    row.durable_payload().map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("cannot encode typed payload: {error:?}"),
+                        )
+                    })
+                })
+                .transpose()
+                .map_err(CommitDeltaSegmentEncodeError::Codec)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(row_count);
     let mut payloads = Vec::with_capacity(row_count);
-    for (ordinal, delta) in deltas.enumerate() {
+    for (ordinal, (delta, encoded_typed_payload)) in
+        deltas.into_iter().zip(&encoded_typed_payloads).enumerate()
+    {
         let change_id = addressable_change_id(commit_id, segment_index, ordinal)
             .map_err(CommitDeltaSegmentEncodeError::Codec)?;
         entries.push(
@@ -5247,6 +5363,7 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
         payloads.push(CommitDeltaPayloadRef {
             snapshot: delta.snapshot,
             metadata: delta.metadata,
+            typed_payload: encoded_typed_payload.as_deref().or(delta.typed_payload),
             origin_key: delta.origin_key,
             base_coordinate: delta.base_coordinate,
             authored: delta.authored,
@@ -5285,9 +5402,25 @@ fn stage_commit_deltas_inner(
             mutation_inventory: CommitStateMutationInventory::default(),
         });
     };
+    let encoded_typed_payloads = deltas
+        .iter()
+        .map(|delta| {
+            delta
+                .typed_snapshot
+                .map(|row| {
+                    row.durable_payload().map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("cannot encode typed payload: {error:?}"),
+                        )
+                    })
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(deltas.len());
     let mut payloads = Vec::with_capacity(deltas.len());
-    for delta in deltas {
+    for (delta, encoded_typed_payload) in deltas.iter().zip(&encoded_typed_payloads) {
         if delta.delta.commit_id != commit_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -5311,6 +5444,7 @@ fn stage_commit_deltas_inner(
         payloads.push(CommitDeltaPayloadRef {
             snapshot: delta.snapshot,
             metadata: delta.metadata,
+            typed_payload: encoded_typed_payload.as_deref().or(delta.typed_payload),
             origin_key: delta.origin_key,
             base_coordinate: delta.base_coordinate,
             authored: delta.authored,
@@ -5416,6 +5550,18 @@ fn stage_commit_deltas_inner(
         encoded_segments.push((segment_start..segment_end, encoded));
         segment_start = segment_end;
     }
+    let mut final_change_ids = HashSet::with_capacity(entries.len());
+    for entry in &entries {
+        let change_id = decode_value(&entry.value)?.change_id;
+        if !final_change_ids.insert(change_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit_delta for commit '{commit_id}' contains colliding authored or generated ChangeIds"
+                ),
+            ));
+        }
+    }
     let member_count = u32::try_from(entries.len()).map_err(|_| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -5433,12 +5579,16 @@ fn stage_commit_deltas_inner(
             value.updated_at,
         )
     }));
-    // A direct-address inventory is valid only when every row owns the slot
-    // encoded into its assigned ChangeId. Mixed batches need locator fallback
-    // for all rows because the inventory cannot describe per-row ownership;
-    // selected-source aliases likewise cannot certify only their local part.
+    // The segment inventory authenticates the physical coordinate range, not
+    // a claim that every coordinate's row uses its derivable direct ID. A
+    // mixed batch can therefore publish the same bounded ranges: direct rows
+    // resolve from their encoded address, while authored rows retain explicit
+    // locators. The direct reader verifies the embedded change ID and treats
+    // an authored coordinate as not owned before consulting that locator.
+    // Selected-source aliases cannot claim local direct coordinates because
+    // their physical authority belongs to the selected source commit.
     let direct_segment_row_counts =
-        if selected_source_commit_id.is_none() && addressable.iter().all(|&direct| direct) {
+        if selected_source_commit_id.is_none() && addressable.iter().any(|&direct| direct) {
             encoded_segments
                 .iter()
                 .map(|(range, _)| {
@@ -5448,7 +5598,15 @@ fn stage_commit_deltas_inner(
         } else {
             Vec::new()
         };
-    let has_dense_address_inventory = !direct_segment_row_counts.is_empty();
+    let direct_segment_ownership = if direct_segment_row_counts.is_empty() {
+        Vec::new()
+    } else {
+        encoded_segments
+            .iter()
+            .map(|(range, _)| direct_ownership_bits(&addressable[range.clone()]))
+            .collect::<Vec<_>>()
+    };
+    let has_direct_address_inventory = !direct_segment_row_counts.is_empty();
     let segment_count = encoded_segments.len();
     if segment_count == 1 {
         let (_, inline_segment) = encoded_segments
@@ -5461,6 +5619,7 @@ fn stage_commit_deltas_inner(
             member_count,
             selection_fingerprint,
             direct_segment_row_counts,
+            direct_segment_ownership,
             single_partition: single_partition_for_entries(&entries)?,
             lifecycle_summary: None,
             replacement_generation: None,
@@ -5488,6 +5647,7 @@ fn stage_commit_deltas_inner(
         member_count,
         selection_fingerprint,
         direct_segment_row_counts,
+        direct_segment_ownership,
         single_partition: single_partition_for_entries(&entries)?,
         lifecycle_summary: None,
         replacement_generation: None,
@@ -5498,7 +5658,8 @@ fn stage_commit_deltas_inner(
     };
     let mut locators = Vec::with_capacity(entries.len());
     for (segment_index, (range, encoded)) in encoded_segments.into_iter().enumerate() {
-        let segment_entries = &entries[range];
+        let segment_entries = &entries[range.clone()];
+        let segment_addressable = &addressable[range];
         let first_key = segment_entries
             .first()
             .expect("non-empty packed commit-delta segment")
@@ -5519,12 +5680,17 @@ fn stage_commit_deltas_inner(
             key(commit_delta_segment_key(commit_id, segment_index)?),
             value(encoded),
         );
-        if !has_dense_address_inventory {
-            locators.extend(commit_delta_change_locators(
-                commit_id,
-                segment_index,
-                segment_entries,
-            )?);
+        let segment_locators =
+            commit_delta_change_locators(commit_id, segment_index, segment_entries)?;
+        if has_direct_address_inventory {
+            locators.extend(
+                segment_locators
+                    .into_iter()
+                    .zip(segment_addressable)
+                    .filter_map(|(locator, &direct)| (!direct).then_some(locator)),
+            );
+        } else {
+            locators.extend(segment_locators);
         }
     }
     Ok(AddressableCommitDeltaStage {
@@ -5565,6 +5731,72 @@ fn addressable_change_id(
             )
         })?;
     Ok(change_id_from_packed_address(commit_id, packed))
+}
+
+fn direct_ownership_bits(rows: &[bool]) -> Vec<u8> {
+    let mut bits = vec![0_u8; rows.len().div_ceil(8)];
+    for (ordinal, &owned) in rows.iter().enumerate() {
+        if owned {
+            bits[ordinal / 8] |= 1 << (ordinal % 8);
+        }
+    }
+    bits
+}
+
+fn fully_owned_direct_part(row_count: u16) -> Vec<u8> {
+    let row_count = usize::from(row_count);
+    let mut bits = vec![u8::MAX; row_count.div_ceil(8)];
+    if row_count % 8 != 0 {
+        *bits.last_mut().expect("nonzero direct part has ownership") = (1 << (row_count % 8)) - 1;
+    }
+    bits
+}
+
+fn fully_owned_direct_parts(row_counts: &[u16]) -> Vec<Vec<u8>> {
+    row_counts
+        .iter()
+        .copied()
+        .map(fully_owned_direct_part)
+        .collect()
+}
+
+fn direct_ownership_is_valid(row_counts: &[u16], ownership: &[Vec<u8>]) -> bool {
+    if row_counts.is_empty() {
+        return ownership.is_empty();
+    }
+    if row_counts.len() != ownership.len() {
+        return false;
+    }
+    let mut any_owned = false;
+    for (&row_count, bits) in row_counts.iter().zip(ownership) {
+        let row_count = usize::from(row_count);
+        if bits.len() != row_count.div_ceil(8) {
+            return false;
+        }
+        let trailing = row_count % 8;
+        if trailing != 0
+            && bits
+                .last()
+                .is_some_and(|last| *last & !((1 << trailing) - 1) != 0)
+        {
+            return false;
+        }
+        any_owned |= bits.iter().any(|&byte| byte != 0);
+    }
+    any_owned
+}
+
+fn direct_ownership_is_fully_owned(row_counts: &[u16], ownership: &[Vec<u8>]) -> bool {
+    direct_ownership_is_valid(row_counts, ownership)
+        && row_counts
+            .iter()
+            .enumerate()
+            .all(|(part_index, &row_count)| {
+                (0..row_count).all(|local_row| {
+                    let ordinal = usize::from(local_row);
+                    ownership[part_index][ordinal / 8] & (1 << (ordinal % 8)) != 0
+                })
+            })
 }
 
 pub(crate) fn change_id_from_packed_address(
@@ -5739,6 +5971,7 @@ enum DirectNotOwnedReason {
     AbsentInlineAuthority,
     PartIndexOutOfRange,
     LocalRowOutOfRange,
+    AuthoredCoordinate,
 }
 
 #[derive(Clone)]
@@ -5908,7 +6141,8 @@ async fn route_direct_change_records_for_state(
                         super::mutation_directory::MutationDirectoryNotOwnedReason::LocalRowOutOfRange
                     }
                     DirectNotOwnedReason::MissingCommitAuthority
-                    | DirectNotOwnedReason::AbsentInlineAuthority => {
+                    | DirectNotOwnedReason::AbsentInlineAuthority
+                    | DirectNotOwnedReason::AuthoredCoordinate => {
                         continue;
                     }
                 },
@@ -5970,7 +6204,7 @@ async fn route_direct_change_records_for_state(
             super::mutation_directory::record_direct_route_claimed_rows(
                 runs.iter().map(|run| run.selector_span.len()).sum(),
             );
-            for (selector_index, record) in load_physical_direct_change_records(
+            for (selector_index, route) in load_physical_direct_change_records(
                 store,
                 state,
                 &coordinates,
@@ -5982,7 +6216,7 @@ async fn route_direct_change_records_for_state(
             )
             .await?
             {
-                unique[selector_index] = Some(DirectChangeRecordRoute::Owned(record));
+                unique[selector_index] = Some(route);
             }
         }
         unique
@@ -6051,14 +6285,27 @@ async fn route_direct_change_records_for_state(
             }
             for selector_index in owned_indices {
                 let locator_index = unique_locator_indices[selector_index];
-                let record = decode_change_at_locator_from_decoded(
-                    &leaf,
-                    &payloads,
-                    locators[locator_index],
-                    &state.change_account_id,
-                )
-                .map(|entry| entry.change_record)?;
-                unique[selector_index] = Some(DirectChangeRecordRoute::Owned(record));
+                let locator = locators[locator_index];
+                let route = match state.mutations.direct_coordinate_owned(0, locator.ordinal) {
+                    Some(false) => {
+                        DirectChangeRecordRoute::NotOwned(DirectNotOwnedReason::AuthoredCoordinate)
+                    }
+                    Some(true) => DirectChangeRecordRoute::Owned(
+                        decode_change_at_locator_from_decoded(
+                            &leaf,
+                            &payloads,
+                            locator,
+                            &state.change_account_id,
+                        )?
+                        .change_record,
+                    ),
+                    None => {
+                        return Err(replacement_payload_error(
+                            "inline direct coordinate omitted authenticated ownership",
+                        ));
+                    }
+                };
+                unique[selector_index] = Some(route);
             }
             unique
                 .into_iter()
@@ -6164,7 +6411,7 @@ async fn load_physical_direct_change_records(
     coordinates: &[super::mutation_directory::MutationDirectoryDirectCoordinate],
     locators: &[CommitDeltaChangeLocator],
     runs: Vec<super::mutation_directory::MutationDirectoryPartRun>,
-) -> Result<Vec<(usize, crate::changelog::ChangeRecord)>, LixError> {
+) -> Result<Vec<(usize, DirectChangeRecordRoute)>, LixError> {
     #[cfg(any(test, feature = "storage-benches"))]
     super::mutation_directory::record_direct_external_parts_loaded(runs.len());
     let storage_keys = runs
@@ -6226,6 +6473,7 @@ async fn load_physical_direct_change_records(
                 content_digest,
                 direct_row_count,
             } => {
+                let mut hydrated = Vec::new();
                 hydrate_compact_replacement_direct_run(
                     state,
                     entry_index,
@@ -6235,8 +6483,13 @@ async fn load_physical_direct_change_records(
                     &bytes,
                     coordinates,
                     locators,
-                    &mut output,
+                    &mut hydrated,
                 )?;
+                output.extend(
+                    hydrated
+                        .into_iter()
+                        .map(|(index, record)| (index, DirectChangeRecordRoute::Owned(record))),
+                );
                 continue;
             }
             super::mutation_directory::MutationDirectoryEntry::DirectAddress { .. } => {
@@ -6265,16 +6518,29 @@ async fn load_physical_direct_change_records(
                     "direct-coordinate run disagrees with its physical locator",
                 ));
             }
-            output.push((
-                output_index,
-                decode_change_at_locator_from_decoded(
-                    &leaf,
-                    &payloads,
-                    locator,
-                    &state.change_account_id,
-                )?
-                .change_record,
-            ));
+            let route = match state
+                .mutations
+                .direct_coordinate_owned(entry_index as usize, locator.ordinal)
+            {
+                Some(false) => {
+                    DirectChangeRecordRoute::NotOwned(DirectNotOwnedReason::AuthoredCoordinate)
+                }
+                Some(true) => DirectChangeRecordRoute::Owned(
+                    decode_change_at_locator_from_decoded(
+                        &leaf,
+                        &payloads,
+                        locator,
+                        &state.change_account_id,
+                    )?
+                    .change_record,
+                ),
+                None => {
+                    return Err(replacement_payload_error(
+                        "direct coordinate omitted authenticated ownership",
+                    ));
+                }
+            };
+            output.push((output_index, route));
         }
     }
     Ok(output)
@@ -6356,13 +6622,21 @@ fn hydrate_compact_replacement_direct_run(
         let snapshot = owned_scoped_json_slot(
             decoded
                 .snapshot(usize::from(locator.ordinal))?
-                .ok_or_else(|| replacement_payload_error("replacement part omitted a snapshot"))?,
+                .unwrap_or(crate::json_store::JsonSlotRef::None),
         );
         let metadata = owned_scoped_json_slot(
             decoded
                 .metadata(usize::from(locator.ordinal))?
                 .ok_or_else(|| replacement_payload_error("replacement part omitted metadata"))?,
         );
+        let typed_payload = decoded
+            .typed_payload(usize::from(locator.ordinal))?
+            .map(ToOwned::to_owned);
+        if (snapshot == crate::json_store::JsonSlot::None) == typed_payload.is_none() {
+            return Err(replacement_payload_error(
+                "replacement part must carry exactly one JSON or typed payload",
+            ));
+        }
         output.push((
             output_index,
             crate::changelog::ChangeRecord {
@@ -6374,6 +6648,7 @@ fn hydrate_compact_replacement_direct_run(
                 file_id: key.file_id,
                 snapshot,
                 metadata,
+                typed_payload,
                 created_at: lifecycle.uniform_created_at,
                 origin_key: None,
             },
@@ -6648,7 +6923,12 @@ async fn load_selected_change_records_from_state(
             )
             .await?;
             let mut records = (0..unique_locators.len()).map(|_| None).collect::<Vec<_>>();
-            for (index, record) in routed {
+            for (index, route) in routed {
+                let DirectChangeRecordRoute::Owned(record) = route else {
+                    return Err(replacement_payload_error(
+                        "selected change locator points at an authored coordinate with a different change id",
+                    ));
+                };
                 records[index] = Some(record);
             }
             records
@@ -6753,10 +7033,13 @@ where
         ));
     }
     let key = decode_key(entry.key)?;
-    let (snapshot, metadata, origin_key, base_coordinate) = match payloads.decode(ordinal)? {
+    let (snapshot, metadata, typed_payload, origin_key, base_coordinate) = match payloads
+        .decode(ordinal)?
+    {
         CommitDeltaPayload::Authored(payload) => (
             payload.snapshot,
             payload.metadata,
+            payload.typed_payload,
             payload.origin_key,
             payload.base_coordinate,
         ),
@@ -6781,6 +7064,7 @@ where
             file_id: key.file_id,
             snapshot,
             metadata,
+            typed_payload,
             created_at: updated_at,
             origin_key,
         },
@@ -7019,7 +7303,29 @@ fn decode_columnar_change_record(
     }
     let row_pk = RowPk::from_json_array_text(identity_column.value(row_index))
         .map_err(|error| replacement_payload_error(&error.to_string()))?;
-    let mut snapshot = serde_json::Map::new();
+    let fingerprint = manifest
+        .metadata
+        .get("lix.schema_v1.fingerprint")
+        .ok_or_else(|| replacement_payload_error("columnar mutation schema fingerprint is missing"))
+        .and_then(|fingerprint| {
+            blake3::Hash::from_hex(fingerprint)
+                .map(|hash| *hash.as_bytes())
+                .map_err(|_| replacement_payload_error("columnar mutation schema fingerprint is invalid"))
+        })?;
+    let mut row = lix_schema::Row::with_capacity(manifest.fields.len() - 1);
+    let primary_key_column_count = manifest
+        .fields
+        .iter()
+        .filter_map(|field| {
+            field
+                .metadata
+                .get("lix.schema_v1.primary_key_ordinal")
+                .and_then(|ordinal| ordinal.parse::<usize>().ok())
+        })
+        .max()
+        .and_then(|ordinal| ordinal.checked_add(1))
+        .ok_or_else(|| replacement_payload_error("columnar mutation primary key is missing"))?;
+    let mut row_pk_values = vec![None; primary_key_column_count];
     for (column_index, field) in manifest
         .fields
         .iter()
@@ -7027,57 +7333,110 @@ fn decode_columnar_change_record(
         .enumerate()
     {
         let column = batch.column(column_index);
+        let native_type = field
+            .metadata
+            .get("lix.schema_v1.type")
+            .map(String::as_str)
+            .ok_or_else(|| replacement_payload_error("columnar mutation native type is missing"))?;
         let value = if column.is_null(row_index) {
-            serde_json::Value::Null
+            lix_schema::Value::Null
         } else {
-            match field.data_type {
-                crate::columnar_row_group::RowGroupDataType::String => {
-                    let value = column
+            match native_type {
+                "text" => lix_schema::Value::Text(
+                    column
                         .as_any()
                         .downcast_ref::<StringArray>()
-                        .ok_or_else(|| replacement_payload_error("columnar string type drift"))?
-                        .value(row_index);
-                    if field.metadata.get("lix.value_type").map(String::as_str) == Some("json") {
-                        serde_json::from_str(value).map_err(|error| {
-                            replacement_payload_error(&format!(
-                                "columnar JSON value is invalid: {error}"
-                            ))
-                        })?
-                    } else {
-                        serde_json::Value::String(value.to_owned())
-                    }
-                }
-                crate::columnar_row_group::RowGroupDataType::Int64 => serde_json::Value::Number(
+                        .ok_or_else(|| replacement_payload_error("columnar text type drift"))?
+                        .value(row_index)
+                        .to_owned(),
+                ),
+                "uuid" => lix_schema::Value::Uuid(
+                    uuid::Uuid::parse_str(
+                        column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| replacement_payload_error("columnar uuid type drift"))?
+                            .value(row_index),
+                    )
+                    .map_err(|_| replacement_payload_error("columnar uuid value is invalid"))?,
+                ),
+                "int8" => lix_schema::Value::Int8(
                     column
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .ok_or_else(|| replacement_payload_error("columnar integer type drift"))?
-                        .value(row_index)
-                        .into(),
+                        .value(row_index),
                 ),
-                crate::columnar_row_group::RowGroupDataType::Float64 => {
-                    let value = column
+                "float8" => lix_schema::Value::Float8(
+                    column
                         .as_any()
                         .downcast_ref::<Float64Array>()
                         .ok_or_else(|| replacement_payload_error("columnar number type drift"))?
-                        .value(row_index);
-                    serde_json::Number::from_f64(value)
-                        .map(serde_json::Value::Number)
-                        .ok_or_else(|| replacement_payload_error("columnar number is non-finite"))?
-                }
-                crate::columnar_row_group::RowGroupDataType::Boolean => serde_json::Value::Bool(
+                        .value(row_index),
+                ),
+                "boolean" => lix_schema::Value::Boolean(
                     column
                         .as_any()
                         .downcast_ref::<BooleanArray>()
                         .ok_or_else(|| replacement_payload_error("columnar boolean type drift"))?
                         .value(row_index),
                 ),
+                "jsonb" => lix_schema::Value::Jsonb(lix_schema::Jsonb::from_value(
+                    serde_json::from_str(
+                        column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| replacement_payload_error("columnar JSONB type drift"))?
+                            .value(row_index),
+                    )
+                    .map_err(|_| replacement_payload_error("columnar JSONB value is invalid"))?,
+                )),
+                "timestamptz" => lix_schema::Value::Timestamptz(
+                    column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| replacement_payload_error("columnar timestamptz type drift"))?
+                        .value(row_index),
+                ),
+                _ => return Err(replacement_payload_error("columnar mutation native type is invalid")),
             }
         };
-        snapshot.insert(field.name.clone(), value);
+        if let Some(ordinal) = field
+            .metadata
+            .get("lix.schema_v1.primary_key_ordinal")
+            .map(|ordinal| ordinal.parse::<usize>())
+            .transpose()
+            .map_err(|_| replacement_payload_error("columnar primary-key ordinal is invalid"))?
+        {
+            let slot = row_pk_values.get_mut(ordinal).ok_or_else(|| {
+                replacement_payload_error("columnar primary-key ordinal is out of bounds")
+            })?;
+            if slot.replace(value.clone()).is_some() {
+                return Err(replacement_payload_error(
+                    "columnar mutation repeats a primary-key ordinal",
+                ));
+            }
+        }
+        row.insert(field.name.clone(), value);
     }
-    let snapshot = serde_json::to_string(&snapshot)
-        .map_err(|error| replacement_payload_error(&error.to_string()))?;
+    let row_pk_values = row_pk_values
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| replacement_payload_error("columnar mutation primary key is incomplete"))?;
+    if RowPk::from_schema_values(&row_pk_values)
+        .map_err(|error| replacement_payload_error(&error.to_string()))?
+        != row_pk
+    {
+        return Err(replacement_payload_error(
+            "columnar mutation typed primary key does not match its identity",
+        ));
+    }
+    let typed_payload = crate::plugin::wire::typed::encode_native_row_payload(
+        &fingerprint,
+        &row_pk_values,
+        &row,
+    )
+    .map_err(|error| replacement_payload_error(&format!("columnar typed row cannot encode: {error:?}")))?;
     Ok(crate::changelog::ChangeRecord {
         account_id: account_id.to_string(),
         format_version: 2,
@@ -7085,8 +7444,9 @@ fn decode_columnar_change_record(
         schema_key: parts.schema_key.clone(),
         row_pk,
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+        snapshot: crate::json_store::JsonSlot::None,
         metadata: crate::json_store::JsonSlot::None,
+        typed_payload: Some(typed_payload),
         created_at: parts.uniform_updated_at,
         origin_key: parts.origin_key.clone(),
     })
@@ -7893,6 +8253,12 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         member.authored = false;
         member.selected_tombstone = member.value.deleted;
     }
+    // A selected-source alias turns the source inventory into selected
+    // references only after that inventory has been decoded. Hydrate those
+    // newly selected members from their canonical change authorities now;
+    // hydrating while they still carried the source's `authored` flag skips
+    // every live inherited payload.
+    hydrate_selected_members(store, &mut members).await?;
     Ok(Some(merge_selected_source_members(members, local)))
 }
 
@@ -8689,6 +9055,7 @@ async fn hydrate_selected_members(
             ));
         }
         member.change.snapshot = change_record.snapshot;
+        member.change.typed_payload = change_record.typed_payload;
         member.change.metadata = change_record.metadata;
         member.change.origin_key = change_record.origin_key;
     }
@@ -9471,6 +9838,7 @@ async fn hydrate_selected_loaded_entries(
             ));
         }
         entry.change_record.snapshot = change_record.snapshot;
+        entry.change_record.typed_payload = change_record.typed_payload;
         entry.change_record.metadata = change_record.metadata;
         entry.change_record.origin_key = change_record.origin_key;
         entry.selected_ref = false;
@@ -9510,8 +9878,13 @@ pub(crate) async fn scan_commit_delta_values(
         ),
         None => None,
     };
-    scan_commit_delta_values_from_authenticated_states(store, &state, source.as_deref(), schema_keys)
-        .await
+    scan_commit_delta_values_from_authenticated_states(
+        store,
+        &state,
+        source.as_deref(),
+        schema_keys,
+    )
+    .await
 }
 
 /// Scans from immutable authority already authenticated in this reader
@@ -10704,8 +11077,7 @@ pub(crate) async fn stage_delete_commit_state_manifest_for_gc(
                 format!("retired columnar mutation authority '{commit_id}' names owner '{owner}'"),
             ));
         }
-        let row_group_id =
-            crate::row_columnar::row_group_set_id(commit_id, &parts.schema_key);
+        let row_group_id = crate::row_columnar::row_group_set_id(commit_id, &parts.schema_key);
         if row_group_id.as_bytes() != parts.row_group_set_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -11165,11 +11537,20 @@ fn collect_strict_commit_delta_members(
         }
         let payload = payloads.decode(entry_index)?;
         let key = decode_key(entry.key)?;
-        let (snapshot, metadata, origin_key, base_coordinate, authored, selected_tombstone) =
+        let (
+            snapshot,
+            metadata,
+            typed_payload,
+            origin_key,
+            base_coordinate,
+            authored,
+            selected_tombstone,
+        ) =
             match payload {
                 CommitDeltaPayload::Authored(payload) => (
                     payload.snapshot,
                     payload.metadata,
+                    payload.typed_payload,
                     payload.origin_key,
                     payload.base_coordinate,
                     true,
@@ -11179,6 +11560,7 @@ fn collect_strict_commit_delta_members(
                     crate::json_store::JsonSlot::None,
                     crate::json_store::JsonSlot::None,
                     None,
+                    None,
                     base_coordinate,
                     false,
                     false,
@@ -11186,6 +11568,7 @@ fn collect_strict_commit_delta_members(
                 CommitDeltaPayload::SelectedTombstone(base_coordinate) => (
                     crate::json_store::JsonSlot::None,
                     crate::json_store::JsonSlot::None,
+                    None,
                     None,
                     base_coordinate,
                     false,
@@ -11201,6 +11584,7 @@ fn collect_strict_commit_delta_members(
             file_id: key.file_id.clone(),
             snapshot,
             metadata,
+            typed_payload,
             created_at: value.updated_at,
             origin_key,
         };
@@ -11306,6 +11690,7 @@ pub(crate) async fn load_commit_delta_selection_certificate(
             selection_fingerprint: manifest.mutations.selection_fingerprint,
             selected_source_commit_id: manifest.mutations.selected_source_commit_id(),
             direct_segment_row_counts: manifest.mutations.direct_part_row_counts,
+            direct_segment_ownership: manifest.mutations.direct_part_ownership,
         }))
 }
 
@@ -11468,6 +11853,10 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
             || manifest.member_count == 0
             || manifest.selected_source_commit_id.is_some()
             || manifest.direct_segment_row_counts.is_empty()
+            || !direct_ownership_is_fully_owned(
+                &manifest.direct_segment_row_counts,
+                &manifest.direct_segment_ownership,
+            )
             || !manifest.inline_segment.is_empty()
             || manifest.replacement_parts.is_none()
             || manifest.lifecycle_summary.as_ref().is_none_or(|summary| {
@@ -11553,6 +11942,10 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
     }
     if !manifest.direct_segment_row_counts.is_empty() {
         if manifest.selected_source_commit_id.is_some()
+            || !direct_ownership_is_valid(
+                &manifest.direct_segment_row_counts,
+                &manifest.direct_segment_ownership,
+            )
             || manifest
                 .direct_segment_row_counts
                 .iter()
@@ -11582,8 +11975,20 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
                 "tracked_state commit_delta dense address inventory does not match its segments",
             ));
         }
+    } else if !manifest.direct_segment_ownership.is_empty() {
+        return Err(replacement_payload_error(
+            "tracked_state commit_delta ownership omitted its direct address ranges",
+        ));
     }
     if let Some(parts) = manifest.columnar_parts.as_ref() {
+        if !direct_ownership_is_fully_owned(
+            &manifest.direct_segment_row_counts,
+            &manifest.direct_segment_ownership,
+        ) {
+            return Err(replacement_payload_error(
+                "columnar mutation inventory is not fully direct-owned",
+            ));
+        }
         let actual_single_partition =
             single_partition_from_bounds(&parts.first_key, &parts.last_key)?;
         if manifest.single_partition != actual_single_partition {
@@ -11779,6 +12184,7 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
         CommitDeltaPayloadRef {
             snapshot: crate::json_store::JsonSlotRef::None,
             metadata: crate::json_store::JsonSlotRef::None,
+            typed_payload: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -11826,6 +12232,7 @@ fn encode_commit_delta_segment_layout(
         payload.authored
             && matches!(payload.snapshot, crate::json_store::JsonSlotRef::Inline(_))
             && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
+            && payload.typed_payload.is_none()
             && payload.origin_key.is_none()
             && payload.base_coordinate.is_none()
     });
@@ -11882,26 +12289,121 @@ fn encode_commit_delta_segment_layout(
             COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD,
         );
     }
-    let mut payload_offsets = Vec::with_capacity(payloads.len() + 1);
-    let mut payload_bytes = Vec::new();
-    for (entry, payload) in entries.iter().zip(payloads) {
-        payload_offsets.push(
-            u32::try_from(payload_bytes.len()).expect("commit-delta payload sidecar fits u32"),
+    let authored_typed = payloads.iter().all(|payload| {
+        payload.authored
+            && matches!(payload.snapshot, crate::json_store::JsonSlotRef::None)
+            && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
+            && payload.typed_payload.is_some()
+            && payload.origin_key.is_none()
+            && payload.base_coordinate.is_none()
+    });
+    if authored_typed {
+        let entry_count = u32::try_from(entries.len()).expect("commit-delta entry count fits u32");
+        let directory_bytes = (payloads.len() + 1)
+            .checked_mul(COMMIT_DELTA_PAYLOAD_OFFSET_BYTES)
+            .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
+        let payload_bytes = payloads.iter().try_fold(0usize, |total, payload| {
+            total
+                .checked_add(
+                    payload
+                        .typed_payload
+                        .expect("authored typed sidecar shape was checked")
+                        .len(),
+                )
+                .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)
+        })?;
+        let sidecar_len = 4usize
+            .checked_add(directory_bytes)
+            .and_then(|len| len.checked_add(payload_bytes))
+            .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
+        if sidecar_len > COMMIT_DELTA_MAX_SIDECAR_BYTES {
+            return Err(CommitDeltaSegmentEncodeError::SidecarTooLarge);
+        }
+        let mut sidecar = Vec::with_capacity(sidecar_len);
+        sidecar.extend_from_slice(&entry_count.to_be_bytes());
+        let mut offset = 0usize;
+        for payload in payloads {
+            sidecar.extend_from_slice(
+                &u32::try_from(offset)
+                    .expect("commit-delta payload sidecar fits u32")
+                    .to_be_bytes(),
+            );
+            offset += payload
+                .typed_payload
+                .expect("authored typed sidecar shape was checked")
+                .len();
+        }
+        sidecar.extend_from_slice(
+            &u32::try_from(offset)
+                .expect("commit-delta payload sidecar fits u32")
+                .to_be_bytes(),
         );
+        for payload in payloads {
+            sidecar.extend_from_slice(
+                payload
+                    .typed_payload
+                    .expect("authored typed sidecar shape was checked"),
+            );
+        }
+        return finish_commit_delta_segment_with_sidecar(
+            leaf,
+            sidecar,
+            compressor,
+            COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_RAW,
+            COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_ZSTD,
+        );
+    }
+    let entry_count = u32::try_from(entries.len()).expect("commit-delta entry count fits u32");
+    let directory_bytes = (payloads.len() + 1)
+        .checked_mul(COMMIT_DELTA_PAYLOAD_OFFSET_BYTES)
+        .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
+    let payload_start = 4usize
+        .checked_add(directory_bytes)
+        .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
+    let estimated_payload_bytes = payloads.iter().fold(0usize, |total, payload| {
+        total.saturating_add(
+            payload
+                .typed_payload
+                .map_or(16, |payload| payload.len() + 1),
+        )
+    });
+    let mut sidecar = Vec::with_capacity(payload_start.saturating_add(estimated_payload_bytes));
+    sidecar.extend_from_slice(&entry_count.to_be_bytes());
+    sidecar.resize(payload_start, 0);
+    for (index, (entry, payload)) in entries.iter().zip(payloads).enumerate() {
+        let payload_offset = sidecar.len() - payload_start;
+        sidecar[4 + index * COMMIT_DELTA_PAYLOAD_OFFSET_BYTES
+            ..4 + (index + 1) * COMMIT_DELTA_PAYLOAD_OFFSET_BYTES]
+            .copy_from_slice(
+                &u32::try_from(payload_offset)
+                    .expect("commit-delta payload sidecar fits u32")
+                    .to_be_bytes(),
+            );
         if payload.authored {
-            payload_bytes.push(COMMIT_DELTA_PAYLOAD_AUTHORED);
-            let authored = CommitDeltaAuthoredPayloadRef {
-                snapshot: payload.snapshot,
-                metadata: payload.metadata,
-                origin_key: payload.origin_key,
-                base_coordinate: payload.base_coordinate,
-            };
-            storage_codec::append(
-                "tracked_state indexed authored commit_delta payload",
-                &mut payload_bytes,
-                &authored,
-            )
-            .map_err(CommitDeltaSegmentEncodeError::Codec)?;
+            if let Some(typed_payload) = payload.typed_payload
+                && matches!(payload.snapshot, crate::json_store::JsonSlotRef::None)
+                && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
+                && payload.origin_key.is_none()
+                && payload.base_coordinate.is_none()
+            {
+                sidecar.push(COMMIT_DELTA_PAYLOAD_AUTHORED_TYPED);
+                sidecar.extend_from_slice(typed_payload);
+            } else {
+                sidecar.push(COMMIT_DELTA_PAYLOAD_AUTHORED);
+                let authored = CommitDeltaAuthoredPayloadRef {
+                    snapshot: payload.snapshot,
+                    metadata: payload.metadata,
+                    typed_payload: payload.typed_payload,
+                    origin_key: payload.origin_key,
+                    base_coordinate: payload.base_coordinate,
+                };
+                storage_codec::append(
+                    "tracked_state indexed authored commit_delta payload",
+                    &mut sidecar,
+                    &authored,
+                )
+                .map_err(CommitDeltaSegmentEncodeError::Codec)?;
+            }
         } else {
             let value = decode_value(&entry.value)
                 .expect("commit-delta entries were encoded by the mutation builder");
@@ -11909,7 +12411,7 @@ fn encode_commit_delta_segment_layout(
                 && matches!(payload.snapshot, crate::json_store::JsonSlotRef::None)
                 && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
                 && payload.origin_key.is_none();
-            payload_bytes.push(if payload_free_tombstone {
+            sidecar.push(if payload_free_tombstone {
                 COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE
             } else {
                 COMMIT_DELTA_PAYLOAD_SELECTED_REF
@@ -11917,30 +12419,24 @@ fn encode_commit_delta_segment_layout(
             if let Some(base_coordinate) = payload.base_coordinate {
                 storage_codec::append(
                     "tracked_state commit_delta base coordinate",
-                    &mut payload_bytes,
+                    &mut sidecar,
                     &base_coordinate,
                 )
                 .map_err(CommitDeltaSegmentEncodeError::Codec)?;
             }
         }
     }
-    payload_offsets
-        .push(u32::try_from(payload_bytes.len()).expect("commit-delta payload sidecar fits u32"));
-    let entry_count = u32::try_from(entries.len()).expect("commit-delta entry count fits u32");
-    let directory_bytes = payload_offsets.len() * COMMIT_DELTA_PAYLOAD_OFFSET_BYTES;
-    let sidecar_len = 4usize
-        .checked_add(directory_bytes)
-        .and_then(|len| len.checked_add(payload_bytes.len()))
-        .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
-    if sidecar_len > COMMIT_DELTA_MAX_SIDECAR_BYTES {
+    let final_payload_offset = sidecar.len() - payload_start;
+    sidecar[4 + payloads.len() * COMMIT_DELTA_PAYLOAD_OFFSET_BYTES
+        ..4 + (payloads.len() + 1) * COMMIT_DELTA_PAYLOAD_OFFSET_BYTES]
+        .copy_from_slice(
+            &u32::try_from(final_payload_offset)
+                .expect("commit-delta payload sidecar fits u32")
+                .to_be_bytes(),
+        );
+    if sidecar.len() > COMMIT_DELTA_MAX_SIDECAR_BYTES {
         return Err(CommitDeltaSegmentEncodeError::SidecarTooLarge);
     }
-    let mut sidecar = Vec::with_capacity(sidecar_len);
-    sidecar.extend_from_slice(&entry_count.to_be_bytes());
-    for offset in payload_offsets {
-        sidecar.extend_from_slice(&offset.to_be_bytes());
-    }
-    sidecar.extend_from_slice(&payload_bytes);
     finish_commit_delta_segment_with_sidecar(
         leaf,
         sidecar,
@@ -12156,6 +12652,9 @@ fn decode_commit_delta_with_payloads<'a>(
         COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD => {
             CommitDeltaPayloadLayout::AuthoredInline
         }
+        COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_RAW | COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_ZSTD => {
+            CommitDeltaPayloadLayout::AuthoredTyped
+        }
         _ => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -12164,18 +12663,24 @@ fn decode_commit_delta_with_payloads<'a>(
         }
     };
     let sidecar = match encoding {
-        COMMIT_DELTA_SIDECAR_RAW | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW
+        COMMIT_DELTA_SIDECAR_RAW
+        | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW
+        | COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_RAW
             if encoded_sidecar.len() == uncompressed_len =>
         {
             Cow::Borrowed(encoded_sidecar)
         }
-        COMMIT_DELTA_SIDECAR_RAW | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW => {
+        COMMIT_DELTA_SIDECAR_RAW
+        | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW
+        | COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_RAW => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state raw commit_delta sidecar length does not match its header",
             ));
         }
-        COMMIT_DELTA_SIDECAR_ZSTD | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD => {
+        COMMIT_DELTA_SIDECAR_ZSTD
+        | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD
+        | COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_ZSTD => {
             let decoded = crate::compression::decompress_zstd(encoded_sidecar, uncompressed_len)
                 .map_err(|error| {
                     LixError::new(
@@ -12329,10 +12834,16 @@ fn decode_replacement_part_as_commit_delta(
         );
         let snapshot = decoded
             .snapshot(ordinal)?
-            .ok_or_else(|| replacement_payload_error("part omitted a snapshot"))?;
+            .unwrap_or(crate::json_store::JsonSlotRef::None);
         let metadata = decoded
             .metadata(ordinal)?
             .ok_or_else(|| replacement_payload_error("part omitted metadata authority"))?;
+        let typed_payload = decoded.typed_payload(ordinal)?;
+        if snapshot == crate::json_store::JsonSlotRef::None && typed_payload.is_none() {
+            return Err(replacement_payload_error(
+                "replacement part omitted both JSON and typed payload",
+            ));
+        }
         payload_bytes.push(COMMIT_DELTA_PAYLOAD_AUTHORED);
         storage_codec::append(
             "tracked_state replacement authored payload",
@@ -12340,6 +12851,7 @@ fn decode_replacement_part_as_commit_delta(
             &CommitDeltaAuthoredPayloadRef {
                 snapshot,
                 metadata,
+                typed_payload,
                 origin_key: None,
                 base_coordinate: None,
             },
@@ -12569,29 +13081,33 @@ where
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_row_loaded(account_id.len());
     let key = decode_key(entry.key)?;
-    let (snapshot, metadata, origin_key, base_coordinate, selected_ref) = match payload {
-        CommitDeltaPayload::Authored(payload) => (
-            payload.snapshot,
-            payload.metadata,
-            payload.origin_key,
-            payload.base_coordinate,
-            false,
-        ),
-        CommitDeltaPayload::SelectedRef(base_coordinate) => (
-            crate::json_store::JsonSlot::None,
-            crate::json_store::JsonSlot::None,
-            None,
-            base_coordinate,
-            true,
-        ),
-        CommitDeltaPayload::SelectedTombstone(base_coordinate) => (
-            crate::json_store::JsonSlot::None,
-            crate::json_store::JsonSlot::None,
-            None,
-            base_coordinate,
-            false,
-        ),
-    };
+    let (snapshot, metadata, typed_payload, origin_key, base_coordinate, selected_ref) =
+        match payload {
+            CommitDeltaPayload::Authored(payload) => (
+                payload.snapshot,
+                payload.metadata,
+                payload.typed_payload,
+                payload.origin_key,
+                payload.base_coordinate,
+                false,
+            ),
+            CommitDeltaPayload::SelectedRef(base_coordinate) => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                None,
+                None,
+                base_coordinate,
+                true,
+            ),
+            CommitDeltaPayload::SelectedTombstone(base_coordinate) => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                None,
+                None,
+                base_coordinate,
+                false,
+            ),
+        };
     let change_record = crate::changelog::ChangeRecord {
         account_id: account_id.to_string(),
         format_version: 2,
@@ -12601,6 +13117,7 @@ where
         file_id: key.file_id,
         snapshot,
         metadata,
+        typed_payload,
         created_at: value.updated_at,
         origin_key,
     };
@@ -13114,6 +13631,7 @@ fn stored_commit_mutation_inventory(
     let stored = StoredCommitMutationInventory {
         member_count: inventory.member_count,
         selection_fingerprint: inventory.selection_fingerprint,
+        direct_part_ownership: inventory.direct_part_ownership.clone(),
         single_partition: inventory.single_partition.clone(),
         lifecycle_summary: inventory.lifecycle_summary.clone(),
         replacement_generation: inventory.replacement_generation.clone(),
@@ -13293,6 +13811,7 @@ fn assemble_commit_state_manifest(
         member_count: stored_inventory.member_count,
         selection_fingerprint: stored_inventory.selection_fingerprint,
         direct_part_row_counts,
+        direct_part_ownership: stored_inventory.direct_part_ownership,
         replacement_part_digests,
         single_partition: stored_inventory.single_partition,
         lifecycle_summary: stored_inventory.lifecycle_summary,
@@ -13386,6 +13905,7 @@ fn assemble_shallow_commit_state_manifest(
         member_count: stored_inventory.member_count,
         selection_fingerprint: stored_inventory.selection_fingerprint,
         direct_part_row_counts,
+        direct_part_ownership: stored_inventory.direct_part_ownership,
         replacement_part_digests: Vec::new(),
         single_partition: stored_inventory.single_partition,
         lifecycle_summary: stored_inventory.lifecycle_summary,
@@ -13640,8 +14160,7 @@ fn validate_commit_state_mutation_inventory(
             })
             || columnar.owner_commit_id != *commit_id.as_uuid().as_bytes()
             || columnar.row_group_set_id
-                != crate::row_columnar::row_group_set_id(commit_id, &columnar.schema_key)
-                    .as_bytes()
+                != crate::row_columnar::row_group_set_id(commit_id, &columnar.schema_key).as_bytes()
             || columnar.manifest_digest == [0; 32]
             || columnar.schema_key.is_empty()
             || columnar.row_count != inventory.member_count
@@ -13679,6 +14198,7 @@ fn validate_commit_state_mutation_inventory(
                     || summary.scope.file_id.is_some()
                     || summary.uniform_created_at != columnar.uniform_created_at
             })
+            || !inventory.direct_addresses_are_fully_owned()
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -13732,6 +14252,7 @@ fn validate_commit_state_mutation_inventory(
     if !inventory.direct_part_row_counts.is_empty() {
         let direct_rows = &inventory.direct_part_row_counts;
         if (inventory.columnar_parts.is_none() && direct_rows.len() != inventory.part_count())
+            || !direct_ownership_is_valid(direct_rows, &inventory.direct_part_ownership)
             || direct_rows
                 .iter()
                 .any(|&rows| rows == 0 || usize::from(rows) > COMMIT_DELTA_SEGMENT_MAX_ROWS)
@@ -13743,10 +14264,15 @@ fn validate_commit_state_mutation_inventory(
                 "tracked_state commit_state_manifest has an invalid direct mutation address inventory",
             ));
         }
+    } else if !inventory.direct_part_ownership.is_empty() {
+        return Err(replacement_payload_error(
+            "tracked_state commit_state ownership omitted its direct address ranges",
+        ));
     }
     let is_empty = inventory.member_count == 0
         && inventory.selected_source_commit_id.is_none()
         && inventory.direct_part_row_counts.is_empty()
+        && inventory.direct_part_ownership.is_empty()
         && inventory.single_partition.is_none()
         && inventory.lifecycle_summary.is_none()
         && inventory.replacement_generation.is_none()
@@ -13802,6 +14328,7 @@ fn validate_compact_replacement_inventory(
         || !inventory.inline_part.is_empty()
         || !inventory.parts.is_empty()
         || inventory.replacement_part_digests.len() != inventory.direct_part_row_counts.len()
+        || !inventory.direct_addresses_are_fully_owned()
         || inventory
             .direct_part_row_counts
             .iter()
@@ -13830,7 +14357,6 @@ mod tests {
     use crate::LixError;
     use crate::changelog::{COMMIT_SPACE, ChangeId, CommitId, CommitRecord};
     use crate::common::LixTimestamp;
-    use crate::tracked_state::types::CurrentStatePartSource;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageReadOptions, StorageSpace, StorageWriteOptions,
@@ -13841,6 +14367,7 @@ mod tests {
         EncodedLeafEntry, PendingChunk, PendingChunkBatch, TrackedStateKeyBatchBuilder,
         encode_key_ref, encode_value_ref, hash_bytes,
     };
+    use crate::tracked_state::types::CurrentStatePartSource;
     use crate::tracked_state::types::{
         CommitStateManifest, CommitStateMutationInventory,
         CommitStateMutationPart as FixtureMutationPart, CommitStateReplayDebt,
@@ -13851,9 +14378,9 @@ mod tests {
 
     use super::{
         AuthenticatedReplayCommitStateManifest, COMMIT_DELTA_FORMAT_MAGIC,
-        COMMIT_STATE_MANIFEST_FORMAT_MAGIC, CommitDeltaChangeLocator,
-        CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
-        DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
+        COMMIT_STATE_MANIFEST_FORMAT_MAGIC, CommitDeltaChangeLocator, CommitDeltaManifest,
+        CommitDeltaPayloadRef, DecodedCommitDeltaBatch, DecodedCommitDeltaCache,
+        DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TrackedStateChunkOverlay,
         columnar_identity_row_map, decode_commit_delta_with_payloads,
         decode_encoded_commit_state_manifest, decode_stored_commit_state_authority,
@@ -13907,6 +14434,7 @@ mod tests {
                 },
                 snapshot: JsonSlot::Inline(format!("{{\"version\":{index}}}").into()),
                 metadata: JsonSlot::None,
+                typed_payload: None,
             })
             .collect::<Vec<_>>();
         let descriptor = CurrentStatePartDescriptor {
@@ -14005,6 +14533,7 @@ mod tests {
                 },
                 snapshot: JsonSlot::Inline("{}".into()),
                 metadata: JsonSlot::None,
+                typed_payload: None,
             })
             .collect::<Vec<_>>();
         let alternating_descriptor = CurrentStatePartDescriptor {
@@ -14250,28 +14779,7 @@ mod tests {
     fn fixture_addressable_inventory(
         staged: &super::AddressableCommitDeltaStage,
     ) -> CommitStateMutationInventory {
-        let mut mutations = staged.mutation_inventory().clone();
-        if mutations.direct_part_row_counts.is_empty()
-            && staged
-                .assigned_change_ids
-                .iter()
-                .any(|change_id| *change_id != ChangeId::default())
-        {
-            let mut row_counts = vec![0_u16; mutations.part_count()];
-            for locator in staged.locators.iter().copied().chain(
-                staged
-                    .assigned_change_ids
-                    .iter()
-                    .copied()
-                    .filter(|change_id| *change_id != ChangeId::default())
-                    .filter_map(super::direct_change_locator),
-            ) {
-                let rows = &mut row_counts[locator.segment_index as usize];
-                *rows = (*rows).max(locator.ordinal + 1);
-            }
-            mutations.direct_part_row_counts = row_counts;
-        }
-        mutations
+        staged.mutation_inventory().clone()
     }
 
     fn stage_ordered_addressable_commit_deltas<'a, I>(
@@ -14495,6 +15003,8 @@ mod tests {
             },
             snapshot,
             metadata,
+            typed_snapshot: None,
+            typed_payload: None,
             origin_key,
             base_coordinate: None,
             authored: true,
@@ -14610,6 +15120,120 @@ mod tests {
             .expect("direct address batch should read");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0], loaded);
+    }
+
+    #[tokio::test]
+    async fn mixed_addressable_segment_retains_only_authored_locators_and_falls_back_at_holes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mixed_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_3456_0000_0000,
+        ));
+        let fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(4)
+            .collect::<Vec<_>>();
+        let mixed_deltas = commit_delta_refs(mixed_commit, &fixtures[..3]);
+        let mut writes = storage.new_write_set();
+        let mixed =
+            stage_addressable_commit_deltas(&mut writes, &mixed_deltas, &[true, false, true])
+                .expect("mixed addressable deltas should stage");
+        assert_eq!(mixed.mutation_inventory().direct_part_row_counts, vec![3],);
+        assert_eq!(mixed.locators.len(), 1);
+        assert_eq!(mixed.locators[0].change_id, fixtures[1].change_id);
+        assert_ne!(mixed.assigned_change_ids[0], ChangeId::default());
+        assert_eq!(mixed.assigned_change_ids[1], ChangeId::default());
+        assert_ne!(mixed.assigned_change_ids[2], ChangeId::default());
+        stage_change_locators(&mut writes, &mixed.locators);
+
+        let authored_locator = mixed.locators[0];
+        let hole_change_id = super::addressable_change_id(
+            mixed_commit,
+            authored_locator.segment_index as usize,
+            usize::from(authored_locator.ordinal),
+        )
+        .expect("authored hole should retain a valid direct-shaped id");
+        let explicit_commit = CommitId::for_test_label("mixed-addressable-hole-explicit");
+        let mut explicit_fixture = fixtures[3].clone();
+        explicit_fixture.change_id = hole_change_id;
+        let explicit_deltas =
+            commit_delta_refs(explicit_commit, std::slice::from_ref(&explicit_fixture));
+        let explicit = stage_addressable_commit_deltas(&mut writes, &explicit_deltas, &[false])
+            .expect("explicit collision should stage");
+        assert_eq!(explicit.locators.len(), 1);
+        stage_change_locators(&mut writes, &explicit.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mixed and explicit authorities should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed addressable read should open");
+        for index in [0, 2] {
+            let change_id = mixed.assigned_change_ids[index];
+            assert!(
+                super::load_change_locator_by_id(&read, change_id)
+                    .await
+                    .expect("direct locator absence should read")
+                    .is_none()
+            );
+            let loaded = load_change_record_by_id(&read, change_id)
+                .await
+                .expect("mixed direct row should read")
+                .expect("mixed direct row should resolve");
+            assert_eq!(loaded.row_pk, fixtures[index].row_pk);
+        }
+
+        let authored = load_change_record_by_id(&read, fixtures[1].change_id)
+            .await
+            .expect("mixed authored row should read")
+            .expect("mixed authored row should resolve through its locator");
+        assert_eq!(authored.row_pk, fixtures[1].row_pk);
+        let collision = load_change_record_by_id(&read, hole_change_id)
+            .await
+            .expect("direct-shaped authored hole should dispatch")
+            .expect("explicit collision should resolve through its locator");
+        assert_eq!(collision.row_pk, explicit_fixture.row_pk);
+        assert_eq!(
+            super::load_canonical_change_locator(&read, hole_change_id)
+                .await
+                .expect("collision locator should read")
+                .expect("collision should retain explicit locator authority")
+                .commit_id,
+            explicit_commit,
+        );
+    }
+
+    #[test]
+    fn mixed_addressable_staging_rejects_authored_generated_id_collisions_atomically() {
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_4567_0000_0000,
+        ));
+        let mut fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        for (index, fixture) in fixtures.iter_mut().enumerate() {
+            fixture.schema_key = "mixed-id-collision".to_string();
+            fixture.row_pk = RowPk::single(format!("row-{index}"));
+        }
+        fixtures[1].change_id =
+            super::addressable_change_id(commit_id, 0, 0).expect("valid occupied direct id");
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        let error = match stage_addressable_commit_deltas(&mut writes, &deltas, &[true, false]) {
+            Ok(_) => panic!("authored id must not collide with an occupied generated id"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message
+                .contains("colliding authored or generated ChangeIds")
+        );
+        assert_eq!(writes.stats().staged_puts, 0);
+        assert_eq!(writes.stats().staged_deletes, 0);
     }
 
     #[tokio::test]
@@ -15589,6 +16213,7 @@ mod tests {
             &[CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -16303,7 +16928,11 @@ mod tests {
 
         let schemas = ["alpha".to_string(), "beta".to_string()];
         let unbounded = super::load_commit_delta_members_with_payloads_for_schemas(
-            &read, commit_id, &schemas, &[], usize::MAX,
+            &read,
+            commit_id,
+            &schemas,
+            &[],
+            usize::MAX,
         )
         .await
         .expect("unbounded schema scan should load")
@@ -16332,7 +16961,11 @@ mod tests {
                 .map(|member| (member.key.clone(), member.change.change_id))
                 .collect::<Vec<_>>();
             let actual = super::load_commit_delta_members_with_payloads_for_schemas(
-                &read, commit_id, &schemas, &requested, usize::MAX,
+                &read,
+                commit_id,
+                &schemas,
+                &requested,
+                usize::MAX,
             )
             .await
             .expect("file-bounded scan should load")
@@ -16660,6 +17293,7 @@ mod tests {
             &[CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -16673,6 +17307,7 @@ mod tests {
             member_count: 1,
             selection_fingerprint: [0; 32],
             direct_segment_row_counts: Vec::new(),
+            direct_segment_ownership: Vec::new(),
             single_partition: Some(super::CommitDeltaReplacementScope {
                 schema_key: fixture.schema_key.clone(),
                 file_id: fixture.file_id.clone(),
@@ -16762,6 +17397,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[0]),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: Some("first"),
                 base_coordinate: None,
                 authored: true,
@@ -16769,6 +17405,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[1]),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -16776,6 +17413,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[2]),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: Some("last"),
                 base_coordinate: None,
                 authored: true,
@@ -16888,6 +17526,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"authored":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: Some(coordinates[0]),
                 authored: true,
@@ -16895,6 +17534,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: Some(coordinates[1]),
                 authored: false,
@@ -16902,6 +17542,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"authored":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: Some(coordinates[2]),
                 authored: true,
@@ -16966,6 +17607,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&first_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -16973,6 +17615,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&second_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -17025,6 +17668,133 @@ mod tests {
     }
 
     #[test]
+    fn authored_typed_payloads_use_the_raw_indexed_layout() {
+        let commit_id = CommitId::for_test_label("authored-typed-payload-sidecar");
+        let fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let entries = fixtures
+            .iter()
+            .map(|fixture| EncodedLeafEntry {
+                key: encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &fixture.schema_key,
+                    file_id: fixture.file_id.as_deref(),
+                    row_pk: &fixture.row_pk,
+                })
+                .into(),
+                value: encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: fixture.change_id,
+                    commit_id,
+                    deleted: false,
+                    created_at: fixture.created_at,
+                    updated_at: fixture.updated_at,
+                })
+                .into(),
+            })
+            .collect::<Vec<_>>();
+        let first_payload = vec![b'a'; 8 * 1024];
+        let second_payload = vec![b'b'; 8 * 1024];
+        let payloads = [
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: Some(&first_payload),
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+            },
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: Some(&second_payload),
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+            },
+        ];
+        let encoded = encode_commit_delta_segment_with_payloads(&entries, &payloads);
+        let leaf_len = usize::try_from(u32::from_be_bytes(
+            encoded[COMMIT_DELTA_FORMAT_MAGIC.len()..COMMIT_DELTA_FORMAT_MAGIC.len() + 4]
+                .try_into()
+                .expect("fixed leaf length"),
+        ))
+        .expect("u32 fits usize");
+        let sidecar_header = COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + leaf_len;
+        assert_eq!(
+            encoded[sidecar_header],
+            super::COMMIT_DELTA_SIDECAR_AUTHORED_TYPED_ZSTD
+        );
+
+        let (_, decoded) = decode_commit_delta_with_payloads(&encoded, None).unwrap();
+        assert_eq!(
+            decoded.decode(0).unwrap().authored_payload().typed_payload,
+            Some(first_payload)
+        );
+        assert_eq!(
+            decoded.decode(1).unwrap().authored_payload().typed_payload,
+            Some(second_payload)
+        );
+    }
+
+    #[test]
+    fn mixed_json_and_typed_payloads_preserve_native_bytes() {
+        let commit_id = CommitId::for_test_label("mixed-native-payload-sidecar");
+        let fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let entries = fixtures
+            .iter()
+            .map(|fixture| EncodedLeafEntry {
+                key: encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &fixture.schema_key,
+                    file_id: fixture.file_id.as_deref(),
+                    row_pk: &fixture.row_pk,
+                })
+                .into(),
+                value: encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: fixture.change_id,
+                    commit_id,
+                    deleted: false,
+                    created_at: fixture.created_at,
+                    updated_at: fixture.updated_at,
+                })
+                .into(),
+            })
+            .collect::<Vec<_>>();
+        let typed = b"native-typed-payload";
+        let payloads = [
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: Some(typed),
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+            },
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"engine":true}"#),
+                metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+            },
+        ];
+        let encoded = encode_commit_delta_segment_with_raw_sidecar(&entries, &payloads);
+        let (_, decoded) = decode_commit_delta_with_payloads(&encoded, None).unwrap();
+        assert_eq!(
+            decoded.decode(0).unwrap().authored_payload().typed_payload,
+            Some(typed.to_vec())
+        );
+        assert_eq!(
+            decoded.decode(1).unwrap().authored_payload().snapshot,
+            crate::json_store::JsonSlot::Inline(r#"{"engine":true}"#.into())
+        );
+    }
+
+    #[test]
     fn tiny_payload_sidecar_keeps_raw_fallback() {
         let fixture = packed_commit_delta_fixtures()
             .into_iter()
@@ -17051,6 +17821,7 @@ mod tests {
             &[CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -17100,6 +17871,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -17107,6 +17879,7 @@ mod tests {
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"second":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -17254,6 +18027,7 @@ mod tests {
             &[CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"ok":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_payload: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -17831,6 +18605,7 @@ mod tests {
             member_count: 2,
             selection_fingerprint: [0; 32],
             direct_segment_row_counts: Vec::new(),
+            direct_segment_ownership: Vec::new(),
             single_partition: None,
             lifecycle_summary: None,
             replacement_generation: None,
@@ -18102,6 +18877,7 @@ mod tests {
                 member_count: 1,
                 selection_fingerprint: [3; 32],
                 direct_part_row_counts: vec![1],
+                direct_part_ownership: vec![vec![1]],
                 replacement_part_digests: Vec::new(),
                 single_partition: Some(super::CommitDeltaReplacementScope {
                     schema_key: schema_key.to_owned(),
@@ -18158,6 +18934,7 @@ mod tests {
                 member_count: part_count as u32,
                 selection_fingerprint: [4; 32],
                 direct_part_row_counts: vec![1; part_count],
+                direct_part_ownership: vec![vec![1]; part_count],
                 replacement_part_digests: Vec::new(),
                 single_partition: Some(super::CommitDeltaReplacementScope {
                     schema_key,
@@ -18205,7 +18982,9 @@ mod tests {
         let mut tampered_header = a.header.clone();
         *tampered_header.last_mut().expect("header is non-empty") ^= 1;
         let mut tampered_inventory = a.mutation_inventory.clone();
-        *tampered_inventory.last_mut().expect("inventory is non-empty") ^= 1;
+        *tampered_inventory
+            .last_mut()
+            .expect("inventory is non-empty") ^= 1;
 
         // (label, must_be_accepted, commit id, header bytes, inventory bytes)
         let cases: Vec<(&str, bool, CommitId, Vec<u8>, Vec<u8>)> = vec![
@@ -18330,8 +19109,7 @@ mod tests {
             );
             match (expected, &cached) {
                 (Ok(expected), Ok(Some(cached))) => assert_eq!(
-                    expected,
-                    &**cached,
+                    expected, &**cached,
                     "{label}: the cache returned a different authority"
                 ),
                 (Err(expected), Err(cached)) => assert_eq!(
@@ -18913,7 +19691,6 @@ mod tests {
     }
 }
 
-
 /// Process-wide, content-keyed cache for the point-replay authority.
 ///
 /// # Why this exists
@@ -18945,7 +19722,7 @@ mod tests {
 /// compares the encoded bytes before returning a hit.
 pub(crate) mod replay_authority_cache {
     use super::{
-        AuthenticatedReplayCommitStateManifest, Arc, Bytes, CommitId, CommitRecord, LixError,
+        Arc, AuthenticatedReplayCommitStateManifest, Bytes, CommitId, CommitRecord, LixError,
         storage_codec,
     };
     use std::collections::{HashMap, VecDeque};
@@ -19007,15 +19784,24 @@ pub(crate) mod replay_authority_cache {
 
     impl<T: Clone> Lru<T> {
         fn get(&self, commit_id: CommitId, first: &Bytes, second: Option<&Bytes>) -> Option<T> {
-            self.buckets.get(&bucket(commit_id))?.iter().find_map(|slot| {
-                (slot.commit_id == commit_id
-                    && slot.first.as_ref() == first.as_ref()
-                    && slot.second.as_deref() == second.map(Bytes::as_ref))
-                .then(|| slot.value.clone())
-            })
+            self.buckets
+                .get(&bucket(commit_id))?
+                .iter()
+                .find_map(|slot| {
+                    (slot.commit_id == commit_id
+                        && slot.first.as_ref() == first.as_ref()
+                        && slot.second.as_deref() == second.map(Bytes::as_ref))
+                    .then(|| slot.value.clone())
+                })
         }
 
-        fn insert(&mut self, commit_id: CommitId, first: &Bytes, second: Option<&Bytes>, value: &T) {
+        fn insert(
+            &mut self,
+            commit_id: CommitId,
+            first: &Bytes,
+            second: Option<&Bytes>,
+            value: &T,
+        ) {
             let key = bucket(commit_id);
             self.buckets.entry(key).or_default().push(Slot {
                 commit_id,

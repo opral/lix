@@ -3836,7 +3836,6 @@ mod tests {
             HistoryQuerySource {
                 store: read_scope.clone(),
                 json_reader: JsonStoreContext::new().reader(read_scope),
-                certified_history_reader: None,
                 default_as_of_commit_id,
             }
         }

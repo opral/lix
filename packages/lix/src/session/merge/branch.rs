@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use tracing::Instrument as _;
@@ -9,9 +9,11 @@ use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
 use crate::plugin::runtime::{
-    ColumnMergeResult as HostColumnMergeResult, ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner,
-    PluginRegistry, PluginRegistryEntry, RowVersionRef, WasmColumnMergeResult, WasmHostColumnMerge,
-    load_plugin_registry_at_commit, reconcile_row,
+    ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
+    ReconciledRow, ReconciledTypedRow, RowVersionRef,
+    TypedColumnMergeResult as HostTypedColumnMergeResult, TypedRowVersionRef,
+    WasmColumnMergeResult, WasmHostColumnMerge, load_plugin_registry_at_commit, reconcile_row,
+    reconcile_typed_row, visit_typed_row_overlaps,
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::Storage;
@@ -33,7 +35,7 @@ use super::conflicts::{
 };
 use super::stats::MergeStats;
 use crate::common::{SharedStr, compose_directory_path, compose_file_path};
-use crate::plugin::runtime::{WasmHostBytes, WasmRowKey};
+use crate::plugin::runtime::{WasmRowKey, WasmTypedRow};
 use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
 use crate::transaction::StagedCommitChangeBatchBuilder;
@@ -686,8 +688,14 @@ fn pick_is_derived_plugin_state(
 
 #[derive(Debug, Clone)]
 struct PluginMergeConflictPayload {
-    snapshot: SharedStr,
+    snapshot: MergeConflictSnapshot,
     metadata: Option<SharedStr>,
+}
+
+#[derive(Debug, Clone)]
+enum MergeConflictSnapshot {
+    Json(SharedStr),
+    Typed(Arc<WasmTypedRow>),
 }
 #[derive(Debug)]
 struct RowMergeInput {
@@ -695,6 +703,7 @@ struct RowMergeInput {
     base: Option<PluginMergeConflictPayload>,
     a: Option<PluginMergeConflictPayload>,
     b: Option<PluginMergeConflictPayload>,
+    typed: bool,
     merger: Option<PluginRegistryEntry>,
     primary_key_columns: BTreeSet<String>,
 }
@@ -777,18 +786,6 @@ where
                 &ChangeRecordProjection::full(),
             )
             .await?;
-        let missing_base_keys = keys
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| base_rows.row(*index).is_none())
-            .map(|(_, key)| key.clone())
-            .collect::<Vec<_>>();
-        let certified_base_rows = crate::hot_state::load_certified_rows_at_commit(
-            reader.store(),
-            &analysis.commits.base_commit_id.to_string(),
-            &missing_base_keys,
-        )
-        .await?;
         let base_registry = load_plugin_registry_at_commit(
             &mut reader,
             &analysis.commits.base_commit_id.to_string(),
@@ -814,16 +811,30 @@ where
             verify_historical_conflict_row_ref(target, conflict.target.after.as_ref(), "target")?;
             verify_historical_conflict_row_ref(source, conflict.source.after.as_ref(), "source")?;
             let (a, b) = canonical_conflict_variants_ref(conflict, target, source)?;
-            let base = historical_live_payload_ref(base)?.or_else(|| {
-                certified_base_rows
-                    .get(&keys[index])
-                    .and_then(certified_live_payload)
-            });
+            let typed_ownership = [
+                base_registry.owns_schema(conflict.identity.schema_key()),
+                target_registry.owns_schema(conflict.identity.schema_key()),
+                source_registry.owns_schema(conflict.identity.schema_key()),
+            ];
+            if typed_ownership.iter().any(|owned| *owned)
+                && !typed_ownership.iter().all(|owned| *owned)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_MERGE_CONFLICT,
+                    format!(
+                        "plugin ownership for schema '{}' differs across the merge",
+                        conflict.identity.schema_key()
+                    ),
+                ));
+            }
+            let typed = typed_ownership[0];
+            let base = historical_live_payload_ref(base, typed)?;
             inputs.push(RowMergeInput {
                 identity: conflict.identity.clone(),
                 base,
-                a: historical_live_payload_ref(a)?,
-                b: historical_live_payload_ref(b)?,
+                a: historical_live_payload_ref(a, typed)?,
+                b: historical_live_payload_ref(b, typed)?,
+                typed,
                 merger: common_column_merger_for_schema(
                     conflict.identity.schema_key(),
                     &base_registry,
@@ -839,27 +850,76 @@ where
         inputs
     };
 
-    let decoded = inputs
-        .iter()
-        .map(|input| {
-            Ok((
-                DecodedMergePayload::parse(input.base.as_ref())?,
-                DecodedMergePayload::parse(input.a.as_ref())?,
-                DecodedMergePayload::parse(input.b.as_ref())?,
-            ))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
+    for input in inputs.iter().filter(|input| input.typed) {
+        let expected = transaction
+            .plugin_schema_plan(input.identity.schema_key())
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "typed row merge references unknown schema '{}'",
+                        input.identity.schema_key()
+                    ),
+                )
+            })?
+            .fingerprint()
+            .bytes();
+        for payload in [input.base.as_ref(), input.a.as_ref(), input.b.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if typed_merge_snapshot(payload)?.schema_fingerprint != expected {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "plugin merge row for schema '{}' has the wrong schema fingerprint",
+                        input.identity.schema_key()
+                    ),
+                ));
+            }
+        }
+    }
+
     let mut groups = BTreeMap::<(String, String), ColumnMergeGroup>::new();
-    for (row_index, (input, (base, a, b))) in inputs.iter().zip(&decoded).enumerate() {
+    for (row_index, input) in inputs.iter().enumerate() {
+        if !input.typed {
+            continue;
+        }
         let Some(plugin) = input.merger.as_ref() else {
             continue;
         };
-        let (Some(base), Some(a), Some(b)) = (base.as_ref(), a.as_ref(), b.as_ref()) else {
+        let (Some(base), Some(a), Some(b)) =
+            (input.base.as_ref(), input.a.as_ref(), input.b.as_ref())
+        else {
             continue;
         };
-        let base_row = json_bytes(&base.snapshot)?;
-        let a_row = json_bytes(&a.snapshot)?;
-        let b_row = json_bytes(&b.snapshot)?;
+        let schema_plan = transaction
+            .plugin_schema_plan(input.identity.schema_key())
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "column merge references unknown schema '{}'",
+                        input.identity.schema_key()
+                    ),
+                )
+            })?;
+        let schema_fingerprint = schema_plan.fingerprint().bytes();
+        let base_row = typed_merge_snapshot(base)?;
+        let a_row = typed_merge_snapshot(a)?;
+        let b_row = typed_merge_snapshot(b)?;
+        if [base_row, a_row, b_row]
+            .into_iter()
+            .any(|row| row.schema_fingerprint != schema_fingerprint)
+        {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "plugin merge row for schema '{}' has the wrong schema fingerprint",
+                    input.identity.schema_key()
+                ),
+            ));
+        }
         let group = groups
             .entry((
                 plugin.key().to_owned(),
@@ -870,10 +930,10 @@ where
                 merges: Vec::new(),
                 destinations: Vec::new(),
             });
-        reconcile_row(
-            Some(base.borrowed()),
-            Some(a.borrowed()),
-            Some(b.borrowed()),
+        visit_typed_row_overlaps(
+            Some(typed_merge_payload_ref(base)?),
+            Some(typed_merge_payload_ref(a)?),
+            Some(typed_merge_payload_ref(b)?),
             &input.primary_key_columns,
             |overlap| {
                 let ordinal = u32::try_from(group.merges.len()).map_err(|_| {
@@ -884,28 +944,30 @@ where
                 })?;
                 group.merges.push(WasmHostColumnMerge {
                     ordinal,
-                    key: WasmRowKey::from_owned_parts(
+                    key: WasmRowKey::from_typed_parts(
                         input.identity.schema_key().to_owned(),
-                        input.identity.row_pk().clone().into_parts(),
-                    ),
+                        schema_fingerprint,
+                        base_row.row_pk.clone(),
+                    )?,
                     file_id: input.identity.file_id().map(str::to_owned),
                     column: overlap.column.to_owned(),
-                    base: optional_json_bytes(overlap.base)?,
-                    a: optional_json_bytes(overlap.a)?,
-                    b: optional_json_bytes(overlap.b)?,
-                    base_row: base_row.clone(),
-                    a_row: a_row.clone(),
-                    b_row: b_row.clone(),
+                    schema_fingerprint,
+                    base: base_row.row.get(overlap.column).cloned(),
+                    a: overlap.a.cloned(),
+                    b: overlap.b.cloned(),
+                    base_row: Arc::clone(base_row),
+                    a_row: Arc::clone(a_row),
+                    b_row: Arc::clone(b_row),
                 });
                 group
                     .destinations
                     .push((row_index, overlap.column.to_owned()));
-                Ok(Some(HostColumnMergeResult::UseLww))
+                Ok(())
             },
         )?;
     }
 
-    let mut replacements = BTreeMap::<(usize, String), HostColumnMergeResult>::new();
+    let mut replacements = BTreeMap::<(usize, String), HostTypedColumnMergeResult>::new();
     for (_, group) in groups {
         let resolved = transaction
             .merge_plugin_columns(&group.plugin, group.merges)
@@ -918,25 +980,41 @@ where
         }
         for (destination, result) in group.destinations.into_iter().zip(resolved.results) {
             let result = match result {
-                WasmColumnMergeResult::UseLww => HostColumnMergeResult::UseLww,
-                WasmColumnMergeResult::Replace(value) => {
-                    HostColumnMergeResult::Replace(value.map(host_bytes_json).transpose()?)
-                }
+                WasmColumnMergeResult::UseLww => HostTypedColumnMergeResult::UseLww,
+                WasmColumnMergeResult::Replace(value) => HostTypedColumnMergeResult::Replace(value),
             };
             replacements.insert(destination, result);
         }
     }
 
     let mut rows = RawWriteBatch::with_capacity(inputs.len());
-    for (row_index, (input, (base, a, b))) in inputs.iter().zip(&decoded).enumerate() {
-        let resolved = reconcile_row(
-            base.as_ref().map(DecodedMergePayload::borrowed),
-            a.as_ref().map(DecodedMergePayload::borrowed),
-            b.as_ref().map(DecodedMergePayload::borrowed),
-            &input.primary_key_columns,
-            |overlap| Ok(replacements.remove(&(row_index, overlap.column.to_owned()))),
-        )?;
-        push_reconciled_transaction_row(&mut rows, input, resolved, target_branch_id)?;
+    for (row_index, input) in inputs.iter().enumerate() {
+        if input.typed {
+            let resolved = reconcile_typed_row(
+                input
+                    .base
+                    .as_ref()
+                    .map(typed_merge_payload_ref)
+                    .transpose()?,
+                input.a.as_ref().map(typed_merge_payload_ref).transpose()?,
+                input.b.as_ref().map(typed_merge_payload_ref).transpose()?,
+                &input.primary_key_columns,
+                |overlap| Ok(replacements.remove(&(row_index, overlap.column.to_owned()))),
+            )?;
+            push_reconciled_typed_transaction_row(&mut rows, input, resolved, target_branch_id);
+        } else {
+            let base = DecodedMergePayload::parse(input.base.as_ref())?;
+            let a = DecodedMergePayload::parse(input.a.as_ref())?;
+            let b = DecodedMergePayload::parse(input.b.as_ref())?;
+            let resolved = reconcile_row(
+                base.as_ref().map(DecodedMergePayload::borrowed),
+                a.as_ref().map(DecodedMergePayload::borrowed),
+                b.as_ref().map(DecodedMergePayload::borrowed),
+                &input.primary_key_columns,
+                |_| Ok(None),
+            )?;
+            push_reconciled_json_transaction_row(&mut rows, input, resolved, target_branch_id)?;
+        }
     }
     Ok(rows)
 }
@@ -976,44 +1054,53 @@ fn common_column_merger_for_schema(
     }
 }
 
-fn json_bytes(value: &JsonValue) -> Result<WasmHostBytes, LixError> {
-    serde_json::to_vec(value)
-        .map(|bytes| WasmHostBytes::Inline(Bytes::from(bytes)))
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to encode column merge JSON: {error}"),
-            )
-        })
-}
-
-fn optional_json_bytes(value: Option<&JsonValue>) -> Result<Option<WasmHostBytes>, LixError> {
-    value.map(json_bytes).transpose()
-}
-
-fn host_bytes_json(value: WasmHostBytes) -> Result<JsonValue, LixError> {
-    let bytes = match value {
-        WasmHostBytes::Inline(bytes) => bytes.to_vec(),
-        WasmHostBytes::CanonicalJson(json) => json.normalized().as_bytes().to_vec(),
-        WasmHostBytes::Source(slice) => slice.source.read(
-            slice.range.offset,
-            u32::try_from(slice.range.length).map_err(|_| {
-                LixError::new(LixError::CODE_INVALID_PLUGIN, "column value exceeds u32")
-            })?,
-        )?,
+fn typed_merge_snapshot(
+    payload: &PluginMergeConflictPayload,
+) -> Result<&Arc<WasmTypedRow>, LixError> {
+    let MergeConflictSnapshot::Typed(snapshot) = &payload.snapshot else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "plugin-owned merge row carries a forbidden JSON snapshot",
+        ));
     };
-    serde_json::from_slice(&bytes).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!("column merger returned invalid JSON: {error}"),
-        )
+    Ok(snapshot)
+}
+
+fn typed_merge_payload_ref(
+    payload: &PluginMergeConflictPayload,
+) -> Result<TypedRowVersionRef<'_>, LixError> {
+    Ok(TypedRowVersionRef {
+        snapshot: typed_merge_snapshot(payload)?,
+        metadata: payload.metadata.as_ref(),
     })
 }
 
-fn push_reconciled_transaction_row(
+fn push_reconciled_typed_transaction_row(
     rows: &mut RawWriteBatch,
     input: &RowMergeInput,
-    resolved: Option<crate::plugin::runtime::ReconciledRow>,
+    resolved: Option<ReconciledTypedRow>,
+    target_branch_id: &SharedStr,
+) {
+    match resolved {
+        Some(resolved) => {
+            push_plugin_transaction_row(
+                rows,
+                &input.identity,
+                Some(Arc::new(resolved.snapshot)),
+                resolved.metadata.map(|metadata| {
+                    TransactionJson::from_unvalidated_shared_normalized_content(metadata)
+                }),
+                target_branch_id,
+            );
+        }
+        None => push_plugin_transaction_row(rows, &input.identity, None, None, target_branch_id),
+    }
+}
+
+fn push_reconciled_json_transaction_row(
+    rows: &mut RawWriteBatch,
+    input: &RowMergeInput,
+    resolved: Option<ReconciledRow>,
     target_branch_id: &SharedStr,
 ) -> Result<(), LixError> {
     match resolved {
@@ -1034,9 +1121,10 @@ fn push_reconciled_transaction_row(
                         format!("failed to encode reconciled row metadata: {error}"),
                     )
                 })?;
-            push_plugin_transaction_row(
-                rows,
-                &input.identity,
+            rows.push_parts(
+                Some(input.identity.row_pk().clone()),
+                input.identity.schema_key_shared(),
+                input.identity.file_id_shared(),
                 Some(TransactionJson::from_unvalidated_shared_normalized_content(
                     SharedStr::from(snapshot),
                 )),
@@ -1045,10 +1133,31 @@ fn push_reconciled_transaction_row(
                         metadata,
                     ))
                 }),
-                target_branch_id,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                false,
+                target_branch_id.clone(),
             );
         }
-        None => push_plugin_transaction_row(rows, &input.identity, None, None, target_branch_id),
+        None => rows.push_parts(
+            Some(input.identity.row_pk().clone()),
+            input.identity.schema_key_shared(),
+            input.identity.file_id_shared(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            target_branch_id.clone(),
+        ),
     }
     Ok(())
 }
@@ -1062,13 +1171,18 @@ impl DecodedMergePayload {
     fn parse(payload: Option<&PluginMergeConflictPayload>) -> Result<Option<Self>, LixError> {
         payload
             .map(|payload| {
-                let snapshot =
-                    serde_json::from_str(payload.snapshot.as_str()).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_SCHEMA_VALIDATION,
-                            format!("row merge snapshot is invalid JSON: {error}"),
-                        )
-                    })?;
+                let MergeConflictSnapshot::Json(snapshot) = &payload.snapshot else {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "generic merge row carries a native typed snapshot",
+                    ));
+                };
+                let snapshot = serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!("row merge snapshot is invalid JSON: {error}"),
+                    )
+                })?;
                 let metadata = payload
                     .metadata
                     .as_ref()
@@ -1091,18 +1205,6 @@ impl DecodedMergePayload {
             metadata: self.metadata.as_ref(),
         }
     }
-}
-
-fn certified_live_payload(
-    row: &crate::hot_state::MaterializedHotStateRow,
-) -> Option<PluginMergeConflictPayload> {
-    if row.deleted {
-        return None;
-    }
-    Some(PluginMergeConflictPayload {
-        snapshot: row.snapshot_content.clone()?,
-        metadata: row.metadata.clone(),
-    })
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -1401,15 +1503,39 @@ fn verify_historical_conflict_row_ref(
 
 fn historical_live_payload_ref(
     row: Option<MaterializedTrackedStateRowRef<'_>>,
+    typed: bool,
 ) -> Result<Option<PluginMergeConflictPayload>, LixError> {
     row.filter(|row| !row.deleted())
         .map(|row| {
-            let snapshot = row.snapshot_content().cloned().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    "live plugin semantic row is missing its complete snapshot",
-                )
-            })?;
+            let snapshot = if typed {
+                let snapshot = row.typed_snapshot().cloned().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        "live plugin semantic row is missing its native typed snapshot",
+                    )
+                })?;
+                if row.snapshot_content().is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        "live plugin semantic row carries a forbidden JSON snapshot",
+                    ));
+                }
+                MergeConflictSnapshot::Typed(snapshot)
+            } else {
+                let snapshot = row.snapshot_content().cloned().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "live engine merge row is missing its JSON snapshot",
+                    )
+                })?;
+                if row.typed_snapshot().is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "live engine merge row carries an unexpected typed snapshot",
+                    ));
+                }
+                MergeConflictSnapshot::Json(snapshot)
+            };
             Ok(PluginMergeConflictPayload {
                 snapshot,
                 metadata: row.metadata().cloned(),
@@ -1462,11 +1588,11 @@ fn canonical_conflict_variants_ref<'a>(
 fn push_plugin_transaction_row(
     rows: &mut RawWriteBatch,
     identity: &TrackedStateDiffIdentity,
-    snapshot: Option<TransactionJson>,
+    snapshot: Option<Arc<WasmTypedRow>>,
     metadata: Option<TransactionJson>,
     target_branch_id: &SharedStr,
 ) {
-    rows.push_parts(
+    rows.push_typed_parts(
         Some(identity.row_pk().clone()),
         identity.schema_key_shared(),
         identity.file_id_shared(),
@@ -1488,29 +1614,45 @@ fn push_transaction_row_from_tracked_row_ref(
     row: MaterializedTrackedStateRowRef<'_>,
     target_branch_id: &SharedStr,
 ) {
-    let snapshot = row
-        .snapshot_content()
-        .cloned()
-        .map(TransactionJson::from_unvalidated_shared_normalized_content);
     let metadata = row
         .metadata()
         .cloned()
         .map(TransactionJson::from_unvalidated_shared_normalized_content);
-    rows.push_parts(
-        Some(row.row_pk().clone()),
-        row.schema_key_shared(),
-        row.file_id_shared(),
-        snapshot,
-        metadata,
-        None,
-        None,
-        None,
-        false,
-        None,
-        None,
-        false,
-        target_branch_id.clone(),
-    );
+    if let Some(typed_snapshot) = row.typed_snapshot().cloned() {
+        rows.push_typed_parts(
+            Some(row.row_pk().clone()),
+            row.schema_key_shared(),
+            row.file_id_shared(),
+            Some(typed_snapshot),
+            metadata,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            target_branch_id.clone(),
+        );
+    } else {
+        rows.push_parts(
+            Some(row.row_pk().clone()),
+            row.schema_key_shared(),
+            row.file_id_shared(),
+            row.snapshot_content()
+                .cloned()
+                .map(TransactionJson::from_unvalidated_shared_normalized_content),
+            metadata,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            target_branch_id.clone(),
+        );
+    }
 }
 
 async fn materialized_plugin_merge_rows<S>(
@@ -1626,24 +1768,70 @@ where
     let mut stats = MergeChangeStats::default();
     for (index, resolved) in resolved_rows.iter().enumerate() {
         let target = target_rows.row(index).filter(|row| !row.deleted());
-        let target_snapshot = target
-            .map(|row| {
-                row.snapshot_content().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "live plugin target row omitted its snapshot",
-                    )
-                })
-            })
-            .transpose()?;
-        match classify_plugin_resolution(
-            target_snapshot.map(SharedStr::as_str),
-            target
-                .and_then(MaterializedTrackedStateRowRef::metadata)
-                .map(SharedStr::as_str),
-            resolved.snapshot.map(TransactionJson::normalized),
-            resolved.metadata.map(TransactionJson::normalized),
-        ) {
+        let target_metadata = target
+            .and_then(MaterializedTrackedStateRowRef::metadata)
+            .map(SharedStr::as_str);
+        let resolved_metadata = resolved.metadata.map(TransactionJson::normalized);
+        let change = match (resolved.snapshot, resolved.typed_snapshot) {
+            (Some(snapshot), None) => {
+                let target_snapshot = target
+                    .map(|row| {
+                        if row.typed_snapshot().is_some() {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "live engine target row carries an unexpected typed snapshot",
+                            ));
+                        }
+                        row.snapshot_content()
+                            .map(SharedStr::as_str)
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "live engine target row omitted its JSON snapshot",
+                                )
+                            })
+                    })
+                    .transpose()?;
+                classify_plugin_resolution(
+                    target_snapshot,
+                    target_metadata,
+                    Some(snapshot.normalized()),
+                    resolved_metadata,
+                )
+            }
+            (None, Some(snapshot)) => {
+                let target_snapshot = target
+                    .map(|row| {
+                        if row.snapshot_content().is_some() {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "live plugin target row carries a forbidden JSON snapshot",
+                            ));
+                        }
+                        row.typed_snapshot().map(Arc::as_ref).ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "live plugin target row omitted its native typed snapshot",
+                            )
+                        })
+                    })
+                    .transpose()?;
+                classify_plugin_resolution(
+                    target_snapshot,
+                    target_metadata,
+                    Some(snapshot.as_ref()),
+                    resolved_metadata,
+                )
+            }
+            (None, None) => target.map(|_| PluginResolutionChange::Removed),
+            (Some(_), Some(_)) => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "resolved merge row carries both JSON and native typed snapshots",
+                ));
+            }
+        };
+        match change {
             Some(PluginResolutionChange::Added) => stats.added += 1,
             Some(PluginResolutionChange::Modified) => stats.modified += 1,
             Some(PluginResolutionChange::Removed) => stats.removed += 1,
@@ -1661,10 +1849,10 @@ enum PluginResolutionChange {
     Removed,
 }
 
-fn classify_plugin_resolution(
-    target_snapshot: Option<&str>,
+fn classify_plugin_resolution<T: PartialEq + ?Sized>(
+    target_snapshot: Option<&T>,
     target_metadata: Option<&str>,
-    resolved_snapshot: Option<&str>,
+    resolved_snapshot: Option<&T>,
     resolved_metadata: Option<&str>,
 ) -> Option<PluginResolutionChange> {
     match (target_snapshot, resolved_snapshot) {
@@ -1801,6 +1989,7 @@ mod tests {
                 .to_string()
                 .into(),
             ),
+            typed_snapshot: None,
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -1854,6 +2043,7 @@ mod tests {
             schema_key: "lix_key_value".to_owned(),
             file_id: Some(file_id.to_owned()),
             snapshot_content: Some(owner.to_snapshot().unwrap().to_string().into()),
+            typed_snapshot: None,
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -1871,6 +2061,7 @@ mod tests {
                 schema_key: "certified_schema".to_owned(),
                 file_id: Some("certified-file".to_owned()),
                 snapshot_content: Some(r#"{"value":"base"}"#.into()),
+                typed_snapshot: None,
                 metadata: None,
                 deleted: false,
                 created_at: "2026-01-01T00:00:00Z".to_owned(),

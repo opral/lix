@@ -687,12 +687,12 @@ where
 
     /// Returns engine-local transition counters for profiling and
     /// production invariant monitoring.
-    pub(crate) fn plugin_transition_counters(&self) -> WasmTransitionCounters {
+    pub fn plugin_transition_counters(&self) -> WasmTransitionCounters {
         self.engine.plugin_transition_counters()
     }
 
     /// Starts a new engine-local transition measurement window.
-    pub(crate) fn reset_plugin_transition_counters(&self) {
+    pub fn reset_plugin_transition_counters(&self) {
         self.engine.reset_plugin_transition_counters();
     }
 }

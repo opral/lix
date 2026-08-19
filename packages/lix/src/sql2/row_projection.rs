@@ -107,6 +107,42 @@ impl RowProjectionDecoder {
             .collect())
     }
 
+    /// Decodes a mixed live-state batch. Native Schema v1 rows are projected
+    /// directly; internal engine records use their own raw JSON projection.
+    pub(crate) fn decode_mixed_arrow_columns<'a>(
+        &self,
+        rows: impl IntoIterator<Item = (Option<&'a [u8]>, Option<&'a lix_schema::Row>)>,
+    ) -> Result<Vec<ArrayRef>, LixError> {
+        let rows = rows.into_iter();
+        let (capacity, _) = rows.size_hint();
+        let mut sink = ArrowProjectionSink {
+            columns: self
+                .fields
+                .iter()
+                .map(|field| RowProjectionColumn::new(field.column_type, capacity))
+                .collect(),
+        };
+        for (snapshot, typed_row) in rows {
+            if let Some(typed_row) = typed_row {
+                sink.begin_row(self.fields.len());
+                for (index, field) in self.fields.iter().enumerate() {
+                    sink.columns[index].replace_last_from_typed(
+                        typed_row.get(&field.name),
+                        field,
+                        &self.schema_key,
+                    )?;
+                }
+            } else {
+                self.decode_into(snapshot, &mut sink)?;
+            }
+        }
+        Ok(sink
+            .columns
+            .into_iter()
+            .map(RowProjectionColumn::into_array)
+            .collect())
+    }
+
     /// Decodes one exact point result directly into the public scalar row.
     ///
     /// This is deliberately narrower than the Arrow path: callers must have
@@ -120,6 +156,17 @@ impl RowProjectionDecoder {
         let mut sink = PublicProjectionSink { values: Vec::new() };
         self.decode_into(snapshot, &mut sink)?;
         Ok(sink.values)
+    }
+
+    /// Decodes one typed plugin row at the public scalar boundary.
+    pub(crate) fn decode_typed_public_values(
+        &self,
+        row: &lix_schema::Row,
+    ) -> Result<Vec<crate::Value>, LixError> {
+        self.fields
+            .iter()
+            .map(|field| typed_public_value(row.get(&field.name), field, &self.schema_key))
+            .collect()
     }
 
     fn decode_into<S>(&self, snapshot: Option<&[u8]>, sink: &mut S) -> Result<(), LixError>
@@ -517,6 +564,60 @@ impl RowProjectionColumn {
         Ok(())
     }
 
+    fn replace_last_from_typed(
+        &mut self,
+        value: Option<&lix_schema::Value>,
+        field: &RowProjectionField,
+        schema_key: &str,
+    ) -> Result<(), LixError> {
+        let value = typed_public_value(value, field, schema_key)?;
+        match (self, value) {
+            (Self::String(values), crate::Value::Null)
+            | (Self::Jsonb(values), crate::Value::Null) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = None;
+            }
+            (Self::String(values), crate::Value::Text(value)) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = Some(value);
+            }
+            (Self::Jsonb(values), crate::Value::Jsonb(value)) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = Some(value.to_string());
+            }
+            (Self::Integer(values), crate::Value::Integer(value)) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = Some(value);
+            }
+            (Self::Number(values), crate::Value::Real(value)) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = Some(value);
+            }
+            (Self::Boolean(values), crate::Value::Boolean(value)) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = Some(value);
+            }
+            (Self::Timestamptz(values), crate::Value::Timestamptz(value)) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = Some(value);
+            }
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "typed row projection produced a value with the wrong SQL type",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn into_array(self) -> ArrayRef {
         match self {
             Self::String(values) | Self::Jsonb(values) => Arc::new(StringArray::from(values)),
@@ -528,6 +629,59 @@ impl RowProjectionColumn {
             }
         }
     }
+}
+
+fn typed_public_value(
+    value: Option<&lix_schema::Value>,
+    field: &RowProjectionField,
+    schema_key: &str,
+) -> Result<crate::Value, LixError> {
+    let Some(value) = value else {
+        return Ok(crate::Value::Null);
+    };
+    let value = match (field.column_type, value) {
+        (_, lix_schema::Value::Null) => crate::Value::Null,
+        (SchemaColumnType::String, lix_schema::Value::Text(value)) => {
+            crate::Value::Text(value.clone())
+        }
+        (SchemaColumnType::String, lix_schema::Value::Uuid(value)) => {
+            crate::Value::Text(value.to_string())
+        }
+        (SchemaColumnType::Jsonb, lix_schema::Value::Jsonb(value)) => {
+            let json = serde_json::to_string(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot render typed JSONB value for {schema_key}.{}: {error}",
+                        field.name
+                    ),
+                )
+            })?;
+            crate::Value::Jsonb(crate::Json::from_canonical_text(json))
+        }
+        (SchemaColumnType::Integer, lix_schema::Value::Int8(value)) => {
+            crate::Value::Integer(*value)
+        }
+        (SchemaColumnType::Number, lix_schema::Value::Float8(value)) => {
+            crate::Value::Real(*value)
+        }
+        (SchemaColumnType::Boolean, lix_schema::Value::Boolean(value)) => {
+            crate::Value::Boolean(*value)
+        }
+        (SchemaColumnType::Timestamptz, lix_schema::Value::Timestamptz(value)) => {
+            crate::Value::Timestamptz(*value)
+        }
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "typed row projection value does not match {}.{}",
+                    schema_key, field.name
+                ),
+            ));
+        }
+    };
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -556,6 +710,7 @@ mod tests {
         spec.columns
             .push(crate::sql2::catalog::schema_surface::SchemaSurfaceColumn {
             name: "stamp".to_string(),
+            native_type: lix_schema::DataType::Timestamptz,
             column_type: crate::sql2::catalog::SchemaColumnType::Timestamptz,
             read_nullable: true,
             insert_required: false,

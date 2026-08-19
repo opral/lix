@@ -56,17 +56,15 @@ pub(crate) use tracked_head::{
 };
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
-    CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE,
-    CERTIFIED_ROW_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedCurrentStatePredecessor,
-    CertifiedCurrentStatePredecessorRef, CertifiedRowBatchFileRef, ColumnarBaseCoordinate,
-    CurrentStateDeltaRef, DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef,
-    DeferredFreshHotRows, RowColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue,
+    COLLECTION_CONTROL_SPACE, CertifiedCurrentStatePredecessor,
+    CertifiedCurrentStatePredecessorRef, ColumnarBaseCoordinate,
+    CurrentStateDeltaRef, DIFF_SPACE, RowColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue,
     HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
     ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, load_certified_rows_at_commit,
-    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_row_batches,
-    stage_hot_index_entries, stage_tracked_working_diff_epoch,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    stage_hot_index_entries, stage_tracked_working_diff_epoch, decode_typed_payload,
+    encode_typed_payload,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

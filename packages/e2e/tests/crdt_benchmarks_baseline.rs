@@ -126,7 +126,7 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
                     "UPDATE json_object_member SET scalar_json = $1 \
                      WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
                     &[
-                        Value::Text(client.to_string()),
+                        Value::Jsonb(serde_json::json!(client).into()),
                         Value::Text(file_id.clone()),
                     ],
                 )
@@ -258,7 +258,10 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                             .execute(
                                 "UPDATE json_object_member SET scalar_json = $1 \
                  WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
-                                &[Value::Text(value.to_string()), Value::Text(file_id.clone())],
+                                &[
+                                    Value::Jsonb(serde_json::json!(value).into()),
+                                    Value::Text(file_id.clone()),
+                                ],
                             )
                             .await
                             .unwrap();
@@ -296,7 +299,10 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                         .execute(
                             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
-                            &[Value::Text("99".to_owned()), Value::Text(file_id)],
+                            &[
+                                Value::Jsonb(serde_json::json!(99).into()),
+                                Value::Text(file_id),
+                            ],
                         )
                         .await
                         .unwrap();
@@ -342,7 +348,7 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
                     let file_id = file_id(&lix, path).await;
                     let mut peers = Vec::new();
                     let mut transactions = Vec::new();
-                    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
+                    for (key, value) in [("a", 1), ("b", 2), ("c", 3)] {
                         let peer = lix.open_another_session().await.unwrap();
                         let mut transaction = peer.begin_transaction().await.unwrap();
                         transaction
@@ -350,7 +356,7 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
                                 "UPDATE json_object_member SET scalar_json = $1 \
                                  WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
                                 &[
-                                    Value::Text(value.to_owned()),
+                                    Value::Jsonb(serde_json::json!(value).into()),
                                     Value::Text(key.to_owned()),
                                     Value::Text(file_id.clone()),
                                 ],

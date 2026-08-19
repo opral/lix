@@ -231,6 +231,57 @@ jobs:
           cp packages/lix/examples/plugin_minimal.rs "$downstream/src/lib.rs"
           cargo build --manifest-path "$downstream/Cargo.toml" --target wasm32-wasip2
 
+  typed-row-plugin-benchmark:
+    name: Typed-row plugin benchmark
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+
+    steps:
+      - name: Checkout repository with baseline history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the immutable benchmark baseline
+        run: git fetch --no-tags origin 89aea5d55773586ea60f77c1d9dddcfc8b394dd1
+
+      - name: Install the plugin target
+        run: rustup target add wasm32-wasip2
+
+      - name: Install pinned CPU profiler
+        run: cargo install samply --locked --version 0.13.1
+
+      - name: Test benchmark report contract
+        run: PYTHONDONTWRITEBYTECODE=1 python3 packages/e2e/benchmarks/test_plugin_api_benchmark.py
+
+      # Qualification is strict: the immutable pre-refactor baseline, paired
+      # lane/sample records, and zero-outer-JSON candidate profiles are all
+      # required. Missing or non-comparable evidence fails this job.
+      - name: Run matched plugin API benchmark and write report
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 packages/e2e/benchmarks/plugin_api_benchmark.py run \
+            --root "$GITHUB_WORKSPACE" \
+            --output "$RUNNER_TEMP/lix-plugin-api-benchmark" \
+            --baseline 89aea5d55773586ea60f77c1d9dddcfc8b394dd1 \
+            --samples 61 \
+            --warmups 5 \
+            --require-baseline
+
+      - name: Publish auditable benchmark summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/lix-plugin-api-benchmark/PLUGIN_TYPED_ROW_BENCHMARK_REPORT.md"
+          test -s "$report"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plugin benchmark report and raw profiles
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lix-plugin-api-benchmark-${{ github.run_id }}
+          path: ${{ runner.temp }}/lix-plugin-api-benchmark
+          if-no-files-found: error
+
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
     if: github.event_name == 'push' || github.event.pull_request.draft == false

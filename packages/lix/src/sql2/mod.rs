@@ -44,11 +44,10 @@ pub(crate) use catalog::{
     PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec, PublicCatalog,
     derive_schema_surface_spec_from_schema, row_visible_fields,
 };
-pub(crate) use change_materialization::MaterializedChange;
 pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
-    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
-    DiffCommandOutcome, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
+    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, HistoryQuerySource,
+    SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextHotStateReader,
 };

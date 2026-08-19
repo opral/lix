@@ -1,4 +1,4 @@
-//! Excalidraw support for the row-first Component API v1.
+//! Excalidraw support for the row-first Component API v2.
 #![allow(dead_code)]
 
 mod core;
@@ -9,6 +9,7 @@ use core::{
     RowRecord,
 };
 use lix::plugin as sdk;
+use std::sync::OnceLock;
 
 struct ExcalidrawPlugin;
 
@@ -20,6 +21,9 @@ const ELEMENT_INDEX_HEADER_BYTES: u32 = 16;
 const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
 const ELEMENT_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_ELEMENT_SHIFT_RECORDS: usize = 4096;
+const SCENE_SCHEMA_JSON: &str = include_str!("../schema/excalidraw_scene.json");
+const ELEMENT_SCHEMA_JSON: &str = include_str!("../schema/excalidraw_element.json");
+const FILE_SCHEMA_JSON: &str = include_str!("../schema/excalidraw_file.json");
 
 fn cold_parse_changes(
     update: &mut sdk::ParseChangesInput<'_>,
@@ -28,15 +32,15 @@ fn cold_parse_changes(
     let accepted = update.before.read_all()?;
     let mut builder = RowImportBuilder::new();
     let rows = update
-        .rows
+        .typed_rows
         .as_mut()
-        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable typed rows"))?;
     while let Some(row) = rows.next()? {
         builder
             .push(RowRecord {
                 schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                snapshot: row.snapshot,
+                row_pk: row.primary_key,
+                row: row.row,
             })
             .map_err(sdk::Error::invalid_input)?;
     }
@@ -87,11 +91,11 @@ impl sdk::FileProjection for ExcalidrawPlugin {
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
-        while let Some(change) = update.row_changes.next()? {
+        while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
-                row_pk: change.row_pk,
-                snapshot: change.snapshot,
+                row_pk: change.primary_key,
+                row: change.row,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
                     sdk::ChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
@@ -122,11 +126,11 @@ impl sdk::FileProjection for ExcalidrawPlugin {
         sink: &mut sdk::FileOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(row) = input.rows.next()? {
+        while let Some(row) = input.typed_rows.next()? {
             records.push(RowRecord {
                 schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                snapshot: row.snapshot,
+                row_pk: row.primary_key,
+                row: row.row,
             });
         }
         let (document, _) = Document::open_rows(records).map_err(sdk::Error::invalid_input)?;
@@ -224,6 +228,10 @@ fn namespace_from_changes(changes: &[RowChange]) -> Option<IdNamespace> {
     changes
         .iter()
         .flat_map(|change| &change.row_pk)
+        .filter_map(|component| match component {
+            sdk::TypedValue::Text(value) => Some(value),
+            _ => None,
+        })
         .find_map(|component| uuid::Uuid::parse_str(component).ok())
         .map(|id| {
             let bytes = id.into_bytes();
@@ -651,11 +659,11 @@ where
 {
     for change in changes {
         let change = change.map_err(sdk::Error::invalid_input)?;
-        match change.snapshot {
-            Some(snapshot) => sink.upsert(
+        match change.row {
+            Some(row) => sink.upsert(
                 &change.schema_key,
                 &change.row_pk,
-                &snapshot,
+                &row,
                 match change.effect {
                     ChangeEffect::Content => sdk::ChangeEffect::Content,
                     ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
@@ -692,29 +700,63 @@ trait MutationOutput {
     fn upsert(
         &mut self,
         schema_key: &str,
-        row_pk: &[String],
-        snapshot: &[u8],
+        row_pk: &[sdk::TypedValue],
+        row: &sdk::TypedRow,
         effect: sdk::ChangeEffect,
     ) -> sdk::Result<()>;
-    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: &[sdk::TypedValue]) -> sdk::Result<()>;
 }
 impl MutationOutput for sdk::RowOutput<'_, '_> {
-    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], _: sdk::ChangeEffect) -> sdk::Result<()> {
-        self.upsert(s, k, v)
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[sdk::TypedValue],
+        row: &sdk::TypedRow,
+        _: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        let fingerprint = schema_fingerprint(schema_key)?;
+        sdk::RowOutput::upsert(self, schema_key, fingerprint, row_pk.to_vec(), row)
     }
-    fn delete(&mut self, _: &str, _: &[String]) -> sdk::Result<()> {
+    fn delete(&mut self, _: &str, _: &[sdk::TypedValue]) -> sdk::Result<()> {
         Err(sdk::Error::invalid_input(
             "initial Excalidraw parse produced a deletion",
         ))
     }
 }
 impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
-    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], e: sdk::ChangeEffect) -> sdk::Result<()> {
-        self.upsert(s, k, v, e)
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[sdk::TypedValue],
+        row: &sdk::TypedRow,
+        effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        let fingerprint = schema_fingerprint(schema_key)?;
+        sdk::RowChangeOutput::upsert(self, schema_key, fingerprint, row_pk.to_vec(), row, effect)
     }
-    fn delete(&mut self, s: &str, k: &[String]) -> sdk::Result<()> {
-        self.delete(s, k)
+    fn delete(&mut self, schema_key: &str, row_pk: &[sdk::TypedValue]) -> sdk::Result<()> {
+        let fingerprint = schema_fingerprint(schema_key)?;
+        sdk::RowChangeOutput::delete(self, schema_key, fingerprint, row_pk.to_vec())
     }
+}
+
+fn schema_fingerprint(schema_key: &str) -> sdk::Result<[u8; 32]> {
+    static SCENE: OnceLock<[u8; 32]> = OnceLock::new();
+    static ELEMENT: OnceLock<[u8; 32]> = OnceLock::new();
+    static FILE: OnceLock<[u8; 32]> = OnceLock::new();
+    let (schema_json, fingerprint) = match schema_key {
+        "excalidraw_scene" => (SCENE_SCHEMA_JSON, &SCENE),
+        "excalidraw_element" => (ELEMENT_SCHEMA_JSON, &ELEMENT),
+        "excalidraw_file" => (FILE_SCHEMA_JSON, &FILE),
+        _ => {
+            return Err(sdk::Error::invalid_input(format!(
+                "Excalidraw plugin does not support schema '{schema_key}'"
+            )));
+        }
+    };
+    Ok(*fingerprint.get_or_init(|| {
+        sdk::schema_fingerprint(schema_json).expect("embedded Excalidraw schema must be valid")
+    }))
 }
 
 #[cfg(target_family = "wasm")]
@@ -786,6 +828,60 @@ mod tests {
             )
             .expect("structural edit is an optimization miss"),
             None
+        );
+    }
+
+    #[test]
+    fn parsed_element_and_file_payloads_are_native_jsonb() {
+        let source = br#"{
+            "type": "excalidraw",
+            "elements": [{"id":"a","type":"rectangle","x":1.5}],
+            "appState": {"zoom":{"value":2}},
+            "files": {"f":{"mimeType":"image/png","created":123}}
+        }"#;
+        let (_, changes) = Document::open_file(
+            source.to_vec(),
+            Some("scene.excalidraw"),
+            IdNamespace::from_halves(0, 0),
+        )
+        .expect("parse Excalidraw source");
+        let changes = changes
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect typed changes");
+
+        let element = changes
+            .iter()
+            .find(|change| change.schema_key.as_ref() == core::ELEMENT_SCHEMA_KEY)
+            .and_then(|change| change.row.as_ref())
+            .and_then(|row| row.get("element_json"));
+        assert!(matches!(
+            element,
+            Some(sdk::TypedValue::Jsonb(value)) if value["x"] == serde_json::json!(1.5)
+        ));
+
+        let file = changes
+            .iter()
+            .find(|change| change.schema_key.as_ref() == core::FILE_SCHEMA_KEY)
+            .and_then(|change| change.row.as_ref())
+            .and_then(|row| row.get("file_json"));
+        assert!(matches!(
+            file,
+            Some(sdk::TypedValue::Jsonb(value)) if value["created"] == serde_json::json!(123)
+        ));
+
+        let rows = changes
+            .into_iter()
+            .map(|change| RowRecord {
+                schema_key: change.schema_key,
+                row_pk: change.row_pk,
+                row: change.row.expect("initial parse emits upserts"),
+            })
+            .collect();
+        let (roundtrip, _) = Document::open_rows(rows).expect("open native typed rows");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&roundtrip.bytes())
+                .expect("render valid JSON"),
+            serde_json::from_slice::<serde_json::Value>(source).expect("source is valid JSON")
         );
     }
 }

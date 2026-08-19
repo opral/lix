@@ -1,4 +1,4 @@
-//! Host-owned immutable arenas for the Lix plugin API v1.
+//! Host-owned immutable arenas for the Lix plugin API v2.
 //!
 //! A [`Root`] names three independently persistent values:
 //!
@@ -21,8 +21,8 @@ use std::sync::{Arc, Weak};
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
 const SUCCESSOR_CHECKPOINT_MAGIC: &[u8; 8] = b"LIXPSC01";
 const SUCCESSOR_CHECKPOINT_HASH_DOMAIN: &[u8] = b"lix-plugin-v3/successor-checkpoint\0";
-pub const REQUIRED_V1_SPEEDUP: u64 = 2;
-pub const REQUIRED_V1_MEMORY_REDUCTION: u64 = 3;
+pub const REQUIRED_BASELINE_SPEEDUP: u64 = 2;
+pub const REQUIRED_BASELINE_MEMORY_REDUCTION: u64 = 3;
 
 /// One end-to-end benchmark lane. `peak_total_bytes` must include host live
 /// ownership, guest linear-memory high water, and transient materialization.
@@ -44,7 +44,7 @@ impl Acceptance {
     }
 }
 
-/// Applies the non-negotiable API v1 performance gate without floating-point
+/// Applies the retained arena baseline gate without floating-point
 /// rounding: the candidate must be at least 2× faster and consume at least 3×
 /// less total peak memory than its matching baseline.
 pub const fn compare_to_baseline(
@@ -52,13 +52,16 @@ pub const fn compare_to_baseline(
     candidate: PerformanceMeasurement,
 ) -> Acceptance {
     Acceptance {
-        latency_passes: match candidate.p95_nanoseconds.checked_mul(REQUIRED_V1_SPEEDUP) {
+        latency_passes: match candidate
+            .p95_nanoseconds
+            .checked_mul(REQUIRED_BASELINE_SPEEDUP)
+        {
             Some(scaled) => scaled <= baseline.p95_nanoseconds,
             None => false,
         },
         memory_passes: match candidate
             .peak_total_bytes
-            .checked_mul(REQUIRED_V1_MEMORY_REDUCTION)
+            .checked_mul(REQUIRED_BASELINE_MEMORY_REDUCTION)
         {
             Some(scaled) => scaled <= baseline.peak_total_bytes,
             None => false,

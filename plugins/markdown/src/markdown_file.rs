@@ -163,7 +163,7 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
         .collect::<Result<Vec<_>, _>>()?;
     let root = NodeTree {
         node: NodeSnapshot {
-            id: PARSED_ROOT_ID.to_string(),
+            id: PARSED_ROOT_ID,
             kind: NodeKind::Document,
             parent_id: None,
             order_key: None,
@@ -436,14 +436,14 @@ fn detected_line_ending(source: &str) -> &'static str {
 struct ParseIds(Cell<u32>);
 
 impl ParseIds {
-    fn next(&self) -> String {
+    fn next(&self) -> uuid::Uuid {
         let ordinal = self.0.get();
         self.0.set(
             ordinal
                 .checked_add(1)
                 .expect("one Markdown parse cannot contain more than u32::MAX identified nodes"),
         );
-        format!("~{ordinal:x}")
+        uuid::Uuid::from_u128(u128::from(ordinal) + 1)
     }
 }
 
@@ -657,7 +657,7 @@ fn tree_from_table(
             json!({}),
             Vec::new(),
         );
-        column_ids.push(column.node.id.clone());
+        column_ids.push(column.node.id);
         children.push(column);
     }
     for (row_index, row) in node.rows.iter().enumerate() {
@@ -1305,7 +1305,7 @@ fn table_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
         .iter()
         .enumerate()
         .map(|(index, column)| {
-            column_indices.insert(column.node.id.as_str(), index);
+            column_indices.insert(column.node.id, index);
             match string_field(&column.node.payload, "alignment")? {
                 "none" => Ok(md::TableAlignment::None),
                 "left" => Ok(md::TableAlignment::Left),
@@ -1327,7 +1327,13 @@ fn table_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
                     )));
                 }
                 let column_id = string_field(&cell.node.payload, "column_id")?;
-                let index = *column_indices.get(column_id).ok_or_else(|| {
+                let parsed_column_id = uuid::Uuid::parse_str(column_id).map_err(|_| {
+                    PluginError::InvalidInput(format!(
+                        "table cell '{}' has non-UUID column identity '{column_id}'",
+                        cell.node.id
+                    ))
+                })?;
+                let index = *column_indices.get(&parsed_column_id).ok_or_else(|| {
                     PluginError::InvalidInput(format!(
                         "table cell '{}' references unknown column '{column_id}'",
                         cell.node.id

@@ -60,13 +60,18 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// recreate the repository. Every hard cut to a persisted record shape has to
 /// move this value with it.
 ///
-/// `v68` is a single bump covering both of this round's format changes:
+/// `v68` is a single bump covering both of that round's format changes:
 /// the `CurrentStatePartSource` enum with `LOCATOR_PAYLOAD_VERSION` 3 -> 4,
 /// and `StoredCheckpointGcState` 3 -> 6 fields with
 /// `CHECKPOINT_GC_STATE_FORMAT_VERSION` 1 -> 2. Every record is
 /// `#[musli(packed)]`, so one bump carries any number of shape changes at no
 /// extra cost to the user, who recreates the repository once either way.
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v68";
+///
+/// `v69` hard-cuts the packed `ChangeRecord` snapshot payload from the legacy
+/// JSON representation to the schema-fingerprinted native typed-row payload.
+/// Older repositories are deliberately rejected at open rather than decoded
+/// through a compatibility fallback.
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -395,7 +400,7 @@ where
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: plan.commit.id,
-                deleted: change.snapshot.is_none(),
+                deleted: change.snapshot.is_none() && change.typed_payload.is_none(),
                 created_at: change.created_at,
                 updated_at: change.created_at,
             })
@@ -407,6 +412,8 @@ where
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                typed_snapshot: None,
+                typed_payload: None,
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -467,11 +474,12 @@ where
                 change_id: Some(change.change_id),
                 commit_id: Some(plan.commit.id),
                 untracked: false,
-                deleted: change.snapshot.is_none(),
+                deleted: change.snapshot.is_none() && change.typed_payload.is_none(),
                 created_at: change.created_at,
                 updated_at: change.created_at,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
+                typed_snapshot: None,
                 columnar_base_coordinate: None,
             })
             .collect::<Vec<_>>();
@@ -491,7 +499,6 @@ where
                     plan.commit.id,
                     &head_deltas,
                     &absence_guards,
-                    None,
                     None,
                     Some(plan.commit.id),
                     &mut working_diff_coverage,
@@ -563,6 +570,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
+        typed_payload: None,
         created_at: change.created_at,
         origin_key: None,
     }
@@ -578,6 +586,7 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&row.snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
+        typed_payload: None,
         created_at: row.updated_at,
         origin_key: None,
     }
@@ -1025,6 +1034,35 @@ mod tests {
             )
             .await
             .expect("pre-split protocol marker should stage");
+        let read = storage
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .expect("protocol read should open");
+
+        assert_eq!(
+            repository_protocol_status(&read)
+                .await
+                .expect("protocol status should load"),
+            RepositoryProtocolStatus::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_protocol_rejects_pre_typed_change_record_marker() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            REPOSITORY_PROTOCOL_SPACE,
+            REPOSITORY_PROTOCOL_KEY,
+            &b"tracked-default-branch.v68"[..],
+        );
+        storage
+            .commit_write_set(
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
+            .await
+            .expect("v68 protocol marker should stage");
         let read = storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await

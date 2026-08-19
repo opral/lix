@@ -1,5 +1,9 @@
 # Cross-format Wasm plugin runtime profile
 
+> Historical pre-hard-cut profile. Packet-v1 and JSON snapshot references
+> below describe the retired baseline only; current qualification is defined
+> by `PLUGIN_TYPED_ROW_BENCHMARK_PLAN.md`.
+
 Profiled on Linux x86-64 with Rust nightly 1.97.0. The release benchmarks were
 verified against `origin/main` at `c082f5f14`. The exact VS Code Docs replay
 uses commit `d5badf95f8ab16c4deb91199dc696f2293d93554`.

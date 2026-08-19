@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 #[cfg(test)]
 use std::mem::size_of;
 #[cfg(test)]
@@ -11,6 +12,7 @@ use crate::changelog::{
 };
 use crate::common::{LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder};
 use crate::row_pk::RowPk;
+use crate::plugin::runtime::WasmTypedRow;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
@@ -22,6 +24,7 @@ struct MaterializedTrackedStateDescriptor {
     file_id: Option<u32>,
     snapshot_content: Option<SharedStr>,
     metadata: Option<SharedStr>,
+    typed_snapshot: Option<Arc<WasmTypedRow>>,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -70,7 +73,7 @@ impl MaterializedTrackedStateBatch {
     #[cfg(test)]
     pub(crate) fn from_rows(rows: Vec<MaterializedTrackedStateRow>) -> Result<Self, LixError> {
         let mut builder = MaterializedTrackedStateBatchBuilder::with_capacity(rows.len());
-        for row in rows {
+        for (index, row) in rows.into_iter().enumerate() {
             let created_at = LixTimestamp::parse(&row.created_at).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -99,6 +102,9 @@ impl MaterializedTrackedStateBatch {
                 row.snapshot_content,
                 row.metadata,
             );
+            if let Some(typed_snapshot) = row.typed_snapshot {
+                builder.set_typed_snapshot(index, Some(typed_snapshot));
+            }
         }
         Ok(builder.finish())
     }
@@ -175,6 +181,10 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
         self.descriptor().metadata.as_ref()
     }
 
+    pub(crate) fn typed_snapshot(self) -> Option<&'a Arc<WasmTypedRow>> {
+        self.descriptor().typed_snapshot.as_ref()
+    }
+
     pub(crate) fn deleted(self) -> bool {
         self.descriptor().deleted
     }
@@ -202,6 +212,7 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
             schema_key: self.schema_key().to_owned(),
             file_id: self.file_id().map(str::to_owned),
             snapshot_content: self.snapshot_content().cloned(),
+            typed_snapshot: self.typed_snapshot().cloned(),
             metadata: self.metadata().cloned(),
             deleted: self.deleted(),
             created_at: self.created_at().to_string(),
@@ -337,6 +348,7 @@ impl MaterializedTrackedStateBatchBuilder {
             file_id,
             snapshot_content,
             metadata,
+            typed_snapshot: None,
             deleted: value.deleted(),
             created_at: value.created_at(),
             updated_at: value.updated_at(),
@@ -360,6 +372,7 @@ impl MaterializedTrackedStateBatchBuilder {
             file_id,
             snapshot_content,
             metadata,
+            typed_snapshot: None,
             deleted: value.deleted(),
             created_at: value.created_at(),
             updated_at: value.updated_at(),
@@ -373,6 +386,10 @@ impl MaterializedTrackedStateBatchBuilder {
             strings: self.strings.finish(),
             rows: self.rows,
         }
+    }
+
+    fn set_typed_snapshot(&mut self, ordinal: usize, typed_snapshot: Option<Arc<WasmTypedRow>>) {
+        self.rows[ordinal].typed_snapshot = typed_snapshot;
     }
 }
 
@@ -424,7 +441,8 @@ where
                 || record.schema_key != key.schema_key
                 || record.file_id != key.file_id
                 || record.row_pk != key.row_pk
-                || record.snapshot.is_none()
+                || (record.snapshot.is_none() && record.typed_payload.is_none())
+                || (record.snapshot.is_some() && record.typed_payload.is_some())
                 || record.created_at != updated_at
             {
                 return Err(LixError::new(
@@ -487,8 +505,8 @@ where
     .await?;
 
     for (key, value) in entries {
-        let (snapshot_content, metadata) = if value.deleted {
-            (None, None)
+        let (snapshot_content, metadata, typed_snapshot) = if value.deleted {
+            (None, None, None)
         } else {
             shared_payload_fields(
                 &payloads,
@@ -500,7 +518,9 @@ where
                 value.change_id,
             )?
         };
+        let ordinal = rows.rows.len();
         rows.push(key, value, snapshot_content, metadata);
+        rows.set_typed_snapshot(ordinal, typed_snapshot);
     }
     Ok(rows.finish())
 }
@@ -542,12 +562,14 @@ where
     .await?;
 
     for (key, value) in entries {
-        let (snapshot_content, metadata) = if value.deleted {
-            (None, None)
+        let (snapshot_content, metadata, typed_snapshot) = if value.deleted {
+            (None, None, None)
         } else {
             shared_payload_fields(&payloads, key, value.change_id)?
         };
+        let ordinal = rows.rows.len();
         rows.push_ref(key, value, snapshot_content, metadata);
+        rows.set_typed_snapshot(ordinal, typed_snapshot);
     }
     Ok(rows.finish())
 }
@@ -561,7 +583,11 @@ fn shared_payload_fields(
     payloads: &HashMap<ChangeId, MaterializedChangePayload>,
     key: TrackedStateKeyRef<'_>,
     change_id: ChangeId,
-) -> Result<(Option<SharedStr>, Option<SharedStr>), LixError> {
+) -> Result<(
+    Option<SharedStr>,
+    Option<SharedStr>,
+    Option<Arc<WasmTypedRow>>,
+), LixError> {
     let payload = payloads.get(&change_id).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -582,7 +608,11 @@ fn shared_payload_fields(
             ),
         ));
     }
-    Ok((payload.snapshot_content.clone(), payload.metadata.clone()))
+    Ok((
+        payload.snapshot_content.clone(),
+        payload.metadata.clone(),
+        payload.typed_snapshot.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -1051,6 +1081,7 @@ mod tests {
             }),
             snapshot_content: Some(snapshot.clone()),
             metadata: None,
+            typed_snapshot: None,
         };
         (
             change_id,

@@ -1,11 +1,10 @@
-# Plugin API v1
+# Plugin API v1 (historical)
 
 ## Status
 
-Accepted hard cut. `lix:plugin@1.0.0` is the only plugin ABI and runtime path;
-there is no compatibility adapter. The selected author API, universal row
-page, manifest contract, correctness gates, and performance protocol are
-specified in [Universal plugin API v1](universal-plugin-api.md).
+Superseded by the [`lix:plugin@2.0.0` typed-row hard cut](universal-plugin-api.md).
+This document records the previous design only and is not an implemented or
+supported compatibility contract.
 
 ## Architecture
 
@@ -29,7 +28,7 @@ file format.
 ## Acceptance
 
 The implementation is accepted only when the cross-format protocol in
-[Universal plugin API v1](universal-plugin-api.md#performance-protocol) proves:
+[Universal plugin API v2](universal-plugin-api.md#performance-protocol) proves:
 
 - exact byte reconstruction and complete semantic rows;
 - stable identity, history, conflict, reopen, and cold-successor behavior;

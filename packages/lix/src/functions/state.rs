@@ -11,7 +11,7 @@ use crate::common::LixTimestamp;
 use crate::row_pk::RowPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::hot_state::{
-    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRow,
+    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRowRef,
     TrackedHeadContext,
 };
 use crate::json_store::{
@@ -35,10 +35,9 @@ pub(crate) async fn load_mode(
     read: &(impl StorageAdapterRead + ?Sized),
     cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicMode, LixError> {
-    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_MODE_KEY).await? else {
+    let Some(value) = load_key_value_payload(read, cache, DETERMINISTIC_MODE_KEY).await? else {
         return Ok(DeterministicMode::disabled());
     };
-    let value = key_value_payload(&row, DETERMINISTIC_MODE_KEY)?;
     parse_mode_value(value)
 }
 
@@ -50,10 +49,9 @@ pub(crate) async fn load_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
     cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicSequence, LixError> {
-    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_SEQUENCE_KEY).await? else {
+    let Some(value) = load_key_value_payload(read, cache, DETERMINISTIC_SEQUENCE_KEY).await? else {
         return Ok(DeterministicSequence::uninitialized());
     };
-    let value = key_value_payload(&row, DETERMINISTIC_SEQUENCE_KEY)?;
     parse_sequence_value(value)
 }
 
@@ -124,6 +122,7 @@ pub(crate) async fn stage_sequence(
                 updated_at: timestamp,
                 snapshot: snapshot_slot.as_ref_slot(),
                 metadata: crate::json_store::JsonSlotRef::None,
+                typed_snapshot: None,
                 columnar_base_coordinate: None,
             }],
             &std::collections::BTreeSet::new(),
@@ -143,11 +142,11 @@ pub(crate) async fn stage_sequence(
     Ok(preconditions)
 }
 
-async fn load_key_value_row(
+async fn load_key_value_payload(
     read: &(impl StorageAdapterRead + ?Sized),
     cache: Option<&GlobalKeyValueRowCache>,
     key: &str,
-) -> Result<Option<MaterializedHotStateRow>, LixError> {
+) -> Result<Option<JsonValue>, LixError> {
     let Some(control) = BranchHeadControlContext::new()
         .reader(read)
         .load(GLOBAL_BRANCH_ID)
@@ -221,7 +220,13 @@ async fn load_key_value_row(
                 ),
             ));
         }
-        Some(row.to_owned())
+        if row.schema_key() != KEY_VALUE_SCHEMA_KEY || row.row_pk() != &RowPk::single(key) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("deterministic key-value row '{key}' resolved a different identity"),
+            ));
+        }
+        Some(key_value_payload(row, key)?)
     };
     if let Some(cache) = cache {
         cache.insert(control, key, row.clone());
@@ -229,8 +234,33 @@ async fn load_key_value_row(
     Ok(row)
 }
 
-fn key_value_payload(row: &MaterializedHotStateRow, key: &str) -> Result<JsonValue, LixError> {
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+fn key_value_payload(row: MaterializedHotStateRowRef<'_>, key: &str) -> Result<JsonValue, LixError> {
+    if let Some(typed) = row.typed_snapshot() {
+        if row.snapshot_content().is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("deterministic key-value row '{key}' carries both JSON and typed payloads"),
+            ));
+        }
+        let stored_key = match typed.row.get("key") {
+            Some(lix_schema::Value::Text(value)) => value.as_str(),
+            _ => "",
+        };
+        if stored_key != key {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("deterministic key-value row '{key}' has mismatched key field"),
+            ));
+        }
+        return match typed.row.get("value") {
+            Some(lix_schema::Value::Jsonb(value)) => Ok(value.as_value().clone()),
+            _ => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("deterministic key-value row '{key}' is missing value"),
+            )),
+        };
+    }
+    let snapshot_content = row.snapshot_content().map(AsRef::as_ref).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("deterministic key-value row '{key}' is missing snapshot_content"),
@@ -598,6 +628,7 @@ mod tests {
                     updated_at: test_timestamp(),
                     snapshot: snapshot.as_ref_slot(),
                     metadata: crate::json_store::JsonSlotRef::None,
+                    typed_snapshot: None,
                     columnar_base_coordinate: None,
                 }],
                 &std::collections::BTreeSet::new(),

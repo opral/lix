@@ -8,11 +8,9 @@ use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::NullableKeyFilter;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::row_pk::RowPk;
-use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest};
 
 use super::SqlHistoryQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
@@ -136,12 +134,7 @@ impl HistoryRoute {
         {
             return false;
         }
-        if !self.row_pks.is_empty()
-            && !self
-                .row_pks
-                .iter()
-                .any(|candidate| candidate == row_pk)
-        {
+        if !self.row_pks.is_empty() && !self.row_pks.iter().any(|candidate| candidate == row_pk) {
             return false;
         }
         if !self.file_ids.is_empty() {
@@ -388,9 +381,7 @@ where
             let history = guard
                 .change_history_from_commit(&as_of_commit_id, &request)
                 .await?;
-            let reachable_nodes = if metadata_projection.commit_created_at
-                || query_source.certified_history_reader.is_some()
-            {
+            let reachable_nodes = if metadata_projection.commit_created_at {
                 history.reachable_nodes
             } else {
                 Arc::from([])
@@ -435,65 +426,6 @@ where
                 as_of_commit_id: entry.start_commit_id.to_string(),
                 depth: entry.depth,
             });
-        }
-
-        if limit.is_some_and(|limit| rows.len() >= limit) {
-            continue;
-        }
-
-        let certified_commit_ids = reachable_by_id
-            .iter()
-            .filter(|(_, (depth, _))| {
-                request.min_depth.is_none_or(|minimum| *depth >= minimum)
-                    && request.max_depth.is_none_or(|maximum| *depth <= maximum)
-            })
-            .map(|(commit_id, _)| *commit_id)
-            .collect();
-        let certified_request = TrackedStateScanRequest {
-            filter: TrackedStateFilter {
-                schema_keys: request.schema_keys.clone(),
-                row_pks: request.row_pks.clone(),
-                file_ids: request
-                    .file_ids
-                    .iter()
-                    .cloned()
-                    .map(NullableKeyFilter::Value)
-                    .collect(),
-                row_pk_lower: None,
-                row_pk_upper: None,
-                include_tombstones: true,
-            },
-            read_columns: TrackedStateReadColumns {
-                columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
-            },
-            limit: None,
-        };
-        let existing_change_ids = rows
-            .iter()
-            .map(|entry| entry.change.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        if let Some(certified_history_reader) = &query_source.certified_history_reader {
-            for certified in certified_history_reader
-                .scan(&certified_commit_ids, &certified_request)
-                .await?
-            {
-                if existing_change_ids.contains(&certified.change.id) {
-                    continue;
-                }
-                let Some((depth, commit_created_at)) = reachable_by_id.get(&certified.commit_id)
-                else {
-                    continue;
-                };
-                rows.push(HistoryEntry {
-                    change: certified.change,
-                    observed_commit_id: certified.commit_id.to_string(),
-                    commit_created_at: metadata_projection
-                        .commit_created_at
-                        .then(|| commit_created_at.clone()),
-                    as_of_commit_id: as_of_commit_id.to_string(),
-                    depth: *depth,
-                });
-            }
         }
     }
 
@@ -740,8 +672,7 @@ fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute) {
                     apply_conjunctive_values_filter(&mut route.as_of_commit_ids, values);
             }
             HistoryFilterTerm::RowPks(values) => {
-                route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.row_pks, values);
+                route.contradictory |= apply_conjunctive_values_filter(&mut route.row_pks, values);
             }
             HistoryFilterTerm::SchemaKeys(values) => {
                 route.contradictory |=
@@ -853,8 +784,8 @@ mod tests {
         CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
         CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
     };
-    use crate::row_pk::RowPk;
     use crate::json_store::{JsonSlot, JsonStoreContext};
+    use crate::row_pk::RowPk;
     use crate::sql2::HistoryQuerySource;
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
@@ -1146,6 +1077,7 @@ mod tests {
             file_id: None,
             snapshot: JsonSlot::None,
             metadata: JsonSlot::None,
+            typed_payload: None,
             created_at,
             origin_key: None,
         }
@@ -1171,7 +1103,6 @@ mod tests {
         HistoryQuerySource {
             store: read_scope.clone(),
             json_reader: JsonStoreContext::new().reader(read_scope),
-            certified_history_reader: None,
             default_as_of_commit_id: default_as_of_commit_id.to_string(),
         }
     }

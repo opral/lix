@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::LixError;
 use crate::changelog::{
@@ -16,7 +16,7 @@ use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
-use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateKey};
+use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateKey, TrackedStateKeyRef};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
@@ -426,13 +426,43 @@ where
         .collect::<Vec<_>>();
     let commit_id = plan.commit_id.to_string();
     let parent_commit_id = plan.parent_commit_id.map(|commit_id| commit_id.to_string());
+    let replacement_markers = replacement_marker_keys(plan.deltas.iter())?;
     // Explicit repair must replay the same identity-aware path used by the
     // canonical root writer. The ordered bulk merge is a publication
     // optimization whose parent-stream assumptions are not sufficient for a
     // repair frontier containing shuffled filesystem lifecycle changes.
     writer
-        .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
+        .stage_commit_root_with_absence_guards(
+            &commit_id,
+            parent_commit_id.as_deref(),
+            deltas,
+            &BTreeSet::new(),
+            &replacement_markers,
+        )
         .await
+}
+
+fn replacement_marker_keys<'a>(
+    deltas: impl IntoIterator<Item = &'a CommitRootRebuildDelta>,
+) -> Result<BTreeSet<TrackedStateKey>, LixError> {
+    deltas
+        .into_iter()
+        .filter(|delta| {
+            !delta.deleted
+                && delta.schema_key
+                    == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+        })
+        .map(|delta| {
+            // Parsing here authenticates the scope identity before the root
+            // writer uses this marker to retire an older collection image.
+            crate::collection_generation::collection_scope_from_row_pk(&delta.row_pk)?;
+            Ok(TrackedStateKey {
+                schema_key: delta.schema_key.clone(),
+                file_id: delta.file_id.clone(),
+                row_pk: delta.row_pk.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Collapses one contiguous rootless first-parent replay interval into its
@@ -447,7 +477,9 @@ where
 /// interval.
 ///
 /// File-descriptor deletion has ordered cascade semantics, so those uncommon
-/// intervals stay on the canonical sequential algorithm.
+/// intervals stay on the canonical sequential algorithm. Certified collection
+/// generations collapse by clearing older members of their scope before the
+/// replacement commit is folded into the terminal map.
 pub(crate) async fn try_stage_collapsed_rebuild_plans_with_writer<S>(
     writer: &mut TrackedStateWriter<'_, S>,
     plans: &[CommitRootRebuildPlan],
@@ -466,58 +498,132 @@ where
             ));
         }
     }
-    if plans.iter().flat_map(|plan| &plan.deltas).any(|delta| {
-        (delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-            || delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-    }) {
+    if plans
+        .iter()
+        .flat_map(|plan| &plan.deltas)
+        .any(|delta| delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+    {
         return Ok(None);
     }
 
-    let mut terminal_by_key = BTreeMap::<TrackedStateKey, CommitRootRebuildDelta>::new();
+    #[derive(Clone, Copy)]
+    struct ReplacementTombstone {
+        change_id: ChangeId,
+        commit_id: CommitId,
+        updated_at: LixTimestamp,
+    }
+    #[derive(Clone, Copy)]
+    struct TerminalDelta<'a> {
+        source: &'a CommitRootRebuildDelta,
+        created_at: LixTimestamp,
+        replacement_tombstone: Option<ReplacementTombstone>,
+    }
+    impl TerminalDelta<'_> {
+        fn as_ref(&self) -> TrackedStateDeltaRef<'_> {
+            let replacement = self.replacement_tombstone;
+            TrackedStateDeltaRef {
+                schema_key: &self.source.schema_key,
+                file_id: self.source.file_id.as_deref(),
+                row_pk: &self.source.row_pk,
+                change_id: replacement.map_or(self.source.change_id, |value| value.change_id),
+                commit_id: replacement.map_or(self.source.commit_id, |value| value.commit_id),
+                deleted: replacement.is_some() || self.source.deleted,
+                created_at: self.created_at,
+                updated_at: replacement.map_or(self.source.updated_at, |value| value.updated_at),
+            }
+        }
+    }
+
+    // Every key and terminal delta borrows immutable rebuild-plan authority.
+    // This avoids cloning schema/file strings and primary keys twice for every
+    // row in a long rootless interval.
+    let mut terminal_by_key = BTreeMap::<TrackedStateKeyRef<'_>, TerminalDelta<'_>>::new();
     for plan in plans.iter().rev() {
+        let replacement_scopes = plan
+            .deltas
+            .iter()
+            .filter(|delta| {
+                !delta.deleted
+                    && delta.schema_key
+                        == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            })
+            .map(|delta| {
+                let scope =
+                    crate::collection_generation::collection_scope_from_row_pk(&delta.row_pk)?;
+                Ok((scope, delta))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        for ((schema_key, file_id), marker) in replacement_scopes {
+            for (key, terminal) in &mut terminal_by_key {
+                if key.schema_key == schema_key && key.file_id == file_id.as_deref() {
+                    terminal.replacement_tombstone = Some(ReplacementTombstone {
+                        change_id: marker.change_id,
+                        commit_id: marker.commit_id,
+                        updated_at: marker.updated_at,
+                    });
+                }
+            }
+        }
         for delta in &plan.deltas {
-            let key = TrackedStateKey {
-                schema_key: delta.schema_key.clone(),
-                file_id: delta.file_id.clone(),
-                row_pk: delta.row_pk.clone(),
+            let key = TrackedStateKeyRef {
+                schema_key: &delta.schema_key,
+                file_id: delta.file_id.as_deref(),
+                row_pk: &delta.row_pk,
             };
             match terminal_by_key.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(delta.clone());
+                    entry.insert(TerminalDelta {
+                        source: delta,
+                        created_at: delta.created_at,
+                        replacement_tombstone: None,
+                    });
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let created_at = entry.get().created_at;
-                    let mut terminal = delta.clone();
                     // Sequential replay preserves the first visible lifecycle
                     // timestamp across every later update, tombstone, and
                     // reinsert. The durable base, when present, may replace it
                     // once more inside the canonical root writer.
-                    terminal.created_at = created_at;
-                    entry.insert(terminal);
+                    entry.insert(TerminalDelta {
+                        source: delta,
+                        created_at,
+                        replacement_tombstone: None,
+                    });
                 }
             }
         }
     }
     let deltas = terminal_by_key
         .values()
-        .map(|delta| TrackedStateDeltaRef {
-            schema_key: &delta.schema_key,
-            file_id: delta.file_id.as_deref(),
-            row_pk: &delta.row_pk,
-            change_id: delta.change_id,
-            commit_id: delta.commit_id,
-            deleted: delta.deleted,
-            created_at: delta.created_at,
-            updated_at: delta.updated_at,
-        })
+        .map(TerminalDelta::as_ref)
         .collect::<Vec<_>>();
     let terminal_commit_id = plans[0].commit_id.to_string();
     let base_commit_id = plans
         .last()
         .and_then(|plan| plan.parent_commit_id)
         .map(|commit_id| commit_id.to_string());
+    let replacement_markers = terminal_by_key
+        .iter()
+        .filter(|(_, terminal)| {
+            terminal.replacement_tombstone.is_none()
+                && !terminal.source.deleted
+                && terminal.source.schema_key
+                    == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+        })
+        .map(|(key, _)| TrackedStateKey {
+            schema_key: key.schema_key.to_owned(),
+            file_id: key.file_id.map(str::to_owned),
+            row_pk: key.row_pk.clone(),
+        })
+        .collect::<BTreeSet<_>>();
     writer
-        .stage_commit_root(&terminal_commit_id, base_commit_id.as_deref(), deltas)
+        .stage_commit_root_with_absence_guards(
+            &terminal_commit_id,
+            base_commit_id.as_deref(),
+            deltas,
+            &BTreeSet::new(),
+            &replacement_markers,
+        )
         .await
         .map(Some)
 }
@@ -704,18 +810,11 @@ mod tests {
             .await
             .expect("test read should open");
         let context = TrackedStateContext::new();
-        for sensitive_delta in [
-            CommitRootRebuildDelta {
-                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
-                deleted: true,
-                ..delta("file", "file-delete", 20, 20, true)
-            },
-            CommitRootRebuildDelta {
-                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-                    .to_owned(),
-                ..delta("replacement", "replacement", 20, 20, false)
-            },
-        ] {
+        for sensitive_delta in [CommitRootRebuildDelta {
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+            deleted: true,
+            ..delta("file", "file-delete", 20, 20, true)
+        }] {
             let plans = vec![
                 plan("second", Some("first"), vec![sensitive_delta]),
                 plan("first", None, vec![delta("row", "first", 10, 10, false)]),
@@ -730,5 +829,40 @@ mod tests {
                 "order-sensitive lifecycle replay must use the sequential writer"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn collapsed_replay_matches_sequential_collection_replacement() {
+        let marker = |commit: &str, millis: i64| CommitRootRebuildDelta {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            row_pk: RowPk::single(crate::collection_generation::collection_scope_key(
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: "test_row",
+                    file_id: None,
+                },
+            )),
+            ..delta("marker", commit, millis, millis, false)
+        };
+        let plans = vec![
+            plan(
+                "second",
+                Some("first"),
+                vec![
+                    delta("new", "second", 20, 20, false),
+                    marker("second-marker", 20),
+                ],
+            ),
+            plan(
+                "first",
+                None,
+                vec![
+                    delta("old-a", "first-a", 10, 10, false),
+                    delta("old-b", "first-b", 10, 10, false),
+                    marker("first-marker", 10),
+                ],
+            ),
+        ];
+        let (sequential, collapsed) = sequential_and_collapsed_roots(&plans).await;
+        assert_eq!(collapsed, sequential);
     }
 }

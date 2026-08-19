@@ -34,6 +34,7 @@ use crate::hot_state::{
     HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
     MaterializedHotStateExactBatch,
 };
+use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatch;
 use crate::transaction::staged_commit_changes::StagedCommitChangeRefs;
@@ -434,6 +435,8 @@ impl ImmutableMutationJournalChunk {
                             encoded_key: &key_arena[start..end],
                             snapshot: self.snapshot_slot(first + offset),
                             metadata: crate::json_store::JsonSlotRef::None,
+                            typed_snapshot: None,
+                            typed_payload: None,
                         },
                     )
                     .collect::<Vec<_>>();
@@ -537,6 +540,7 @@ impl ImmutableMutationJournalChunk {
                 },
                 tracked_keys_strictly_ordered: true,
                 complete_collection_replacement: None,
+                fileless_typed_sql_rows: false,
             },
         )?
         .into_dense_prepared(self.origin_key.as_ref(), self.timestamp)?;
@@ -1298,6 +1302,12 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
+    pub(crate) fn typed_snapshot(self) -> Option<&'a Arc<WasmTypedRow>> {
+        match self {
+            Self::State(row) => row.typed_snapshot,
+        }
+    }
+
     pub(crate) fn metadata_json(self) -> Option<&'a serde_json::Value> {
         match self {
             Self::State(row) => row.metadata.map(StageJson::value),
@@ -1324,7 +1334,7 @@ impl<'a> PreparedValidationRow<'a> {
 
     pub(crate) fn is_tombstone(&self) -> bool {
         match self {
-            Self::State(row) => row.snapshot.is_none(),
+            Self::State(row) => row.snapshot.is_none() && row.typed_snapshot.is_none(),
         }
     }
 
@@ -2380,7 +2390,7 @@ impl TransactionWriteBuffer {
             && inserts
             && !rows
                 .iter()
-                .all(|row| row_is_insert(mode, row) && row.snapshot.is_some()))
+                .all(|row| row_is_insert(mode, row) && row_has_payload(row)))
         {
             return Ok(AppendOnlyStage::Fallback(rows));
         }
@@ -2401,7 +2411,7 @@ impl TransactionWriteBuffer {
         let append_shape_matches = if certified_tracked_keys_strictly_ordered {
             rows.first().is_none_or(|first| {
                 is_normal_tracked_append_row(first)
-                    && first.snapshot.is_some()
+                    && row_has_payload(first)
                     && last_key.as_ref().is_none_or(|previous| {
                         compare_tracked_key_to_row(previous, first) == std::cmp::Ordering::Less
                     })
@@ -2492,7 +2502,7 @@ impl TransactionWriteBuffer {
                 !is_normal_tracked_append_row(row)
                     || row.branch_id != first.branch_id
                     || row.facts.requires_transaction_validation
-                    || (row_is_insert(mode, row) && row.snapshot.is_none())
+                    || (row_is_insert(mode, row) && !row_has_payload(row))
             })
         {
             return Ok(AppendOnlyStage::Fallback(rows));
@@ -3311,6 +3321,10 @@ fn row_is_insert(mode: Option<TransactionWriteMode>, row: PreparedStateRowRef<'_
             .is_some_and(|origin| origin.operation == TransactionWriteOperation::Update)
 }
 
+fn row_has_payload(row: PreparedStateRowRef<'_>) -> bool {
+    row.snapshot.is_some() || row.typed_snapshot.is_some()
+}
+
 fn rows_are_append_only_tracked(
     rows: &PreparedStateBatch,
     previous_last: Option<&TrackedStateKey>,
@@ -3646,7 +3660,7 @@ impl crate::hot_state::StagedHotStateRows for PreparedStateRowOverlay {
             {
                 continue;
             }
-            if row.snapshot.is_none() && !request.include_tombstones {
+            if row.snapshot.is_none() && row.typed_snapshot.is_none() && !request.include_tombstones {
                 continue;
             } else {
                 slots[request_index] = Some(
@@ -4120,7 +4134,7 @@ fn validate_rows_in_identity_order<'a>(
         if previous_identity != Some(identity) {
             previous_identity = Some(identity);
             group_untracked = row.untracked;
-            pending_present = row.snapshot.map(|_| row);
+            pending_present = row_has_payload(row).then_some(row);
             unique_count += 1;
             continue;
         }
@@ -4132,7 +4146,7 @@ fn validate_rows_in_identity_order<'a>(
                 BatchIdentityViolation::MixedDurability(row),
             );
         }
-        if row.snapshot.is_none() {
+        if !row_has_payload(row) {
             pending_present = None;
         } else if let Some(previous) = pending_present.replace(row) {
             retain_earliest_batch_identity_violation(
@@ -4333,13 +4347,14 @@ fn push_prepared_materialized(
     output: &mut MaterializedHotStateBatchBuilder,
     row: PreparedStateRowRef<'_>,
 ) -> usize {
-    output.push_materialized_ref(
+    let snapshot = row.snapshot.map(StageJson::materialize_shared);
+    let ordinal = output.push_materialized_ref(
         row.row_pk,
         row.schema_key.as_str(),
         row.file_id.map(SharedStr::as_str),
-        row.snapshot.map(StageJson::materialize_shared),
+        snapshot,
         row.metadata.map(StageJson::materialize_shared),
-        row.snapshot.is_none(),
+        row.snapshot.is_none() && row.typed_snapshot.is_none(),
         row.created_at,
         row.updated_at,
         row.global,
@@ -4349,8 +4364,11 @@ fn push_prepared_materialized(
         row.commit_id,
         row.untracked,
         row.branch_id.as_str(),
-    )
+    );
+    output.set_typed_snapshot(ordinal, row.typed_snapshot.cloned());
+    ordinal
 }
+
 
 fn staged_row_identity_matches_scan(
     row: PreparedStateRowRef<'_>,

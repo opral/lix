@@ -12,19 +12,21 @@ mod order_key;
 use core::{Document, FileEdit, LineIdentity};
 use lix::plugin as sdk;
 use model::{ChangeEffect, RowChange, RowRecord};
+use std::sync::OnceLock;
 
 struct TextPlugin;
 
 const ID_NAMESPACE_STATE: &[u8] = b"text/id-namespace";
 const LINE_IDENTITIES_STATE: &[u8] = b"text/line-identities";
-const LINE_IDENTITIES_MAGIC: &[u8; 4] = b"LTX1";
+const LINE_IDENTITIES_MAGIC: &[u8; 4] = b"LTX2";
 const STATE_PAGE_BYTES: usize = 1024 * 1024;
+const LINE_SCHEMA_JSON: &str = include_str!("../schema/text_line.json");
 
 impl sdk::FileProjection for TextPlugin {
     fn parse(input: sdk::ParseInput<'_>, output: &mut sdk::RowOutput<'_, '_>) -> sdk::Result<()> {
         let namespace = input.creates;
         let (document, changes) = Document::open_file(input.file.read_all()?, |ordinal| {
-            namespace.id(local_ref(ordinal))
+            created_uuid(namespace, local_ref(ordinal))
         })
         .map_err(sdk::Error::invalid_input)?;
         output.put_state(ID_NAMESPACE_STATE, &namespace.namespace_bytes())?;
@@ -49,7 +51,9 @@ impl sdk::FileProjection for TextPlugin {
                 .collect::<Vec<_>>();
             let creates = update.creates;
             let (after, changes) = before
-                .file_changed(&splices, |ordinal| creates.id(local_ref(ordinal)))
+                .file_changed(&splices, |ordinal| {
+                    created_uuid(creates, local_ref(ordinal))
+                })
                 .map_err(sdk::Error::invalid_input)?;
             replace_identities(&update.before, output, &after)?;
             return emit_changes(changes.into_iter().map(Ok), creates, output);
@@ -57,15 +61,14 @@ impl sdk::FileProjection for TextPlugin {
 
         let accepted = update.before.read_all()?;
         let mut records = Vec::new();
-        let rows = update
-            .rows
-            .as_mut()
-            .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+        let rows = update.typed_rows.as_mut().ok_or_else(|| {
+            sdk::Error::internal("cold parse_changes requires durable typed rows")
+        })?;
         while let Some(row) = rows.next()? {
             records.push(Ok(RowRecord {
                 schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                snapshot: row.snapshot,
+                row_pk: row.primary_key,
+                row: row.row,
             }));
         }
         let creates = update.creates;
@@ -78,7 +81,9 @@ impl sdk::FileProjection for TextPlugin {
                 insert: accepted,
             }];
             document = document
-                .file_changed(&reconcile, |ordinal| creates.id(local_ref(ordinal)))
+                .file_changed(&reconcile, |ordinal| {
+                    created_uuid(creates, local_ref(ordinal))
+                })
                 .map_err(sdk::Error::invalid_input)?
                 .0;
         }
@@ -92,7 +97,9 @@ impl sdk::FileProjection for TextPlugin {
             })
             .collect::<Vec<_>>();
         let (successor, changes) = document
-            .file_changed(&splices, |ordinal| creates.id(local_ref(ordinal)))
+            .file_changed(&splices, |ordinal| {
+                created_uuid(creates, local_ref(ordinal))
+            })
             .map_err(sdk::Error::invalid_input)?;
         output.put_state(ID_NAMESPACE_STATE, &creates.namespace_bytes())?;
         store_identities(output, &successor)?;
@@ -105,11 +112,11 @@ impl sdk::FileProjection for TextPlugin {
     ) -> sdk::Result<()> {
         let before = read_document(&update.before)?;
         let mut changes = Vec::new();
-        while let Some(change) = update.row_changes.next()? {
+        while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
-                row_pk: change.row_pk,
-                snapshot: change.snapshot,
+                row_pk: change.primary_key,
+                row: change.row,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
                     sdk::ChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
@@ -130,11 +137,11 @@ impl sdk::FileProjection for TextPlugin {
         output: &mut sdk::FileOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(row) = input.rows.next()? {
+        while let Some(row) = input.typed_rows.next()? {
             records.push(Ok(RowRecord {
                 schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                snapshot: row.snapshot,
+                row_pk: row.primary_key,
+                row: row.row,
             }));
         }
         let document = Document::open_rows_fallible(records).map_err(sdk::Error::invalid_input)?;
@@ -200,7 +207,7 @@ fn encode_identities(identities: &[LineIdentity]) -> sdk::Result<(Vec<u8>, Vec<V
     let mut page = Vec::with_capacity(STATE_PAGE_BYTES);
     for identity in identities {
         let mut record = Vec::new();
-        push_text(&mut record, &identity.id)?;
+        record.extend_from_slice(identity.id.as_bytes());
         push_text(&mut record, &identity.order_key)?;
         push_paged_state(&mut pages, &mut page, &record);
     }
@@ -227,7 +234,12 @@ fn decode_identities(line_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<Li
     let mut identities = Vec::with_capacity(line_count as usize);
     for _ in 0..line_count {
         identities.push(LineIdentity {
-            id: reader.text()?,
+            id: uuid::Uuid::from_bytes(
+                reader
+                    .bytes(16)?
+                    .try_into()
+                    .expect("identity reader returned sixteen UUID bytes"),
+            ),
             order_key: reader.text()?,
         });
     }
@@ -352,15 +364,15 @@ where
 {
     for change in changes {
         let change = change.map_err(sdk::Error::invalid_input)?;
-        match change.snapshot {
-            Some(snapshot) => {
+        match change.row {
+            Some(row) => {
                 if let Some(local_ref) = create_local_ref(&change.row_pk, creates) {
-                    sink.create(&change.schema_key, local_ref, &snapshot)?;
+                    sink.create(&change.schema_key, local_ref, &row)?;
                 } else {
                     sink.upsert(
                         &change.schema_key,
                         &change.row_pk,
-                        &snapshot,
+                        &row,
                         match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
                             ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
@@ -398,31 +410,33 @@ impl_state_output!(sdk::FileOutput<'_, '_>);
 impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
-    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()>;
+    fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()>;
     fn upsert(
         &mut self,
         schema_key: &str,
-        row_pk: &[String],
-        snapshot: &[u8],
+        row_pk: &[sdk::TypedValue],
+        row: &sdk::TypedRow,
         effect: sdk::ChangeEffect,
     ) -> sdk::Result<()>;
-    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: &[sdk::TypedValue]) -> sdk::Result<()>;
 }
 
 impl MutationOutput for sdk::RowOutput<'_, '_> {
-    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()> {
-        self.create(schema_key, local_ref, snapshot)
+    fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(schema_key)?;
+        self.create(schema_key, fingerprint, local_ref, row)
     }
     fn upsert(
         &mut self,
         schema_key: &str,
-        row_pk: &[String],
-        snapshot: &[u8],
+        row_pk: &[sdk::TypedValue],
+        row: &sdk::TypedRow,
         _effect: sdk::ChangeEffect,
     ) -> sdk::Result<()> {
-        self.upsert(schema_key, row_pk, snapshot)
+        let (schema_key, fingerprint) = typed_schema(schema_key)?;
+        self.upsert(schema_key, fingerprint, row_pk.to_vec(), row)
     }
-    fn delete(&mut self, _schema_key: &str, _row_pk: &[String]) -> sdk::Result<()> {
+    fn delete(&mut self, _schema_key: &str, _row_pk: &[sdk::TypedValue]) -> sdk::Result<()> {
         Err(sdk::Error::invalid_input(
             "initial Text parse produced a deletion",
         ))
@@ -430,30 +444,55 @@ impl MutationOutput for sdk::RowOutput<'_, '_> {
 }
 
 impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
-    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()> {
-        self.create(schema_key, local_ref, snapshot)
+    fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(schema_key)?;
+        self.create(schema_key, fingerprint, local_ref, row)
     }
     fn upsert(
         &mut self,
         schema_key: &str,
-        row_pk: &[String],
-        snapshot: &[u8],
+        row_pk: &[sdk::TypedValue],
+        row: &sdk::TypedRow,
         effect: sdk::ChangeEffect,
     ) -> sdk::Result<()> {
-        self.upsert(schema_key, row_pk, snapshot, effect)
+        let (schema_key, fingerprint) = typed_schema(schema_key)?;
+        self.upsert(schema_key, fingerprint, row_pk.to_vec(), row, effect)
     }
-    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()> {
-        self.delete(schema_key, row_pk)
+    fn delete(&mut self, schema_key: &str, row_pk: &[sdk::TypedValue]) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(schema_key)?;
+        self.delete(schema_key, fingerprint, row_pk.to_vec())
     }
 }
 
-fn create_local_ref(row_pk: &[String], creates: sdk::CreateContext) -> Option<u32> {
-    let [id] = row_pk else {
+fn typed_schema(schema_key: &str) -> sdk::Result<(&'static str, [u8; 32])> {
+    static FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
+    if schema_key != "text_line" {
+        return Err(sdk::Error::invalid_input(format!(
+            "Text plugin does not support schema '{schema_key}'"
+        )));
+    }
+    Ok((
+        "text_line",
+        *FINGERPRINT.get_or_init(|| {
+            sdk::schema_fingerprint(LINE_SCHEMA_JSON).expect("embedded text schema must be valid")
+        }),
+    ))
+}
+
+fn create_local_ref(row_pk: &[sdk::TypedValue], creates: sdk::CreateContext) -> Option<u32> {
+    let [sdk::TypedValue::Uuid(id)] = row_pk else {
         return None;
     };
-    let bytes = uuid::Uuid::parse_str(id).ok()?.into_bytes();
+    let bytes = id.into_bytes();
     (bytes[..12] == creates.namespace_bytes())
         .then(|| u32::from_be_bytes(bytes[12..].try_into().expect("four UUID bytes")))
+}
+
+fn created_uuid(creates: sdk::CreateContext, local_ref: u32) -> uuid::Uuid {
+    let mut bytes = [0_u8; 16];
+    bytes[..12].copy_from_slice(&creates.namespace_bytes());
+    bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
+    uuid::Uuid::from_bytes(bytes)
 }
 
 fn push_text(output: &mut Vec<u8>, value: &str) -> sdk::Result<()> {

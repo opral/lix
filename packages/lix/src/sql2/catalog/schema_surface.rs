@@ -8,9 +8,9 @@ use crate::LixError;
 use crate::row_pk::RowPkComponentType;
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ROW_PK, HISTORY_COL_FILE_ID,
-    HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_FILE_ID, HISTORY_COL_IS_DELETED,
+    HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
+    HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY,
 };
 use crate::sql2::result_metadata::{json_field, mark_json_field};
 
@@ -34,6 +34,7 @@ pub(crate) enum SchemaColumnType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaSurfaceColumn {
     pub(crate) name: String,
+    pub(crate) native_type: lix_schema::DataType,
     pub(crate) column_type: SchemaColumnType,
     pub(crate) read_nullable: bool,
     pub(crate) insert_required: bool,
@@ -43,6 +44,10 @@ pub(crate) struct SchemaSurfaceColumn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaSurfaceSpec {
     pub(crate) schema_key: String,
+    /// Fingerprint used by the typed plugin wire and durable row payloads.
+    /// SQL readers bind durable rows to this resolved schema before exposing
+    /// any typed value.
+    pub(crate) schema_fingerprint: [u8; 32],
     pub(crate) primary_key_paths: Vec<Vec<String>>,
     pub(crate) primary_key_component_types: Vec<RowPkComponentType>,
     pub(crate) columns: Vec<SchemaSurfaceColumn>,
@@ -134,6 +139,15 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
 ) -> Result<SchemaSurfaceSpec, LixError> {
     let parsed = crate::schema::parse_lix_schema(schema)?;
     let schema_key = parsed.key.clone();
+    let schema_fingerprint = *parsed
+        .wire_fingerprint()
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("failed to fingerprint resolved schema '{schema_key}': {error}"),
+            )
+        })?
+        .as_bytes();
     let primary_key_paths = parsed
         .primary_key
         .iter()
@@ -162,6 +176,7 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
         .iter()
         .map(|column| SchemaSurfaceColumn {
             name: column.name.clone(),
+            native_type: column.data_type,
             column_type: match column.data_type {
                 lix_schema::DataType::Text | lix_schema::DataType::Uuid => SchemaColumnType::String,
                 lix_schema::DataType::Int8 => SchemaColumnType::Integer,
@@ -207,6 +222,7 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
     });
     Ok(SchemaSurfaceSpec {
         schema_key,
+        schema_fingerprint,
         primary_key_paths,
         primary_key_component_types,
         indexed_columns,
@@ -350,9 +366,29 @@ pub(crate) fn schema_surface_schema(
 }
 
 pub(crate) fn row_visible_fields(spec: &SchemaSurfaceSpec) -> Vec<Field> {
+    let primary_key_ordinals = spec
+        .primary_key_paths
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, path)| path.first().map(|name| (name.as_str(), ordinal)))
+        .collect::<std::collections::HashMap<_, _>>();
     schema_surface_schema(spec, SchemaSurfaceShape::Active).fields()[..spec.columns.len()]
         .iter()
-        .map(|field| field.as_ref().clone())
+        .zip(&spec.columns)
+        .map(|(field, column)| {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                "lix.schema_v1.type".to_owned(),
+                column.native_type.postgres_name().to_owned(),
+            );
+            if let Some(ordinal) = primary_key_ordinals.get(column.name.as_str()) {
+                metadata.insert(
+                    "lix.schema_v1.primary_key_ordinal".to_owned(),
+                    ordinal.to_string(),
+                );
+            }
+            field.as_ref().clone().with_metadata(metadata)
+        })
         .collect()
 }
 
@@ -427,7 +463,7 @@ mod tests {
     #[test]
     fn certifies_complete_path_value_rows_when_value_accepts_all_json() {
         let spec = derive_schema_surface_spec_from_schema(&path_value_schema("jsonb"))
-        .expect("schema should derive");
+            .expect("schema should derive");
 
         assert!(spec.certifies_path_value_replacement);
     }
@@ -435,11 +471,11 @@ mod tests {
     #[test]
     fn columnar_snapshot_certificate_requires_exact_reversible_columns() {
         let strings = derive_schema_surface_spec_from_schema(&path_value_schema("text"))
-        .expect("string schema should derive");
+            .expect("string schema should derive");
         assert!(strings.columnar_snapshot_bijective);
 
         let numbers = derive_schema_surface_spec_from_schema(&path_value_schema("float8"))
-        .expect("number schema should derive");
+            .expect("number schema should derive");
         assert!(!numbers.columnar_snapshot_bijective);
 
         let mut reserved = path_value_schema("text");

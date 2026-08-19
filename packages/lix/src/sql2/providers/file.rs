@@ -9220,7 +9220,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: crate::plugin::runtime::PluginCapabilities {
                 column_merger: false,
                 file_projection: true,
@@ -9323,7 +9323,7 @@ mod tests {
             std::iter::empty::<(&str, ComponentExportKind, u32)>(),
         );
         component.export(
-            "lix:plugin/file-projection@1.0.0",
+            "lix:plugin/file-projection@2.0.0",
             ComponentExportKind::Instance,
             instance,
             None,

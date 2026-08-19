@@ -25,7 +25,6 @@ use serde_json::Value as JsonValue;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
-use crate::row_pk::RowPk;
 use crate::hot_state::MaterializedHotStateBatch;
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
@@ -33,16 +32,15 @@ use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
     HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
+use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
-    SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec, PublicCatalog, PublicSurfaceKind,
+    PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec,
     schema_surface_schema,
-};
-use crate::sql2::row_projection::{
-    RowProjectionDecoder, row_projection_error_to_datafusion_error,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_schema_surface;
+use crate::sql2::row_projection::{RowProjectionDecoder, row_projection_error_to_datafusion_error};
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
@@ -72,42 +70,44 @@ use super::values::{
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Executes the already-proved unique registered-schema point shape without
-/// constructing a DataFusion plan or Arrow batch. The retained snapshot
+/// constructing a DataFusion plan or Arrow batch. The retained hot-state
 /// reader remains the sole visibility/authentication authority.
 pub(crate) async fn execute_exact_schema_point_read(
     spec: &SchemaSurfaceSpec,
     active_branch_id: &str,
-    reader: Arc<dyn RowSnapshotReader>,
+    reader: Arc<dyn HotStateReader>,
     row_pk: RowPk,
     projected_columns: &[String],
     output_columns: Vec<String>,
 ) -> Result<Option<crate::SqlQueryResult>, LixError> {
-    let mut request = row_hot_state_scan_request(
-        &spec.schema_key,
-        Some(active_branch_id),
-        None,
-        Some(1),
-        true,
-    );
-    request.filter.row_pks = vec![row_pk];
-    let Some(snapshots) = reader.scan_row_snapshots(request).await? else {
+    let request = HotStateExactBatchRequest {
+        rows: vec![HotStateExactRowRequest {
+            schema_key: spec.schema_key.clone(),
+            branch_id: active_branch_id.to_owned(),
+            row_pk,
+            file_id: None,
+        }],
+        projection: HotStateProjection {
+            columns: vec!["snapshot_content".to_owned()],
+        },
+        untracked: None,
+        include_tombstones: false,
+    };
+    let exact = reader.load_exact_batch(&request).await?;
+    let Some(row) = exact.row(0) else {
         return Ok(None);
     };
-    if snapshots.len() > 1 {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "exact schema point route returned more than one row",
-        ));
-    }
-    let rows = snapshots
-        .first()
-        .map(|snapshot| {
-            RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?
-                .decode_public_values(snapshot.as_deref())
-        })
-        .transpose()?
-        .into_iter()
-        .collect();
+    let decoder = RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?;
+    let rows = vec![if let Some(typed) = row.typed_snapshot() {
+        typed.validate_resolved_schema_binding(
+            row.schema_key(),
+            &spec.schema_key,
+            &spec.schema_fingerprint,
+        )?;
+        decoder.decode_typed_public_values(&typed.row)?
+    } else {
+        decoder.decode_public_values(row.snapshot_content().map(|snapshot| snapshot.as_bytes()))?
+    }];
     Ok(Some(crate::SqlQueryResult {
         rows,
         columns: output_columns,
@@ -150,9 +150,17 @@ pub(crate) async fn execute_exact_schema_batch_read(
         let Some(row) = exact.row(slot) else {
             continue;
         };
-        rows.push(decoder.decode_public_values(
-            row.snapshot_content().map(|snapshot| snapshot.as_bytes()),
-        )?);
+        rows.push(if let Some(typed) = row.typed_snapshot() {
+            typed.validate_resolved_schema_binding(
+                row.schema_key(),
+                &spec.schema_key,
+                &spec.schema_fingerprint,
+            )?;
+            decoder.decode_typed_public_values(&typed.row)?
+        } else {
+            decoder
+                .decode_public_values(row.snapshot_content().map(|snapshot| snapshot.as_bytes()))?
+        });
     }
     Ok(crate::SqlQueryResult {
         rows,
@@ -457,10 +465,7 @@ impl SchemaSpec {
                 "UPDATE schema surface RETURNING",
             )?,
         };
-        Ok(RowReturningKey {
-            row_pk,
-            branch_id,
-        })
+        Ok(RowReturningKey { row_pk, branch_id })
     }
 
     async fn returning_post_image(
@@ -579,7 +584,7 @@ impl SchemaSpec {
                     .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                let filtered = apply_row_batch_filters(rows, &row_filters)?;
+                let filtered = apply_row_batch_filters(&spec, rows, &row_filters)?;
                 capture_row_update_snapshots(&filtered.rows, &update_snapshots)?;
                 row_record_batch(&spec, schema, &filtered.rows, batch_projection)
             },
@@ -788,8 +793,7 @@ impl TableSpec for SchemaSpec {
                 .plan_row_columnar_scan(columnar_request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?
-            && let Some(projection) =
-                row_columnar_projection(&layout.manifest, &schema, &self.spec)
+            && let Some(projection) = row_columnar_projection(&layout.manifest, &schema, &self.spec)
         {
             let group_indices = row_columnar_group_indices(&layout.manifest, &row_filters);
             return Ok(PlannedScan {
@@ -847,6 +851,18 @@ impl TableSpec for SchemaSpec {
                             .scan_row_snapshots(request.clone())
                             .await
                             .map_err(lix_error_to_datafusion_error)?
+                        // The snapshot-only fast path cannot represent native
+                        // typed rows. A missing outer snapshot for any live
+                        // member therefore selects the authoritative mixed-row
+                        // materializer below instead of manufacturing NULLs.
+                        && rows.iter().all(|row| {
+                            row.as_deref().is_some_and(|bytes| {
+                                bytes
+                                    .iter()
+                                    .find(|byte| !byte.is_ascii_whitespace())
+                                    == Some(&b'{')
+                            })
+                        })
                     {
                         record_rows_examined(rows.len());
                         let decoder = RowProjectionDecoder::new(
@@ -867,7 +883,7 @@ impl TableSpec for SchemaSpec {
                     // Before `row_filters` run: this is the row count a
                     // predicate without an indexed access path pays for.
                     record_rows_examined(rows.len());
-                    let filtered = apply_row_batch_filters(rows, &row_filters)?;
+                    let filtered = apply_row_batch_filters(&spec, rows, &row_filters)?;
                     row_record_batch(&spec, schema, &filtered.rows, batch_projection)
                 },
             ),
@@ -919,7 +935,7 @@ impl TableSpec for SchemaSpec {
                     .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                let filtered = apply_row_batch_filters(rows, &row_filters)?;
+                let filtered = apply_row_batch_filters(&spec, rows, &row_filters)?;
                 row_record_batch(&spec, schema, &filtered.rows, batch_projection)
             },
         );
@@ -1379,8 +1395,7 @@ fn row_columnar_coordinate_shadow_masks(
             // has no stale base member to suppress.
             continue;
         };
-        let owner =
-            crate::hot_state::row_group_set_id(coordinate.base_commit_id, &spec.schema_key);
+        let owner = crate::hot_state::row_group_set_id(coordinate.base_commit_id, &spec.schema_key);
         if owner != layout.id {
             return exec_err!(
                 "row overlay columnar coordinate belongs to a different immutable base"
@@ -1451,27 +1466,40 @@ fn row_columnar_overlay_batches(
         if row.deleted {
             continue;
         }
-        let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
-            DataFusionError::Execution(
-                "live row columnar overlay row has no snapshot".to_owned(),
-            )
-        })?;
+        if row.snapshot_content.is_some() == row.typed_snapshot.is_some() {
+            return Err(DataFusionError::Execution(
+                "live row columnar overlay must carry exactly one payload".to_owned(),
+            ));
+        }
         if !row_filters.is_empty() {
-            let parsed = parse_snapshot_value(std::str::from_utf8(snapshot).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "row columnar overlay snapshot is not UTF-8: {error}"
-                ))
-            })?)
-            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            if !row_filters.iter().try_fold(true, |matches, filter| {
-                Ok::<_, DataFusionError>(
-                    matches && filter.matches_snapshot(Some(&parsed), &spec.schema_key)?,
-                )
-            })? {
+            let matches = if let Some(typed) = row.typed_snapshot.as_deref() {
+                row_filters.iter().try_fold(true, |matches, filter| {
+                    Ok::<_, DataFusionError>(
+                        matches && filter.matches_typed(&typed.row, &spec.schema_key)?,
+                    )
+                })?
+            } else {
+                let snapshot = row.snapshot_content.as_deref().expect("payload checked above");
+                let parsed = parse_snapshot_value(std::str::from_utf8(snapshot).map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "row columnar overlay snapshot is not UTF-8: {error}"
+                    ))
+                })?)
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                row_filters.iter().try_fold(true, |matches, filter| {
+                    Ok::<_, DataFusionError>(
+                        matches && filter.matches_snapshot(Some(&parsed), &spec.schema_key)?,
+                    )
+                })?
+            };
+            if !matches {
                 continue;
             }
         }
-        snapshots.push(Some(snapshot));
+        snapshots.push((
+            row.snapshot_content.as_deref(),
+            row.typed_snapshot.as_deref().map(|typed| &typed.row),
+        ));
     }
     let decoder = RowProjectionDecoder::new(
         spec,
@@ -1482,7 +1510,7 @@ fn row_columnar_overlay_batches(
         .chunks(crate::columnar_row_group::ROW_GROUP_MAX_ROWS)
         .map(|snapshots| {
             let columns = decoder
-                .decode_arrow_columns(snapshots.iter().copied())
+                .decode_mixed_arrow_columns(snapshots.iter().copied())
                 .map_err(row_projection_error_to_datafusion_error)?;
             RecordBatch::try_new(Arc::clone(&schema), columns).map_err(DataFusionError::from)
         })
@@ -1836,12 +1864,7 @@ fn row_update_json_value(
         }
         SchemaColumnType::Integer => match value {
             ScalarValue::Int64(Some(value)) => Ok(JsonValue::from(value)),
-            other => Err(row_update_type_error(
-                spec,
-                column_name,
-                "BIGINT",
-                &other,
-            )),
+            other => Err(row_update_type_error(spec, column_name, "BIGINT", &other)),
         },
         SchemaColumnType::Number => match value {
             ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
@@ -1861,12 +1884,7 @@ fn row_update_json_value(
         },
         SchemaColumnType::Boolean => match value {
             ScalarValue::Boolean(Some(value)) => Ok(JsonValue::Bool(value)),
-            other => Err(row_update_type_error(
-                spec,
-                column_name,
-                "BOOLEAN",
-                &other,
-            )),
+            other => Err(row_update_type_error(spec, column_name, "BOOLEAN", &other)),
         },
         SchemaColumnType::Timestamptz => match value {
             ScalarValue::TimestampMicrosecond(Some(value), _) => {
@@ -2247,9 +2265,7 @@ fn row_filter_mentions_primary_key(filter: &RowFilter, primary_key_columns: &[&s
     match filter {
         RowFilter::ColumnEq { column, .. }
         | RowFilter::ColumnIn { column, .. }
-        | RowFilter::ColumnRange { column, .. } => {
-            primary_key_columns.contains(&column.as_str())
-        }
+        | RowFilter::ColumnRange { column, .. } => primary_key_columns.contains(&column.as_str()),
         RowFilter::And(left, right) | RowFilter::Or(left, right) => {
             row_filter_mentions_primary_key(left, primary_key_columns)
                 || row_filter_mentions_primary_key(right, primary_key_columns)
@@ -2307,10 +2323,9 @@ fn apply_exact_branch_id_filter(
 ///
 /// `HOT_ROW` is keyed `schema_key ++ file_id ++ row_pk`, so a
 /// `schema_key + file_id` filter is a contiguous prefix
-/// (`hot_file_scan_prefixes`). The other three live-state authorities that can
+/// (`hot_file_scan_prefixes`). The other two live-state authorities that can
 /// hold rows with no branch-local `HOT_ROW` — the packed current base, the
-/// certified row batches, and the root current base — each already apply
-/// `HotStateFilter::file_ids` (two of them with their own file-scoped seek),
+/// root current base — each already applies `HotStateFilter::file_ids`,
 /// so the merged answer stays complete. Without this analyzer the predicate
 /// only ever survived as a DataFusion residual and every file-scoped read paid
 /// O(rows in the branch).
@@ -2329,7 +2344,10 @@ fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<ExactFileI
     Ok(file_ids.map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_file_id_filter(request: &mut HotStateScanRequest, file_ids: Option<Vec<ExactFileId>>) {
+fn apply_exact_file_id_filter(
+    request: &mut HotStateScanRequest,
+    file_ids: Option<Vec<ExactFileId>>,
+) {
     if let Some(file_ids) = file_ids {
         if file_ids.is_empty() {
             request.filter.rows = HotStateRowFilter::None;
@@ -2390,8 +2408,7 @@ impl ExactFileIdFilterAnalyzer {
                 let Expr::Column(column) = expression.as_ref() else {
                     return Ok(None);
                 };
-                Ok((column.name == "lixcol_file_id")
-                    .then(|| BTreeSet::from([ExactFileId::Null])))
+                Ok((column.name == "lixcol_file_id").then(|| BTreeSet::from([ExactFileId::Null])))
             }
             _ => Ok(None),
         }
@@ -2557,10 +2574,7 @@ impl<'a> RowPrimaryKeyFilterAnalyzer<'a> {
         let Some(constraint) = self.analyze_constraint(expr)? else {
             return Ok(None);
         };
-        Ok(
-            constraint
-                .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types),
-        )
+        Ok(constraint.into_row_pks(&self.primary_key_columns, &self.primary_key_component_types))
     }
 
     /// Extracts identity constraints that are guaranteed conjuncts while
@@ -2605,8 +2619,8 @@ impl<'a> RowPrimaryKeyFilterAnalyzer<'a> {
                 let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
                     return Ok(None);
                 };
-                let Some(left_ids) = left
-                    .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
+                let Some(left_ids) =
+                    left.into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
                 else {
                     return Ok(None);
                 };
@@ -2704,12 +2718,10 @@ impl<'a> RowFilterAnalyzer<'a> {
             Expr::Column(column) => {
                 let column_name = self.filterable_column_name(&column.name)?;
                 let column = self.spec.visible_column(column_name)?;
-                (column.column_type == SchemaColumnType::Boolean).then(|| {
-                    RowFilter::ColumnEq {
-                        column: column_name.to_string(),
-                        column_type: SchemaColumnType::Boolean,
-                        value: RowFilterValue::Boolean(true),
-                    }
+                (column.column_type == SchemaColumnType::Boolean).then(|| RowFilter::ColumnEq {
+                    column: column_name.to_string(),
+                    column_type: SchemaColumnType::Boolean,
+                    value: RowFilterValue::Boolean(true),
                 })
             }
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
@@ -2819,11 +2831,7 @@ impl<'a> RowFilterAnalyzer<'a> {
         })
     }
 
-    fn analyze_column_literal(
-        &self,
-        column_expr: &Expr,
-        literal_expr: &Expr,
-    ) -> Option<RowFilter> {
+    fn analyze_column_literal(&self, column_expr: &Expr, literal_expr: &Expr) -> Option<RowFilter> {
         let Expr::Column(column) = column_expr else {
             return None;
         };
@@ -3013,12 +3021,7 @@ impl RowFilter {
                     .fields
                     .iter()
                     .position(|field| field.name == *column)?;
-                row_filter_range_in_statistics(
-                    *op,
-                    value,
-                    &group.columns[index],
-                    group.row_count,
-                )
+                row_filter_range_in_statistics(*op, value, &group.columns[index], group.row_count)
             }
             Self::And(left, right) => match (
                 left.may_match_group(manifest, group),
@@ -3097,6 +3100,54 @@ impl RowFilter {
                 || right.matches_snapshot(snapshot, schema_key)?),
         }
     }
+
+    fn matches_typed(&self, row: &lix_schema::Row, schema_key: &str) -> Result<bool> {
+        match self {
+            Self::ColumnEq {
+                column,
+                column_type,
+                value,
+            } => row_typed_filter_value_eq(
+                row,
+                schema_key,
+                column,
+                *column_type,
+                value,
+            ),
+            Self::ColumnIn {
+                column,
+                column_type,
+                values,
+            } => {
+                for expected in values {
+                    if row_typed_filter_value_eq(
+                        row,
+                        schema_key,
+                        column,
+                        *column_type,
+                        expected,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::ColumnRange {
+                column,
+                column_type,
+                op,
+                value,
+            } => Ok(row_typed_value(row, schema_key, column, *column_type)?
+                .and_then(|actual| row_filter_value_cmp(&actual, value))
+                .is_some_and(|ordering| op.matches(ordering))),
+            Self::And(left, right) => {
+                Ok(left.matches_typed(row, schema_key)? && right.matches_typed(row, schema_key)?)
+            }
+            Self::Or(left, right) => {
+                Ok(left.matches_typed(row, schema_key)? || right.matches_typed(row, schema_key)?)
+            }
+        }
+    }
 }
 
 fn row_filter_value_in_statistics(
@@ -3171,9 +3222,7 @@ fn row_scalar_value_cmp(
 ) -> Option<std::cmp::Ordering> {
     use crate::columnar_row_group::RowGroupScalar;
     match (scalar, value) {
-        (RowGroupScalar::Int64(scalar), RowFilterValue::Integer(value)) => {
-            Some(scalar.cmp(value))
-        }
+        (RowGroupScalar::Int64(scalar), RowFilterValue::Integer(value)) => Some(scalar.cmp(value)),
         (RowGroupScalar::String(scalar), RowFilterValue::String(value)) => {
             Some(scalar.as_str().cmp(value.as_str()))
         }
@@ -3201,10 +3250,7 @@ fn row_filter_value_cmp(
     }
 }
 
-fn row_filter_value_literal(
-    expr: &Expr,
-    column_type: SchemaColumnType,
-) -> Option<RowFilterValue> {
+fn row_filter_value_literal(expr: &Expr, column_type: SchemaColumnType) -> Option<RowFilterValue> {
     let Expr::Literal(literal, _) = expr else {
         return None;
     };
@@ -3217,9 +3263,7 @@ fn row_filter_value_literal(
         ScalarValue::UInt8(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
         ScalarValue::UInt16(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
         ScalarValue::UInt32(Some(value)) => Some(RowFilterValue::Integer(i64::from(*value))),
-        ScalarValue::UInt64(Some(value)) => {
-            i64::try_from(*value).ok().map(RowFilterValue::Integer)
-        }
+        ScalarValue::UInt64(Some(value)) => i64::try_from(*value).ok().map(RowFilterValue::Integer),
         ScalarValue::Float32(Some(value)) => Some(RowFilterValue::Number(f64::from(*value))),
         ScalarValue::Float64(Some(value)) => Some(RowFilterValue::Number(*value)),
         ScalarValue::Utf8(Some(value))
@@ -3230,10 +3274,7 @@ fn row_filter_value_literal(
     match (&value, column_type) {
         (RowFilterValue::Boolean(_), SchemaColumnType::Boolean)
         | (RowFilterValue::Integer(_), SchemaColumnType::Integer)
-        | (
-            RowFilterValue::Integer(_) | RowFilterValue::Number(_),
-            SchemaColumnType::Number,
-        )
+        | (RowFilterValue::Integer(_) | RowFilterValue::Number(_), SchemaColumnType::Number)
         | (RowFilterValue::String(_), SchemaColumnType::String) => Some(value),
         _ => None,
     }
@@ -3265,6 +3306,114 @@ fn row_snapshot_value(
             .as_str()
             .map(|value| RowFilterValue::String(value.to_owned())),
     })
+}
+
+fn row_typed_value(
+    row: &lix_schema::Row,
+    schema_key: &str,
+    column: &str,
+    column_type: SchemaColumnType,
+) -> Result<Option<RowFilterValue>> {
+    let Some(value) = row.get(column) else {
+        return Ok(None);
+    };
+    Ok(match (column_type, value) {
+        (_, lix_schema::Value::Null) => None,
+        (SchemaColumnType::String, lix_schema::Value::Text(value)) => {
+            Some(RowFilterValue::String(value.clone()))
+        }
+        (SchemaColumnType::String, lix_schema::Value::Uuid(value)) => {
+            Some(RowFilterValue::String(value.to_string()))
+        }
+        (SchemaColumnType::Integer, lix_schema::Value::Int8(value)) => {
+            Some(RowFilterValue::Integer(*value))
+        }
+        (SchemaColumnType::Number, lix_schema::Value::Float8(value)) => {
+            Some(RowFilterValue::Number(*value))
+        }
+        (SchemaColumnType::Boolean, lix_schema::Value::Boolean(value)) => {
+            Some(RowFilterValue::Boolean(*value))
+        }
+        (SchemaColumnType::Timestamptz, lix_schema::Value::Timestamptz(value)) => {
+            let timestamp = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "typed row {}.{} contains an invalid timestamptz value {}",
+                    schema_key, column, value
+                ))
+            })?;
+            Some(RowFilterValue::String(
+                timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            ))
+        }
+        (SchemaColumnType::Jsonb, _) => None,
+        (_, value) => {
+            return Err(DataFusionError::Execution(format!(
+                "typed row {}.{} has value {:?} incompatible with its SQL filter type {:?}",
+                schema_key, column, value, column_type
+            )));
+        }
+    })
+}
+
+fn row_typed_filter_value_eq(
+    row: &lix_schema::Row,
+    schema_key: &str,
+    column: &str,
+    column_type: SchemaColumnType,
+    expected: &RowFilterValue,
+) -> Result<bool> {
+    let Some(actual) = row.get(column) else {
+        return Ok(false);
+    };
+    let equal = match (column_type, actual, expected) {
+        (_, lix_schema::Value::Null, _) => false,
+        (
+            SchemaColumnType::String,
+            lix_schema::Value::Text(actual),
+            RowFilterValue::String(expected),
+        ) => actual == expected,
+        (
+            SchemaColumnType::String,
+            lix_schema::Value::Uuid(actual),
+            RowFilterValue::String(expected),
+        ) => uuid::Uuid::parse_str(expected).is_ok_and(|expected| expected == *actual),
+        (
+            SchemaColumnType::Integer,
+            lix_schema::Value::Int8(actual),
+            RowFilterValue::Integer(expected),
+        ) => actual == expected,
+        (
+            SchemaColumnType::Number,
+            lix_schema::Value::Float8(actual),
+            RowFilterValue::Number(expected),
+        ) => actual == expected,
+        (
+            SchemaColumnType::Number,
+            lix_schema::Value::Float8(actual),
+            RowFilterValue::Integer(expected),
+        ) => *actual == *expected as f64,
+        (
+            SchemaColumnType::Boolean,
+            lix_schema::Value::Boolean(actual),
+            RowFilterValue::Boolean(expected),
+        ) => actual == expected,
+        (
+            SchemaColumnType::Timestamptz,
+            lix_schema::Value::Timestamptz(actual),
+            RowFilterValue::String(expected),
+        ) => chrono::DateTime::parse_from_rfc3339(expected)
+            .ok()
+            .map(|expected| expected.timestamp_micros())
+            .is_some_and(|expected| expected == *actual),
+        (SchemaColumnType::Jsonb, _, _) => false,
+        (_, actual, _) => {
+            return Err(DataFusionError::Execution(format!(
+                "typed row {}.{} has value {:?} incompatible with its SQL filter type {:?}",
+                schema_key, column, actual, column_type
+            )));
+        }
+    };
+    Ok(equal)
 }
 
 #[expect(clippy::cast_precision_loss, clippy::float_cmp)]
@@ -3490,10 +3639,7 @@ fn identity_matches_parts(
 }
 
 #[cfg(test)]
-fn apply_row_filters(
-    rows: &mut Vec<MaterializedHotStateRow>,
-    filters: &[RowFilter],
-) -> Result<()> {
+fn apply_row_filters(rows: &mut Vec<MaterializedHotStateRow>, filters: &[RowFilter]) -> Result<()> {
     if filters.is_empty() {
         return Ok(());
     }
@@ -3526,10 +3672,45 @@ fn apply_row_filters(
     Ok(())
 }
 
+fn validate_typed_row_schema_binding(
+    spec: &SchemaSurfaceSpec,
+    stored_schema_key: &str,
+    typed: &crate::plugin::runtime::WasmTypedRow,
+) -> Result<()> {
+    typed
+        .validate_resolved_schema_binding(
+            stored_schema_key,
+            &spec.schema_key,
+            &spec.schema_fingerprint,
+        )
+        .map_err(lix_error_to_datafusion_error)
+}
+
+fn validate_typed_row_schema_bindings(
+    spec: &SchemaSurfaceSpec,
+    rows: &MaterializedHotStateBatch,
+) -> Result<()> {
+    for row in rows.iter() {
+        if let Some(typed) = row.typed_snapshot() {
+            validate_typed_row_schema_binding(spec, row.schema_key(), typed)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_row_batch_filters(
+    spec: &SchemaSurfaceSpec,
     rows: MaterializedHotStateBatch,
     filters: &[RowFilter],
 ) -> Result<FilteredRowBatch> {
+    // Public schema scans never expose tombstones. Some overlay paths retain
+    // a deletion slot so later layers can reconcile it; compact those slots
+    // before Arrow projection even when the SQL query has no predicate.
+    let rows = rows.filter(
+        |row| row.snapshot_content().is_some() || row.typed_snapshot().is_some(),
+        None,
+    );
+    validate_typed_row_schema_bindings(spec, &rows)?;
     if filters.is_empty() {
         return Ok(FilteredRowBatch { rows });
     }
@@ -3546,6 +3727,19 @@ fn apply_row_batch_filters(
         |row| {
             if failure.is_some() {
                 return false;
+            }
+            if let Some(typed) = row.typed_snapshot() {
+                for filter in filters {
+                    match filter.matches_typed(&typed.row, row.schema_key()) {
+                        Ok(true) => {}
+                        Ok(false) => return false,
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    }
+                }
+                return true;
             }
             let Some(snapshot_content) = row.snapshot_content().map(AsRef::<str>::as_ref) else {
                 return false;
@@ -3754,6 +3948,7 @@ fn row_record_batch(
     rows: &MaterializedHotStateBatch,
     projection: RowBatchProjection,
 ) -> Result<RecordBatch> {
+    validate_typed_row_schema_bindings(spec, rows)?;
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
         return RecordBatch::try_new_with_options(schema, vec![], &options)
@@ -3761,10 +3956,12 @@ fn row_record_batch(
     }
 
     match projection {
-        RowBatchProjection::ParsedSnapshots => {
-            row_record_batch_from_snapshots(spec, schema, rows)
-        }
-        RowBatchProjection::RawTrackedProjection if rows.iter().all(|row| !row.untracked()) => {
+        RowBatchProjection::ParsedSnapshots => row_record_batch_from_snapshots(spec, schema, rows),
+        RowBatchProjection::RawTrackedProjection
+            if rows
+                .iter()
+                .all(|row| !row.untracked() && row.typed_snapshot().is_none()) =>
+        {
             row_record_batch_from_raw_projection(spec, schema, rows)
         }
         // Raw projection depends on the tracked write invariant: compact
@@ -3813,6 +4010,61 @@ fn row_record_batch_from_snapshots(
     schema: SchemaRef,
     rows: &MaterializedHotStateBatch,
 ) -> Result<RecordBatch> {
+    if rows.iter().any(|row| row.typed_snapshot().is_some()) {
+        for row in rows.iter() {
+            let Some(typed) = row.typed_snapshot() else {
+                continue;
+            };
+            for field in schema.fields().iter().filter(|field| {
+                !field.is_nullable() && !field.name().starts_with("lixcol_")
+            }) {
+                if matches!(typed.row.get(field.name()), None | Some(lix_schema::Value::Null)) {
+                    return Err(DataFusionError::Execution(format!(
+                        "typed row '{}.{}' is missing required projected column '{}'",
+                        row.schema_key(),
+                        row.row_pk().as_json_array_text().map_err(lix_error_to_datafusion_error)?,
+                        field.name()
+                    )));
+                }
+            }
+        }
+        let decoder = RowProjectionDecoder::new(
+            spec,
+            schema.fields().iter().filter_map(|field| {
+                (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
+            }),
+        )
+        .map_err(row_projection_error_to_datafusion_error)?;
+        let mut visible_columns = decoder
+            .decode_mixed_arrow_columns(rows.iter().map(|row| {
+                (
+                    row.snapshot_content()
+                        .map(AsRef::<str>::as_ref)
+                        .map(str::as_bytes),
+                    row.typed_snapshot().map(|typed| &typed.row),
+                )
+            }))
+            .map_err(row_projection_error_to_datafusion_error)?
+            .into_iter();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                field.name().strip_prefix("lixcol_").map_or_else(
+                    || {
+                        visible_columns.next().ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "row projection decoder did not return a visible column"
+                                    .to_string(),
+                            )
+                        })
+                    },
+                    |property_name| row_system_column_array(property_name, rows),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return RecordBatch::try_new(schema, columns).map_err(DataFusionError::from);
+    }
     let snapshots = rows
         .iter()
         .map(|row| parse_snapshot(row.snapshot_content().map(AsRef::<str>::as_ref)))
@@ -4257,15 +4509,15 @@ mod tests {
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk as TestRowPk;
     use crate::hot_state::{
         HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
         MaterializedHotStateBatch, MaterializedHotStateRow,
     };
+    use crate::row_pk::RowPk as TestRowPk;
     use crate::sql2::catalog::{
-        SchemaColumnType, SchemaSurfaceShape, derive_schema_surface_spec_from_schema,
-        schema_surface_schema, schema_exposed_as_history_surface,
-        schema_exposed_as_schema_surface,
+        SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec,
+        derive_schema_surface_spec_from_schema, schema_exposed_as_history_surface,
+        schema_exposed_as_schema_surface, schema_surface_schema,
     };
 
     struct EmptyHotStateReader;
@@ -4482,7 +4734,7 @@ mod tests {
         MaterializedHotStateBatch::from_rows(rows)
     }
 
-    fn row_insert_spec_with_primary_key() -> Arc<super::SchemaSurfaceSpec> {
+    fn row_insert_spec_with_primary_key() -> Arc<SchemaSurfaceSpec> {
         Arc::new(
             derive_schema_surface_spec_from_schema(&json!({
                 "$schema": "https://lix.dev/schema-v1.json",
@@ -4663,6 +4915,7 @@ mod tests {
         super::reset_row_snapshot_parse_count();
         super::reset_row_snapshot_filter_parse_count();
         let filtered = super::apply_row_batch_filters(
+            &spec,
             live_batch(vec![winner, rejected, tombstone]),
             &[filter],
         )
@@ -4703,6 +4956,140 @@ mod tests {
                 .expect("body is utf8")
                 .value(0),
             "hello"
+        );
+    }
+
+    #[test]
+    fn typed_row_filter_does_not_require_a_legacy_snapshot() {
+        let spec = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_message",
+            "columns": [
+                { "name": "body", "type": "text", "nullable": false },
+                { "name": "count", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["body"],
+        }))
+        .expect("typed filter schema should derive");
+        let mut row = live_row();
+        row.snapshot_content = None;
+        let mut batch = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(1);
+        batch.push_owned(row);
+        batch.set_typed_snapshot(
+            0,
+            Some(Arc::new(crate::plugin::runtime::WasmTypedRow {
+                schema_fingerprint: spec.schema_fingerprint,
+                row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+                row: lix_schema::Row::from([
+                    (
+                        "body".to_owned(),
+                        lix_schema::Value::Text("hello".to_owned()),
+                    ),
+                    ("count".to_owned(), lix_schema::Value::Int8(7)),
+                ]),
+                native_payload: std::sync::OnceLock::new(),
+                boundary_create_validation: std::sync::OnceLock::new(),
+            })),
+        );
+
+        let filters = [
+            super::RowFilter::ColumnEq {
+                column: "body".to_owned(),
+                column_type: SchemaColumnType::String,
+                value: super::RowFilterValue::String("hello".to_owned()),
+            },
+            super::RowFilter::ColumnRange {
+                column: "count".to_owned(),
+                column_type: SchemaColumnType::Integer,
+                op: super::RowRangeOp::Gt,
+                value: super::RowFilterValue::Integer(6),
+            },
+        ];
+        let filtered = super::apply_row_batch_filters(&spec, batch.finish(), &filters)
+            .expect("typed row predicates should use the native row");
+        assert_eq!(filtered.rows.len(), 1);
+    }
+
+    fn typed_binding_test_spec() -> SchemaSurfaceSpec {
+        derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "project_message",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        }))
+        .expect("typed binding schema should derive")
+    }
+
+    fn typed_binding_test_batch(
+        stored_schema_key: &str,
+        schema_fingerprint: [u8; 32],
+    ) -> MaterializedHotStateBatch {
+        let mut row = live_row();
+        row.schema_key = stored_schema_key.to_owned();
+        row.snapshot_content = None;
+        let mut batch = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(1);
+        batch.push_owned(row);
+        batch.set_typed_snapshot(
+            0,
+            Some(Arc::new(crate::plugin::runtime::WasmTypedRow {
+                schema_fingerprint,
+                row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+                row: lix_schema::Row::from([
+                    (
+                        "body".to_owned(),
+                        lix_schema::Value::Text("hello".to_owned()),
+                    ),
+                    ("id".to_owned(), lix_schema::Value::Text("row-1".to_owned())),
+                ]),
+                native_payload: std::sync::OnceLock::new(),
+                boundary_create_validation: std::sync::OnceLock::new(),
+            })),
+        );
+        batch.finish()
+    }
+
+    #[test]
+    fn sql_projection_rejects_stale_durable_typed_fingerprint() {
+        let spec = typed_binding_test_spec();
+        let mut stale = spec.schema_fingerprint;
+        stale[0] ^= 0xff;
+        let rows = typed_binding_test_batch(&spec.schema_key, stale);
+
+        let error = row_record_batch(
+            &spec,
+            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
+            &rows,
+            super::RowBatchProjection::ParsedSnapshots,
+        )
+        .expect_err("stale durable fingerprint must fail before SQL projection");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the resolved schema")
+        );
+    }
+
+    #[test]
+    fn sql_projection_rejects_corrupted_durable_schema_envelope() {
+        let spec = typed_binding_test_spec();
+        let rows = typed_binding_test_batch("other_schema", spec.schema_fingerprint);
+
+        let error = row_record_batch(
+            &spec,
+            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
+            &rows,
+            super::RowBatchProjection::ParsedSnapshots,
+        )
+        .expect_err("stored schema corruption must fail before SQL projection");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be exposed as resolved schema")
         );
     }
 
@@ -4850,7 +5237,7 @@ mod tests {
         assert_eq!(super::row_snapshot_parse_count(), rows.len());
     }
 
-    fn filter_pushdown_spec() -> Arc<super::SchemaSurfaceSpec> {
+    fn filter_pushdown_spec() -> Arc<SchemaSurfaceSpec> {
         Arc::new(
             derive_schema_surface_spec_from_schema(&json!({
                 "$schema": "https://lix.dev/schema-v1.json",
@@ -5450,10 +5837,7 @@ mod tests {
             .expect("primary-key filters should analyze")
             .expect("primary-key filters should produce a constraint");
 
-        assert_eq!(
-            row_pks,
-            vec![crate::row_pk::RowPk::single("row-a")]
-        );
+        assert_eq!(row_pks, vec![crate::row_pk::RowPk::single("row-a")]);
     }
 
     #[tokio::test]
@@ -5547,7 +5931,10 @@ mod tests {
             .plan_scan_parts(None, &[null_file_owner], None)
             .await
             .expect("NULL file-owner scan should plan");
-        assert_eq!(request.filter.file_ids, vec![crate::NullableKeyFilter::Null]);
+        assert_eq!(
+            request.filter.file_ids,
+            vec![crate::NullableKeyFilter::Null]
+        );
         assert!(row_filters.is_empty());
 
         // Shapes the seek cannot represent stay unsupported so DataFusion keeps
@@ -5691,8 +6078,8 @@ mod tests {
             },
         ];
 
-        let (lower, upper) = super::primary_key_range(&spec, &filters)
-            .expect("contiguous typed range should route");
+        let (lower, upper) =
+            super::primary_key_range(&spec, &filters).expect("contiguous typed range should route");
         let lower = lower.expect("lower bound");
         let upper = upper.expect("upper bound");
         assert_eq!(lower.row_pk.clone().into_parts(), vec!["41"]);
@@ -5732,9 +6119,8 @@ mod tests {
         };
 
         assert!(super::primary_key_range(&spec, &[prefix.clone(), lower.clone()]).is_none());
-        let (actual_lower, actual_upper) =
-            super::primary_key_range(&spec, &[prefix, lower, upper])
-                .expect("bounded final component with exact prefix should route");
+        let (actual_lower, actual_upper) = super::primary_key_range(&spec, &[prefix, lower, upper])
+            .expect("bounded final component with exact prefix should route");
         assert_eq!(
             actual_lower.expect("lower").row_pk.into_parts(),
             vec!["docs", "10"]
@@ -6199,10 +6585,8 @@ mod tests {
             column_type: SchemaColumnType::Boolean,
             value: super::RowFilterValue::Boolean(true),
         };
-        let selected = super::row_columnar_group_indices(
-            &encoded.manifest,
-            std::slice::from_ref(&row_filter),
-        );
+        let selected =
+            super::row_columnar_group_indices(&encoded.manifest, std::slice::from_ref(&row_filter));
         let flag_index = encoded
             .manifest
             .fields
@@ -6344,18 +6728,21 @@ mod tests {
             crate::hot_state::RowColumnarOverlayRow {
                 row_pk: TestRowPk::single("a"),
                 snapshot_content: Some(Bytes::from_static(br#"{"active":false,"lane":"new-a"}"#)),
+                typed_snapshot: None,
                 deleted: false,
                 columnar_base_coordinate: None,
             },
             crate::hot_state::RowColumnarOverlayRow {
                 row_pk: TestRowPk::single("b"),
                 snapshot_content: None,
+                typed_snapshot: None,
                 deleted: true,
                 columnar_base_coordinate: None,
             },
             crate::hot_state::RowColumnarOverlayRow {
                 row_pk: TestRowPk::single("c"),
                 snapshot_content: Some(Bytes::from_static(br#"{"active":true,"lane":"insert-c"}"#)),
+                typed_snapshot: None,
                 deleted: false,
                 columnar_base_coordinate: None,
             },
@@ -6472,6 +6859,7 @@ mod tests {
                 crate::hot_state::RowColumnarOverlayRow {
                     row_pk: identities[0].clone(),
                     snapshot_content: Some(Bytes::from_static(br#"{"id":"a","active":false}"#)),
+                    typed_snapshot: None,
                     deleted: false,
                     columnar_base_coordinate: Some(crate::hot_state::ColumnarBaseCoordinate {
                         base_commit_id,
@@ -6485,6 +6873,7 @@ mod tests {
                     snapshot_content: Some(Bytes::from_static(
                         br#"{"id":"inserted","active":true}"#,
                     )),
+                    typed_snapshot: None,
                     deleted: false,
                     columnar_base_coordinate: None,
                 },

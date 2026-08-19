@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use crate::changelog::ChangeRecord;
 use crate::common::SharedStr;
-use crate::row_pk::RowPk;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
+use crate::plugin::runtime::WasmTypedRow;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, parse_row_metadata};
 
@@ -11,7 +14,7 @@ use crate::{LixError, parse_row_metadata};
 /// derived `lix_commit` changes from `changelog.commit`. History surfaces
 /// materialize reachability-aware commit-graph changes, while traversal context
 /// stays outside this row shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct MaterializedChange {
     pub(crate) id: String,
     pub(crate) account_id: String,
@@ -20,6 +23,7 @@ pub(crate) struct MaterializedChange {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
     pub(crate) metadata: Option<SharedStr>,
+    pub(crate) typed_snapshot: Option<Arc<WasmTypedRow>>,
     pub(crate) created_at: String,
     pub(crate) origin_key: Option<String>,
 }
@@ -70,6 +74,7 @@ where
             file_id: change.file_id,
             snapshot: change.snapshot,
             metadata: change.metadata,
+            typed_payload: change.typed_payload,
             created_at: change.created_at,
             origin_key: change.origin_key,
         },
@@ -80,12 +85,29 @@ where
 
 pub(crate) async fn materialize_commit_graph_change<S>(
     json_reader: &mut JsonStoreReader<S>,
-    change: crate::commit_graph::CommitGraphChange,
+    mut change: crate::commit_graph::CommitGraphChange,
     payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
     S: StorageAdapterRead,
 {
+    if change.snapshot.is_some() && change.typed_payload.is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "changelog change '{}' carries both JSON and typed row payloads",
+                change.id
+            ),
+        ));
+    }
+    let typed_snapshot = change
+        .typed_payload
+        .take()
+        .map(|payload| {
+            WasmTypedRow::decode_durable_payload(payload.into(), &change.schema_key, &change.row_pk)
+                .map(Arc::new)
+        })
+        .transpose()?;
     let snapshot_content = if payload_projection.snapshot_content {
         load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?
     } else {
@@ -109,6 +131,7 @@ where
         file_id: change.file_id,
         snapshot_content,
         metadata,
+        typed_snapshot,
         created_at: change.created_at.to_string(),
         origin_key: change.origin_key,
     })
@@ -157,10 +180,10 @@ mod tests {
     use crate::changelog::ChangeId;
     use crate::commit_graph::CommitGraphChange;
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
     use crate::json_store::{
         JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
     };
+    use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     use super::{ChangePayloadProjection, materialize_commit_graph_change};
@@ -174,6 +197,7 @@ mod tests {
             file_id: Some("file-1".to_string()),
             snapshot,
             metadata,
+            typed_payload: None,
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
             origin_key: Some("origin-1".to_string()),
         }

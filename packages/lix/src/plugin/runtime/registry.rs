@@ -299,6 +299,19 @@ impl PluginRegistry {
         self.plugin(key)
     }
 
+    /// Whether an active plugin claims semantic ownership of this schema.
+    /// Engine catalog, registry, and filesystem schemas are intentionally not
+    /// inferred from where their rows originated; only manifest-declared
+    /// semantic schema keys belong to the typed plugin boundary.
+    pub(crate) fn owns_schema(&self, schema_key: &str) -> bool {
+        self.plugins.iter().any(|plugin| {
+            plugin
+                .schema_keys()
+                .binary_search_by(|key| key.as_str().cmp(schema_key))
+                .is_ok()
+        })
+    }
+
     pub(crate) fn upsert(
         &mut self,
         plugin: PluginRegistryEntry,
@@ -1397,7 +1410,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: PluginCapabilities {
                 column_merger: true,
                 file_projection: true,
@@ -1422,7 +1435,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: PluginCapabilities {
                 column_merger: true,
                 file_projection: true,
@@ -1459,7 +1472,7 @@ mod tests {
             PluginRegistry::from_wire(wire).expect_err("durable non-v1 components must hard fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("lix:plugin"));
-        assert!(error.message.contains("1.0.0"));
+        assert!(error.message.contains("2.0.0"));
     }
 
     #[test]
@@ -1629,7 +1642,16 @@ mod tests {
         assert!(!row.global);
         assert!(!row.untracked);
         assert_eq!(row.branch_id, "main");
-        assert_eq!(row.snapshot.unwrap().value()["key"], PLUGIN_OWNER_KEY);
+        let snapshot = row.snapshot.unwrap();
+        assert_eq!(snapshot.value()["key"], PLUGIN_OWNER_KEY);
+        assert_eq!(
+            PluginFileOwner::from_snapshot(
+                "01920000-0000-7000-8000-0000000000a2",
+                snapshot.value(),
+            )
+            .unwrap(),
+            owner
+        );
         assert_eq!(owner.schema_keys(), ["plugin_a_meta", "plugin_a_note"]);
 
         let registry_row = PluginRegistry::empty().write_row("main").unwrap();
@@ -1646,7 +1668,7 @@ mod tests {
         let mut input = PluginRegistryEntryInput {
             key: "plugin_a".to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: PluginCapabilities {
                 column_merger: true,
                 file_projection: true,

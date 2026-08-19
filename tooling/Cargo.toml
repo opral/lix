@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "../packages/cli",
   "../packages/e2e",
+  "../packages/e2e/fixtures/column-merger",
 ]
 
 [workspace.package]

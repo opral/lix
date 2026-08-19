@@ -1,0 +1,70 @@
+{
+  "schema": "lix.plugin-api-benchmark-corpus.v1",
+  "corpus_id": "plugin-api-public-workflows",
+  "revision": "typed-row-fixtures-v3",
+  "seed": "lix-plugin-api-public-workflows-v1",
+  "default_samples": 61,
+  "warmup_samples": 5,
+  "warmup_overrides": {
+    "json_ten_mib_paged_roundtrip": {"warmups": 1, "rationale": "One 10 MiB import/export warmup is sufficient and avoids retaining multiple large fixtures before the measured scope."},
+    "direct_row_mutation": {"warmups": 0, "rationale": "These lanes intentionally measure cold create/update/delete transaction sequences in fresh processes; setup imports the owning file before measurement."}
+  },
+  "fixtures": {
+    "csv": {"source_rows": 256, "import_rows": 258, "sparse_row": 128, "input_bytes": 12782, "sha256": "2a463364f96013e1203efb638ef93701625e7bb1dcdfec86f8fca8b13ceffacf"},
+    "json": {"source_rows": 256, "import_rows": 417, "sparse_row": 128, "input_bytes": 6594, "sha256": "3073d5e07ee0f993298f43dbd9c9c879c144f41b4c1f713199dd08a1c5e0c86d"},
+    "markdown": {"source_rows": 256, "import_rows": 258, "sparse_row": 128, "input_bytes": 43743, "sha256": "91c8b8507d0f4b23053e8917f87b23cb30d5f10a24ee142982fa7f5db008557d"},
+    "text": {"source_rows": 256, "import_rows": 256, "sparse_row": 128, "input_bytes": 7626, "sha256": "815fd02c8730a09c2083f16c41f703866ba4629b6a314a2fea7b877305a7bfd9"},
+    "excalidraw": {"source_rows": 64, "import_rows": 66, "sparse_row": 32, "input_bytes": 14905, "sha256": "f9ca7257f0a6c7b4d3107f9f0cfe922f5b05aafc854d53bd570533f68a64a87a"},
+    "large_typed_attachment": {"import_rows": 2, "input_bytes": 344096, "sha256": "fe232140e832909c142c8393c1ea5022e765d7ee7188aa015148545161936746"},
+    "json_ten_mib": {"import_rows": 4097, "input_bytes": 10485760, "sha256": "8f1ec4b60db0640c75d70f6019e9586df50de96b532a8292209ed8612757a812", "warmups": 1}
+  },
+  "lanes": [
+    "csv-file-roundtrip",
+    "csv-sparse-file-update",
+    "csv-direct-row-mutation",
+    "json-file-roundtrip",
+    "json-sparse-file-update",
+    "json-ten-mib-paged-roundtrip",
+    "json-direct-row-mutation",
+    "markdown-file-roundtrip",
+    "markdown-sparse-file-update",
+    "markdown-direct-row-mutation",
+    "text-file-roundtrip",
+    "text-sparse-file-update",
+    "text-direct-row-mutation",
+    "text-large-typed-attachment-roundtrip",
+    "excalidraw-file-roundtrip",
+    "excalidraw-sparse-file-update",
+    "excalidraw-direct-row-mutation",
+    "markdown-same-row-text-merge",
+    "csv-same-row-column-merge"
+  ],
+  "workload_contract": {
+    "roundtrip": ["parse_or_import", "serialize_or_export"],
+    "sparse_update": ["incremental_update", "serialize_or_export"],
+    "row_mutation": ["row_create", "read_generated_identity", "serialize_after_create", "row_update", "serialize_after_update", "row_delete", "serialize_after_delete"],
+    "json_scalar_row_mutation": ["row_update", "serialize_after_update"],
+    "merge": ["commit_a", "commit_b", "serialize_or_export"]
+  },
+  "lane_contracts": {
+    "csv-file-roundtrip": "roundtrip",
+    "csv-sparse-file-update": "sparse_update",
+    "csv-direct-row-mutation": "row_mutation",
+    "json-file-roundtrip": "roundtrip",
+    "json-sparse-file-update": "sparse_update",
+    "json-ten-mib-paged-roundtrip": "roundtrip",
+    "json-direct-row-mutation": "json_scalar_row_mutation",
+    "markdown-file-roundtrip": "roundtrip",
+    "markdown-sparse-file-update": "sparse_update",
+    "markdown-direct-row-mutation": "row_mutation",
+    "text-file-roundtrip": "roundtrip",
+    "text-sparse-file-update": "sparse_update",
+    "text-direct-row-mutation": "row_mutation",
+    "text-large-typed-attachment-roundtrip": "roundtrip",
+    "excalidraw-file-roundtrip": "roundtrip",
+    "excalidraw-sparse-file-update": "sparse_update",
+    "excalidraw-direct-row-mutation": "row_mutation",
+    "markdown-same-row-text-merge": "merge",
+    "csv-same-row-column-merge": "merge"
+  }
+}

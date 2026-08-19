@@ -8,15 +8,16 @@ use crate::model::{
 };
 use crate::order_key::OrderKey;
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use lix::plugin::{TypedRow, TypedValue};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
+use uuid::Uuid;
 
-pub(crate) const PARSED_ROOT_ID: &str = "parsed-markdown-root";
+pub(crate) const PARSED_ROOT_ID: Uuid = Uuid::nil();
 pub const NODE_SCHEMA_KEY: &str = crate::schemas::NODE_SCHEMA_KEY;
 const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
 const LEXICAL_SOURCE_REQUIRED_FIELD: &str = "lexical_source_required";
@@ -33,19 +34,19 @@ pub struct File {
     pub content: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowState {
-    pub row_pk: Vec<String>,
-    pub schema_key: String,
-    pub snapshot_content: String,
+    pub row_pk: Vec<Uuid>,
+    pub schema_key: Arc<str>,
+    pub row: TypedRow,
     pub metadata: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DetectedChange {
-    pub row_pk: Vec<String>,
-    pub schema_key: String,
-    pub snapshot_content: Option<String>,
+    pub row_pk: Vec<Uuid>,
+    pub schema_key: Arc<str>,
+    pub row: Option<TypedRow>,
     pub metadata: Option<String>,
 }
 
@@ -69,9 +70,7 @@ impl IdNamespace {
 
     /// Reconstructs the core's compact namespace from one canonical ID minted
     /// by the opaque public API namespace.
-    pub fn from_generated_id(id: &str) -> Result<Self, String> {
-        let decoded = uuid::Uuid::parse_str(id)
-            .map_err(|_| "plugin API generated an invalid Markdown identity".to_owned())?;
+    pub fn from_generated_id(decoded: Uuid) -> Result<Self, String> {
         let high = u64::from_be_bytes(
             decoded.as_bytes()[..8]
                 .try_into()
@@ -104,7 +103,7 @@ impl IdAllocator {
         }
     }
 
-    fn next(&mut self) -> String {
+    fn next(&mut self) -> Uuid {
         let ordinal = u32::try_from(self.ordinal)
             .expect("one Markdown transition cannot allocate more than u32::MAX nodes");
         let mut bytes = [0_u8; 16];
@@ -115,7 +114,7 @@ impl IdAllocator {
             .ordinal
             .checked_add(1)
             .expect("Markdown allocation counter overflowed");
-        uuid::Uuid::from_bytes(bytes).to_string()
+        Uuid::from_bytes(bytes)
     }
 }
 
@@ -277,7 +276,7 @@ fn reconcile_markdown_tree(
         collect_subtrees(before_root, &old_hashes, &mut global_subtrees);
         let mut new_signature_counts = HashMap::<SubtreeHash, usize>::new();
         collect_signature_counts(&after.root, &new_hashes, &mut new_signature_counts);
-        let mut used_ids = BTreeSet::from([before_root.node.id.clone()]);
+        let mut used_ids = BTreeSet::from([before_root.node.id]);
         let mut has_fresh_subtrees = false;
         reconcile_node(
             before_root,
@@ -317,19 +316,21 @@ fn reconcile_markdown_tree(
         if let Some(parent_id) = &mut node.parent_id
             && let Some(replacement) = replacements.get(parent_id)
         {
-            *parent_id = replacement.clone();
+            *parent_id = *replacement;
         }
         replace_column_ids(&mut node.payload, &replacements);
     });
     Ok(after.root)
 }
 
-fn collect_generated_ids(root: &NodeTree) -> BTreeSet<String> {
-    fn collect_value_ids(value: &serde_json::Value, output: &mut BTreeSet<String>) {
+fn collect_generated_ids(root: &NodeTree) -> BTreeSet<Uuid> {
+    fn collect_value_ids(value: &serde_json::Value, output: &mut BTreeSet<Uuid>) {
         match value {
             serde_json::Value::Object(object) => {
-                if let Some(serde_json::Value::String(id)) = object.get("id") {
-                    output.insert(id.clone());
+                if let Some(serde_json::Value::String(id)) = object.get("id")
+                    && let Ok(id) = Uuid::parse_str(id)
+                {
+                    output.insert(id);
                 }
                 for child in object.values() {
                     collect_value_ids(child, output);
@@ -344,8 +345,8 @@ fn collect_generated_ids(root: &NodeTree) -> BTreeSet<String> {
         }
     }
 
-    fn visit(tree: &NodeTree, output: &mut BTreeSet<String>) {
-        output.insert(tree.node.id.clone());
+    fn visit(tree: &NodeTree, output: &mut BTreeSet<Uuid>) {
+        output.insert(tree.node.id);
         collect_value_ids(&tree.node.payload, output);
         for child in &tree.children {
             visit(child, output);
@@ -359,26 +360,27 @@ fn collect_generated_ids(root: &NodeTree) -> BTreeSet<String> {
 
 fn allocate_generated_ids(
     root: &mut NodeTree,
-    generated: &BTreeSet<String>,
+    generated: &BTreeSet<Uuid>,
     allocator: &mut IdAllocator,
-    replacements: &mut BTreeMap<String, String>,
+    replacements: &mut BTreeMap<Uuid, Uuid>,
 ) {
     fn collect_reserved_ids(
         tree: &NodeTree,
-        generated: &BTreeSet<String>,
-        reserved: &mut BTreeSet<String>,
+        generated: &BTreeSet<Uuid>,
+        reserved: &mut BTreeSet<Uuid>,
     ) {
         fn collect_value(
             value: &serde_json::Value,
-            generated: &BTreeSet<String>,
-            reserved: &mut BTreeSet<String>,
+            generated: &BTreeSet<Uuid>,
+            reserved: &mut BTreeSet<Uuid>,
         ) {
             match value {
                 serde_json::Value::Object(object) => {
                     if let Some(serde_json::Value::String(id)) = object.get("id")
-                        && !generated.contains(id)
+                        && let Ok(id) = Uuid::parse_str(id)
+                        && !generated.contains(&id)
                     {
-                        reserved.insert(id.clone());
+                        reserved.insert(id);
                     }
                     for child in object.values() {
                         collect_value(child, generated, reserved);
@@ -394,7 +396,7 @@ fn allocate_generated_ids(
         }
 
         if !generated.contains(&tree.node.id) {
-            reserved.insert(tree.node.id.clone());
+            reserved.insert(tree.node.id);
         }
         collect_value(&tree.node.payload, generated, reserved);
         for child in &tree.children {
@@ -404,18 +406,19 @@ fn allocate_generated_ids(
 
     fn allocate_value_ids(
         value: &mut serde_json::Value,
-        generated: &BTreeSet<String>,
-        replacements: &BTreeMap<String, String>,
+        generated: &BTreeSet<Uuid>,
+        replacements: &BTreeMap<Uuid, Uuid>,
     ) {
         match value {
             serde_json::Value::Object(object) => {
                 if let Some(serde_json::Value::String(id)) = object.get_mut("id")
-                    && generated.contains(id)
+                    && let Ok(parsed) = Uuid::parse_str(id)
+                    && generated.contains(&parsed)
                 {
                     *id = replacements
-                        .get(id)
+                        .get(&parsed)
                         .expect("every generated Markdown ID must have a replacement")
-                        .clone();
+                        .to_string();
                 }
                 for child in object.values_mut() {
                     allocate_value_ids(child, generated, replacements);
@@ -430,16 +433,11 @@ fn allocate_generated_ids(
         }
     }
 
-    fn visit(
-        tree: &mut NodeTree,
-        generated: &BTreeSet<String>,
-        replacements: &BTreeMap<String, String>,
-    ) {
+    fn visit(tree: &mut NodeTree, generated: &BTreeSet<Uuid>, replacements: &BTreeMap<Uuid, Uuid>) {
         if generated.contains(&tree.node.id) {
-            tree.node.id = replacements
+            tree.node.id = *replacements
                 .get(&tree.node.id)
-                .expect("every generated Markdown node ID must have a replacement")
-                .clone();
+                .expect("every generated Markdown node ID must have a replacement");
         }
         allocate_value_ids(&mut tree.node.payload, generated, replacements);
         for child in &mut tree.children {
@@ -455,11 +453,11 @@ fn allocate_generated_ids(
         }
         let replacement = loop {
             let candidate = allocator.next();
-            if reserved.insert(candidate.clone()) {
+            if reserved.insert(candidate) {
                 break candidate;
             }
         };
-        replacements.insert(generated_id.clone(), replacement);
+        replacements.insert(*generated_id, replacement);
     }
     visit(root, generated, replacements);
 }
@@ -467,21 +465,21 @@ fn allocate_generated_ids(
 fn reconcile_node(
     old: &NodeTree,
     new: &mut NodeTree,
-    parent_id: Option<&str>,
-    replacements: &mut BTreeMap<String, String>,
+    parent_id: Option<&Uuid>,
+    replacements: &mut BTreeMap<Uuid, Uuid>,
     global_subtrees: &HashMap<SubtreeHash, Vec<&NodeTree>>,
     new_signature_counts: &HashMap<SubtreeHash, usize>,
     old_hashes: &SubtreeHashes,
     new_hashes: &SubtreeHashes,
-    used_ids: &mut BTreeSet<String>,
+    used_ids: &mut BTreeSet<Uuid>,
     has_fresh_subtrees: &mut bool,
 ) -> Result<(), PluginError> {
-    let generated_id = new.node.id.clone();
-    new.node.id.clone_from(&old.node.id);
+    let generated_id = new.node.id;
+    new.node.id = old.node.id;
     if generated_id != new.node.id {
-        replacements.insert(generated_id, new.node.id.clone());
+        replacements.insert(generated_id, new.node.id);
     }
-    new.node.parent_id = parent_id.map(str::to_string);
+    new.node.parent_id = parent_id.copied();
     new.node.order_key.clone_from(&old.node.order_key);
     reconcile_inline_payload(old, new)?;
     reconcile_children(
@@ -500,12 +498,12 @@ fn reconcile_node(
 fn reconcile_children(
     old: &NodeTree,
     new: &mut NodeTree,
-    replacements: &mut BTreeMap<String, String>,
+    replacements: &mut BTreeMap<Uuid, Uuid>,
     global_subtrees: &HashMap<SubtreeHash, Vec<&NodeTree>>,
     new_signature_counts: &HashMap<SubtreeHash, usize>,
     old_hashes: &SubtreeHashes,
     new_hashes: &SubtreeHashes,
-    used_ids: &mut BTreeSet<String>,
+    used_ids: &mut BTreeSet<Uuid>,
     has_fresh_subtrees: &mut bool,
 ) -> Result<(), PluginError> {
     let mut old_for_new = vec![None; new.children.len()];
@@ -524,7 +522,7 @@ fn reconcile_children(
         {
             old_for_new[index] = Some(index);
             old_used[index] = true;
-            used_ids.insert(old.children[index].node.id.clone());
+            used_ids.insert(old.children[index].node.id);
         }
     }
     let mut exact = HashMap::<String, Vec<usize>>::new();
@@ -549,7 +547,7 @@ fn reconcile_children(
             if !old_used[old_index] {
                 old_for_new[new_index] = Some(old_index);
                 old_used[old_index] = true;
-                used_ids.insert(old.children[old_index].node.id.clone());
+                used_ids.insert(old.children[old_index].node.id);
                 break;
             }
         }
@@ -580,12 +578,12 @@ fn reconcile_children(
         if let Some(old_index) = matching {
             old_for_new[new_index] = Some(old_index);
             old_used[old_index] = true;
-            used_ids.insert(old.children[old_index].node.id.clone());
+            used_ids.insert(old.children[old_index].node.id);
             search_start = old_index.saturating_add(1);
         }
     }
 
-    let parent_id = new.node.id.clone();
+    let parent_id = new.node.id;
     for (new_index, child) in new.children.iter_mut().enumerate() {
         if let Some(old_index) = old_for_new[new_index] {
             reconcile_node(
@@ -630,7 +628,7 @@ fn has_available_unique_global_match(
     new_signature_counts: &HashMap<SubtreeHash, usize>,
     old_hashes: &SubtreeHashes,
     new_hashes: &SubtreeHashes,
-    used_ids: &BTreeSet<String>,
+    used_ids: &BTreeSet<Uuid>,
 ) -> bool {
     let signature = new_hashes.get(tree);
     global_subtrees.get(&signature).is_some_and(|candidates| {
@@ -647,7 +645,7 @@ fn match_table_columns(
     new: &NodeTree,
     old_for_new: &mut [Option<usize>],
     old_used: &mut [bool],
-    used_ids: &mut BTreeSet<String>,
+    used_ids: &mut BTreeSet<Uuid>,
 ) {
     let mut old_by_signature = HashMap::<String, Vec<usize>>::new();
     for (index, column) in old.children.iter().enumerate() {
@@ -680,7 +678,7 @@ fn match_table_columns(
         let old_index = old_indices[0];
         old_for_new[new_index] = Some(old_index);
         old_used[old_index] = true;
-        used_ids.insert(old.children[old_index].node.id.clone());
+        used_ids.insert(old.children[old_index].node.id);
     }
 }
 
@@ -696,7 +694,8 @@ fn table_column_signature(table: &NodeTree, column: &NodeTree) -> String {
                 .payload
                 .get("column_id")
                 .and_then(serde_json::Value::as_str)
-                == Some(column.node.id.as_str())
+                .and_then(|id| Uuid::parse_str(id).ok())
+                == Some(column.node.id)
         });
         cells.push(cell.map(NodeTree::subtree_signature));
     }
@@ -748,8 +747,8 @@ fn adopt_unique_global_moves(
     new_signature_counts: &HashMap<SubtreeHash, usize>,
     old_hashes: &SubtreeHashes,
     new_hashes: &SubtreeHashes,
-    used_ids: &mut BTreeSet<String>,
-    replacements: &mut BTreeMap<String, String>,
+    used_ids: &mut BTreeSet<Uuid>,
+    replacements: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<(), PluginError> {
     for child in &mut tree.children {
         let signature = new_hashes.get(child);
@@ -779,7 +778,7 @@ fn adopt_unique_global_moves(
     Ok(())
 }
 
-fn subtree_ids_are_available(tree: &NodeTree, used_ids: &BTreeSet<String>) -> bool {
+fn subtree_ids_are_available(tree: &NodeTree, used_ids: &BTreeSet<Uuid>) -> bool {
     !used_ids.contains(&tree.node.id)
         && tree
             .children
@@ -790,18 +789,18 @@ fn subtree_ids_are_available(tree: &NodeTree, used_ids: &BTreeSet<String>) -> bo
 fn adopt_exact_subtree(
     old: &NodeTree,
     new: &mut NodeTree,
-    used_ids: &mut BTreeSet<String>,
-    replacements: &mut BTreeMap<String, String>,
+    used_ids: &mut BTreeSet<Uuid>,
+    replacements: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<(), PluginError> {
-    let generated_id = new.node.id.clone();
-    let parent_id = new.node.parent_id.clone();
+    let generated_id = new.node.id;
+    let parent_id = new.node.parent_id;
     let order_key = new.node.order_key.clone();
-    new.node.id.clone_from(&old.node.id);
+    new.node.id = old.node.id;
     new.node.parent_id = parent_id;
     new.node.order_key = order_key;
-    used_ids.insert(new.node.id.clone());
+    used_ids.insert(new.node.id);
     if generated_id != new.node.id {
-        replacements.insert(generated_id, new.node.id.clone());
+        replacements.insert(generated_id, new.node.id);
     }
     reconcile_inline_payload(old, new)?;
 
@@ -810,7 +809,7 @@ fn adopt_exact_subtree(
             "equal Markdown subtree signatures had different child counts".to_string(),
         ));
     }
-    let parent_id = new.node.id.clone();
+    let parent_id = new.node.id;
     for (old_child, new_child) in old.children.iter().zip(&mut new.children) {
         adopt_exact_subtree_child(old_child, new_child, &parent_id, used_ids, replacements)?;
     }
@@ -820,17 +819,17 @@ fn adopt_exact_subtree(
 fn adopt_exact_subtree_child(
     old: &NodeTree,
     new: &mut NodeTree,
-    parent_id: &str,
-    used_ids: &mut BTreeSet<String>,
-    replacements: &mut BTreeMap<String, String>,
+    parent_id: &Uuid,
+    used_ids: &mut BTreeSet<Uuid>,
+    replacements: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<(), PluginError> {
-    let generated_id = new.node.id.clone();
-    new.node.id.clone_from(&old.node.id);
-    new.node.parent_id = Some(parent_id.to_string());
+    let generated_id = new.node.id;
+    new.node.id = old.node.id;
+    new.node.parent_id = Some(*parent_id);
     new.node.order_key.clone_from(&old.node.order_key);
-    used_ids.insert(new.node.id.clone());
+    used_ids.insert(new.node.id);
     if generated_id != new.node.id {
-        replacements.insert(generated_id, new.node.id.clone());
+        replacements.insert(generated_id, new.node.id);
     }
     reconcile_inline_payload(old, new)?;
     if old.children.len() != new.children.len() {
@@ -838,7 +837,7 @@ fn adopt_exact_subtree_child(
             "equal Markdown subtree signatures had different child counts".to_string(),
         ));
     }
-    let parent_id = new.node.id.clone();
+    let parent_id = new.node.id;
     for (old_child, new_child) in old.children.iter().zip(&mut new.children) {
         adopt_exact_subtree_child(old_child, new_child, &parent_id, used_ids, replacements)?;
     }
@@ -858,12 +857,12 @@ fn collect_signature_counts(
     }
 }
 
-fn initialize_subtree(tree: &mut NodeTree, parent_id: Option<&str>) -> Result<(), PluginError> {
-    tree.node.parent_id = parent_id.map(str::to_string);
+fn initialize_subtree(tree: &mut NodeTree, parent_id: Option<&Uuid>) -> Result<(), PluginError> {
+    tree.node.parent_id = parent_id.copied();
     if tree.node.kind == NodeKind::Document {
         tree.node.order_key = None;
     }
-    let parent_id = tree.node.id.clone();
+    let parent_id = tree.node.id;
     for child in &mut tree.children {
         initialize_subtree(child, Some(&parent_id))?;
     }
@@ -1019,7 +1018,7 @@ fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) {
         if old_inline.signature() == new_inline.signature()
             || old_inline.kind_tag() == new_inline.kind_tag()
         {
-            new_inline.id.clone_from(&old_inline.id);
+            new_inline.id = old_inline.id;
             if let (Some(old_children), Some(new_children)) =
                 (old_inline.children(), new_inline.children_mut())
             {
@@ -1105,7 +1104,7 @@ fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) {
         let Some(old_index) = old_for_new[new_index] else {
             continue;
         };
-        inline.id.clone_from(&old[old_index].id);
+        inline.id = old[old_index].id;
         if let (Some(old_children), Some(new_children)) =
             (old[old_index].children(), inline.children_mut())
         {
@@ -1264,9 +1263,9 @@ fn match_compatible_inlines_in_range(
     }
 }
 
-fn flatten_tree(root: &NodeTree) -> BTreeMap<String, NodeSnapshot> {
-    fn visit(tree: &NodeTree, output: &mut BTreeMap<String, NodeSnapshot>) {
-        output.insert(tree.node.id.clone(), tree.node.clone());
+fn flatten_tree(root: &NodeTree) -> BTreeMap<Uuid, NodeSnapshot> {
+    fn visit(tree: &NodeTree, output: &mut BTreeMap<Uuid, NodeSnapshot>) {
+        output.insert(tree.node.id, tree.node.clone());
         for child in &tree.children {
             visit(child, output);
         }
@@ -1283,11 +1282,11 @@ fn diff_tree(
     let after = ProjectionView::from_tree(after);
     let mut changes = Vec::new();
     for id in before.nodes_by_id.keys().copied() {
-        if !after.nodes_by_id.contains_key(id) {
+        if !after.nodes_by_id.contains_key(&id) {
             changes.push(DetectedChange {
-                row_pk: vec![id.to_owned()],
-                schema_key: NODE_SCHEMA_KEY.to_string(),
-                snapshot_content: None,
+                row_pk: vec![id],
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row: None,
                 metadata: None,
             });
         }
@@ -1296,13 +1295,10 @@ fn diff_tree(
         if before.nodes_by_id.get(id).copied() == Some(*node) {
             continue;
         }
-        let snapshot_content = serde_json::to_string(node).map_err(|error| {
-            PluginError::Internal(format!("failed to serialize Markdown node '{id}': {error}"))
-        })?;
         changes.push(DetectedChange {
-            row_pk: vec![(*id).to_owned()],
-            schema_key: NODE_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content),
+            row_pk: vec![*id],
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row: Some(node_to_typed_row(node)?),
             metadata: change_metadata(before.nodes_by_id.get(id).copied(), node),
         });
     }
@@ -1324,7 +1320,7 @@ fn change_metadata(before: Option<&NodeSnapshot>, after: &NodeSnapshot) -> Optio
     }
 }
 
-fn single_row_pk(mut row_pk: Vec<String>) -> Result<String, PluginError> {
+fn single_row_pk(mut row_pk: Vec<Uuid>) -> Result<Uuid, PluginError> {
     if row_pk.len() != 1 {
         return Err(PluginError::InvalidInput(format!(
             "expected single-component row_pk, got {} components",
@@ -1338,23 +1334,18 @@ impl Projection {
     fn from_row_state(rows: impl Iterator<Item = RowState>) -> Result<Self, PluginError> {
         let mut nodes_by_id = BTreeMap::new();
         for row in rows {
-            if row.schema_key != NODE_SCHEMA_KEY {
+            if row.schema_key.as_ref() != NODE_SCHEMA_KEY {
                 continue;
             }
             let row_pk = single_row_pk(row.row_pk)?;
-            let node: NodeSnapshot =
-                serde_json::from_str(&row.snapshot_content).map_err(|error| {
-                    PluginError::InvalidInput(format!(
-                        "invalid Markdown node snapshot for row_pk '{row_pk}': {error}"
-                    ))
-                })?;
+            let node = node_from_typed_row(&row.row)?;
             if node.id != row_pk {
                 return Err(PluginError::InvalidInput(format!(
                     "Markdown node snapshot id '{}' does not match row_pk '{row_pk}'",
                     node.id
                 )));
             }
-            if nodes_by_id.insert(row_pk.clone(), node).is_some() {
+            if nodes_by_id.insert(row_pk, node).is_some() {
                 return Err(PluginError::InvalidInput(format!(
                     "duplicate Markdown node row_pk '{row_pk}'"
                 )));
@@ -1381,7 +1372,7 @@ impl Projection {
                     .to_string(),
             ));
         }
-        let mut children_by_parent = BTreeMap::<String, Vec<&NodeSnapshot>>::new();
+        let mut children_by_parent = BTreeMap::<Uuid, Vec<&NodeSnapshot>>::new();
         for node in self.nodes_by_id.values() {
             if node.id == root.id {
                 continue;
@@ -1410,10 +1401,7 @@ impl Projection {
                     node.id
                 )));
             }
-            children_by_parent
-                .entry(parent.clone())
-                .or_default()
-                .push(node);
+            children_by_parent.entry(*parent).or_default().push(node);
         }
         for children in children_by_parent.values_mut() {
             children.sort_by(|left, right| {
@@ -1450,7 +1438,7 @@ impl Projection {
 /// transition.
 #[derive(Default)]
 struct ProjectionView<'a> {
-    nodes_by_id: BTreeMap<&'a str, &'a NodeSnapshot>,
+    nodes_by_id: BTreeMap<Uuid, &'a NodeSnapshot>,
 }
 
 impl<'a> ProjectionView<'a> {
@@ -1459,14 +1447,14 @@ impl<'a> ProjectionView<'a> {
             nodes_by_id: projection
                 .nodes_by_id
                 .values()
-                .map(|node| (node.id.as_str(), node))
+                .map(|node| (node.id, node))
                 .collect(),
         }
     }
 
     fn from_tree(root: &'a NodeTree) -> Self {
-        fn visit<'a>(tree: &'a NodeTree, output: &mut BTreeMap<&'a str, &'a NodeSnapshot>) {
-            output.insert(tree.node.id.as_str(), &tree.node);
+        fn visit<'a>(tree: &'a NodeTree, output: &mut BTreeMap<Uuid, &'a NodeSnapshot>) {
+            output.insert(tree.node.id, &tree.node);
             for child in &tree.children {
                 visit(child, output);
             }
@@ -1480,11 +1468,11 @@ impl<'a> ProjectionView<'a> {
 
 fn build_tree(
     node: &NodeSnapshot,
-    children_by_parent: &BTreeMap<String, Vec<&NodeSnapshot>>,
-    visiting: &mut BTreeSet<String>,
-    visited: &mut BTreeSet<String>,
+    children_by_parent: &BTreeMap<Uuid, Vec<&NodeSnapshot>>,
+    visiting: &mut BTreeSet<Uuid>,
+    visited: &mut BTreeSet<Uuid>,
 ) -> Result<NodeTree, PluginError> {
-    if !visiting.insert(node.id.clone()) {
+    if !visiting.insert(node.id) {
         return Err(PluginError::InvalidInput(format!(
             "Markdown graph contains a cycle at node '{}'",
             node.id
@@ -1497,7 +1485,7 @@ fn build_tree(
         .map(|child| build_tree(child, children_by_parent, visiting, visited))
         .collect::<Result<Vec<_>, _>>()?;
     visiting.remove(&node.id);
-    visited.insert(node.id.clone());
+    visited.insert(node.id);
     Ok(NodeTree {
         node: node.clone(),
         children,
@@ -1510,18 +1498,18 @@ pub enum ChangeEffect {
     FormatOnly,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowRecord {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Vec<u8>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<Uuid>,
+    pub row: TypedRow,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowChange {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Option<Vec<u8>>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<Uuid>,
+    pub row: Option<TypedRow>,
     pub effect: ChangeEffect,
 }
 
@@ -1806,77 +1794,88 @@ fn push_byte_piece(output: &mut Vec<BytePiece>, piece: BytePiece) {
     output.push(piece);
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct WireNodeSnapshot {
-    format_json: String,
-    id: String,
-    kind: NodeKind,
-    order_key: Option<String>,
-    parent_id: Option<String>,
-    payload_json: String,
+fn node_to_typed_row(node: &NodeSnapshot) -> Result<TypedRow, PluginError> {
+    let mut row = TypedRow::new();
+    row.insert(
+        "format_json".to_owned(),
+        TypedValue::Jsonb(node.format.clone().into()),
+    );
+    row.insert("id".to_owned(), TypedValue::Uuid(node.id));
+    row.insert(
+        "kind".to_owned(),
+        TypedValue::Text(
+            serde_json::to_value(node.kind)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .ok_or_else(|| PluginError::Internal("encode Markdown node kind".to_owned()))?,
+        ),
+    );
+    row.insert(
+        "order_key".to_owned(),
+        node.order_key
+            .clone()
+            .map(TypedValue::Text)
+            .unwrap_or(TypedValue::Null),
+    );
+    row.insert(
+        "parent_id".to_owned(),
+        node.parent_id
+            .map(TypedValue::Uuid)
+            .unwrap_or(TypedValue::Null),
+    );
+    row.insert(
+        "payload_json".to_owned(),
+        TypedValue::Jsonb(node.payload.clone().into()),
+    );
+    Ok(row)
 }
 
-impl WireNodeSnapshot {
-    fn from_logical(node: &NodeSnapshot) -> Result<Self, PluginError> {
-        let payload_json = serde_json::to_string(&node.payload).map_err(|error| {
-            PluginError::Internal(format!("failed to encode Markdown node payload: {error}"))
-        })?;
-        let format_json = serde_json::to_string(&node.format).map_err(|error| {
-            PluginError::Internal(format!("failed to encode Markdown node format: {error}"))
-        })?;
-        Ok(Self {
-            format_json,
-            id: node.id.clone(),
-            kind: node.kind.clone(),
-            order_key: node.order_key.clone(),
-            parent_id: node.parent_id.clone(),
-            payload_json,
-        })
-    }
-
-    fn into_logical(self) -> Result<NodeSnapshot, PluginError> {
-        let payload: serde_json::Value =
-            serde_json::from_str(&self.payload_json).map_err(|error| {
-                PluginError::InvalidInput(format!(
-                    "Markdown node payload_json is not valid JSON: {error}"
-                ))
-            })?;
-        let format: serde_json::Value =
-            serde_json::from_str(&self.format_json).map_err(|error| {
-                PluginError::InvalidInput(format!(
-                    "Markdown node format_json is not valid JSON: {error}"
-                ))
-            })?;
-        if !payload.is_object() || !format.is_object() {
+fn node_from_typed_row(row: &TypedRow) -> Result<NodeSnapshot, PluginError> {
+    let uuid = |column: &str| match row.get(column) {
+        Some(TypedValue::Uuid(value)) => Ok(*value),
+        _ => Err(PluginError::InvalidInput(format!(
+            "Markdown node column '{column}' must be UUID"
+        ))),
+    };
+    let optional_uuid = |column: &str| match row.get(column) {
+        Some(TypedValue::Null) => Ok(None),
+        Some(TypedValue::Uuid(value)) => Ok(Some(*value)),
+        _ => Err(PluginError::InvalidInput(format!(
+            "Markdown node column '{column}' must be nullable UUID"
+        ))),
+    };
+    let optional_text = |column: &str| match row.get(column) {
+        Some(TypedValue::Null) => Ok(None),
+        Some(TypedValue::Text(value)) => Ok(Some(value.clone())),
+        _ => Err(PluginError::InvalidInput(format!(
+            "Markdown node column '{column}' must be nullable text"
+        ))),
+    };
+    let json_object = |column: &str| match row.get(column) {
+        Some(TypedValue::Jsonb(value)) if value.is_object() => Ok(value.as_value().clone()),
+        _ => Err(PluginError::InvalidInput(format!(
+            "Markdown node column '{column}' must be a JSONB object"
+        ))),
+    };
+    let kind = match row.get("kind") {
+        Some(TypedValue::Text(value)) => {
+            serde_json::from_value(serde_json::Value::String(value.clone())).map_err(|_| {
+                PluginError::InvalidInput(format!("unknown Markdown node kind '{value}'"))
+            })?
+        }
+        _ => {
             return Err(PluginError::InvalidInput(
-                "Markdown payload_json and format_json must encode JSON objects".to_owned(),
+                "Markdown node column 'kind' must be text".to_owned(),
             ));
         }
-        Ok(NodeSnapshot {
-            id: self.id,
-            kind: self.kind,
-            parent_id: self.parent_id,
-            order_key: self.order_key,
-            payload,
-            format,
-        })
-    }
-}
-
-fn logical_to_wire(snapshot: &str) -> Result<Vec<u8>, PluginError> {
-    let logical: NodeSnapshot = serde_json::from_str(snapshot).map_err(|error| {
-        PluginError::Internal(format!(
-            "generated Markdown snapshot is not valid JSON: {error}"
-        ))
-    })?;
-    logical_node_to_wire(&logical)
-}
-
-fn logical_node_to_wire(logical: &NodeSnapshot) -> Result<Vec<u8>, PluginError> {
-    let wire = WireNodeSnapshot::from_logical(logical)?;
-    serde_json::to_vec(&wire).map_err(|error| {
-        PluginError::Internal(format!("failed to encode Markdown wire snapshot: {error}"))
+    };
+    Ok(NodeSnapshot {
+        id: uuid("id")?,
+        kind,
+        parent_id: optional_uuid("parent_id")?,
+        order_key: optional_text("order_key")?,
+        payload: json_object("payload_json")?,
+        format: json_object("format_json")?,
     })
 }
 
@@ -1886,24 +1885,13 @@ fn fresh_tree_to_row_changes(root: &NodeTree) -> Result<Vec<RowChange>, PluginEr
         .into_iter()
         .map(|(id, node)| {
             Ok(RowChange {
-                schema_key: NODE_SCHEMA_KEY.to_owned(),
-                row_pk: vec![id.to_owned()],
-                snapshot: Some(logical_node_to_wire(node)?),
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![id],
+                row: Some(node_to_typed_row(node)?),
                 effect: ChangeEffect::Content,
             })
         })
         .collect()
-}
-
-fn wire_to_logical(snapshot: &[u8]) -> Result<String, PluginError> {
-    let wire: WireNodeSnapshot = serde_json::from_slice(snapshot).map_err(|error| {
-        PluginError::InvalidInput(format!("invalid Markdown wire snapshot: {error}"))
-    })?;
-    serde_json::to_string(&wire.into_logical()?).map_err(|error| {
-        PluginError::Internal(format!(
-            "failed to encode logical Markdown snapshot: {error}"
-        ))
-    })
 }
 
 fn detected_to_row_change(change: DetectedChange) -> Result<RowChange, PluginError> {
@@ -1915,17 +1903,13 @@ fn detected_to_row_change(change: DetectedChange) -> Result<RowChange, PluginErr
     Ok(RowChange {
         schema_key: change.schema_key,
         row_pk: change.row_pk,
-        snapshot: change
-            .snapshot_content
-            .as_deref()
-            .map(logical_to_wire)
-            .transpose()?,
+        row: change.row,
         effect,
     })
 }
 
 fn row_change_to_detected(change: RowChange) -> Result<DetectedChange, PluginError> {
-    if change.schema_key != NODE_SCHEMA_KEY {
+    if change.schema_key.as_ref() != NODE_SCHEMA_KEY {
         return Err(PluginError::InvalidInput(format!(
             "Markdown transition received foreign schema '{}'",
             change.schema_key
@@ -1934,11 +1918,7 @@ fn row_change_to_detected(change: RowChange) -> Result<DetectedChange, PluginErr
     Ok(DetectedChange {
         schema_key: change.schema_key,
         row_pk: change.row_pk,
-        snapshot_content: change
-            .snapshot
-            .as_deref()
-            .map(wire_to_logical)
-            .transpose()?,
+        row: change.row,
         metadata: (change.effect == ChangeEffect::FormatOnly)
             .then(|| r#"{"impact":"format"}"#.to_owned()),
     })
@@ -2022,13 +2002,15 @@ fn projection_after_detected_changes(
         let id = change.row_pk.first().ok_or_else(|| {
             PluginError::InvalidInput("Markdown row_pk must contain one id".into())
         })?;
-        if let Some(snapshot_content) = &change.snapshot_content {
-            let node: NodeSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
-                PluginError::InvalidInput(format!(
-                    "invalid Markdown node snapshot for '{id}': {error}"
-                ))
-            })?;
-            nodes_by_id.insert(id.clone(), node);
+        if let Some(row) = &change.row {
+            let node = node_from_typed_row(row)?;
+            if node.id != *id {
+                return Err(PluginError::InvalidInput(format!(
+                    "Markdown node id '{}' does not match row_pk '{id}'",
+                    node.id
+                )));
+            }
+            nodes_by_id.insert(*id, node);
         } else {
             nodes_by_id.remove(id);
         }
@@ -2046,17 +2028,25 @@ impl Document {
     /// can safely retain both edits instead. Everything structural, formatted,
     /// deleted, malformed, or overlapping deliberately takes the b
     /// snapshot unchanged.
-    pub fn resolve_row_conflict(
-        base: Option<Vec<u8>>,
-        a: Option<Vec<u8>>,
-        b: Option<Vec<u8>>,
-    ) -> Option<Vec<u8>> {
-        let b = b?;
-        let (Some(base), Some(a)) = (base, a) else {
-            return Some(b);
-        };
-
-        Some(merge_plain_paragraph_snapshots(&base, &a, &b).unwrap_or(b))
+    /// JSONB payload and format values stay native throughout the merge; only
+    /// the Markdown inline-text algorithm examines their object structure.
+    pub(crate) fn resolve_typed_row_payload(
+        base: &TypedRow,
+        a: &TypedRow,
+        b: &TypedRow,
+    ) -> Option<serde_json::Value> {
+        let b_node = node_from_typed_row(b).ok()?;
+        if base == a {
+            return Some(b_node.payload);
+        }
+        if b == base {
+            return Some(node_from_typed_row(a).ok()?.payload);
+        }
+        let base = node_from_typed_row(base).ok()?;
+        let a = node_from_typed_row(a).ok()?;
+        let merged =
+            merge_plain_paragraph_nodes(&base, &a, &b_node).unwrap_or_else(|| b_node.clone());
+        Some(merged.payload)
     }
 
     pub fn open_file(
@@ -2108,7 +2098,7 @@ impl Document {
         let state = records
             .into_iter()
             .map(|record| {
-                if record.schema_key != NODE_SCHEMA_KEY {
+                if record.schema_key.as_ref() != NODE_SCHEMA_KEY {
                     return Err(PluginError::InvalidInput(format!(
                         "Markdown import received foreign schema '{}'",
                         record.schema_key
@@ -2117,7 +2107,7 @@ impl Document {
                 Ok(RowState {
                     row_pk: record.row_pk,
                     schema_key: record.schema_key,
-                    snapshot_content: wire_to_logical(&record.snapshot)?,
+                    row: record.row,
                     metadata: None,
                 })
             })
@@ -2436,7 +2426,7 @@ impl Document {
         let [change] = changes else {
             return Ok(None);
         };
-        let Some(snapshot_content) = &change.snapshot_content else {
+        let Some(row) = &change.row else {
             return Ok(None);
         };
         if self
@@ -2453,7 +2443,7 @@ impl Document {
             .base
             .children
             .iter()
-            .position(|child| change.row_pk == [child.node.id.clone()])
+            .position(|child| change.row_pk == [child.node.id])
         else {
             return Ok(None);
         };
@@ -2467,11 +2457,7 @@ impl Document {
         if range.end > self.bytes.len {
             return Ok(None);
         }
-        let new: NodeSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
-            PluginError::InvalidInput(format!(
-                "invalid Markdown paragraph snapshot for incremental rendering: {error}"
-            ))
-        })?;
+        let new = node_from_typed_row(row)?;
         if old.kind != NodeKind::Paragraph
             || new.kind != NodeKind::Paragraph
             || new.id != old.id
@@ -2599,29 +2585,23 @@ impl Document {
             .clone();
         let mut new = replacement.root.children.remove(0);
         let generated_ids = collect_generated_ids(&new);
-        let generated_node_id = new.node.id.clone();
-        new.node.id.clone_from(&old.node.id);
-        new.node.parent_id.clone_from(&old.node.parent_id);
+        let generated_node_id = new.node.id;
+        new.node.id = old.node.id;
+        new.node.parent_id = old.node.parent_id;
         new.node.order_key.clone_from(&old.node.order_key);
         reconcile_inline_payload(&old, &mut new)?;
 
-        let mut replacements = BTreeMap::from([(generated_node_id, new.node.id.clone())]);
+        let mut replacements = BTreeMap::from([(generated_node_id, new.node.id)]);
         let mut allocator = IdAllocator::new(namespace);
         allocate_generated_ids(&mut new, &generated_ids, &mut allocator, &mut replacements);
         replace_column_ids(&mut new.node.payload, &replacements);
         let detected = if old.node == new.node {
             Vec::new()
         } else {
-            let snapshot_content = serde_json::to_string(&new.node).map_err(|error| {
-                PluginError::Internal(format!(
-                    "failed to serialize Markdown node '{}': {error}",
-                    new.node.id
-                ))
-            })?;
             vec![DetectedChange {
-                row_pk: vec![new.node.id.clone()],
-                schema_key: NODE_SCHEMA_KEY.to_owned(),
-                snapshot_content: Some(snapshot_content),
+                row_pk: vec![new.node.id],
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row: Some(node_to_typed_row(&new.node)?),
                 metadata: change_metadata(Some(&old.node), &new.node),
             }]
         };
@@ -2789,36 +2769,19 @@ struct TextReplacement {
     insert: Vec<char>,
 }
 
-fn merge_plain_paragraph_snapshots(
-    base_snapshot: &[u8],
-    a_snapshot: &[u8],
-    b_snapshot: &[u8],
-) -> Option<Vec<u8>> {
-    let base = node_from_wire_snapshot(base_snapshot)?;
-    let a = node_from_wire_snapshot(a_snapshot)?;
-    let b = node_from_wire_snapshot(b_snapshot)?;
-
-    if !same_plain_paragraph_shape(&base, &a) || !same_plain_paragraph_shape(&base, &b) {
+fn merge_plain_paragraph_nodes(
+    base: &NodeSnapshot,
+    a: &NodeSnapshot,
+    b: &NodeSnapshot,
+) -> Option<NodeSnapshot> {
+    if !same_plain_paragraph_shape(base, a) || !same_plain_paragraph_shape(base, b) {
         return None;
     }
-
-    let base_text = single_text_value(&base)?;
-    let a_text = single_text_value(&a)?;
-    let b_text = single_text_value(&b)?;
+    let base_text = single_text_value(base)?;
+    let a_text = single_text_value(a)?;
+    let b_text = single_text_value(b)?;
     let merged = merge_disjoint_text_replacements(&base_text, &a_text, &b_text)?;
-
-    let merged_node = replace_single_text(b, merged)?;
-    node_to_wire_snapshot(&merged_node)
-}
-
-fn node_from_wire_snapshot(snapshot: &[u8]) -> Option<NodeSnapshot> {
-    let logical = wire_to_logical(snapshot).ok()?;
-    serde_json::from_str(&logical).ok()
-}
-
-fn node_to_wire_snapshot(node: &NodeSnapshot) -> Option<Vec<u8>> {
-    let logical = serde_json::to_string(node).ok()?;
-    logical_to_wire(&logical).ok()
+    replace_single_text(b.clone(), merged)
 }
 
 fn same_plain_paragraph_shape(base: &NodeSnapshot, side: &NodeSnapshot) -> bool {
@@ -2948,6 +2911,64 @@ fn chars_to_string(base: &[char], edits: &[TextReplacement]) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn paragraph_node(source: &str) -> NodeSnapshot {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("merge.md"),
+            IdNamespace::from_halves(3, 5),
+        )
+        .expect("parse Markdown paragraph");
+        document
+            .tree
+            .materialize()
+            .children
+            .into_iter()
+            .find(|child| child.node.kind == NodeKind::Paragraph)
+            .expect("paragraph node")
+            .node
+    }
+
+    #[test]
+    fn typed_node_rows_keep_json_columns_native() {
+        let node = paragraph_node("hello\n");
+        let row = node_to_typed_row(&node).expect("typed Markdown row");
+        assert_eq!(
+            row.get("payload_json"),
+            Some(&TypedValue::Jsonb(node.payload.clone().into()))
+        );
+        assert_eq!(
+            row.get("format_json"),
+            Some(&TypedValue::Jsonb(node.format.clone().into()))
+        );
+        assert_eq!(
+            node_from_typed_row(&row).expect("decode typed Markdown row"),
+            node
+        );
+    }
+
+    #[test]
+    fn typed_row_merge_preserves_disjoint_text_edits() {
+        let base = paragraph_node("hello\n");
+        let mut a = base.clone();
+        let mut b = base.clone();
+        let replace_text = |node: &mut NodeSnapshot, before: &str, after: &str| {
+            let encoded = serde_json::to_string(&node.payload).expect("encode payload");
+            node.payload = serde_json::from_str(&encoded.replacen(before, after, 1))
+                .expect("decode edited payload");
+        };
+        replace_text(&mut a, "hello", "Ahello");
+        replace_text(&mut b, "hello", "helloB");
+        let payload = Document::resolve_typed_row_payload(
+            &node_to_typed_row(&base).expect("base row"),
+            &node_to_typed_row(&a).expect("a row"),
+            &node_to_typed_row(&b).expect("b row"),
+        )
+        .expect("merged payload");
+        let mut merged = b;
+        merged.payload = payload;
+        assert_eq!(single_text_value(&merged).as_deref(), Some("AhelloB"));
+    }
+
     fn semantic_records_without_raw_source(source: Vec<u8>) -> Vec<RowRecord> {
         let (_, mut changes) = Document::open_file(
             source,
@@ -2956,13 +2977,10 @@ mod tests {
         )
         .expect("parse Markdown source");
         for change in &mut changes {
-            let Some(snapshot) = &change.snapshot else {
+            let Some(row) = &mut change.row else {
                 continue;
             };
-            let mut node: NodeSnapshot = serde_json::from_str(
-                &wire_to_logical(snapshot).expect("decode logical Markdown snapshot"),
-            )
-            .expect("logical Markdown snapshot");
+            let mut node = node_from_typed_row(row).expect("typed Markdown row");
             if node.kind != NodeKind::Document {
                 continue;
             }
@@ -2972,18 +2990,15 @@ mod tests {
                 LEXICAL_SOURCE_REQUIRED_FIELD.to_owned(),
                 serde_json::Value::Bool(true),
             );
-            change.snapshot = Some(
-                logical_to_wire(&serde_json::to_string(&node).expect("encode logical snapshot"))
-                    .expect("encode wire Markdown snapshot"),
-            );
+            *row = node_to_typed_row(&node).expect("encode typed Markdown row");
         }
         changes
             .into_iter()
             .filter_map(|change| {
-                change.snapshot.map(|snapshot| RowRecord {
+                change.row.map(|row| RowRecord {
                     schema_key: change.schema_key,
                     row_pk: change.row_pk,
-                    snapshot,
+                    row,
                 })
             })
             .collect()
@@ -3103,16 +3118,13 @@ Another paragraph must survive an unrelated semantic edit.
         let successor_payload = payload.replacen("remaining document", "retained document", 1);
         assert_ne!(successor_payload, payload);
         edited.payload = serde_json::from_str(&successor_payload).expect("edited payload");
-        let edited_id = edited.id.clone();
-        let snapshot = logical_to_wire(
-            &serde_json::to_string(&edited).expect("edited logical Markdown snapshot"),
-        )
-        .expect("edited wire Markdown snapshot");
+        let edited_id = edited.id;
+        let row = node_to_typed_row(&edited).expect("edited typed Markdown row");
         let (successor, _) = reopened
             .rows_changed(vec![RowChange {
-                schema_key: NODE_SCHEMA_KEY.to_owned(),
-                row_pk: vec![edited_id.clone()],
-                snapshot: Some(snapshot),
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![edited_id],
+                row: Some(row),
                 effect: ChangeEffect::Content,
             }])
             .expect("semantic child edit after restore");

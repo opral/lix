@@ -14,6 +14,7 @@ pub(crate) struct CommitGraphChange {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: crate::json_store::JsonSlot,
     pub(crate) metadata: crate::json_store::JsonSlot,
+    pub(crate) typed_payload: Option<Vec<u8>>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
 }

@@ -12,6 +12,10 @@ mod hot;
 pub(crate) use hot::hot_decode_row_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
+#[cfg(test)]
+pub(crate) use hot::WORKING_DIFF_PATH_HITS;
+#[cfg(test)]
+pub(crate) use hot::hot_generation_scope_prefix;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use hot::{
     BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
@@ -21,21 +25,12 @@ pub(crate) use hot::{
     INTERVAL_LOCAL_TOMBSTONE_CANDIDATES, INTERVAL_LOCAL_TOMBSTONE_ELIDED,
     INTERVAL_LOCAL_TOMBSTONE_OFFERED, INTERVAL_LOCAL_TOMBSTONE_ROUTES,
 };
-#[cfg(test)]
-pub(crate) use hot::WORKING_DIFF_PATH_HITS;
-#[cfg(test)]
-pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
-    RootBaseBatchCache,
-    CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE,
-    CERTIFIED_ROW_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef,
-    DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
-    RowColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache,
-    HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
-    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    ROW_SPACE, load_certified_rows_at_commit, materialize_certified_root_rows,
-    scan_certified_history_rows, stage_certified_row_batches, stage_hot_index_entries,
-    stage_retire_hot_generation,
+    COLLECTION_CONTROL_SPACE, DIFF_SPACE, FILE_SPACE, HotIndexEntry, HotIndexValue,
+    HotStateTransactionCache, HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RootBaseBatchCache,
+    RowColumnarOverlayRow, stage_hot_index_entries, stage_retire_hot_generation,
 };
 
 /// Stable physical address of a row in an immutable columnar base.
@@ -62,7 +57,6 @@ use crate::branch::stage_branch_head_control;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::row_pk::RowPk;
 use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
     MaterializedHotStateRow, MaterializedHotStateRowRef,
@@ -70,6 +64,9 @@ use crate::hot_state::{
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
 };
+use crate::plugin::runtime::WasmTypedRow;
+use crate::plugin::wire::typed as typed_wire;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageSpace,
@@ -274,6 +271,7 @@ impl HeadValue {
             updated_at: self.updated_at,
             snapshot: self.snapshot.as_ref_slot(),
             metadata: self.metadata.as_ref_slot(),
+            typed_snapshot: None,
             columnar_base_coordinate: self.columnar_base_coordinate,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         }
@@ -290,6 +288,7 @@ struct HeadValueRef<'a> {
     updated_at: LixTimestamp,
     snapshot: JsonSlotRef<'a>,
     metadata: JsonSlotRef<'a>,
+    typed_snapshot: Option<&'a WasmTypedRow>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
@@ -341,6 +340,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
             updated_at: self.updated_at,
             snapshot: self.snapshot,
             metadata: self.metadata,
+            typed_snapshot: None,
             columnar_base_coordinate: None,
         }
     }
@@ -365,6 +365,7 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) snapshot: JsonSlotRef<'a>,
     pub(crate) metadata: JsonSlotRef<'a>,
+    pub(crate) typed_snapshot: Option<&'a WasmTypedRow>,
     pub(crate) columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
@@ -442,6 +443,7 @@ impl<'a> CurrentStateDeltaRef<'a> {
             } else {
                 self.metadata
             },
+            typed_snapshot: self.typed_snapshot,
             columnar_base_coordinate: self.columnar_base_coordinate,
             working_diff_baseline,
         }
@@ -585,7 +587,6 @@ where
             generation,
             deltas,
             absence_guards,
-            None,
             None,
             None,
             &mut coverage,
@@ -1000,15 +1001,12 @@ fn read_row_pk(bytes: &[u8], offset: &mut usize) -> Result<RowPk, LixError> {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
             _ => {
-                return Err(key_codec_error(
-                    "row primary key has an invalid terminator",
-                ));
+                return Err(key_codec_error("row primary key has an invalid terminator"));
             }
         }
     }
-    RowPk::from_components(components).map_err(|error| {
-        key_codec_error(&format!("contains an invalid row primary key: {error}"))
-    })
+    RowPk::from_components(components)
+        .map_err(|error| key_codec_error(&format!("contains an invalid row primary key: {error}")))
 }
 
 fn read_row_pk_part(
@@ -1054,10 +1052,7 @@ fn read_row_pk_part(
                 ));
             }
             *offset = uuid_end + 1;
-            Ok((
-                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::Uuid(uuid_bytes), terminator))
         }
         ROW_PK_INTEGER => {
             let integer_end = offset
@@ -1085,9 +1080,7 @@ fn read_row_pk_part(
                 terminator,
             ))
         }
-        _ => Err(key_codec_error(
-            "has an unknown row primary key part tag",
-        )),
+        _ => Err(key_codec_error("has an unknown row primary key part tag")),
     }
 }
 
@@ -1292,7 +1285,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// every row before it was copied into a live-state row.
 ///
 /// ```text
-///  0      format version (9)
+///  0      format version (10; older versions are rejected)
 ///  1      deleted + untracked + snapshot/metadata kinds + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
@@ -1305,13 +1298,12 @@ fn working_diff_error(message: &str) -> LixError {
 ///          checkpoint before-image, then an optional 24-byte base coordinate
 /// ```
 ///
-/// Slot payloads are either inline UTF-8 JSON, a fixed 32-byte `JsonRef`, or
-/// that same fingerprint followed by inline JSON for dirty working-diff rows.
-/// Persisting fingerprints only while a row is dirty keeps repeated diff
-/// classification independent of payload size without taxing checkpointed
-/// current state.
-const HEAD_VALUE_VERSION: u8 = 9;
+/// Slot payloads are either inline UTF-8 JSON for generic engine rows, a fixed
+/// 32-byte `JsonRef`, or a native typed payload carrying its schema fingerprint,
+/// typed key, and typed row. There is no legacy plugin-row reader.
+const HEAD_VALUE_VERSION: u8 = 10;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;
+const HEAD_VALUE_TYPED_HEADER_BYTES: usize = HEAD_VALUE_HEADER_BYTES + 4;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
@@ -1349,6 +1341,7 @@ struct HeadValueView<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotView<'a>,
     metadata: HeadSlotView<'a>,
+    typed_payload: Option<&'a [u8]>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
     /// False when the JSON slots above are placeholders because this view was
@@ -1378,6 +1371,7 @@ impl CertifiedCurrentStatePredecessor {
                 // reference the reader hydrates from when it needs the payload.
                 snapshot: HeadSlotView::None,
                 metadata: HeadSlotView::None,
+                typed_payload: None,
                 payload_slots_materialized: false,
                 columnar_base_coordinate: value.columnar_base_coordinate,
                 working_diff_baseline: match value.working_diff_baseline {
@@ -1469,10 +1463,7 @@ fn effective_hot_created_at(
     value: HeadValueView<'_>,
     active_checkpoint_commit_id: Option<CommitId>,
 ) -> LixTimestamp {
-    match (
-        active_checkpoint_commit_id,
-        value.working_diff_baseline,
-    ) {
+    match (active_checkpoint_commit_id, value.working_diff_baseline) {
         (
             Some(active),
             WorkingDiffBaseline::BeforeAbsent {
@@ -1615,6 +1606,8 @@ struct HeadValueEncode<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotEncode<'a>,
     metadata: HeadSlotEncode<'a>,
+    typed_snapshot: Option<&'a WasmTypedRow>,
+    typed_payload: Option<&'a [u8]>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
@@ -1640,6 +1633,8 @@ fn append_head_value(
             updated_at: value.updated_at,
             snapshot: value.snapshot.into(),
             metadata: value.metadata.into(),
+            typed_snapshot: value.typed_snapshot,
+            typed_payload: None,
             columnar_base_coordinate: value.columnar_base_coordinate,
             working_diff_baseline: value.working_diff_baseline,
         },
@@ -1659,6 +1654,8 @@ fn reencode_head_value_with_baseline(
         updated_at: value.updated_at,
         snapshot: value.snapshot.into(),
         metadata: value.metadata.into(),
+        typed_snapshot: None,
+        typed_payload: value.typed_payload,
         columnar_base_coordinate: value.columnar_base_coordinate,
         working_diff_baseline,
     })
@@ -1680,9 +1677,25 @@ fn append_head_value_parts(
     );
     let snapshot_kind = encoded_slot_kind(value.snapshot, fingerprint_inline);
     let metadata_kind = encoded_slot_kind(value.metadata, fingerprint_inline);
-    if value.deleted && (snapshot_kind != HEAD_SLOT_NONE || metadata_kind != HEAD_SLOT_NONE) {
+    let typed_payload = if let Some(payload) = value.typed_payload {
+        payload.to_vec()
+    } else if let Some(row) = value.typed_snapshot {
+        encode_typed_payload(row)?
+    } else {
+        Vec::new()
+    };
+    if snapshot_kind != HEAD_SLOT_NONE && !typed_payload.is_empty() {
         return Err(head_value_error(
-            "deleted current-state rows must not carry JSON payloads",
+            "current-state row must not carry both JSON and typed payloads",
+        ));
+    }
+    if value.deleted
+        && (snapshot_kind != HEAD_SLOT_NONE
+            || metadata_kind != HEAD_SLOT_NONE
+            || !typed_payload.is_empty())
+    {
+        return Err(head_value_error(
+            "deleted current-state rows must not carry payloads",
         ));
     }
     // Encode-side half of the untracked identity invariant documented on
@@ -1738,7 +1751,8 @@ fn append_head_value_parts(
     }
     let snapshot_len = encoded_slot_len(value.snapshot, fingerprint_inline);
     let metadata_len = encoded_slot_len(value.metadata, fingerprint_inline);
-    let capacity = HEAD_VALUE_HEADER_BYTES
+    let header_bytes = HEAD_VALUE_TYPED_HEADER_BYTES;
+    let capacity = header_bytes
         .checked_add(snapshot_len)
         .and_then(|bytes| bytes.checked_add(metadata_len))
         .and_then(|bytes| {
@@ -1757,6 +1771,7 @@ fn append_head_value_parts(
                     .map_or(0, |_| COLUMNAR_BASE_COORDINATE_BYTES),
             )
         })
+        .and_then(|bytes| bytes.checked_add(typed_payload.len()))
         .ok_or_else(|| head_value_error("encoded row length overflow"))?;
     let start = bytes.len();
     bytes.reserve(capacity);
@@ -1776,15 +1791,20 @@ fn append_head_value_parts(
     bytes.extend_from_slice(&value.updated_at.packed().to_be_bytes());
     bytes.extend_from_slice(
         &u32::try_from(snapshot_len)
-            .map_err(|_| head_value_error("snapshot payload exceeds v8 u32 limit"))?
+            .map_err(|_| head_value_error("snapshot payload exceeds v10 u32 limit"))?
             .to_be_bytes(),
     );
     bytes.extend_from_slice(
         &u32::try_from(metadata_len)
-            .map_err(|_| head_value_error("metadata payload exceeds v8 u32 limit"))?
+            .map_err(|_| head_value_error("metadata payload exceeds v10 u32 limit"))?
             .to_be_bytes(),
     );
     bytes.push(u8::from(value.columnar_base_coordinate.is_some()));
+    bytes.extend_from_slice(
+        &u32::try_from(typed_payload.len())
+            .map_err(|_| head_value_error("typed payload exceeds u32 limit"))?
+            .to_be_bytes(),
+    );
     append_slot_payload(bytes, value.snapshot, fingerprint_inline);
     append_slot_payload(bytes, value.metadata, fingerprint_inline);
     match value.working_diff_baseline {
@@ -1805,6 +1825,7 @@ fn append_head_value_parts(
         bytes.extend_from_slice(&coordinate.group_index.to_be_bytes());
         bytes.extend_from_slice(&coordinate.row_index.to_be_bytes());
     }
+    bytes.extend_from_slice(&typed_payload);
     debug_assert_eq!(bytes.len() - start, capacity);
     Ok(start..bytes.len())
 }
@@ -1851,6 +1872,29 @@ fn append_slot_payload(bytes: &mut Vec<u8>, slot: HeadSlotEncode<'_>, fingerprin
     }
 }
 
+pub(crate) fn encode_typed_payload(row: &WasmTypedRow) -> Result<Vec<u8>, LixError> {
+    row.durable_payload()
+        .map(|payload| payload.to_vec())
+        .map_err(|error| head_value_error(format!("cannot encode typed row payload: {error:?}")))
+}
+
+pub(crate) fn decode_typed_payload(bytes: &[u8]) -> Result<WasmTypedRow, LixError> {
+    let payload = typed_wire::decode_native_row_payload(bytes)
+        .map_err(|error| head_value_error(format!("cannot decode typed row payload: {error:?}")))?;
+    Ok(WasmTypedRow {
+        schema_fingerprint: payload.schema_fingerprint,
+        row_pk: payload.row_pk.into(),
+        row: payload.row,
+        native_payload: std::sync::OnceLock::from(
+            crate::plugin::runtime::NativePayloadCache::Durable {
+                bytes: Arc::from(bytes),
+                boundary_validation: std::sync::OnceLock::new(),
+            },
+        ),
+        boundary_create_validation: std::sync::OnceLock::new(),
+    })
+}
+
 fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
     let StorageProjectedValue::FullValue(bytes) = value else {
         return Err(head_value_error(
@@ -1862,7 +1906,7 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     if bytes.len() < HEAD_VALUE_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v8 fixed header"));
+        return Err(head_value_error("row is shorter than the fixed header"));
     }
     if bytes[0] != HEAD_VALUE_VERSION {
         return Err(head_value_error(&format!(
@@ -1870,6 +1914,10 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
             bytes[0]
         )));
     }
+    if bytes.len() < HEAD_VALUE_TYPED_HEADER_BYTES {
+        return Err(head_value_error("row is shorter than the v10 fixed header"));
+    }
+    let header_bytes = HEAD_VALUE_TYPED_HEADER_BYTES;
     let flags = bytes[1];
     let snapshot_kind = (flags >> HEAD_VALUE_SNAPSHOT_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let metadata_kind = (flags >> HEAD_VALUE_METADATA_SHIFT) & HEAD_VALUE_SLOT_MASK;
@@ -1888,7 +1936,12 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         1 => true,
         _ => return Err(head_value_error("invalid columnar base-coordinate tag")),
     };
-    let snapshot_end = HEAD_VALUE_HEADER_BYTES
+    let typed_len = usize::try_from(read_u32(
+        &bytes[HEAD_VALUE_HEADER_BYTES..HEAD_VALUE_TYPED_HEADER_BYTES],
+        "typed payload length",
+    )?)
+    .map_err(|_| head_value_error("typed payload length exceeds usize"))?;
+    let snapshot_end = header_bytes
         .checked_add(snapshot_len)
         .ok_or_else(|| head_value_error("snapshot payload length overflow"))?;
     let metadata_end = snapshot_end
@@ -1896,7 +1949,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
     let snapshot = decode_slot(
         snapshot_kind,
-        &bytes[HEAD_VALUE_HEADER_BYTES..snapshot_end],
+        &bytes[header_bytes..snapshot_end],
         "snapshot",
     )?;
     let metadata = decode_slot(
@@ -1949,6 +2002,19 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     } else {
         None
     };
+    let typed_end = baseline_offset
+        .checked_add(typed_len)
+        .ok_or_else(|| head_value_error("typed payload length overflow"))?;
+    let typed_payload = if typed_len == 0 {
+        None
+    } else {
+        Some(
+            bytes
+                .get(baseline_offset..typed_end)
+                .ok_or_else(|| head_value_error("typed payload is truncated"))?,
+        )
+    };
+    baseline_offset = typed_end;
     if baseline_offset != bytes.len() {
         return Err(head_value_error(
             "row payload lengths do not match the buffer",
@@ -1956,9 +2022,18 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     }
     let deleted = flags & HEAD_VALUE_DELETED != 0;
     let untracked = flags & HEAD_VALUE_UNTRACKED != 0;
-    if deleted && (snapshot != HeadSlotView::None || metadata != HeadSlotView::None) {
+    if snapshot != HeadSlotView::None && typed_payload.is_some() {
         return Err(head_value_error(
-            "deleted current-state rows must not carry JSON payloads",
+            "current-state row carries both JSON and typed payloads",
+        ));
+    }
+    if deleted
+        && (snapshot != HeadSlotView::None
+            || metadata != HeadSlotView::None
+            || typed_payload.is_some())
+    {
+        return Err(head_value_error(
+            "deleted current-state rows must not carry payloads",
         ));
     }
     let (change_id, commit_id) = if untracked {
@@ -2003,6 +2078,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         updated_at,
         snapshot,
         metadata,
+        typed_payload,
         payload_slots_materialized: true,
         columnar_base_coordinate,
         working_diff_baseline,
@@ -2028,7 +2104,7 @@ fn take_head_bytes<'a>(
 fn uuid_from_head_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
     let bytes: [u8; UUID_BYTES] = bytes.try_into().map_err(|_| {
         head_value_error(&format!(
-            "{field} must have {UUID_BYTES} bytes in the v8 header"
+            "{field} must have {UUID_BYTES} bytes in the v10 header"
         ))
     })?;
     Ok(uuid::Uuid::from_bytes(bytes))
@@ -2115,6 +2191,10 @@ struct DeferredJson {
 }
 
 trait LiveMaterializationIdentity {
+    fn schema_key(&self) -> &str;
+
+    fn row_pk(&self) -> &RowPk;
+
     #[allow(clippy::too_many_arguments)]
     fn push_materialized(
         self,
@@ -2133,6 +2213,14 @@ trait LiveMaterializationIdentity {
 }
 
 impl LiveMaterializationIdentity for HeadRowIdentity {
+    fn schema_key(&self) -> &str {
+        &self.schema_key
+    }
+
+    fn row_pk(&self) -> &RowPk {
+        &self.row_pk
+    }
+
     fn push_materialized(
         self,
         rows: &mut MaterializedHotStateBatchBuilder,
@@ -2166,6 +2254,14 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
 }
 
 impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
+    fn schema_key(&self) -> &str {
+        self.schema_key
+    }
+
+    fn row_pk(&self) -> &RowPk {
+        self.row_pk
+    }
+
     fn push_materialized(
         self,
         rows: &mut MaterializedHotStateBatchBuilder,
@@ -2218,6 +2314,17 @@ where
     let mut rows = MaterializedHotStateBatchBuilder::with_capacity(entries.len());
     for (identity, bytes) in entries {
         let value = decode_head_value(&bytes)?;
+        let typed_snapshot = value
+            .typed_payload
+            .map(|payload| {
+                WasmTypedRow::decode_durable_payload(
+                    Arc::from(payload),
+                    identity.schema_key(),
+                    identity.row_pk(),
+                )
+            })
+            .transpose()?
+            .map(Arc::new);
         let row_index = rows.len();
         let snapshot_content = materialize_live_slot(
             !value.deleted && projection.snapshot_content,
@@ -2252,6 +2359,9 @@ where
         );
         if let Some(coordinate) = value.columnar_base_coordinate {
             rows.set_columnar_base_coordinate(row_index, coordinate);
+        }
+        if typed_snapshot.is_some() {
+            rows.set_typed_snapshot(row_index, typed_snapshot);
         }
         rows.set_durable_predecessor(row_index, CertifiedCurrentStatePredecessor::Encoded(bytes));
     }
@@ -2495,7 +2605,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
+    fn v10_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
         let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
         let columnar_base_coordinate = ColumnarBaseCoordinate {
             base_commit_id: CommitId::for_test_label("columnar-base"),
@@ -2511,20 +2621,21 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
             metadata: JsonSlotRef::Ref(&snapshot_ref),
+            typed_snapshot: None,
             columnar_base_coordinate: Some(columnar_base_coordinate),
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
 
-        let bytes = encode_head_value(&value).expect("encode v8 row");
+        let bytes = encode_head_value(&value).expect("encode v10 row");
         assert_eq!(bytes[0], HEAD_VALUE_VERSION);
         assert_eq!(
             bytes.len(),
-            HEAD_VALUE_HEADER_BYTES
+            HEAD_VALUE_TYPED_HEADER_BYTES
                 + "{\"snapshot\":true}".len()
                 + JSON_REF_BYTES
                 + COLUMNAR_BASE_COORDINATE_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v8 row");
+        let decoded = decode_head_value(&bytes).expect("decode v10 row");
         assert_eq!(decoded.change_id, value.change_id);
         assert_eq!(decoded.commit_id, value.commit_id);
         assert_eq!(decoded.created_at, value.created_at);
@@ -2541,6 +2652,67 @@ mod tests {
     }
 
     #[test]
+    fn typed_value_codec_roundtrips_fingerprinted_native_row() {
+        let typed = WasmTypedRow {
+            schema_fingerprint: [9; 32],
+            row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+            row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(42))]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("typed-change")),
+            commit_id: Some(CommitId::for_test_label("typed-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::None,
+            metadata: JsonSlotRef::None,
+            typed_snapshot: Some(&typed),
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+
+        let bytes = encode_head_value(&value).expect("encode typed row");
+        assert_eq!(bytes[0], HEAD_VALUE_VERSION);
+        assert!(bytes.len() > HEAD_VALUE_TYPED_HEADER_BYTES);
+        let decoded = decode_head_value(&bytes).expect("decode typed row");
+        let decoded_typed = decode_typed_payload(
+            decoded
+                .typed_payload
+                .expect("typed row payload should be present"),
+        )
+        .expect("decode native typed row payload");
+        assert_eq!(decoded_typed, typed);
+    }
+
+    #[test]
+    fn v9_rows_are_rejected_without_a_compatibility_reader() {
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("hard-cut-change")),
+            commit_id: Some(CommitId::for_test_label("hard-cut-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::Inline("{\"value\":true}"),
+            metadata: JsonSlotRef::None,
+            typed_snapshot: None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+        let mut bytes = encode_head_value(&value).expect("encode hard-cut row");
+        bytes[0] = 9;
+        let error = decode_head_value(&bytes).expect_err("v9 rows must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported row format version 9")
+        );
+    }
+
+    #[test]
     fn materialized_inline_fields_share_the_head_value_buffer() {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("shared-fields-change")),
@@ -2551,11 +2723,12 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
+            typed_snapshot: None,
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
-        let bytes = Bytes::from(encode_head_value(&value).expect("encode v8 row"));
-        let decoded = decode_head_value(&bytes).expect("decode v8 row");
+        let bytes = Bytes::from(encode_head_value(&value).expect("encode v10 row"));
+        let decoded = decode_head_value(&bytes).expect("decode v10 row");
         let mut json_refs = Vec::new();
         let mut deferred = Vec::new();
         let snapshot = materialize_live_slot(
@@ -2587,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
+    fn v10_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
         let checkpoint_commit_id = CommitId::for_test_label("baseline-checkpoint");
         let baseline = WorkingDiffVersion {
             change_id: ChangeId::for_test_label("before-change"),
@@ -2613,6 +2786,7 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"current\":true}"),
             metadata: JsonSlotRef::None,
+            typed_snapshot: None,
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
                 checkpoint_commit_id,
@@ -2620,16 +2794,16 @@ mod tests {
             },
         };
 
-        let bytes = encode_head_value(&value).expect("encode v8 row with baseline");
+        let bytes = encode_head_value(&value).expect("encode v10 row with baseline");
         assert_eq!(
             bytes.len(),
-            HEAD_VALUE_HEADER_BYTES
+            HEAD_VALUE_TYPED_HEADER_BYTES
                 + JSON_REF_BYTES
                 + "{\"current\":true}".len()
                 + WORKING_DIFF_CHECKPOINT_BYTES
                 + WORKING_DIFF_VERSION_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v8 row with baseline");
+        let decoded = decode_head_value(&bytes).expect("decode v10 row with baseline");
         assert_eq!(
             decoded.working_diff_baseline,
             WorkingDiffBaseline::BeforePresent {
@@ -5050,6 +5224,7 @@ mod tests {
             schema_key: "schema".to_string(),
             file_id: None,
             snapshot_content: Some("{\"value\":1}".into()),
+            typed_snapshot: None,
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
