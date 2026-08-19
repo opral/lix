@@ -2990,6 +2990,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3071,6 +3072,7 @@ dependencies = [
 name = "lix_js_sdk"
 version = "0.12.3"
 dependencies = [
+ "async-stream",
  "blake3",
  "bytes",
  "chrono",
