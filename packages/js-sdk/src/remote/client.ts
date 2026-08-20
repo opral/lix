@@ -12,15 +12,21 @@ type RemoteLixClientOptions = {
 
 let wasmInitialized: Promise<unknown> | undefined;
 
-async function initializeWasm(): Promise<unknown> {
+function initializeWasm(): Promise<unknown> {
 	if (wasmInitialized !== undefined) return wasmInitialized;
 	if (typeof process !== "undefined" && process.versions?.node) {
-		const { readFile } = await import("node:fs/promises");
-		wasmInitialized = initWasm({
-			module_or_path: readFile(
-				new URL("../wasm/lix_js_sdk_bg.wasm", import.meta.url),
-			),
-		});
+		wasmInitialized = import("node:fs/promises").then(
+			({ readFile }) =>
+				initWasm({
+					module_or_path: readFile(
+						new URL("../wasm/lix_js_sdk_bg.wasm", import.meta.url),
+					),
+				}),
+			(error) => {
+				wasmInitialized = undefined;
+				throw error;
+			},
+		);
 	} else {
 		wasmInitialized = initWasm();
 	}
