@@ -310,18 +310,13 @@ where
 }
 
 fn ensure_success(response: &RawHttpResponse, operation: &str) -> Result<(), LixError> {
-    ensure_response_bound(response, operation)?;
+    if response.body.len() > MAX_SYNC_PULL_RESPONSE_BYTES {
+        return Err(response_too_large(operation));
+    }
     if (200..300).contains(&response.status) {
         return Ok(());
     }
     Err(response_error(response, operation))
-}
-
-fn ensure_response_bound(response: &RawHttpResponse, operation: &str) -> Result<(), LixError> {
-    if response.body.len() <= MAX_SYNC_PULL_RESPONSE_BYTES {
-        return Ok(());
-    }
-    Err(response_too_large(operation))
 }
 
 pub(super) fn response_too_large(operation: &str) -> LixError {
