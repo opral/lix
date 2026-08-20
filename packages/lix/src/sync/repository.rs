@@ -1890,16 +1890,7 @@ where
                 }
                 let adapter = self.storage_adapter();
                 let read = adapter.begin_read(StorageReadOptions::default()).await?;
-                let local_heads = BranchHeadControlContext::new()
-                    .reader(&read)
-                    .scan()
-                    .await?
-                    .into_iter()
-                    .map(|(branch_id, control)| {
-                        (branch_id, Some(control.head_commit_id.to_string()))
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                let local_checkpoints = BranchHeadControlContext::new()
+                let local_controls = BranchHeadControlContext::new()
                     .reader(&read)
                     .scan()
                     .await?
@@ -1907,27 +1898,33 @@ where
                     .map(|(branch_id, control)| {
                         (
                             branch_id,
-                            control
-                                .working_diff_checkpoint_commit_id
-                                .map(|checkpoint| checkpoint.to_string()),
+                            (
+                                control.head_commit_id.to_string(),
+                                control
+                                    .working_diff_checkpoint_commit_id
+                                    .map(|checkpoint| checkpoint.to_string()),
+                            ),
                         )
                     })
                     .collect::<BTreeMap<_, _>>();
-                let all_branches = local_heads
+                let all_branches = local_controls
                     .keys()
                     .chain(state.authoritative_heads.keys())
-                    .chain(local_checkpoints.keys())
                     .chain(state.authoritative_checkpoints.keys())
                     .collect::<BTreeSet<_>>();
                 if all_branches.into_iter().all(|branch_id| {
-                    local_heads.get(branch_id).cloned().flatten()
-                        == state.authoritative_heads.get(branch_id).cloned().flatten()
-                        && local_checkpoints.get(branch_id).cloned().flatten()
+                    local_controls.get(branch_id).map(|(head, _)| head)
+                        == state
+                            .authoritative_heads
+                            .get(branch_id)
+                            .and_then(Option::as_ref)
+                        && local_controls
+                            .get(branch_id)
+                            .and_then(|(_, checkpoint)| checkpoint.as_ref())
                             == state
                                 .authoritative_checkpoints
                                 .get(branch_id)
-                                .cloned()
-                                .flatten()
+                                .and_then(Option::as_ref)
                 }) {
                     state.authority_known_commit_ids.clear();
                 }
@@ -4493,20 +4490,27 @@ mod tests {
     struct SyncAccountingStorage {
         inner: Memory,
         forbidden_operations: Arc<AtomicU64>,
+        branch_control_scans: Arc<AtomicU64>,
     }
 
     struct SyncAccountingRead {
         inner: MemoryRead,
         forbidden_operations: Arc<AtomicU64>,
+        branch_control_scans: Arc<AtomicU64>,
     }
 
     impl SyncAccountingStorage {
         fn reset(&self) {
             self.forbidden_operations.store(0, Ordering::Relaxed);
+            self.branch_control_scans.store(0, Ordering::Relaxed);
         }
 
         fn forbidden_operation_count(&self) -> u64 {
             self.forbidden_operations.load(Ordering::Relaxed)
+        }
+
+        fn branch_control_scan_count(&self) -> u64 {
+            self.branch_control_scans.load(Ordering::Relaxed)
         }
     }
 
@@ -4524,6 +4528,7 @@ mod tests {
             Ok(SyncAccountingRead {
                 inner: self.inner.begin_read(options).await?,
                 forbidden_operations: Arc::clone(&self.forbidden_operations),
+                branch_control_scans: Arc::clone(&self.branch_control_scans),
             })
         }
 
@@ -4551,6 +4556,9 @@ mod tests {
             options: BeginScanOptions,
         ) -> Result<ScanCursor<'_>, StorageError> {
             self.forbidden_operations.fetch_add(1, Ordering::Relaxed);
+            if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE {
+                self.branch_control_scans.fetch_add(1, Ordering::Relaxed);
+            }
             self.inner.begin_scan(space, range, options).await
         }
     }
@@ -4723,6 +4731,63 @@ mod tests {
             storage.forbidden_operation_count(),
             0,
             "an unchanged heartbeat must not scan branches or open a write transaction",
+        );
+    }
+
+    #[tokio::test]
+    async fn nonempty_sync_delta_scans_branch_controls_once_for_convergence() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("authority snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let (branch_id, _) = default_head(&snapshot);
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
+        let storage = SyncAccountingStorage::default();
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
+            .await
+            .expect("replica storage should initialize");
+        let replica = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("replica should open");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role should install");
+        replica
+            .apply_sync_repository_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+                &checkpoint_roots,
+            )
+            .await
+            .expect("snapshot should initialize replica");
+
+        write_key_value(&authority, "one-scan-delta", "after").await;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("authority delta should load");
+        storage.reset();
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("replica should apply remote delta");
+
+        assert_eq!(
+            storage.branch_control_scan_count(),
+            1,
+            "nonempty delta convergence should scan branch controls exactly once",
         );
     }
 
