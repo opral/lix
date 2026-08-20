@@ -1,10 +1,13 @@
 //! Lazy binary-CAS sync outside the live commit/ref cursor.
 
+use base64::Engine as _;
+
 use crate::binary_cas::{
     BlobChunkReceipt, BlobId, CanonicalBlobManifest, ChunkHash, chunk_presence_many,
     load_canonical_blob_chunks, load_metadata_many, load_verified_chunk,
     stage_deferred_canonical_manifest, stage_transfer_publication_fence,
-    stage_verified_canonical_manifest, stage_verified_raw_chunk,
+    stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
+    stage_verified_raw_chunk,
 };
 use crate::storage_adapter::{Storage, StorageReadOptions, StorageWriteOptions};
 use crate::{Lix, LixError};
@@ -12,6 +15,7 @@ use crate::{Lix, LixError};
 use super::{SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration};
 
 const MAX_SYNC_BLOB_CHUNKS: usize = 16_384;
+const MAX_INLINE_SYNC_BLOB_BYTES: usize = 64 * 1024;
 
 fn decode_manifest(manifest: &SyncBlobManifest) -> Result<CanonicalBlobManifest, LixError> {
     if manifest.chunks.len() > MAX_SYNC_BLOB_CHUNKS {
@@ -37,7 +41,10 @@ fn decode_manifest(manifest: &SyncBlobManifest) -> Result<CanonicalBlobManifest,
     })
 }
 
-fn encode_manifest(manifest: CanonicalBlobManifest) -> SyncBlobManifest {
+fn encode_manifest(
+    manifest: CanonicalBlobManifest,
+    inline_bytes_base64: Option<String>,
+) -> SyncBlobManifest {
     SyncBlobManifest {
         blob_id: manifest.blob_id.to_hex(),
         size_bytes: manifest.size_bytes,
@@ -49,7 +56,35 @@ fn encode_manifest(manifest: CanonicalBlobManifest) -> SyncBlobManifest {
                 size_bytes: chunk.size_bytes,
             })
             .collect(),
+        inline_bytes_base64,
     }
+}
+
+fn decode_inline_bytes(wire: &SyncBlobManifest) -> Result<Option<Vec<u8>>, LixError> {
+    let Some(encoded) = wire.inline_bytes_base64.as_deref() else {
+        return Ok(None);
+    };
+    if encoded.len() > MAX_INLINE_SYNC_BLOB_BYTES.div_ceil(3) * 4 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("sync inline blob exceeds {MAX_INLINE_SYNC_BLOB_BYTES} bytes"),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("sync inline blob is not valid base64: {error}"),
+            )
+        })?;
+    if bytes.len() > MAX_INLINE_SYNC_BLOB_BYTES {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("sync inline blob exceeds {MAX_INLINE_SYNC_BLOB_BYTES} bytes"),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn manifest_from_canonical_chunks(
@@ -104,6 +139,9 @@ where
         // and authenticated the complete blob. Derive its manifest from those
         // receipts instead of loading and materializing the blob a second time.
         let manifest = manifest_from_canonical_chunks(blob_id, &chunks)?;
+        let inline_bytes_base64 = (manifest.size_bytes <= MAX_INLINE_SYNC_BLOB_BYTES as u64
+            && chunks.len() == 1)
+            .then(|| base64::engine::general_purpose::STANDARD.encode(&chunks[0].bytes));
         let present = chunk_presence_many(
             &read,
             &chunks
@@ -133,7 +171,7 @@ where
                 )
                 .await?;
         }
-        Ok(Some(encode_manifest(manifest)))
+        Ok(Some(encode_manifest(manifest, inline_bytes_base64)))
     }
 
     pub(crate) async fn get_sync_chunk(&self, chunk_id: &str) -> Result<Option<Vec<u8>>, LixError> {
@@ -173,11 +211,32 @@ where
     /// only after every referenced chunk is already present.
     pub(crate) async fn register_sync_blob_manifest(
         &self,
-        manifest: &SyncBlobManifest,
+        wire: &SyncBlobManifest,
     ) -> Result<SyncBlobRegistration, LixError> {
-        let manifest = decode_manifest(manifest)?;
+        let manifest = decode_manifest(wire)?;
+        let inline = decode_inline_bytes(wire)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        if let Some(bytes) = inline {
+            let mut writes = adapter.new_write_set();
+            let mut preconditions = Vec::new();
+            stage_verified_inline_canonical_blob(&mut writes, &manifest, &bytes)?;
+            stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
+            drop(read);
+            adapter
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        await_durable: true,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await?;
+            return Ok(SyncBlobRegistration {
+                missing_chunk_ids: Vec::new(),
+            });
+        }
         let presence = chunk_presence_many(
             &read,
             &manifest
@@ -194,9 +253,7 @@ where
             .filter_map(|(chunk, present)| (!present).then(|| chunk.hash.to_hex()))
             .collect::<Vec<_>>();
         if !missing_chunk_ids.is_empty() {
-            return Ok(SyncBlobRegistration {
-                missing_chunk_ids,
-            });
+            return Ok(SyncBlobRegistration { missing_chunk_ids });
         }
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
@@ -226,18 +283,24 @@ where
     /// clears its marker atomically with the payload.
     pub(crate) async fn register_deferred_sync_blob_manifest(
         &self,
-        manifest: &SyncBlobManifest,
+        wire: &SyncBlobManifest,
     ) -> Result<SyncBlobRegistration, LixError> {
-        let manifest = decode_manifest(manifest)?;
+        let manifest = decode_manifest(wire)?;
+        let inline = decode_inline_bytes(wire)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
-        let missing_chunk_ids = stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
-            .await?
-            .into_iter()
-            .map(|chunk| chunk.to_hex())
-            .collect::<Vec<_>>();
+        let missing_chunk_ids = if let Some(bytes) = inline {
+            stage_verified_inline_canonical_blob(&mut writes, &manifest, &bytes)?;
+            Vec::new()
+        } else {
+            stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
+                .await?
+                .into_iter()
+                .map(|chunk| chunk.to_hex())
+                .collect::<Vec<_>>()
+        };
         stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
         drop(read);
         adapter
@@ -303,6 +366,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_manifest_registers_small_payload_without_chunk_demand() {
+        let lix = crate::open_lix()
+            .await
+            .expect("test repository should open");
+        let bytes = b"small realtime markdown payload".to_vec();
+        let canonical = CanonicalBlobManifest::from_bytes(&bytes);
+        assert_eq!(canonical.chunks.len(), 1);
+        let manifest = encode_manifest(
+            canonical.clone(),
+            Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        );
+
+        let deferred = encode_manifest(canonical.clone(), None);
+        let registration = lix
+            .register_deferred_sync_blob_manifest(&deferred)
+            .await
+            .expect("manifest-only registration should stage demand");
+        assert_eq!(registration.missing_chunk_ids.len(), 1);
+        let registration = lix
+            .register_deferred_sync_blob_manifest(&manifest)
+            .await
+            .expect("inline registration should satisfy staged demand");
+        assert!(registration.missing_chunk_ids.is_empty());
+        let registration = lix
+            .register_deferred_sync_blob_manifest(&manifest)
+            .await
+            .expect("repeated inline registration should be idempotent");
+        assert!(registration.missing_chunk_ids.is_empty());
+
+        let adapter = lix.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        let loaded = crate::binary_cas::load_bytes_many(&read, &[canonical.blob_id])
+            .await
+            .expect("inline payload should already be readable")
+            .into_vec();
+        assert_eq!(loaded, vec![Some(bytes.clone())]);
+
+        let authority = crate::open_lix()
+            .await
+            .expect("authority repository should open");
+        let registration = authority
+            .register_sync_blob_manifest(&manifest)
+            .await
+            .expect("authority should accept a self-contained manifest");
+        assert!(registration.missing_chunk_ids.is_empty());
+        let registration = authority
+            .register_sync_blob_manifest(&manifest)
+            .await
+            .expect("authority inline registration should be idempotent");
+        assert!(registration.missing_chunk_ids.is_empty());
+        let read = authority
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authority verification read should open");
+        let loaded = crate::binary_cas::load_bytes_many(&read, &[canonical.blob_id])
+            .await
+            .expect("authority inline payload should already be readable")
+            .into_vec();
+        assert_eq!(loaded, vec![Some(bytes)]);
+    }
+
+    #[tokio::test]
+    async fn inline_manifest_rejects_tampered_payload() {
+        let lix = crate::open_lix()
+            .await
+            .expect("test repository should open");
+        let bytes = b"authenticated inline payload".to_vec();
+        let canonical = CanonicalBlobManifest::from_bytes(&bytes);
+        let manifest = encode_manifest(
+            canonical,
+            Some(base64::engine::general_purpose::STANDARD.encode(b"xuthenticated inline payload")),
+        );
+
+        let error = lix
+            .register_sync_blob_manifest(&manifest)
+            .await
+            .expect_err("tampered inline payload must fail");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[tokio::test]
+    async fn inline_manifest_enforces_the_sixty_four_kibibyte_cap() {
+        let lix = crate::open_lix()
+            .await
+            .expect("test repository should open");
+        let at_limit = vec![7; MAX_INLINE_SYNC_BLOB_BYTES];
+        let canonical = CanonicalBlobManifest::from_bytes(&at_limit);
+        assert_eq!(canonical.chunks.len(), 1);
+        let manifest = encode_manifest(
+            canonical,
+            Some(base64::engine::general_purpose::STANDARD.encode(&at_limit)),
+        );
+        lix.register_sync_blob_manifest(&manifest)
+            .await
+            .expect("an exact-cap one-chunk payload should register inline");
+
+        let over_limit = vec![7; MAX_INLINE_SYNC_BLOB_BYTES + 1];
+        let canonical = CanonicalBlobManifest::from_bytes(&over_limit);
+        assert_eq!(canonical.chunks.len(), 1);
+        let manifest = encode_manifest(
+            canonical,
+            Some(base64::engine::general_purpose::STANDARD.encode(&over_limit)),
+        );
+        let error = lix
+            .register_sync_blob_manifest(&manifest)
+            .await
+            .expect_err("an oversized inline payload must fail");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[tokio::test]
     async fn deferred_registration_publishes_manifest_and_demand_without_payload_rows() {
         let lix = crate::open_lix()
             .await
@@ -312,7 +490,7 @@ mod tests {
             .collect::<Vec<_>>();
         let canonical = CanonicalBlobManifest::from_bytes(&bytes);
         assert!(canonical.chunks.len() > 1);
-        let manifest = encode_manifest(canonical.clone());
+        let manifest = encode_manifest(canonical.clone(), None);
 
         let registration = lix
             .register_deferred_sync_blob_manifest(&manifest)

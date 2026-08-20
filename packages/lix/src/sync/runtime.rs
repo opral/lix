@@ -2378,6 +2378,7 @@ mod tests {
                     size_bytes: chunk.size_bytes,
                 })
                 .collect(),
+            inline_bytes_base64: None,
         };
         let mut offset = 0usize;
         let mut chunks = BTreeMap::new();
@@ -2432,11 +2433,31 @@ mod tests {
             .iter()
             .map(|id| id.as_str().expect("chunk id string").to_owned())
             .collect::<BTreeSet<_>>();
-        hydrate_chunk_ids(&lix, &transport, demanded.clone())
-            .await
-            .expect("chunk hydration succeeds");
+        let chunk_ids = demanded.iter().cloned().collect::<Vec<_>>();
+        let (first_response, _first_done) = tokio::sync::oneshot::channel();
+        let (second_response, _second_done) = tokio::sync::oneshot::channel();
+        let results = hydrate_sync_demands(
+            &lix,
+            &transport,
+            &[
+                SyncDemand {
+                    request: SyncDemandRequest::Chunks(chunk_ids.clone()),
+                    response: first_response,
+                },
+                SyncDemand {
+                    request: SyncDemandRequest::Chunks(chunk_ids),
+                    response: second_response,
+                },
+            ],
+        )
+        .await;
+        assert!(results.into_iter().all(|result| result.is_ok()));
         let first_call_count = chunk_calls.lock().expect("chunk calls lock").len();
-        assert_eq!(first_call_count, demanded.len());
+        assert_eq!(
+            first_call_count,
+            demanded.len(),
+            "concurrent identical demands share one fetch per unique chunk",
+        );
 
         let read = adapter
             .begin_read(crate::storage_adapter::StorageReadOptions::default())

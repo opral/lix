@@ -309,6 +309,8 @@ pub struct SyncBlobManifest {
     pub blob_id: String,
     pub size_bytes: u64,
     pub chunks: Vec<SyncBlobChunk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_bytes_base64: Option<String>,
 }
 
 /// Result of registering a manifest. Upload the missing chunks and retry the

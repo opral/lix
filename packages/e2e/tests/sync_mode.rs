@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::future::join_all;
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt as _, Full};
@@ -35,6 +34,7 @@ struct HttpProbe {
     history_gets: AtomicU64,
     blob_gets: AtomicU64,
     chunk_gets: AtomicU64,
+    chunk_puts: AtomicU64,
     drop_next_push_ack: AtomicBool,
     reject_requests: AtomicBool,
     one_way_delay_millis: AtomicU64,
@@ -617,14 +617,13 @@ async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
     let alice = open_replica(alice_dir.path(), &url).await;
     let bob = open_replica(bob_dir.path(), &url).await;
 
-    let pulls_before_hydration = probe.delta_pulls.load(Ordering::Acquire);
     let (alice_content, bob_content) = tokio::join!(
         read_file_content(&alice, "/existing.md"),
         read_file_content(&bob, "/existing.md"),
     );
     assert_eq!(alice_content, Some(b"base".to_vec()));
     assert_eq!(bob_content, Some(b"base".to_vec()));
-    wait_for_counter(&probe.delta_pulls, pulls_before_hydration + 2).await;
+    wait_for_counter(&probe.delta_pulls, 2).await;
 
     // Hold both publish requests until they have been built from the same
     // authority head. Exactly one CAS must then lose with HTTP 409.
@@ -674,8 +673,7 @@ async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn file_observer_hydrates_lazy_chunks_after_a_remote_edit() {
-    const OBSERVER_COUNT: usize = 70;
+async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
     let authority = Arc::new(open_lix().await.expect("open authority"));
     authority
         .execute(
@@ -685,126 +683,65 @@ async fn file_observer_hydrates_lazy_chunks_after_a_remote_edit() {
         .await
         .expect("seed shared file");
     let probe = Arc::new(HttpProbe::default());
+    probe.set_round_trip_delay(Duration::from_millis(100));
     let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
     let alice_dir = TempDir::new().expect("alice tempdir");
     let bob_dir = TempDir::new().expect("bob tempdir");
     let alice = open_replica(alice_dir.path(), &url).await;
     let bob = open_replica(bob_dir.path(), &url).await;
 
-    alice
-        .execute(
+    let mut events = alice
+        .observe(
             "SELECT content FROM lix_file WHERE path = '/shared.md'",
             &[],
         )
+        .expect("observe shared file");
+    let initial = events
+        .next()
         .await
-        .expect("hydrate Alice's initial file content");
-    bob.execute(
-        "SELECT content FROM lix_file WHERE path = '/shared.md'",
-        &[],
-    )
-    .await
-    .expect("hydrate Bob's initial file content");
-    let initial_change_id = alice
-        .execute(
-            "SELECT lixcol_change_id FROM lix_file WHERE path = '/shared.md'",
-            &[],
-        )
-        .await
-        .expect("read Alice's initial file change id")
-        .rows()[0]
-        .get::<String>("lixcol_change_id")
-        .expect("initial file change id decodes");
-    let mut observers = Vec::with_capacity(OBSERVER_COUNT);
-    for _ in 0..OBSERVER_COUNT {
-        let mut events = alice
-            .observe(
-                "SELECT content FROM lix_file WHERE path = '/shared.md'",
-                &[],
-            )
-            .expect("observe shared file");
-        let initial = events
-            .next()
-            .await
-            .expect("initial observer evaluation succeeds")
-            .expect("initial observer event exists");
-        assert_eq!(
-            initial.rows.rows()[0]
-                .get::<Vec<u8>>("content")
-                .expect("initial content decodes"),
-            b"Hello world",
-        );
-        observers.push(events);
-    }
-    let mut writer_observers = Vec::with_capacity(OBSERVER_COUNT);
-    for _ in 0..OBSERVER_COUNT {
-        let mut events = bob
-            .observe(
-                "SELECT content FROM lix_file WHERE path = '/shared.md'",
-                &[],
-            )
-            .expect("observe Bob's shared file");
-        events
-            .next()
-            .await
-            .expect("Bob's initial observer evaluation succeeds")
-            .expect("Bob's initial observer event exists");
-        writer_observers.push(events);
-    }
+        .expect("initial observer evaluation succeeds")
+        .expect("initial observer event exists");
+    assert_eq!(
+        initial.rows.rows()[0]
+            .get::<Vec<u8>>("content")
+            .expect("initial content decodes"),
+        b"Hello world",
+    );
+    wait_for_counter(&probe.delta_pulls, 2).await;
 
     let chunk_gets_before_remote_edit = probe.chunk_gets.load(Ordering::Acquire);
+    let chunk_puts_before_remote_edit = probe.chunk_puts.load(Ordering::Acquire);
+    let started = Instant::now();
     bob.execute(
         "UPDATE lix_file SET content = CAST('Hello worlds' AS BYTEA) WHERE path = '/shared.md'",
         &[],
     )
     .await
     .expect("Bob updates the shared file");
-    tokio::time::timeout(WAIT_TIMEOUT, async {
-        loop {
-            let change_id = alice
-                .execute(
-                    "SELECT lixcol_change_id FROM lix_file WHERE path = '/shared.md'",
-                    &[],
-                )
-                .await
-                .expect("read Alice's file change id")
-                .rows()[0]
-                .get::<String>("lixcol_change_id")
-                .expect("remote file change id decodes");
-            if change_id != initial_change_id {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("timed out waiting for Alice to apply Bob's file metadata");
+    let remote = tokio::time::timeout(WAIT_TIMEOUT, events.next())
+        .await
+        .expect("timed out waiting for remote observer event")
+        .expect("remote observer evaluation succeeds")
+        .expect("remote observer event exists");
+    assert_eq!(
+        remote.rows.rows()[0]
+            .get::<Vec<u8>>("content")
+            .expect("remote content decodes"),
+        b"Hello worlds",
+    );
     assert_eq!(
         probe.chunk_gets.load(Ordering::Acquire),
         chunk_gets_before_remote_edit,
-        "pull applies the remote commit without eagerly hydrating file chunks",
+        "self-contained small manifests must not schedule chunk hydration",
     );
-
-    let remote = tokio::time::timeout(
-        WAIT_TIMEOUT,
-        join_all(observers.iter_mut().map(|events| events.next())),
-    )
-    .await
-    .expect("timed out waiting for remote observer events");
-    for event in remote {
-        let event = event
-            .expect("remote observer evaluation hydrates demanded chunks")
-            .expect("remote observer event exists");
-        assert_eq!(
-            event.rows.rows()[0]
-                .get::<Vec<u8>>("content")
-                .expect("remote content decodes"),
-            b"Hello worlds",
-        );
-    }
     assert_eq!(
-        probe.chunk_gets.load(Ordering::Acquire),
-        chunk_gets_before_remote_edit + 1,
-        "identical observers share one exact lazy chunk hydration request",
+        probe.chunk_puts.load(Ordering::Acquire),
+        chunk_puts_before_remote_edit,
+        "self-contained small manifests must not upload a separate chunk",
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "small-file propagation should stay below 700 ms at 100 ms RTT",
     );
 
     alice.close().await.expect("close alice");
@@ -1149,6 +1086,9 @@ where
     }
     if parts.method == Method::GET && path == "/lix/v1/sync/chunk" {
         probe.chunk_gets.fetch_add(1, Ordering::Release);
+    }
+    if parts.method == Method::PUT && path == "/lix/v1/sync/chunk" {
+        probe.chunk_puts.fetch_add(1, Ordering::Release);
     }
     let body = body
         .collect()
