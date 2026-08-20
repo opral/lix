@@ -316,7 +316,6 @@ impl<H: ProtocolHttp> ClientCore<H> {
                 params: encode_engine_values(params)?,
                 full_params: encode_engine_values(params)?,
                 cache_updates: Vec::new(),
-                cache_blobs: false,
                 has_delta: false,
             }
         };
@@ -339,7 +338,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     sql: sql.to_owned(),
                     params: params.to_vec(),
                     options: request_options.clone(),
-                    cache_blobs: prepared.cache_blobs,
+                    cache_blobs: !prepared.cache_updates.is_empty(),
                 };
                 self.request_json(
                     "POST",
@@ -387,7 +386,9 @@ impl<H: ProtocolHttp> ClientCore<H> {
                 })
                 .collect()
         };
-        let cache_blobs = prepared.iter().any(|(_, _, item)| item.cache_blobs);
+        let cache_blobs = prepared
+            .iter()
+            .any(|(_, _, item)| !item.cache_updates.is_empty());
         let has_delta = prepared.iter().any(|(_, _, item)| item.has_delta);
         let request_options = options.as_ref().and_then(|options| {
             options.origin_key.as_ref().map(|origin_key| ExecuteOptionsBody {
