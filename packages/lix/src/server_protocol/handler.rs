@@ -224,24 +224,6 @@ impl IntoResponse for Response {
     }
 }
 
-impl<T> IntoResponse for ([(HeaderName, T); 1], Json<HandshakeResponse>)
-where
-    T: TryInto<http::HeaderValue>,
-    T::Error: std::fmt::Debug,
-{
-    fn into_response(self) -> Response {
-        let (headers, body) = self;
-        let mut response = body.into_response();
-        for (name, value) in headers {
-            response.headers_mut().insert(
-                name,
-                value.try_into().expect("static protocol header is valid"),
-            );
-        }
-        response
-    }
-}
-
 #[derive(Default)]
 struct Event {
     event: Option<&'static str>,

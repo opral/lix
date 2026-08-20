@@ -1259,30 +1259,21 @@ fn validate_delta_after(
     Ok(*cursor)
 }
 
-async fn wait_for_retry_or_shutdown(
-    duration: Duration,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-) -> Result<(), LixError> {
-    if *shutdown_rx.borrow() {
-        return Err(stopped_error());
-    }
-    let timer = sleep(duration).fuse();
-    let changed = shutdown_rx.changed().fuse();
-    futures_util::pin_mut!(timer, changed);
-    select_biased! {
-        _ = changed => Err(stopped_error()),
-        result = timer => result,
-    }
-}
-
 async fn wait_for_sync_retry(
     retry_backoff: &mut Duration,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
-    if wait_for_retry_or_shutdown(*retry_backoff, shutdown_rx)
-        .await
-        .is_err()
-    {
+    if *shutdown_rx.borrow() {
+        return false;
+    }
+    let timer = sleep(*retry_backoff).fuse();
+    let changed = shutdown_rx.changed().fuse();
+    futures_util::pin_mut!(timer, changed);
+    let elapsed = select_biased! {
+        _ = changed => false,
+        result = timer => result.is_ok(),
+    };
+    if !elapsed {
         return false;
     }
     *retry_backoff = next_backoff(*retry_backoff);
