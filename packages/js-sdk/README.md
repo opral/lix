@@ -165,8 +165,8 @@ try {
 - Every browser `openLix()` owns one dedicated worker, so database work does
   not block the page's main thread. Node.js uses the native binding's actor.
 - Node.js executes installed Component API v1 plugins with the Rust SDK's
-  Wasmtime runtime. The browser and Workerd bindings currently open without a
-  component runtime: they can use ordinary Lix storage and SQL, but do not
+  Wasmtime runtime. The browser binding currently opens without a component
+  runtime: it can use ordinary Lix storage and SQL, but does not
   execute installed plugins. A browser Component host is a separate follow-up.
 - A page Content Security Policy only needs to permit the package's same-origin
   worker. WebAssembly compilation happens inside that worker, so the required
