@@ -6728,7 +6728,13 @@ async fn load_selected_change_records_from_state(
     #[cfg(any(test, feature = "storage-benches"))]
     super::mutation_directory::record_direct_route_unique_rows(unique_locators.len());
 
-    let unique_records = if let Some(root) = state.mutation_directory_root.as_ref() {
+    let unique_records = if state
+        .mutation_directory_root
+        .as_ref()
+        .is_some_and(|root| root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT)
+    {
+        load_indirect_change_records_from_state(store, state, &unique_locators).await?
+    } else if let Some(root) = state.mutation_directory_root.as_ref() {
         let coordinates = unique_locators
             .iter()
             .map(
@@ -6829,6 +6835,74 @@ async fn load_selected_change_records_from_state(
         .map(|record| {
             record.ok_or_else(|| {
                 replacement_payload_error("selected change scatter lost a requested row")
+            })
+        })
+        .collect()
+}
+
+async fn load_indirect_change_records_from_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &AuthenticatedReplayCommitStateManifest,
+    locators: &[CommitDeltaChangeLocator],
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    let full_state = load_commit_state_manifest(store, state.commit_id)
+        .await?
+        .ok_or_else(|| {
+            replacement_payload_error("indirect selected change authority disappeared")
+        })?;
+    let manifest = expanded_commit_delta_manifest_from_commit_state(store, &full_state).await?;
+    if manifest.inline_segment().is_some() || manifest.columnar_parts.is_some() {
+        return Err(replacement_payload_error(
+            "indirect selected change authority has an invalid physical layout",
+        ));
+    }
+    let mut by_segment = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, locator) in locators.iter().enumerate() {
+        by_segment
+            .entry(usize::try_from(locator.segment_index).expect("u32 fits usize"))
+            .or_default()
+            .push(index);
+    }
+    let segment_keys = by_segment
+        .keys()
+        .map(|&segment_index| {
+            let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+                replacement_payload_error(
+                    "selected change references an out-of-range indirect segment",
+                )
+            })?;
+            commit_delta_segment_key_for_bounds(state.commit_id, segment_index, bounds)
+                .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let segment_values =
+        PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &segment_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+    let mut loaded = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
+    for ((segment_index, indices), value) in by_segment.into_iter().zip(segment_values.value) {
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            replacement_payload_error("selected change references a missing indirect segment")
+        })?;
+        let bounds = &manifest.segments[segment_index];
+        let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
+        for index in indices {
+            loaded[index] = Some(
+                decode_change_at_locator_from_decoded(
+                    &leaf,
+                    &payloads,
+                    locators[index],
+                    &state.change_account_id,
+                )?
+                .change_record,
+            );
+        }
+    }
+    loaded
+        .into_iter()
+        .map(|record| {
+            record.ok_or_else(|| {
+                replacement_payload_error("indirect selected change resolution lost a row")
             })
         })
         .collect()
@@ -10180,13 +10254,18 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                         .await?
                         .into_iter()
                         .next()
-                        .and_then(|(_, record)| record)
-                        .ok_or_else(|| {
-                            invalid_change_locator(
-                                member.change.change_id,
-                                "does not resolve to a canonical record",
-                            )
-                        })?;
+                        .and_then(|(_, record)| record);
+                    let Some(standalone) = standalone else {
+                        if member.authored {
+                            visit(member.change)?;
+                            emitted += 1;
+                            continue;
+                        }
+                        return Err(invalid_change_locator(
+                            member.change.change_id,
+                            "does not resolve to a canonical record",
+                        ));
+                    };
                     if standalone != member.change {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
