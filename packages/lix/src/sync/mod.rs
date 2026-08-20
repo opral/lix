@@ -100,13 +100,12 @@ pub(crate) enum SyncRole {
 ///
 /// There are no query scopes, hydration registries, branch bindings, or file
 /// projection caches. SQL always reads the local hot state. This object only
-/// identifies the role, wakes long-polls after local commits, and serializes
-/// application of remote repository events.
+/// identifies the role and wakes long-polls after local commits. The single
+/// runtime worker serializes remote repository events.
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
     role: Arc<RwLock<SyncRole>>,
     change_watch: Arc<tokio::sync::watch::Sender<u64>>,
-    apply_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for SyncModeState {
@@ -114,7 +113,6 @@ impl Default for SyncModeState {
         Self {
             role: Arc::new(RwLock::new(SyncRole::Disabled)),
             change_watch: Arc::new(tokio::sync::watch::channel(0).0),
-            apply_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -140,9 +138,5 @@ impl SyncModeState {
     pub(crate) fn notify_sync_change(&self) {
         self.change_watch
             .send_modify(|version| *version = version.wrapping_add(1));
-    }
-
-    pub(crate) async fn lock_apply_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        Arc::clone(&self.apply_gate).lock_owned().await
     }
 }

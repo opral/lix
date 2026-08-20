@@ -1431,7 +1431,6 @@ where
         remote_id: &str,
         response: &SyncRepositoryPullResponse,
     ) -> Result<(), LixError> {
-        let _apply_guard = self.sync_mode_state().lock_apply_gate().await;
         match response {
             SyncRepositoryPullResponse::Snapshot { .. } => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -1582,7 +1581,6 @@ where
                 "sync repository snapshot installer requires snapshot metadata",
             ));
         };
-        let _apply_guard = self.sync_mode_state().lock_apply_gate().await;
         if self.load_sync_repository_cursor(remote_id).await?.is_some() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
