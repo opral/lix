@@ -134,6 +134,10 @@ export type ServerProtocolCreateCheckpointResponse = {
 	commitId: string;
 };
 
+export type ServerProtocolRestoreRequest = {
+	commitId: string;
+};
+
 export type ServerProtocolUndoResponse = {
 	branchId: string;
 	targetCommitId: string;

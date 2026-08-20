@@ -266,6 +266,8 @@ where
         && b.atomic_metadata_preconditions.is_empty()
         && a.pending_branch_checkpoint_replacements.is_empty()
         && b.pending_branch_checkpoint_replacements.is_empty()
+        && a.pending_restore_targets.is_empty()
+        && b.pending_restore_targets.is_empty()
         && !a.await_durable_commit
         && !b.await_durable_commit
         && eligible_a
@@ -707,8 +709,18 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// delayed to the coherent commit-boundary read so its queue observation
     /// is fenced by the same branch publication batch.
     pending_branch_checkpoint_replacements: BTreeMap<String, CommitId>,
+    /// Existing branches that are being restored to an ancestor. Restore is
+    /// a ref move, but unlike a generic repoint it must carry branch-local
+    /// untracked rows forward and reset the private working-diff epoch.
+    pending_restore_targets: BTreeMap<String, PendingRestoreIntent>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRestoreIntent {
+    pub(crate) expected_head_commit_id: CommitId,
+    pub(crate) target_commit_id: CommitId,
 }
 
 struct TransactionMutationJournal {
@@ -1588,6 +1600,7 @@ where
                     pending_file_view_mutations: BTreeMap::new(),
                     pending_plugin_actor_publications: Vec::new(),
                     pending_branch_checkpoint_replacements: BTreeMap::new(),
+                    pending_restore_targets: BTreeMap::new(),
                     plugin_generation_read_guard: None,
                     plugin_generation_upgrade_guard: None,
                 },
@@ -1691,6 +1704,7 @@ where
                 return Err(error);
             }
         };
+        let restore_targets = std::mem::take(&mut transaction.pending_restore_targets);
         let commit_parent_heads = match commit::resolve_prepared_commit_parent_heads(
             transaction.branch_ctx.as_ref(),
             &read,
@@ -1763,6 +1777,7 @@ where
                 &commit_parent_heads,
                 &mut read,
                 &branch_checkpoint_bridges,
+                &restore_targets,
                 prepared_writes,
             )
             .instrument(tracing::debug_span!(
@@ -7600,6 +7615,33 @@ where
             rows,
         })
         .await?;
+        Ok(())
+    }
+
+    /// Stages an ancestor restore for commit-time lifecycle publication.
+    pub(crate) async fn restore_branch_ref(
+        &mut self,
+        branch_id: &str,
+        expected_head_commit_id: CommitId,
+        target_commit_id: CommitId,
+    ) -> Result<(), LixError> {
+        self.advance_branch_ref(branch_id, target_commit_id).await?;
+        if self
+            .pending_restore_targets
+            .insert(
+                branch_id.to_owned(),
+                PendingRestoreIntent {
+                    expected_head_commit_id,
+                    target_commit_id,
+                },
+            )
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("branch '{branch_id}' staged more than one restore"),
+            ));
+        }
         Ok(())
     }
 

@@ -30,8 +30,8 @@ use wire::{
     CreateBranchResponseBody, CreateCheckpointResponseBody, EmptyBody, ErrorEnvelope,
     ExecuteBatchRequestBody, ExecuteBatchStatementBody, ExecuteOptionsBody, ExecuteRequestBody,
     ExecuteResponseBody, HandshakeResponse, IDEMPOTENCY_KEY_HEADER, RedoResponseBody,
-    SESSION_HEADER, SERVER_PROTOCOL_VERSION, SwitchBranchRequestBody, SwitchBranchResponseBody,
-    TRANSACTION_HEADER, UndoResponseBody, closed_error, encode_engine_values,
+    RestoreRequestBody, SESSION_HEADER, SERVER_PROTOCOL_VERSION, SwitchBranchRequestBody,
+    SwitchBranchResponseBody, TRANSACTION_HEADER, UndoResponseBody, closed_error, encode_engine_values,
     is_recoverable_session_error, protocol_error, remote_error, unsupported_remote_operation,
     validate_session_id,
 };
@@ -637,6 +637,26 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     commit_id: value.commit_id,
                     change_id: String::new(),
                 })
+            })
+            .await
+        })
+        .await
+    }
+
+    pub async fn restore(&self, commit_id: String) -> Result<(), LixError> {
+        self.enqueue(|| async {
+            self.with_session_recovery(|| async {
+                self.request_json::<(), _>(
+                    "POST",
+                    self.join_path("restore")?,
+                    true,
+                    None,
+                    Some(RestoreRequestBody {
+                        commit_id: &commit_id,
+                    }),
+                    "empty",
+                )
+                .await
             })
             .await
         })

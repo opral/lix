@@ -12,6 +12,7 @@ pub(crate) enum BranchOperation {
     MergeBranch,
     MergeBranchPreview,
     CreateCheckpoint,
+    Restore,
     LoadDefaultBranch,
 }
 
@@ -23,6 +24,7 @@ impl BranchOperation {
             Self::MergeBranch => "merge_branch",
             Self::MergeBranchPreview => "merge_branch_preview",
             Self::CreateCheckpoint => "create_checkpoint",
+            Self::Restore => "restore",
             Self::LoadDefaultBranch => "load_default_branch_id",
         }
     }

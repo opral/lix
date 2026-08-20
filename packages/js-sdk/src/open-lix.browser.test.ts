@@ -116,6 +116,35 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 	}
 });
 
+test("restore moves the active branch to an ancestor through browser WASM", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const lix = await openLix();
+	try {
+		const initial = (
+			await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
+		).rows[0]?.get("commit_id") as string;
+		await lix.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+			["restore-test", "later"],
+		);
+
+		await lix.restore(initial);
+
+		expect(
+			(
+				await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
+			).rows[0]?.get("commit_id"),
+		).toBe(initial);
+		expect(
+			(await lix.execute("SELECT * FROM lix_key_value WHERE key = $1", [
+				"restore-test",
+			])).rows,
+		).toHaveLength(0);
+	} finally {
+		await lix.close();
+	}
+});
+
 test("executes a globally ordered union plan in browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	const lix = await openLix();

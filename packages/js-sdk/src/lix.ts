@@ -171,6 +171,11 @@ export class Lix {
 		return this.#runOperation(() => this.binding.createCheckpoint());
 	}
 
+	/** Moves the active branch HEAD to an ancestor commit without creating a commit. */
+	async restore(commitId: string): Promise<void> {
+		return this.#runOperation(() => this.binding.restore(commitId));
+	}
+
 	async undo(): Promise<UndoReceipt> {
 		return this.#runOperation(() => this.binding.undo());
 	}

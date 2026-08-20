@@ -288,6 +288,7 @@ pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("POST", "/lix/v1/file/upsert-batch"),
     ("POST", "/lix/v1/branch/create"),
     ("POST", "/lix/v1/checkpoint/create"),
+    ("POST", "/lix/v1/restore"),
     ("POST", "/lix/v1/undo"),
     ("POST", "/lix/v1/redo"),
     ("POST", "/lix/v1/branch/switch"),
@@ -1537,6 +1538,7 @@ where
                 | (&Method::POST, "/lix/v1/execute-batch")
                 | (&Method::POST, "/lix/v1/transaction/execute")
                 | (&Method::POST, "/lix/v1/branch/create")
+                | (&Method::POST, "/lix/v1/restore")
                 | (&Method::POST, "/lix/v1/branch/switch")
                 | (&Method::POST, "/lix/v1/observe")
                 | (&Method::POST, "/lix/v1/observe/multiplex")
@@ -1621,6 +1623,9 @@ where
             }
             (&Method::POST, "/lix/v1/checkpoint/create") => {
                 result_response(create_checkpoint(lease).await)
+            }
+            (&Method::POST, "/lix/v1/restore") => {
+                result_response(restore(lease, json_request!(RestoreRequest)).await)
             }
             (&Method::POST, "/lix/v1/undo") => result_response(undo(lease).await),
             (&Method::POST, "/lix/v1/redo") => result_response(redo(lease).await),
@@ -2757,6 +2762,20 @@ where
     Ok(Json(CreateCheckpointResponse {
         commit_id: receipt.commit_id,
     }))
+}
+
+async fn restore<S>(
+    lease: SessionLease<S>,
+    Json(request): Json<RestoreRequest>,
+) -> Result<StatusCode, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let commit_id = required_non_empty(request.commit_id, "commitId")?;
+    lease
+        .run_durable(move |lix| async move { lix.restore(commit_id).await })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn undo<S>(lease: SessionLease<S>) -> Result<Json<UndoResponse>, ApiError>
@@ -3933,6 +3952,12 @@ struct CreateCheckpointResponse {
     commit_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreRequest {
+    commit_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UndoResponse {
@@ -4433,6 +4458,7 @@ mod tests {
                 ("POST", "/lix/v1/file/upsert-batch") => "upsertFileBatch",
                 ("POST", "/lix/v1/branch/create") => "createBranch",
                 ("POST", "/lix/v1/checkpoint/create") => "createCheckpoint",
+                ("POST", "/lix/v1/restore") => "restore",
                 ("POST", "/lix/v1/undo") => "undo",
                 ("POST", "/lix/v1/redo") => "redo",
                 ("POST", "/lix/v1/branch/switch") => "switchBranch",
@@ -7529,6 +7555,65 @@ mod tests {
         assert_eq!(
             response_json(head).await["rows"][0][0],
             json!({ "kind": "text", "value": checkpoint_id })
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_moves_the_pinned_branch_to_an_ancestor() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let initial_head = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT lix_active_branch_commit_id() AS commit_id"
+            })),
+        )
+        .await;
+        let initial_commit_id = response_json(initial_head).await["rows"][0][0]["value"]
+            .as_str()
+            .expect("initial commit id")
+            .to_string();
+
+        let inserted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('restore-test', 'later')"
+            })),
+        )
+        .await;
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let restored = request(
+            &app.router,
+            "POST",
+            "/lix/v1/restore",
+            Some(&session_id),
+            Some(json!({ "commitId": initial_commit_id })),
+        )
+        .await;
+        if restored.status() != StatusCode::NO_CONTENT {
+            panic!("restore failed: {}", response_json(restored).await);
+        }
+
+        let rows = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'restore-test'"
+            })),
+        )
+        .await;
+        assert_eq!(
+            response_json(rows).await["rows"][0][0],
+            json!({ "kind": "int", "value": 0 })
         );
     }
 

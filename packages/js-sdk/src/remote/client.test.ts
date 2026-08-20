@@ -775,6 +775,46 @@ test("remote createCheckpoint posts no body and decodes the receipt", async () =
 	await lix.close();
 });
 
+test("remote restore posts the commit id", async () => {
+	const requests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: "session-1",
+					});
+				}
+				if (pathname.endsWith("/restore")) {
+					return new Response(null, { status: 204 });
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				throw new Error(`Unexpected request: ${pathname}`);
+			}) as typeof fetch,
+		},
+	});
+
+	await expect(lix.restore("target-commit-id")).resolves.toBeUndefined();
+	const request = requests.find((candidate) =>
+		new URL(candidate.url).pathname.endsWith("/restore"),
+	);
+	expect(request?.method).toBe("POST");
+	expect(request?.headers.get("lix-session-id")).toBe("session-1");
+	expect(await request?.json()).toEqual({ commitId: "target-commit-id" });
+
+	await lix.close();
+});
+
 test("remote undo and redo decode branch-history receipts", async () => {
 	const lix = await openLix({
 		server: {
