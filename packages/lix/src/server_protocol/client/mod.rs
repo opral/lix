@@ -310,7 +310,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state
                 .blobs
-                .prepare(params, |index| request_blob_slot("execute", sql, index, None))
+                .prepare(params, |index| request_blob_slot(sql, index, None))
         } else {
             PreparedRequestParams {
                 params: encode_engine_values(params)?,
@@ -374,12 +374,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                         statement.sql.clone(),
                         statement.label.clone(),
                         state.blobs.prepare(&statement.params, |param_index| {
-                            request_blob_slot(
-                                "batch",
-                                &statement.sql,
-                                param_index,
-                                Some(statement_index),
-                            )
+                            request_blob_slot(&statement.sql, param_index, Some(statement_index))
                         }),
                     )
                 })

@@ -100,13 +100,12 @@ struct PreparedRequestParam {
 }
 
 pub fn request_blob_slot(
-    kind: &str,
     sql: &str,
     param_index: usize,
     statement_index: Option<usize>,
 ) -> String {
-    serde_json::to_string(&(kind, statement_index, sql, param_index))
-        .unwrap_or_else(|_| format!("{kind}:{statement_index:?}:{sql}:{param_index}"))
+    serde_json::to_string(&(statement_index, sql, param_index))
+        .unwrap_or_else(|_| format!("{statement_index:?}:{sql}:{param_index}"))
 }
 
 fn prepare_param(cache: &BlobCache, value: &Value, slot: &str) -> PreparedRequestParam {
