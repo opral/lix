@@ -10047,8 +10047,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
     // reclaimed. The selected member is a reference, not a packed canonical
     // payload, so it intentionally has no locator to name. Keep deduplication
     // memory proportional only to those unlocated IDs, not ordinary history.
-    let mut unlocated_changes =
-        BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
+    let mut unlocated_change_ids = BTreeSet::<crate::changelog::ChangeId>::new();
     let range = StorageKeyRange {
         lower: Bound::Unbounded,
         upper: Bound::Unbounded,
@@ -10197,19 +10196,9 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                             ),
                         ));
                     }
-                    if let Some(canonical) = unlocated_changes.get(&member.change.change_id) {
-                        if canonical != &standalone {
-                            return Err(LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "tracked_state change '{}' has conflicting authoritative packed payloads",
-                                    member.change.change_id
-                                ),
-                            ));
-                        }
+                    if !unlocated_change_ids.insert(member.change.change_id) {
                         continue;
                     }
-                    unlocated_changes.insert(member.change.change_id, standalone);
                     visit(member.change)?;
                     emitted += 1;
                 }
