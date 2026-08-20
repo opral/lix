@@ -10042,6 +10042,13 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
     visit: impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
 ) -> Result<usize, LixError> {
     let mut visit = visit;
+    // A sparse replica can retain a canonical standalone change and a selected
+    // checkpoint member after the authored commit body becomes lazy or is
+    // reclaimed. The selected member is a reference, not a packed canonical
+    // payload, so it intentionally has no locator to name. Keep deduplication
+    // memory proportional only to those unlocated IDs, not ordinary history.
+    let mut unlocated_changes =
+        BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
     let range = StorageKeyRange {
         lower: Bound::Unbounded,
         upper: Bound::Unbounded,
@@ -10111,30 +10118,35 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[], true)
                         .await?;
                 for member in members {
-                    if member.authored {
-                        visit(member.change)?;
-                        emitted += 1;
-                    } else if is_payload_free_selected_tombstone(&member) {
+                    if !member.authored && is_payload_free_selected_tombstone(&member) {
                         // Cascade tombstones preserve identity history but do
                         // not introduce another public changelog fact.
                         continue;
-                    } else {
-                        let locator = load_canonical_change_locator(store, member.change.change_id)
-                            .await?
-                            .ok_or_else(|| {
-                                invalid_change_locator(
-                                    member.change.change_id,
-                                    "does not resolve to a canonical record",
-                                )
-                            })?;
-                        if locator.commit_id == member.value.commit_id
+                    }
+                    let is_current_occurrence = |locator: CommitDeltaChangeLocator| {
+                        locator.commit_id == member.value.commit_id
                             && locator.segment_index == member.segment_index
                             && u32::from(locator.ordinal) == member.ordinal
-                        {
-                            visit(member.change)?;
-                            emitted += 1;
-                            continue;
-                        }
+                    };
+                    // Locally-authored direct IDs name their packed slot, so
+                    // they retain the zero-read scan path. Explicit IDs and
+                    // selected copies consult the movable canonical locator.
+                    if member.authored
+                        && direct_change_locator(member.change.change_id)
+                            .is_some_and(is_current_occurrence)
+                    {
+                        visit(member.change)?;
+                        emitted += 1;
+                        continue;
+                    }
+                    let locator =
+                        load_canonical_change_locator(store, member.change.change_id).await?;
+                    if locator.is_some_and(is_current_occurrence) {
+                        visit(member.change)?;
+                        emitted += 1;
+                        continue;
+                    }
+                    if locator.is_some() {
                         let canonical =
                             load_change_records_by_ids(store, &[member.change.change_id])
                                 .await?
@@ -10154,7 +10166,52 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                                 ),
                             ));
                         }
+                        continue;
                     }
+
+                    // An unlocated selected reference is valid only when its
+                    // immutable standalone payload authenticates the hydrated
+                    // copy. The same check safely deduplicates a still-present
+                    // authored occurrence during reclamation.
+                    let standalone = ChangelogContext::new()
+                        .reader(store)
+                        .load_changes(ChangeLoadRequest {
+                            change_ids: &[member.change.change_id],
+                        })
+                        .await?
+                        .into_iter()
+                        .next()
+                        .and_then(|(_, record)| record)
+                        .ok_or_else(|| {
+                            invalid_change_locator(
+                                member.change.change_id,
+                                "does not resolve to a canonical record",
+                            )
+                        })?;
+                    if standalone != member.change {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state change '{}' has conflicting standalone and packed payloads",
+                                member.change.change_id
+                            ),
+                        ));
+                    }
+                    if let Some(canonical) = unlocated_changes.get(&member.change.change_id) {
+                        if canonical != &standalone {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "tracked_state change '{}' has conflicting authoritative packed payloads",
+                                    member.change.change_id
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
+                    unlocated_changes.insert(member.change.change_id, standalone);
+                    visit(member.change)?;
+                    emitted += 1;
                 }
             }
         }

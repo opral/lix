@@ -5629,6 +5629,81 @@ mod tests {
             1,
             "selected fallback must not duplicate an authored change imported in the same batch",
         );
+        drop(read);
+
+        // Reproduce the sparse-replica failure: the selected checkpoint has a
+        // canonical standalone payload, but its packed locator is absent.
+        let adapter = replica.storage_adapter();
+        let mut missing_locator = adapter.new_write_set();
+        crate::tracked_state::stage_delete_change_locators(
+            &mut missing_locator,
+            [shared_change_id_parsed],
+        );
+        adapter
+            .commit_write_set(missing_locator, StorageWriteOptions::default())
+            .await
+            .expect("missing-locator fixture should commit");
+        let missing_locator_read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("missing-locator scan should open");
+        let changes =
+            crate::tracked_state::scan_change_records_from_commit_deltas(&missing_locator_read)
+                .await
+                .expect("standalone canonical payload should recover a missing locator");
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| change.change_id == shared_change_id_parsed)
+                .count(),
+            1,
+            "authored and selected packed copies must remain deduplicated without a locator",
+        );
+        drop(missing_locator_read);
+
+        let retirement_read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authored retirement read should open");
+        let authored_manifest = load_commit_state_manifest(&retirement_read, authored_commit_id)
+            .await
+            .expect("authored manifest lookup should succeed")
+            .expect("authored manifest should exist before reclamation");
+        let mut retirement = adapter.new_write_set();
+        crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
+            &retirement_read,
+            &mut retirement,
+            authored_commit_id,
+            &authored_manifest,
+        )
+        .await
+        .expect("authored physical authority should retire");
+        drop(retirement_read);
+        adapter
+            .commit_write_set(retirement, StorageWriteOptions::default())
+            .await
+            .expect("authored retirement should commit");
+
+        let warm = replica
+            .open_another_session()
+            .await
+            .expect("warm sparse replica should reopen");
+        let warm_read = warm
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("warm sparse change scan should open");
+        let changes = crate::tracked_state::scan_change_records_from_commit_deltas(&warm_read)
+            .await
+            .expect("selected checkpoint should use its standalone canonical fallback");
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| change.change_id == shared_change_id_parsed)
+                .count(),
+            1,
+            "warm sparse scans must emit an unlocated selected change exactly once",
+        );
     }
 
     #[tokio::test]
