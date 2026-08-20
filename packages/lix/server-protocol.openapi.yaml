@@ -589,10 +589,14 @@ components:
           description: Branch working-diff checkpoint at headCommitId. Required and non-null for a headed update; null only when deleting the branch.
     SyncPushRequest:
       type: object
-      required: [commits, refUpdates]
+      required: [commits, refUpdates, inlineBlobs]
       properties:
         commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
         refUpdates: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
+        inlineBlobs:
+          type: array
+          description: Self-contained small blobs referenced by commits. Larger blobs use the manifest and chunk endpoints.
+          items: { $ref: "#/components/schemas/SyncBlobManifest" }
     SyncPushResponse:
       type: object
       required: [cursor]
@@ -653,11 +657,14 @@ components:
         continuation: { type: [string, "null"], maxLength: 4096 }
     SyncEvent:
       type: object
-      required: [cursor, commits, refUpdates]
+      required: [cursor, commits, refUpdates, inlineBlobs]
       properties:
         cursor: { type: integer, minimum: 1 }
         commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
         refUpdates: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
+        inlineBlobs:
+          type: array
+          items: { $ref: "#/components/schemas/SyncBlobManifest" }
     SyncPullResponse:
       oneOf:
         - type: object

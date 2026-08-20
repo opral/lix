@@ -22,6 +22,7 @@ pub(crate) fn encoded_delta_event_len(
         cursor: u64,
         commits: &'a [&'a SyncCommit],
         ref_updates: &'a [SyncRefUpdate],
+        inline_blobs: &'a [SyncBlobManifest],
     }
 
     #[derive(Serialize)]
@@ -39,6 +40,7 @@ pub(crate) fn encoded_delta_event_len(
             cursor,
             commits,
             ref_updates,
+            inline_blobs: &[],
         }],
     })
     .map(|encoded| encoded.len())
@@ -106,6 +108,9 @@ impl<'de> Deserialize<'de> for SyncRefUpdate {
 pub struct SyncPushRequest {
     pub commits: Vec<SyncCommit>,
     pub ref_updates: Vec<SyncRefUpdate>,
+    /// Self-contained small blobs referenced by `commits`. Larger blobs keep
+    /// using the manifest/chunk transfer lane.
+    pub inline_blobs: Vec<SyncBlobManifest>,
 }
 
 /// Acknowledges the repository cursor assigned to a successful push.
@@ -245,6 +250,8 @@ pub struct SyncEvent {
     pub cursor: u64,
     pub commits: Vec<SyncCommit>,
     pub ref_updates: Vec<SyncRefUpdate>,
+    /// Self-contained small blobs referenced by `commits`.
+    pub inline_blobs: Vec<SyncBlobManifest>,
 }
 
 /// Bootstrap is hot state plus lightweight topology; delta pages contain
@@ -462,6 +469,7 @@ mod tests {
                 cursor: 3,
                 commits: Vec::new(),
                 ref_updates: ref_updates.clone(),
+                inline_blobs: Vec::new(),
             }],
         })
         .expect("serialize delta response")

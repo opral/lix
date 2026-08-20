@@ -2345,8 +2345,11 @@ fn ensure_sync_push_event_fits(
     max_bytes: usize,
 ) -> Result<(), ApiError> {
     let commits = request.commits.iter().collect::<Vec<_>>();
-    let encoded_len =
-        crate::sync::encoded_delta_event_len(u64::MAX, &commits, &request.ref_updates)?;
+    let encoded_len = crate::sync::encoded_delta_event_len(
+        u64::MAX,
+        &commits,
+        &request.ref_updates,
+    )?;
     if encoded_len > max_bytes {
         return Err(ApiError::sync_push_event_too_large(max_bytes));
     }
@@ -5051,6 +5054,7 @@ mod tests {
                 head_commit_id: None,
                 checkpoint_commit_id: None,
             }],
+            inline_blobs: Vec::new(),
         };
         ensure_sync_push_event_fits(&request, 1024)
             .expect("the small synthetic event should fit a normal envelope");
@@ -7475,7 +7479,7 @@ mod tests {
             "POST",
             "/lix/v1/sync/push",
             Some(&session_id),
-            Some(json!({ "commits": [], "refUpdates": [] })),
+            Some(json!({ "commits": [], "refUpdates": [], "inlineBlobs": [] })),
         )
         .await;
         assert_eq!(empty_push.status(), StatusCode::BAD_REQUEST);
@@ -7558,6 +7562,90 @@ mod tests {
             }
         }
         assert!(row_count > 0, "bootstrap fixture should expose hot rows");
+    }
+
+    #[tokio::test]
+    async fn sync_router_roundtrips_inline_files_without_blob_routes() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let snapshot = request(
+            &app.router,
+            "GET",
+            "/lix/v1/sync/pull",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot = response_json(snapshot).await;
+        let cursor = snapshot["cursor"].as_u64().expect("snapshot cursor");
+
+        app.lix
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST('' AS BYTEA))",
+                &[Value::Text("/empty-inline.md".to_owned())],
+            )
+            .await
+            .expect("empty authority file should commit");
+        let pull = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/pull?after={cursor}&limit=1"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(pull.status(), StatusCode::OK);
+        let empty_pull = response_json(pull).await;
+        assert!(
+            empty_pull["events"][0]["inlineBlobs"]
+                .as_array()
+                .expect("empty event inline blobs")
+                .is_empty(),
+            "an intrinsic empty file references no binary blob and needs no blob route",
+        );
+        let empty_cursor = empty_pull["cursor"].as_u64().expect("empty file cursor");
+
+        app.lix
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST('inline' AS BYTEA))",
+                &[Value::Text("/nonempty-inline.md".to_owned())],
+            )
+            .await
+            .expect("non-empty authority file should commit");
+        let pull = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/pull?after={empty_cursor}&limit=1"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(pull.status(), StatusCode::OK);
+        let pull = response_json(pull).await;
+        let event = &pull["events"][0];
+        let inline = event["inlineBlobs"]
+            .as_array()
+            .and_then(|inline| inline.first())
+            .unwrap_or_else(|| panic!("non-empty file event omitted inline blob: {pull}"));
+        assert_eq!(inline["sizeBytes"], 6);
+        assert_eq!(inline["inlineBytesBase64"], "aW5saW5l");
+
+        let replay = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/push",
+            Some(&session_id),
+            Some(json!({
+                "commits": event["commits"],
+                "refUpdates": [],
+                "inlineBlobs": event["inlineBlobs"],
+            })),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay = response_json(replay).await;
+        assert_eq!(replay["cursor"], pull["cursor"]);
     }
 
     #[tokio::test]
@@ -7681,6 +7769,7 @@ mod tests {
         let forged_target = self::app().await;
         let forged_request: SyncPushRequest = serde_json::from_value(json!({
             "commits": forged_commits,
+            "inlineBlobs": [],
             "refUpdates": [{
                 "branchId": "01920000-0000-7000-8000-000000001503",
                 "expectedHeadCommitId": null,
@@ -7700,6 +7789,7 @@ mod tests {
         let target = self::app().await;
         let replay_request: SyncPushRequest = serde_json::from_value(json!({
             "commits": imported.into_values().collect::<Vec<_>>(),
+            "inlineBlobs": [],
             "refUpdates": [{
                 "branchId": "01920000-0000-7000-8000-000000001502",
                 "expectedHeadCommitId": null,
@@ -7955,7 +8045,10 @@ mod tests {
         assert_eq!(blobs[0]["sizeBytes"], manifest["sizeBytes"]);
         assert_eq!(blobs[0]["chunks"], manifest["chunks"]);
         assert!(blobs[0]["inlineBytesBase64"].as_str().is_some());
-        assert_eq!(blobs[1], empty_manifest);
+        assert_eq!(blobs[1]["blobId"], empty_manifest["blobId"]);
+        assert_eq!(blobs[1]["sizeBytes"], 0);
+        assert_eq!(blobs[1]["chunks"], json!([]));
+        assert_eq!(blobs[1]["inlineBytesBase64"], "");
 
         let chunk = request(
             &app.router,
@@ -8105,6 +8198,7 @@ mod tests {
                 serde_json::to_vec(&json!({
                     "commits": [foreign_commit],
                     "refUpdates": [],
+                    "inlineBlobs": [],
                 }))
                 .expect("encode sync push"),
             ))

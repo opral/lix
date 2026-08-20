@@ -268,18 +268,32 @@ pub(crate) fn stage_verified_raw_chunk(
     })
 }
 
-/// Verifies and stages a one-chunk canonical blob carried inline with its manifest.
+/// Verifies and stages an empty or one-chunk canonical blob carried inline
+/// with its manifest.
 pub(crate) fn stage_verified_inline_canonical_blob(
     writes: &mut StorageWriteSet,
     manifest: &CanonicalBlobManifest,
     bytes: &[u8],
 ) -> Result<BlobWriteReceipt, LixError> {
     validate_manifest_receipts(manifest)?;
-    let [chunk] = manifest.chunks.as_slice() else {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "binary CAS inline manifest must contain exactly one chunk",
-        ));
+    let chunk = match manifest.chunks.as_slice() {
+        [] if bytes.is_empty() => {
+            let receipt = crate::binary_cas::kv::stage_upload_manifest(writes, &[])?;
+            if receipt.hash != manifest.blob_id || receipt.size_bytes != manifest.size_bytes {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "binary CAS inline empty manifest staging changed its identity",
+                ));
+            }
+            return Ok(receipt);
+        }
+        [chunk] => chunk,
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "binary CAS inline manifest must contain zero or one chunk",
+            ));
+        }
     };
     if bytes.len() as u64 != manifest.size_bytes || bytes.len() as u64 != chunk.size_bytes {
         return Err(LixError::new(

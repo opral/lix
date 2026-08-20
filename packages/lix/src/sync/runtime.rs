@@ -553,11 +553,11 @@ where
     // Publish completed local commits before waiting for remote work. Commit
     // identity and ref compare-and-swap make retry after a lost response safe.
     let ref_conflicted = loop {
-        let Some(request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
+        let Some(mut request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
             break false;
         };
-        push_request_blobs(lix, transport, &request).await?;
-        match transport.push(&request).await {
+        let result = push_with_inline_fallback(lix, transport, &mut request).await;
+        match result {
             Ok(receipt) => {
                 catch_up_to(lix, remote_id, transport, receipt.cursor, delta_pull_limit).await?;
             }
@@ -1039,7 +1039,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    let mut blob_ids = blob_ids_from_commits(commits)?;
+    let mut blob_ids = super::repository::sync_commit_blob_ids(commits)?;
     blob_ids.extend(blob_ids_from_rows(
         rows.iter()
             .map(|row| (row.schema_key.as_str(), row.snapshot.as_ref())),
@@ -1079,7 +1079,15 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    for blob_id in blob_ids_from_commits(&request.commits)? {
+    let inline_blob_ids = request
+        .inline_blobs
+        .iter()
+        .map(|manifest| manifest.blob_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for blob_id in super::repository::sync_commit_blob_ids(&request.commits)? {
+        if inline_blob_ids.contains(blob_id.as_str()) {
+            continue;
+        }
         let manifest = lix
             .get_sync_blob_manifest(&blob_id)
             .await?
@@ -1111,6 +1119,28 @@ where
     Ok(())
 }
 
+async fn push_with_inline_fallback<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    request: &mut SyncPushRequest,
+) -> Result<super::SyncPushResponse, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    push_request_blobs(lix, transport, request).await?;
+    let first = transport.push(request).await;
+    if first.as_ref().is_err_and(is_request_too_large) && !request.inline_blobs.is_empty() {
+        // A server may configure a lower request-body cap than the protocol
+        // default. Inline blobs are optional acceleration: retry the exact
+        // commit/ref request once through the ordinary manifest lane.
+        request.inline_blobs.clear();
+        push_request_blobs(lix, transport, request).await?;
+        return transport.push(request).await;
+    }
+    first
+}
+
 async fn prepare_pull<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -1124,9 +1154,12 @@ where
         return Ok(());
     };
     let mut blob_ids = BTreeSet::new();
+    let mut inline_blob_ids = BTreeSet::new();
     for event in events {
-        blob_ids.extend(blob_ids_from_commits(&event.commits)?);
+        blob_ids.extend(super::repository::sync_commit_blob_ids(&event.commits)?);
+        inline_blob_ids.extend(event.inline_blobs.iter().map(|manifest| manifest.blob_id.clone()));
     }
+    blob_ids.retain(|blob_id| !inline_blob_ids.contains(blob_id));
     ensure_blob_manifests(lix, transport, blob_ids).await?;
     let included = events
         .iter()
@@ -1186,16 +1219,6 @@ where
         }
     }
     Ok(())
-}
-
-fn blob_ids_from_commits(commits: &[super::SyncCommit]) -> Result<BTreeSet<String>, LixError> {
-    blob_ids_from_rows(commits.iter().flat_map(|commit| {
-        commit
-            .members
-            .iter()
-            .filter(|member| !member.deleted)
-            .map(|member| (member.schema_key.as_str(), member.snapshot.as_ref()))
-    }))
 }
 
 fn blob_ids_from_rows<'a>(
@@ -1313,6 +1336,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use base64::Engine as _;
     use crate::engine::Engine;
     use crate::storage::Memory;
     use crate::{Value, open_lix};
@@ -1491,6 +1515,295 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct BlobCallTransport {
+        manifests: BTreeMap<String, super::super::SyncBlobManifest>,
+        get_calls: Arc<Mutex<Vec<Vec<String>>>>,
+        register_calls: Arc<Mutex<Vec<String>>>,
+        push_calls: Arc<Mutex<Vec<usize>>>,
+        reject_inline_push: bool,
+    }
+
+    impl SyncTransport for BlobCallTransport {
+        fn active_account_id(&self) -> &str {
+            crate::ANONYMOUS_ACCOUNT_ID
+        }
+
+        fn push<'a>(
+            &'a self,
+            request: &'a SyncPushRequest,
+        ) -> super::super::SyncTransportFuture<'a, super::super::SyncPushResponse> {
+            Box::pin(async move {
+                self.push_calls
+                    .lock()
+                    .expect("push calls lock")
+                    .push(request.inline_blobs.len());
+                if self.reject_inline_push && !request.inline_blobs.is_empty() {
+                    Err(LixError::new(
+                        SYNC_REQUEST_TOO_LARGE_CODE,
+                        "test server inline body cap",
+                    ))
+                } else {
+                    Ok(super::super::SyncPushResponse { cursor: 1 })
+                }
+            })
+        }
+
+        fn pull(
+            &self,
+            _after: Option<u64>,
+            _limit: usize,
+        ) -> super::super::SyncTransportFuture<'_, SyncRepositoryPullResponse> {
+            Box::pin(async { Err(LixError::unknown("unused blob-call pull")) })
+        }
+
+        fn snapshot_rows<'a>(
+            &'a self,
+            _branch_id: &'a str,
+            _head_commit_id: &'a str,
+            _continuation: Option<&'a str>,
+            _limit: usize,
+        ) -> super::super::SyncTransportFuture<'a, super::super::SyncSnapshotRowPage> {
+            Box::pin(async { Err(LixError::unknown("unused blob-call snapshot")) })
+        }
+
+        fn history<'a>(
+            &'a self,
+            _head: &'a str,
+            _limit: usize,
+        ) -> super::super::SyncTransportFuture<'a, super::super::SyncHistoryResponse> {
+            Box::pin(async { Err(LixError::unknown("unused blob-call history")) })
+        }
+
+        fn get_blobs<'a>(
+            &'a self,
+            blob_ids: &'a [String],
+        ) -> super::super::SyncTransportFuture<'a, Vec<super::super::SyncBlobManifest>> {
+            Box::pin(async move {
+                self.get_calls
+                    .lock()
+                    .expect("get calls lock")
+                    .push(blob_ids.to_vec());
+                Ok(blob_ids
+                    .iter()
+                    .filter_map(|blob_id| self.manifests.get(blob_id).cloned())
+                    .collect())
+            })
+        }
+
+        fn register_blob<'a>(
+            &'a self,
+            manifest: &'a super::super::SyncBlobManifest,
+        ) -> super::super::SyncTransportFuture<'a, super::super::SyncBlobRegistration> {
+            Box::pin(async move {
+                self.register_calls
+                    .lock()
+                    .expect("register calls lock")
+                    .push(manifest.blob_id.clone());
+                Ok(super::super::SyncBlobRegistration {
+                    missing_chunk_ids: Vec::new(),
+                })
+            })
+        }
+
+        fn get_chunk<'a>(
+            &'a self,
+            _chunk_id: &'a str,
+        ) -> super::super::SyncTransportFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Err(LixError::unknown("unused blob-call chunk get")) })
+        }
+
+        fn put_chunk<'a>(
+            &'a self,
+            _chunk_id: &'a str,
+            _bytes: &'a [u8],
+        ) -> super::super::SyncTransportFuture<'a, ()> {
+            Box::pin(async { Err(LixError::unknown("unused blob-call chunk put")) })
+        }
+    }
+
+    fn blob_ref_commit(blob_id: &str) -> super::super::SyncCommit {
+        super::super::SyncCommit {
+            commit_id: crate::changelog::CommitId::for_test_label("runtime-inline-commit")
+                .to_string(),
+            parent_commit_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            selected_source_commit_id: None,
+            members: vec![super::super::commit::SyncCommitMember {
+                change_id: crate::changelog::ChangeId::for_test_label("runtime-inline-change")
+                    .to_string(),
+                authored: true,
+                schema_key: "lix_binary_blob_ref".to_owned(),
+                file_id: None,
+                row_pk: serde_json::json!(["runtime-inline"]),
+                deleted: false,
+                snapshot: Some(serde_json::json!({ "blob_hash": blob_id })),
+                metadata: None,
+                row_created_at: "2026-01-01T00:00:00Z".to_owned(),
+                row_updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                change_created_at: "2026-01-01T00:00:00Z".to_owned(),
+                origin_key: None,
+            }],
+        }
+    }
+
+    fn wire_blob(bytes: &[u8], inline: bool) -> super::super::SyncBlobManifest {
+        let canonical = crate::binary_cas::CanonicalBlobManifest::from_bytes(bytes);
+        super::super::SyncBlobManifest {
+            blob_id: canonical.blob_id.to_hex(),
+            size_bytes: canonical.size_bytes,
+            chunks: canonical
+                .chunks
+                .iter()
+                .map(|chunk| super::super::SyncBlobChunk {
+                    chunk_id: chunk.hash.to_hex(),
+                    size_bytes: chunk.size_bytes,
+                })
+                .collect(),
+            inline_bytes_base64: inline.then(|| {
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_blobs_skip_manifest_network_lanes_while_large_blobs_fall_back() {
+        let lix = open_lix().await.expect("runtime blob fixture opens");
+        let inline = wire_blob(b"small inline runtime payload", true);
+        let inline_commit = blob_ref_commit(&inline.blob_id);
+        let get_calls = Arc::new(Mutex::new(Vec::new()));
+        let register_calls = Arc::new(Mutex::new(Vec::new()));
+        let push_calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = BlobCallTransport {
+            manifests: BTreeMap::new(),
+            get_calls: Arc::clone(&get_calls),
+            register_calls: Arc::clone(&register_calls),
+            push_calls: Arc::clone(&push_calls),
+            reject_inline_push: false,
+        };
+        let mut push = SyncPushRequest {
+            commits: vec![inline_commit.clone()],
+            ref_updates: Vec::new(),
+            inline_blobs: vec![inline.clone()],
+        };
+        push_with_inline_fallback(&lix, &transport, &mut push)
+            .await
+            .expect("embedded outbound blob pushes directly");
+        assert_eq!(*push_calls.lock().expect("push calls lock"), vec![1]);
+        let inline_delta = SyncRepositoryPullResponse::Delta {
+            cursor: 1,
+            events: vec![super::super::SyncEvent {
+                cursor: 1,
+                commits: vec![inline_commit],
+                ref_updates: Vec::new(),
+                inline_blobs: vec![inline],
+            }],
+        };
+        prepare_pull(&lix, &transport, &inline_delta)
+            .await
+            .expect("embedded inbound blob needs no fetch");
+
+        let empty = wire_blob(&[], true);
+        let empty_commit = blob_ref_commit(&empty.blob_id);
+        let mut empty_push = SyncPushRequest {
+            commits: vec![empty_commit.clone()],
+            ref_updates: Vec::new(),
+            inline_blobs: vec![empty.clone()],
+        };
+        push_with_inline_fallback(&lix, &transport, &mut empty_push)
+            .await
+            .expect("empty blob pushes inline without a manifest request");
+        prepare_pull(
+            &lix,
+            &transport,
+            &SyncRepositoryPullResponse::Delta {
+                cursor: 2,
+                events: vec![super::super::SyncEvent {
+                    cursor: 2,
+                    commits: vec![empty_commit],
+                    ref_updates: Vec::new(),
+                    inline_blobs: vec![empty],
+                }],
+            },
+        )
+        .await
+        .expect("empty blob arrives inline without a manifest fetch");
+        assert_eq!(*push_calls.lock().expect("push calls lock"), vec![1, 1]);
+        assert!(get_calls.lock().expect("get calls lock").is_empty());
+        assert!(
+            register_calls
+                .lock()
+                .expect("register calls lock")
+                .is_empty()
+        );
+
+        let large = wire_blob(&vec![7_u8; 65 * 1024], false);
+        let large_commit = blob_ref_commit(&large.blob_id);
+        let large_get_calls = Arc::new(Mutex::new(Vec::new()));
+        let large_transport = BlobCallTransport {
+            manifests: BTreeMap::from([(large.blob_id.clone(), large)]),
+            get_calls: Arc::clone(&large_get_calls),
+            register_calls: Arc::new(Mutex::new(Vec::new())),
+            push_calls: Arc::new(Mutex::new(Vec::new())),
+            reject_inline_push: false,
+        };
+        prepare_pull(
+            &lix,
+            &large_transport,
+            &SyncRepositoryPullResponse::Delta {
+                cursor: 2,
+                events: vec![super::super::SyncEvent {
+                    cursor: 2,
+                    commits: vec![large_commit],
+                    ref_updates: Vec::new(),
+                    inline_blobs: Vec::new(),
+                }],
+            },
+        )
+        .await
+        .expect("large blob retains manifest fetch lane");
+        assert_eq!(large_get_calls.lock().expect("large get calls lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lower_server_body_cap_retries_inline_push_through_manifest_lane() {
+        let lix = open_lix().await.expect("inline fallback fixture opens");
+        let bytes = b"inline fallback payload";
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+            &[
+                Value::Text("/inline-fallback.bin".to_owned()),
+                Value::Blob(bytes.to_vec().into()),
+            ],
+        )
+        .await
+        .expect("inline fallback blob should commit locally");
+        let inline = wire_blob(bytes, true);
+        let mut request = SyncPushRequest {
+            commits: vec![blob_ref_commit(&inline.blob_id)],
+            ref_updates: Vec::new(),
+            inline_blobs: vec![inline],
+        };
+        let register_calls = Arc::new(Mutex::new(Vec::new()));
+        let push_calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = BlobCallTransport {
+            manifests: BTreeMap::new(),
+            get_calls: Arc::new(Mutex::new(Vec::new())),
+            register_calls: Arc::clone(&register_calls),
+            push_calls: Arc::clone(&push_calls),
+            reject_inline_push: true,
+        };
+        let response = push_with_inline_fallback(&lix, &transport, &mut request)
+            .await
+            .expect("manifest fallback should fit lower server body cap");
+        assert_eq!(response.cursor, 1);
+        assert!(request.inline_blobs.is_empty());
+        assert_eq!(*push_calls.lock().expect("push calls lock"), vec![1, 0]);
+        assert_eq!(register_calls.lock().expect("register calls lock").len(), 1);
+    }
+
+    #[derive(Debug)]
     struct CappedPullTransport {
         max_items: usize,
         calls: Arc<Mutex<Vec<usize>>>,
@@ -1528,6 +1841,7 @@ mod tests {
                         cursor: after + 1,
                         commits: Vec::new(),
                         ref_updates: Vec::new(),
+                        inline_blobs: Vec::new(),
                     }],
                 })
             })
@@ -1952,6 +2266,7 @@ mod tests {
                     cursor: 11,
                     commits: Vec::new(),
                     ref_updates: Vec::new(),
+                    inline_blobs: Vec::new(),
                 }],
             },
         )

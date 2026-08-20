@@ -9,7 +9,9 @@ use crate::binary_cas::{
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
     stage_verified_raw_chunk,
 };
-use crate::storage_adapter::{Storage, StorageReadOptions, StorageWriteOptions};
+use crate::storage_adapter::{
+    Storage, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+};
 use crate::{Lix, LixError};
 
 use super::{SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration};
@@ -59,8 +61,13 @@ fn encode_manifest(
                 size_bytes: chunk.receipt.size_bytes,
             })
             .collect(),
-        inline_bytes_base64: (size_bytes <= MAX_INLINE_SYNC_BLOB_BYTES as u64 && chunks.len() == 1)
-            .then(|| base64::engine::general_purpose::STANDARD.encode(&chunks[0].bytes)),
+        inline_bytes_base64: match chunks {
+            [] => Some(base64::engine::general_purpose::STANDARD.encode([])),
+            [chunk] if size_bytes <= MAX_INLINE_SYNC_BLOB_BYTES as u64 => {
+                Some(base64::engine::general_purpose::STANDARD.encode(&chunk.bytes))
+            }
+            _ => None,
+        },
     })
 }
 
@@ -91,10 +98,88 @@ fn decode_inline_bytes(wire: &SyncBlobManifest) -> Result<Option<Vec<u8>>, LixEr
     Ok(Some(bytes))
 }
 
+/// Validates and stages one self-contained hot-path blob in a caller-owned
+/// atomic publication. The protocol keeps this separate from the large blob
+/// lane so commit/ref admission never observes a half-published inline blob.
+pub(crate) fn stage_inline_sync_blob(
+    writes: &mut StorageWriteSet,
+    wire: &SyncBlobManifest,
+) -> Result<(), LixError> {
+    let manifest = decode_manifest(wire)?;
+    let bytes = decode_inline_bytes(wire)?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync hot-path blob manifest has no inline payload",
+        )
+    })?;
+    stage_verified_inline_canonical_blob(writes, &manifest, &bytes).map(|_| ())
+}
+
 impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Returns a self-contained hot-path manifest only when metadata proves
+    /// the blob can fit inline. Large and missing blobs return `None` without
+    /// materializing delta layouts or publishing canonical transfer chunks.
+    pub(crate) async fn get_sync_inline_blob_manifest(
+        &self,
+        blob_id: &str,
+    ) -> Result<Option<SyncBlobManifest>, LixError> {
+        let blob_id = BlobId::from_hex(blob_id)?;
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let metadata = load_metadata_many(&read, &[blob_id])
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten();
+        if metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.size_bytes > MAX_INLINE_SYNC_BLOB_BYTES as u64)
+        {
+            return Ok(None);
+        }
+        let bytes = crate::binary_cas::load_bytes_many(&read, &[blob_id])
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("sync inline blob '{}' lost its payload", blob_id.to_hex()),
+                )
+            })?;
+        let canonical = CanonicalBlobManifest::from_bytes(&bytes);
+        if canonical.blob_id != blob_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("sync inline blob '{}' failed authentication", blob_id.to_hex()),
+            ));
+        }
+        if canonical.chunks.len() > 1 {
+            return Ok(None);
+        }
+        Ok(Some(SyncBlobManifest {
+            blob_id: blob_id.to_hex(),
+            size_bytes: canonical.size_bytes,
+            chunks: canonical
+                .chunks
+                .into_iter()
+                .map(|chunk| SyncBlobChunk {
+                    chunk_id: chunk.hash.to_hex(),
+                    size_bytes: chunk.size_bytes,
+                })
+                .collect(),
+            inline_bytes_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode(&bytes),
+            ),
+        }))
+    }
+
     /// Checks only authenticated manifest metadata. Unlike the outbound
     /// transfer accessor, this never materializes the blob or requires its
     /// chunks to be present.
@@ -439,6 +524,33 @@ mod tests {
             .expect("authority inline payload should already be readable")
             .into_vec();
         assert_eq!(loaded, vec![Some(bytes)]);
+    }
+
+    #[tokio::test]
+    async fn inline_manifest_registers_an_authenticated_empty_blob_without_chunk_demand() {
+        let lix = crate::open_lix()
+            .await
+            .expect("test repository should open");
+        let canonical = CanonicalBlobManifest::from_bytes(&[]);
+        assert!(canonical.chunks.is_empty());
+        let manifest = wire_manifest(canonical.clone(), Some(&[]));
+
+        let registration = lix
+            .register_sync_blob_manifest(&manifest)
+            .await
+            .expect("an authenticated empty inline manifest should register");
+        assert!(registration.missing_chunk_ids.is_empty());
+
+        let read = lix
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        let loaded = crate::binary_cas::load_bytes_many(&read, &[canonical.blob_id])
+            .await
+            .expect("the empty inline blob should be readable")
+            .into_vec();
+        assert_eq!(loaded, vec![Some(Vec::new())]);
     }
 
     #[tokio::test]

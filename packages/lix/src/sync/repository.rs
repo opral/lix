@@ -55,10 +55,57 @@ use crate::{Lix, LixError};
 
 use super::commit::{SyncCommit, SyncCommitMember, export_sync_commit, load_sync_commit};
 use super::protocol::{
-    SyncBranchHead, SyncCommitHeader, SyncEvent, SyncHistoryBoundary, SyncHistoryResponse,
-    SyncPushRequest, SyncPushResponse, SyncRefUpdate, SyncRepositoryPullResponse, SyncSnapshotRow,
-    SyncSnapshotRowPage,
+    SyncBlobManifest, SyncBranchHead, SyncCommitHeader, SyncEvent, SyncHistoryBoundary,
+    SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRefUpdate,
+    SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage,
 };
+
+pub(super) fn sync_commit_blob_ids(commits: &[SyncCommit]) -> Result<BTreeSet<String>, LixError> {
+    let mut ids = BTreeSet::new();
+    for member in commits
+        .iter()
+        .flat_map(|commit| &commit.members)
+        .filter(|member| member.schema_key == "lix_binary_blob_ref" && !member.deleted)
+    {
+        let blob_id = member
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("blob_hash"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "live sync binary blob ref has no blob_hash",
+                )
+            })?;
+        super::validate_blake3_id(blob_id, "sync binary blob ref blob_hash")?;
+        ids.insert(blob_id.to_owned());
+    }
+    Ok(ids)
+}
+
+fn append_bounded_inline_blob(
+    inline_blobs: &mut Vec<SyncBlobManifest>,
+    encoded_len: &mut usize,
+    manifest: SyncBlobManifest,
+    context: &str,
+) -> Result<bool, LixError> {
+    let manifest_len = serde_json::to_vec(&manifest)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("encode {context}: {error}"),
+            )
+        })?
+        .len();
+    let addition = manifest_len.saturating_add(usize::from(!inline_blobs.is_empty()));
+    if encoded_len.saturating_add(addition) > super::MAX_SYNC_PULL_RESPONSE_BYTES {
+        return Ok(false);
+    }
+    *encoded_len += addition;
+    inline_blobs.push(manifest);
+    Ok(true)
+}
 
 /// Loads either representation that can own a canonical change payload.
 ///
@@ -687,6 +734,23 @@ impl ParsedMember {
             authored: self.authored,
         }
     }
+
+    fn as_current_delta(&self, commit_id: CommitId) -> CurrentStateDeltaRef<'_> {
+        CurrentStateDeltaRef {
+            schema_key: &self.schema_key,
+            file_id: self.file_id.as_deref(),
+            row_pk: &self.row_pk,
+            change_id: Some(self.change_id),
+            commit_id: Some(commit_id),
+            untracked: false,
+            deleted: self.deleted,
+            created_at: self.row_created_at,
+            updated_at: self.row_updated_at,
+            snapshot: self.snapshot.as_ref_slot(),
+            metadata: self.metadata.as_ref_slot(),
+            columnar_base_coordinate: None,
+        }
+    }
 }
 
 fn selected_payload_matches_authored(selected: &ParsedMember, authored: &ParsedMember) -> bool {
@@ -1175,6 +1239,34 @@ async fn load_sync_hot_snapshot(
         })
         .collect();
     HotTrackedSnapshot::from_materialized_rows(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_sync_hot_delta(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    previous_generation: CommitId,
+    head: CommitId,
+    deltas: &[CurrentStateDeltaRef<'_>],
+    absence_guards: &BTreeSet<TrackedStateKey>,
+    checkpoint: CommitId,
+    coverage: &mut WorkingDiffIndexCoverage,
+) -> Result<CommitId, LixError> {
+    TrackedHeadContext::new()
+        .writer(read, writes)
+        .stage_current_state_with_working_diff(
+            branch_id,
+            Some(previous_generation),
+            head,
+            deltas,
+            absence_guards,
+            None,
+            None,
+            Some(checkpoint),
+            coverage,
+        )
+        .await
 }
 
 /// Stages the only authority-side sync metadata needed by an ordinary Lix
@@ -1719,10 +1811,38 @@ where
                     "bounded sync push could not select a dependency-complete item",
                 ));
             }
-            return Ok(Some(SyncPushRequest {
+            let mut request = SyncPushRequest {
                 commits,
                 ref_updates: selected_ref_updates,
-            }));
+                inline_blobs: Vec::new(),
+            };
+            let blob_ids = sync_commit_blob_ids(&request.commits)?;
+            drop(read);
+            let commit_refs = request.commits.iter().collect::<Vec<_>>();
+            let mut encoded_len = super::encoded_delta_event_len(
+                u64::MAX,
+                &commit_refs,
+                &request.ref_updates,
+            )?;
+            for blob_id in blob_ids {
+                let manifest = self
+                    .get_sync_inline_blob_manifest(&blob_id)
+                    .await?;
+                if let Some(manifest) = manifest {
+                    if !append_bounded_inline_blob(
+                        &mut request.inline_blobs,
+                        &mut encoded_len,
+                        manifest,
+                        "inline sync blob",
+                    )? {
+                        // Inline transfer is optional. Keep the largest
+                        // bounded prefix and let the ordinary manifest/chunk
+                        // lane carry this and all later blobs.
+                        break;
+                    }
+                }
+            }
+            return Ok(Some(request));
         }
     }
 
@@ -1794,6 +1914,7 @@ where
                         .collect::<BTreeMap<_, _>>()
                 };
                 let mut commits = BTreeMap::new();
+                let mut inline_blobs = BTreeMap::new();
                 let mut branch_chains =
                     BTreeMap::<String, (Option<String>, Option<String>, bool)>::new();
                 for event in events {
@@ -1817,6 +1938,20 @@ where
                                 format!(
                                     "sync delta repeats commit '{}' with different content",
                                     commit.commit_id
+                                ),
+                            ));
+                        }
+                    }
+                    for manifest in &event.inline_blobs {
+                        if let Some(existing) =
+                            inline_blobs.insert(manifest.blob_id.clone(), manifest.clone())
+                            && existing != *manifest
+                        {
+                            return Err(LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                format!(
+                                    "sync delta repeats inline blob '{}' with different content",
+                                    manifest.blob_id
                                 ),
                             ));
                         }
@@ -1933,11 +2068,13 @@ where
                     }
                 }
                 let commits = commits.into_values().collect::<Vec<_>>();
+                let inline_blobs = inline_blobs.into_values().collect::<Vec<_>>();
                 if divergent_refs.is_empty() {
                     self.import_sync_repository(
                         &SyncPushRequest {
                             commits,
                             ref_updates: applicable_refs,
+                            inline_blobs,
                         },
                         SyncImportPurpose::ReplicaDelta,
                         None,
@@ -1957,6 +2094,7 @@ where
                         &SyncPushRequest {
                             commits,
                             ref_updates: Vec::new(),
+                            inline_blobs,
                         },
                         SyncImportPurpose::ReplicaDelta,
                         None,
@@ -1978,6 +2116,7 @@ where
                         &SyncPushRequest {
                             commits: Vec::new(),
                             ref_updates: applicable_refs,
+                            inline_blobs: Vec::new(),
                         },
                         SyncImportPurpose::ReplicaDelta,
                         None,
@@ -2085,6 +2224,7 @@ where
                     head_commit_id: Some(expected_head_commit_id.to_owned()),
                     checkpoint_commit_id: Some(checkpoint_commit_id.to_owned()),
                 }],
+                inline_blobs: Vec::new(),
             },
             SyncImportPurpose::ReplicaDelta,
             None,
@@ -2801,6 +2941,7 @@ where
             &SyncPushRequest {
                 commits: commits.to_vec(),
                 ref_updates: Vec::new(),
+                inline_blobs: Vec::new(),
             },
             SyncImportPurpose::History,
             Some((boundaries, rows)),
@@ -2892,6 +3033,34 @@ where
                 LixError::CODE_INVALID_PARAM,
                 "sync history import cannot update refs",
             ));
+        }
+        let referenced_blob_ids = sync_commit_blob_ids(&request.commits)?;
+        let mut inline_blob_ids = BTreeSet::new();
+        for manifest in &request.inline_blobs {
+            if !inline_blob_ids.insert(manifest.blob_id.clone()) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("sync request repeats inline blob '{}'", manifest.blob_id),
+                ));
+            }
+            if !referenced_blob_ids.contains(&manifest.blob_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync request includes unreferenced inline blob '{}'",
+                        manifest.blob_id
+                    ),
+                ));
+            }
+            if manifest.inline_bytes_base64.is_none() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync hot-path blob '{}' has no inline payload",
+                        manifest.blob_id
+                    ),
+                ));
+            }
         }
         let mut parsed = BTreeMap::new();
         for wire in &request.commits {
@@ -3098,12 +3267,11 @@ where
                             "live sync binary blob ref has no blob_hash",
                         )
                     })?;
-                let available = match purpose {
-                    SyncImportPurpose::AuthorityPush => {
-                        self.get_sync_blob_manifest_with_collaboration_guard(&blob_hash)
-                            .await?
-                            .is_some()
-                    }
+                let available = inline_blob_ids.contains(&blob_hash) || match purpose {
+                    SyncImportPurpose::AuthorityPush => self
+                        .get_sync_blob_manifest_with_collaboration_guard(&blob_hash)
+                        .await?
+                        .is_some(),
                     SyncImportPurpose::ReplicaDelta | SyncImportPurpose::History => {
                         self.has_sync_blob_manifest(&blob_hash).await?
                     }
@@ -3270,6 +3438,17 @@ where
 
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
+        for manifest in &request.inline_blobs {
+            super::blob::stage_inline_sync_blob(&mut writes, manifest)?;
+        }
+        if !request.inline_blobs.is_empty() {
+            crate::binary_cas::stage_transfer_publication_fence(
+                &read,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await?;
+        }
         stage_large_json_payloads(&mut writes, parsed.values())?;
         let boundary_json = boundary_rows
             .values()
@@ -3857,11 +4036,38 @@ where
         }
 
         let hydrated_history = !deferred_existing.is_empty();
+        // A direct, authored fast-forward already has every immutable object,
+        // payload, and root staged in this write set. Publishing those objects
+        // merely so the hot-head writer can read them back in a second durable
+        // transaction adds a crash boundary without adding validation. Derive
+        // the hot delta from the authenticated child commit and let the branch
+        // control CAS publish commit, head, and replica receipt atomically.
+        let atomic_fast_forward = !changed_refs.is_empty()
+            && changed_refs.iter().all(|(update, head, checkpoint)| {
+                let observation_index = branch_ids
+                    .iter()
+                    .position(|branch_id| branch_id == &update.branch_id)
+                    .expect("changed ref came from request");
+                let Some(previous) = observations[observation_index].control else {
+                    return false;
+                };
+                let Some(head) = head else {
+                    return false;
+                };
+                let Some(commit) = parsed.get(head) else {
+                    return false;
+                };
+                !existing.contains(head)
+                    && commit.parent_commit_ids.as_slice() == [previous.head_commit_id]
+                    && commit.members.iter().all(|member| member.authored)
+                    && previous.working_diff_checkpoint_commit_id == *checkpoint
+            });
         // Immutable commits and roots are safe to publish before a ref. This
         // makes the second transaction a small atomic `(head, checkpoint)`
         // publication whose hash-guided hot-state diff can read both roots.
         // A failed CAS can leave only unreachable immutable objects.
-        let (read, mut writes, mut preconditions, observations) = if !changed_refs.is_empty()
+        let (read, mut writes, mut preconditions, observations) = if !atomic_fast_forward
+            && !changed_refs.is_empty()
             && (!newly_imported.is_empty() || hydrated_history)
         {
             crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
@@ -3966,66 +4172,110 @@ where
                         ),
                     ));
                 }
-                let diff = TrackedStateContext::new()
-                    .reader(&read)
-                    .diff_commits(
-                        &previous.head_commit_id.to_string(),
-                        &head.to_string(),
-                        &TrackedStateDiffRequest::default(),
-                    )
-                    .await?;
-                let mut deltas = Vec::with_capacity(diff.entries.len());
-                let mut absence_guards = BTreeSet::new();
-                for entry in &diff.entries {
-                    let after = entry.after.as_ref().ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "sync tracked-state diff removed a row without a tombstone",
-                        )
-                    })?;
-                    let payload = diff.payloads().get(after.change_id).ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("sync diff lost payload for change '{}'", after.change_id),
-                        )
-                    })?;
-                    if entry.visible_before().is_none() {
-                        absence_guards.insert(TrackedStateKey {
-                            schema_key: entry.identity.schema_key().to_owned(),
-                            file_id: entry.identity.file_id().map(str::to_owned),
-                            row_pk: entry.identity.row_pk().clone(),
-                        });
-                    }
-                    deltas.push(CurrentStateDeltaRef {
-                        schema_key: entry.identity.schema_key(),
-                        file_id: entry.identity.file_id(),
-                        row_pk: entry.identity.row_pk(),
-                        change_id: Some(after.change_id),
-                        commit_id: Some(after.commit_id),
-                        untracked: false,
-                        deleted: after.deleted,
-                        created_at: after.created_at,
-                        updated_at: after.updated_at,
-                        snapshot: payload.snapshot.as_ref_slot(),
-                        metadata: payload.metadata.as_ref_slot(),
-                        columnar_base_coordinate: None,
-                    });
-                }
                 let mut coverage = epoch.coverage;
-                let generation = TrackedHeadContext::new()
-                    .writer(&read, &mut writes)
-                    .stage_current_state_with_working_diff(
+                let generation = if atomic_fast_forward {
+                    let commit = parsed
+                        .get(head)
+                        .expect("atomic fast-forward target was validated");
+                    let keys = commit
+                        .members
+                        .iter()
+                        .map(|member| TrackedStateKey {
+                            schema_key: member.schema_key.clone(),
+                            file_id: member.file_id.clone(),
+                            row_pk: member.row_pk.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let before = TrackedStateContext::new()
+                        .reader(&read)
+                        .index_values_at_commit(&previous.head_commit_id.to_string(), &keys)
+                        .await?;
+                    let absence_guards = keys
+                        .iter()
+                        .zip(before)
+                        .filter_map(|(key, before)| {
+                            before
+                                .as_ref()
+                                .is_none_or(|before| before.deleted)
+                                .then(|| key.clone())
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let deltas = commit
+                        .members
+                        .iter()
+                        .map(|member| member.as_current_delta(*head))
+                        .collect::<Vec<_>>();
+                    stage_sync_hot_delta(
+                        &read,
+                        &mut writes,
                         &update.branch_id,
-                        Some(previous.tracked_generation),
+                        previous.tracked_generation,
                         *head,
                         &deltas,
                         &absence_guards,
-                        None,
-                        None,
-                        Some(checkpoint),
+                        checkpoint,
                         &mut coverage,
                     )
-                    .await?;
+                    .await?
+                } else {
+                    let diff = TrackedStateContext::new()
+                        .reader(&read)
+                        .diff_commits(
+                            &previous.head_commit_id.to_string(),
+                            &head.to_string(),
+                            &TrackedStateDiffRequest::default(),
+                        )
+                        .await?;
+                    let mut deltas = Vec::with_capacity(diff.entries.len());
+                    let mut absence_guards = BTreeSet::new();
+                    for entry in &diff.entries {
+                        let after = entry.after.as_ref().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "sync tracked-state diff removed a row without a tombstone",
+                            )
+                        })?;
+                        let payload = diff.payloads().get(after.change_id).ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!("sync diff lost payload for change '{}'", after.change_id),
+                            )
+                        })?;
+                        if entry.visible_before().is_none() {
+                            absence_guards.insert(TrackedStateKey {
+                                schema_key: entry.identity.schema_key().to_owned(),
+                                file_id: entry.identity.file_id().map(str::to_owned),
+                                row_pk: entry.identity.row_pk().clone(),
+                            });
+                        }
+                        deltas.push(CurrentStateDeltaRef {
+                            schema_key: entry.identity.schema_key(),
+                            file_id: entry.identity.file_id(),
+                            row_pk: entry.identity.row_pk(),
+                            change_id: Some(after.change_id),
+                            commit_id: Some(after.commit_id),
+                            untracked: false,
+                            deleted: after.deleted,
+                            created_at: after.created_at,
+                            updated_at: after.updated_at,
+                            snapshot: payload.snapshot.as_ref_slot(),
+                            metadata: payload.metadata.as_ref_slot(),
+                            columnar_base_coordinate: None,
+                        });
+                    }
+                    stage_sync_hot_delta(
+                        &read,
+                        &mut writes,
+                        &update.branch_id,
+                        previous.tracked_generation,
+                        *head,
+                        &deltas,
+                        &absence_guards,
+                        checkpoint,
+                        &mut coverage,
+                    )
+                    .await?
+                };
                 (generation, coverage)
             } else {
                 let current = load_sync_hot_snapshot(&read, &update.branch_id, *head).await?;
@@ -4486,6 +4736,7 @@ where
             }],
         )
         .await?;
+        drop(read);
         let mut events = Vec::with_capacity(count);
         for value in values.values {
             let Some(StorageProjectedValue::FullValue(value)) = value else {
@@ -4510,10 +4761,31 @@ where
                     )
                 })?);
             }
+            let commit_refs = commits.iter().collect::<Vec<_>>();
+            let mut inline_blobs = Vec::new();
+            let mut encoded_len = super::encoded_delta_event_len(
+                record.cursor,
+                &commit_refs,
+                &record.ref_updates,
+            )?;
+            for blob_id in sync_commit_blob_ids(&commits)? {
+                let manifest = self.get_sync_inline_blob_manifest(&blob_id).await?;
+                if let Some(manifest) = manifest {
+                    if !append_bounded_inline_blob(
+                        &mut inline_blobs,
+                        &mut encoded_len,
+                        manifest,
+                        "inline sync event blob",
+                    )? {
+                        break;
+                    }
+                }
+            }
             events.push(SyncEvent {
                 cursor: record.cursor,
                 commits,
                 ref_updates: record.ref_updates,
+                inline_blobs,
             });
         }
         let cursor = events.last().map_or(after, |event| event.cursor);
@@ -5107,6 +5379,7 @@ mod tests {
                 &SyncPushRequest {
                     commits: event.commits.clone(),
                     ref_updates: Vec::new(),
+                    inline_blobs: event.inline_blobs.clone(),
                 },
                 SyncImportPurpose::ReplicaDelta,
                 None,
@@ -5238,6 +5511,509 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_file_fast_forwards_publish_once_and_fail_atomically() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("initial snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let (branch_id, _) = default_head(&snapshot);
+        let storage = SyncAccountingStorage::default();
+        let replica =
+            accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
+        let params = [Value::Text("/atomic-fast-forward.md".to_owned())];
+        let mut observed = replica
+            .observe("SELECT content FROM lix_file WHERE path = $1", &params)
+            .expect("file observer should open");
+        assert!(
+            observed
+                .next()
+                .await
+                .expect("initial observation should succeed")
+                .expect("initial observation should exist")
+                .rows
+                .rows()
+                .is_empty()
+        );
+
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/atomic-fast-forward.md".to_owned()),
+                    Value::Text("created".to_owned()),
+                ],
+            )
+            .await
+            .expect("authority file create should commit");
+        let created = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("file create delta should load");
+        assert!(matches!(
+            &created,
+            SyncRepositoryPullResponse::Delta { events, .. }
+                if !events[0].inline_blobs.is_empty()
+        ));
+        storage.reset();
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &created)
+            .await
+            .expect("file create should apply");
+        assert_eq!(storage.write_transaction_count(), 1);
+        assert_eq!(storage.atomic_ref_receipt_count(), 1);
+        let created_event = observed
+            .next()
+            .await
+            .expect("created file observation should succeed")
+            .expect("created file observation should exist");
+        assert_eq!(
+            created_event.rows.rows()[0]
+                .get::<Vec<u8>>("content")
+                .expect("created content should decode"),
+            b"created",
+        );
+        let SyncRepositoryPullResponse::Delta {
+            cursor: created_cursor,
+            events: created_events,
+            ..
+        } = &created
+        else {
+            panic!("file create should produce a delta");
+        };
+        let created_head = created_events[0].ref_updates[0]
+            .head_commit_id
+            .clone()
+            .expect("created branch should remain headed");
+
+        authority
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
+                &[
+                    Value::Text("edited".to_owned()),
+                    Value::Text("/atomic-fast-forward.md".to_owned()),
+                ],
+            )
+            .await
+            .expect("authority file edit should commit");
+        let edited = authority
+            .pull_sync_repository(Some(*created_cursor), 128)
+            .await
+            .expect("file edit delta should load");
+        storage.reset();
+        storage.fail_next_replica_receipt();
+        let SyncRepositoryPullResponse::Delta {
+            cursor: edited_cursor,
+            events,
+        } = &edited
+        else {
+            panic!("file edit should produce a delta");
+        };
+        let edited_commit_id =
+            CommitId::parse_lix(&events[0].commits[0].commit_id, "edited fixture commit")
+                .expect("edited commit id should parse");
+        let edited_blob_id = events[0].inline_blobs[0].blob_id.clone();
+        let error = replica
+            .apply_sync_repository_pull(TEST_REMOTE, &edited)
+            .await
+            .expect_err("injected publication failure should reject the whole fast-forward");
+        assert!(error.message.contains("injected replica receipt failure"));
+        assert_eq!(storage.write_transaction_count(), 1);
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("old cursor should remain readable"),
+            Some(*created_cursor),
+        );
+        let read = replica
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("atomicity read should open");
+        assert!(
+            load_commit_record(&read, edited_commit_id)
+                .await
+                .expect("failed commit lookup should succeed")
+                .is_none(),
+            "a failed atomic publication must not leak the immutable commit",
+        );
+        drop(read);
+        assert!(
+            !replica
+                .has_sync_blob_manifest(&edited_blob_id)
+                .await
+                .expect("failed inline manifest lookup should succeed"),
+            "a failed atomic publication must not leak the inline blob",
+        );
+        let read = replica
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("atomicity control read should reopen");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("branch control should load")
+            .expect("branch control should exist");
+        assert_eq!(control.head_commit_id.to_string(), created_head);
+        drop(read);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), observed.next())
+                .await
+                .is_err(),
+            "a failed atomic publication must not notify the warm observer",
+        );
+
+        storage.reset();
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &edited)
+            .await
+            .expect("replaying the file edit should apply");
+        assert_eq!(storage.write_transaction_count(), 1);
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("edited cursor should load"),
+            Some(*edited_cursor),
+        );
+        let edited_event = observed
+            .next()
+            .await
+            .expect("edited file observation should succeed")
+            .expect("edited file observation should exist");
+        assert_eq!(
+            edited_event.rows.rows()[0]
+                .get::<Vec<u8>>("content")
+                .expect("edited content should decode"),
+            b"edited",
+        );
+
+        authority
+            .execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[Value::Text("/atomic-fast-forward.md".to_owned())],
+            )
+            .await
+            .expect("authority file delete should commit");
+        let deleted = authority
+            .pull_sync_repository(Some(*edited_cursor), 128)
+            .await
+            .expect("file delete delta should load");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &deleted)
+            .await
+            .expect("file delete should apply atomically");
+        assert!(
+            observed
+                .next()
+                .await
+                .expect("deleted file observation should succeed")
+                .expect("deleted file observation should exist")
+                .rows
+                .rows()
+                .is_empty()
+        );
+        let SyncRepositoryPullResponse::Delta {
+            cursor: deleted_cursor,
+            ..
+        } = &deleted
+        else {
+            panic!("file delete should produce a delta");
+        };
+
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/atomic-fast-forward.md".to_owned()),
+                    Value::Text("recreated".to_owned()),
+                ],
+            )
+            .await
+            .expect("authority file recreate should commit");
+        let recreated = authority
+            .pull_sync_repository(Some(*deleted_cursor), 128)
+            .await
+            .expect("file recreate delta should load");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &recreated)
+            .await
+            .expect("tombstoned file recreate should apply atomically");
+        let recreated_event = observed
+            .next()
+            .await
+            .expect("recreated file observation should succeed")
+            .expect("recreated file observation should exist");
+        assert_eq!(
+            recreated_event.rows.rows()[0]
+                .get::<Vec<u8>>("content")
+                .expect("recreated content should decode"),
+            b"recreated",
+        );
+        let SyncRepositoryPullResponse::Delta {
+            cursor: recreated_cursor,
+            ..
+        } = &recreated
+        else {
+            panic!("file recreate should produce a delta");
+        };
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST('' AS BYTEA))",
+                &[Value::Text("/empty-fast-forward.md".to_owned())],
+            )
+            .await
+            .expect("empty authority file should commit");
+        let empty = authority
+            .pull_sync_repository(Some(*recreated_cursor), 128)
+            .await
+            .expect("empty file delta should load");
+        let SyncRepositoryPullResponse::Delta { events, .. } = &empty else {
+            panic!("empty file should produce a delta");
+        };
+        assert!(
+            events[0].inline_blobs.is_empty(),
+            "an intrinsic empty file references no CAS blob",
+        );
+        storage.reset();
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &empty)
+            .await
+            .expect("empty inline file should apply atomically");
+        assert_eq!(
+            storage.write_transaction_count(),
+            1,
+            "empty file commit, head, and receipt publish once without a blob lane",
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_blob_admission_is_referenced_authenticated_and_atomic() {
+        let authority_storage = SyncAccountingStorage::default();
+        Engine::initialize(authority_storage.clone())
+            .await
+            .expect("authority storage should initialize");
+        let authority = open_lix()
+            .with_storage(authority_storage.clone())
+            .await
+            .expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("authority snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot else {
+            panic!("fixture should start from a snapshot");
+        };
+        let replica = replica_from_snapshot(
+            &authority,
+            &authority
+                .pull_sync_repository(None, 1)
+                .await
+                .expect("replica snapshot should load"),
+        )
+        .await;
+        replica
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/inline-admission.md".to_owned()),
+                    Value::Text("authenticated inline payload".to_owned()),
+                ],
+            )
+            .await
+            .expect("replica file write should commit");
+        let request = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("inline push should build")
+            .expect("file write should be pending");
+        assert_eq!(request.inline_blobs.len(), 1);
+        let commit_id = CommitId::parse_lix(&request.commits[0].commit_id, "inline fixture commit")
+            .expect("fixture commit id should parse");
+
+        let mut unreferenced = request.clone();
+        let unrelated = crate::binary_cas::CanonicalBlobManifest::from_bytes(b"unrelated");
+        unreferenced.inline_blobs[0] = SyncBlobManifest {
+            blob_id: unrelated.blob_id.to_hex(),
+            size_bytes: unrelated.size_bytes,
+            chunks: unrelated
+                .chunks
+                .iter()
+                .map(|chunk| super::super::SyncBlobChunk {
+                    chunk_id: chunk.hash.to_hex(),
+                    size_bytes: chunk.size_bytes,
+                })
+                .collect(),
+            inline_bytes_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode(b"unrelated"),
+            ),
+        };
+        let error = authority
+            .push_sync_repository(&unreferenced)
+            .await
+            .expect_err("unreferenced inline blob must be rejected");
+        assert!(error.message.contains("unreferenced inline blob"));
+
+        let mut tampered = request.clone();
+        tampered.inline_blobs[0].inline_bytes_base64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(b"tampered inline payload"),
+        );
+        authority
+            .push_sync_repository(&tampered)
+            .await
+            .expect_err("tampered inline blob must be rejected");
+        assert_eq!(
+            authority
+                .pull_sync_repository(Some(cursor), 1)
+                .await
+                .expect("unchanged authority delta should load"),
+            SyncRepositoryPullResponse::Delta {
+                cursor,
+                events: Vec::new(),
+            },
+        );
+        let read = authority
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("atomicity read should open");
+        assert!(
+            load_commit_record(&read, commit_id)
+                .await
+                .expect("rejected commit lookup should succeed")
+                .is_none()
+        );
+        drop(read);
+
+        authority_storage.reset();
+        authority
+            .push_sync_repository(&request)
+            .await
+            .expect("authenticated referenced inline blob should publish");
+        assert_eq!(
+            authority_storage.write_transaction_count(),
+            1,
+            "authority must publish inline CAS, commit, ref, and event once",
+        );
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 1)
+            .await
+            .expect("published inline delta should load");
+        let SyncRepositoryPullResponse::Delta { events, .. } = delta else {
+            panic!("published response should be a delta");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].inline_blobs, request.inline_blobs);
+        let history = authority
+            .execute(
+                "SELECT path, content FROM lix_history('lix_file') WHERE path = $1",
+                &[Value::Text("/inline-admission.md".to_owned())],
+            )
+            .await
+            .expect("public file history query should remain readable after inline sync");
+        assert!(
+            history.rows().iter().any(|row| {
+                row.get::<Vec<u8>>("content")
+                    .is_ok_and(|content| content == b"authenticated inline payload")
+            }),
+            "public file history should expose the synced commit",
+        );
+    }
+
+    #[tokio::test]
+    async fn large_blob_inline_discovery_is_metadata_only_for_push_and_pull() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("replica snapshot should load");
+        let replica_storage = SyncAccountingStorage::default();
+        let replica =
+            accounting_replica_from_snapshot(&authority, &snapshot, replica_storage.clone()).await;
+        replica
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text("/large-local.bin".to_owned()),
+                    Value::Blob(vec![7_u8; 65 * 1024].into()),
+                ],
+            )
+            .await
+            .expect("large local file should commit");
+        replica_storage.reset();
+        let push = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("large push should build")
+            .expect("large file should be pending");
+        assert!(push.inline_blobs.is_empty());
+        assert_eq!(
+            replica_storage.write_transaction_count(),
+            0,
+            "large outbound discovery must not canonicalize or publish transfer chunks",
+        );
+
+        let authority_storage = SyncAccountingStorage::default();
+        let receipt = Engine::initialize(authority_storage.clone())
+            .await
+            .expect("accounted authority storage should initialize");
+        let accounted_authority = open_lix()
+            .with_storage(authority_storage.clone())
+            .await
+            .expect("accounted authority should open");
+        accounted_authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("accounted authority role should install");
+        accounted_authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text("/large-authority.bin".to_owned()),
+                    Value::Blob(vec![9_u8; 65 * 1024].into()),
+                ],
+            )
+            .await
+            .expect("large authority file should commit");
+        authority_storage.reset();
+        let delta = accounted_authority
+            .pull_sync_repository(Some(0), 1)
+            .await
+            .expect("large authority event should load");
+        let SyncRepositoryPullResponse::Delta { events, .. } = delta else {
+            panic!("large authority pull should be a delta");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(events[0].inline_blobs.is_empty());
+        assert_eq!(
+            authority_storage.write_transaction_count(),
+            0,
+            "large inbound discovery must not canonicalize or publish transfer chunks",
+        );
+        assert_eq!(
+            receipt.main_branch_id,
+            accounted_authority
+                .active_branch_id()
+                .await
+                .expect("accounted authority branch should load"),
+        );
+    }
+
+    #[tokio::test]
     async fn one_delta_page_folds_independent_branch_updates() {
         let authority = open_lix().await.expect("authority should open");
         authority
@@ -5295,7 +6071,11 @@ mod tests {
             .await
             .expect("independent branch page should apply");
 
-        assert_eq!(storage.write_transaction_count(), 2);
+        assert_eq!(
+            storage.write_transaction_count(),
+            1,
+            "independent direct fast-forwards share one atomic page publication",
+        );
         assert_eq!(storage.atomic_ref_receipt_count(), 1);
         assert_eq!(read_key_value(&replica, "main-fold").await, "main");
         replica
@@ -5497,14 +6277,17 @@ mod tests {
             .collect()
     }
 
-    async fn snapshot_parts(
-        authority: &Lix<Memory>,
+    async fn snapshot_parts<AuthorityStorage>(
+        authority: &Lix<AuthorityStorage>,
         snapshot: &SyncRepositoryPullResponse,
     ) -> (
         SyncHistoryResponse,
         Vec<SyncSnapshotRow>,
         BTreeMap<String, String>,
-    ) {
+    )
+    where
+        AuthorityStorage: Storage + Clone + Send + Sync + 'static,
+    {
         let SyncRepositoryPullResponse::Snapshot { branches, .. } = snapshot else {
             unreachable!("initial pull is a snapshot");
         };
@@ -5614,10 +6397,13 @@ mod tests {
         (history, rows, checkpoint_roots)
     }
 
-    async fn replica_from_snapshot(
-        authority: &Lix<Memory>,
+    async fn replica_from_snapshot<AuthorityStorage>(
+        authority: &Lix<AuthorityStorage>,
         snapshot: &SyncRepositoryPullResponse,
-    ) -> Lix<Memory> {
+    ) -> Lix<Memory>
+    where
+        AuthorityStorage: Storage + Clone + Send + Sync + 'static,
+    {
         let (branch_id, _) = default_head(snapshot);
         let (history, rows, checkpoint_roots) = snapshot_parts(authority, snapshot).await;
         let storage = Memory::new();
@@ -5646,11 +6432,14 @@ mod tests {
         replica
     }
 
-    async fn hydrate_delta_blobs(
-        authority: &Lix<Memory>,
-        replica: &Lix<Memory>,
+    async fn hydrate_delta_blobs<AuthorityStorage, ReplicaStorage>(
+        authority: &Lix<AuthorityStorage>,
+        replica: &Lix<ReplicaStorage>,
         response: &SyncRepositoryPullResponse,
-    ) {
+    ) where
+        AuthorityStorage: Storage + Clone + Send + Sync + 'static,
+        ReplicaStorage: Storage + Clone + Send + Sync + 'static,
+    {
         let SyncRepositoryPullResponse::Delta { events, .. } = response else {
             panic!("blob hydration requires a delta");
         };
@@ -6237,6 +7026,7 @@ mod tests {
             .push_sync_repository(&SyncPushRequest {
                 commits: vec![forged_checkpoint.clone()],
                 ref_updates: Vec::new(),
+                inline_blobs: Vec::new(),
             })
             .await
             .expect("a source-less complete checkpoint owns its selected payloads");
@@ -6257,6 +7047,7 @@ mod tests {
             .push_sync_repository(&SyncPushRequest {
                 commits: vec![repeated_checkpoint.clone()],
                 ref_updates: Vec::new(),
+                inline_blobs: Vec::new(),
             })
             .await
             .expect("a repeated selected checkpoint should import");
@@ -6766,6 +7557,7 @@ mod tests {
                 head_commit_id: Some(source_head.clone()),
                 checkpoint_commit_id: Some(source_head.clone()),
             }],
+            inline_blobs: Vec::new(),
         };
         let first = target
             .push_sync_repository(&request)
@@ -6952,6 +7744,7 @@ mod tests {
                     head_commit_id: Some(source_head.clone()),
                     checkpoint_commit_id: Some(source_head.clone()),
                 }],
+                inline_blobs: Vec::new(),
             })
             .await
             .expect_err("stale ref CAS must fail");
@@ -6986,6 +7779,7 @@ mod tests {
                     head_commit_id: None,
                     checkpoint_commit_id: None,
                 }],
+                inline_blobs: Vec::new(),
             })
             .await
             .expect_err("the repository default branch cannot be deleted");
@@ -7036,6 +7830,7 @@ mod tests {
             .push_sync_repository(&SyncPushRequest {
                 commits: vec![commit.clone()],
                 ref_updates: Vec::new(),
+                inline_blobs: Vec::new(),
             })
             .await
             .expect("the complete commit's authoritative id should use locator fallback");
@@ -7620,6 +8415,7 @@ mod tests {
                 &SyncPushRequest {
                     commits: published.commits.clone(),
                     ref_updates: Vec::new(),
+                    inline_blobs: published.inline_blobs.clone(),
                 },
                 SyncImportPurpose::ReplicaDelta,
                 None,
@@ -7732,6 +8528,7 @@ mod tests {
                 &SyncPushRequest {
                     commits: published.commits,
                     ref_updates: Vec::new(),
+                    inline_blobs: published.inline_blobs,
                 },
                 SyncImportPurpose::ReplicaDelta,
                 None,
