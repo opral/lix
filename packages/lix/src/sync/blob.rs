@@ -19,11 +19,15 @@ use super::{SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration};
 const MAX_SYNC_BLOB_CHUNKS: usize = 16_384;
 const MAX_INLINE_SYNC_BLOB_BYTES: usize = 64 * 1024;
 
+pub(crate) fn validate_sync_blob_manifest(manifest: &SyncBlobManifest) -> Result<(), LixError> {
+    decode_manifest(manifest).map(|_| ())
+}
+
 fn decode_manifest(manifest: &SyncBlobManifest) -> Result<CanonicalBlobManifest, LixError> {
     if manifest.chunks.len() > MAX_SYNC_BLOB_CHUNKS {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            format!("sync blob manifest exceeds {MAX_SYNC_BLOB_CHUNKS} chunks"),
+            format!("sync blob manifests accept at most {MAX_SYNC_BLOB_CHUNKS} chunks"),
         ));
     }
     let chunks = manifest
@@ -36,11 +40,13 @@ fn decode_manifest(manifest: &SyncBlobManifest) -> Result<CanonicalBlobManifest,
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    Ok(CanonicalBlobManifest {
+    let canonical = CanonicalBlobManifest {
         blob_id: BlobId::from_hex(&manifest.blob_id)?,
         size_bytes: manifest.size_bytes,
         chunks,
-    })
+    };
+    crate::binary_cas::validate_manifest_receipts(&canonical)?;
+    Ok(canonical)
 }
 
 fn encode_manifest(
@@ -639,5 +645,22 @@ mod tests {
             error.details.unwrap()["chunkIds"],
             serde_json::json!(registration.missing_chunk_ids)
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_registration_rejects_an_invalid_manifest_before_requesting_chunks() {
+        let lix = crate::open_lix()
+            .await
+            .expect("test repository should open");
+        let bytes = vec![7; 5 * 1024 * 1024];
+        let canonical = CanonicalBlobManifest::from_bytes(&bytes);
+        let mut manifest = wire_manifest(canonical, None);
+        manifest.size_bytes += 1;
+
+        let error = lix
+            .register_sync_blob_manifest(&manifest)
+            .await
+            .expect_err("an invalid manifest must fail before chunk admission");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }
 }

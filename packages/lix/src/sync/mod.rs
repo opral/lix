@@ -23,6 +23,8 @@ use std::time::Duration;
 use crate::LixError;
 
 pub(crate) use commit::{SyncCommit, SyncCommitMemberRef, encode_sync_commit_member};
+#[cfg(feature = "server-protocol")]
+pub(crate) use blob::validate_sync_blob_manifest;
 pub(crate) use contract::SyncTransport;
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]

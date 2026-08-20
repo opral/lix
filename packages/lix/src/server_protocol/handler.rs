@@ -8,7 +8,7 @@ use crate::session::media_upload::FILE_UPLOAD_PART_BYTES;
 use crate::sync::{
     MAX_SYNC_BLOB_BATCH_ITEMS, MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_REQUEST_ITEMS,
     SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest, SyncBlobRegistration, SyncPushRequest,
-    SyncPushResponse, SyncRepositoryPullResponse,
+    SyncPushResponse, SyncRepositoryPullResponse, validate_sync_blob_manifest,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -46,7 +46,6 @@ use tokio::{
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 const MAX_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-const MAX_SYNC_BLOB_MANIFEST_CHUNKS: usize = 16_384;
 
 /// Request accepted by the canonical protocol handler.
 pub type ServerProtocolRequest = Request<ServerProtocolBody>;
@@ -2543,7 +2542,8 @@ async fn sync_register_blob<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    validate_sync_blob_manifest(&manifest)?;
+    validate_sync_blob_manifest(&manifest)
+        .map_err(|error| ApiError::bad_request(error.message))?;
     let registration = lease
         .run_durable(move |lix| async move { lix.register_sync_blob_manifest(&manifest).await })
         .await?;
@@ -2625,33 +2625,6 @@ fn required_sync_cas_id(value: Option<String>, field: &str) -> Result<String, Ap
         )));
     }
     Ok(value)
-}
-
-fn validate_sync_blob_manifest(manifest: &SyncBlobManifest) -> Result<(), ApiError> {
-    required_sync_cas_id(Some(manifest.blob_id.clone()), "blobId")?;
-    if manifest.chunks.len() > MAX_SYNC_BLOB_MANIFEST_CHUNKS {
-        return Err(ApiError::bad_request(format!(
-            "sync blob manifests accept at most {MAX_SYNC_BLOB_MANIFEST_CHUNKS} chunks",
-        )));
-    }
-    let mut declared_size = 0_u64;
-    for chunk in &manifest.chunks {
-        required_sync_cas_id(Some(chunk.chunk_id.clone()), "chunks[].chunkId")?;
-        if chunk.size_bytes == 0 || chunk.size_bytes > MAX_SYNC_CHUNK_BYTES as u64 {
-            return Err(ApiError::bad_request(format!(
-                "sync blob chunk sizes must be between 1 and {MAX_SYNC_CHUNK_BYTES} bytes",
-            )));
-        }
-        declared_size = declared_size.checked_add(chunk.size_bytes).ok_or_else(|| {
-            ApiError::bad_request("sync blob manifest size overflows an unsigned 64-bit integer")
-        })?;
-    }
-    if declared_size != manifest.size_bytes {
-        return Err(ApiError::bad_request(
-            "sync blob manifest sizeBytes must equal the sum of its chunk sizes",
-        ));
-    }
-    Ok(())
 }
 
 fn sync_cas_not_found(kind: &str, id: &str) -> ApiError {
@@ -7939,6 +7912,7 @@ mod tests {
         )
         .await;
         assert_eq!(invalid_manifest.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(invalid_manifest).await, "LIX_INVALID_ARGUMENT");
 
         for blob_ids in [
             format!("{digest},{digest}"),

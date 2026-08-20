@@ -431,7 +431,9 @@ pub(crate) async fn stage_verified_canonical_manifest(
     Ok(receipt)
 }
 
-fn validate_manifest_receipts(manifest: &CanonicalBlobManifest) -> Result<(), LixError> {
+pub(crate) fn validate_manifest_receipts(
+    manifest: &CanonicalBlobManifest,
+) -> Result<(), LixError> {
     validate_manifest_shape(manifest)?;
     let observed_size = manifest.chunks.iter().try_fold(0u64, |total, chunk| {
         total.checked_add(chunk.size_bytes).ok_or_else(|| {

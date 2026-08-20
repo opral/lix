@@ -6,11 +6,10 @@
 use serde::Deserialize;
 
 use super::{
-    MAX_SYNC_BLOB_BATCH_ITEMS, MAX_SYNC_HISTORY_PAGE_SIZE, MAX_SYNC_PULL_RESPONSE_BYTES,
-    SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse,
-    SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse, SyncSnapshotRowPage,
-    SyncTransport, SyncTransportBounds, SyncTransportFuture, validate_blake3_id,
-    validate_sync_remote_id,
+    MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest,
+    SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
+    SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportBounds,
+    SyncTransportFuture, validate_sync_remote_id,
 };
 use crate::LixError;
 
@@ -190,14 +189,6 @@ where
         limit: usize,
     ) -> SyncTransportFuture<'a, SyncHistoryResponse> {
         Box::pin(async move {
-            if head.is_empty() || limit == 0 || limit > MAX_SYNC_HISTORY_PAGE_SIZE {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!(
-                        "sync history requires a head and a limit from 1 through {MAX_SYNC_HISTORY_PAGE_SIZE}"
-                    ),
-                ));
-            }
             let query = format!("head={}&limit={limit}", encode_query(head));
             let request = self.request(
                 Method::Get,
@@ -213,17 +204,6 @@ where
         blob_ids: &'a [String],
     ) -> SyncTransportFuture<'a, Vec<SyncBlobManifest>> {
         Box::pin(async move {
-            if blob_ids.is_empty() || blob_ids.len() > MAX_SYNC_BLOB_BATCH_ITEMS {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!(
-                        "sync blob reads require 1 through {MAX_SYNC_BLOB_BATCH_ITEMS} blob IDs"
-                    ),
-                ));
-            }
-            for blob_id in blob_ids {
-                validate_blake3_id(blob_id, "blob ID")?;
-            }
             let blob_ids = blob_ids
                 .iter()
                 .map(|blob_id| encode_query(blob_id))
@@ -243,7 +223,6 @@ where
         manifest: &'a SyncBlobManifest,
     ) -> SyncTransportFuture<'a, SyncBlobRegistration> {
         Box::pin(async move {
-            validate_blake3_id(&manifest.blob_id, "blob ID")?;
             let mut request =
                 self.request(Method::Post, "/sync/blob", "register sync blob manifest");
             request.headers.push(json_content_type());
@@ -254,7 +233,6 @@ where
 
     fn get_chunk<'a>(&'a self, chunk_id: &'a str) -> SyncTransportFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
-            validate_blake3_id(chunk_id, "chunk ID")?;
             let request = self.request(
                 Method::Get,
                 &format!("/sync/chunk?chunkId={}", encode_query(chunk_id)),
@@ -271,7 +249,6 @@ where
 
     fn put_chunk<'a>(&'a self, chunk_id: &'a str, bytes: &'a [u8]) -> SyncTransportFuture<'a, ()> {
         Box::pin(async move {
-            validate_blake3_id(chunk_id, "chunk ID")?;
             let mut request = self.request(Method::Put, "/sync/chunk", "store sync chunk");
             request.url.push_str("?chunkId=");
             request.url.push_str(&encode_query(chunk_id));

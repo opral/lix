@@ -27,7 +27,7 @@ pub(crate) use transfer::{
     CanonicalBlobChunk, CanonicalBlobManifest, chunk_presence_many, load_canonical_blob_chunks,
     load_verified_chunk, stage_deferred_canonical_manifest, stage_transfer_publication_fence,
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
-    stage_verified_raw_chunk,
+    stage_verified_raw_chunk, validate_manifest_receipts,
 };
 pub(crate) use types::{
     BlobBytesBatch, BlobChunkReceipt, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,

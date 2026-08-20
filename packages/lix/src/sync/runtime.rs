@@ -241,8 +241,7 @@ async fn send_sync_demand(
         .send(SyncDemand { request, response })
         .await
         .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
-    done.await
-        .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker stopped"))??;
+    done.await.map_err(|_| stopped_error())??;
     Ok(())
 }
 
@@ -492,7 +491,8 @@ async fn run_sync_worker<StorageImpl>(
             }
         }
     }
-    fail_pending_sync_demands(&mut pending_demands, &mut demand_rx);
+    drop(pending_demands);
+    drop(demand_rx);
     let _ = lix.close().await;
 }
 
@@ -530,25 +530,6 @@ where
     // with outbox construction then wakes the select below and cannot remain
     // hidden behind an already-held long poll.
     let _ = change_watcher.borrow_and_update();
-
-    // A cursor-less replica always bootstraps before it can publish local
-    // work. This prevents an engine's synthetic initialization commit from
-    // being mistaken for user-authored repository history.
-    if lix.load_sync_repository_cursor(remote_id).await?.is_none() {
-        let (snapshot, _lix_id, _default_branch_id) = fetch_repository_snapshot(transport).await?;
-        register_blob_manifests(lix, transport, &snapshot.commits, &snapshot.rows).await?;
-        lix.apply_sync_repository_snapshot(
-            remote_id,
-            transport.active_account_id(),
-            &snapshot.metadata,
-            &snapshot.commits,
-            &snapshot.commit_headers,
-            &snapshot.rows,
-            &snapshot.checkpoint_roots,
-        )
-        .await?;
-        return Ok(None);
-    }
 
     // Publish completed local commits before waiting for remote work. Commit
     // identity and ref compare-and-swap make retry after a lost response safe.
@@ -879,18 +860,6 @@ where
         }
     }
     (retry, retry_error)
-}
-
-fn fail_pending_sync_demands(
-    pending: &mut Vec<SyncDemand>,
-    demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
-) {
-    while let Ok(demand) = demand_rx.try_recv() {
-        pending.push(demand);
-    }
-    for demand in pending.drain(..) {
-        let _ = demand.response.send(Err(stopped_error()));
-    }
 }
 
 async fn hydrate_history_ids<StorageImpl, Transport>(
@@ -2690,25 +2659,23 @@ mod tests {
         let waiter = send_sync_demand(&demand_tx, request);
         let responder = async {
             let demand = demand_rx.recv().await.expect("pending demand arrives");
-            demand
-                .response
-                .send(Err(stopped_error()))
-                .expect("pending waiter remains live");
+            drop(demand);
         };
         let (result, ()) = tokio::join!(waiter, responder);
         let error = result.expect_err("worker shutdown is reported to the caller");
         assert_eq!(error.code, LixError::CODE_CLOSED);
+        assert_eq!(error.message, "sync worker is stopping");
     }
 
     #[tokio::test]
-    async fn worker_exit_fails_retrying_and_queued_demands_together() {
+    async fn worker_exit_drops_retrying_and_queued_demands_together() {
         let request = || SyncDemandRequest::Chunks(vec!["a".repeat(64)]);
         let (retrying_response, retrying_done) = tokio::sync::oneshot::channel();
-        let mut pending = vec![SyncDemand {
+        let pending = vec![SyncDemand {
             request: request(),
             response: retrying_response,
         }];
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(1);
         let (queued_response, queued_done) = tokio::sync::oneshot::channel();
         demand_tx
             .send(SyncDemand {
@@ -2718,15 +2685,42 @@ mod tests {
             .await
             .expect("queued demand is admitted");
 
-        fail_pending_sync_demands(&mut pending, &mut demand_rx);
-        assert!(pending.is_empty());
+        drop(pending);
+        drop(demand_rx);
         for done in [retrying_done, queued_done] {
-            let error = done
-                .await
-                .expect("worker sends an explicit shutdown result")
-                .expect_err("shutdown fails the demand");
-            assert_eq!(error.code, LixError::CODE_CLOSED);
+            done.await
+                .expect_err("worker ownership drop cancels the demand response");
         }
+    }
+
+    #[tokio::test]
+    async fn worker_exit_unblocks_a_demand_waiting_for_channel_capacity() {
+        let request = || SyncDemandRequest::Chunks(vec!["a".repeat(64)]);
+        let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(1);
+        let (queued_response, queued_done) = tokio::sync::oneshot::channel();
+        demand_tx
+            .send(SyncDemand {
+                request: request(),
+                response: queued_response,
+            })
+            .await
+            .expect("first demand fills the channel");
+
+        let mut blocked = Box::pin(send_sync_demand(&demand_tx, request()));
+        assert!(
+            blocked.as_mut().now_or_never().is_none(),
+            "second demand waits for channel capacity",
+        );
+        drop(demand_rx);
+
+        let error = blocked
+            .await
+            .expect_err("receiver drop rejects the blocked demand");
+        assert_eq!(error.code, LixError::CODE_CLOSED);
+        assert_eq!(error.message, "sync demand worker is closed");
+        queued_done
+            .await
+            .expect_err("receiver drop cancels the queued demand response");
     }
 
     #[tokio::test]
@@ -3149,7 +3143,7 @@ mod tests {
 
         let error = sync_iteration(
             &replica,
-            "https://sync.test/repository",
+            "https://sync.example/history",
             &transport,
             &mut push_item_limit,
             &mut delta_pull_limit,
@@ -3171,7 +3165,7 @@ mod tests {
 
         let error = sync_iteration(
             &replica,
-            "https://sync.test/repository",
+            "https://sync.example/history",
             &transport,
             &mut push_item_limit,
             &mut delta_pull_limit,
@@ -3221,7 +3215,7 @@ mod tests {
 
         let error = sync_iteration(
             &replica,
-            "https://sync.test/repository",
+            "https://sync.example/history",
             &transport,
             &mut push_item_limit,
             &mut delta_pull_limit,

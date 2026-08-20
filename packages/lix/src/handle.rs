@@ -1596,6 +1596,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_remote_replica_state_fails_closed() {
+        let storage = Memory::new();
+        Engine::initialize_with_main_branch_id(storage.clone(), None)
+            .await
+            .expect("initialize replica storage");
+        let remote_id = "https://sync.example/repository";
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::sync::SYNC_REPLICA_STATE_SPACE,
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(remote_id.as_bytes())),
+            serde_json::to_vec(&serde_json::json!({
+                "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID
+            }))
+            .expect("malformed replica state should encode"),
+        );
+        adapter
+            .commit_write_set(
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
+            .await
+            .expect("malformed replica state should commit");
+
+        let error = sync_requires_preparation(&storage, remote_id)
+            .await
+            .expect_err("malformed exact-remote state must not trigger a fresh bootstrap");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("decode sync replica state"));
+        assert!(error.message.contains("missing field `cursor`"));
+    }
+
+    #[tokio::test]
     async fn initialized_replica_reopens_only_for_its_exact_remote() {
         let storage = Memory::new();
         Engine::initialize_with_main_branch_id(storage.clone(), None)
