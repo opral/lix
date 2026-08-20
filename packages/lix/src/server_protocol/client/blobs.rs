@@ -45,9 +45,6 @@ impl BlobCache {
         for (index, value) in values.iter().enumerate() {
             prepared.push(prepare_param(self, value, &slot(index)));
         }
-        let has_delta = prepared
-            .iter()
-            .any(|param| matches!(param.value, RequestWireValue::BlobSplice { .. }));
         PreparedRequestParams {
             params: prepared.iter().map(|param| param.value.clone()).collect(),
             full_params: prepared.iter().map(|param| param.full.clone()).collect(),
@@ -55,7 +52,6 @@ impl BlobCache {
                 .into_iter()
                 .filter_map(|param| param.cache_update)
                 .collect(),
-            has_delta,
         }
     }
 
@@ -94,7 +90,6 @@ pub struct PreparedRequestParams {
     pub params: Vec<RequestWireValue>,
     pub full_params: Vec<RequestWireValue>,
     pub cache_updates: Vec<BlobCacheUpdate>,
-    pub has_delta: bool,
 }
 
 #[derive(Debug, Clone)]

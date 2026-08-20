@@ -316,7 +316,6 @@ impl<H: ProtocolHttp> ClientCore<H> {
                 params: encode_engine_values(params)?,
                 full_params: encode_engine_values(params)?,
                 cache_updates: Vec::new(),
-                has_delta: false,
             }
         };
         let request_options = options.as_ref().and_then(|options| {
@@ -389,7 +388,9 @@ impl<H: ProtocolHttp> ClientCore<H> {
         let cache_blobs = prepared
             .iter()
             .any(|(_, _, item)| !item.cache_updates.is_empty());
-        let has_delta = prepared.iter().any(|(_, _, item)| item.has_delta);
+        let has_delta = prepared
+            .iter()
+            .any(|(_, _, item)| request_params_have_delta(&item.params));
         let request_options = options.as_ref().and_then(|options| {
             options.origin_key.as_ref().map(|origin_key| ExecuteOptionsBody {
                 origin_key: Some(origin_key.clone()),
@@ -457,7 +458,10 @@ impl<H: ProtocolHttp> ClientCore<H> {
         Fut: Future<Output = Result<ExecuteResponseBody, LixError>>,
     {
         let result = match request(&prepared.params).await {
-            Err(error) if prepared.has_delta && error.code == BLOB_BASE_MISSING_CODE => {
+            Err(error)
+                if request_params_have_delta(&prepared.params)
+                    && error.code == BLOB_BASE_MISSING_CODE =>
+            {
                 request(&prepared.full_params).await?
             }
             other => other?,
@@ -1076,6 +1080,12 @@ fn error_from_http_response(response: &ProtocolHttpResponse) -> LixError {
 
 fn is_success_status(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+fn request_params_have_delta(params: &[RequestWireValue]) -> bool {
+    params
+        .iter()
+        .any(|param| matches!(param, RequestWireValue::BlobSplice { .. }))
 }
 
 fn error_http_status(error: &LixError) -> Option<u64> {
