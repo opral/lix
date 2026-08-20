@@ -1133,10 +1133,14 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    ensure_blob_manifests(lix, transport, blob_ids_from_pull(response)?).await?;
     let SyncRepositoryPullResponse::Delta { events, .. } = response else {
         return Ok(());
     };
+    let mut blob_ids = BTreeSet::new();
+    for event in events {
+        blob_ids.extend(blob_ids_from_commits(&event.commits)?);
+    }
+    ensure_blob_manifests(lix, transport, blob_ids).await?;
     let included = events
         .iter()
         .flat_map(|event| event.commits.iter().map(|commit| commit.commit_id.as_str()))
@@ -1186,19 +1190,6 @@ where
         lix.register_deferred_sync_blob_manifest(&manifest).await?;
     }
     Ok(())
-}
-
-fn blob_ids_from_pull(response: &SyncRepositoryPullResponse) -> Result<BTreeSet<String>, LixError> {
-    match response {
-        SyncRepositoryPullResponse::Snapshot { .. } => Ok(BTreeSet::new()),
-        SyncRepositoryPullResponse::Delta { events, .. } => {
-            let mut blob_ids = BTreeSet::new();
-            for event in events {
-                blob_ids.extend(blob_ids_from_commits(&event.commits)?);
-            }
-            Ok(blob_ids)
-        }
-    }
 }
 
 fn blob_ids_from_commits(commits: &[super::SyncCommit]) -> Result<BTreeSet<String>, LixError> {
