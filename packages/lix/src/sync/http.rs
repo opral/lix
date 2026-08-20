@@ -36,7 +36,7 @@ pub(super) struct RawHttpResponse {
     pub body: Vec<u8>,
 }
 
-pub(super) trait RawHttpClient: Clone + SyncTransportBounds {
+pub(super) trait RawHttpClient: SyncTransportBounds {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse>;
 }
 
@@ -60,7 +60,7 @@ struct ErrorBody {
     hint: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct HttpSyncTransport<Client> {
     client: Client,
     protocol_url: String,

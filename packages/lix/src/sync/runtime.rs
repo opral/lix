@@ -415,7 +415,7 @@ async fn run_sync_worker<StorageImpl>(
             }
         }
 
-        let Some(current) = transport.clone() else {
+        let Some(current) = transport.as_ref() else {
             continue;
         };
         // This outer race covers every phase, including connect, CAS transfer,
@@ -425,7 +425,7 @@ async fn run_sync_worker<StorageImpl>(
             let iteration = sync_iteration(
                 &lix,
                 &remote_id,
-                &current,
+                current,
                 &mut push_item_limit,
                 &mut delta_pull_limit,
                 &mut change_watcher,
@@ -456,7 +456,7 @@ async fn run_sync_worker<StorageImpl>(
                 let error = match internal_demand_retry.admit(error) {
                     Ok(request) => {
                         let result = {
-                            let hydration = hydrate_sync_request(&lix, &current, request).fuse();
+                            let hydration = hydrate_sync_request(&lix, current, request).fuse();
                             let shutdown = shutdown_rx.changed().fuse();
                             futures_util::pin_mut!(hydration, shutdown);
                             select_biased! {

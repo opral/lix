@@ -51,7 +51,6 @@ pub fn unregister_browser_sync_transport(id: &str) {
     });
 }
 
-#[derive(Clone)]
 pub(crate) struct BrowserHttpClient {
     headers: Vec<(String, String)>,
     header_provider: Option<Function>,

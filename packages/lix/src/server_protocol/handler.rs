@@ -485,7 +485,6 @@ struct SessionOpenGate {
 
 struct PendingSessionOpen {
     gate: Arc<SessionOpenGate>,
-    active: bool,
 }
 
 impl SessionOpenGate {
@@ -507,7 +506,6 @@ impl SessionOpenGate {
                 Ok(_) => {
                     return Ok(PendingSessionOpen {
                         gate: Arc::clone(self),
-                        active: true,
                     });
                 }
                 Err(current) => state = current,
@@ -525,28 +523,14 @@ impl SessionOpenGate {
     }
 }
 
-impl PendingSessionOpen {
-    fn commit(mut self) {
-        self.release();
-    }
-
-    fn release(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
+impl Drop for PendingSessionOpen {
+    fn drop(&mut self) {
         let previous = self.gate.state.fetch_sub(1, Ordering::AcqRel);
         let previous_pending = previous & SESSION_OPEN_GATE_COUNT_MASK;
         debug_assert!(previous_pending > 0, "pending session open count underflow");
         if previous_pending == 1 {
             self.gate.drained.notify_one();
         }
-    }
-}
-
-impl Drop for PendingSessionOpen {
-    fn drop(&mut self) {
-        self.release();
     }
 }
 
@@ -1765,7 +1749,7 @@ where
         principal: Option<ServerProtocolPrincipal>,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
-        let pending_open = self.reserve_session_open()?;
+        let _pending_open = self.reserve_session_open()?;
 
         let active_branch_id = match initial_active_branch_id {
             Some(active_branch_id) => active_branch_id,
@@ -1867,7 +1851,6 @@ where
         for record in removed_sessions {
             close_removed_session(record).await;
         }
-        pending_open.commit();
         lease.record.lix.bind_session();
         Ok(lease)
     }

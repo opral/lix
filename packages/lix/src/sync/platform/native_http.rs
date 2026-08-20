@@ -7,7 +7,7 @@ use super::super::http::{
 use crate::LixError;
 use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct NativeHttpClient {
     client: reqwest::Client,
 }
