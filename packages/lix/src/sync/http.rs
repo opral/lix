@@ -3,6 +3,7 @@
 //! Target adapters implement only [`RawHttpClient`]: issuing a request,
 //! cancellation, dynamic headers, and bounded response-body collection.
 
+use http::Method;
 use serde::Deserialize;
 
 use super::{
@@ -17,13 +18,6 @@ pub(super) const HTTP_TIMEOUT: std::time::Duration =
     SYNC_LONG_POLL_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
 pub(super) const SYNC_TRANSPORT_ERROR_CODE: &str = "LIX_ERROR_SYNC_TRANSPORT";
 const SESSION_HEADER: &str = "lix-session-id";
-
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Method {
-    Get,
-    Post,
-    Put,
-}
 
 #[derive(Debug)]
 pub(super) struct RawHttpRequest {
@@ -87,7 +81,7 @@ where
         let protocol_url = format!("{repository_url}/lix/v1");
         let response = client
             .send(raw_request(
-                Method::Get,
+                Method::GET,
                 protocol_url.clone(),
                 "open sync session",
             ))
@@ -140,7 +134,7 @@ where
 
     fn push<'a>(&'a self, value: &'a SyncPushRequest) -> SyncTransportFuture<'a, SyncPushResponse> {
         Box::pin(async move {
-            let mut request = self.request(Method::Post, "/sync/push", "push sync commits");
+            let mut request = self.request(Method::POST, "/sync/push", "push sync commits");
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode sync push")?);
             self.send_json(request).await
@@ -157,7 +151,7 @@ where
                 Some(after) => format!("/sync/pull?after={after}&limit={limit}"),
                 None => format!("/sync/pull?limit={limit}"),
             };
-            let request = self.request(Method::Get, &path, "pull sync repository");
+            let request = self.request(Method::GET, &path, "pull sync repository");
             self.send_json(request).await
         })
     }
@@ -179,7 +173,7 @@ where
                 path.push_str("&snapshotAfter=");
                 path.push_str(&encode_query(continuation));
             }
-            let request = self.request(Method::Get, &path, "load sync snapshot rows");
+            let request = self.request(Method::GET, &path, "load sync snapshot rows");
             self.send_json(request).await
         })
     }
@@ -192,7 +186,7 @@ where
         Box::pin(async move {
             let query = format!("head={}&limit={limit}", encode_query(head));
             let request = self.request(
-                Method::Get,
+                Method::GET,
                 &format!("/sync/history?{query}"),
                 "load sync history",
             );
@@ -211,7 +205,7 @@ where
                 .collect::<Vec<_>>()
                 .join(",");
             let request = self.request(
-                Method::Get,
+                Method::GET,
                 &format!("/sync/blob?blobIds={blob_ids}"),
                 "load sync blob manifests",
             );
@@ -225,7 +219,7 @@ where
     ) -> SyncTransportFuture<'a, SyncBlobRegistration> {
         Box::pin(async move {
             let mut request =
-                self.request(Method::Post, "/sync/blob", "register sync blob manifest");
+                self.request(Method::POST, "/sync/blob", "register sync blob manifest");
             request.headers.push(json_content_type());
             request.body = Some(json_body(manifest, "encode sync blob manifest")?);
             self.send_json(request).await
@@ -235,7 +229,7 @@ where
     fn get_chunk<'a>(&'a self, chunk_id: &'a str) -> SyncTransportFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
             let mut request = self.request(
-                Method::Get,
+                Method::GET,
                 &format!("/sync/chunk?chunkId={}", encode_query(chunk_id)),
                 "load sync chunk",
             );
@@ -251,7 +245,7 @@ where
 
     fn put_chunk<'a>(&'a self, chunk_id: &'a str, bytes: &'a [u8]) -> SyncTransportFuture<'a, ()> {
         Box::pin(async move {
-            let mut request = self.request(Method::Put, "/sync/chunk", "store sync chunk");
+            let mut request = self.request(Method::PUT, "/sync/chunk", "store sync chunk");
             request.url.push_str("?chunkId=");
             request.url.push_str(&encode_query(chunk_id));
             request.headers.push((

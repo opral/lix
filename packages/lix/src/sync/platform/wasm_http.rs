@@ -7,7 +7,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
 use super::super::http::{
-    HTTP_TIMEOUT, HttpSyncTransport, Method, RawHttpClient, RawHttpRequest, RawHttpResponse,
+    HTTP_TIMEOUT, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse,
     SYNC_TRANSPORT_ERROR_CODE, response_too_large,
 };
 use crate::LixError;
@@ -110,11 +110,7 @@ impl RawHttpClient for BrowserHttpClient {
             headers.extend(request.headers);
             fetch(
                 &request.url,
-                match request.method {
-                    Method::Get => "GET",
-                    Method::Post => "POST",
-                    Method::Put => "PUT",
-                },
+                request.method.as_str(),
                 &headers,
                 request.body,
                 request.cache_immutable,

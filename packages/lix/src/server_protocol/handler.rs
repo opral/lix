@@ -849,12 +849,8 @@ where
         }
     }
 
-    fn acquire(&self, now: Instant) {
+    fn acquire(&self) {
         self.activity.acquire_lease();
-        *self
-            .last_used
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
     }
 
     fn release(&self, now: Instant) {
@@ -921,7 +917,7 @@ where
         record: Arc<SessionRecord<S>>,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Self {
-        record.acquire(Instant::now());
+        record.acquire();
         Self {
             session_id,
             record,

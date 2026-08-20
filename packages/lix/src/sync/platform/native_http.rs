@@ -1,7 +1,7 @@
 //! Native HTTP mechanics for the repository-scoped sync protocol.
 
 use super::super::http::{
-    HTTP_TIMEOUT, HttpSyncTransport, Method, RawHttpClient, RawHttpRequest, RawHttpResponse,
+    HTTP_TIMEOUT, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse,
     SYNC_TRANSPORT_ERROR_CODE, response_too_large,
 };
 use crate::LixError;
@@ -47,12 +47,7 @@ impl HttpSyncTransport<NativeHttpClient> {
 impl RawHttpClient for NativeHttpClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
-            let method = match request.method {
-                Method::Get => reqwest::Method::GET,
-                Method::Post => reqwest::Method::POST,
-                Method::Put => reqwest::Method::PUT,
-            };
-            let mut builder = self.client.request(method, &request.url);
+            let mut builder = self.client.request(request.method, &request.url);
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }

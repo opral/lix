@@ -39,6 +39,7 @@ server-protocol-client = [
   "dep:async-stream",
   "dep:flate2",
   "dep:futures-core",
+  "dep:http",
   "dep:url",
   "tokio/sync",
 ]
