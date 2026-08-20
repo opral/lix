@@ -54,7 +54,7 @@ pub(crate) struct PreparedSync {
     transport: HttpSyncTransport,
     snapshot: PreparedRepositorySnapshot,
     lix_id: String,
-    default_branch_id: String,
+    pub(crate) default_branch_id: String,
 }
 
 #[derive(Debug)]
@@ -63,20 +63,6 @@ struct PreparedRepositorySnapshot {
     commits: Vec<super::SyncCommit>,
     commit_headers: Vec<super::SyncCommitHeader>,
     rows: Vec<super::SyncSnapshotRow>,
-}
-
-impl PreparedSync {
-    pub(crate) fn default_branch_id(&self) -> &str {
-        &self.default_branch_id
-    }
-
-    pub(crate) fn lix_id(&self) -> &str {
-        &self.lix_id
-    }
-
-    pub(crate) fn active_account_id(&self) -> &str {
-        self.transport.active_account_id()
-    }
 }
 
 /// Performs the fresh-store bootstrap network operation exactly once.
@@ -338,10 +324,10 @@ where
             .await?;
         register_snapshot_row_blob_manifests(lix, &prepared.transport, &prepared.snapshot.rows)
             .await?;
-        let authority_lix_id = prepared.lix_id().to_owned();
+        let authority_lix_id = prepared.lix_id.clone();
         lix.apply_sync_repository_snapshot(
             &remote_id,
-            prepared.active_account_id(),
+            prepared.transport.active_account_id(),
             &prepared.snapshot.metadata,
             &prepared.snapshot.commits,
             &prepared.snapshot.commit_headers,
@@ -349,7 +335,7 @@ where
         )
         .await?;
         lix.align_repository_identity_for_sync(authority_lix_id)?;
-        lix.align_primary_account_for_sync(prepared.active_account_id())
+        lix.align_primary_account_for_sync(prepared.transport.active_account_id())
             .await?;
         Some(prepared.transport)
     } else {

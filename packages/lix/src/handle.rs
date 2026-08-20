@@ -370,7 +370,7 @@ where
     };
     let initial_sync_branch_id = prepared_sync
         .as_ref()
-        .map(|prepared| prepared.default_branch_id().to_owned());
+        .map(|prepared| prepared.default_branch_id.clone());
     let reopened_sync_account_id = if prepared_sync.is_none() {
         if let Some(server) = server.as_ref() {
             let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
