@@ -147,13 +147,7 @@ fn prepare_param(cache: &BlobCache, value: &Value, slot: &str) -> PreparedReques
             cache_update: Some(cache_update),
         };
     };
-    let Some(delta) = plan_blob_splice(&base.bytes, bytes, &base.sha256, &result_sha256) else {
-        return PreparedRequestParam {
-            value: full.clone(),
-            full,
-            cache_update: Some(cache_update),
-        };
-    };
+    let delta = plan_blob_splice(&base.bytes, bytes, &base.sha256, &result_sha256);
     if !blob_splice_is_smaller(&delta, bytes.len()) {
         return PreparedRequestParam {
             value: full.clone(),
@@ -188,7 +182,7 @@ fn plan_blob_splice(
     result: &[u8],
     base_sha256: &str,
     result_sha256: &str,
-) -> Option<BlobSplicePlan> {
+) -> BlobSplicePlan {
     let mut prefix_bytes = 0;
     let prefix_limit = base.len().min(result.len());
     while prefix_limit - prefix_bytes >= REQUEST_BLOB_COMPARE_WORD_BYTES
@@ -219,13 +213,13 @@ fn plan_blob_splice(
         suffix_bytes += 1;
     }
 
-    Some(BlobSplicePlan {
+    BlobSplicePlan {
         base_sha256: base_sha256.to_owned(),
         result_sha256: result_sha256.to_owned(),
         prefix_bytes,
         suffix_bytes,
         insert: result[prefix_bytes..result.len() - suffix_bytes].to_vec(),
-    })
+    }
 }
 
 fn blob_splice_is_smaller(delta: &BlobSplicePlan, full_len: usize) -> bool {
