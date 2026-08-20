@@ -1325,29 +1325,6 @@ where
     }
 }
 
-#[derive(Clone)]
-struct HandlerState<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    server: LixServerProtocol<S>,
-}
-
-impl<S> HandlerState<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    async fn lease(
-        &self,
-        session_id: &str,
-        durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
-    ) -> Result<SessionLease<S>, ApiError> {
-        self.server
-            .lease(session_id, durable_terminal_storage_notifier)
-            .await
-    }
-}
-
 struct ServerObserve<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1503,9 +1480,6 @@ where
         request: ServerProtocolRequest,
         context: ServerProtocolContext,
     ) -> ServerProtocolResponse {
-        let state = HandlerState {
-            server: self.clone(),
-        };
         let (parts, body) = request.into_parts();
         if parts.headers.contains_key(http::header::CONTENT_ENCODING) {
             return ApiError::unsupported_media_type(
@@ -1523,23 +1497,21 @@ where
                 Ok(query) => query,
                 Err(error) => return error.into_response(),
             };
-            return result_response(
-                Box::pin(handshake(state, query, parts.headers, context)).await,
-            );
+            return result_response(Box::pin(handshake(self, query, parts.headers, context)).await);
         }
 
         if path == "/lix/v1/session" {
             if method != Method::DELETE {
                 return method_not_allowed();
             }
-            return result_response(delete_session(state, parts.headers, context).await);
+            return result_response(delete_session(self, parts.headers, context).await);
         }
 
         let session_id = match required_session_id(&parts.headers) {
             Ok(session_id) => session_id,
             Err(error) => return error.into_response(),
         };
-        let lease = match state
+        let lease = match self
             .lease(
                 &session_id,
                 context.durable_terminal_storage_notifier.clone(),
@@ -2090,7 +2062,7 @@ fn required_transaction_id(headers: &HeaderMap) -> Result<String, ApiError> {
 }
 
 async fn handshake<S>(
-    state: HandlerState<S>,
+    server: LixServerProtocol<S>,
     request: HandshakeRequest,
     headers: HeaderMap,
     context: ServerProtocolContext,
@@ -2106,7 +2078,7 @@ where
                     "activeBranchId is only allowed when creating a session",
                 ));
             }
-            let lease = state
+            let lease = server
                 .lease(&session_id, durable_terminal_storage_notifier.clone())
                 .await?;
             validate_principal(&lease, &context.principal)?;
@@ -2129,15 +2101,14 @@ where
                 context.principal,
                 ServerProtocolPrincipal::Authenticated { .. }
             ) {
-                Box::pin(state.server.inner.root.ensure_account(
+                Box::pin(server.inner.root.ensure_account(
                     &active_account_id,
                     &active_account_id,
                     "human",
                 ))
                 .await?;
             }
-            state
-                .server
+            server
                 .create_session(
                     active_branch_id,
                     Some(active_account_id),
@@ -2151,29 +2122,26 @@ where
         .run_cancellable_read(|lix| async move { lix.active_branch_id().await })
         .await?;
     let active_account_id = lease.record.principal.account_id().to_owned();
-    Ok((
-        [(CACHE_CONTROL, "no-store")],
-        Json(HandshakeResponse {
-            protocol_version: PROTOCOL_VERSION,
-            active_branch_id,
-            active_account_id,
-            session_id: lease.session_id.clone(),
-            capabilities: ProtocolCapabilities {
-                binary_file_upsert: true,
-                binary_file_upsert_batch: true,
-                binary_file_read: true,
-                sync_push: true,
-                sync_pull: true,
-                sync_history: true,
-                sync_blob: true,
-                sync_chunk: true,
-            },
-        }),
-    ))
+    Ok(Json(HandshakeResponse {
+        protocol_version: PROTOCOL_VERSION,
+        active_branch_id,
+        active_account_id,
+        session_id: lease.session_id.clone(),
+        capabilities: ProtocolCapabilities {
+            binary_file_upsert: true,
+            binary_file_upsert_batch: true,
+            binary_file_read: true,
+            sync_push: true,
+            sync_pull: true,
+            sync_history: true,
+            sync_blob: true,
+            sync_chunk: true,
+        },
+    }))
 }
 
 async fn delete_session<S>(
-    state: HandlerState<S>,
+    server: LixServerProtocol<S>,
     headers: HeaderMap,
     context: ServerProtocolContext,
 ) -> Result<StatusCode, ApiError>
@@ -2181,7 +2149,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session_id = required_session_id(&headers)?;
-    match state.server.lease(&session_id, None).await {
+    match server.lease(&session_id, None).await {
         Ok(lease) => {
             validate_principal(&lease, &context.principal)?;
             drop(lease);
@@ -2189,7 +2157,7 @@ where
         Err(error) if error.status == StatusCode::GONE => return Ok(StatusCode::NO_CONTENT),
         Err(error) => return Err(error),
     }
-    state.server.delete_session(&session_id).await?;
+    server.delete_session(&session_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3065,7 +3033,6 @@ where
         *response.status_mut() = StatusCode::PARTIAL_CONTENT;
     }
     let headers = response.headers_mut();
-    headers.insert(CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
     headers.insert(
         CONTENT_TYPE,
         http::HeaderValue::from_static("application/octet-stream"),
