@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- Removed the public SQL script-parsing API (`parse_sql_script` /
+  `parseSqlScript`, `SqlScriptPlan`, `SqlScriptStatement`) from the Rust and
+  JavaScript SDKs. Hosts pass an array of statements to `executeBatch`;
+  `execute` remains one statement. Do not parse a script string into statements
+  on the host.
 - Removed every public `*_by_branch` SQL relation and the public
   `lixcol_branch_id` row-routing column. SQL relations now always use the
   current session's active branch. Open another session to work with another

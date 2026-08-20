@@ -177,7 +177,6 @@ pub(crate) use session::{
 pub(crate) use session::VerifiedRequestBlob;
 #[cfg(feature = "storage-benches")]
 pub(crate) use sql_profile::SqlReadProfile;
-pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::Memory;
 
 /// Reserved high UUID sentinel for repository-global state.

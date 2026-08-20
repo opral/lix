@@ -827,6 +827,10 @@ where
     /// syntax does not imply support for every PostgreSQL statement or runtime
     /// feature. Use `information_schema` for catalog inspection. Lix owns
     /// transaction boundaries for each statement.
+    ///
+    /// `sql` must be a single statement. To run several statements atomically,
+    /// pass an array of statements to [`Self::execute_batch`]. Do not concatenate
+    /// statements into one script string.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
@@ -1650,6 +1654,9 @@ where
     /// session. Batches containing writes or durable runtime functions use a
     /// write transaction, so reads can observe earlier staged writes and the
     /// transaction commits only after every statement succeeds.
+    ///
+    /// Each entry is one statement plus its own parameters. Callers assemble
+    /// the array; Lix does not parse a multi-statement script on their behalf.
     pub async fn execute_batch(
         &self,
         statements: &[ExecuteBatchStatement],

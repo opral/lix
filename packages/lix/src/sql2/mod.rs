@@ -110,5 +110,4 @@ pub(crate) use providers::{
     execute_fast_lix_file_path_writes,
     execute_fast_lix_file_prepared_path_write,
 };
-pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 mod aggregate_statistics;

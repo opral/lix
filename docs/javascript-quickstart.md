@@ -33,6 +33,10 @@ await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 
 Lix records both writes automatically. You do not need to create commits.
 
+`execute()` runs one statement. To run several statements atomically, pass an
+array of statements to `lix.executeBatch()`. Do not concatenate SQL into one
+script string.
+
 ## Read history
 
 ```ts
