@@ -443,7 +443,27 @@ async fn run_sync_worker<StorageImpl>(
                 let error = match internal_demand_retry.admit(error) {
                     Ok(request) => {
                         let result = {
-                            let hydration = hydrate_sync_request(&lix, current, request).fuse();
+                            let hydration = async {
+                                match request {
+                                    SyncDemandRequest::History(ids) => {
+                                        hydrate_history_ids(
+                                            &lix,
+                                            current,
+                                            ids.into_iter().collect(),
+                                        )
+                                        .await
+                                    }
+                                    SyncDemandRequest::Chunks(ids) => {
+                                        hydrate_chunk_ids(
+                                            &lix,
+                                            current,
+                                            ids.into_iter().collect(),
+                                        )
+                                        .await
+                                    }
+                                }
+                            }
+                            .fuse();
                             let shutdown = shutdown_rx.changed().fuse();
                             futures_util::pin_mut!(hydration, shutdown);
                             select_biased! {
@@ -779,25 +799,6 @@ fn is_retryable_sync_transport_error(error: &LixError) -> bool {
         .and_then(|details| details.get("httpStatus"))
         .and_then(serde_json::Value::as_u64);
     matches!(status, Some(408 | 429 | 500..=599))
-}
-
-async fn hydrate_sync_request<StorageImpl, Transport>(
-    lix: &Lix<StorageImpl>,
-    transport: &Transport,
-    request: SyncDemandRequest,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    Transport: SyncTransport,
-{
-    match request {
-        SyncDemandRequest::History(ids) => {
-            hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
-        }
-        SyncDemandRequest::Chunks(ids) => {
-            hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
-        }
-    }
 }
 
 async fn hydrate_and_resolve_sync_demands<StorageImpl, Transport>(

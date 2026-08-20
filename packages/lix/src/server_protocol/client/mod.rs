@@ -214,10 +214,6 @@ impl<H: ProtocolHttp> ClientCore<H> {
         Ok(())
     }
 
-    async fn handshake_resume(&self) -> Result<HandshakeResponse, LixError> {
-        self.request_handshake(self.base_url.clone(), true).await
-    }
-
     async fn recover_session_once(&self) -> Result<(), LixError> {
         let branch_id = {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -561,7 +557,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
     }
 
     async fn resume_or_recover_handshake(&self) -> Result<(), LixError> {
-        match self.handshake_resume().await {
+        match self.request_handshake(self.base_url.clone(), true).await {
             Ok(handshake) => {
                 let current = self
                     .state
