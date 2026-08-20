@@ -10,6 +10,44 @@ use std::ops::ControlFlow;
 
 use crate::LixError;
 
+fn identifier_matches(identifier: &Ident, expected: &str) -> bool {
+    if identifier.quote_style.is_some() {
+        identifier.value == expected
+    } else {
+        identifier.value.eq_ignore_ascii_case(expected)
+    }
+}
+
+/// Matches a public table function using PostgreSQL identifier rules.
+/// Unquoted identifiers are case-insensitive; quoted identifiers are exact.
+/// DataFusion registers table functions globally, so only the public/default
+/// qualification is normalized away rather than accepting arbitrary schemas.
+pub(crate) fn object_name_is_public_function(name: &ObjectName, expected: &str) -> bool {
+    let identifiers = name
+        .0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(identifier) => Some(identifier),
+            ObjectNamePart::Function(_) => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(identifiers) = identifiers else {
+        return false;
+    };
+    match identifiers.as_slice() {
+        [function] => identifier_matches(function, expected),
+        [schema, function] => {
+            identifier_matches(schema, "public") && identifier_matches(function, expected)
+        }
+        [catalog, schema, function] => {
+            identifier_matches(catalog, "datafusion")
+                && identifier_matches(schema, "public")
+                && identifier_matches(function, expected)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
     let dialect = super::dialect::lix_sql_dialect();
     let mut has_anonymous = false;
@@ -241,6 +279,17 @@ mod tests {
     fn rejects_anonymous_parameters() {
         let error = parse_statement("SELECT ?").expect_err("anonymous parameters are unsupported");
         assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+    }
+
+    #[test]
+    fn rejects_multi_statement_scripts() {
+        let error = parse_statement("SELECT 1; SELECT 2")
+            .expect_err("execute parses one statement, not a script");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(
+            error.message,
+            "Lix SQL only supports one statement per execute() call"
+        );
     }
 
     #[test]

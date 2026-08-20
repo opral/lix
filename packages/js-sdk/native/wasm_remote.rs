@@ -18,14 +18,17 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use super::{
-    CreateBranchOptionsDto, CreateBranchReceiptDto, CreateCheckpointReceiptDto, RedoReceiptDto,
-    SwitchBranchOptionsDto, SwitchBranchReceiptDto, UndoReceiptDto, batch_statements_from_js,
-    execute_result_to_js, from_js, lix_error_to_js, to_js, values_from_js,
+    CreateBranchOptionsDto, CreateBranchReceiptDto, CreateCheckpointReceiptDto,
+    OpenAnotherSessionOptionsDto, RedoReceiptDto, SwitchBranchOptionsDto, SwitchBranchReceiptDto,
+    UndoReceiptDto, batch_statements_from_js, execute_result_to_js, from_js, lix_error_to_js,
+    to_js, values_from_js,
 };
 
 #[wasm_bindgen]
 pub struct WasmRemoteLix {
     inner: ProtocolClient<JsHttp>,
+    http: JsHttp,
+    url: String,
 }
 
 #[wasm_bindgen]
@@ -96,14 +99,56 @@ pub async fn open_remote(
 ) -> Result<WasmRemoteLix, JsValue> {
     console_error_panic_hook::set_once();
     let http = JsHttp { fetch, headers };
-    let inner = open_protocol_client(http, url, initial_active_branch_id)
+    let inner = open_protocol_client(http.clone(), url.clone(), initial_active_branch_id)
         .await
         .map_err(lix_error_to_js)?;
-    Ok(WasmRemoteLix { inner })
+    Ok(WasmRemoteLix { inner, http, url })
 }
 
 #[wasm_bindgen]
 impl WasmRemoteLix {
+    #[wasm_bindgen(js_name = openAnotherSession)]
+    pub async fn open_another_session(&self, options: JsValue) -> Result<WasmRemoteLix, JsValue> {
+        let options: OpenAnotherSessionOptionsDto = from_js(options)?;
+        let parent_account_id = self
+            .inner
+            .active_account_id()
+            .await
+            .map_err(lix_error_to_js)?;
+        if let Some(account_id) = options.account_id
+            && account_id != parent_account_id
+        {
+            return Err(lix_error_to_js(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "remote sessions cannot override the authenticated account",
+            )));
+        }
+        let branch_id = match options.branch_id {
+            Some(branch_id) => branch_id,
+            None => self
+                .inner
+                .active_branch_id()
+                .await
+                .map_err(lix_error_to_js)?,
+        };
+        let inner = open_protocol_client(self.http.clone(), self.url.clone(), Some(branch_id))
+            .await
+            .map_err(lix_error_to_js)?;
+        let child_account_id = inner.active_account_id().await.map_err(lix_error_to_js)?;
+        if child_account_id != parent_account_id {
+            let _ = inner.close().await;
+            return Err(lix_error_to_js(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "remote session authentication changed while opening another session",
+            )));
+        }
+        Ok(WasmRemoteLix {
+            inner,
+            http: self.http.clone(),
+            url: self.url.clone(),
+        })
+    }
+
     #[wasm_bindgen(js_name = execute)]
     pub async fn execute(
         &self,

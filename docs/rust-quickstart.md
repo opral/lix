@@ -41,7 +41,7 @@ async fn main() -> Result<(), lix::LixError> {
     let history = lix
         .execute(
             "SELECT path, lixcol_depth \
-             FROM lix_file_history() \
+             FROM lix_history('lix_file') \
              WHERE path = $1 \
              ORDER BY lixcol_depth",
             &[lix::Value::Text("/hello.txt".to_owned())],
@@ -58,6 +58,10 @@ async fn main() -> Result<(), lix::LixError> {
 
 Lix records both writes automatically. You do not need to create commits.
 Depth `0` is the state at the head. Higher numbers walk back through history.
+
+`execute()` runs one statement. To run several statements atomically, pass an
+array of statements to `lix.execute_batch`. Do not concatenate SQL into one
+script string.
 
 The repository is in memory and disappears when the process ends. For native
 persistence, use `lix-storage-rocksdb` or `lix-storage-filesystem`. See

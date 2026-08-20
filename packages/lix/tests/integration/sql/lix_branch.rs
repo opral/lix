@@ -134,35 +134,13 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_branch_ref_control_preserves_public_row_metadata,
+    lix_branch_components_are_not_public,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine.open_session().await.expect("session should open"),
             &engine,
         );
-        let branch_id = sim.main_branch_id();
-        let before = session
-            .execute(
-                &format!(
-                    "SELECT lixcol_created_at, lixcol_updated_at, lixcol_change_id \
-                     FROM lix_branch_ref WHERE id = '{branch_id}'"
-                ),
-                &[],
-            )
-            .await
-            .expect("initial ref metadata should be readable");
-        assert_eq!(before.len(), 1);
-        let initial_created_at = before.rows()[0]
-            .get::<String>("lixcol_created_at")
-            .expect("created timestamp should be text");
-        let initial_updated_at = before.rows()[0]
-            .get::<String>("lixcol_updated_at")
-            .expect("updated timestamp should be text");
-        let initial_change_id = before.rows()[0]
-            .get::<String>("lixcol_change_id")
-            .expect("change id should be text");
-
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
@@ -172,48 +150,23 @@ simulation_test!(
             .await
             .expect("tracked write should advance the workspace head");
 
-        let after = session
-            .execute(
-                &format!(
-                    "SELECT lixcol_created_at, lixcol_updated_at, lixcol_change_id \
-                     FROM lix_branch_ref WHERE id = '{branch_id}'"
-                ),
-                &[],
-            )
-            .await
-            .expect("advanced ref metadata should be readable");
-        assert_eq!(after.len(), 1);
-        let advanced_created_at = after.rows()[0]
-            .get::<String>("lixcol_created_at")
-            .expect("advanced created timestamp should be text");
-        let advanced_updated_at = after.rows()[0]
-            .get::<String>("lixcol_updated_at")
-            .expect("advanced updated timestamp should be text");
-        let advanced_change_id = after.rows()[0]
-            .get::<String>("lixcol_change_id")
-            .expect("advanced change id should be text");
-
-        assert_eq!(advanced_created_at, initial_created_at);
-        assert_ne!(advanced_updated_at, initial_updated_at);
-        assert_ne!(advanced_change_id, initial_change_id);
-        assert_eq!(
-            count_rows(
-                &session,
-                &format!(
-                    "SELECT COUNT(*) FROM lix_change \
-                     WHERE id = '{advanced_change_id}' \
-                     AND schema_key = 'lix_branch_ref'"
-                ),
-            )
-            .await,
-            1,
-            "the synthesized current ref must retain its immutable public lix_change ledger fact"
-        );
+        for table_name in [
+            "lix_branch_descriptor",
+            "lix_branch_descriptor_history",
+            "lix_branch_ref",
+            "lix_branch_ref_history",
+        ] {
+            let error = session
+                .execute(&format!("SELECT * FROM {table_name}"), &[])
+                .await
+                .expect_err("branch component should not be public");
+            assert_eq!(error.code, LixError::CODE_TABLE_NOT_FOUND);
+        }
     }
 );
 
 simulation_test!(
-    lix_branch_insert_creates_descriptor_and_ref,
+    lix_branch_insert_reads_back_composed_row,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -228,7 +181,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("lix_branch insert should create descriptor and ref");
+            .expect("lix_branch insert should succeed");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         assert_single_branch_row(
@@ -239,22 +192,6 @@ simulation_test!(
             sim.initial_commit_id(),
         )
         .await;
-        assert_eq!(
-            count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = '73716c2d-6272-816e-8368-2d696e736500'",
-            )
-            .await,
-            1
-        );
-        assert_eq!(
-            count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = '73716c2d-6272-816e-8368-2d696e736500'",
-            )
-            .await,
-            1
-        );
     }
 );
 
@@ -292,7 +229,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_branch_update_splits_descriptor_and_ref_changes,
+    lix_branch_update_reads_back_composed_row,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -336,7 +273,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("lix_branch update should split descriptor and ref changes");
+            .expect("lix_branch update should succeed");
         assert_eq!(update_result, ExecuteResult::from_rows_affected(1));
 
         assert_single_branch_row(
@@ -347,19 +284,11 @@ simulation_test!(
             &new_head,
         )
         .await;
-        assert_eq!(
-            select_single_text(
-                &session,
-                "SELECT commit_id FROM lix_branch_ref WHERE id = '73716c2d-6272-816e-8368-2d7570646100'",
-            )
-            .await,
-            new_head
-        );
     }
 );
 
 simulation_test!(
-    lix_branch_delete_removes_descriptor_and_ref_atomically,
+    lix_branch_delete_removes_composed_row,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -382,29 +311,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("lix_branch delete should remove descriptor and ref atomically");
+            .expect("lix_branch delete should succeed");
         assert_eq!(delete_result, ExecuteResult::from_rows_affected(1));
 
         assert_eq!(
             count_rows(
                 &session,
                 "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
-            )
-            .await,
-            0
-        );
-        assert_eq!(
-            count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
-            )
-            .await,
-            0
-        );
-        assert_eq!(
-            count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
             )
             .await,
             0
@@ -493,12 +406,18 @@ simulation_test!(
              WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
         )
         .await;
-        session
+        let branch_session = sim.wrap_session(
+            engine
+                .open_session_at("73716c2d-6272-816e-8368-2d6c6f636100")
+                .await
+                .expect("branch session should open"),
+            &engine,
+        );
+        branch_session
             .execute(
-                "INSERT INTO lix_key_value_by_branch \
-                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'draft', \
-                         '73716c2d-6272-816e-8368-2d6c6f636100', false, true)",
+                "INSERT INTO lix_key_value \
+                 (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'draft', false, true)",
                 &[],
             )
             .await
@@ -593,22 +512,27 @@ simulation_test!(
             )
             .await
             .expect("branch insert should succeed");
-        session
+        let branch_session = sim.wrap_session(
+            engine
+                .open_session_at("73716c2d-6272-816e-8368-2d7265637201")
+                .await
+                .expect("branch session should open"),
+            &engine,
+        );
+        branch_session
             .execute(
-                "INSERT INTO lix_key_value_by_branch \
-                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'old', \
-                         '73716c2d-6272-816e-8368-2d7265637201', false, false)",
+                "INSERT INTO lix_key_value \
+                 (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'old', false, false)",
                 &[],
             )
             .await
             .expect("tracked branch-local row should insert");
         assert_eq!(
             count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_key_value_by_branch \
-                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201' \
-                   AND lixcol_branch_id = '73716c2d-6272-816e-8368-2d7265637201'",
+                &branch_session,
+                "SELECT COUNT(*) FROM lix_key_value \
+                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201'",
             )
             .await,
             1
@@ -632,10 +556,15 @@ simulation_test!(
 
         assert_eq!(
             count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_key_value_by_branch \
-                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201' \
-                   AND lixcol_branch_id = '73716c2d-6272-816e-8368-2d7265637201'",
+                &sim.wrap_session(
+                    engine
+                        .open_session_at("73716c2d-6272-816e-8368-2d7265637201")
+                        .await
+                        .expect("recreated branch session should open"),
+                    &engine,
+                ),
+                "SELECT COUNT(*) FROM lix_key_value \
+                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201'",
             )
             .await,
             0,

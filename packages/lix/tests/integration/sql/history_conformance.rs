@@ -1,4 +1,4 @@
-use lix::Value;
+use lix::{LixError, Value};
 use serde_json::json;
 
 use super::select_rows;
@@ -71,9 +71,9 @@ simulation_test!(
             .expect("registered schema insert should succeed");
 
         for sql in [
-            "SELECT * FROM lix_file_history() LIMIT 0",
-            "SELECT * FROM lix_directory_history() LIMIT 0",
-            "SELECT * FROM engine_history_contract_schema_history() LIMIT 0",
+            "SELECT * FROM lix_history('lix_file') LIMIT 0",
+            "SELECT * FROM lix_history('lix_directory') LIMIT 0",
+            "SELECT * FROM lix_history('engine_history_contract_schema') LIMIT 0",
         ] {
             let result = session.execute(sql, &[]).await.expect("history function");
             assert!(
@@ -151,7 +151,7 @@ simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
     let typed_rows = select_rows(
         &session,
         "SELECT id, value, lixcol_row_pk, lixcol_depth \
-             FROM engine_history_conformance_history() \
+             FROM lix_history('engine_history_conformance') \
                WHERE lixcol_row_pk = CAST('[\"history-conformance-row\"]' AS JSONB) \
              ORDER BY lixcol_depth",
     )
@@ -199,7 +199,7 @@ simulation_test!(
         let rows = select_rows(
             &session,
             "SELECT key, value, lixcol_row_pk, lixcol_depth \
-             FROM lix_key_value_history() \
+             FROM lix_history('lix_key_value') \
                WHERE key = 'history-pk-backfill' \
              ORDER BY lixcol_depth",
         )
@@ -271,7 +271,7 @@ simulation_test!(
         let rows = select_rows(
             &session,
             "SELECT namespace, id, value, lixcol_depth \
-             FROM engine_history_composite_pk_history() \
+             FROM lix_history('engine_history_composite_pk') \
                WHERE namespace = 'messages' \
                AND id = '7' \
              ORDER BY lixcol_depth",
@@ -344,7 +344,7 @@ simulation_test!(
         let rows = select_rows(
             &session,
             "SELECT tenant, id, value, lixcol_depth \
-             FROM engine_history_nested_pk_history() \
+             FROM lix_history('engine_history_nested_pk') \
                WHERE tenant = 'acme' AND id = '7' \
              ORDER BY lixcol_depth",
         )
@@ -372,7 +372,8 @@ simulation_test!(
             &session,
             "SELECT is_nullable \
              FROM information_schema.table_functions \
-             WHERE function_name = 'engine_history_nested_pk_history' \
+             WHERE function_name = 'lix_history' \
+               AND source_relation = 'engine_history_nested_pk' \
                AND result_column = 'tenant'",
         )
         .await;
@@ -418,7 +419,7 @@ simulation_test!(
         let file_rows = select_rows(
             &session,
             "SELECT id, path, name, content, lixcol_row_pk, lixcol_is_deleted, lixcol_depth \
-             FROM lix_file_history() \
+             FROM lix_history('lix_file') \
                WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
         )
@@ -477,7 +478,7 @@ simulation_test!(
         let directory_rows = select_rows(
             &session,
             "SELECT id, path, parent_id, name, lixcol_row_pk, lixcol_is_deleted, lixcol_depth \
-             FROM lix_directory_history() \
+             FROM lix_history('lix_directory') \
                WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
         )
@@ -533,7 +534,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT h.value \
-                     FROM lix_key_value_history('{first_commit_id}') AS h \
+                     FROM lix_history('lix_key_value', '{first_commit_id}') AS h \
                      JOIN lix_key_value AS active \
                        ON h.key = active.key \
                      WHERE h.key = 'history-join-anchor'"
@@ -556,7 +557,7 @@ simulation_test!(
                 &format!(
                     "SELECT h.value \
                      FROM lix_branch AS b \
-                     LEFT JOIN lix_key_value_history('{first_commit_id}') AS h \
+                     LEFT JOIN lix_history('lix_key_value', '{first_commit_id}') AS h \
                        ON h.key = 'history-join-anchor' \
                      WHERE b.id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
                 ),
@@ -577,7 +578,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT h.value \
-                     FROM lix_key_value_history('{first_commit_id}') AS h \
+                     FROM lix_history('lix_key_value', '{first_commit_id}') AS h \
                      RIGHT JOIN lix_branch AS b \
                        ON h.key = 'history-join-anchor' \
                      WHERE b.id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
@@ -599,7 +600,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT h.value \
-                     FROM lix_key_value_history('{first_commit_id}') AS h \
+                     FROM lix_history('lix_key_value', '{first_commit_id}') AS h \
                      LEFT SEMI JOIN lix_branch AS b \
                        ON true \
                      WHERE h.key = 'history-join-anchor'"
@@ -623,7 +624,7 @@ simulation_test!(
                     "SELECT projected.snapshot \
                      FROM (\
                        SELECT key, value AS snapshot \
-                       FROM lix_key_value_history('{first_commit_id}')\
+                       FROM lix_history('lix_key_value', '{first_commit_id}')\
                      ) AS projected \
                      WHERE projected.key = 'history-join-anchor'"
                 ),
@@ -654,19 +655,145 @@ simulation_test!(
             &engine,
         );
 
+        for (sql, expected_message) in [
+            (
+                "SELECT key FROM lix_key_value_history",
+                "lix_key_value_history",
+            ),
+            (
+                "SELECT key FROM lix_key_value_history()",
+                "lix_key_value_history",
+            ),
+            (
+                "SELECT lixcol_as_of_commit_id FROM lix_history('lix_key_value')",
+                "lixcol_as_of_commit_id",
+            ),
+            (
+                "SELECT key FROM lix_history('lix_key_value', 'one', 'two')",
+                "expects a relation argument and an optional as_of commit ID",
+            ),
+            (
+                "SELECT key FROM lix_history('lix_key_value', 42)",
+                "as_of argument must be a non-null text commit ID",
+            ),
+            (
+                "SELECT * FROM lix_history(lix_file)",
+                "literal known at plan time",
+            ),
+            (
+                "SELECT * FROM lix_history(NULL)",
+                "literal known at plan time",
+            ),
+            (
+                "SELECT * FROM lix_history('missing_relation')",
+                "does not support relation 'missing_relation'",
+            ),
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("invalid history function usage must fail");
+            assert!(
+                error.message.contains(expected_message),
+                "{sql} returned an unexpected error: {error:?}",
+            );
+        }
+
+        let parameterized_relation = session
+            .execute(
+                "SELECT * FROM lix_history($1, $2)",
+                &[
+                    Value::Text("lix_file".to_string()),
+                    Value::Text(sim.initial_commit_id().to_string()),
+                ],
+            )
+            .await
+            .expect_err("history relation parameters must be rejected");
+        assert!(
+            parameterized_relation
+                .message
+                .contains("literal known at plan time"),
+            "{parameterized_relation:?}"
+        );
+
         for sql in [
-            "SELECT key FROM lix_key_value_history",
-            "SELECT lixcol_as_of_commit_id FROM lix_key_value_history()",
-            "SELECT key FROM lix_key_value_history('one', 'two')",
-            "SELECT key FROM lix_key_value_history(42)",
+            "SELECT key FROM LIX_HISTORY('lix_key_value') LIMIT 0",
+            "SELECT key FROM public.lix_history('lix_key_value') LIMIT 0",
+            "SELECT key FROM datafusion.public.lix_history('lix_key_value') LIMIT 0",
+            "SELECT key FROM \"lix_history\"('lix_key_value') LIMIT 0",
         ] {
             session
                 .execute(sql, &[])
                 .await
-                .expect_err("invalid history function usage must fail");
+                .unwrap_or_else(|error| panic!("{sql} should use SQL identifier rules: {error:?}"));
+        }
+
+        for sql in [
+            "SELECT * FROM bogus.lix_history('lix_file')",
+            "SELECT * FROM \"PUBLIC\".lix_history('lix_file')",
+        ] {
+            let bogus_schema = session
+                .execute(sql, &[])
+                .await
+                .expect_err("an arbitrary or quoted-wrong schema must not resolve");
+            assert_eq!(
+                bogus_schema.code,
+                LixError::CODE_TABLE_NOT_FOUND,
+                "{sql} returned an unexpected error: {bogus_schema:?}",
+            );
+        }
+
+        for sql in [
+            "EXPLAIN SELECT * FROM lix_history('lix_file')",
+            "EXPLAIN SELECT * FROM lix_working_diff()",
+        ] {
+            session
+                .execute(sql, &[])
+                .await
+                .unwrap_or_else(|error| panic!("first {sql} execution should plan: {error:?}"));
+            session.execute(sql, &[]).await.unwrap_or_else(|error| {
+                panic!("repeated {sql} execution should not use a detached table-function plan: {error:?}")
+            });
         }
     }
 );
+
+simulation_test!(history_discovery_has_no_suffix_surfaces, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    assert_eq!(
+        select_rows(
+            &session,
+            "SELECT COUNT(*) \
+             FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name LIKE '%\\_history' ESCAPE '\\'",
+        )
+        .await,
+        vec![vec![Value::Integer(0)]],
+    );
+    assert_eq!(
+        select_rows(
+            &session,
+            "SELECT function_name \
+             FROM information_schema.table_functions \
+             GROUP BY function_name \
+             ORDER BY function_name",
+        )
+        .await,
+        vec![
+            vec![Value::Text("lix_diff".to_string())],
+            vec![Value::Text("lix_history".to_string())],
+            vec![Value::Text("lix_working_diff".to_string())],
+        ],
+    );
+});
 
 simulation_test!(
     unrelated_same_named_column_does_not_validate_as_history_anchor,
@@ -692,7 +819,7 @@ simulation_test!(
             .execute(
                 "SELECT ordinary.lixcol_as_of_commit_id \
                  FROM (SELECT 'ordinary' AS lixcol_as_of_commit_id) AS ordinary \
-                 CROSS JOIN lix_key_value_history() AS history \
+                 CROSS JOIN lix_history('lix_key_value') AS history \
                  WHERE ordinary.lixcol_as_of_commit_id > 'a' \
                    AND history.key = 'collision' \
                  LIMIT 1",
@@ -754,11 +881,11 @@ simulation_test!(
             &session,
             &format!(
                 "SELECT '{first_commit_id}' AS anchor, lixcol_depth, value \
-                 FROM lix_key_value_history('{first_commit_id}') \
+                 FROM lix_history('lix_key_value', '{first_commit_id}') \
                  WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
                  UNION ALL \
                  SELECT '{second_commit_id}' AS anchor, lixcol_depth, value \
-                 FROM lix_key_value_history('{second_commit_id}') \
+                 FROM lix_history('lix_key_value', '{second_commit_id}') \
                  WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
                  ORDER BY anchor"
             ),
@@ -785,11 +912,11 @@ simulation_test!(
             &session,
             &format!(
                 "SELECT '{first_commit_id}' AS anchor \
-                 FROM lix_key_value_history('{first_commit_id}') \
+                 FROM lix_history('lix_key_value', '{first_commit_id}') \
                  WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
                  UNION ALL \
                  SELECT '{second_commit_id}' AS anchor \
-                 FROM lix_key_value_history('{second_commit_id}') \
+                 FROM lix_history('lix_key_value', '{second_commit_id}') \
                  WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
                  ORDER BY anchor"
             ),
@@ -842,7 +969,7 @@ simulation_test!(
             &session,
             &format!(
                 "SELECT key \
-                 FROM lix_key_value_history('{head_commit_id}') \
+                 FROM lix_history('lix_key_value', '{head_commit_id}') \
                    WHERE key IN ('history-and-a', 'history-and-b') \
                    AND key = 'history-and-a'"
             ),
@@ -858,7 +985,7 @@ simulation_test!(
             &session,
             &format!(
                 "SELECT key \
-                 FROM lix_key_value_history('{head_commit_id}') \
+                 FROM lix_history('lix_key_value', '{head_commit_id}') \
                    WHERE key = 'history-and-a' \
                    AND key = 'history-and-b'"
             ),

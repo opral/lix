@@ -2,7 +2,7 @@
 
 //! Scaling harness for **file-scoped** working-diff reads.
 //!
-//! `docs/diff-commands.md` documents `SELECT ... FROM lix_working_diff WHERE
+//! `docs/diff-commands.md` documents `SELECT ... FROM lix_working_diff() WHERE
 //! file_id = $1` as the headline shape, but no benchmark covered it. This
 //! harness holds the *returned* row count fixed and grows the *total* dirty
 //! set since the checkpoint, so the slope answers one question: does a
@@ -199,17 +199,17 @@ async fn run<StorageImpl>(
 
     let probe_file = file_ids[0].clone();
     let file_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                    FROM lix_working_diff WHERE file_id = $1";
+                    FROM lix_working_diff() WHERE file_id = $1";
     let full_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                    FROM lix_working_diff";
+                    FROM lix_working_diff()";
     // `schema_key + file_id`, the shape of the only file-scoped working-diff
     // test in the tree. Still a full HOT_DIFF scan today.
     let file_schema_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                           FROM lix_working_diff WHERE file_id = $1 AND schema_key = $2";
+                           FROM lix_working_diff() WHERE file_id = $1 AND schema_key = $2";
     // Finite identity + file id: takes the existing bypass and resolves as a
     // point read. This is the floor a seekable file-scoped read aims at.
     let point_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                     FROM lix_working_diff \
+                     FROM lix_working_diff() \
                      WHERE schema_key = $1 AND row_pk = CAST($2 AS JSONB) AND file_id = $3";
     // Live-state read of the same file. HOT_ROW is keyed
     // `schema_key ++ file_id ++ row_pk` and `hot_scan_entries` owns a

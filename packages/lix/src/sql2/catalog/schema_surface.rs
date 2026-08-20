@@ -17,7 +17,6 @@ use crate::sql2::result_metadata::{json_field, mark_json_field};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaSurfaceShape {
     Active,
-    ByBranch,
     History,
 }
 
@@ -297,6 +296,8 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
     !matches!(
         schema_key,
         "lix_binary_blob_ref"
+            | "lix_branch_descriptor"
+            | "lix_branch_ref"
             | "lix_change"
             | "lix_directory_descriptor"
             | "lix_file_descriptor"
@@ -374,7 +375,7 @@ pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
         ];
     }
 
-    let mut fields = vec![
+    vec![
         json_field("lixcol_row_pk", true),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
@@ -385,11 +386,7 @@ pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
         Field::new("lixcol_untracked", DataType::Boolean, true),
-    ];
-    if shape == SchemaSurfaceShape::ByBranch {
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    }
-    fields
+    ]
 }
 
 fn arrow_data_type_for_schema_column_type(column_type: SchemaColumnType) -> DataType {

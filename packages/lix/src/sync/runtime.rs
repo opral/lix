@@ -306,7 +306,9 @@ where
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
-    let worker_lix = lix.clone();
+    let worker_lix = lix
+        .open_internal_session_suppressed(lix.active_branch_id().await?, lix.active_account_id())
+        .await?;
     let task = spawn_sync_task(async move {
         run_sync_worker(
             worker_lix,
@@ -480,6 +482,7 @@ async fn run_sync_worker<StorageImpl>(
             }
         }
     }
+    let _ = lix.close().await;
 }
 
 #[derive(Debug)]
@@ -529,10 +532,7 @@ where
     // Publish completed local commits before waiting for remote work. Commit
     // identity and ref compare-and-swap make retry after a lost response safe.
     let ref_conflicted = loop {
-        let Some(request) = lix
-            .build_sync_push(remote_id, *push_item_limit)
-            .await?
-        else {
+        let Some(request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
             break false;
         };
         push_request_blobs(lix, transport, &request).await?;
@@ -1977,9 +1977,7 @@ mod tests {
     fn live_history_and_snapshot_use_distinct_protocol_limits() {
         assert_eq!(super::super::MAX_SYNC_REQUEST_ITEMS, 512);
         assert_eq!(crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE, 100);
-        assert!(
-            crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE < super::super::MAX_SYNC_REQUEST_ITEMS
-        );
+        assert!(crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE < super::super::MAX_SYNC_REQUEST_ITEMS);
     }
 
     #[tokio::test]

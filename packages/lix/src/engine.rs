@@ -1359,7 +1359,7 @@ mod tests {
             .expect("changelog count should be numeric");
         let diff_before = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff \
+                "SELECT COUNT(*) AS entries FROM lix_working_diff() \
                  WHERE schema_key = 'json_pointer'",
                 &[],
             )
@@ -1399,7 +1399,7 @@ mod tests {
             .expect("changelog count should be numeric");
         let diff_after = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff \
+                "SELECT COUNT(*) AS entries FROM lix_working_diff() \
                  WHERE schema_key = 'json_pointer'",
                 &[],
             )
@@ -1556,7 +1556,7 @@ mod tests {
         let index_before = hits.index_scan.load(Ordering::Relaxed);
         let broad = session
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff \
+                "SELECT row_pk, diff_type FROM lix_working_diff() \
                  WHERE schema_key = 'json_pointer' ORDER BY row_pk",
                 &[],
             )
@@ -1605,7 +1605,7 @@ mod tests {
             let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
             let finite = session
                 .execute(
-                    "SELECT row_pk, diff_type FROM lix_working_diff \
+                    "SELECT row_pk, diff_type FROM lix_working_diff() \
                      WHERE schema_key = 'json_pointer' AND row_pk = CAST($1 AS JSONB) \
                      ORDER BY row_pk",
                     &[crate::Value::Text(requested_row_pk.clone())],
@@ -1790,7 +1790,7 @@ mod tests {
             rows
         }
         const COLUMNS: &str = "SELECT row_pk, schema_key, file_id, diff_type \
-                               FROM lix_working_diff";
+                               FROM lix_working_diff()";
 
         use std::sync::atomic::Ordering;
         let hits = &crate::hot_state::WORKING_DIFF_PATH_HITS;
@@ -2196,7 +2196,7 @@ mod tests {
             "checkpoint rotation must not synchronously scan and delete the superseded sparse epoch"
         );
         let logical = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff()", &[])
             .await
             .expect("post-checkpoint logical diff should execute");
         assert_eq!(
@@ -2264,7 +2264,7 @@ mod tests {
             "the second immutable checkpoint row remains while the superseded branch epoch is reclaimed"
         );
         let logical = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff()", &[])
             .await
             .expect("second post-checkpoint logical diff should execute");
         assert_eq!(
@@ -2311,33 +2311,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/global"],
             "a global tracked overlay must retain the general visibility resolver"
-        );
-    }
-
-    #[tokio::test]
-    async fn tracked_row_fast_path_keeps_synthesized_branch_refs_generic() {
-        let storage = Memory::new();
-        let receipt = Engine::initialize(storage.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("initialized engine should open");
-        let session = engine.open_session().await.expect("session should open");
-
-        let rows = session
-            .execute("SELECT id, commit_id FROM lix_branch_ref ORDER BY id", &[])
-            .await
-            .expect("synthesized branch refs should read through the generic path");
-        assert!(
-            rows.rows().iter().any(|row| {
-                row.get::<String>("id")
-                    .is_ok_and(|id| id == receipt.main_branch_id)
-                    && row
-                        .get::<String>("commit_id")
-                        .is_ok_and(|commit_id| commit_id == receipt.initial_commit_id)
-            }),
-            "the normal branch-ref SQL surface must retain its synthesized control row"
         );
     }
 

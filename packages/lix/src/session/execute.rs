@@ -827,6 +827,10 @@ where
     /// syntax does not imply support for every PostgreSQL statement or runtime
     /// feature. Use `information_schema` for catalog inspection. Lix owns
     /// transaction boundaries for each statement.
+    ///
+    /// `sql` must be a single statement. To run several statements atomically,
+    /// pass an array of statements to [`Self::execute_batch`]. Do not concatenate
+    /// statements into one script string.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
@@ -1698,6 +1702,9 @@ where
     /// session. Batches containing writes or durable runtime functions use a
     /// write transaction, so reads can observe earlier staged writes and the
     /// transaction commits only after every statement succeeds.
+    ///
+    /// Each entry is one statement plus its own parameters. Callers assemble
+    /// the array; Lix does not parse a multi-statement script on their behalf.
     pub async fn execute_batch(
         &self,
         statements: &[ExecuteBatchStatement],
@@ -3595,21 +3602,6 @@ where
             }
         }
     }
-
-    #[cfg(test)]
-    pub(crate) async fn scan_hot_state_for_test(
-        &mut self,
-        request: &crate::hot_state::HotStateScanRequest,
-    ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
-        let _operation_guard = self.begin_session_operation()?;
-        let transaction = self.transaction_mut()?;
-        transaction.flush_prepared_mutations_for_read().await?;
-        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_hot_state_batch(
-            transaction,
-            request,
-        )
-        .await
-    }
 }
 
 async fn try_execute_transaction_parameter_batch<StorageImpl>(
@@ -3870,11 +3862,6 @@ fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params:
     match point_read.table_name.as_str() {
         "lix_file" => {
             equality_columns.len() == 1
-                && (equality_columns.contains("id") || equality_columns.contains("path"))
-        }
-        "lix_file_by_branch" => {
-            equality_columns.len() == 2
-                && equality_columns.contains("lixcol_branch_id")
                 && (equality_columns.contains("id") || equality_columns.contains("path"))
         }
         _ => false,
@@ -6621,7 +6608,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{}') \
+                     FROM lix_history('rootless_ordered_insert_probe', '{}') \
                      WHERE lixcol_is_deleted = false",
                     head.commit_id
                 ),
@@ -6892,7 +6879,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(DISTINCT id) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     FROM lix_history('rootless_ordered_insert_probe', '{rooted_fence}') \
                      WHERE id IN ('00000', '00001', '00002', '32767') \
                        AND lixcol_is_deleted = false"
                 ),
@@ -6905,7 +6892,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     FROM lix_history('rootless_ordered_insert_probe', '{rooted_fence}') \
                      WHERE (id = '00001' AND value = 'draft') \
                         OR (id = '32767' AND value = 'main')"
                 ),
@@ -7207,7 +7194,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
-                     FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                     FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
                      WHERE lixcol_is_deleted = false"
                 ),
                 &[],
@@ -7234,7 +7221,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT COUNT(DISTINCT id) AS entries \
-                     FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                     FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
                      WHERE id IN ('02047', '02048', '65535', '65536') \
                        AND lixcol_is_deleted = false"
                 ),
@@ -7373,7 +7360,7 @@ mod tests {
             .execute(
                 &format!(
                     "SELECT value, lixcol_depth \
-                     FROM columnar_lifecycle_probe_history('{merged_head}') \
+                     FROM lix_history('columnar_lifecycle_probe', '{merged_head}') \
                      WHERE id = '00000' ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -7434,7 +7421,7 @@ mod tests {
             reopened_session
                 .execute(
                     &format!(
-                        "SELECT value FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                        "SELECT value FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
                          WHERE id = '65536'"
                     ),
                     &[],
@@ -7534,7 +7521,7 @@ mod tests {
         );
         let working_diff = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff WHERE schema_key = 'ordered_packed_update_probe' AND diff_type = 'added'",
+                "SELECT COUNT(*) AS entries FROM lix_working_diff() WHERE schema_key = 'ordered_packed_update_probe' AND diff_type = 'added'",
                 &[],
             )
             .await
@@ -7584,7 +7571,7 @@ mod tests {
             .await
             .expect("replaced packed current base should remain checkpointable");
         let working_diff = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff()", &[])
             .await
             .unwrap();
         assert_eq!(
@@ -8354,7 +8341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_preserves_later_missing_branch_index() {
+    async fn execute_batch_preserves_later_bind_error_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -8372,40 +8359,30 @@ mod tests {
             )
             .await
             .unwrap();
-        let active_branch_id = session
-            .execute("SELECT lix_active_branch_id() AS id", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("id")
-            .unwrap();
-
-        let sql = "INSERT INTO parameter_insert_branch_probe_by_branch \
-                   (id, value, lixcol_branch_id) VALUES ($1, $2, $3)";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
                     label: None,
-                    sql: sql.to_string(),
+                    sql: "INSERT INTO parameter_insert_branch_probe (id, value) VALUES ($1, $2)"
+                        .to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
                         Value::Text("value-a".to_string()),
-                        Value::Text(active_branch_id),
                     ],
                 },
                 ExecuteBatchStatement {
                     label: None,
-                    sql: sql.to_string(),
+                    sql: "INSERT INTO parameter_insert_branch_probe (id, missing) VALUES ($1, $2)"
+                        .to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
                         Value::Text("value-b".to_string()),
-                        Value::Text("00000000-0000-7000-8000-000000000404".to_string()),
                     ],
                 },
             ])
             .await
-            .expect_err("the second row's missing branch must retain its statement index");
-        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+            .expect_err("the second statement's bind error must retain its statement index");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
 
         let rows = session
@@ -9445,7 +9422,7 @@ mod tests {
         let merged_history = session
             .execute(
                 &format!(
-                    "SELECT value FROM packed_replacement_probe_history('{merged_commit_id}') \
+                    "SELECT value FROM lix_history('packed_replacement_probe', '{merged_commit_id}') \
                      WHERE path = '/00000' ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -10527,7 +10504,7 @@ mod tests {
             ),
             (
                 "SELECT lixcol_depth \
-                 FROM lix_key_value_history() \
+                 FROM lix_history('lix_key_value') \
                  WHERE key = 'batch-read'",
                 &[],
             ),
@@ -10639,7 +10616,10 @@ mod tests {
         );
 
         session
-            .execute("SELECT COUNT(*) AS rows FROM lix_key_value_history()", &[])
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_history('lix_key_value')",
+                &[],
+            )
             .await
             .expect("fixed history surface should execute");
         assert_eq!(

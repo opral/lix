@@ -15,7 +15,10 @@ use lix::{
 use std::{
     future::{Future, IntoFuture},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use crate::engine::{Engine, EngineOptions};
@@ -340,8 +343,50 @@ where
     engine: Arc<Engine<StorageImpl>>,
     session: Arc<SessionContext<StorageImpl>>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
-    sync_runtime: Option<Arc<crate::sync::SyncRuntime>>,
+    sync_lease: Option<Arc<SyncSessionLease>>,
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+}
+
+#[derive(Debug)]
+struct SyncSessionLease {
+    runtime: Arc<crate::sync::SyncRuntime>,
+    active_sessions: Arc<AtomicUsize>,
+    released: AtomicBool,
+}
+
+impl SyncSessionLease {
+    fn root(runtime: Arc<crate::sync::SyncRuntime>) -> Arc<Self> {
+        Arc::new(Self {
+            runtime,
+            active_sessions: Arc::new(AtomicUsize::new(1)),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    fn child(&self) -> Arc<Self> {
+        self.active_sessions.fetch_add(1, Ordering::AcqRel);
+        Arc::new(Self {
+            runtime: self.runtime.clone(),
+            active_sessions: self.active_sessions.clone(),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    async fn release(&self) -> Result<(), LixError> {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if self.active_sessions.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.runtime.stop_and_join().await?;
+        }
+        Ok(())
+    }
+
+    fn stop_if_only_session(&self) {
+        if self.active_sessions.load(Ordering::Acquire) == 1 {
+            self.runtime.stop();
+        }
+    }
 }
 
 async fn open_lix_inner<StorageImpl>(
@@ -400,7 +445,7 @@ where
         engine: Arc::new(engine),
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
-        sync_runtime: None,
+        sync_lease: None,
         sync_demand_tx: None,
     };
     if let Some(server) = server {
@@ -410,7 +455,7 @@ where
                     crate::sync::activate_sync_mode(&mut lix, &server, prepared_sync.take())
                         .await?;
                 lix.sync_demand_tx = Some(runtime.demand_tx.clone());
-                lix.sync_runtime = Some(runtime);
+                lix.sync_lease = Some(SyncSessionLease::root(runtime));
             }
         }
     }
@@ -540,8 +585,11 @@ where
             None => self.active_branch_id().await?,
         };
         let active_account_id = account_id.unwrap_or_else(|| self.active_account_id().to_owned());
-        self.open_internal_session(active_branch_id, active_account_id)
-            .await
+        let mut opened = self
+            .open_internal_session(active_branch_id, active_account_id)
+            .await?;
+        opened.sync_lease = self.sync_lease.as_ref().map(|lease| lease.child());
+        Ok(opened)
     }
 
     pub(crate) async fn open_internal_session(
@@ -597,7 +645,7 @@ where
             engine: self.engine.clone(),
             session: Arc::new(session),
             primary_switch_gate: None,
-            sync_runtime: None,
+            sync_lease: None,
             sync_demand_tx: self.sync_demand_tx.clone(),
         })
     }
@@ -611,6 +659,10 @@ where
     /// transaction boundaries for each statement.
     /// While a transaction is active, call `execute()` on the transaction
     /// handle instead.
+    ///
+    /// `sql` must be a single statement. To run several statements atomically,
+    /// pass an array of statements to [`Self::execute_batch`]. Do not concatenate
+    /// statements into one script string.
     pub fn execute<'a>(
         &'a self,
         sql: &'a str,
@@ -749,6 +801,9 @@ where
     /// Executes statements sequentially against one atomic snapshot.
     /// Pure reads share one read snapshot; batches containing writes retain
     /// transactional read-after-write and rollback semantics.
+    ///
+    /// Each entry is one statement plus its own parameters. Callers assemble
+    /// the array; Lix does not parse a multi-statement script on their behalf.
     pub fn execute_batch<'a>(
         &'a self,
         statements: &'a [ExecuteBatchStatement],
@@ -912,21 +967,21 @@ where
         name: &str,
         kind: &str,
     ) -> Result<(), LixError> {
-        let branch_id = Box::pin(self.active_branch_id()).await?;
-        let system =
-            Box::pin(self.open_internal_session(branch_id, lix::SYSTEM_ACCOUNT_ID)).await?;
+        let system = Box::pin(
+            self.open_internal_session(lix::GLOBAL_BRANCH_ID.to_string(), lix::SYSTEM_ACCOUNT_ID),
+        )
+        .await?;
         system
             .execute(
-                "INSERT INTO lix_account_by_branch \
-                 (id, name, kind, status, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, $2, $3, 'active', $4, true, false) \
-                 ON CONFLICT (id, lixcol_branch_id) \
+                "INSERT INTO lix_account \
+                 (id, name, kind, status, lixcol_global, lixcol_untracked) \
+                 VALUES ($1, $2, $3, 'active', true, false) \
+                 ON CONFLICT (id) \
                  DO NOTHING",
                 &[
                     Value::Text(id.to_string()),
                     Value::Text(name.to_string()),
                     Value::Text(kind.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
                 ],
             )
             .await?;
@@ -999,18 +1054,19 @@ where
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
-        if let Some(runtime) = &self.sync_runtime {
-            runtime.stop_and_join().await?;
+        self.session.close().await?;
+        if let Some(lease) = &self.sync_lease {
+            lease.release().await?;
         }
-        self.session.close().await
+        Ok(())
     }
     /// Signals background synchronization to stop before asynchronous close
     /// drainage begins. Browser hosts use this during page teardown so the
     /// active fetch can be aborted while the document is still alive.
     #[doc(hidden)]
     pub fn begin_close(&self) {
-        if let Some(runtime) = &self.sync_runtime {
-            runtime.stop();
+        if let Some(lease) = &self.sync_lease {
+            lease.stop_if_only_session();
         }
     }
 
@@ -1698,17 +1754,14 @@ mod tests {
 
         let system = root
             .open_another_session()
+            .with_branch(lix::GLOBAL_BRANCH_ID)
             .with_account(lix::SYSTEM_ACCOUNT_ID)
             .await
             .expect("open system session");
         system
             .execute(
-                "UPDATE lix_account_by_branch SET name = 'Ada Lovelace' \
-                 WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(AUTHOR_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "UPDATE lix_account SET name = 'Ada Lovelace' WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
             .expect("rename account");
@@ -1732,11 +1785,8 @@ mod tests {
 
         system
             .execute(
-                "DELETE FROM lix_account_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(UNUSED_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "DELETE FROM lix_account WHERE id = $1",
+                &[Value::Text(UNUSED_ID.to_string())],
             )
             .await
             .expect("delete unused account");
@@ -1750,11 +1800,8 @@ mod tests {
         assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
         let error = system
             .execute(
-                "DELETE FROM lix_account_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(AUTHOR_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "DELETE FROM lix_account WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
             .expect_err("authored changes must restrict account deletion");
@@ -1762,12 +1809,8 @@ mod tests {
 
         system
             .execute(
-                "UPDATE lix_account_by_branch SET status = 'disabled' \
-                 WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(AUTHOR_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
             .expect("disable author");
@@ -1782,12 +1825,8 @@ mod tests {
 
         let error = system
             .execute(
-                "UPDATE lix_account_by_branch SET status = 'disabled' \
-                 WHERE id = $1 AND lixcol_branch_id = $2",
-                &[
-                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
-                ],
+                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
+                &[Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string())],
             )
             .await
             .expect_err("built-in accounts must remain active");
@@ -1822,36 +1861,20 @@ mod tests {
             );
         }
 
-        // Physical copies materialize as `lixcol_global = false`. Unfiltered
-        // `*_by_branch` also *projects* inherited global rows onto every
-        // visible branch with `lixcol_global = true` — that is the same
-        // visibility overlay `ensure_account` uses, not a second seed write.
-        let local_copies = root
-            .execute(
-                "SELECT id, lixcol_branch_id FROM lix_account_by_branch \
-                 WHERE id IN ($1, $2) AND lixcol_global = false",
-                &[
-                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                ],
-            )
+        let global = root
+            .open_another_session()
+            .with_branch(lix::GLOBAL_BRANCH_ID)
             .await
-            .expect("query local account copies should succeed");
-        assert!(
-            local_copies.rows().is_empty(),
-            "built-in accounts must not have branch-local copies"
-        );
-
-        let home_rows = root
+            .expect("global session should open");
+        let home_rows = global
             .execute(
-                "SELECT id, name, lixcol_global, lixcol_branch_id \
-                 FROM lix_account_by_branch \
-                 WHERE id IN ($1, $2) AND lixcol_branch_id = $3 \
+                "SELECT id, name, lixcol_global \
+                 FROM lix_account \
+                 WHERE id IN ($1, $2) \
                  ORDER BY name",
                 &[
                     Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
                     Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
                 ],
             )
             .await
@@ -1864,25 +1887,21 @@ mod tests {
         for row in home_rows.rows() {
             let values = row.values();
             assert_eq!(&values[2], &Value::Boolean(true));
-            assert_eq!(&values[3], &Value::Text(lix::GLOBAL_BRANCH_ID.to_string()));
         }
 
         // A later ensure_account write has the same physical/home shape.
         root.ensure_account(AUTHOR_ID, "Ada", "human")
             .await
             .expect("provision author");
-        let author_copies = root
+        let author_rows = global
             .execute(
-                "SELECT id FROM lix_account_by_branch \
-                 WHERE id = $1 AND lixcol_global = false",
+                "SELECT id, lixcol_global FROM lix_account WHERE id = $1",
                 &[Value::Text(AUTHOR_ID.to_string())],
             )
             .await
-            .expect("query ensure_account copies should succeed");
-        assert!(
-            author_copies.rows().is_empty(),
-            "ensure_account must not create branch-local copies either"
-        );
+            .expect("query ensure_account row should succeed");
+        assert_eq!(author_rows.rows().len(), 1);
+        assert_eq!(author_rows.rows()[0].values()[1], Value::Boolean(true));
 
         let draft = root
             .create_branch(CreateBranchOptions {
@@ -1917,23 +1936,6 @@ mod tests {
                 "inherited account should still have lixcol_global=true on draft"
             );
         }
-
-        let draft_local_copies = root
-            .execute(
-                "SELECT id FROM lix_account_by_branch \
-                 WHERE id IN ($1, $2, $3) AND lixcol_global = false",
-                &[
-                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                    Value::Text(AUTHOR_ID.to_string()),
-                ],
-            )
-            .await
-            .expect("query draft local copies should succeed");
-        assert!(
-            draft_local_copies.rows().is_empty(),
-            "creating a branch must not copy global accounts onto the new branch"
-        );
     }
 }
 

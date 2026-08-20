@@ -1,6 +1,7 @@
 #![allow(missing_debug_implementations)]
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,10 +13,8 @@ use lix::{
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
     Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
-    ObserveEvents as RsObserveEvents, ServerOptions, SqlScriptPlan,
-    SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
-    parse_sql_script as parse_rs_sql_script, register_browser_sync_transport,
-    unregister_browser_sync_transport,
+    ObserveEvents as RsObserveEvents, ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions,
+    Value, open_lix, register_browser_sync_transport, unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -94,7 +93,9 @@ pub async fn benchmark_storage_bridge(
 pub struct WasmLix {
     inner: BrowserLix,
     storage: BrowserStorage,
-    browser_sync_transport_id: RefCell<Option<String>>,
+    storage_sessions: Rc<Cell<usize>>,
+    closed: Cell<bool>,
+    browser_sync_transport_id: Rc<RefCell<Option<String>>>,
 }
 
 #[wasm_bindgen]
@@ -120,20 +121,6 @@ pub async fn open_memory(
         server,
     )
     .await
-}
-
-#[wasm_bindgen(js_name = openMemoryFromSnapshot)]
-pub async fn open_memory_from_snapshot(
-    telemetry_dispatch: Option<Function>,
-    snapshot: Option<Vec<u8>>,
-) -> Result<WasmLix, JsValue> {
-    let storage = match snapshot {
-        Some(snapshot) => {
-            Memory::from_snapshot(&snapshot).map_err(|error| lix_error_to_js(error.into()))?
-        }
-        None => Memory::new(),
-    };
-    open_browser_storage(BrowserStorage::Memory(storage), telemetry_dispatch, None).await
 }
 
 #[wasm_bindgen(js_name = openJsStorage)]
@@ -224,7 +211,9 @@ async fn open_browser_storage(
     Ok(WasmLix {
         inner,
         storage,
-        browser_sync_transport_id: RefCell::new(browser_sync_transport_id),
+        storage_sessions: Rc::new(Cell::new(1)),
+        closed: Cell::new(false),
+        browser_sync_transport_id: Rc::new(RefCell::new(browser_sync_transport_id)),
     })
 }
 
@@ -248,24 +237,28 @@ struct BrowserTelemetryDispatch(Function);
 unsafe impl Send for BrowserTelemetryDispatch {}
 unsafe impl Sync for BrowserTelemetryDispatch {}
 
-#[wasm_bindgen(js_name = parseSqlScript)]
-pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsValue, JsValue> {
-    let plan = parse_rs_sql_script(&sql, provided_param_count).map_err(lix_error_to_js)?;
-    to_js(&SqlScriptPlanDto::from(plan))
-}
-
 #[wasm_bindgen]
 impl WasmLix {
-    #[wasm_bindgen(js_name = exportSnapshot)]
-    pub async fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        match &self.storage {
-            BrowserStorage::Memory(storage) => storage
-                .export_snapshot()
-                .map_err(|error| lix_error_to_js(error.into())),
-            BrowserStorage::Js(_) => Err(JsValue::from_str(
-                "snapshot export is only available for memory storage",
-            )),
+    #[wasm_bindgen(js_name = openAnotherSession)]
+    pub async fn open_another_session(&self, options: JsValue) -> Result<WasmLix, JsValue> {
+        let options: OpenAnotherSessionOptionsDto = from_js(options)?;
+        let mut builder = self.inner.open_another_session();
+        if let Some(branch_id) = options.branch_id {
+            builder = builder.with_branch(branch_id);
         }
+        if let Some(account_id) = options.account_id {
+            builder = builder.with_account(account_id);
+        }
+        let inner = builder.await.map_err(lix_error_to_js)?;
+        self.storage_sessions
+            .set(self.storage_sessions.get().saturating_add(1));
+        Ok(WasmLix {
+            inner,
+            storage: self.storage.clone(),
+            storage_sessions: self.storage_sessions.clone(),
+            closed: Cell::new(false),
+            browser_sync_transport_id: self.browser_sync_transport_id.clone(),
+        })
     }
 
     #[wasm_bindgen(js_name = execute)]
@@ -454,27 +447,30 @@ impl WasmLix {
 
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) -> Result<(), JsValue> {
-        self.inner.close().await.map_err(lix_error_to_js)?;
-        if let Some(id) = self.browser_sync_transport_id.borrow_mut().take() {
-            unregister_browser_sync_transport(&id);
+        if self.closed.replace(true) {
+            return Ok(());
         }
-        self.storage
-            .close()
-            .await
-            .map_err(|error| lix_error_to_js(error.into()))
+        if let Err(error) = self.inner.close().await {
+            self.closed.set(false);
+            return Err(lix_error_to_js(error));
+        }
+        let remaining = self.storage_sessions.get().saturating_sub(1);
+        self.storage_sessions.set(remaining);
+        if remaining == 0 {
+            if let Some(id) = self.browser_sync_transport_id.borrow_mut().take() {
+                unregister_browser_sync_transport(&id);
+            }
+            self.storage
+                .close()
+                .await
+                .map_err(|error| lix_error_to_js(error.into()))?;
+        }
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = beginClose)]
     pub fn begin_close(&self) {
         self.inner.begin_close();
-    }
-}
-
-impl Drop for WasmLix {
-    fn drop(&mut self) {
-        if let Some(id) = self.browser_sync_transport_id.get_mut().take() {
-            unregister_browser_sync_transport(&id);
-        }
     }
 }
 
@@ -564,34 +560,11 @@ struct ExecuteOptionsDto {
     origin_key: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SqlScriptPlanDto {
-    statements: Vec<SqlScriptStatementDto>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SqlScriptStatementDto {
-    sql: String,
-    param_start: usize,
-    param_end: usize,
-}
-
-impl From<SqlScriptPlan> for SqlScriptPlanDto {
-    fn from(plan: SqlScriptPlan) -> Self {
-        Self {
-            statements: plan
-                .statements
-                .into_iter()
-                .map(|statement| SqlScriptStatementDto {
-                    sql: statement.sql,
-                    param_start: statement.params.start,
-                    param_end: statement.params.end,
-                })
-                .collect(),
-        }
-    }
+pub(super) struct OpenAnotherSessionOptionsDto {
+    pub(super) branch_id: Option<String>,
+    pub(super) account_id: Option<String>,
 }
 
 pub(super) fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, JsValue> {

@@ -9181,7 +9181,7 @@ mod tests {
                         "sql": "INSERT INTO lix_key_value (key, value) VALUES ('adapter-rollback', 'written')",
                         "params": []
                     },
-                    { "sql": "SELECT id FROM lix_file_history('one', 'two')", "params": [] }
+                    { "sql": "SELECT id FROM lix_history('lix_file', 'one', 'two')", "params": [] }
                 ]
             })),
         )

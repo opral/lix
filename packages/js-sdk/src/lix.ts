@@ -25,6 +25,7 @@ import type {
 	MergeBranchPreview,
 	MergeBranchReceipt,
 	ObserveEvent,
+	OpenAnotherSessionOptions,
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
@@ -62,6 +63,16 @@ export class Lix {
 	#terminatedForPageUnload = false;
 
 	constructor(private readonly binding: LixBinding) {}
+
+	/** Opens an independent session over the same repository storage. */
+	async openAnotherSession(
+		options: OpenAnotherSessionOptions = {},
+	): Promise<Lix> {
+		assertOpenAnotherSessionOptions(options);
+		return this.#runOperation(
+			async () => new Lix(await this.binding.openAnotherSession(options)),
+		);
+	}
 
 	async execute(
 		sql: string,
@@ -284,6 +295,27 @@ export class Lix {
 		error.name = "LixError";
 		error.code = "LIX_ERROR_CLOSED";
 		throw error;
+	}
+}
+
+function assertOpenAnotherSessionOptions(
+	options: OpenAnotherSessionOptions,
+): void {
+	if (!options || typeof options !== "object" || Array.isArray(options)) {
+		throw new TypeError("openAnotherSession() options must be an object");
+	}
+	for (const [name, value] of [
+		["branchId", options.branchId],
+		["accountId", options.accountId],
+	] as const) {
+		if (
+			value !== undefined &&
+			(typeof value !== "string" || value.length === 0)
+		) {
+			throw new TypeError(
+				`openAnotherSession() ${name} must be a non-empty string`,
+			);
+		}
 	}
 }
 

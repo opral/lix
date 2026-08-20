@@ -316,6 +316,21 @@ async fn transaction_commits_multiple_statements_together() {
 }
 
 #[tokio::test]
+async fn execute_rejects_multi_statement_scripts() {
+    let lix = open_lix().await.unwrap();
+    let error = lix
+        .execute("SELECT 1; SELECT 2", &[])
+        .await
+        .expect_err("execute is one statement, not a script splitter");
+    assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+    assert_eq!(
+        error.message,
+        "Lix SQL only supports one statement per execute() call"
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn execute_batch_is_atomic_and_returns_ordered_results() {
     let lix = open_lix().await.unwrap();
     let results = lix
@@ -389,7 +404,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
             },
             ExecuteBatchStatement {
                 label: None,
-                sql: "SELECT id FROM lix_file_history('one', 'two')".to_string(),
+                sql: "SELECT id FROM lix_history('lix_file', 'one', 'two')".to_string(),
                 params: Vec::new(),
             },
         ])

@@ -160,8 +160,14 @@ where
     report("checkpoint", &checkpoint);
 
     for (label, sql) in [
-        ("history_key_value", "SELECT * FROM lix_key_value_history"),
-        ("history_checkpoint", "SELECT * FROM lix_checkpoint_history"),
+        (
+            "history_key_value",
+            "SELECT * FROM lix_history('lix_key_value')",
+        ),
+        (
+            "history_checkpoint",
+            "SELECT * FROM lix_history('lix_checkpoint')",
+        ),
         ("commit_graph", "SELECT * FROM lix_commit"),
         ("change_scan", "SELECT * FROM lix_change"),
         ("read_all", "SELECT * FROM replay_scope"),

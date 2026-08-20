@@ -1,6 +1,6 @@
 #![allow(clippy::cloned_ref_to_slice_refs, clippy::match_same_arms)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
@@ -15,23 +15,25 @@ mod columns;
 mod diff;
 mod directory;
 mod directory_history;
-pub(crate) use diff::register_diff_function;
+pub(crate) use diff::{diff_schema, register_diff_function};
 mod diff_command;
-mod schema;
-mod schema_history;
 mod file;
 mod file_history;
 mod filesystem_history_path;
-mod filesystem_working_diff;
 mod history_table_function;
 mod history_util;
+mod schema;
+mod schema_history;
 mod spec;
 pub(crate) use spec::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 mod upsert;
 mod values;
 mod working_diff;
+pub(crate) use working_diff::working_diff_schema;
 
-use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
+use crate::sql2::catalog::{
+    PublicCatalog, PublicHistoryKind, PublicSurfaceContract, PublicSurfaceKind,
+};
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
@@ -39,7 +41,6 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::TableSource;
 
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
-pub(crate) use schema::{execute_exact_schema_batch_read, execute_exact_schema_point_read};
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_file_batch_read, execute_exact_lix_file_id_manifest_batch_read,
@@ -48,8 +49,7 @@ pub(crate) use file::{
     execute_fast_lix_file_content_update_by_id_with_metadata, execute_fast_lix_file_id_path_writes,
     execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
 };
-#[cfg(test)]
-pub(crate) use filesystem_working_diff::filesystem_working_diff_schema;
+pub(crate) use schema::{execute_exact_schema_batch_read, execute_exact_schema_point_read};
 pub(crate) use spec::{DmlReturning, SpecWriteTarget, WriteTargetRegistry};
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
@@ -106,7 +106,10 @@ fn register_information_schema(
     selection: &ProviderSelection,
     catalog: Arc<PublicCatalog>,
 ) -> Result<(), LixError> {
-    if !matches!(selection, ProviderSelection::All) {
+    if !matches!(
+        selection,
+        ProviderSelection::All | ProviderSelection::AllWithHistory(_)
+    ) {
         return Ok(());
     }
     crate::sql2::information_schema::register(session, catalog)
@@ -114,31 +117,57 @@ fn register_information_schema(
 
 /// Snapshot-local providers needed to plan already-bound SQL.
 ///
-/// For reads, DataFusion's resolver is deliberately used instead of maintaining
-/// a second SQL AST walker. It is the same resolver called by
-/// `SessionState::statement_to_plan`, including its CTE scoping and identifier
-/// normalization rules. Bound target-only writes select their known target
-/// directly. The selection retains names only; providers and plans remain
-/// scoped to the current storage snapshot.
+/// Ordinary reads use DataFusion's resolver, including its CTE scoping and
+/// identifier normalization rules. A narrow AST walk additionally extracts the
+/// plan-time relation literal from `lix_history(...)`; provider construction
+/// cannot depend on a runtime parameter because each relation has a different
+/// result schema. Bound target-only writes select their known target directly.
+/// Providers and plans remain scoped to the current storage snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderSelection {
     /// Register every surface when catalog-wide visibility is part of the SQL
     /// semantics (notably `information_schema` and rewritten `SHOW` queries),
     /// or when reference resolution cannot prove a narrower set is sufficient.
     All,
+    /// Register every ordinary surface while constructing history providers
+    /// only for relation literals that occur in the statement.
+    AllWithHistory(BTreeSet<String>),
     /// Register the union of concrete table names referenced by the statements.
-    Only(BTreeSet<String>),
+    Only {
+        names: BTreeSet<String>,
+        history_relations: BTreeSet<String>,
+    },
 }
 
 impl ProviderSelection {
     fn is_empty(&self) -> bool {
-        matches!(self, Self::Only(names) if names.is_empty())
+        matches!(self, Self::Only { names, history_relations } if names.is_empty() && history_relations.is_empty())
     }
 
     fn includes(&self, surface: &PublicSurfaceContract) -> bool {
         match self {
-            Self::All => true,
-            Self::Only(names) => names.contains(&surface.name),
+            Self::All | Self::AllWithHistory(_) => true,
+            Self::Only { names, .. } => names.contains(&surface.name),
+        }
+    }
+
+    fn includes_history_relation(&self, relation_name: &str) -> bool {
+        match self {
+            Self::All => false,
+            Self::AllWithHistory(history_relations) => history_relations.contains(relation_name),
+            Self::Only {
+                history_relations, ..
+            } => history_relations.contains(relation_name),
+        }
+    }
+
+    fn requested_history_relations(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::All => Some(empty_history_relations()),
+            Self::AllWithHistory(history_relations) => Some(history_relations),
+            Self::Only {
+                history_relations, ..
+            } => Some(history_relations),
         }
     }
 
@@ -153,10 +182,20 @@ impl ProviderSelection {
     /// unknown-table errors keep their current semantics.
     fn requires_visible_schemas(&self) -> bool {
         match self {
-            Self::All => true,
-            Self::Only(names) => names
-                .iter()
-                .any(|name| PublicCatalog::fixed_system().surface(name).is_none()),
+            Self::All | Self::AllWithHistory(_) => true,
+            Self::Only {
+                names,
+                history_relations,
+            } => {
+                names
+                    .iter()
+                    .any(|name| PublicCatalog::fixed_system().surface(name).is_none())
+                    || history_relations.iter().any(|name| {
+                        PublicCatalog::fixed_system()
+                            .history_relation(name)
+                            .is_none()
+                    })
+            }
         }
     }
 }
@@ -166,24 +205,103 @@ pub(crate) fn read_provider_selection(
     statements: &[datafusion::sql::parser::Statement],
 ) -> ProviderSelection {
     let mut names = BTreeSet::new();
+    let mut history_relations = BTreeSet::new();
+    let mut requires_all = false;
     // Resolving references only reads the SQL parser configuration, so the
     // statement's pooled session state is used directly instead of cloning the
     // live one.
     for statement in statements {
+        collect_history_relation_literals(statement, &mut history_relations);
         if statement_requires_all_providers(statement) {
-            return ProviderSelection::All;
+            requires_all = true;
+            continue;
         }
         let Ok(references) = state.resolve_table_references(statement) else {
-            return ProviderSelection::All;
+            requires_all = true;
+            continue;
         };
         for reference in references {
             if reference.schema() == Some("information_schema") {
-                return ProviderSelection::All;
+                requires_all = true;
             }
             names.insert(reference.table().to_string());
         }
     }
-    ProviderSelection::Only(names)
+    if requires_all {
+        return all_provider_selection(history_relations);
+    }
+    ProviderSelection::Only {
+        names,
+        history_relations,
+    }
+}
+
+fn all_provider_selection(history_relations: BTreeSet<String>) -> ProviderSelection {
+    if history_relations.is_empty() {
+        ProviderSelection::All
+    } else {
+        ProviderSelection::AllWithHistory(history_relations)
+    }
+}
+
+fn empty_history_relations() -> &'static BTreeSet<String> {
+    static EMPTY: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(BTreeSet::new)
+}
+
+fn collect_history_relation_literals(
+    statement: &datafusion::sql::parser::Statement,
+    relations: &mut BTreeSet<String>,
+) {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::parser::Statement as DataFusionStatement;
+    use datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, FunctionArg, FunctionArgExpr, TableFactor, Value as SqlValue, Visit,
+        Visitor,
+    };
+
+    struct HistoryRelationVisitor<'a>(&'a mut BTreeSet<String>);
+
+    impl Visitor for HistoryRelationVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            let TableFactor::Table {
+                name,
+                args: Some(arguments),
+                ..
+            } = table_factor
+            else {
+                return ControlFlow::Continue(());
+            };
+            if !crate::sql2::parse::object_name_is_public_function(name, "lix_history") {
+                return ControlFlow::Continue(());
+            }
+            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value)))) =
+                arguments.args.first()
+            else {
+                return ControlFlow::Continue(());
+            };
+            if let SqlValue::SingleQuotedString(relation_name) = &value.value {
+                self.0.insert(relation_name.clone());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    match statement {
+        DataFusionStatement::Statement(statement) => {
+            let _ = statement.visit(&mut HistoryRelationVisitor(relations));
+        }
+        DataFusionStatement::Explain(explain) => {
+            collect_history_relation_literals(explain.statement.as_ref(), relations);
+        }
+        _ => {}
+    }
 }
 
 fn statement_requires_all_providers(statement: &datafusion::sql::parser::Statement) -> bool {
@@ -246,16 +364,25 @@ async fn register_read_from_catalog<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let needs_history_query_source = catalog.surfaces().any(|surface| {
-        scope.includes(surface)
-            && selection.includes(surface)
-            && match &surface.kind {
-                PublicSurfaceKind::FileHistory | PublicSurfaceKind::DirectoryHistory => true,
-                PublicSurfaceKind::SchemaHistory { schema_key } => {
-                    schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
-                }
-                _ => false,
+    if let Some(requested) = selection.requested_history_relations() {
+        for relation_name in requested {
+            if catalog.history_relation(relation_name).is_none() {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    format!("lix_history does not support relation '{relation_name}'"),
+                ));
             }
+        }
+    }
+    let selected_history = catalog
+        .history_relations()
+        .filter(|history| selection.includes_history_relation(&history.relation_name))
+        .collect::<Vec<_>>();
+    let needs_history_query_source = selected_history.iter().any(|history| match &history.kind {
+        PublicHistoryKind::File | PublicHistoryKind::Directory => true,
+        PublicHistoryKind::Schema { schema_key } => {
+            schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+        }
     });
     let history_query_source = if needs_history_query_source {
         let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
@@ -277,14 +404,12 @@ where
             )
         })
     };
-    let needs_checkpoint_history = catalog.surfaces().any(|surface| {
-        scope.includes(surface)
-            && selection.includes(surface)
-            && matches!(
-                &surface.kind,
-                PublicSurfaceKind::SchemaHistory { schema_key }
-                    if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
-            )
+    let needs_checkpoint_history = selected_history.iter().any(|history| {
+        matches!(
+            &history.kind,
+            PublicHistoryKind::Schema { schema_key }
+                if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+        )
     });
     let checkpoint_history_query_source = if needs_checkpoint_history {
         let global_head = branch_ref
@@ -319,69 +444,10 @@ where
                 working_diff::register_working_diff_provider(
                     session,
                     &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
+                    ctx.active_branch_id().to_string(),
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::WorkingDiffByBranch => {
-                working_diff::register_working_diff_provider(
-                    session,
-                    &surface.name,
-                    None,
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::FileWorkingDiff => {
-                filesystem_working_diff::register_filesystem_working_diff_provider(
-                    session,
-                    &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                    filesystem_working_diff::FilesystemWorkingDiffKind::File,
-                )
-                .await?;
-            }
-            PublicSurfaceKind::FileWorkingDiffByBranch => {
-                filesystem_working_diff::register_filesystem_working_diff_provider(
-                    session,
-                    &surface.name,
-                    None,
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                    filesystem_working_diff::FilesystemWorkingDiffKind::File,
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryWorkingDiff => {
-                filesystem_working_diff::register_filesystem_working_diff_provider(
-                    session,
-                    &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                    filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryWorkingDiffByBranch => {
-                filesystem_working_diff::register_filesystem_working_diff_provider(
-                    session,
-                    &surface.name,
-                    None,
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                    filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
             }
@@ -408,31 +474,6 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::FileByBranch => {
-                file::register_lix_file_by_branch_provider(
-                    session,
-                    &surface.name,
-                    ctx.hot_state(),
-                    ctx.filesystem_path_index(),
-                    Arc::clone(&branch_ref),
-                    ctx.blob_reader(),
-                    ctx.plugin_host(),
-                    ctx.functions(),
-                    ctx.session_file_views(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::FileHistory => {
-                file_history::register_lix_file_history_surface(
-                    session,
-                    &surface.name,
-                    ctx.commit_graph(),
-                    history_query_source_for_provider()?,
-                    ctx.blob_reader(),
-                    ctx.plugin_host(),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Directory => {
                 directory::register_lix_directory_active_provider(
                     session,
@@ -445,53 +486,77 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::DirectoryByBranch => {
-                directory::register_lix_directory_by_branch_provider(
-                    session,
-                    &surface.name,
-                    ctx.hot_state(),
-                    ctx.filesystem_path_index(),
-                    Arc::clone(&branch_ref),
-                    ctx.functions(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryHistory => {
-                directory_history::register_lix_directory_history_surface(
-                    session,
-                    &surface.name,
-                    ctx.commit_graph(),
-                    history_query_source_for_provider()?,
-                )
-                .await?;
-            }
             PublicSurfaceKind::SchemaBase { .. }
-            | PublicSurfaceKind::SchemaByBranch { .. }
-            | PublicSurfaceKind::SchemaHistory { .. }
+            | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => {}
         }
     }
-    let needs_row_history = catalog.surfaces().any(|surface| {
-        scope.includes(surface)
-            && selection.includes(surface)
-            && matches!(&surface.kind, PublicSurfaceKind::SchemaHistory { .. })
-    });
     schema::register_row_providers(
         session,
         ctx.active_branch_id(),
         ctx.hot_state(),
         ctx.row_snapshot_reader(),
         Arc::clone(&branch_ref),
-        needs_row_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
-        history_query_source,
-        checkpoint_history_query_source,
         catalog,
         scope == ReadProviderScope::All,
         selection,
     )
     .await?;
+
+    if catalog
+        .surface("lix_history")
+        .is_some_and(|surface| scope.includes(surface) && selection.includes(surface))
+    {
+        let row_commit_graph = selected_history
+            .iter()
+            .any(|history| matches!(history.kind, PublicHistoryKind::Schema { .. }))
+            .then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph())));
+        let mut providers = BTreeMap::new();
+        for history in selected_history {
+            let provider = match &history.kind {
+                PublicHistoryKind::File => file_history::build_lix_file_history_provider(
+                    ctx.commit_graph(),
+                    history_query_source_for_provider()?,
+                    ctx.blob_reader(),
+                    ctx.plugin_host(),
+                ),
+                PublicHistoryKind::Directory => {
+                    directory_history::build_lix_directory_history_provider(
+                        ctx.commit_graph(),
+                        history_query_source_for_provider()?,
+                    )
+                }
+                PublicHistoryKind::Schema { schema_key } => {
+                    let query_source = if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY {
+                        checkpoint_history_query_source.as_ref()
+                    } else {
+                        history_query_source.as_ref()
+                    }
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "selected row history provider is missing its query source",
+                        )
+                    })?;
+                    schema_history::build_row_history_provider(
+                        &history.relation_name,
+                        schema::catalog_schema_spec(catalog, schema_key)?,
+                        Arc::clone(row_commit_graph.as_ref().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "selected row history provider is missing its commit graph",
+                            )
+                        })?),
+                        query_source.clone(),
+                    )
+                }
+            };
+            providers.insert(history.relation_name.clone(), provider);
+        }
+        history_table_function::register_history_table_function(session, providers)?;
+    }
 
     Ok(())
 }
@@ -580,27 +645,8 @@ async fn register_write_from_catalog(
                 )
                 .await?;
             }
-            PublicSurfaceKind::FileByBranch => {
-                file::register_by_branch_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                    Arc::clone(&branch_ref),
-                    options.clone(),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Directory => {
                 directory::register_active_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                    Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryByBranch => {
-                directory::register_by_branch_write_provider(
                     session,
                     &surface.name,
                     write_ctx.clone(),
@@ -637,16 +683,8 @@ async fn register_write_from_catalog(
             }
             PublicSurfaceKind::Change
             | PublicSurfaceKind::WorkingDiff
-            | PublicSurfaceKind::WorkingDiffByBranch
-            | PublicSurfaceKind::FileWorkingDiff
-            | PublicSurfaceKind::FileWorkingDiffByBranch
-            | PublicSurfaceKind::DirectoryWorkingDiff
-            | PublicSurfaceKind::DirectoryWorkingDiffByBranch
-            | PublicSurfaceKind::FileHistory
-            | PublicSurfaceKind::DirectoryHistory => {}
-            PublicSurfaceKind::SchemaBase { .. }
-            | PublicSurfaceKind::SchemaByBranch { .. }
-            | PublicSurfaceKind::SchemaHistory { .. } => {}
+            | PublicSurfaceKind::HistoryFunction => {}
+            PublicSurfaceKind::SchemaBase { .. } => {}
         }
     }
     schema::register_row_write_providers(session, write_ctx, branch_ref, catalog, selection)
@@ -668,24 +706,12 @@ mod tests {
     use crate::LixError;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::CommitId;
-    use crate::commit_graph::{
-        CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader,
-        ReachableCommitGraphNode,
-    };
     use crate::hot_state::{HotStateReader, HotStateScanRequest};
-    use crate::json_store::JsonStoreContext;
-    use crate::sql2::HistoryQuerySource;
-    use crate::sql2::catalog::{
-        PublicCatalog, PublicSurfaceKind, derive_schema_surface_spec_from_schema,
-    };
-    use crate::storage_adapter::{
-        Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
-    };
+    use crate::sql2::catalog::{PublicCatalog, derive_schema_surface_spec_from_schema};
 
     use super::{
         ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, file,
-        file_history, filesystem_working_diff, is_write_surface, read_provider_selection, schema,
-        working_diff,
+        file_history, is_write_surface, read_provider_selection, schema, working_diff,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -697,7 +723,10 @@ mod tests {
     }
 
     fn selected_names(names: &[&str]) -> ProviderSelection {
-        ProviderSelection::Only(names.iter().map(|name| (*name).to_string()).collect())
+        ProviderSelection::Only {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            history_relations: BTreeSet::new(),
+        }
     }
 
     #[test]
@@ -757,7 +786,56 @@ mod tests {
     fn referenced_provider_selection_registers_none_for_table_free_queries() {
         assert_eq!(
             selection_for_sql(&["SELECT 1, uuidv7()"]),
-            ProviderSelection::Only(BTreeSet::new())
+            ProviderSelection::Only {
+                names: BTreeSet::new(),
+                history_relations: BTreeSet::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn history_provider_selection_keeps_the_literal_relation_separate_from_the_function() {
+        assert_eq!(
+            selection_for_sql(&["SELECT id FROM lix_history('lix_file', $1)"]),
+            ProviderSelection::Only {
+                names: BTreeSet::from(["lix_history".to_string()]),
+                history_relations: BTreeSet::from(["lix_file".to_string()]),
+            }
+        );
+        assert!(
+            selection_for_sql(&["SELECT * FROM lix_history('runtime_note')"])
+                .requires_visible_schemas()
+        );
+        assert_eq!(
+            selection_for_sql(&[
+                "SELECT * FROM information_schema.tables",
+                "SELECT * FROM lix_history('lix_file')",
+            ]),
+            ProviderSelection::AllWithHistory(BTreeSet::from(["lix_file".to_string()]))
+        );
+
+        for sql in [
+            "SELECT * FROM LIX_HISTORY('lix_file')",
+            "SELECT * FROM public.lix_history('lix_file')",
+            "SELECT * FROM datafusion.public.lix_history('lix_file')",
+            "SELECT * FROM \"lix_history\"('lix_file')",
+        ] {
+            let selection = selection_for_sql(&[sql]);
+            assert!(
+                selection.includes_history_relation("lix_file"),
+                "{sql} should select the literal history provider: {selection:?}",
+            );
+        }
+
+        assert!(
+            !selection_for_sql(&["SELECT * FROM \"LIX_HISTORY\"('lix_file')"])
+                .includes_history_relation("lix_file"),
+            "quoted identifiers retain their case",
+        );
+        assert!(
+            !selection_for_sql(&["SELECT * FROM \"PUBLIC\".lix_history('lix_file')"])
+                .includes_history_relation("lix_file"),
+            "quoted schema identifiers retain their case",
         );
     }
 
@@ -775,7 +853,8 @@ mod tests {
         assert!(!selection_for_sql(&["SELECT 1"]).requires_visible_schemas());
         assert!(!selection_for_sql(&["SELECT * FROM lix_key_value"]).requires_visible_schemas());
         assert!(
-            !selection_for_sql(&["SELECT * FROM lix_key_value_history"]).requires_visible_schemas()
+            !selection_for_sql(&["SELECT * FROM lix_history('lix_key_value')"])
+                .requires_visible_schemas()
         );
         assert!(
             !selection_for_sql(&["SELECT * FROM lix_key_value JOIN lix_file ON false"])
@@ -795,7 +874,9 @@ mod tests {
     #[test]
     fn referenced_provider_selection_filters_transaction_capabilities_symmetrically() {
         let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
-        let selection = selected_names(&["lix_file", "lix_file_history"]);
+        let selection = selection_for_sql(&[
+            "SELECT * FROM lix_file JOIN lix_history('lix_file') AS history ON false",
+        ]);
 
         let committed_read_names = catalog
             .surfaces()
@@ -810,7 +891,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(committed_read_names, vec!["lix_file_history"]);
+        assert_eq!(committed_read_names, vec!["lix_history"]);
         assert_eq!(overlay_write_names, vec!["lix_file"]);
     }
 
@@ -843,18 +924,7 @@ mod tests {
 
         assert_eq!(
             read_only,
-            vec![
-                "lix_change",
-                "lix_directory_history",
-                "lix_directory_working_diff",
-                "lix_directory_working_diff_by_branch",
-                "lix_file_history",
-                "lix_file_working_diff",
-                "lix_file_working_diff_by_branch",
-                "lix_working_diff",
-                "lix_working_diff_by_branch",
-                "phase8_row_history",
-            ]
+            vec!["lix_change", "lix_history", "lix_working_diff"]
         );
         assert_eq!(
             writable,
@@ -863,21 +933,14 @@ mod tests {
                 "lix_branch",
                 "lix_create_checkpoint",
                 "lix_directory",
-                "lix_directory_by_branch",
                 "lix_file",
-                "lix_file_by_branch",
                 "lix_revert",
                 "phase8_row",
-                "phase8_row_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 30, "previous construction count");
-        assert_eq!(
-            read_only.len() + writable.len(),
-            20,
-            "new construction count"
-        );
+        assert_eq!(all_read + writable.len(), 17, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 10, "surface count");
     }
 
     #[test]
@@ -894,7 +957,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 8, "previous standalone write count");
+        assert_eq!(all_writable, 6, "previous standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 
@@ -909,38 +972,8 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_file_working_diff",
-            filesystem_working_diff::filesystem_working_diff_schema(false),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_file_working_diff_by_branch",
-            filesystem_working_diff::filesystem_working_diff_schema(true),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_directory_working_diff",
-            filesystem_working_diff::filesystem_working_diff_schema(false),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_directory_working_diff_by_branch",
-            filesystem_working_diff::filesystem_working_diff_schema(true),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_file_by_branch",
-            file::lix_file_by_branch_schema(),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
             "lix_directory",
             directory::lix_directory_schema(),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_directory_by_branch",
-            directory::lix_directory_by_branch_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
@@ -955,21 +988,16 @@ mod tests {
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_working_diff",
-            working_diff::working_diff_schema(false),
+            working_diff::working_diff_schema(),
         );
-        assert_surface_schema_matches_provider_schema(
+        assert_history_schema_matches_provider_schema(
             &catalog,
-            "lix_working_diff_by_branch",
-            working_diff::working_diff_schema(true),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_file_history",
+            "lix_file",
             file_history::lix_file_history_schema(),
         );
-        assert_surface_schema_matches_provider_schema(
+        assert_history_schema_matches_provider_schema(
             &catalog,
-            "lix_directory_history",
+            "lix_directory",
             directory_history::lix_directory_history_schema(),
         );
     }
@@ -978,10 +1006,14 @@ mod tests {
     fn file_content_surfaces_use_large_binary() {
         let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
 
-        for surface_name in ["lix_file", "lix_file_by_branch", "lix_file_history"] {
-            let schema = catalog
-                .surface_schema(surface_name)
-                .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
+        for (surface_name, schema) in [
+            ("lix_file", catalog.surface_schema("lix_file")),
+            (
+                "lix_history('lix_file')",
+                catalog.history_relation_schema("lix_file"),
+            ),
+        ] {
+            let schema = schema.unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
             let content_field = schema
                 .field_with_name("content")
                 .unwrap_or_else(|_| panic!("{surface_name}.content should exist"));
@@ -1016,11 +1048,6 @@ mod tests {
             Arc::new(EmptyHotStateReader),
             None,
             Arc::new(EmptyBranchRefReader),
-            Some(Arc::new(tokio::sync::Mutex::new(Box::new(
-                EmptyCommitGraphReader,
-            )))),
-            Some(empty_history_query_source().await),
-            None,
             &catalog,
             true,
             &ProviderSelection::All,
@@ -1029,14 +1056,6 @@ mod tests {
         .expect("row providers should register");
 
         assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row").await;
-        assert_registered_table_schema_matches_catalog(
-            &session,
-            &catalog,
-            "phase8_row_by_branch",
-        )
-        .await;
-        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row_history")
-            .await;
     }
 
     async fn assert_registered_table_schema_matches_catalog(
@@ -1044,26 +1063,10 @@ mod tests {
         catalog: &PublicCatalog,
         surface_name: &str,
     ) {
-        let surface = catalog
-            .surface(surface_name)
-            .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
-        let provider = if matches!(
-            surface.kind,
-            PublicSurfaceKind::SchemaHistory { .. }
-                | PublicSurfaceKind::FileHistory
-                | PublicSurfaceKind::DirectoryHistory
-        ) {
-            session
-                .table_function(surface_name)
-                .unwrap_or_else(|error| panic!("{surface_name} function should load: {error}"))
-                .create_table_provider(&[])
-                .unwrap_or_else(|error| panic!("{surface_name} function should bind: {error}"))
-        } else {
-            session
-                .table_provider(surface_name)
-                .await
-                .unwrap_or_else(|error| panic!("{surface_name} provider should load: {error}"))
-        };
+        let provider = session
+            .table_provider(surface_name)
+            .await
+            .unwrap_or_else(|error| panic!("{surface_name} provider should load: {error}"));
         assert_surface_schema_matches_provider_schema(catalog, surface_name, provider.schema());
     }
 
@@ -1075,25 +1078,14 @@ mod tests {
         let surface = catalog
             .surface(surface_name)
             .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
-        let history_surface = matches!(
-            surface.kind,
-            PublicSurfaceKind::SchemaHistory { .. }
-                | PublicSurfaceKind::FileHistory
-                | PublicSurfaceKind::DirectoryHistory
-        );
         let catalog_column_names = surface
             .columns
             .iter()
-            .filter(|column| !history_surface || column.is_public())
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
         let provider_field_names = provider_schema
             .fields()
             .iter()
-            .filter(|field| {
-                !history_surface
-                    || field.name() != crate::sql2::history_route::HISTORY_COL_AS_OF_COMMIT_ID
-            })
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1101,32 +1093,40 @@ mod tests {
             "{surface_name} column order"
         );
 
-        if !history_surface {
-            let catalog_schema = catalog
-                .surface_schema(surface_name)
-                .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
-            assert_eq!(
-                catalog_schema.fields(),
-                provider_schema.fields(),
-                "{surface_name}"
-            );
-        }
+        let catalog_schema = catalog
+            .surface_schema(surface_name)
+            .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
+        assert_eq!(
+            catalog_schema.fields(),
+            provider_schema.fields(),
+            "{surface_name}"
+        );
     }
 
-    async fn empty_history_query_source()
-    -> crate::sql2::SqlHistoryQuerySource<SharedStorageAdapterRead<MemoryRead>> {
-        let storage = StorageAdapter::new(Memory::new());
-        let read_scope = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let read_scope = SharedStorageAdapterRead::new(read_scope);
-        HistoryQuerySource {
-            store: read_scope.clone(),
-            json_reader: JsonStoreContext::new().reader(read_scope),
-            certified_history_reader: None,
-            default_as_of_commit_id: CommitId::for_test_label("history-default").to_string(),
-        }
+    fn assert_history_schema_matches_provider_schema(
+        catalog: &PublicCatalog,
+        relation_name: &str,
+        provider_schema: SchemaRef,
+    ) {
+        let contract = catalog
+            .history_relation(relation_name)
+            .unwrap_or_else(|| panic!("{relation_name} history should be in catalog"));
+        let catalog_columns = contract
+            .columns
+            .iter()
+            .filter(|column| column.is_public())
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let provider_columns = provider_schema
+            .fields()
+            .iter()
+            .filter(|field| field.name() != crate::sql2::history_route::HISTORY_COL_AS_OF_COMMIT_ID)
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            catalog_columns, provider_columns,
+            "{relation_name} history columns"
+        );
     }
 
     struct EmptyHotStateReader;
@@ -1161,36 +1161,6 @@ mod tests {
 
         async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
             Ok(Vec::new().into())
-        }
-    }
-
-    struct EmptyCommitGraphReader;
-
-    #[async_trait]
-    impl CommitGraphReader for EmptyCommitGraphReader {
-        async fn load_node(
-            &mut self,
-            _commit_id: &CommitId,
-        ) -> Result<Option<CommitGraphNode>, LixError> {
-            Ok(None)
-        }
-
-        async fn reachable_nodes(
-            &mut self,
-            _head_commit_id: &CommitId,
-        ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
-            Ok(Vec::new().into())
-        }
-
-        async fn change_history_from_commit(
-            &mut self,
-            _start_commit_id: &CommitId,
-            _request: &CommitGraphChangeHistoryRequest,
-        ) -> Result<crate::commit_graph::CommitGraphHistory, LixError> {
-            Ok(crate::commit_graph::CommitGraphHistory {
-                entries: Vec::new(),
-                reachable_nodes: Arc::from([]),
-            })
         }
     }
 }

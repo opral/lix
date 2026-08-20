@@ -157,25 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn by_branch_row_exposes_lixcol_branch_id_without_branch_id_alias() {
-        let catalog = catalog();
-        let table = bind_public_table(
-            &catalog,
-            &table_name("SELECT * FROM test_state_schema_by_branch"),
-        )
-        .expect("by-branch row table should bind");
-
-        assert!(matches!(
-            table.surface.kind,
-            PublicSurfaceKind::SchemaByBranch { .. }
-        ));
-        assert!(require_public_column(&table, "lixcol_branch_id").is_ok());
-        let error = require_public_column(&table, "branch_id")
-            .expect_err("by-branch schema surface should not alias branch_id");
-        assert!(error.message.contains("does not exist"));
-    }
-
-    #[test]
     fn quoted_table_names_are_case_sensitive() {
         let catalog = catalog();
 
@@ -193,6 +174,10 @@ mod tests {
         let table = bind_public_table(&catalog, &table_name("SELECT * FROM lix_file"))
             .expect("lix_file should bind");
 
+        require_public_column(&table, "lixcol_created_at")
+            .expect("filesystem created timestamp should be public");
+        require_public_column(&table, "lixcol_updated_at")
+            .expect("filesystem updated timestamp should be public");
         let error = require_public_column(&table, "lixcol_schema_key")
             .expect_err("hidden column should not bind");
         assert!(error.message.contains("not part of public SQL surface"));
@@ -236,46 +221,27 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = vec![
             "lix_account",
-            "lix_account_by_branch",
-            "lix_account_history",
             "lix_apply",
             "lix_branch",
-            "lix_branch_descriptor",
-            "lix_branch_descriptor_by_branch",
-            "lix_branch_descriptor_history",
-            "lix_branch_ref",
-            "lix_branch_ref_by_branch",
-            "lix_branch_ref_history",
             "lix_change",
             "lix_checkpoint",
-            "lix_checkpoint_history",
             "lix_commit",
-            "lix_commit_by_branch",
             "lix_commit_edge",
-            "lix_commit_edge_by_branch",
             "lix_create_checkpoint",
             "lix_directory",
-            "lix_directory_by_branch",
-            "lix_directory_history",
-            "lix_directory_working_diff",
-            "lix_directory_working_diff_by_branch",
             "lix_file",
-            "lix_file_by_branch",
-            "lix_file_history",
-            "lix_file_working_diff",
-            "lix_file_working_diff_by_branch",
+            "lix_history",
             "lix_key_value",
-            "lix_key_value_by_branch",
-            "lix_key_value_history",
             "lix_registered_schema",
-            "lix_registered_schema_by_branch",
-            "lix_registered_schema_history",
             "lix_revert",
             "lix_working_diff",
-            "lix_working_diff_by_branch",
         ];
 
         assert_eq!(actual, expected);
+        assert!(
+            actual.iter().all(|name| !name.ends_with("_by_branch")),
+            "the public catalog must not expose explicit-branch table variants"
+        );
     }
 
     #[test]
@@ -283,22 +249,26 @@ mod tests {
         let catalog = PublicCatalog::fixed_system();
         for surface_name in [
             "lix_key_value",
-            "lix_key_value_by_branch",
-            "lix_key_value_history",
             "lix_registered_schema",
-            "lix_registered_schema_by_branch",
-            "lix_registered_schema_history",
             "lix_checkpoint",
-            "lix_checkpoint_history",
+            "lix_history",
             "lix_working_diff",
-            "lix_working_diff_by_branch",
         ] {
             assert!(
                 catalog.surface(surface_name).is_some(),
                 "{surface_name} should remain public"
             );
         }
+        for relation_name in ["lix_key_value", "lix_registered_schema", "lix_checkpoint"] {
+            assert!(
+                catalog.history_relation(relation_name).is_some(),
+                "{relation_name} should support lix_history"
+            );
+        }
         for surface_name in [
+            "lix_key_value_by_branch",
+            "lix_registered_schema_by_branch",
+            "lix_working_diff_by_branch",
             "lix_state",
             "lix_state_by_branch",
             "lix_state_history",
@@ -314,6 +284,12 @@ mod tests {
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",
+            "lix_branch_descriptor",
+            "lix_branch_descriptor_by_branch",
+            "lix_branch_descriptor_history",
+            "lix_branch_ref",
+            "lix_branch_ref_by_branch",
+            "lix_branch_ref_history",
             "lix_directory_descriptor",
             "lix_directory_descriptor_by_branch",
             "lix_directory_descriptor_history",
@@ -350,18 +326,22 @@ mod tests {
     #[test]
     fn dynamic_row_history_surface_uses_provider_history_column_names() {
         let catalog = catalog();
-        let table = bind_public_table(
-            &catalog,
-            &table_name("SELECT * FROM test_state_schema_history()"),
-        )
-        .expect("schema history surface should bind");
+        let history = catalog
+            .history_relation("test_state_schema")
+            .expect("schema history contract should exist");
 
-        assert!(matches!(
-            table.surface.kind,
-            PublicSurfaceKind::SchemaHistory { .. }
-        ));
-        assert!(require_public_column(&table, "lixcol_row_pk").is_ok());
-        assert!(require_public_column(&table, "lixcol_snapshot_content").is_err());
+        assert!(
+            history
+                .columns
+                .iter()
+                .any(|column| { column.name == "lixcol_row_pk" && column.is_public() })
+        );
+        assert!(
+            !history
+                .columns
+                .iter()
+                .any(|column| { column.name == "lixcol_snapshot_content" && column.is_public() })
+        );
     }
 
     #[test]

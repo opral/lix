@@ -5,6 +5,72 @@ use serde_json::json;
 
 use super::assert_rows_eq;
 
+simulation_test!(lix_directory_exposes_public_timestamps, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+    let directory_id = "6469722d-7469-8d65-8374-616d70730000";
+
+    session
+        .execute(
+            &format!("INSERT INTO lix_directory (id, path) VALUES ('{directory_id}', '/before')"),
+            &[],
+        )
+        .await
+        .expect("directory insert should succeed");
+    let initial = session
+        .execute(
+            &format!(
+                "SELECT lixcol_created_at, lixcol_updated_at \
+                     FROM lix_directory WHERE id = '{directory_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("directory timestamps should be public");
+    let created_at = initial.rows()[0]
+        .get::<String>("lixcol_created_at")
+        .expect("created timestamp should be text");
+    let updated_at = initial.rows()[0]
+        .get::<String>("lixcol_updated_at")
+        .expect("updated timestamp should be text");
+
+    session
+        .execute(
+            &format!("UPDATE lix_directory SET path = '/after' WHERE id = '{directory_id}'"),
+            &[],
+        )
+        .await
+        .expect("directory rename should succeed");
+    let renamed = session
+        .execute(
+            &format!(
+                "SELECT lixcol_created_at, lixcol_updated_at \
+                     FROM lix_directory WHERE id = '{directory_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("renamed directory timestamps should be public");
+    assert_eq!(
+        renamed.rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created timestamp should be text"),
+        created_at,
+    );
+    assert_ne!(
+        renamed.rows()[0]
+            .get::<String>("lixcol_updated_at")
+            .expect("updated timestamp should be text"),
+        updated_at,
+    );
+});
+
 simulation_test!(
     lix_directory_path_insert_preserves_long_opaque_segments,
     |sim| async move {
@@ -342,55 +408,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_directory_by_branch_insert_duplicate_id_reports_lix_directory_by_branch,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-        let branch_id = sim.main_branch_id();
-
-        session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_directory_by_branch \
-                     (id, path, lixcol_branch_id) \
-                     VALUES ('73616d65-2d64-8972-8000-000000000000', '/a', '{branch_id}')"
-                ),
-                &[],
-            )
-            .await
-            .expect("first by-branch directory insert should succeed");
-
-        let error = session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_directory_by_branch \
-                     (id, path, lixcol_branch_id) \
-                     VALUES ('73616d65-2d64-8972-8000-000000000000', '/b', '{branch_id}')"
-                ),
-                &[],
-            )
-            .await
-            .expect_err("duplicate by-branch directory id insert should be rejected");
-
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert!(
-            error.message.contains("table 'lix_directory_by_branch'")
-                && error
-                    .message
-                    .contains("id '73616d65-2d64-8972-8000-000000000000'")
-                && !error.message.contains("table 'lix_directory':")
-                && !error.message.contains("lix_directory_descriptor"),
-            "unexpected error: {error:?}"
-        );
-    }
-);
 
 simulation_test!(
     lix_directory_path_insert_rejects_existing_file_entry,
@@ -779,11 +796,17 @@ simulation_test!(
             .await
             .expect("branch-local directory should be a distinct storage namespace");
 
-        let global_file = session
+        let global_session = sim.wrap_session(
+            engine
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let global_file = global_session
             .execute(
-                "SELECT id, path, lixcol_branch_id, lixcol_global \
-                 FROM lix_file_by_branch \
-                 WHERE id = '676c6f62-616c-8d66-896c-652d666f6f00' AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+                "SELECT id, path, lixcol_global FROM lix_file \
+                 WHERE id = '676c6f62-616c-8d66-896c-652d666f6f00'",
                 &[],
             )
             .await
@@ -878,58 +901,6 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_directory_by_branch_expands_global_rows,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path, lixcol_global, lixcol_untracked) \
-                 VALUES ('6469722d-676c-8f62-816c-2d6f76657200', '/shared', true, false)",
-                &[],
-            )
-            .await
-            .expect("global directory insert should succeed");
-
-        let result = session
-            .execute(
-                "SELECT id, path, lixcol_branch_id, lixcol_global, lixcol_untracked \
-                 FROM lix_directory_by_branch \
-                 WHERE id = '6469722d-676c-8f62-816c-2d6f76657200' \
-                 ORDER BY lixcol_branch_id",
-                &[],
-            )
-            .await
-            .expect("directory by-branch read should succeed");
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Text("6469722d-676c-8f62-816c-2d6f76657200".to_string()),
-                    Value::Text("/shared".to_string()),
-                    Value::Text(sim.main_branch_id().to_string()),
-                    Value::Boolean(true),
-                    Value::Boolean(false),
-                ],
-                vec![
-                    Value::Text("6469722d-676c-8f62-816c-2d6f76657200".to_string()),
-                    Value::Text("/shared".to_string()),
-                    Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-                    Value::Boolean(true),
-                    Value::Boolean(false),
-                ],
-            ],
-        );
-    }
-);
 
 simulation_test!(
     lix_directory_global_path_insert_reuses_existing_global_directory,
@@ -1425,93 +1396,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_directory_by_branch_insert_on_conflict_path_branch_do_nothing,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-        let branch_id = sim.main_branch_id();
 
-        session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_directory_by_branch \
-                     (id, path, lixcol_branch_id) \
-                     VALUES ('6469722d-6272-816e-8368-2d7061746800', '/branch-dir', '{branch_id}')"
-                ),
-                &[],
-            )
-            .await
-            .expect("seed by-branch directory insert should succeed");
-
-        let result = session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_directory_by_branch \
-                     (path, lixcol_branch_id) \
-                     VALUES ('/branch-dir', '{branch_id}') \
-                     ON CONFLICT (path, lixcol_branch_id) DO NOTHING"
-                ),
-                &[],
-            )
-            .await
-            .expect("by-branch directory path upsert should succeed");
-        assert_eq!(result.rows_affected(), 0);
-
-        let read = session
-            .execute(
-                "SELECT id FROM lix_directory WHERE path = '/branch-dir'",
-                &[],
-            )
-            .await
-            .expect("directory read should succeed");
-        assert_rows_eq(
-            read,
-            vec![vec![Value::Text(
-                "6469722d-6272-816e-8368-2d7061746800".to_string(),
-            )]],
-        );
-    }
-);
-
-simulation_test!(
-    lix_directory_by_branch_insert_on_conflict_path_without_branch_target_rejects,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-        let branch_id = sim.main_branch_id();
-
-        let error = session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_directory_by_branch \
-                     (path, lixcol_branch_id) \
-                     VALUES ('/dir-reject', '{branch_id}') \
-                     ON CONFLICT (path) DO NOTHING"
-                ),
-                &[],
-            )
-            .await
-            .expect_err("by-branch path-only target should be rejected");
-        assert!(
-            error
-                .message
-                .contains("path identity columns (path, lixcol_branch_id)")
-        );
-    }
-);
 
 simulation_test!(
     lix_directory_insert_on_conflict_path_rejects_missing_path,
@@ -1605,11 +1490,17 @@ simulation_test!(
             .expect("path upsert should update visible global directory");
         assert_eq!(result.rows_affected(), 1);
 
-        let read = session
+        let global_session = sim.wrap_session(
+            engine
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let read = global_session
             .execute(
-                "SELECT id, lixcol_metadata, lixcol_global, lixcol_branch_id \
-                 FROM lix_directory_by_branch \
-                 WHERE id = '6469722d-676c-8f62-816c-2d7061746800' AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+                "SELECT id, lixcol_metadata, lixcol_global FROM lix_directory \
+                 WHERE id = '6469722d-676c-8f62-816c-2d7061746800'",
                 &[],
             )
             .await
@@ -1620,7 +1511,6 @@ simulation_test!(
                 Value::Text("6469722d-676c-8f62-816c-2d7061746800".to_string()),
                 Value::Jsonb(json!({"version": 2}).into()),
                 Value::Boolean(true),
-                Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             ]],
         );
     }

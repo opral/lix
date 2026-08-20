@@ -26,30 +26,25 @@ await lix.switchBranch({ branchId: main });
 
 Use names that fit your product, such as `"Marketing edit"`, `"Q3 pricing draft"`, or `"Agent task 123"`.
 
-## Read branches side by side
+## Work with branches concurrently
 
-Every registered schema `X` gets an `X_by_branch` table with a `lixcol_branch_id` column. Files and directories have the same pattern with `lix_file_by_branch` and `lix_directory_by_branch`.
+SQL relations always read and write the current session's active branch. Open
+another session to work with another branch without switching the primary one:
 
 ```ts
-const sideBySide = await lix.execute(
-  `SELECT b.name, s.title
-	 FROM acme_section_by_branch s
-	 JOIN lix_branch b ON b.id = s.lixcol_branch_id
-	 WHERE s.id = $1
-	   AND s.lixcol_branch_id IN ($2, $3)
-	 ORDER BY b.name`,
-  ["s1", main, draft.id],
-);
+const draftLix = await lix.openAnotherSession({ branchId: draft.id });
+
+const [mainRows, draftRows] = await Promise.all([
+  lix.execute("SELECT id, title FROM acme_section ORDER BY id"),
+  draftLix.execute("SELECT id, title FROM acme_section ORDER BY id"),
+]);
+
+await draftLix.close();
 ```
 
-Rules for `_by_branch` tables:
-
-- `SELECT` can read one or many branches.
-- `INSERT` must include `lixcol_branch_id`.
-- `UPDATE` and `DELETE` must filter by `lixcol_branch_id`.
-- The plain table reads and writes the active branch.
-
-Use `_by_branch` tables for review UIs and side-by-side views. See [SQL Surfaces](./surfaces.md) for the full table map.
+Each session has independent branch selection, transactions, observations, and
+lifecycle. Use `lix_diff(mainCommit, draftCommit)` when the desired result is a
+commit-to-commit change set rather than two current-state result sets.
 
 ## Preview a merge
 

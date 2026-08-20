@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { mkdir, rm, symlink } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -108,6 +108,48 @@ await run("wasm-bindgen", [
 	"--out-name",
 	"lix_js_sdk",
 ]);
+await removeSyncInitializer();
 // Source imports (`../wasm/lix_js_sdk.js`) resolve here for Node vitest.
 await rm(sourceOutDir, { recursive: true, force: true });
 await symlink(outDir, sourceOutDir, "dir");
+
+async function removeSyncInitializer() {
+	const jsPath = join(outDir, "lix_js_sdk.js");
+	const typesPath = join(outDir, "lix_js_sdk.d.ts");
+	let source = await readFile(jsPath, "utf8");
+	const syncStart = source.indexOf("\nfunction initSync(module) {");
+	const asyncStart = source.indexOf("\nasync function __wbg_init(", syncStart);
+	if (syncStart === -1 || asyncStart === -1) {
+		throw new Error("wasm-bindgen output did not contain the sync initializer");
+	}
+	source = source.slice(0, syncStart) + source.slice(asyncStart);
+	const oldExport = "export { initSync, __wbg_init as default };";
+	if (!source.includes(oldExport)) {
+		throw new Error("wasm-bindgen output did not export the sync initializer");
+	}
+	source = source.replace(oldExport, "export { __wbg_init as default };");
+	if (/\binitSync\b/.test(source)) {
+		throw new Error("sync initializer remained in generated JavaScript");
+	}
+	await writeFile(jsPath, source);
+
+	let types = await readFile(typesPath, "utf8");
+	const syncTypeStart = types.indexOf("\nexport type SyncInitInput");
+	const syncFunctionStart = types.indexOf(
+		"\nexport function initSync",
+		syncTypeStart,
+	);
+	const asyncDocsStart = types.indexOf("\n/**", syncFunctionStart + 1);
+	if (
+		syncTypeStart === -1 ||
+		syncFunctionStart === -1 ||
+		asyncDocsStart === -1
+	) {
+		throw new Error("wasm-bindgen types did not contain the sync initializer");
+	}
+	types = types.slice(0, syncTypeStart) + types.slice(asyncDocsStart);
+	if (/\b(?:initSync|SyncInitInput)\b/.test(types)) {
+		throw new Error("sync initializer remained in generated types");
+	}
+	await writeFile(typesPath, types);
+}

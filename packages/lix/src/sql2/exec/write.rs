@@ -1,6 +1,5 @@
 //! Write execution for bound sql2 plans.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -14,11 +13,8 @@ use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::PreparedDmlParameterBatch;
 use crate::common::ExecuteStatementMetadata;
 use crate::sql2::SqlWriteExecutionContext;
-use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::BoundWriteTarget;
 use crate::sql2::plan::LogicalWritePlan;
-use crate::sql2::plan::branch_scope::BranchScope;
-use crate::sql2::plan::predicate::BoundPredicate;
 use crate::{LixError, Value};
 
 #[cfg(test)]
@@ -533,7 +529,7 @@ async fn execute_write_logical_plan_with_mode_inner(
             "expected SQL write logical plan",
         ));
     };
-    let write_plan = resolve_parameterized_branch_scope(write_plan.plan, params)?;
+    let write_plan = write_plan.plan;
     validate_write_parameter_count(&write_plan, params.len())?;
 
     if mode != WriteExecutorModeInner::ForceDataFusion {
@@ -563,267 +559,6 @@ async fn execute_write_logical_plan_with_mode_inner(
     let result =
         super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
     Ok((result, WriteExecutorPath::DataFusion))
-}
-
-fn resolve_parameterized_branch_scope(
-    mut plan: LogicalWritePlan,
-    params: &[Value],
-) -> Result<LogicalWritePlan, LixError> {
-    plan.bound.branch_scope = match plan.bound.branch_scope {
-        BranchScope::ExplicitDynamic {
-            mut branch_ids,
-            param_indexes,
-        } => {
-            insert_branch_param_values(
-                &mut branch_ids,
-                &param_indexes,
-                params,
-                BranchParamNullPolicy::Reject,
-            )?;
-            if branch_ids.is_empty() {
-                BranchScope::Empty
-            } else {
-                BranchScope::Explicit { branch_ids }
-            }
-        }
-        BranchScope::ExplicitRequiredDynamic {
-            mut branch_ids,
-            param_indexes,
-        } => match branch_column_for_target(&plan.bound.target) {
-            Some(branch_column) => {
-                match resolved_predicate_branch_selector(
-                    &plan.bound.predicate,
-                    branch_column,
-                    params,
-                )? {
-                    ResolvedBranchSelector::Static(branch_ids) if branch_ids.is_empty() => {
-                        BranchScope::Empty
-                    }
-                    ResolvedBranchSelector::Static(branch_ids) => {
-                        BranchScope::ExplicitRequired { branch_ids }
-                    }
-                    ResolvedBranchSelector::Missing => {
-                        insert_branch_param_values(
-                            &mut branch_ids,
-                            &param_indexes,
-                            params,
-                            BranchParamNullPolicy::Ignore,
-                        )?;
-                        if branch_ids.is_empty() {
-                            BranchScope::Empty
-                        } else {
-                            BranchScope::ExplicitRequired { branch_ids }
-                        }
-                    }
-                }
-            }
-            None => {
-                insert_branch_param_values(
-                    &mut branch_ids,
-                    &param_indexes,
-                    params,
-                    BranchParamNullPolicy::Ignore,
-                )?;
-                if branch_ids.is_empty() {
-                    BranchScope::Empty
-                } else {
-                    BranchScope::ExplicitRequired { branch_ids }
-                }
-            }
-        },
-        scope => scope,
-    };
-    Ok(plan)
-}
-
-fn branch_column_for_target(target: &BoundWriteTarget) -> Option<&'static str> {
-    match target {
-        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::ByBranch {
-            ..
-        })
-        | BoundWriteTarget::File(crate::sql2::bind::write::FileWriteSurface::ByBranch)
-        | BoundWriteTarget::Directory(crate::sql2::bind::write::DirectoryWriteSurface::ByBranch) => {
-            Some("lixcol_branch_id")
-        }
-        _ => None,
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ResolvedBranchSelector {
-    Missing,
-    Static(BTreeSet<String>),
-}
-
-impl ResolvedBranchSelector {
-    fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Missing, _) | (_, Self::Missing) => Self::Missing,
-            (Self::Static(mut left), Self::Static(right)) => {
-                left.extend(right);
-                Self::Static(left)
-            }
-        }
-    }
-
-    fn intersect(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
-            (Self::Static(left), Self::Static(right)) => {
-                Self::Static(left.intersection(&right).cloned().collect())
-            }
-        }
-    }
-}
-
-fn resolved_predicate_branch_selector(
-    predicate: &BoundPredicate,
-    branch_column: &str,
-    params: &[Value],
-) -> Result<ResolvedBranchSelector, LixError> {
-    match predicate {
-        BoundPredicate::True => Ok(ResolvedBranchSelector::Missing),
-        BoundPredicate::False => Ok(ResolvedBranchSelector::Static(BTreeSet::new())),
-        BoundPredicate::And(predicates) => {
-            let mut result = ResolvedBranchSelector::Missing;
-            for predicate in predicates {
-                result = result.intersect(resolved_predicate_branch_selector(
-                    predicate,
-                    branch_column,
-                    params,
-                )?);
-            }
-            Ok(result)
-        }
-        BoundPredicate::Or(predicates) => {
-            let mut result = ResolvedBranchSelector::Static(BTreeSet::new());
-            for predicate in predicates {
-                result = result.union(resolved_predicate_branch_selector(
-                    predicate,
-                    branch_column,
-                    params,
-                )?);
-            }
-            Ok(result)
-        }
-        BoundPredicate::Eq(left, right) => {
-            resolved_branch_selector_from_binary_exprs(left, right, branch_column, params)
-                .or_else(|| {
-                    resolved_branch_selector_from_binary_exprs(right, left, branch_column, params)
-                })
-                .transpose()
-                .map(|selector| selector.unwrap_or(ResolvedBranchSelector::Missing))
-        }
-        BoundPredicate::Like { .. } | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
-            Ok(ResolvedBranchSelector::Missing)
-        }
-        BoundPredicate::In { expr, values } => {
-            let BoundExpr::Column(column) = expr else {
-                return Ok(ResolvedBranchSelector::Missing);
-            };
-            if column.name != branch_column {
-                return Ok(ResolvedBranchSelector::Missing);
-            }
-            let mut result = ResolvedBranchSelector::Static(BTreeSet::new());
-            for value in values {
-                result = result.union(resolved_value_branch_selector(value, params)?);
-            }
-            Ok(result)
-        }
-    }
-}
-
-fn resolved_branch_selector_from_binary_exprs(
-    column_expr: &BoundExpr,
-    value_expr: &BoundExpr,
-    branch_column: &str,
-    params: &[Value],
-) -> Option<Result<ResolvedBranchSelector, LixError>> {
-    let BoundExpr::Column(column) = column_expr else {
-        return None;
-    };
-    if column.name != branch_column {
-        return None;
-    }
-    Some(resolved_value_branch_selector(value_expr, params))
-}
-
-fn resolved_value_branch_selector(
-    expr: &BoundExpr,
-    params: &[Value],
-) -> Result<ResolvedBranchSelector, LixError> {
-    match expr {
-        BoundExpr::Literal(BoundLiteral::Text(branch_id)) => {
-            Ok(ResolvedBranchSelector::Static(BTreeSet::from([
-                branch_id.clone()
-            ])))
-        }
-        BoundExpr::Literal(BoundLiteral::Null) => {
-            Ok(ResolvedBranchSelector::Static(BTreeSet::new()))
-        }
-        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
-            Some(Value::Text(branch_id)) => Ok(ResolvedBranchSelector::Static(BTreeSet::from([
-                branch_id.clone(),
-            ]))),
-            Some(Value::Null) => Ok(ResolvedBranchSelector::Static(BTreeSet::new())),
-            Some(_) => Err(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                "by-branch SQL write selectors require text branch-id parameters",
-            )),
-            None => Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!(
-                    "SQL branch selector parameter ${} was not provided",
-                    param.index
-                ),
-            )),
-        },
-        _ => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "by-branch SQL write predicates require string branch ids",
-        )),
-    }
-}
-
-fn insert_branch_param_values(
-    branch_ids: &mut BTreeSet<String>,
-    param_indexes: &BTreeSet<usize>,
-    params: &[Value],
-    null_policy: BranchParamNullPolicy,
-) -> Result<(), LixError> {
-    for index in param_indexes {
-        match params.get(index.saturating_sub(1)) {
-            Some(Value::Text(branch_id)) => {
-                branch_ids.insert(branch_id.clone());
-            }
-            Some(Value::Null) if null_policy == BranchParamNullPolicy::Ignore => {}
-            Some(Value::Null) => {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "INSERT into a by-branch SQL surface requires non-null text branch-id parameters",
-                ));
-            }
-            Some(_) => {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "by-branch SQL write selectors require text branch-id parameters",
-                ));
-            }
-            None => {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!("SQL branch selector parameter ${index} was not provided"),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BranchParamNullPolicy {
-    Reject,
-    Ignore,
 }
 
 fn normalize_bound_public_write_error(error: LixError) -> LixError {

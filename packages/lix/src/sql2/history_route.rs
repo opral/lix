@@ -70,7 +70,7 @@ impl HistoryRoute {
     /// Returns the part of the route that is safe to apply before a shaped
     /// history provider has built its output rows.
     ///
-    /// Surface providers such as `lix_file_history` may be caused by different
+    /// Surface providers such as `lix_history('lix_file')` may be caused by different
     /// canonical event schemas than the schema they expose. For those providers,
     /// identity/schema filters must be evaluated against the shaped output row,
     /// not against the canonical event row.

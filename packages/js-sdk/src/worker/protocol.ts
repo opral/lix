@@ -10,6 +10,7 @@ import type {
 	MergeBranchOptions,
 	SwitchBranchOptions,
 	LixTelemetrySpan,
+	OpenAnotherSessionOptions,
 } from "../types.js";
 
 export type WorkerSyncServerOptions = {
@@ -37,6 +38,7 @@ export type WorkerSyncFetchResponse = {
 
 export type WorkerRequest = {
 	id: number;
+	sessionId: number;
 	operation: WorkerOperation;
 };
 
@@ -47,6 +49,7 @@ export type WorkerOperation =
 			telemetryEnabled: boolean;
 			server?: WorkerSyncServerOptions;
 	  }
+	| { kind: "openAnotherSession"; options: OpenAnotherSessionOptions }
 	| {
 			kind: "execute";
 			sql: string;

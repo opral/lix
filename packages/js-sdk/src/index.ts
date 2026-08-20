@@ -49,6 +49,7 @@ export type {
 	MergeConflictSide,
 	ObserveEvent,
 	OpenLixOptions,
+	OpenAnotherSessionOptions,
 	LixTelemetryOptions,
 	LixTelemetrySpan,
 	RemoteLixFetch,

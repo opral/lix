@@ -108,5 +108,4 @@ pub(crate) use row_columnar_layout::{
     RowGroupLocations, encode_registered_row_groups, encode_unclustered_registered_row_groups,
 };
 pub(crate) use row_projection::RowProjectionDecoder;
-pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 mod aggregate_statistics;

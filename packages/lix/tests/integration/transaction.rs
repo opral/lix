@@ -113,7 +113,10 @@ async fn stale_transaction_composes_different_columns_of_one_ordinary_row() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let setup = engine.open_session().await.expect("setup session should open");
+    let setup = engine
+        .open_session()
+        .await
+        .expect("setup session should open");
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value)
@@ -130,8 +133,14 @@ async fn stale_transaction_composes_different_columns_of_one_ordinary_row() {
         .await
         .expect("note should seed");
 
-    let stale_session = engine.open_session().await.expect("stale session should open");
-    let winner_session = engine.open_session().await.expect("winner session should open");
+    let stale_session = engine
+        .open_session()
+        .await
+        .expect("stale session should open");
+    let winner_session = engine
+        .open_session()
+        .await
+        .expect("winner session should open");
     let mut stale = stale_session
         .begin_transaction()
         .await
@@ -162,7 +171,10 @@ async fn stale_transaction_composes_different_columns_of_one_ordinary_row() {
         )
         .await
         .expect("merged note should read");
-    assert_eq!(result.rows()[0].get::<String>("title").unwrap(), "alice title");
+    assert_eq!(
+        result.rows()[0].get::<String>("title").unwrap(),
+        "alice title"
+    );
     assert_eq!(result.rows()[0].get::<String>("body").unwrap(), "bob body");
 }
 
@@ -175,7 +187,10 @@ async fn commit_cohort_composes_different_columns_of_one_ordinary_row() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let setup = engine.open_session().await.expect("setup session should open");
+    let setup = engine
+        .open_session()
+        .await
+        .expect("setup session should open");
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value)
@@ -192,8 +207,14 @@ async fn commit_cohort_composes_different_columns_of_one_ordinary_row() {
         .await
         .expect("note should seed");
 
-    let alice_session = engine.open_session().await.expect("alice session should open");
-    let bob_session = engine.open_session().await.expect("bob session should open");
+    let alice_session = engine
+        .open_session()
+        .await
+        .expect("alice session should open");
+    let bob_session = engine
+        .open_session()
+        .await
+        .expect("bob session should open");
     let mut alice = alice_session
         .begin_transaction()
         .await
@@ -227,8 +248,15 @@ async fn commit_cohort_composes_different_columns_of_one_ordinary_row() {
         )
         .await
         .expect("cohort-merged note should read");
-    assert_eq!(result.rows().len(), 1, "cohort must retain one row identity");
-    assert_eq!(result.rows()[0].get::<String>("title").unwrap(), "alice title");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "cohort must retain one row identity"
+    );
+    assert_eq!(
+        result.rows()[0].get::<String>("title").unwrap(),
+        "alice title"
+    );
     assert_eq!(result.rows()[0].get::<String>("body").unwrap(), "bob body");
 }
 
@@ -679,13 +707,16 @@ async fn existing_session_ignores_later_default_branch_corruption() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine.open_session().await.expect("session should open");
+    let global_session = engine
+        .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+        .await
+        .expect("global session should open");
 
-    session
+    global_session
         .execute(
-            "UPDATE lix_key_value_by_branch \
+            "UPDATE lix_key_value \
              SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_default_branch_id' \
-               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+             WHERE key = 'lix_default_branch_id'",
             &[],
         )
         .await
@@ -759,13 +790,16 @@ async fn existing_session_writes_to_its_selected_branch() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine.open_session().await.expect("session should open");
+    let global_session = engine
+        .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+        .await
+        .expect("global session should open");
 
-    session
+    global_session
         .execute(
-            "UPDATE lix_key_value_by_branch \
+            "UPDATE lix_key_value \
              SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_default_branch_id' \
-               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+             WHERE key = 'lix_default_branch_id'",
             &[],
         )
         .await
@@ -937,7 +971,7 @@ async fn transaction_read_can_query_history_surfaces() {
         .await
         .expect("transaction should begin");
     let result = tx
-        .execute("SELECT key FROM lix_key_value_history()", &[])
+        .execute("SELECT key FROM lix_history('lix_key_value')", &[])
         .await
         .expect("transaction read should register history surfaces");
 

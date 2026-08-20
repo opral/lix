@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- Removed the `@lix-js/sdk/workerd` entry point, its direct in-isolate WASM
+  snapshot bindings, and the now-unused synchronous WASM initializer.
+- Removed the public SQL script-parsing API (`parse_sql_script` /
+  `parseSqlScript`, `SqlScriptPlan`, `SqlScriptStatement`) from the Rust and
+  JavaScript SDKs. Hosts pass an array of statements to `executeBatch`;
+  `execute` remains one statement. Do not parse a script string into statements
+  on the host.
+- Removed the public `lix_branch_descriptor`, `lix_branch_ref`, and matching
+  history SQL relations. Use the writable `lix_branch` relation for branch
+  creation, metadata, and current head access.
+- Removed every public `*_by_branch` SQL relation and the public
+  `lixcol_branch_id` row-routing column. SQL relations now always use the
+  current session's active branch. Open another session to work with another
+  branch, use that session's `lix_working_diff` for uncheckpointed work, and
+  use `lix_diff(from_commit, to_commit)` for commit-to-commit comparison.
+  `lixcol_global` and the global branch remain supported.
+
 ## 0.12.3 - 2026-08-18
 
 ### Patch

@@ -99,6 +99,30 @@ async fn first_local_write_pushes_before_deferred_history_is_read() {
     authority.close().await.expect("close authority");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_runtime_outlives_the_primary_session() {
+    let authority = Arc::new(open_lix().await.expect("open authority"));
+    put_value(&authority, "seed", "authority").await;
+    let (url, server_task) = serve(Arc::clone(&authority), Arc::default()).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let primary = open_replica(replica_dir.path(), &url).await;
+    let child = primary
+        .open_another_session()
+        .await
+        .expect("open child session");
+
+    primary.close().await.expect("close primary session");
+    put_value(&child, "from-child", "after-primary-close").await;
+    wait_for_value(&authority, "from-child", "after-primary-close").await;
+
+    put_value(&authority, "from-authority", "child-still-live").await;
+    wait_for_value(&child, "from-authority", "child-still-live").await;
+
+    child.close().await.expect("close final session");
+    stop_server(server_task).await;
+    authority.close().await.expect("close authority");
+}
+
 impl HttpProbe {
     fn gate_next_two_pushes(&self) {
         *self.push_gate.lock().expect("push gate lock") =

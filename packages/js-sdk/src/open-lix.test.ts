@@ -41,6 +41,23 @@ test("SQLite is not part of the JavaScript SDK export surface", async () => {
 	expect("SQLite" in sdk).toBe(false);
 });
 
+test("parseSqlScript is not part of the JavaScript SDK export surface", async () => {
+	const sdk = await import("./index.js");
+	expect("parseSqlScript" in sdk).toBe(false);
+	expect("SqlScriptPlan" in sdk).toBe(false);
+	expect("SqlScriptStatement" in sdk).toBe(false);
+});
+
+test("execute rejects multi-statement scripts", async () => {
+	const lix = await openLix();
+	await expect(lix.execute("SELECT 1; SELECT 2")).rejects.toMatchObject({
+		name: "LixError",
+		code: "LIX_UNSUPPORTED_SQL",
+		message: "Lix SQL only supports one statement per execute() call",
+	});
+	await lix.close();
+});
+
 test("filesystem storage is owned by its adapter package", async () => {
 	const sdk = await import("./index.js");
 	expect("FilesystemStorage" in sdk).toBe(false);
@@ -150,6 +167,42 @@ test("openLix opens native storage without telemetry", async () => {
 	const lix = await openLix();
 	const result = await lix.execute("SELECT 1 AS value");
 	expect(get(result, "value")).toBe(1);
+	await lix.close();
+});
+
+test("openAnotherSession keeps branch and lifecycle independent", async () => {
+	const main = await openLix();
+	const mainBranchId = await main.activeBranchId();
+	const draft = await main.createBranch({ name: "Independent draft" });
+	const review = await main.openAnotherSession({ branchId: draft.id });
+
+	expect(await main.activeBranchId()).toBe(mainBranchId);
+	expect(await review.activeBranchId()).toBe(draft.id);
+	expect(await review.activeAccountId()).toBe(await main.activeAccountId());
+
+	await review.switchBranch({ branchId: mainBranchId });
+	expect(await main.activeBranchId()).toBe(mainBranchId);
+	expect(await review.activeBranchId()).toBe(mainBranchId);
+
+	await main.close();
+	await expect(review.execute("SELECT 1 AS value")).resolves.toBeDefined();
+	await expect(main.openAnotherSession()).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
+	await review.close();
+});
+
+test("openAnotherSession validates options and missing branches", async () => {
+	const lix = await openLix();
+	await expect(
+		lix.openAnotherSession({ branchId: "missing-branch" }),
+	).rejects.toMatchObject({ code: "LIX_BRANCH_NOT_FOUND" });
+	await expect(lix.openAnotherSession({ branchId: "" })).rejects.toBeInstanceOf(
+		TypeError,
+	);
+	await expect(lix.openAnotherSession(null as never)).rejects.toBeInstanceOf(
+		TypeError,
+	);
 	await lix.close();
 });
 
@@ -556,7 +609,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
 	const fileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history($2) WHERE id = $1 AND lixcol_depth = 0",
+			"SELECT lixcol_source_changes FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_depth = 0",
 			[fileId, insertedHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -585,7 +638,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(txStamped, "origin_key")).toBe("tx-origin");
 	const txFileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history($2) WHERE id = $1 AND lixcol_depth = 0",
+			"SELECT lixcol_source_changes FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_depth = 0",
 			[fileId, txHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -783,6 +836,25 @@ test("fs storage binds to one open lix at a time", async () => {
 	const reopened = await openLix({ storage });
 	await storage.syncDiskToLix();
 	await reopened.close();
+});
+
+test("fs storage connector routes through a live child session", async () => {
+	const dir = tempFsDir();
+	mkdirSync(dir, { recursive: true });
+	const storage = new FilesystemStorage({ path: dir, syncAllFiles: false });
+	const primary = await openLix({ storage });
+	const child = await primary.openAnotherSession();
+
+	await primary.close();
+	writeFileSync(join(dir, "child.md"), "child");
+	await storage.importPaths(["child.md"]);
+	await storage.syncDiskToLix();
+	expect(
+		new TextDecoder().decode((await readFile(child, "/child.md"))!),
+	).toBe("child");
+
+	await child.close();
+	await expect(storage.syncDiskToLix()).rejects.toThrow("requires an open Lix");
 });
 
 test("fs storage defaults match FilesystemStorage::new(path)", () => {
@@ -1226,7 +1298,7 @@ test("beginTransaction preserves handle after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT id FROM lix_file_history('one', 'two')",
+			"SELECT id FROM lix_history('lix_file', 'one', 'two')",
 		),
 	).rejects.toMatchObject({
 		code: "LIX_PARSE_ERROR",
@@ -1257,7 +1329,7 @@ test("beginTransaction can continue after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT id FROM lix_file_history('one', 'two')",
+			"SELECT id FROM lix_history('lix_file', 'one', 'two')",
 		),
 	).rejects.toMatchObject({
 		code: "LIX_PARSE_ERROR",
@@ -1392,7 +1464,7 @@ test("engine errors cross the native boundary", async () => {
 
 	try {
 		await lix.execute(
-			"SELECT id FROM lix_file_history('one', 'two')",
+			"SELECT id FROM lix_history('lix_file', 'one', 'two')",
 		);
 		throw new Error("expected history query to fail");
 	} catch (error) {
@@ -1838,7 +1910,7 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 
 	const result = await lix.execute(
 		"SELECT lixcol_source_changes \
-		 FROM lix_directory_history() \
+		 FROM lix_history('lix_directory') \
 		 WHERE id = $1 \
 		 ORDER BY lixcol_depth \
 		 LIMIT 1",

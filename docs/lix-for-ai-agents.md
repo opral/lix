@@ -58,16 +58,20 @@ Use remote mode when the repository runs on a server. See
 
 ## Inspect the work
 
-To review the agent's work before the merge, read the task branch with the `_by_branch` table. Here `acme_task` is an example registered schema; every registered schema gets the same table set:
+To review the agent's work before the merge, open another session on the task
+branch and query the ordinary current-state relation:
 
-```sql
-SELECT id, title, status
-FROM acme_task_by_branch
-WHERE lixcol_branch_id = $1
-ORDER BY id;
+```ts
+const reviewLix = await lix.openAnotherSession({ branchId: task.id });
+const rows = await reviewLix.execute(
+  "SELECT id, title, status FROM acme_task ORDER BY id",
+);
+await reviewLix.close();
 ```
 
-Pass the task branch id as `$1`. `<schema>_history()` anchors to the active branch head. Run it from main and it will not show the agent's unmerged work.
+`lix_history('<schema>')` is revision history anchored to a commit; it is not a
+current-state snapshot replacement. Use the branch-scoped session for current
+rows and `lix_diff()` for a commit-to-commit change set.
 
 Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole repository. It is not limited to the active branch.
 

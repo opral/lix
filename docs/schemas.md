@@ -67,8 +67,9 @@ VALUES ('acme_section', '{
 }'::jsonb);
 ```
 
-`schema_key` must equal `value.key`. After registration, `acme_section`,
-`acme_section_by_branch`, and `acme_section_history()` expose the typed row.
+`schema_key` must equal `value.key`. After registration, `acme_section` and
+`lix_history('acme_section')` expose the typed current row and its revision
+history.
 
 ## Contract
 

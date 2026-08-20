@@ -37,9 +37,6 @@ fn read_only_error(action: &str, schema_key: &str, message: &'static str) -> Dat
 
 fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
     match schema_key {
-        "lix_branch_descriptor" | "lix_branch_ref" => {
-            Some("Use the writable lix_branch surface to create, update, or delete branches.")
-        }
         "lix_file_descriptor" => {
             Some("Use the writable lix_file surface to create, update, or delete files.")
         }

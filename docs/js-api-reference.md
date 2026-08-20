@@ -94,6 +94,9 @@ const result = await lix.execute(sql, params?, options?);
 ```
 
 Executes one PostgreSQL-dialect SQL statement against the active Lix session.
+Pass a single statement. To run several statements atomically, call
+`executeBatch()` with an array of `{ sql, params? }` objects. Do not concatenate
+statements into one SQL string or parse a script on the host.
 
 Parameters:
 
@@ -155,11 +158,12 @@ const results = await lix.executeBatch(statements, options?);
 ```
 
 Executes multiple statements atomically in one call. `statements` is a non-empty
-array of `{ sql, params?, label? }` objects. `options` accepts the same
-`originKey` and `idempotencyKey` as `execute()`. Results preserve input order and
-include a zero-based `statementIndex`. A supplied label is echoed unchanged;
-labels are opaque and may repeat. If a label is omitted, the result has no
-`label` property.
+array of `{ sql, params?, label? }` objects — one statement per entry, already
+split by the caller. Lix does not parse a multi-statement script. `options`
+accepts the same `originKey` and `idempotencyKey` as `execute()`. Results
+preserve input order and include a zero-based `statementIndex`. A supplied label
+is echoed unchanged; labels are opaque and may repeat. If a label is omitted,
+the result has no `label` property.
 
 ```ts
 const results = await lix.executeBatch([

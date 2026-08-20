@@ -33,13 +33,13 @@ simulation_test!(
 
         let branch_result = session
             .execute(
-                "SELECT id, name, hidden \
-             FROM lix_branch_descriptor \
+                "SELECT id, name, hidden, commit_id \
+             FROM lix_branch \
              ORDER BY id",
                 &[],
             )
             .await
-            .expect("branch descriptors should be readable");
+            .expect("branches should be readable through the public surface");
         let branch_rows = branch_result;
         assert_eq!(branch_rows.len(), 2);
         let branch_values = branch_rows
@@ -51,11 +51,13 @@ simulation_test!(
             Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             Value::Text("global".to_string()),
             Value::Boolean(true),
+            Value::Text(sim.initial_commit_id().to_string()),
         ]));
         assert!(branch_values.contains(&vec![
             Value::Text(sim.main_branch_id().to_string()),
             Value::Text("main".to_string()),
             Value::Boolean(false),
+            Value::Text(sim.initial_commit_id().to_string()),
         ]));
 
         let lix_id_result = session
@@ -63,33 +65,6 @@ simulation_test!(
             .await
             .expect("lix_id key value should be readable");
         assert_single_json(lix_id_result, &format!("\"{}\"", sim.lix_id()));
-
-        let refs_result = session
-            .execute(
-                "SELECT id, commit_id, lixcol_untracked \
-             FROM lix_branch_ref \
-             ORDER BY id",
-                &[],
-            )
-            .await
-            .expect("branch refs should be readable");
-        let ref_rows = refs_result;
-        assert_eq!(ref_rows.len(), 2);
-        let ref_values = ref_rows
-            .rows()
-            .iter()
-            .map(|row| row.values().to_vec())
-            .collect::<Vec<_>>();
-        assert!(ref_values.contains(&vec![
-            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
-            Value::Text(sim.initial_commit_id().to_string()),
-            Value::Boolean(true),
-        ]));
-        assert!(ref_values.contains(&vec![
-            Value::Text(sim.main_branch_id().to_string()),
-            Value::Text(sim.initial_commit_id().to_string()),
-            Value::Boolean(true),
-        ]));
 
         drop(main_session);
         drop(session);

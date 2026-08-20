@@ -51,7 +51,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT id, path, parent_id, name, lixcol_depth \
-                     FROM lix_directory_history('{second_commit_id}') \
+                     FROM lix_history('lix_directory', '{second_commit_id}') \
                        WHERE id IN ('68697374-6f72-892d-8469-722d646f6300', '68697374-6f72-892d-8469-722d67756900') \
                      ORDER BY lixcol_depth, id"
                 ),
@@ -84,7 +84,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT lixcol_source_changes \
-                     FROM lix_directory_history('{second_commit_id}') \
+                     FROM lix_history('lix_directory', '{second_commit_id}') \
                        WHERE id = '68697374-6f72-892d-8469-722d67756900' \
                        AND lixcol_depth = 0"
                 ),
@@ -156,7 +156,7 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT id, lixcol_depth \
-                 FROM lix_directory_history() \
+                 FROM lix_history('lix_directory') \
                  WHERE id = '68697374-6f72-892d-8465-6661756c7401'",
                 &[],
             )
@@ -242,7 +242,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_observed_commit_id, lixcol_depth \
-                     FROM lix_directory_history('{merge_commit_id}') \
+                     FROM lix_history('lix_directory', '{merge_commit_id}') \
                        WHERE id = '6469616d-6f6e-842d-8469-720000000000' \
                        AND lixcol_depth = 1 \
                      ORDER BY lixcol_observed_commit_id"
@@ -328,7 +328,7 @@ simulation_test!(
             .execute(
                 &format!(
 					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_depth \
-	                 FROM lix_directory_history('{delete_commit_id}') \
+	                 FROM lix_history('lix_directory', '{delete_commit_id}') \
 	                   WHERE lixcol_row_pk IN (CAST('[\"01940000-0000-7000-8000-000000000001\"]' AS JSONB), CAST('[\"01940000-0000-7000-8000-000000000002\"]' AS JSONB)) \
 	                   AND lixcol_depth = 0 \
 	                 ORDER BY lixcol_row_pk"

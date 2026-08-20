@@ -8,6 +8,20 @@ pub(crate) struct PublicSurfaceContract {
     pub(crate) capabilities: SurfaceCapabilities,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicHistoryContract {
+    pub(crate) relation_name: String,
+    pub(crate) kind: PublicHistoryKind,
+    pub(crate) columns: Vec<PublicColumn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PublicHistoryKind {
+    Schema { schema_key: String },
+    File,
+    Directory,
+}
+
 impl PublicSurfaceContract {
     pub(crate) fn public_column(&self, column_name: &str) -> Option<&PublicColumn> {
         self.columns
@@ -25,23 +39,13 @@ impl PublicSurfaceContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicSurfaceKind {
     SchemaBase { schema_key: String },
-    SchemaByBranch { schema_key: String },
-    SchemaHistory { schema_key: String },
     File,
-    FileByBranch,
-    FileHistory,
     Directory,
-    DirectoryByBranch,
-    DirectoryHistory,
     Branch,
+    HistoryFunction,
     WorkingDiff,
-    WorkingDiffByBranch,
     Revert,
     Apply,
     CreateCheckpoint,
-    FileWorkingDiff,
-    FileWorkingDiffByBranch,
-    DirectoryWorkingDiff,
-    DirectoryWorkingDiffByBranch,
     Change,
 }

@@ -2786,19 +2786,15 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "PublicSurfaceKind::Branch",
             "PublicSurfaceKind::Change",
             "PublicSurfaceKind::File",
-            "PublicSurfaceKind::FileByBranch",
-            "PublicSurfaceKind::FileHistory",
             "PublicSurfaceKind::Directory",
-            "PublicSurfaceKind::DirectoryByBranch",
-            "PublicSurfaceKind::DirectoryHistory",
+            "PublicSurfaceKind::HistoryFunction",
             "branch::register_lix_branch_read_provider",
             "change::register_lix_change_read_provider",
-            "file_history::register_lix_file_history_surface",
-            "directory_history::register_lix_directory_history_surface",
+            "file_history::build_lix_file_history_provider",
+            "directory_history::build_lix_directory_history_provider",
+            "history_table_function::register_history_table_function",
             "directory::register_lix_directory_active_provider",
-            "directory::register_lix_directory_by_branch_provider",
             "file::register_lix_file_active_provider",
-            "file::register_lix_file_by_branch_provider",
             "schema::register_row_providers",
         ],
     );
@@ -2860,14 +2856,10 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "catalog.surfaces()",
             "PublicSurfaceKind::Branch",
             "PublicSurfaceKind::File",
-            "PublicSurfaceKind::FileByBranch",
             "PublicSurfaceKind::Directory",
-            "PublicSurfaceKind::DirectoryByBranch",
             "branch::register_write_provider",
             "file::register_active_write_provider",
-            "file::register_by_branch_write_provider",
             "directory::register_active_write_provider",
-            "directory::register_by_branch_write_provider",
             "schema::register_row_write_providers",
         ],
     );
@@ -2930,21 +2922,12 @@ fn sql2_row_provider_registration_is_catalog_driven() {
     assert_source_contains_all(
         relative,
         read_registration,
-        &[
-            "catalog.surfaces()",
-            "PublicSurfaceKind::SchemaBase",
-            "PublicSurfaceKind::SchemaByBranch",
-            "PublicSurfaceKind::SchemaHistory",
-        ],
+        &["catalog.surfaces()", "PublicSurfaceKind::SchemaBase"],
     );
     assert_source_contains_all(
         relative,
         write_registration,
-        &[
-            "catalog.surfaces()",
-            "PublicSurfaceKind::SchemaBase",
-            "PublicSurfaceKind::SchemaByBranch",
-        ],
+        &["catalog.surfaces()", "PublicSurfaceKind::SchemaBase"],
     );
     assert_source_contains_none(
         relative,

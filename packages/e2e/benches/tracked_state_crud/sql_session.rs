@@ -764,7 +764,7 @@ where
         let result = execute(
             &self.session,
             &format!(
-                "SELECT COUNT(*) AS entries FROM tracked_crud_insert_history('{commit_id}') \
+                "SELECT COUNT(*) AS entries FROM lix_history('tracked_crud_insert', '{commit_id}') \
                  WHERE lixcol_is_deleted = false"
             ),
         )

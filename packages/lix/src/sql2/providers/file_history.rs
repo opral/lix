@@ -30,9 +30,8 @@ use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
     ObservedTrackedStateOrdinal, ObservedTrackedStateRows, row_pk_json_array,
 };
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
+use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 use crate::sql2::SqlHistoryQuerySource;
-use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
@@ -54,31 +53,24 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
-pub(super) async fn register_lix_file_history_surface<S>(
-    session: &datafusion::prelude::SessionContext,
-    surface_name: &str,
+pub(super) fn build_lix_file_history_provider<S>(
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
-) -> Result<(), LixError>
+) -> Arc<dyn datafusion::catalog::TableProvider>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    register_spec_table(
-        session,
-        surface_name,
-        Arc::new(LixFileHistorySpec {
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
-            query_source,
-            blob_reader,
-            plugin_host,
-        }),
-        WriteAccess::read_only(),
-    )
+    Arc::new(SpecTableProvider::new(Arc::new(LixFileHistorySpec {
+        commit_graph: Arc::new(Mutex::new(commit_graph)),
+        query_source,
+        blob_reader,
+        plugin_host,
+    })))
 }
 
-/// SQL spec for `lix_file_history`.
+/// SQL spec for `lix_history('lix_file')`.
 ///
 /// The reachability-aware file history surface: rows are reconstructed by
 /// walking the commit graph from the routed anchor commits, resolving the
@@ -97,7 +89,7 @@ where
 {
     #[expect(clippy::unnecessary_literal_bound)]
     fn table_name(&self) -> &str {
-        "lix_file_history"
+        "lix_history('lix_file')"
     }
 
     fn schema(&self) -> SchemaRef {
@@ -1054,7 +1046,7 @@ where
 
     let entries = load_history_entries(
         HistoryViewDescriptor {
-            view_name: "lix_file_history",
+            view_name: "lix_history('lix_file')",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
@@ -1258,7 +1250,7 @@ where
     };
     load_history_entries(
         HistoryViewDescriptor {
-            view_name: "lix_file_history",
+            view_name: "lix_history('lix_file')",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
@@ -1580,7 +1572,7 @@ where
     let Some(lookup_ids) = lookup_ids else {
         return load_history_entries(
             HistoryViewDescriptor {
-                view_name: "lix_file_history",
+                view_name: "lix_history('lix_file')",
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             commit_graph,
@@ -1596,7 +1588,7 @@ where
     let descriptor_and_blob_route = file_history_descriptor_blob_route(route, lookup_ids)?;
     let mut entries = load_history_entries(
         HistoryViewDescriptor {
-            view_name: "lix_file_history",
+            view_name: "lix_history('lix_file')",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         Arc::clone(&commit_graph),
@@ -1615,7 +1607,7 @@ where
     // history and let `file_history_events` join only relevant directories.
     let directories = load_history_entries(
         HistoryViewDescriptor {
-            view_name: "lix_file_history",
+            view_name: "lix_history('lix_file')",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
@@ -1721,7 +1713,7 @@ where
             async move {
                 load_history_entries(
                     HistoryViewDescriptor {
-                        view_name: "lix_file_history",
+                        view_name: "lix_history('lix_file')",
                         as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
                     },
                     commit_graph,
@@ -1757,7 +1749,7 @@ where
     owner_route.resolved_row_pks = vec![owner_pk];
     let entries = load_history_entries(
         HistoryViewDescriptor {
-            view_name: "lix_file_history",
+            view_name: "lix_history('lix_file')",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
@@ -1935,7 +1927,7 @@ where
     registry_route.resolved_row_pks = vec![registry_pk.clone()];
     let registry_events = load_history_entries(
         HistoryViewDescriptor {
-            view_name: "lix_file_history",
+            view_name: "lix_history('lix_file')",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         Arc::clone(&commit_graph),
@@ -1966,7 +1958,7 @@ where
     } else {
         load_history_entries(
             HistoryViewDescriptor {
-                view_name: "lix_file_history",
+                view_name: "lix_history('lix_file')",
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             Arc::clone(&commit_graph),
@@ -2536,8 +2528,11 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
         (
             HISTORY_COL_SOURCE_CHANGES,
             Col::Utf8Fallible(|row| {
-                serialize_history_source_changes(&row.event.source_changes, "lix_file_history")
-                    .map(Some)
+                serialize_history_source_changes(
+                    &row.event.source_changes,
+                    "lix_history('lix_file')",
+                )
+                .map(Some)
             }),
         ),
         (

@@ -148,14 +148,13 @@ mod tests {
         );
     }
 
-
     /// The set of places that WRITE a commit record must not grow silently.
     ///
     /// # What this defends
     ///
     /// A commit record entering storage is the moment a file name becomes part
     /// of history. Any derived index over those names -- the persisted path
-    /// index scoped for `lix_file_history(...) WHERE path = ?` is the live
+    /// index scoped for `lix_history('lix_file', ...) WHERE path = ?` is the live
     /// proposal -- can only be maintained at one site if there *is* only one
     /// site. That premise was established by compiler enumeration; without a
     /// guard it decays into a comment, and the failure it would hide is the

@@ -18,7 +18,8 @@ import {
 } from "./protocol.js";
 
 export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
-	let lix: LixBinding | undefined;
+	const sessions = new Map<number, LixBinding>();
+	let nextSessionId = 1;
 	let nextTransactionId = 1;
 	let nextObserveId = 1;
 	const transactions = new Map<number, LixTransactionBinding>();
@@ -45,11 +46,15 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			return;
 		}
 		if (message.operation.kind === "beginClose") {
-			void respond(message, () => handleFiniteOperation(message.operation));
+			void respond(message, () =>
+				handleFiniteOperation(message.sessionId, message.operation),
+			);
 			return;
 		}
 		finiteQueue = finiteQueue.then(async () => {
-			await respond(message, () => handleFiniteOperation(message.operation));
+			await respond(message, () =>
+				handleFiniteOperation(message.sessionId, message.operation),
+			);
 		});
 	});
 
@@ -106,33 +111,46 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	}
 
 	async function handleFiniteOperation(
+		sessionId: number,
 		operation: WorkerOperation,
 	): Promise<unknown> {
 		switch (operation.kind) {
 			case "open":
-				if (lix) throw workerStateError("Lix worker is already open");
-				lix = await openLixBinding(
-					operation.storage,
-					operation.telemetryEnabled
-						? (span: LixTelemetrySpan) =>
-							endpoint.postMessage({ kind: "telemetry", span })
-						: undefined,
-					createSyncServerBridge(operation.server),
+				if (sessions.size > 0)
+					throw workerStateError("Lix worker is already open");
+				sessions.set(
+					0,
+					await openLixBinding(
+						operation.storage,
+						operation.telemetryEnabled
+							? (span: LixTelemetrySpan) =>
+									endpoint.postMessage({ kind: "telemetry", span })
+							: undefined,
+						createSyncServerBridge(operation.server),
+					),
 				);
 				return undefined;
+			case "openAnotherSession": {
+				const opened = await requiredLix(sessionId).openAnotherSession(
+					operation.options,
+				);
+				const openedSessionId = nextSessionId++;
+				sessions.set(openedSessionId, opened);
+				return openedSessionId;
+			}
 			case "execute":
-				return requiredLix().execute(
+				return requiredLix(sessionId).execute(
 					operation.sql,
 					operation.params,
 					operation.options,
 				);
 			case "executeBatch":
-				return requiredLix().executeBatch(
+				return requiredLix(sessionId).executeBatch(
 					operation.statements,
 					operation.options,
 				);
 			case "beginTransaction": {
-				const transaction = await requiredLix().beginTransaction();
+				const transaction = await requiredLix(sessionId).beginTransaction();
 				const transactionId = nextTransactionId++;
 				transactions.set(transactionId, transaction);
 				return transactionId;
@@ -156,29 +174,29 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return undefined;
 			}
 			case "activeBranchId":
-				return requiredLix().activeBranchId();
+				return requiredLix(sessionId).activeBranchId();
 			case "activeAccountId":
-				return requiredLix().activeAccountId();
+				return requiredLix(sessionId).activeAccountId();
 			case "createBranch":
-				return requiredLix().createBranch(operation.options);
+				return requiredLix(sessionId).createBranch(operation.options);
 			case "createCheckpoint":
-				return requiredLix().createCheckpoint();
+				return requiredLix(sessionId).createCheckpoint();
 			case "undo":
-				return requiredLix().undo();
+				return requiredLix(sessionId).undo();
 			case "redo":
-				return requiredLix().redo();
+				return requiredLix(sessionId).redo();
 			case "switchBranch":
-				return requiredLix().switchBranch(operation.options);
+				return requiredLix(sessionId).switchBranch(operation.options);
 			case "mergeBranchPreview":
-				return requiredLix().mergeBranchPreview(operation.options);
+				return requiredLix(sessionId).mergeBranchPreview(operation.options);
 			case "mergeBranch":
-				return requiredLix().mergeBranch(operation.options);
+				return requiredLix(sessionId).mergeBranch(operation.options);
 			case "importFilesystemPaths":
-				return requiredLix().importFilesystemPaths(operation.paths);
+				return requiredLix(sessionId).importFilesystemPaths(operation.paths);
 			case "syncDiskToLix":
-				return requiredLix().syncDiskToLix();
+				return requiredLix(sessionId).syncDiskToLix();
 			case "observe": {
-				const events = await requiredLix().observe(
+				const events = await requiredLix(sessionId).observe(
 					operation.sql,
 					operation.params,
 				);
@@ -187,15 +205,12 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return observeId;
 			}
 			case "beginClose":
-				requiredLix().beginClose?.();
+				requiredLix(sessionId).beginClose?.();
 				return undefined;
 			case "close": {
-				const openLix = requiredLix();
+				const openLix = requiredLix(sessionId);
 				await openLix.close();
-				for (const events of observations.values()) events.close();
-				observations.clear();
-				transactions.clear();
-				lix = undefined;
+				sessions.delete(sessionId);
 				return undefined;
 			}
 			case "observe.next":
@@ -287,8 +302,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		return events.next();
 	}
 
-	function requiredLix(): LixBinding {
-		if (!lix) throw workerStateError("Lix worker is closed");
+	function requiredLix(sessionId: number): LixBinding {
+		const lix = sessions.get(sessionId);
+		if (!lix) throw workerStateError("Lix session is closed");
 		return lix;
 	}
 

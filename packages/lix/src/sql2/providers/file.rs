@@ -55,8 +55,7 @@ use crate::plugin::runtime::{
 };
 use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{
-    BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
-    resolve_write_branch_scope,
+    BranchBinding, resolve_provider_branch_ids, resolve_write_branch_scope,
 };
 use crate::sql2::dml::InsertSink;
 use crate::sql2::predicate_typecheck::{
@@ -139,54 +138,6 @@ pub(super) async fn register_lix_file_active_provider(
             .with_session_file_views(session_file_views),
         ),
         WriteAccess::read_only(),
-    )
-}
-
-pub(super) async fn register_lix_file_by_branch_provider(
-    session: &SessionContext,
-    surface_name: &str,
-    hot_state: Arc<dyn HotStateReader>,
-    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
-    branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
-    functions: FunctionProviderHandle,
-    session_file_views: Option<SessionFileViews>,
-) -> Result<(), LixError> {
-    register_spec_table(
-        session,
-        surface_name,
-        Arc::new(
-            LixFileSpec::by_branch(
-                hot_state,
-                filesystem_path_index,
-                branch_ref,
-                blob_reader,
-                plugin_host,
-                functions,
-            )
-            .with_session_file_views(session_file_views),
-        ),
-        WriteAccess::read_only(),
-    )
-}
-
-pub(super) async fn register_by_branch_write_provider(
-    session: &SessionContext,
-    surface_name: &str,
-    write_ctx: SqlWriteContext,
-    branch_ref: Arc<dyn BranchRefReader>,
-    options: SqlWriteSessionOptions,
-) -> Result<(), LixError> {
-    register_spec_table(
-        session,
-        surface_name,
-        Arc::new(LixFileSpec::by_branch_with_write(
-            write_ctx.clone(),
-            branch_ref,
-            options,
-        )),
-        WriteAccess::write(write_ctx),
     )
 }
 
@@ -348,53 +299,6 @@ impl LixFileSpec {
         }
     }
 
-    fn by_branch(
-        hot_state: Arc<dyn HotStateReader>,
-        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
-        branch_ref: Arc<dyn BranchRefReader>,
-        blob_reader: Arc<dyn BlobDataReader>,
-        plugin_host: PluginRuntimeHost,
-        functions: FunctionProviderHandle,
-    ) -> Self {
-        Self {
-            schema: lix_file_by_branch_schema(),
-            hot_state,
-            filesystem_path_index,
-            branch_ref,
-            blob_reader,
-            plugin_host,
-            functions,
-            branch_binding: BranchBinding::explicit(),
-            options: SqlWriteSessionOptions::default(),
-            session_file_views: None,
-        }
-    }
-
-    fn by_branch_with_write(
-        write_ctx: SqlWriteContext,
-        branch_ref: Arc<dyn BranchRefReader>,
-        options: SqlWriteSessionOptions,
-    ) -> Self {
-        let functions = write_ctx.functions();
-        let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
-        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = hot_state.clone();
-        let blob_reader = write_ctx.blob_reader();
-        let plugin_host = write_ctx.plugin_host();
-        let session_file_views = write_ctx.session_file_views();
-        Self {
-            schema: lix_file_by_branch_schema(),
-            hot_state,
-            filesystem_path_index,
-            branch_ref,
-            blob_reader,
-            plugin_host,
-            functions,
-            branch_binding: BranchBinding::explicit(),
-            options,
-            session_file_views,
-        }
-    }
-
     fn with_session_file_views(mut self, session_file_views: Option<SessionFileViews>) -> Self {
         self.session_file_views = session_file_views;
         self
@@ -526,14 +430,7 @@ impl LixFileSpec {
         row_index: usize,
     ) -> Result<FileReturningKey> {
         let id = required_string_value(batch, row_index, "id")?;
-        let branch_id = match self.branch_binding {
-            BranchBinding::Active { .. } => String::new(),
-            // This is a readback identity, not a new write context. A global
-            // row is projected into the requested explicit branch with
-            // `lixcol_global = true` and that branch in `lixcol_branch_id`.
-            // Normalizing it as a write would reject the valid projection.
-            BranchBinding::Explicit => required_string_value(batch, row_index, "lixcol_branch_id")?,
-        };
+        let branch_id = String::new();
         Ok(FileReturningKey { id, branch_id })
     }
 
@@ -568,19 +465,11 @@ impl LixFileSpec {
         if keys.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
-        let mut request = lix_file_scan_request(
+        let request = lix_file_scan_request(
             self.branch_binding.active_branch_id(),
             Some(self.schema.as_ref()),
             None,
         );
-        if matches!(self.branch_binding, BranchBinding::Explicit) {
-            request.filter.branch_ids = keys
-                .iter()
-                .map(|key| key.branch_id.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-        }
         let file_ids = keys
             .iter()
             .map(|key| key.id.clone())
@@ -975,8 +864,7 @@ impl TableSpec for LixFileSpec {
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let analyzer = LixFileIdFilterAnalyzer;
-        if ExactStringColumnFilterAnalyzer::new("lixcol_branch_id").supports(filter)
-            || analyzer.supports(filter)
+        if analyzer.supports(filter)
             || ExactStringColumnFilterAnalyzer::new("directory_id").supports(filter)
             || is_null_column_filter(filter, "directory_id")
             || contains_column(filter, "path")
@@ -1002,9 +890,6 @@ impl TableSpec for LixFileSpec {
             scan_limit,
         );
         let filters = filters.to_vec();
-        if matches!(self.branch_binding, BranchBinding::Explicit) {
-            request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
-        }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -1421,7 +1306,6 @@ impl TableSpec for LixFileSpec {
             || options.returning_columns.contains("content");
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
-        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -1520,7 +1404,6 @@ impl LixFileSpec {
                 .is_some_and(|returning| returning.required_columns().contains("content"));
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
-        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -1667,11 +1550,9 @@ impl LixFileSpec {
 }
 
 /// Physical and path identities the upsert driver can match `lix_file` rows
-/// on. Path targets model the visible filesystem identity for active and
-/// by-branch surfaces.
+/// on.
 const LIX_FILE_IDENTITY: &[&str] = &["id"];
 const LIX_FILE_PATH_IDENTITY: &[&str] = &["path"];
-const LIX_FILE_BY_BRANCH_PATH_IDENTITY: &[&str] = &["path", "lixcol_branch_id"];
 
 #[async_trait]
 impl UpsertSupport for LixFileSpec {
@@ -1695,10 +1576,7 @@ impl UpsertSupport for LixFileSpec {
             return Ok(UpsertConflictTarget::id(LIX_FILE_IDENTITY));
         }
 
-        let path_identity = match self.branch_binding {
-            BranchBinding::Active { .. } => LIX_FILE_PATH_IDENTITY,
-            BranchBinding::Explicit => LIX_FILE_BY_BRANCH_PATH_IDENTITY,
-        };
+        let path_identity = LIX_FILE_PATH_IDENTITY;
         validate_target_columns(
             table_name,
             target_columns,
@@ -1859,12 +1737,6 @@ impl UpsertSupport for LixFileSpec {
             ),
         };
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
-        if matches!(self.branch_binding, BranchBinding::Explicit) {
-            request.filter.branch_ids = match target.kind() {
-                UpsertConflictKind::Id => proposed_branch_ids(proposed)?,
-                UpsertConflictKind::Path => required_proposed_branch_ids(proposed, "lix_file")?,
-            };
-        }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -1985,9 +1857,6 @@ impl UpsertSupport for LixFileSpec {
         // plugins installed for path-move rewrites.
         let target_file_ids = augmented_file_id_constraint(augmented)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
-        if matches!(self.branch_binding, BranchBinding::Explicit) {
-            request.filter.branch_ids = augmented_branch_ids(augmented)?;
-        }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -2115,38 +1984,6 @@ fn augmented_file_id_constraint(batch: &RecordBatch) -> Result<FileIdConstraint>
         ids.push(required_string_value(batch, row_index, "id")?);
     }
     Ok(FileIdConstraint::from_ids(ids))
-}
-
-/// Distinct explicit `lixcol_branch_id` values in a proposed insert batch
-/// (by-branch surface). Empty when the column is absent or all-null.
-fn proposed_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
-    let mut branch_ids = BTreeSet::new();
-    for row_index in 0..batch.num_rows() {
-        if let Some(branch_id) = optional_string_value(batch, row_index, "lixcol_branch_id")? {
-            branch_ids.insert(branch_id);
-        }
-    }
-    Ok(branch_ids.into_iter().collect())
-}
-
-fn required_proposed_branch_ids(batch: &RecordBatch, table_name: &str) -> Result<Vec<String>> {
-    let mut branch_ids = BTreeSet::new();
-    for row_index in 0..batch.num_rows() {
-        let branch_id = optional_string_value(batch, row_index, "lixcol_branch_id")?.ok_or_else(
-            || {
-                DataFusionError::Execution(format!(
-                    "INSERT ON CONFLICT (path, lixcol_branch_id) on {table_name} requires non-null lixcol_branch_id"
-                ))
-            },
-        )?;
-        branch_ids.insert(branch_id);
-    }
-    Ok(branch_ids.into_iter().collect())
-}
-
-/// Distinct `lixcol_branch_id` values carried by an augmented conflict batch.
-fn augmented_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
-    proposed_branch_ids(batch)
 }
 
 fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> {
@@ -2288,10 +2125,8 @@ impl InsertSink for LixFileInsertSink {
 }
 
 fn lix_file_surface_name(branch_binding: &BranchBinding) -> &'static str {
-    match branch_binding {
-        BranchBinding::Active { .. } => "lix_file",
-        BranchBinding::Explicit => "lix_file_by_branch",
-    }
+    let _ = branch_binding;
+    "lix_file"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4362,13 +4197,10 @@ fn file_row_context_from_batch(
     row_index: usize,
     branch_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
-    let explicit_branch_id = optional_string_value(batch, row_index, "lixcol_branch_id")?;
     let scope = resolve_write_branch_scope(
         defaultable_bool_insert_value(batch, row_index, "lixcol_global", "INSERT into lix_file")?,
-        explicit_branch_id,
         branch_binding,
-        "INSERT into lix_file_by_branch",
-        "lix_file",
+        "INSERT into lix_file",
     )?;
 
     Ok(FilesystemRowContext {
@@ -4393,18 +4225,7 @@ fn file_row_context_from_update(
     branch_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
     let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
-    let explicit_branch_id = if explicit_global == Some(true) {
-        Some(GLOBAL_BRANCH_ID.to_string())
-    } else {
-        optional_string_value(batch, row_index, "lixcol_branch_id")?
-    };
-    let scope = resolve_write_branch_scope(
-        explicit_global,
-        explicit_branch_id,
-        branch_binding,
-        "UPDATE into lix_file_by_branch",
-        "lix_file",
-    )?;
+    let scope = resolve_write_branch_scope(explicit_global, branch_binding, "UPDATE lix_file")?;
 
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
@@ -4814,12 +4635,6 @@ fn lix_file_record_batch_from_path_selection(
                     .map(|entry| entry.metadata())
                     .collect::<Vec<_>>(),
             )),
-            "lixcol_branch_id" => Arc::new(StringArray::from(
-                entries
-                    .iter()
-                    .map(|entry| Some(entry.key.branch_id()))
-                    .collect::<Vec<_>>(),
-            )),
             other => {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -4853,7 +4668,6 @@ struct LixFileRecordBatchRow {
     commit_id: Option<String>,
     untracked: bool,
     metadata: Option<String>,
-    branch_id: String,
 }
 
 #[derive(Default)]
@@ -4873,7 +4687,6 @@ struct LixFileRecordBatchColumns {
     commit_ids: Vec<Option<String>>,
     untracked_values: Vec<Option<bool>>,
     metadata_values: Vec<Option<String>>,
-    branch_ids: Vec<Option<String>>,
 }
 
 impl LixFileRecordBatchColumns {
@@ -4894,7 +4707,6 @@ impl LixFileRecordBatchColumns {
         self.commit_ids.push(row.commit_id);
         self.untracked_values.push(Some(row.untracked));
         self.metadata_values.push(row.metadata);
-        self.branch_ids.push(Some(row.branch_id));
     }
 
     fn into_record_batch(self, schema: &SchemaRef) -> Result<RecordBatch, LixError> {
@@ -4915,7 +4727,6 @@ impl LixFileRecordBatchColumns {
             commit_ids,
             untracked_values,
             metadata_values,
-            branch_ids,
         } = self;
         let ids: ArrayRef = Arc::new(StringArray::from(ids));
         let paths: ArrayRef = Arc::new(StringArray::from(paths));
@@ -4937,7 +4748,6 @@ impl LixFileRecordBatchColumns {
         let commit_ids: ArrayRef = Arc::new(StringArray::from(commit_ids));
         let untracked_values: ArrayRef = Arc::new(BooleanArray::from(untracked_values));
         let metadata_values: ArrayRef = Arc::new(StringArray::from(metadata_values));
-        let branch_ids: ArrayRef = Arc::new(StringArray::from(branch_ids));
 
         let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
         for field in schema.fields() {
@@ -4957,7 +4767,6 @@ impl LixFileRecordBatchColumns {
                 "lixcol_commit_id" => Arc::clone(&commit_ids),
                 "lixcol_untracked" => Arc::clone(&untracked_values),
                 "lixcol_metadata" => Arc::clone(&metadata_values),
-                "lixcol_branch_id" => Arc::clone(&branch_ids),
                 other => {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -5072,7 +4881,6 @@ async fn lix_file_record_batch_from_prepared(
             commit_id: live.commit_id().map(|id| id.to_string()),
             untracked: live.untracked(),
             metadata: live.metadata().map(|value| serialize_row_metadata(value)),
-            branch_id: live.branch_id().to_owned(),
         });
     }
 
@@ -6982,16 +6790,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
     ]))
 }
 
-pub(super) fn lix_file_by_branch_schema() -> SchemaRef {
-    let mut fields = lix_file_schema()
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect::<Vec<_>>();
-    fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    Arc::new(Schema::new(fields))
-}
-
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
 }
@@ -7777,111 +7575,6 @@ mod tests {
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 2);
-        assert_eq!(hot_state_scans.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn by_branch_descriptor_scan_keeps_scope_columns_and_residual_filtering() {
-        let hot_state_scans = Arc::new(AtomicUsize::new(0));
-        let path_index_requests = Arc::new(AtomicUsize::new(0));
-        let mut target = live_file_row(
-            "01920000-0000-7000-8000-000000000522",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"readme.md"}"#,
-        );
-        target.untracked = true;
-        let index = Arc::new(
-            path_index_from_rows(vec![
-                live_file_row(
-                    "01920000-0000-7000-8000-000000000482",
-                    "01920000-0000-7000-8000-0000000000a1",
-                    r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"readme.md"}"#,
-                ),
-                target,
-            ])
-            .expect("filesystem path index should build"),
-        );
-        let spec = LixFileSpec::by_branch(
-            Arc::new(RejectingHotStateReader {
-                scan_count: Arc::clone(&hot_state_scans),
-            }),
-            Arc::new(StaticFilesystemPathIndexReader {
-                index,
-                request_count: Arc::clone(&path_index_requests),
-            }),
-            Arc::new(TestBranchRefReader),
-            Arc::new(StaticBlobReader::from_blobs(Vec::new())),
-            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
-            test_functions(),
-        );
-        let projection = [
-            "id",
-            "lixcol_file_id",
-            "lixcol_global",
-            "lixcol_untracked",
-            "lixcol_created_at",
-            "lixcol_updated_at",
-            "lixcol_branch_id",
-        ]
-        .into_iter()
-        .map(|column_name| {
-            spec.schema()
-                .index_of(column_name)
-                .expect("by-branch descriptor column should exist")
-        })
-        .collect::<Vec<_>>();
-        let filters = vec![eq_filter(
-            "lixcol_branch_id",
-            "01920000-0000-7000-8000-0000000000b1",
-        )];
-
-        let planned = spec
-            .plan_scan(Some(&projection), &filters, Some(1), &ExecutionProps::new())
-            .await
-            .expect("by-branch descriptor scan should plan");
-        let batch = planned
-            .source
-            .load_single_batch()
-            .await
-            .expect("by-branch descriptor scan should load");
-
-        assert_eq!(batch.num_rows(), 1);
-        let string_value = |column_name: &str| {
-            batch
-                .column(batch.schema().index_of(column_name).unwrap())
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("descriptor column should be string data")
-                .value(0)
-        };
-        let boolean_value = |column_name: &str| {
-            batch
-                .column(batch.schema().index_of(column_name).unwrap())
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("descriptor column should be boolean data")
-                .value(0)
-        };
-        assert_eq!(string_value("id"), "01920000-0000-7000-8000-000000000522");
-        assert_eq!(
-            string_value("lixcol_file_id"),
-            "01920000-0000-7000-8000-000000000522"
-        );
-        assert!(!boolean_value("lixcol_global"));
-        assert!(boolean_value("lixcol_untracked"));
-        assert_eq!(
-            string_value("lixcol_created_at"),
-            "2026-04-23T00:00:00.000Z"
-        );
-        assert_eq!(
-            string_value("lixcol_updated_at"),
-            "2026-04-23T01:00:00.000Z"
-        );
-        assert_eq!(
-            string_value("lixcol_branch_id"),
-            "01920000-0000-7000-8000-0000000000b1"
-        );
-        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         assert_eq!(hot_state_scans.load(Ordering::SeqCst), 0);
     }
 
@@ -9335,27 +9028,21 @@ mod tests {
         Arc::new(StringArray::from(values)) as ArrayRef
     }
 
-    fn file_insert_batch(include_branch: bool, global: bool) -> RecordBatch {
-        let mut fields = vec![
+    fn file_insert_batch(global: bool) -> RecordBatch {
+        let fields = vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
             Field::new("lixcol_global", DataType::Boolean, false),
             Field::new("lixcol_metadata", DataType::Utf8, true),
         ];
-        let mut columns = vec![
+        let columns = vec![
             string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
             string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
             string_column(vec![Some("readme.md")]),
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             string_column(vec![Some("{\"source\":\"file\"}")]),
         ];
-        if include_branch {
-            fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-            columns.push(string_column(vec![Some(
-                "01920000-0000-7000-8000-0000000000b1",
-            )]));
-        }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("file insert batch")
     }
 
@@ -9366,14 +9053,12 @@ mod tests {
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
                 Field::new("content", DataType::Binary, true),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
                 string_column(vec![Some("readme.md")]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
-                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file data batch")
@@ -9393,13 +9078,11 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
                 Field::new("content", DataType::Binary, true),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![data.as_slice()])) as ArrayRef,
-                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file path data batch")
@@ -9419,13 +9102,11 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
                 Field::new("content", DataType::Binary, true),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![data])) as ArrayRef,
-                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file path update batch")
@@ -9437,13 +9118,11 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
                 Field::new("content", DataType::Binary, true),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
-                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file data update batch")
@@ -9457,7 +9136,6 @@ mod tests {
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
                 Field::new("content", DataType::Binary, true),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
@@ -9465,7 +9143,6 @@ mod tests {
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
                 string_column(vec![Some("readme.md")]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
-                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file descriptor data update batch")
@@ -9480,7 +9157,6 @@ mod tests {
                 Field::new("name", DataType::Utf8, false),
                 Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_metadata", DataType::Utf8, true),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
@@ -9489,7 +9165,6 @@ mod tests {
                 string_column(vec![Some("readme.md")]),
                 Arc::new(BinaryArray::from_vec(vec![b"updated"])) as ArrayRef,
                 string_column(vec![Some(r#"{"source":"upload"}"#)]),
-                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file metadata data update batch")
@@ -9500,12 +9175,10 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("content", DataType::Binary, true),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 Arc::new(BinaryArray::from_vec(vec![b""])) as ArrayRef,
-                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("empty file data update batch")
@@ -9526,11 +9199,6 @@ mod tests {
             fields.push(Field::new("path", DataType::Utf8, false));
             columns.push(string_column(vec![Some(path)]));
         }
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-        columns.push(string_column(vec![Some(
-            "01920000-0000-7000-8000-0000000000b1",
-        )]));
-
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("file delete batch")
     }
 
@@ -10445,9 +10113,11 @@ mod tests {
 
     #[test]
     fn decodes_file_insert_into_transaction_write_row() {
-        let batch = file_insert_batch(true, false);
+        let batch = file_insert_batch(false);
 
-        let rows = lix_file_write_rows_from_batch(&batch, None).expect("decode file insert");
+        let rows =
+            lix_file_write_rows_from_batch(&batch, Some("01920000-0000-7000-8000-0000000000b1"))
+                .expect("decode file insert");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -10473,7 +10143,7 @@ mod tests {
 
     #[test]
     fn active_file_insert_defaults_branch_id() {
-        let batch = file_insert_batch(false, false);
+        let batch = file_insert_batch(false);
 
         let rows =
             lix_file_write_rows_from_batch(&batch, Some("01920000-0000-7000-8000-0000000000a1"))
@@ -10482,33 +10152,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
     }
-
-    #[test]
-    fn by_branch_file_insert_requires_branch_id_for_non_global_rows() {
-        let batch = file_insert_batch(false, false);
-
-        let error =
-            lix_file_write_rows_from_batch(&batch, None).expect_err("branch id is required");
-
-        assert!(
-            error.to_string().contains("requires lixcol_branch_id"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn file_insert_rejects_global_with_non_global_branch_id() {
-        let error = lix_file_write_rows_from_batch(&file_insert_batch(true, true), None)
-            .expect_err("global file write should reject conflicting branch id");
-
-        assert!(
-            error
-                .to_string()
-                .contains("cannot set lixcol_global=true with non-global lixcol_branch_id"),
-            "unexpected error: {error}"
-        );
-    }
-
     #[test]
     fn file_update_accepts_path_assignment() {
         super::validate_lix_file_update_assignments(
@@ -10527,7 +10170,7 @@ mod tests {
                 "/.lix/plugins/nested/plugin_sentinel.lixplugin",
                 plugin_archive("*.sentinel", "plugin_note"),
             ),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             "lix_file",
             &mut resolvers,
             &mut test_id_generator(&["should-not-be-used"]),
@@ -10547,7 +10190,7 @@ mod tests {
 
         let error = lix_file_update_stage_from_batch_for_test(
             &path_update_batch_with_path("/.lix/plugins/nested/plugin_sentinel.lixplugin"),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: false,
                 descriptor: super::LixFileDescriptorUpdate::Path,
@@ -10570,7 +10213,7 @@ mod tests {
 
         let error = lix_file_update_stage_from_batch_for_test(
             &path_update_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: false,
                 descriptor: super::LixFileDescriptorUpdate::Path,
@@ -10590,7 +10233,7 @@ mod tests {
     fn file_content_update_rejects_invalid_existing_plugin_storage_path() {
         let error = lix_file_update_stage_from_batch_for_test(
             &data_update_batch_with_path("/.lix/plugins/nested/plugin_sentinel.lixplugin"),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: true,
                 descriptor: super::LixFileDescriptorUpdate::None,
@@ -10614,7 +10257,7 @@ mod tests {
                 "lix_plugin_archive::plugin_sentinel",
                 Some("/.lix/plugins/plugin_sentinel.lixplugin"),
             ),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             &BTreeSet::new(),
             None,
         )
@@ -10635,7 +10278,7 @@ mod tests {
                 &plugin_storage_archive_file_id("plugin_sentinel"),
                 Some("/.lix/plugins/plugin_sentinel.lixplugin"),
             ),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             &BTreeSet::new(),
             Some("plugin_sentinel"),
         )
@@ -10663,7 +10306,7 @@ mod tests {
         ] {
             let error = lix_file_delete_stage_from_batch(
                 &file_delete_batch_with_id_and_path(file_id, Some(path)),
-                None,
+                Some("01920000-0000-7000-8000-0000000000b1"),
                 &BTreeSet::new(),
                 Some("plugin_sentinel"),
             )
@@ -10697,7 +10340,7 @@ mod tests {
 
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: false,
                 descriptor: super::LixFileDescriptorUpdate::Path,
@@ -10743,7 +10386,7 @@ mod tests {
 
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: false,
                 descriptor: super::LixFileDescriptorUpdate::Path,
@@ -10783,7 +10426,7 @@ mod tests {
 
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: false,
                 descriptor: super::LixFileDescriptorUpdate::Path,
@@ -10821,7 +10464,7 @@ mod tests {
 
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: false,
                 descriptor: super::LixFileDescriptorUpdate::Path,
@@ -10883,7 +10526,7 @@ mod tests {
 
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: true,
                 descriptor: super::LixFileDescriptorUpdate::Path,
@@ -10933,7 +10576,7 @@ mod tests {
 
         let staged = lix_file_update_stage_from_batch_for_test(
             &descriptor_data_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: true,
                 descriptor: super::LixFileDescriptorUpdate::Topology,
@@ -11009,7 +10652,7 @@ mod tests {
         let staged = super::lix_file_update_stage_from_batch(
             &batch,
             &assignment_values,
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             update_columns,
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000b1",
@@ -11044,7 +10687,7 @@ mod tests {
     fn file_content_update_without_path_ignores_materialized_path_column() {
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: true,
                 descriptor: super::LixFileDescriptorUpdate::None,
@@ -11068,7 +10711,7 @@ mod tests {
     fn file_content_update_to_empty_ignores_blob_ref_in_other_scope() {
         let staged = lix_file_update_stage_from_batch_with_blob_keys_for_test(
             &empty_data_update_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             super::LixFileUpdateColumns {
                 data: true,
                 descriptor: super::LixFileDescriptorUpdate::None,
@@ -11095,7 +10738,9 @@ mod tests {
     fn file_insert_stages_non_null_data() {
         let batch = data_insert_batch();
 
-        let staged = lix_file_insert_stage_from_batch(&batch, None).expect("decode file content");
+        let staged =
+            lix_file_insert_stage_from_batch(&batch, Some("01920000-0000-7000-8000-0000000000b1"))
+                .expect("decode file content");
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.state_rows.len(), 2);
@@ -11148,7 +10793,7 @@ mod tests {
         let batch = file_delete_batch();
         let staged = lix_file_delete_stage_from_batch(
             &batch,
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000b1",
                 false,
@@ -11195,8 +10840,13 @@ mod tests {
     #[test]
     fn file_delete_without_blob_ref_stages_only_descriptor_tombstone() {
         let batch = file_delete_batch();
-        let staged = lix_file_delete_stage_from_batch(&batch, None, &BTreeSet::new(), None)
-            .expect("decode file delete");
+        let staged = lix_file_delete_stage_from_batch(
+            &batch,
+            Some("01920000-0000-7000-8000-0000000000b1"),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("decode file delete");
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.state_rows.len(), 1);
@@ -11214,7 +10864,7 @@ mod tests {
         let batch = file_delete_batch();
         let staged = lix_file_delete_stage_from_batch(
             &batch,
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000a1",
                 false,
@@ -11255,7 +10905,7 @@ mod tests {
 
         let staged = lix_file_insert_stage_from_batch_with_path_resolvers(
             &path_data_insert_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             "lix_file",
             &mut resolvers,
             &mut test_id_generator(&["should-not-be-used"]),
@@ -11290,7 +10940,7 @@ mod tests {
 
         let staged = lix_file_insert_stage_from_batch_with_path_resolvers(
             &path_data_insert_batch(),
-            None,
+            Some("01920000-0000-7000-8000-0000000000b1"),
             "lix_file",
             &mut resolvers,
             &mut test_id_generator(&[
@@ -11321,13 +10971,13 @@ mod tests {
 
     #[tokio::test]
     async fn file_insert_sink_stages_decoded_transaction_rows() {
-        let batch = file_insert_batch(true, false);
+        let batch = file_insert_batch(false);
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink = LixFileInsertSink::new(
             write_ctx,
             test_functions(),
-            BranchBinding::explicit(),
+            BranchBinding::active("01920000-0000-7000-8000-0000000000b1"),
             false,
         );
 
@@ -11618,7 +11268,7 @@ mod tests {
         let candidates = spec
             .scan_conflict_candidates(
                 &write_ctx,
-                &file_insert_batch(false, false),
+                &file_insert_batch(false),
                 &UpsertConflictTarget::id(super::LIX_FILE_IDENTITY),
             )
             .await
@@ -12280,8 +11930,12 @@ mod tests {
             ..CapturingWriteContext::default()
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let sink =
-            LixFileInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit(), true);
+        let sink = LixFileInsertSink::new(
+            write_ctx,
+            test_functions(),
+            BranchBinding::active("01920000-0000-7000-8000-0000000000b1"),
+            true,
+        );
 
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))
@@ -12342,8 +11996,12 @@ mod tests {
             ..CapturingWriteContext::default()
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let sink =
-            LixFileInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit(), true);
+        let sink = LixFileInsertSink::new(
+            write_ctx,
+            test_functions(),
+            BranchBinding::active("01920000-0000-7000-8000-0000000000b1"),
+            true,
+        );
 
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))

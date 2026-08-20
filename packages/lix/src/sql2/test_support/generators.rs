@@ -46,7 +46,6 @@ pub(crate) enum DifferentialParam {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DifferentialProbe {
     RegisteredSchemaActive,
-    RegisteredSchemaByBranch { branch_ids: &'static [&'static str] },
     LixFileActive { paths: &'static [&'static str] },
 }
 
@@ -54,20 +53,7 @@ pub(crate) enum DifferentialProbe {
 const EMPTY_PARAMS: &[DifferentialParam] = &[];
 
 #[cfg(test)]
-pub(crate) const ACTIVE_BRANCH_PROBE_ID: &str = "__active_branch__";
-
-#[cfg(test)]
-const REGISTERED_SCHEMA_PROBE: &[DifferentialProbe] = &[
-    DifferentialProbe::RegisteredSchemaActive,
-    DifferentialProbe::RegisteredSchemaByBranch {
-        branch_ids: &[
-            ACTIVE_BRANCH_PROBE_ID,
-            "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            "01920000-0000-7000-8000-0000000000a1",
-            "01920000-0000-7000-8000-0000000000b1",
-        ],
-    },
-];
+const REGISTERED_SCHEMA_PROBE: &[DifferentialProbe] = &[DifferentialProbe::RegisteredSchemaActive];
 
 #[cfg(test)]
 const FILE_AND_REGISTERED_SCHEMA_PROBES: &[DifferentialProbe] = &[
@@ -175,30 +161,6 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
                 code: "LIX_COLUMN_NOT_FOUND",
-            },
-        },
-        DifferentialSqlCase {
-            seed: "known/by-branch-update-without-branch-predicate".into(),
-            setup_sql: &[],
-            transaction_setup_sql: &[],
-            sql: "UPDATE lix_registered_schema_by_branch SET value = CAST('{\"x-lix-key\":\"x\",\"type\":\"object\"}' AS JSONB)".into(),
-            params: EMPTY_PARAMS,
-            probes: REGISTERED_SCHEMA_PROBE,
-            expectation: DifferentialExpectation::SemanticParityMayFallback,
-            expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
-            },
-        },
-        DifferentialSqlCase {
-            seed: "known/by-branch-delete-without-branch-predicate".into(),
-            setup_sql: &[],
-            transaction_setup_sql: &[],
-            sql: "DELETE FROM lix_registered_schema_by_branch".into(),
-            params: EMPTY_PARAMS,
-            probes: REGISTERED_SCHEMA_PROBE,
-            expectation: DifferentialExpectation::SemanticParityMayFallback,
-            expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
             },
         },
         DifferentialSqlCase {

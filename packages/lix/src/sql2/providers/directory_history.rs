@@ -18,7 +18,6 @@ use crate::common::SharedStr;
 use crate::tracked_state::{TrackedStateContext, TrackedStateFilter, TrackedStateScanRequest};
 
 use crate::sql2::SqlHistoryQuerySource;
-use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
@@ -40,29 +39,22 @@ use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
     ObservedTrackedStateOrdinal, ObservedTrackedStateRows, row_pk_json_array,
 };
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
+use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-pub(super) async fn register_lix_directory_history_surface<S>(
-    session: &datafusion::prelude::SessionContext,
-    surface_name: &str,
+pub(super) fn build_lix_directory_history_provider<S>(
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlHistoryQuerySource<S>,
-) -> Result<(), LixError>
+) -> Arc<dyn datafusion::catalog::TableProvider>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    register_spec_table(
-        session,
-        surface_name,
-        Arc::new(LixDirectoryHistorySpec {
-            schema: lix_directory_history_schema(),
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
-            query_source,
-        }),
-        WriteAccess::read_only(),
-    )
+    Arc::new(SpecTableProvider::new(Arc::new(LixDirectoryHistorySpec {
+        schema: lix_directory_history_schema(),
+        commit_graph: Arc::new(Mutex::new(commit_graph)),
+        query_source,
+    })))
 }
 
 struct LixDirectoryHistorySpec<S> {
@@ -78,7 +70,7 @@ where
 {
     #[expect(clippy::unnecessary_literal_bound)]
     fn table_name(&self) -> &str {
-        "lix_directory_history"
+        "lix_history('lix_directory')"
     }
 
     fn schema(&self) -> SchemaRef {
@@ -251,7 +243,7 @@ where
     let event_route = route.traversal_only();
     let event_entries = load_history_entries(
         HistoryViewDescriptor {
-            view_name: "lix_directory_history",
+            view_name: "lix_history('lix_directory')",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         Arc::clone(&commit_graph),
@@ -597,8 +589,11 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
         (
             HISTORY_COL_SOURCE_CHANGES,
             Col::Utf8Fallible(|row| {
-                serialize_history_source_changes(&row.event.source_changes, "lix_directory_history")
-                    .map(Some)
+                serialize_history_source_changes(
+                    &row.event.source_changes,
+                    "lix_history('lix_directory')",
+                )
+                .map(Some)
             }),
         ),
         (

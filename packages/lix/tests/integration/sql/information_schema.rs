@@ -2,6 +2,93 @@ use lix::{LixError, Value};
 
 use super::assert_rows_eq;
 
+simulation_test!(public_catalog_hides_internal_branch_surfaces, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"no_explicit_branch_surface\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB), false, false)",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+    let tables = session
+        .execute(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name LIKE '%\\_by\\_branch' ESCAPE '\\'",
+            &[],
+        )
+        .await
+        .expect("public table catalog should be readable");
+    assert!(
+        tables.rows().is_empty(),
+        "no explicit-branch tables may remain"
+    );
+
+    let branch_component_tables = session
+        .execute(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'public' \
+               AND table_name IN ('lix_branch_descriptor', 'lix_branch_ref')",
+            &[],
+        )
+        .await
+        .expect("public table catalog should be readable");
+    assert!(
+        branch_component_tables.rows().is_empty(),
+        "internal branch component tables must not be advertised"
+    );
+
+    let branch_component_history = session
+        .execute(
+            "SELECT function_name FROM information_schema.table_functions \
+             WHERE function_schema = 'public' \
+               AND function_name IN (\
+                 'lix_branch_descriptor_history', 'lix_branch_ref_history'\
+               )",
+            &[],
+        )
+        .await
+        .expect("public table-function catalog should be readable");
+    assert!(
+        branch_component_history.rows().is_empty(),
+        "internal branch history functions must not be advertised"
+    );
+
+    let columns = session
+        .execute(
+            "SELECT table_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND column_name = 'lixcol_branch_id'",
+            &[],
+        )
+        .await
+        .expect("public column catalog should be readable");
+    assert!(
+        columns.rows().is_empty(),
+        "no public data relation may expose lixcol_branch_id"
+    );
+
+    let error = session
+        .execute("SELECT * FROM no_explicit_branch_surface_by_branch", &[])
+        .await
+        .expect_err("retired explicit-branch table names must fail closed");
+    assert!(
+        error
+            .message
+            .contains("no_explicit_branch_surface_by_branch"),
+        "the unknown-table error should identify the retired surface: {error:?}"
+    );
+});
+
 simulation_test!(
     information_schema_never_exposes_raw_snapshot_content,
     |sim| async move {
@@ -321,26 +408,7 @@ simulation_test!(
             )
             .await
             .expect("by-branch contract query should succeed");
-        assert_rows_eq(
-            by_branch_contract,
-            vec![
-                vec![
-                    Value::Text("engine_column_contract_by_branch".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("REQUIRED".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_directory_by_branch".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("REQUIRED".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_file_by_branch".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("REQUIRED".to_string()),
-                ],
-            ],
-        );
+        assert_rows_eq(by_branch_contract, vec![]);
 
         let identity_contract = session
             .execute(
@@ -487,7 +555,8 @@ simulation_test!(
             .execute(
                 "SELECT result_column, is_nullable \
                  FROM information_schema.table_functions \
-                 WHERE function_name = 'engine_column_contract_history' \
+                 WHERE function_name = 'lix_history' \
+                   AND source_relation = 'engine_column_contract' \
                    AND result_column IN ('id', 'title') \
                  ORDER BY result_column",
                 &[],
@@ -1355,19 +1424,17 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    nullable_columns_are_optional_on_insert,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+simulation_test!(nullable_columns_are_optional_on_insert, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
-        session
+    session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
                  VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_required_nullable_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"payload\",\"type\":\"jsonb\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB))",
@@ -1376,66 +1443,65 @@ simulation_test!(
             .await
             .expect("required nullable schema should register");
 
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT is_nullable, lix_insert_policy \
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT is_nullable, lix_insert_policy \
                      FROM information_schema.columns \
                      WHERE table_name = 'engine_required_nullable_contract' \
                        AND column_name = 'payload'",
-                    &[],
-                )
-                .await
-                .expect("required nullable column should introspect"),
-            vec![vec![
-                Value::Text("YES".to_string()),
-                Value::Text("OPTIONAL".to_string()),
-            ]],
-        );
-        session
-            .execute(
-                "INSERT INTO engine_required_nullable_contract (id) VALUES ('omitted')",
                 &[],
             )
             .await
-            .expect("nullable column may be omitted");
+            .expect("required nullable column should introspect"),
+        vec![vec![
+            Value::Text("YES".to_string()),
+            Value::Text("OPTIONAL".to_string()),
+        ]],
+    );
+    session
+        .execute(
+            "INSERT INTO engine_required_nullable_contract (id) VALUES ('omitted')",
+            &[],
+        )
+        .await
+        .expect("nullable column may be omitted");
 
+    session
+        .execute(
+            "INSERT INTO engine_required_nullable_contract (id, payload) \
+                 VALUES ('explicit-null', CAST('null' AS JSONB))",
+            &[],
+        )
+        .await
+        .expect("required nullable column should accept explicit JSON null");
+    assert_rows_eq(
         session
             .execute(
-                "INSERT INTO engine_required_nullable_contract (id, payload) \
-                 VALUES ('explicit-null', CAST('null' AS JSONB))",
+                "SELECT payload FROM engine_required_nullable_contract \
+                     WHERE id = 'explicit-null'",
                 &[],
             )
             .await
-            .expect("required nullable column should accept explicit JSON null");
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT payload FROM engine_required_nullable_contract \
-                     WHERE id = 'explicit-null'",
-                    &[],
-                )
-                .await
-                .expect("typed JSON null should read as SQL NULL"),
-            vec![vec![Value::Null]],
-        );
-        assert_rows_eq(
-            session
-                .execute(
-                    "DELETE FROM engine_required_nullable_contract \
+            .expect("typed JSON null should read as SQL NULL"),
+        vec![vec![Value::Null]],
+    );
+    assert_rows_eq(
+        session
+            .execute(
+                "DELETE FROM engine_required_nullable_contract \
                      WHERE id = 'explicit-null' \
                      RETURNING payload, CAST('null' AS JSONB)",
-                    &[],
-                )
-                .await
-                .expect("DELETE RETURNING should match SELECT null semantics"),
-            vec![vec![
-                Value::Null,
-                Value::Jsonb(serde_json::Value::Null.into()),
-            ]],
-        );
-    }
-);
+                &[],
+            )
+            .await
+            .expect("DELETE RETURNING should match SELECT null semantics"),
+        vec![vec![
+            Value::Null,
+            Value::Jsonb(serde_json::Value::Null.into()),
+        ]],
+    );
+});
 
 simulation_test!(
     typed_bigint_projection_is_lossless_or_explicit,
@@ -1497,7 +1563,7 @@ simulation_test!(
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT count FROM engine_bigint_contract_history() \
+                    "SELECT count FROM lix_history('engine_bigint_contract') \
                        WHERE lixcol_row_pk = CAST('[\"integral-real\"]' AS JSONB)",
                     &[],
                 )

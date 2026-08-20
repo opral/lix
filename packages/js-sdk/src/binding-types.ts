@@ -12,6 +12,7 @@ import type {
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	LixTelemetrySpan,
+	OpenAnotherSessionOptions,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
 import type { LixStorageProvider } from "./storage-adapter.js";
@@ -51,6 +52,7 @@ export type BindingBatchStatement = {
 };
 
 export type LixBinding = {
+	openAnotherSession(options: OpenAnotherSessionOptions): Promise<LixBinding>;
 	execute(
 		sql: string,
 		params: BindingParam[],
@@ -73,8 +75,6 @@ export type LixBinding = {
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
-	/** Explicit snapshot utility available on direct in-memory WASM bindings. */
-	exportSnapshot?(): Promise<Uint8Array>;
 	/** Signals background work to stop before asynchronous close drainage. */
 	beginClose?(): void;
 	/** Immediately tears down the execution transport during document unload. */

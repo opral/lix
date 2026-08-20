@@ -9,7 +9,7 @@ from the current head. The common query needs no arguments:
 
 ```sql
 SELECT title, done, lixcol_depth, lixcol_is_deleted
-FROM acme_task_history()
+FROM lix_history('acme_task')
 WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
@@ -29,7 +29,7 @@ the question:
 
 | Surface | What it answers |
 | :-- | :-- |
-| `<schema>_history()`, `lix_file_history()`, `lix_directory_history()` | Which logical revisions are reachable from a commit? |
+| `lix_history('<schema>')`, `lix_history('lix_file')`, `lix_history('lix_directory')` | Which logical revisions are reachable from a commit? |
 | `lix_change` | Which retained changes exist anywhere in this repository? |
 
 Typed history is exposed through table-valued functions. It is schema-specific
@@ -42,10 +42,9 @@ For the full surface grid, insert policies, and the
 
 ## Typed row history
 
-A registered application schema such as `acme_task` has two typed relations
-and one history function:
-`acme_task` for the active branch, `acme_task_by_branch` for explicit branch
-scope, and `acme_task_history()` for branch-reachable history.
+A registered application schema such as `acme_task` has one typed current-state
+relation and supports the generic history function: `acme_task` for the current
+session and `lix_history('acme_task')` for branch-reachable revision history.
 
 History starts at the active branch head. The user columns are the same typed
 columns exposed by the base relation. Row history adds these system
@@ -65,13 +64,13 @@ columns:
 | `lixcol_depth` | `0` is the revision at the anchor; higher values walk back through reachable history. |
 | `lixcol_is_deleted` | `true` when the revision is a tombstone. The row keeps the row identity — every declared primary-key root, including nested JSON roots — and the history metadata, while the nullable state columns are `NULL`. |
 
-The commit argument sets the starting point for the whole query. Call the
-function without an argument to start at the active head, or pass a commit id
-for time travel:
+The optional second argument sets the starting point for the whole query. Omit
+it to start at the active head, or pass a commit id for time travel. The first
+argument is always the relation name as a text literal:
 
 ```sql
 SELECT id, title, lixcol_depth
-FROM acme_task_history($1)
+FROM lix_history('acme_task', $1)
 WHERE id = $2
 ORDER BY lixcol_depth;
 ```
@@ -87,7 +86,7 @@ const commitId = branch.rows[0].get("commit_id") as string;
 
 const history = await lix.execute(
   `SELECT id, title, lixcol_depth
-     FROM acme_task_history($1)
+     FROM lix_history('acme_task', $1)
     WHERE id = $2
     ORDER BY lixcol_depth`,
   [commitId, "t1"],
@@ -99,7 +98,7 @@ order does not change the identity encoded by the schema:
 
 ```sql
 SELECT project_id, issue_number, title, lixcol_depth
-FROM acme_issue_history()
+FROM lix_history('acme_issue')
 WHERE project_id = 'launch'
   AND issue_number = '7'
 ORDER BY lixcol_depth;
@@ -107,24 +106,24 @@ ORDER BY lixcol_depth;
 
 ## File and directory history
 
-`lix_file_history()` and `lix_directory_history()` expose logical filesystem
+`lix_history('lix_file')` and `lix_history('lix_directory')` expose logical filesystem
 history. Lix does not expose the underlying storage rows as SQL relations.
 
 Both follow the same active-head and explicit-anchor convention:
 
 ```sql
-lix_file_history()
-lix_file_history($as_of)
+lix_history('lix_file')
+lix_history('lix_file', $as_of)
 
-lix_directory_history()
-lix_directory_history($as_of)
+lix_history('lix_directory')
+lix_history('lix_directory', $as_of)
 ```
 
 Use a stable ID to follow an object across renames:
 
 ```sql
 SELECT path, name, lixcol_depth, lixcol_observed_commit_id
-FROM lix_file_history()
+FROM lix_history('lix_file')
 WHERE id = $1
 ORDER BY lixcol_depth;
 ```
