@@ -489,6 +489,10 @@ where
         self.engine.notify_observers();
     }
 
+    pub(crate) fn fail_observers_for_sync(&self, error: LixError) {
+        self.engine.fail_observers(error);
+    }
+
     pub(crate) async fn repository_default_branch_id_for_sync(
         &self,
         read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),

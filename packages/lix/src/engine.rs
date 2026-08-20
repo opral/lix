@@ -210,6 +210,10 @@ where
         self.observe_invalidation.bump();
     }
 
+    pub(crate) fn fail_observers(&self, error: LixError) {
+        self.observe_invalidation.fail_terminal(error);
+    }
+
     pub(crate) fn collaboration_write_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.collaboration_write_gate)
     }

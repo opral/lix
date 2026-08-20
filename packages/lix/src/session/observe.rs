@@ -170,7 +170,7 @@ where
             .clone();
         match event {
             ObserveInvalidationEvent::Generation(generation) => Ok(generation),
-            ObserveInvalidationEvent::TerminalStorageError(error) => Err(error),
+            ObserveInvalidationEvent::TerminalError(error) => Err(error),
         }
     }
 

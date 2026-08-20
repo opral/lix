@@ -363,6 +363,7 @@ async fn run_sync_worker<StorageImpl>(
                         .await
                     {
                         tracing::error!(error = ?error, "sync authority account changed");
+                        lix.fail_observers_for_sync(error);
                         break;
                     }
                     transport = Some(connected);
@@ -464,6 +465,7 @@ async fn run_sync_worker<StorageImpl>(
                 internal_demand_retry = SyncDemandRetry::default();
                 if is_terminal_sync_error(&error) {
                     tracing::error!(error = ?error, "sync repository cannot make progress");
+                    lix.fail_observers_for_sync(error);
                     break;
                 }
                 tracing::warn!(error = ?error, "sync repository iteration failed");
