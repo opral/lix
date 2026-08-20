@@ -1,6 +1,7 @@
 //! One repository-scoped synchronization state machine for every platform.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -676,18 +677,10 @@ async fn pull_delta_adaptive<Transport>(
 where
     Transport: SyncTransport,
 {
-    loop {
-        match transport.pull(Some(after), *limit).await {
-            Ok(response) => return Ok(response),
-            Err(error) if is_response_too_large(&error) && *limit > 1 => {
-                *limit = smaller_page_limit(*limit);
-            }
-            Err(error) if is_response_too_large(&error) => {
-                return Err(sync_item_too_large_error("repository event", error));
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    fetch_adaptive(limit, "repository event", |limit| {
+        transport.pull(Some(after), limit)
+    })
+    .await
 }
 
 async fn fetch_snapshot_rows<Transport>(
@@ -770,17 +763,29 @@ async fn fetch_snapshot_row_page_adaptive<Transport>(
 where
     Transport: SyncTransport,
 {
+    fetch_adaptive(limit, "snapshot row", |limit| {
+        transport.snapshot_rows(branch_id, head_commit_id, continuation, limit)
+    })
+    .await
+}
+
+async fn fetch_adaptive<T, Fetch, FetchFuture>(
+    limit: &mut usize,
+    item_kind: &str,
+    mut fetch: Fetch,
+) -> Result<T, LixError>
+where
+    Fetch: FnMut(usize) -> FetchFuture,
+    FetchFuture: Future<Output = Result<T, LixError>>,
+{
     loop {
-        match transport
-            .snapshot_rows(branch_id, head_commit_id, continuation, *limit)
-            .await
-        {
-            Ok(page) => return Ok(page),
+        match fetch(*limit).await {
+            Ok(response) => return Ok(response),
             Err(error) if is_response_too_large(&error) && *limit > 1 => {
                 *limit = smaller_page_limit(*limit);
             }
             Err(error) if is_response_too_large(&error) => {
-                return Err(sync_item_too_large_error("snapshot row", error));
+                return Err(sync_item_too_large_error(item_kind, error));
             }
             Err(error) => return Err(error),
         }
@@ -1057,24 +1062,17 @@ async fn fetch_history_page_adaptive<Transport>(
 where
     Transport: SyncTransport,
 {
-    loop {
-        match transport.history(head, *limit).await {
-            Ok(response) if response.commits.len() <= *limit => return Ok(response),
-            Ok(_) => {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync history response exceeds the requested page limit",
-                ));
-            }
-            Err(error) if is_response_too_large(&error) && *limit > 1 => {
-                *limit = smaller_page_limit(*limit);
-            }
-            Err(error) if is_response_too_large(&error) => {
-                return Err(sync_item_too_large_error("history commit", error));
-            }
-            Err(error) => return Err(error),
-        }
+    let response = fetch_adaptive(limit, "history commit", |limit| {
+        transport.history(head, limit)
+    })
+    .await?;
+    if response.commits.len() > *limit {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync history response exceeds the requested page limit",
+        ));
     }
+    Ok(response)
 }
 
 async fn register_commit_blob_manifests<StorageImpl, Transport>(
