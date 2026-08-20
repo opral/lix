@@ -68,8 +68,6 @@ export type LixBinding = {
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
-	/** Explicit snapshot utility available on direct in-memory WASM bindings. */
-	exportSnapshot?(): Promise<Uint8Array>;
 	close(): Promise<void>;
 };
 

@@ -112,20 +112,6 @@ pub async fn open_memory(telemetry_dispatch: Option<Function>) -> Result<WasmLix
     open_browser_storage(BrowserStorage::Memory(Memory::new()), telemetry_dispatch).await
 }
 
-#[wasm_bindgen(js_name = openMemoryFromSnapshot)]
-pub async fn open_memory_from_snapshot(
-    telemetry_dispatch: Option<Function>,
-    snapshot: Option<Vec<u8>>,
-) -> Result<WasmLix, JsValue> {
-    let storage = match snapshot {
-        Some(snapshot) => {
-            Memory::from_snapshot(&snapshot).map_err(|error| lix_error_to_js(error.into()))?
-        }
-        None => Memory::new(),
-    };
-    open_browser_storage(BrowserStorage::Memory(storage), telemetry_dispatch).await
-}
-
 #[wasm_bindgen(js_name = openJsStorage)]
 pub async fn open_js_storage(
     provider: JsStorageProvider,
@@ -205,18 +191,6 @@ impl WasmLix {
             storage_sessions: self.storage_sessions.clone(),
             closed: Cell::new(false),
         })
-    }
-
-    #[wasm_bindgen(js_name = exportSnapshot)]
-    pub async fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        match &self.storage {
-            BrowserStorage::Memory(storage) => storage
-                .export_snapshot()
-                .map_err(|error| lix_error_to_js(error.into())),
-            BrowserStorage::Js(_) => Err(JsValue::from_str(
-                "snapshot export is only available for memory storage",
-            )),
-        }
     }
 
     #[wasm_bindgen(js_name = execute)]
