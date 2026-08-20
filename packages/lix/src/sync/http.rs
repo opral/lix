@@ -16,6 +16,7 @@ use crate::LixError;
 
 pub(super) const HTTP_TIMEOUT: std::time::Duration =
     SYNC_LONG_POLL_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
+pub(super) const SYNC_TRANSPORT_ERROR_CODE: &str = "LIX_ERROR_SYNC_TRANSPORT";
 const SESSION_HEADER: &str = "lix-session-id";
 
 #[derive(Clone, Copy, Debug)]
@@ -349,7 +350,7 @@ fn response_error(response: &RawHttpResponse, operation: &str) -> LixError {
         if let Some(hint) = envelope.error.hint {
             error = error.with_hint(hint);
         }
-        return error;
+        return error.with_details(serde_json::json!({ "httpStatus": response.status }));
     }
     if response.status == 413 {
         return LixError::new(
@@ -366,6 +367,7 @@ fn response_error(response: &RawHttpResponse, operation: &str) -> LixError {
             String::from_utf8_lossy(&response.body)
         ),
     )
+    .with_details(serde_json::json!({ "httpStatus": response.status }))
 }
 
 fn encode_query(value: &str) -> String {

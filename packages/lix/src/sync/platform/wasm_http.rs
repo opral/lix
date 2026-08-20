@@ -8,7 +8,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::super::http::{
     HTTP_TIMEOUT, HttpSyncTransport, Method, RawHttpClient, RawHttpRequest, RawHttpResponse,
-    response_too_large,
+    SYNC_TRANSPORT_ERROR_CODE, response_too_large,
 };
 use crate::LixError;
 use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
@@ -134,10 +134,10 @@ async fn resolve_request_headers(
     };
     let value = provider
         .call0(&JsValue::UNDEFINED)
-        .map_err(js_transport_error)?;
+        .map_err(js_callback_error)?;
     let value = JsFuture::from(Promise::resolve(&value))
         .await
-        .map_err(js_transport_error)?;
+        .map_err(js_callback_error)?;
     if !Array::is_array(&value) {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -397,13 +397,31 @@ fn abort_controller(controller: &Object) {
 }
 
 fn js_transport_error(error: JsValue) -> LixError {
-    let code = Reflect::get(&error, &"code".into())
+    let detail = js_error_detail(&error);
+    if let Some(code) = js_error_code(&error).filter(|code| code.starts_with("LIX_")) {
+        return LixError::new(code, detail);
+    }
+    LixError::new(
+        SYNC_TRANSPORT_ERROR_CODE,
+        format!("browser sync fetch failed: {detail}"),
+    )
+}
+
+fn js_callback_error(error: JsValue) -> LixError {
+    let code = js_error_code(&error).unwrap_or_else(|| LixError::CODE_INTERNAL_ERROR.to_owned());
+    LixError::new(code, js_error_detail(&error))
+}
+
+fn js_error_code(error: &JsValue) -> Option<String> {
+    Reflect::get(error, &"code".into())
         .ok()
         .and_then(|code| code.as_string())
-        .unwrap_or_else(|| LixError::CODE_INTERNAL_ERROR.to_owned());
+}
+
+fn js_error_detail(error: &JsValue) -> String {
     let detail = Reflect::get(&error, &"message".into())
         .ok()
         .and_then(|message| message.as_string())
         .unwrap_or_else(|| format!("{error:?}"));
-    LixError::new(code, format!("browser sync fetch failed: {detail}"))
+    detail
 }

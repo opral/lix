@@ -377,6 +377,7 @@ async fn run_sync_worker<StorageImpl>(
     let mut push_item_limit = super::MAX_SYNC_REQUEST_ITEMS;
     let mut change_watcher = lix.sync_mode_state().change_watcher();
     let mut internal_demand_retry = SyncDemandRetry::default();
+    let mut pending_demands = Vec::new();
 
     while !*shutdown_rx.borrow() {
         if transport.is_none() {
@@ -403,13 +404,9 @@ async fn run_sync_worker<StorageImpl>(
                 }
                 Err(error) => {
                     tracing::warn!(error = ?error, "sync reconnect failed");
-                    if wait_for_retry_or_shutdown(retry_backoff, &mut shutdown_rx)
-                        .await
-                        .is_err()
-                    {
+                    if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
                         break;
                     }
-                    retry_backoff = next_backoff(retry_backoff);
                     continue;
                 }
             }
@@ -418,6 +415,40 @@ async fn run_sync_worker<StorageImpl>(
         let Some(current) = transport.clone() else {
             continue;
         };
+        if !pending_demands.is_empty() {
+            while let Ok(demand) = demand_rx.try_recv() {
+                pending_demands.push(demand);
+            }
+            let demands = std::mem::take(&mut pending_demands);
+            let results = {
+                let hydration = hydrate_sync_demands(&lix, &current, &demands).fuse();
+                let shutdown = shutdown_rx.changed().fuse();
+                futures_util::pin_mut!(hydration, shutdown);
+                select_biased! {
+                    _ = shutdown => None,
+                    results = hydration => Some(results),
+                }
+            };
+            let Some(results) = results else {
+                pending_demands = demands;
+                break;
+            };
+            let retry_error = results.iter().find_map(|result| match result {
+                Err(error) if is_retryable_sync_transport_error(error) => Some(error.clone()),
+                _ => None,
+            });
+            pending_demands = resolve_sync_demands(demands, results);
+            if let Some(error) = retry_error {
+                tracing::warn!(error = ?error, "sync demand hydration failed");
+                transport = None;
+                if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
+                    break;
+                }
+            } else {
+                retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
+            }
+            continue;
+        }
         // This outer race covers every phase, including connect, CAS transfer,
         // and push. Dropping an in-flight transport future invokes the
         // adapter's cancellation mechanism.
@@ -446,29 +477,10 @@ async fn run_sync_worker<StorageImpl>(
             }
             Ok(Some(first)) => {
                 internal_demand_retry = SyncDemandRetry::default();
-                let mut demands = vec![first];
+                pending_demands.push(first);
                 while let Ok(demand) = demand_rx.try_recv() {
-                    demands.push(demand);
+                    pending_demands.push(demand);
                 }
-                let (result, should_stop) = {
-                    let hydration = hydrate_sync_demands(&lix, &current, &demands).fuse();
-                    let shutdown = shutdown_rx.changed().fuse();
-                    futures_util::pin_mut!(hydration, shutdown);
-                    select_biased! {
-                        _ = shutdown => (
-                            (0..demands.len()).map(|_| Err(stopped_error())).collect(),
-                            true,
-                        ),
-                        result = hydration => (result, false),
-                    }
-                };
-                for (demand, result) in demands.into_iter().zip(result) {
-                    let _ = demand.response.send(result);
-                }
-                if should_stop {
-                    break;
-                }
-                retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
             }
             Err(error) => {
                 let error = match internal_demand_retry.admit(error) {
@@ -503,16 +515,13 @@ async fn run_sync_worker<StorageImpl>(
                 }
                 tracing::warn!(error = ?error, "sync repository iteration failed");
                 transport = None;
-                if wait_for_retry_or_shutdown(retry_backoff, &mut shutdown_rx)
-                    .await
-                    .is_err()
-                {
+                if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
                     break;
                 }
-                retry_backoff = next_backoff(retry_backoff);
             }
         }
     }
+    fail_pending_sync_demands(&mut pending_demands, &mut demand_rx);
     let _ = lix.close().await;
 }
 
@@ -810,6 +819,18 @@ fn is_terminal_sync_error(error: &LixError) -> bool {
     )
 }
 
+fn is_retryable_sync_transport_error(error: &LixError) -> bool {
+    if error.code == super::http::SYNC_TRANSPORT_ERROR_CODE {
+        return true;
+    }
+    let status = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("httpStatus"))
+        .and_then(serde_json::Value::as_u64);
+    matches!(status, Some(408 | 429 | 500..=599))
+}
+
 async fn hydrate_sync_request<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -863,6 +884,36 @@ where
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
         })
         .collect()
+}
+
+fn resolve_sync_demands(
+    demands: Vec<SyncDemand>,
+    results: Vec<Result<(), LixError>>,
+) -> Vec<SyncDemand> {
+    let mut retry = Vec::new();
+    for (demand, result) in demands.into_iter().zip(results) {
+        if result
+            .as_ref()
+            .is_err_and(is_retryable_sync_transport_error)
+        {
+            retry.push(demand);
+        } else {
+            let _ = demand.response.send(result);
+        }
+    }
+    retry
+}
+
+fn fail_pending_sync_demands(
+    pending: &mut Vec<SyncDemand>,
+    demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
+) {
+    while let Ok(demand) = demand_rx.try_recv() {
+        pending.push(demand);
+    }
+    for demand in pending.drain(..) {
+        let _ = demand.response.send(Err(stopped_error()));
+    }
 }
 
 async fn hydrate_history_ids<StorageImpl, Transport>(
@@ -1282,6 +1333,20 @@ async fn wait_for_retry_or_shutdown(
     }
 }
 
+async fn wait_for_sync_retry(
+    retry_backoff: &mut Duration,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if wait_for_retry_or_shutdown(*retry_backoff, shutdown_rx)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    *retry_backoff = next_backoff(*retry_backoff);
+    true
+}
+
 fn next_backoff(current: Duration) -> Duration {
     current
         .checked_mul(2)
@@ -1308,6 +1373,7 @@ mod tests {
         missing: BTreeSet<String>,
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         max_history_items: Option<usize>,
+        fail_first_history: bool,
         commit_headers: Vec<super::super::SyncCommitHeader>,
         history_boundaries: BTreeMap<String, super::super::SyncHistoryBoundary>,
         boundary_rows: BTreeMap<String, Vec<super::super::SyncSnapshotRow>>,
@@ -1370,10 +1436,17 @@ mod tests {
             limit: usize,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncHistoryResponse> {
             Box::pin(async move {
-                self.calls
-                    .lock()
-                    .expect("history calls lock")
-                    .push(vec![head.to_owned()]);
+                let call_number = {
+                    let mut calls = self.calls.lock().expect("history calls lock");
+                    calls.push(vec![head.to_owned()]);
+                    calls.len()
+                };
+                if self.fail_first_history && call_number == 1 {
+                    return Err(LixError::new(
+                        super::super::http::SYNC_TRANSPORT_ERROR_CODE,
+                        "test transport disconnected",
+                    ));
+                }
                 if self.max_history_items.is_some_and(|cap| limit > cap) {
                     return Err(LixError::new(
                         SYNC_RESPONSE_TOO_LARGE_CODE,
@@ -2042,6 +2115,7 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::clone(&calls),
             max_history_items: None,
+            fail_first_history: false,
             commit_headers: response.commit_headers,
             history_boundaries: response_boundaries,
             boundary_rows: BTreeMap::new(),
@@ -2092,6 +2166,7 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::clone(&calls),
             max_history_items: Some(2),
+            fail_first_history: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -2119,6 +2194,7 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: Some(0),
+            fail_first_history: false,
             commit_headers: Vec::new(),
             history_boundaries: BTreeMap::new(),
             boundary_rows: BTreeMap::new(),
@@ -2358,6 +2434,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_exit_fails_retrying_and_queued_demands_together() {
+        let request = || SyncDemandRequest::Chunks(vec!["a".repeat(64)]);
+        let (retrying_response, retrying_done) = tokio::sync::oneshot::channel();
+        let mut pending = vec![SyncDemand {
+            request: request(),
+            response: retrying_response,
+        }];
+        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let (queued_response, queued_done) = tokio::sync::oneshot::channel();
+        demand_tx
+            .send(SyncDemand {
+                request: request(),
+                response: queued_response,
+            })
+            .await
+            .expect("queued demand is admitted");
+
+        fail_pending_sync_demands(&mut pending, &mut demand_rx);
+        assert!(pending.is_empty());
+        for done in [retrying_done, queued_done] {
+            let error = done
+                .await
+                .expect("worker sends an explicit shutdown result")
+                .expect_err("shutdown fails the demand");
+            assert_eq!(error.code, LixError::CODE_CLOSED);
+        }
+    }
+
+    #[tokio::test]
     async fn chunk_demand_hydrates_a_deferred_blob_once() {
         let lix = open_lix().await.expect("replica opens");
         let bytes = (0..5 * 1024 * 1024 + 19)
@@ -2392,6 +2497,7 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
+            fail_first_history: false,
             commit_headers: Vec::new(),
             history_boundaries: BTreeMap::new(),
             boundary_rows: BTreeMap::new(),
@@ -2513,6 +2619,7 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
+            fail_first_history: false,
             commit_headers: Vec::new(),
             history_boundaries: BTreeMap::new(),
             boundary_rows: BTreeMap::new(),
@@ -2589,6 +2696,7 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::clone(&calls),
             max_history_items: None,
+            fail_first_history: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -2651,6 +2759,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_history_hydration_reconnect_keeps_the_sql_waiter_alive() {
+        let (replica, parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = HistoryTransport {
+            commits,
+            missing: BTreeSet::new(),
+            calls: Arc::clone(&calls),
+            max_history_items: None,
+            fail_first_history: true,
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
+            blobs: BTreeMap::new(),
+            blob_calls: Arc::new(Mutex::new(Vec::new())),
+            chunks: BTreeMap::new(),
+            chunk_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (response, mut done) = tokio::sync::oneshot::channel();
+        let demands = vec![SyncDemand {
+            request: SyncDemandRequest::History(vec![parent]),
+            response,
+        }];
+
+        let first = hydrate_sync_demands(&replica, &transport, &demands).await;
+        let demands = resolve_sync_demands(demands, first);
+        assert_eq!(demands.len(), 1, "transport failure remains pending");
+        assert!(
+            matches!(
+                done.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the SQL caller must not see the transient fetch error",
+        );
+
+        let second = hydrate_sync_demands(&replica, &transport, &demands).await;
+        let demands = resolve_sync_demands(demands, second);
+        assert!(demands.is_empty());
+        done.await
+            .expect("SQL waiter receives the retry result")
+            .expect("second history fetch succeeds");
+        assert_eq!(calls.lock().expect("history calls lock").len(), 2);
+    }
+
+    #[test]
+    fn demand_retry_distinguishes_transport_from_semantic_errors() {
+        assert!(is_retryable_sync_transport_error(&LixError::new(
+            super::super::http::SYNC_TRANSPORT_ERROR_CODE,
+            "disconnected",
+        )));
+        assert!(is_retryable_sync_transport_error(
+            &LixError::new("LIX_REMOTE_OVERLOADED", "try later")
+                .with_details(serde_json::json!({ "httpStatus": 503 })),
+        ));
+        assert!(!is_retryable_sync_transport_error(
+            &LixError::new(LixError::CODE_COMMIT_NOT_FOUND, "missing history")
+                .with_details(serde_json::json!({ "httpStatus": 404 })),
+        ));
+        assert!(!is_retryable_sync_transport_error(&LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "missing chunk"
+        ),));
+    }
+
+    #[tokio::test]
     async fn missing_sparse_boundary_hydrates_through_shared_retry_path() {
         let (replica, _parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture_with_depth(32).await;
@@ -2673,6 +2846,7 @@ mod tests {
             missing: BTreeSet::new(),
             calls: Arc::clone(&calls),
             max_history_items: None,
+            fail_first_history: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -2749,6 +2923,7 @@ mod tests {
             missing: BTreeSet::from([parent.clone()]),
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
+            fail_first_history: false,
             commit_headers: Vec::new(),
             history_boundaries,
             boundary_rows,

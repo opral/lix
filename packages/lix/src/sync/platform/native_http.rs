@@ -2,7 +2,7 @@
 
 use super::super::http::{
     HTTP_TIMEOUT, HttpSyncTransport, Method, RawHttpClient, RawHttpRequest, RawHttpResponse,
-    response_too_large,
+    SYNC_TRANSPORT_ERROR_CODE, response_too_large,
 };
 use crate::LixError;
 use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
@@ -95,8 +95,5 @@ impl RawHttpClient for NativeHttpClient {
 }
 
 fn transport_error(operation: &str, error: impl std::fmt::Display) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("{operation}: {error}"),
-    )
+    LixError::new(SYNC_TRANSPORT_ERROR_CODE, format!("{operation}: {error}"))
 }
