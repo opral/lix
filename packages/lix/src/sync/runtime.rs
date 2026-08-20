@@ -120,12 +120,22 @@ where
         })
         .flatten()
         .collect::<BTreeSet<_>>();
+    let branch_targets = branches
+        .iter()
+        .filter_map(|branch| {
+            branch
+                .head_commit_id
+                .as_deref()
+                .map(|head| (branch.branch_id.as_str(), head))
+        })
+        .collect::<Vec<_>>();
     let (history, mut rows) = futures_util::try_join!(
         fetch_history_objects(transport, head_ids, 1),
-        fetch_snapshot_rows(transport, branches),
+        fetch_snapshot_rows(transport, &branch_targets),
     )?;
     let mut checkpoint_targets = Vec::new();
     let mut seen_checkpoints = BTreeSet::new();
+    let mut checkpoint_roots = BTreeMap::new();
     for branch in branches {
         let (Some(head), Some(checkpoint)) = (
             branch.head_commit_id.as_deref(),
@@ -133,21 +143,15 @@ where
         ) else {
             continue;
         };
-        if head == checkpoint || !seen_checkpoints.insert(checkpoint.to_owned()) {
+        if head == checkpoint || !seen_checkpoints.insert(checkpoint) {
             continue;
         }
-        checkpoint_targets.push(super::SyncBranchHead {
-            branch_id: checkpoint.to_owned(),
-            head_commit_id: Some(checkpoint.to_owned()),
-            checkpoint_commit_id: Some(checkpoint.to_owned()),
-            checkpoint_state_root_id: branch.checkpoint_state_root_id.clone(),
-            hot_state_root_id: branch.checkpoint_state_root_id.clone(),
-        });
+        checkpoint_targets.push((checkpoint, checkpoint));
+        checkpoint_roots.insert(
+            checkpoint.to_owned(),
+            branch.checkpoint_state_root_id.clone(),
+        );
     }
-    let checkpoint_roots = checkpoint_targets
-        .iter()
-        .map(|target| (target.branch_id.clone(), target.hot_state_root_id.clone()))
-        .collect();
     rows.extend(fetch_snapshot_rows(transport, &checkpoint_targets).await?);
     let snapshot = PreparedRepositorySnapshot {
         metadata,
@@ -658,28 +662,19 @@ where
 
 async fn fetch_snapshot_rows<Transport>(
     transport: &Transport,
-    branches: &[super::SyncBranchHead],
+    targets: &[(&str, &str)],
 ) -> Result<Vec<super::SyncSnapshotRow>, LixError>
 where
     Transport: SyncTransport,
 {
-    let targets = branches
-        .iter()
-        .filter_map(|branch| {
-            branch
-                .head_commit_id
-                .as_ref()
-                .map(|head| (branch.branch_id.clone(), head.clone()))
-        })
-        .collect::<Vec<_>>();
     let mut rows = Vec::new();
     let mut page_limit = super::MAX_SYNC_REQUEST_ITEMS;
-    for (branch_id, head_commit_id) in targets {
+    for &(branch_id, head_commit_id) in targets {
         let mut continuation = None;
         let mut seen_continuations = BTreeSet::new();
         loop {
             let page = fetch_adaptive(&mut page_limit, "snapshot row", |limit| {
-                transport.snapshot_rows(&branch_id, &head_commit_id, continuation.as_deref(), limit)
+                transport.snapshot_rows(branch_id, head_commit_id, continuation.as_deref(), limit)
             })
             .await?;
             if page.branch_id != branch_id || page.head_commit_id != head_commit_id {
@@ -851,15 +846,17 @@ where
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
         }
     }
+    let history_ids = history_ids.into_iter().cloned().collect::<BTreeSet<_>>();
+    let chunk_ids = chunk_ids.into_iter().cloned().collect::<BTreeSet<_>>();
     let history_result = if history_ids.is_empty() {
         Ok(())
     } else {
-        hydrate_history_ids(lix, transport, history_ids.into_iter().cloned().collect()).await
+        hydrate_history_ids(lix, transport, history_ids).await
     };
     let chunk_result = if chunk_ids.is_empty() {
         Ok(())
     } else {
-        hydrate_chunk_ids(lix, transport, chunk_ids.into_iter().cloned().collect()).await
+        hydrate_chunk_ids(lix, transport, chunk_ids).await
     };
     let mut retry = Vec::new();
     let mut retry_error = None;
@@ -915,18 +912,12 @@ where
     }
     let fetched =
         fetch_history_objects(transport, pending, super::MAX_SYNC_HISTORY_PAGE_SIZE).await?;
-    let boundaries = fetched
+    let boundary_targets = fetched
         .boundaries
         .iter()
-        .map(|boundary| super::SyncBranchHead {
-            branch_id: boundary.commit_id.clone(),
-            head_commit_id: Some(boundary.commit_id.clone()),
-            checkpoint_commit_id: Some(boundary.commit_id.clone()),
-            checkpoint_state_root_id: boundary.live_state_root_id.clone(),
-            hot_state_root_id: boundary.live_state_root_id.clone(),
-        })
+        .map(|boundary| (boundary.commit_id.as_str(), boundary.commit_id.as_str()))
         .collect::<Vec<_>>();
-    let rows = fetch_snapshot_rows(transport, &boundaries).await?;
+    let rows = fetch_snapshot_rows(transport, &boundary_targets).await?;
     register_blob_manifests(lix, transport, &fetched.commits, &rows).await?;
     lix.import_sync_history_headers(&fetched.commit_headers)
         .await?;
@@ -2221,7 +2212,16 @@ mod tests {
         else {
             panic!("snapshot remains a snapshot");
         };
-        let rows = fetch_snapshot_rows(&transport, &branches)
+        let targets = branches
+            .iter()
+            .filter_map(|branch| {
+                branch
+                    .head_commit_id
+                    .as_deref()
+                    .map(|head| (branch.branch_id.as_str(), head))
+            })
+            .collect::<Vec<_>>();
+        let rows = fetch_snapshot_rows(&transport, &targets)
             .await
             .expect("snapshot row pages hydrate");
         assert_eq!(cursor, 7, "paging does not publish a different cursor");
@@ -2240,13 +2240,6 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_row_paging_rejects_cycles_and_empty_progress() {
-        let branches = vec![super::super::SyncBranchHead {
-            branch_id: "branch".to_owned(),
-            head_commit_id: Some("head".to_owned()),
-            checkpoint_commit_id: Some("head".to_owned()),
-            checkpoint_state_root_id: "0".repeat(64),
-            hot_state_root_id: "0".repeat(64),
-        }];
         for behavior in [
             SnapshotPageBehavior::Cycle,
             SnapshotPageBehavior::EmptyContinuation,
@@ -2256,7 +2249,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 behavior,
             };
-            let error = fetch_snapshot_rows(&transport, &branches)
+            let error = fetch_snapshot_rows(&transport, &[("branch", "head")])
                 .await
                 .expect_err("malformed continuation must not hang bootstrap");
             assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
